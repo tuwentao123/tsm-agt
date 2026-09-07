@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.coverage
+dist/
+build/
+*.egg-info/
+.DS_Store
+.env
+.env.*
+!.env.example
+.agent/
+
+# Local investigation notes may contain workspace paths and internal project names.
+实测记录与优化问题本.md

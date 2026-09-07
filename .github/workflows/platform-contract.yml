@@ -1,0 +1,59 @@
+name: Platform Contract
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  platform-contracts:
+    name: Platform contracts (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run native platform contracts
+        shell: bash
+        env:
+          PYTHONPATH: src
+        run: >-
+          python -m unittest
+          tests.test_cross_process_lock_contract
+          tests.test_workspace_filesystem_contract
+          tests.test_workspace_path_contract
+          tests.test_local_identity_contract
+          tests.test_process_executor_platform_contract
+          tests.test_local_workspace_sandbox
+          tests.test_command_risk_policy
+
+  macos-regression:
+    name: Full regression (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run full suite
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s tests
