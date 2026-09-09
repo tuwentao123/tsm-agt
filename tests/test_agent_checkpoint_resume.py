@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,7 +10,8 @@ from tsm_agt.adapters.fixture import EchoModelProvider, EchoToolProvider
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
-    AgentCheckpointConflict, AgentTurnCheckpoint, AgentTurnResult, TaskState,
+    AgentCheckpointConflict, AgentTurnCheckpoint, AgentTurnResult,
+    SessionContinuationMode, SessionResumeSafety, TaskState,
 )
 from tsm_agt.core.configuration import canonical_hash
 from tsm_agt.ports import (
@@ -71,6 +73,22 @@ class CountingEchoTool(EchoToolProvider):
     async def invoke(self, call, context):
         self.invocation_count += 1
         return await super().invoke(call, context)
+
+
+class UpgradedRestartableModel(RestartableToolModel):
+    descriptor = AdapterDescriptor(
+        "fixture.restartable-tool-model", "2.0",
+        "ModelProviderPort", "1.0", frozenset({"text", "tools"}),
+    )
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        self.invocation_count += 1
+        return ModelResponse(
+            Message(
+                "assistant-upgraded-final", MessageRole.ASSISTANT,
+                (TextBlock("resumed with current runtime"),),
+            ), FinishReason.STOP, ModelUsage(1, 1),
+        )
 
 
 class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
@@ -136,6 +154,97 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             await second.registry.stop_all()
+            temporary.cleanup()
+
+    async def test_active_checkpoint_projection_is_safe_deduplicated_and_restartable(
+        self,
+    ) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        database = root / "runtime.db"
+        first_model = RestartableToolModel(block_after_tool=True)
+        first = compose_fixture_application(
+            model_adapter=first_model, tool_adapters=(CountingEchoTool(),),
+            store_adapter=SQLiteRuntimeStore(database),
+        )
+        await first.registry.start_all()
+        task = await self._create_task(first, root)
+        running = asyncio.create_task(
+            first.kernel.run_agent_turn(task.task_id, "private turn input")
+        )
+        await first_model.entered.wait()
+        running.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await running
+        await first.kernel.interrupt_agent_turn(
+            task.task_id, "simulate process interruption"
+        )
+        interrupted = await first.kernel.get_task(task.task_id)
+        assert interrupted.active_agent_checkpoint is not None
+        checkpoint = AgentTurnCheckpoint.from_data(
+            interrupted.active_agent_checkpoint
+        )
+        # Add a visible result for the same Task to prove the active projection
+        # replaces, rather than duplicates, its recent Task summary.
+        await first.kernel._record_session_task_result(
+            task.task_id, checkpoint.turn_id,
+            Message(
+                "visible-user", MessageRole.USER,
+                (TextBlock("visible historical request"),),
+            ),
+            Message(
+                "visible-assistant", MessageRole.ASSISTANT,
+                (TextBlock("visible partial result"),),
+            ),
+        )
+        first_projection = await first.kernel.get_session_prompt_projection(
+            task.session_id
+        )
+        assert first_projection.message is not None
+        first_body = json.loads(first_projection.message.text)
+        active = first_body["active_checkpoint"]
+        self.assertEqual(active["task_id"], task.task_id)
+        self.assertEqual(active["task_state"], "INTERRUPTED")
+        self.assertEqual(
+            active["continuation"], "resume_from_authoritative_checkpoint"
+        )
+        self.assertEqual(active["progress"]["tool_calls"], 1)
+        self.assertEqual(first_body["recent_task_summaries"], [])
+        self.assertEqual(first_body["earlier_summary"]["tasks"], [])
+        encoded = json.dumps(active, ensure_ascii=False)
+        self.assertNotIn("private turn input", encoded)
+        self.assertNotIn('\"text\": \"once\"', encoded)
+        self.assertNotIn("messages", active)
+        self.assertNotIn("pending_tool_calls", active)
+        suspended = first_body["suspended_tasks"]["items"]
+        self.assertEqual(len(suspended), 1)
+        self.assertEqual(suspended[0]["task_id"], task.task_id)
+        suspended_encoded = json.dumps(suspended, ensure_ascii=False)
+        self.assertNotIn("private turn input", suspended_encoded)
+        self.assertNotIn('"text": "once"', suspended_encoded)
+        self.assertNotIn("pending_tool_calls", suspended_encoded)
+        await first.registry.stop_all()
+
+        restarted = compose_fixture_application(
+            model_adapter=RestartableToolModel(),
+            tool_adapters=(CountingEchoTool(),),
+            store_adapter=SQLiteRuntimeStore(database),
+        )
+        await restarted.registry.start_all()
+        try:
+            restarted_projection = (
+                await restarted.kernel.get_session_prompt_projection(
+                    task.session_id
+                )
+            )
+            assert restarted_projection.message is not None
+            restarted_body = json.loads(restarted_projection.message.text)
+            self.assertEqual(
+                restarted_body["active_checkpoint"],
+                first_body["active_checkpoint"],
+            )
+        finally:
+            await restarted.registry.stop_all()
             temporary.cleanup()
 
     async def test_restart_before_first_model_call_resamples_safely(self) -> None:
@@ -224,7 +333,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
             await second.registry.stop_all()
             temporary.cleanup()
 
-    async def test_finder_does_not_skip_latest_completed_task(self) -> None:
+    async def test_finder_keeps_older_interrupted_task_addressable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = RestartableToolModel(block_first=True)
@@ -257,8 +366,8 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(old.state, TaskState.INTERRUPTED)
                 self.assertIsNotNone(old.active_agent_checkpoint)
-                # Create a newer successful Task and prove the finder never
-                # scans behind it to revive the stale interrupted Task.
+                # A newer unrelated Task may move the Session cursor, but must
+                # not erase the older Task's durable recovery address.
                 latest = await app.kernel.create_task(
                     "new completed task", root, session_id=session.session_id
                 )
@@ -271,13 +380,168 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
                     latest = await app.kernel.transition_task(
                         latest.task_id, state, state.value
                     )
-                self.assertIsNone(
-                    await app.kernel.find_recoverable_session_task(
-                        session.session_id, root
+                candidate = await app.kernel.find_recoverable_session_task(
+                    session.session_id, root
+                )
+                self.assertIsNotNone(candidate)
+                assert candidate is not None
+                self.assertEqual(candidate.task_id, old.task_id)
+            finally:
+                await app.registry.stop_all()
+
+    async def test_multiple_interrupted_tasks_require_explicit_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = compose_fixture_application(
+                model_adapter=RestartableToolModel(), tool_adapters=()
+            )
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("two suspended tasks")
+                for index in (1, 2):
+                    task = await app.kernel.create_task(
+                        f"unfinished goal {index}", root,
+                        session_id=session.session_id,
                     )
+                    for state in (
+                        TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                        TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                        TaskState.EXECUTING,
+                    ):
+                        task = await app.kernel.transition_task(
+                            task.task_id, state, state.value
+                        )
+                    model = app.kernel.dependencies.model
+                    assert isinstance(model, RestartableToolModel)
+                    model.block_first = True
+                    model.entered.clear()
+                    running = asyncio.create_task(
+                        app.kernel.run_agent_turn(task.task_id, task.goal)
+                    )
+                    await model.entered.wait()
+                    running.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await running
+                    await app.kernel.interrupt_agent_turn(
+                        task.task_id, "fixture interruption"
+                    )
+                    model.block_first = False
+                decision = await app.kernel.resolve_session_continuation(
+                    session.session_id, root
+                )
+                self.assertEqual(
+                    decision.mode, SessionContinuationMode.MULTIPLE_CANDIDATES
+                )
+                self.assertEqual(len(decision.candidates), 2)
+                selected = await app.kernel.resolve_session_continuation(
+                    session.session_id, root,
+                    task_id=decision.candidates[-1].task_id,
+                )
+                self.assertEqual(selected.mode, SessionContinuationMode.RECOVER_TASK)
+                self.assertEqual(
+                    selected.task_id, decision.candidates[-1].task_id
                 )
             finally:
                 await app.registry.stop_all()
+
+    async def test_resume_candidate_survives_sqlite_restart(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        database = root / "runtime.db"
+        first_model = RestartableToolModel(block_first=True)
+        first = compose_fixture_application(
+            model_adapter=first_model, tool_adapters=(),
+            store_adapter=SQLiteRuntimeStore(database),
+        )
+        await first.registry.start_all()
+        task = await self._create_task(first, root)
+        running = asyncio.create_task(
+            first.kernel.run_agent_turn(task.task_id, "persist me")
+        )
+        await first_model.entered.wait()
+        running.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await running
+        await first.kernel.interrupt_agent_turn(task.task_id, "restart")
+        before = await first.kernel.list_session_resume_candidates(
+            task.session_id, root
+        )
+        await first.registry.stop_all()
+        second = compose_fixture_application(
+            model_adapter=RestartableToolModel(), tool_adapters=(),
+            store_adapter=SQLiteRuntimeStore(database),
+        )
+        await second.registry.start_all()
+        try:
+            after = await second.kernel.list_session_resume_candidates(
+                task.session_id, root
+            )
+            self.assertEqual(after, before)
+            self.assertEqual(after[0].safety, SessionResumeSafety.EXACT_RESUME)
+        finally:
+            await second.registry.stop_all()
+            temporary.cleanup()
+
+    async def test_zero_side_effect_runtime_upgrade_rebases_and_resumes(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        database = root / "runtime.db"
+        first_model = RestartableToolModel(block_first=True)
+        first = compose_fixture_application(
+            model_adapter=first_model, tool_adapters=(),
+            store_adapter=SQLiteRuntimeStore(database),
+        )
+        await first.registry.start_all()
+        task = await self._create_task(first, root)
+        running = asyncio.create_task(
+            first.kernel.run_agent_turn(task.task_id, "preserve this goal")
+        )
+        await first_model.entered.wait()
+        running.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await running
+        await first.kernel.interrupt_agent_turn(task.task_id, "runtime upgrade")
+        await first.registry.stop_all()
+
+        second = compose_fixture_application(
+            model_adapter=UpgradedRestartableModel(), tool_adapters=(),
+            store_adapter=SQLiteRuntimeStore(database),
+        )
+        await second.registry.start_all()
+        try:
+            candidates = await second.kernel.list_session_resume_candidates(
+                task.session_id, root
+            )
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(
+                candidates[0].safety, SessionResumeSafety.REBASE_REQUIRED
+            )
+            self.assertEqual(
+                candidates[0].reason_code, "safe_runtime_upgrade_rebase"
+            )
+            self.assertIn("adapter_lock_hash", candidates[0].rebase_reasons)
+
+            result = await second.kernel.resume_checkpointed_agent_turn(
+                task.task_id
+            )
+            self.assertIsInstance(result, AgentTurnResult)
+            restored = await second.kernel.get_task(task.task_id)
+            self.assertEqual(restored.goal, "checkpoint resume")
+            self.assertEqual(len(restored.effective_configurations), 2)
+            events = await second.registry.require(RuntimeStorePort).read_events(
+                task.task_id
+            )
+            event_types = [event.event_type for event in events]
+            self.assertIn("config.rebased", event_types)
+            self.assertIn("turn.rebased", event_types)
+            self.assertIn("turn.resumed", event_types)
+            rebased = next(
+                event for event in events if event.event_type == "turn.rebased"
+            )
+            self.assertFalse(rebased.payload["tool_calls_replayed"])
+        finally:
+            await second.registry.stop_all()
+            temporary.cleanup()
 
     async def test_workspace_identity_change_enters_conflict(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -327,6 +591,10 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
                 "fingerprints": {"new_paths": ["path-hash"]},
                 "consecutive_zero_delta": 1,
             },
+            evidence_question_state={
+                "schema_version": 1, "task_id": "task",
+                "records": [],
+            },
             read_hits_state={
                 "question_hash": "question-hash",
                 "candidate_path_hashes": ["path-hash"],
@@ -365,6 +633,12 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
                 "blocked_semantic_signature": "semantic-hash",
                 "change_method_attempts": 1,
             },
+            completion_readiness_state={
+                "continue_attempts": 1,
+                "disclosure_attempts": 1,
+                "last_action": "REPORT_BLOCKED",
+                "schema_version": 1,
+            },
         )
         self.assertEqual(
             AgentTurnCheckpoint.from_data(checkpoint.to_data()), checkpoint
@@ -382,7 +656,8 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         legacy = checkpoint._content_data()
         for field in (
             "evidence_relation_state", "rejection_loop_state",
-            "exploration_outcome_state",
+            "exploration_outcome_state", "evidence_question_state",
+            "completion_readiness_state",
         ):
             legacy.pop(field)
         legacy["checkpoint_hash"] = canonical_hash(legacy)
@@ -390,6 +665,8 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.evidence_relation_state, {})
         self.assertEqual(restored.rejection_loop_state, {})
         self.assertEqual(restored.exploration_outcome_state, {})
+        self.assertEqual(restored.evidence_question_state, {})
+        self.assertEqual(restored.completion_readiness_state, {})
 
 
 if __name__ == "__main__":

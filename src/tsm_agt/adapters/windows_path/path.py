@@ -61,6 +61,17 @@ class WindowsWorkspacePath:
             return False
         return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
+    def is_same_or_descendant(self, path: Path, root: Path) -> bool:
+        """Compare canonical Windows paths across case and separator aliases."""
+        self._require_started()
+        candidate = os.path.normcase(str(path.expanduser().resolve(strict=False)))
+        ancestor = os.path.normcase(str(root.expanduser().resolve(strict=False)))
+        try:
+            return os.path.commonpath((candidate, ancestor)) == ancestor
+        except ValueError:
+            # Different drives or incompatible UNC roots cannot contain each other.
+            return False
+
     def resolve_mutation_path(
         self, workspace: Path, relative_path: str,
     ) -> ResolvedWorkspacePath:
@@ -112,6 +123,63 @@ class WindowsWorkspacePath:
             raise ValueError("path escapes the workspace") from error
         key = self._path_identity(resolved)
         return ResolvedWorkspacePath(root, resolved, relative.as_posix(), key)
+
+    def resolve_read_path(
+        self, workspace: Path, requested_path: str,
+        additional_roots: tuple[Path, ...] = (),
+    ) -> ResolvedWorkspacePath:
+        self._require_started()
+        candidate = Path(requested_path).expanduser()
+        if any(
+            ":" in part for part in candidate.parts
+            if part != candidate.anchor
+        ):
+            raise PermissionError(
+                "Windows alternate data stream paths are not allowed"
+            )
+        workspace_root = self.normalize_workspace(workspace)
+        resolved = (
+            candidate.resolve(strict=False)
+            if candidate.is_absolute() or candidate.drive or candidate.root
+            else (workspace_root / candidate).resolve(strict=False)
+        )
+        roots = (workspace_root,) + tuple(
+            self.normalize_workspace(root) for root in additional_roots
+        )
+        for root in roots:
+            try:
+                relative = resolved.relative_to(root)
+            except ValueError:
+                continue
+            return ResolvedWorkspacePath(
+                root, resolved, relative.as_posix(), self._path_identity(resolved)
+            )
+        raise ValueError("path escapes the approved read roots")
+
+    def external_read_approval_root(
+        self, workspace: Path, requested_path: str,
+    ) -> Path | None:
+        self._require_started()
+        candidate = Path(requested_path).expanduser()
+        if any(
+            ":" in part for part in candidate.parts
+            if part != candidate.anchor
+        ):
+            return None
+        workspace_root = self.normalize_workspace(workspace)
+        candidate = (
+            candidate.resolve(strict=False)
+            if candidate.is_absolute() or candidate.drive or candidate.root
+            else (workspace_root / candidate).resolve(strict=False)
+        )
+        if not candidate.exists():
+            return None
+        root = candidate if candidate.is_dir() else candidate.parent
+        root = root.resolve(strict=True)
+        home = Path.home().resolve(strict=True)
+        if root == home or root == Path(root.anchor):
+            return None
+        return root
 
     def _require_started(self) -> None:
         if not self._started:

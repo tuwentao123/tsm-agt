@@ -8,7 +8,6 @@ from tsm_agt.adapters.fixture import EchoModelProvider
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     RuntimeInputContext, RuntimeInputIntent, RuntimeInputRouter, TaskState,
-    is_retry_last_interrupted_input, parse_retry_last_interrupted_input,
 )
 from tsm_agt.ports import AdapterDescriptor, HealthState, HealthStatus
 
@@ -28,32 +27,14 @@ class FixtureClassifier:
     async def stop(self, deadline):
         pass
 
+    def __init__(self, intent="REPLACE", confidence=0.93):
+        self.intent = intent
+        self.confidence = confidence
+        self.contexts = []
+
     async def classify_runtime_input(self, text, context):
-        return {"intent": "REPLACE", "confidence": 0.93}
-
-
-class RetryLastInterruptedInputTest(unittest.TestCase):
-    def test_short_retry_phrases_are_recognized(self):
-        for text in (
-            "继续", "继续吧！", "重试呢", "再试一下", "retry",
-            "重新试试", "刚才断了，再来一下", "恢复上次执行",
-            "重试登录流程",
-        ):
-            with self.subTest(text=text):
-                self.assertTrue(is_retry_last_interrupted_input(text))
-
-    def test_input_with_a_new_requirement_is_not_retry(self):
-        for text in ("继续修改另一个页面", "重新分析另一个项目"):
-            with self.subTest(text=text):
-                self.assertFalse(is_retry_last_interrupted_input(text))
-
-    def test_retry_can_carry_additional_steering(self):
-        parsed = parse_retry_last_interrupted_input(
-            "继续，但不要改公共组件"
-        )
-        self.assertIsNotNone(parsed)
-        assert parsed is not None
-        self.assertEqual(parsed.steering_text, "但不要改公共组件")
+        self.contexts.append(dict(context))
+        return {"intent": self.intent, "confidence": self.confidence}
 
 
 async def executing_task(application, root: Path):
@@ -73,23 +54,26 @@ class RuntimeInputRouterTest(unittest.TestCase):
         self.router = RuntimeInputRouter()
         self.context = RuntimeInputContext("EXECUTING")
 
-    def test_routes_high_confidence_phrases_and_defers_ambiguous_input(self):
-        cases = {
-            "另外不要修改公共 API": RuntimeInputIntent.STEER,
-            "别修这个了，改成只补测试": RuntimeInputIntent.REPLACE,
-            "现在做到哪了？": RuntimeInputIntent.STATUS_QUERY,
-            "完成当前任务后再整理文档": (
-                RuntimeInputIntent.NEW_TASK_AFTER_CURRENT
-            ),
-        }
-        for text, expected in cases.items():
+    def test_ordinary_language_is_never_special_cased_in_core(self):
+        for text in (
+            "另外不要修改公共 API",
+            "别修这个了，改成只补测试",
+            "现在做到哪了？",
+            "完成当前任务后再整理文档",
+            "return to the earlier investigation",
+        ):
             with self.subTest(text=text):
                 route = self.router.route(text, self.context)
-                self.assertEqual(route.intent, expected)
-                self.assertFalse(route.requires_confirmation)
-        ambiguous = self.router.route("测试呢？", self.context)
-        self.assertEqual(ambiguous.intent, RuntimeInputIntent.AMBIGUOUS)
-        self.assertTrue(ambiguous.requires_confirmation)
+                self.assertEqual(route.intent, RuntimeInputIntent.AMBIGUOUS)
+                self.assertTrue(route.requires_confirmation)
+
+    def test_explicit_ui_choice_is_deterministic(self):
+        route = self.router.route(
+            "arbitrary text", self.context,
+            explicit_intent=RuntimeInputIntent.REPLACE,
+        )
+        self.assertEqual(route.intent, RuntimeInputIntent.REPLACE)
+        self.assertFalse(route.requires_confirmation)
 
     def test_pending_protocols_take_precedence(self):
         answer = self.router.route(
@@ -130,7 +114,8 @@ class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             app = compose_fixture_application(
-                model_adapter=EchoModelProvider(), tool_adapters=()
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+                runtime_input_classifier_adapter=FixtureClassifier("STEER"),
             )
             await app.registry.start_all()
             try:
@@ -159,6 +144,25 @@ class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len((await app.kernel.get_steering(
                     task.task_id
                 )).pending), 1)
+            finally:
+                await app.registry.stop_all()
+
+    async def test_classifier_receives_current_goal_and_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            classifier = FixtureClassifier("STATUS_QUERY")
+            app = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+                runtime_input_classifier_adapter=classifier,
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, Path(directory))
+                route = await app.kernel.route_runtime_input(
+                    task.task_id, "how is it going", "status-input"
+                )
+                self.assertEqual(route.intent, RuntimeInputIntent.STATUS_QUERY)
+                self.assertEqual(classifier.contexts[0]["current_goal"], "original goal")
+                self.assertEqual(classifier.contexts[0]["task_state"], "EXECUTING")
             finally:
                 await app.registry.stop_all()
 

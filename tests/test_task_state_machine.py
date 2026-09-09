@@ -3,7 +3,10 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
-from tsm_agt.core import ApprovalRequest, InvalidTaskTransition, TaskSnapshot, TaskState
+from tsm_agt.core import (
+    ApprovalRequest, InvalidTaskTransition, TaskSnapshot, TaskState,
+    WorkspaceAccessCapability, WorkspaceAccessGrant,
+)
 from tsm_agt.ports import ToolCall, ToolRisk
 
 
@@ -57,6 +60,17 @@ class TaskStateMachineTest(unittest.TestCase):
         restored = TaskSnapshot.from_data(self.task.to_data())
 
         self.assertEqual(restored, self.task)
+
+    def test_workspace_read_grant_round_trip_and_legacy_default(self) -> None:
+        grant = WorkspaceAccessGrant(
+            "grant-1", "/external/project", WorkspaceAccessCapability.READ,
+            "approval-1", self.now,
+        )
+        granted = self.task.with_workspace_access_grant(grant, self.now)
+        self.assertEqual(TaskSnapshot.from_data(granted.to_data()), granted)
+        legacy = self.task.to_data()
+        legacy.pop("workspace_access_grants")
+        self.assertEqual(TaskSnapshot.from_data(legacy).workspace_access_grants, ())
 
     def test_pending_approval_serialization_round_trip(self) -> None:
         request = ApprovalRequest(

@@ -78,6 +78,19 @@ class NativeWorkspacePathContractTest(unittest.IsolatedAsyncioTestCase):
                 self.workspace, "../outside/secret.txt"
             )
 
+    async def test_read_path_accepts_only_explicit_additional_root(self) -> None:
+        target = self.outside / "source.txt"
+        target.write_text("outside source\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "approved read roots"):
+            self.path_service.resolve_read_path(
+                self.workspace, str(target), ()
+            )
+        resolved = self.path_service.resolve_read_path(
+            self.workspace, str(target), (self.outside,)
+        )
+        self.assertEqual(resolved.workspace, self.outside.resolve())
+        self.assertEqual(resolved.relative_path, "source.txt")
+
     async def test_linked_parent_cannot_escape_workspace(self) -> None:
         link = self.workspace / "linked-parent"
         if os.name == "nt":

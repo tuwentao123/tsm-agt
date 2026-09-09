@@ -111,11 +111,11 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     )
                 first = await client.route_input(
                     task.task_id, "记得兼容 Windows",
-                    command_id="sdk-input-1",
+                    command_id="sdk-input-1", intent="steer",
                 )
                 replay = await client.route_input(
                     task.task_id, "记得兼容 Windows",
-                    command_id="sdk-input-1",
+                    command_id="sdk-input-1", intent="steer",
                 )
                 self.assertEqual(first.result["intent"], "STEER")
                 self.assertTrue(first.result["applied"])

@@ -117,11 +117,13 @@ Prompt 目前按固定顺序装配 `System Safety → Harness Instructions → U
 
 Working Memory/Scratchpad 1.0 通过 `core.working_memory_read/update` 让真实工程 Agent 维护当前 Goal、Constraints、Facts、Decisions、Hypotheses、Open Questions、简单 Plan、Completed/Remaining Work 和 Evidence 引用。它是 Task 临时工作台，不是长期 Memory，也不保存隐藏推理、凭据、原始日志或源码正文。更新使用完整快照、revision 乐观锁和 keyed idempotency；Evidence 只能引用真实 `event:`、`tool_call:` 或 `mutation:`。R0 内部状态更新仍经过 Policy 和 Tool Ledger，但不弹审批；白名单之外的 R0 写操作仍拒绝。Checkpoint 绑定 Working Memory Hash，并发改动会让恢复进入 `CONFLICT`。最终 Turn 将状态与会话结果一起写入 Session，后续 Task 可以继续未完成事项。可用 `tsm-agt working-memory show <task_id> [--json]` 检查；Flow/Replay 只展示 revision/hash，不泄漏正文。用于大日志和原始正文的 Private Artifact Scratchpad 尚未实现，不能与本能力混为一谈。
 
-持久化 Session 可通过 `session create/list/show/close/archive/select-task/flow` 管理，使用 `task create --session <id>` 创建归属 Task。Session Event 有独立 cursor；`session flow` 只展示状态、Task 列表和事件类型，不替代原有单 Task `flow`/`replay`。Session 上下文 revision 会绑定 Agent Checkpoint，Session Memory 或跨 Task 结果变化后，旧 Checkpoint 会进入冲突而不会带着过期上下文继续。SQLite、CLI 与纯 Python 合约已在 macOS 验证；实现不使用平台路径语法，Windows 原生回归暂未执行。
+持久化 Session 可通过 `session create/list/show/close/archive/select-task/flow` 管理，使用 `task create --session <id>` 创建归属 Task。Session Event 有独立 cursor；`session flow` 只展示状态、Task 列表和事件类型，不替代原有单 Task `flow`/`replay`。Session 上下文 revision 会绑定 Agent Checkpoint。仅新增会话消息或切换模型、且没有待执行 Tool Call 时，恢复会刷新当前 Session 上下文并重新采样，不重放旧 Tool；Workspace、Policy、Toolset、Working Memory/Evidence 等执行身份变化仍进入冲突。SQLite、CLI 与纯 Python 合约已在 macOS 验证；实现不使用平台路径语法，Windows 原生回归暂未执行。
 
 Project Onboarding 会在 Task 首次进入 `RESOLVING_PROJECT` 时进行有界静态扫描，识别语言/构建系统、源码边界、入口、候选构建测试命令和受信任规则文件。它不会运行 Wrapper、构建脚本、测试、依赖安装或项目代码；候选命令仍必须通过普通 Tool、Trust、Policy 和审批。五个阶段分别保存 Checkpoint，崩溃后可继续；未变化项目按规范化工作区和本地主体复用缓存，变化后生成新 revision。摘要带来源路径/Hash，以 `untrusted_project_onboarding` 的 `user` 数据段进入 Prompt；规则正文不会借 Onboarding 绕过 Trusted Project Instructions 门禁。
 
-只读工具始终把输出标为不可信数据，并拒绝绝对路径、`..` 越界、逃逸工作区的 symlink/Junction、`.git`、`.env*`、凭据文件和常见密钥/证书格式。除目录浏览、正文读取和正文搜索外，`core.find_files` 可按已知文件名或相对路径通配模式直接定位文件；它跳过 build/dist/node_modules/target 等生成目录，避免模型明知文件名仍逐层 `list_files`。目录列表只证明“这里有这个文件”，若结论依赖资源名、配置键、常量或别名，Agent 还必须搜索并读取定义，不能把目录存在当成定义证据。
+只读工具始终把输出标为不可信数据。工作区内路径可直接读取；模型确实需要访问工作区外的现有文件或目录时，Runtime 会暂停同一个 Agent Turn，向用户展示规范化目录、只读权限和当前 Task 范围。批准后，原 Tool Call 自动恢复，并且同一 Task 的 `core.read_file/list_files/find_files/search_text` 可以继续使用该目录；新 Task 不继承授权。磁盘根目录和用户 Home 不会作为可批准根目录。
+
+额外目录授权不会交给写文件工具、命令工具或任意第三方 Tool Adapter，也不会改变主工作区。即使已经批准只读访问，逃逸授权目录的 symlink/Junction、Windows ADS、`.git`、`.ssh`、`.env*`、凭据文件和常见密钥/证书格式仍然拒绝。除目录浏览、正文读取和正文搜索外，`core.find_files` 可按已知文件名或相对路径通配模式直接定位文件；它跳过 build/dist/node_modules/target 等生成目录，避免模型明知文件名仍逐层 `list_files`。目录列表只证明“这里有这个文件”，若结论依赖资源名、配置键、常量或别名，Agent 还必须搜索并读取定义，不能把目录存在当成定义证据。
 
 代码导航通过独立 `CodeIntelligencePort` 接入，真实 Engineering Composition 默认提供七个 R0 只读工具：`code.symbol_overview`、`code.definition`、`code.references`、`code.implementations`、`code.workspace_symbols`、`code.diagnostics` 和 `code.rename_preview`。内置 `TextCodeIntelligenceProvider` 是无需额外依赖的有界回退实现，支持 Python、Kotlin、Java、TypeScript/JavaScript、Go、Rust、Swift 和 C/C++ 常见声明；每个结果都带 Workspace fingerprint、index version、是否刷新、文件/语言覆盖与截断状态。源文件变化后索引自动刷新，未变化时复用内存索引。
 
@@ -194,7 +196,7 @@ tsm-agt doctor --workspace . --json
 uv run tsm-agt chat --workspace .
 ```
 
-启动后会打印 `session_id`。每条普通输入创建一个隔离的 Task，并自动完成 Intake、项目发现、Agent Loop、验证和收尾；同一 Session 的后续 Task 会获得前面用户输入和最终回复的带来源引用，但不会继承原始 Tool Result、审批权或后台进程。模型请求写文件、执行受控命令等动作时，CLI 会展示 risk、action、target、preview、网络、数据传输和回滚信息，只有输入 `y/yes/approve` 才批准；其他回答默认拒绝。
+启动后会打印 `session_id`。每条普通输入创建一个隔离的 Task，并自动完成 Intake、项目发现、Agent Loop、验证和收尾；同一 Session 的后续 Task 会获得前面用户输入和最终回复的带来源引用，但不会继承原始 Tool Result、审批权、额外目录授权或后台进程。模型请求写文件、执行受控命令等动作时，CLI 会展示 risk、action、target、preview、网络、数据传输和回滚信息，只有输入 `y/yes/approve` 才批准；其他回答默认拒绝。模型请求读取工作区外的关联项目时，CLI 会单独显示“需要额外目录访问权限”、目录、只读范围和仍然禁止的能力；批准只恢复该次只读调用，不等于批准写入或命令执行。
 
 模型给出最终回答后，CLI 还会输出可信验证结果，例如 `verification: passed (2 criteria)`。Flow 中会出现 `Verification → workspace-integrity / post-mutation-command` 节点；节点下钻只显示状态、Evidence 数量和是否全部通过，不复制测试日志正文。当前内置命令识别覆盖 Python unittest/pytest/compileall、Gradle/Maven、Node 包管理器 test/build/lint/check、Cargo、Go、Flutter/Dart、Xcode、常见编译器、CMake/Make/Ninja；普通 `git status` 或打印命令不能充当验证证据。
 
@@ -207,16 +209,16 @@ uv run tsm-agt answer <request_id> \
 
 普通信息不足时模型应采用可见假设继续，不能把 `request_input` 当成频繁反问工具。Clarification 的问题和答案正文不会进入 Flow/导出诊断字段；流程只展示等待、解决状态、选项数量和内容 Hash。
 
-交互命令包括 `/help`、`/session`、`/tasks`、`/flow` 和 `/exit`。退出、EOF 或在输入提示处按 Ctrl+C 都会保留 Session；之后可继续：
+交互命令包括 `/help`、`/session`、`/tasks`、`/resume`、`/flow` 和 `/exit`。退出、EOF 或在输入提示处按 Ctrl+C 都会保留 Session；之后可继续：
 
 ```bash
 uv run tsm-agt chat \
   --session <session_id> --workspace .
 ```
 
-如果当前 Session 的最新 Task 因网络断开、模型 Provider 异常、Ctrl+C、CLI 或进程意外停止而留下了安全 Checkpoint，直接输入 `继续`、`重试`、`再试一下` 等短句，会恢复同一个 Task：原 Goal、已完成工具结果和模型/工具计数都会保留，只重新执行断点后没有完成的部分。输入 `继续修改另一个页面` 这类带新要求的句子不会被当成恢复命令。没有可恢复断点时，CLI 会要求说明新目标，不会创建 Goal 为“继续”的空任务。已经开始但结果不明的非幂等工具、`UNKNOWN_OUTCOME`、工作区/配置冲突、预算耗尽或确定性协议错误不会自动重放。
+如果 Session 中存在未完成 Task，任何普通输入都会进入统一的语义决策流程：可替换 `SessionInputResolverPort` 结合用户原文、近期对话和挂起 Task 摘要判断这是新任务、恢复某个任务还是需要澄清。默认 Adapter 使用当前模型理解任意语言和历史指代；Core 与 CLI 没有“继续/重试”关键词表。Resolver 只能提出动作，Runtime 仍独立校验 Task 归属、Checkpoint、工作区、策略、工具、Working Memory/Evidence 和副作用安全。自然语言恢复时，本轮用户原文完整加入原 Task；不会被 Runtime 拆句或替换。`/resume` 查看挂起目录，`/resume <task_id>` 明确恢复，`/new <goal>` 明确创建新 Task。已经开始但结果不明的非幂等工具、`UNKNOWN_OUTCOME` 或身份冲突不会自动重放；审批和澄清也不能被普通文本绕过。
 
-Agent 正在执行时，第二段输入由 Follow-up Mode 决定。默认 `STEER`：普通消息在下一个安全点加入当前 Task；`/followup queue` 切换到 `QUEUE` 后，普通消息会落入 SQLite，当前 Task 结束后按顺序创建后续 Task。`/followup steer` 切回 Steer，`/followup` 查看当前模式，`/queued` 查看待处理消息，`/unqueue <input_id>` 取消一条。显式命令不受当前模式影响：`/steer <补充要求>` 加入当前任务，`/queue <后续任务>` 排队，`/redirect <新目标>` 在安全点替换当前未完成目标；`/after` 和 `/replace` 是兼容旧名称。Redirect 会保留已完成工具结果和已提交修改，只取消尚未执行的工具调用。状态查询、模式切换和队列管理命令始终立即执行，不进入业务队列。
+Agent 正在执行时，第二段普通输入默认使用 `AUTO`：可替换 `RuntimeInputClassifierPort` 结合当前目标和 Task 状态判断这是补充当前任务、替换目标、排到当前任务之后，还是仅查询状态；默认生产 Adapter 复用当前模型，Core/CLI 不含中英文关键词表。Runtime 再独立执行置信度、审批、澄清和副作用安全检查。`/followup steer|queue` 可让用户明确固定后续输入模式，`/followup auto` 恢复语义判断，`/followup` 查看当前模式。显式 `/steer <补充要求>`、`/queue <后续任务>`、`/redirect <新目标>` 是确定性人工覆盖；`/after` 和 `/replace` 是兼容旧名称。队列保存在 SQLite，`/queued` 可查看，`/unqueue <input_id>` 可取消。Redirect 保留已完成工具结果和已提交修改，只取消尚未执行的工具调用。
 
 如果在审批提示输入 `leave` 或 Ctrl+C，审批保持待处理且不授予权限，可再使用现有 `approve/reject` 命令处理。在 `answer>` 直接回车、EOF 或 Ctrl+C，则 Clarification 保持待处理，可使用上面的 `answer` 命令恢复。当前 REPL 支持模型流式输出、采样期间 Ctrl+C 快速取消，以及等待模型首个响应时每 5 秒一次的进度心跳。交互式终端使用精确锁定的 `prompt-toolkit==3.0.52` 处理 Unicode 显示宽度、中文 IME 提交、方向键、退格/Delete、历史和粘贴；管道/重定向输入仍使用普通 stdin。
 

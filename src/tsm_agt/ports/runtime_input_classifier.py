@@ -1,4 +1,4 @@
-"""Optional semantic classifier boundary for ambiguous Runtime input."""
+"""Replaceable semantic boundary for input received during a live Task."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from .adapter import RuntimeAdapter
 
 
 class RuntimeInputClassifierPort(RuntimeAdapter, Protocol):
-    """Classify one ambiguous input without performing any Runtime action."""
+    """Classify ordinary live input without performing or authorizing it."""
 
     async def classify_runtime_input(
         self, text: str, context: Mapping[str, Any],

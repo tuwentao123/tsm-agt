@@ -48,8 +48,10 @@ from tsm_agt.core import (
     ProjectTrustLevel,
     ProjectOnboardingSnapshot,
     RuntimeInputIntent,
+    SessionContinuationMode,
+    SessionResumeSafety,
+    SessionInputAction,
     ModelInvocationFailed,
-    parse_retry_last_interrupted_input,
     SteeringKind,
     TaskState,
     build_flow_export_document,
@@ -115,7 +117,9 @@ def _render_investigation_status(status) -> tuple[str, ...]:
 async def _print_chat_status(application, session, task_id, output_fn) -> None:
     task = await application.kernel.get_task(task_id)
     steering = await application.kernel.get_steering(task_id)
-    checkpoint = dict(task.active_agent_checkpoint or {})
+    checkpoint = await application.kernel.get_session_active_checkpoint(
+        session.session_id
+    )
     output_fn(
         f"status: session={session.session_id} task={task.task_id} "
         f"state={task.state.value}"
@@ -129,10 +133,16 @@ async def _print_chat_status(application, session, task_id, output_fn) -> None:
             output_fn(line)
     output_fn(
         "activity: "
-        f"model_calls={checkpoint.get('model_calls', 0)} "
-        f"tool_calls={checkpoint.get('tool_calls', 0)} "
+        f"model_calls={checkpoint.model_calls if checkpoint else 0}"
+        f"/{checkpoint.max_model_calls if checkpoint else 0} "
+        f"tool_calls={checkpoint.tool_calls if checkpoint else 0}"
+        f"/{checkpoint.max_tool_calls if checkpoint else 0} "
         f"pending_input={len(steering.pending)}"
     )
+    if checkpoint is not None:
+        output_fn("continuation: " + checkpoint.continuation)
+        if checkpoint.pending_tools:
+            output_fn("pending tools: " + ", ".join(checkpoint.pending_tools))
     if task.pending_approval is not None:
         output_fn("waiting: explicit approval (ordinary text cannot approve)")
     elif task.pending_clarification is not None:
@@ -140,7 +150,8 @@ async def _print_chat_status(application, session, task_id, output_fn) -> None:
 
 
 async def _print_chat_plan(application, task_id, output_fn) -> None:
-    memory = await application.kernel.get_working_memory(task_id)
+    effective = await application.kernel.get_effective_working_memory(task_id)
+    memory = effective.snapshot
     output_fn(f"goal: {memory.goal}")
     if not memory.plan:
         output_fn("plan: not published yet")
@@ -149,8 +160,8 @@ async def _print_chat_plan(application, task_id, output_fn) -> None:
             f"{index}. [{step.status.value}] {step.description} "
             f"(done when: {step.completion_criteria})"
         )
-    if memory.remaining_work:
-        output_fn("remaining: " + "; ".join(memory.remaining_work))
+    if effective.remaining_work:
+        output_fn("remaining: " + "; ".join(effective.remaining_work))
 
 
 async def _print_chat_spec(application, task_id, output_fn) -> None:
@@ -813,11 +824,11 @@ async def _chat(
         output_fn(f"session: {session.session_id}")
         output_fn(
             "commands: /status, /plan, /spec, /diff, /permissions, /session, "
-            "/sessions, /use, /tasks, /flow, /followup, /queued, /exit"
+            "/sessions, /use, /tasks, /resume, /new, /flow, /followup, /queued, /exit"
         )
         output_fn(
-            "follow-up mode: STEER "
-            "(/followup queue switches new messages to the next Task)"
+            "follow-up mode: AUTO "
+            "(ordinary messages are resolved semantically; /followup changes it)"
         )
         trust = await application.kernel.get_project_trust(root)
         visible_tool_names = {tool.name for tool in await application.kernel.list_tools()}
@@ -851,7 +862,7 @@ async def _chat(
                         f"TRUSTED_BUILD --workspace {root}"
                     )
         deferred_inputs: deque[str] = deque()
-        follow_up_mode = FollowUpMode.STEER
+        follow_up_mode = FollowUpMode.AUTO
         while True:
             queued_follow_up = None
             try:
@@ -877,6 +888,8 @@ async def _chat(
             prompt = raw.strip()
             if not prompt:
                 continue
+            explicit_resume_task: str | None = None
+            explicit_new_task = False
             if prompt in {"/exit", "/quit"}:
                 output_fn(
                     f"session saved: {session.session_id} "
@@ -886,7 +899,7 @@ async def _chat(
             if prompt == "/help":
                 output_fn(
                     "Enter a request to run one Agent Task. While it runs, type "
-                    "ordinary language using the visible Steer/Queue mode, or use "
+                    "ordinary language using AUTO semantic routing, or use "
                     "/steer, /queue, /redirect and /interrupt. /followup shows or "
                     "changes the mode. /status, /plan, /diff and "
                     "/spec, /permissions are read-only; /sessions and /use switch "
@@ -896,17 +909,22 @@ async def _chat(
             if prompt == "/followup":
                 output_fn(f"follow-up mode: {follow_up_mode.value}")
                 continue
-            if prompt in {"/followup steer", "/followup queue"}:
+            if prompt in {"/followup auto", "/followup steer", "/followup queue"}:
                 follow_up_mode = (
-                    FollowUpMode.STEER
-                    if prompt.endswith("steer") else FollowUpMode.QUEUE
+                    FollowUpMode.AUTO if prompt.endswith("auto") else (
+                        FollowUpMode.STEER
+                        if prompt.endswith("steer") else FollowUpMode.QUEUE
+                    )
                 )
                 output_fn(
                     f"follow-up mode: {follow_up_mode.value}; "
                     + (
-                        "new messages will adjust the running Task at a safe point"
-                        if follow_up_mode is FollowUpMode.STEER else
-                        "new messages will wait for the running Task to finish"
+                        "ordinary messages will be resolved from their meaning"
+                        if follow_up_mode is FollowUpMode.AUTO else (
+                            "new messages will adjust the running Task at a safe point"
+                            if follow_up_mode is FollowUpMode.STEER else
+                            "new messages will wait for the running Task to finish"
+                        )
                     )
                 )
                 continue
@@ -946,6 +964,33 @@ async def _chat(
                 for task in tasks:
                     output_fn(f"{task.task_id} [{task.state.value}] {task.goal}")
                 continue
+            if prompt == "/resume":
+                candidates = (
+                    await application.kernel.list_session_resume_candidates(
+                        session.session_id, root
+                    )
+                )
+                if not candidates:
+                    output_fn("no suspended tasks in this session")
+                for item in candidates:
+                    output_fn(
+                        f"{item.task_id} [{item.task_state}] "
+                        f"resume={item.safety.value} {item.goal}"
+                    )
+                if candidates:
+                    output_fn("resume one with: /resume <task_id>")
+                continue
+            if prompt.startswith("/resume "):
+                explicit_resume_task = prompt.removeprefix("/resume " ).strip()
+                if not explicit_resume_task:
+                    output_fn("usage: /resume <task_id>")
+                    continue
+            if prompt.startswith("/new "):
+                prompt = prompt.removeprefix("/new " ).strip()
+                if not prompt:
+                    output_fn("usage: /new <goal>")
+                    continue
+                explicit_new_task = True
             if prompt == "/sessions":
                 sessions = await application.kernel.list_sessions()
                 for item in sessions:
@@ -987,40 +1032,145 @@ async def _chat(
                         root, output_fn,
                     )
                 continue
-            if prompt.startswith("/"):
+            if (
+                prompt.startswith("/")
+                and explicit_resume_task is None
+                and not explicit_new_task
+            ):
                 output_fn(f"unknown command: {prompt}; use /help")
                 continue
 
             resume_mode = False
-            retry_input = parse_retry_last_interrupted_input(prompt)
-            if retry_input is not None:
-                task = await application.kernel.find_recoverable_session_task(
-                    session.session_id, root
+            session_input = (
+                await application.kernel.resolve_session_input(
+                    session.session_id, prompt, root
                 )
-                if task is None:
+                if explicit_resume_task is None and not explicit_new_task else None
+            )
+            if (
+                session_input is not None
+                and session_input.action is SessionInputAction.CLARIFY
+            ):
+                output_fn(
+                    "[会话] " + (session_input.clarification or
+                    "请明确说明要处理的新目标或选择未完成任务。")
+                )
+                for item in session_input.candidates:
                     output_fn(
-                        "[恢复] 当前会话没有可以安全恢复的意外中断任务；"
-                        "请直接说明接下来要做什么。"
+                        f"- {item.task_id} [{item.task_state}] {item.goal}"
                     )
-                    continue
+                continue
+            selected_resume_task = (
+                explicit_resume_task
+                if explicit_resume_task is not None else (
+                    session_input.task_id
+                    if session_input is not None
+                    and session_input.action is SessionInputAction.RESUME_TASK
+                    else None
+                )
+            )
+            continuation = (
+                await application.kernel.resolve_session_continuation(
+                    session.session_id, root, task_id=selected_resume_task
+                )
+                if selected_resume_task is not None
+                else None
+            )
+            if (
+                continuation is not None
+                and continuation.mode is SessionContinuationMode.RECOVER_TASK
+            ):
+                assert continuation.task_id is not None
+                task = await application.kernel.get_task(continuation.task_id)
+                session = await application.kernel.select_session_task(
+                    session.session_id, task.task_id
+                )
                 resume_mode = True
                 checkpoint = dict(task.active_agent_checkpoint or {})
                 output_fn(f"task: {task.task_id}")
                 output_fn(f"[恢复] 正在继续上次意外中断的任务：{task.goal}")
                 output_fn(
-                    "[恢复] 已保留原目标和已完成的工具结果；"
-                    f"从模型回合 {int(checkpoint.get('model_calls', 0)) + 1} "
-                    "重新发起未完成步骤。"
+                    "[恢复] 已保留原目标、已完成工作和证据；"
+                    f"恢复方式={continuation.resume_safety.value if continuation.resume_safety else '-'}，"
+                    f"从模型回合 {int(checkpoint.get('model_calls', 0)) + 1} 继续。"
                 )
-                if retry_input.steering_text is not None:
-                    await application.kernel.queue_steering(
-                        task.task_id, SteeringKind.STEER,
-                        retry_input.steering_text, f"input-{uuid4().hex}",
+                if continuation.resume_safety is SessionResumeSafety.REBASE_REQUIRED:
+                    selected_candidate = next((
+                        item for item in continuation.candidates
+                        if item.task_id == task.task_id
+                    ), None)
+                    reasons = (
+                        ", ".join(selected_candidate.rebase_reasons)
+                        if selected_candidate is not None else "runtime changed"
                     )
                     output_fn(
-                        "[恢复] 已加入补充要求："
-                        f"{retry_input.steering_text}"
+                        "[恢复] 检测到 Runtime/Adapter 升级，将使用当前版本"
+                        "重新组装上下文；不会重放旧工具调用。"
                     )
+                    output_fn(f"[恢复] 升级差异：{reasons}")
+                if explicit_resume_task is None:
+                    await application.kernel.queue_steering(
+                        task.task_id, SteeringKind.STEER,
+                        prompt, f"input-{uuid4().hex}",
+                    )
+                    output_fn(
+                        "[恢复] 已将本轮用户原文加入任务上下文。"
+                    )
+            elif (
+                continuation is not None
+                and continuation.mode is SessionContinuationMode.MULTIPLE_CANDIDATES
+            ):
+                output_fn(
+                    "[恢复] 找到多个未完成任务，无法安全猜测你要继续哪一个："
+                )
+                for item in continuation.candidates:
+                    output_fn(
+                        f"- {item.task_id} [{item.task_state}] "
+                        f"resume={item.safety.value} {item.goal}"
+                    )
+                output_fn("请输入 /resume <task_id> 明确选择。")
+                continue
+            elif (
+                continuation is not None
+                and continuation.mode is SessionContinuationMode.AWAIT_USER_ACTION
+            ):
+                output_fn(
+                    "[续接] 当前任务正在等待明确的审批决定或澄清答案；"
+                    "“继续”不会被当成同意，也不会新建任务。"
+                )
+                output_fn(
+                    f"[续接] task={continuation.task_id or '-'} "
+                    f"state={continuation.task_state or '-'} "
+                    f"reason={continuation.reason_code}"
+                )
+                continue
+            elif (
+                continuation is not None
+                and continuation.mode is SessionContinuationMode.BLOCKED
+            ):
+                output_fn(
+                    "[恢复] 选中的任务仍未正常结束，但当前没有可安全恢复的"
+                    "断点；为避免重复执行未知结果的写入或命令，本次不会"
+                    "自动新建任务。"
+                )
+                output_fn(
+                    f"[恢复] task={continuation.task_id or '-'} "
+                    f"state={continuation.task_state or '-'} "
+                    f"reason={continuation.reason_code}"
+                )
+                selected_candidate = next((
+                    item for item in continuation.candidates
+                    if item.task_id == continuation.task_id
+                ), None)
+                if selected_candidate and selected_candidate.conflict_reasons:
+                    output_fn(
+                        "[恢复] 冲突："
+                        + ", ".join(selected_candidate.conflict_reasons)
+                    )
+                output_fn(
+                    "[恢复] 可使用 /new <目标> 新建任务，或修复冲突后再恢复。"
+                )
+                continue
             else:
                 task = await application.kernel.create_task(
                     prompt, root, session_id=session.session_id,
@@ -1185,14 +1335,17 @@ async def _chat(
                                     )
                                     return 0
                                 if live_text in {
-                                    "/followup", "/followup steer",
+                                    "/followup", "/followup auto", "/followup steer",
                                     "/followup queue",
                                 }:
                                     if live_text != "/followup":
                                         follow_up_mode = (
-                                            FollowUpMode.STEER
-                                            if live_text.endswith("steer")
-                                            else FollowUpMode.QUEUE
+                                            FollowUpMode.AUTO
+                                            if live_text.endswith("auto") else (
+                                                FollowUpMode.STEER
+                                                if live_text.endswith("steer")
+                                                else FollowUpMode.QUEUE
+                                            )
                                         )
                                     output_fn(
                                         f"follow-up mode: {follow_up_mode.value}"
@@ -1505,7 +1658,7 @@ async def _chat(
                 if current.state is TaskState.INTERRUPTED:
                     output_fn(
                         "[恢复] 任务已在安全断点停止。保持当前 Session，"
-                        "修复外部问题后输入“继续”即可恢复。"
+                        "修复外部问题后描述你的恢复意图，或使用 /resume 明确选择。"
                     )
     finally:
         try:
@@ -1518,6 +1671,14 @@ async def _chat(
 def _print_chat_approval(
     result: AgentTurnSuspended, output_fn: Callable[[str], None],
 ) -> None:
+    if result.approval_kind == "workspace_read":
+        output_fn("需要额外目录访问权限")
+        output_fn(f"目录：{result.target}")
+        output_fn("权限：只读")
+        output_fn("范围：当前 Task（任务结束后自动失效）")
+        output_fn(f"用途：{result.action}")
+        output_fn("仍然禁止：写文件、运行命令、读取 .env/.ssh/凭据和密钥")
+        return
     output_fn("approval required")
     output_fn(f"risk: {result.risk}")
     output_fn(f"action: {result.action}")
@@ -1666,10 +1827,11 @@ async def _working_memory_show(
     application = compose_local_project_control_application(root)
     await application.registry.start_all()
     try:
-        snapshot = await application.kernel.get_working_memory(task_id)
+        effective = await application.kernel.get_effective_working_memory(task_id)
+        snapshot = effective.snapshot
         if as_json:
             print(json.dumps(
-                snapshot.to_data(), ensure_ascii=False, indent=2, sort_keys=True
+                effective.to_data(), ensure_ascii=False, indent=2, sort_keys=True
             ))
             return 0
         print(
@@ -1683,7 +1845,7 @@ async def _working_memory_show(
             ("hypotheses", snapshot.hypotheses),
             ("open_questions", snapshot.open_questions),
             ("completed_work", snapshot.completed_work),
-            ("remaining_work", snapshot.remaining_work),
+            ("remaining_work", effective.remaining_work),
         ):
             print(f"{label}:")
             for value in values:
@@ -1699,7 +1861,7 @@ async def _working_memory_show(
         if not snapshot.plan:
             print("- none")
         print("evidence:")
-        for evidence in snapshot.evidence:
+        for evidence in effective.evidence:
             print(
                 f"- {evidence.evidence_id} ({evidence.kind}) "
                 f"{evidence.reference}: {evidence.summary}"
@@ -2515,6 +2677,24 @@ def _print_agent_result(
         )
         return
     if isinstance(result, AgentTurnSuspended):
+        if result.approval_kind == "workspace_read":
+            print("需要额外目录访问权限")
+            print(f"request_id: {result.approval_request_id}")
+            print(f"task_id: {result.task_id}")
+            print(f"目录：{result.target}")
+            print("权限：只读")
+            print("范围：当前 Task（任务结束后自动失效）")
+            print(f"用途：{result.action}")
+            print("仍然禁止：写文件、运行命令、读取 .env/.ssh/凭据和密钥")
+            print(
+                "continue with: tsm-agt approve "
+                f"{result.approval_request_id} --reason 'allow Task read access'"
+            )
+            print(
+                "or reject with: tsm-agt reject "
+                f"{result.approval_request_id} --reason 'not approved'"
+            )
+            return
         print("approval required")
         print(f"request_id: {result.approval_request_id}")
         print(f"task_id: {result.task_id}")

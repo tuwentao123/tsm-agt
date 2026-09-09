@@ -83,6 +83,53 @@ class StructuredEvidenceDeltaEvaluatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("do-not-persist-this-body", rendered)
         self.assertIn("secret.txt", rendered)
 
+    async def test_recoverable_path_error_preserves_zero_delta_streak(self):
+        call = ToolCall(
+            "recover-path", "core.read_file",
+            {"path": "src/external.py"},
+            EvidenceQuestion("E4", "Read the discovered external file"),
+        )
+        result = ToolResult(
+            call.call_id, False, data={"candidates": []},
+            error_code="PATH_CONTEXT_REQUIRED", retryable=True,
+            meta={"recoverable_input": True},
+        )
+        evaluation = await self.evaluator.evaluate(
+            call, result, EvidenceInventory(consecutive_zero_delta=2)
+        )
+        self.assertEqual(evaluation.delta.consecutive_zero_delta, 2)
+        self.assertEqual(
+            evaluation.delta.result_status,
+            "recoverable:PATH_CONTEXT_REQUIRED",
+        )
+
+    async def test_recoverable_scope_mismatch_is_not_evidence_or_zero_delta(self):
+        call = ToolCall(
+            "wrong-scope", "core.search_text",
+            {"path": ".", "query": "Service"},
+            EvidenceQuestion(
+                "E5", "Find Service in the intended repository",
+                expected_scope="/intended/repository",
+            ),
+        )
+        result = ToolResult(
+            call.call_id, False,
+            data={
+                "expected_scope": "/intended/repository",
+                "resolved_root": "/actual/repository",
+            },
+            error_code="TOOL_SCOPE_MISMATCH", retryable=True,
+            meta={"recoverable_input": True},
+        )
+        evaluation = await self.evaluator.evaluate(
+            call, result, EvidenceInventory(consecutive_zero_delta=2)
+        )
+        self.assertEqual(evaluation.delta.total_new, 0)
+        self.assertEqual(evaluation.delta.consecutive_zero_delta, 2)
+        self.assertEqual(
+            evaluation.delta.result_status, "recoverable:TOOL_SCOPE_MISMATCH"
+        )
+
 
 class RepeatedEvidenceModel(EchoModelProvider):
     capabilities = ProviderCapabilities(tools=True, context_window=4096)

@@ -34,17 +34,21 @@ class EvidenceQuestion:
     question_id: str
     question: str
     scope_expansion_reason: str = ""
+    expected_scope: str = ""
 
     def __post_init__(self) -> None:
         normalized_id = self.question_id.strip()
         normalized_question = self.question.strip()
         normalized_reason = self.scope_expansion_reason.strip()
+        normalized_scope = self.expected_scope.strip()
         if not normalized_id or len(normalized_id) > 64:
             raise ValueError("evidence question_id must contain 1..64 characters")
         if not normalized_question or len(normalized_question) > 500:
             raise ValueError("evidence question must contain 1..500 characters")
         if len(normalized_reason) > 500:
             raise ValueError("scope expansion reason must contain at most 500 characters")
+        if len(normalized_scope) > 1000:
+            raise ValueError("expected scope must contain at most 1000 characters")
 
     def to_data(self) -> dict[str, str]:
         data = {
@@ -53,6 +57,8 @@ class EvidenceQuestion:
         }
         if self.scope_expansion_reason.strip():
             data["scope_expansion_reason"] = self.scope_expansion_reason.strip()
+        if self.expected_scope.strip():
+            data["expected_scope"] = self.expected_scope.strip()
         return data
 
     @classmethod
@@ -61,6 +67,7 @@ class EvidenceQuestion:
             question_id=str(data.get("question_id", "")),
             question=str(data.get("question", "")),
             scope_expansion_reason=str(data.get("scope_expansion_reason", "")),
+            expected_scope=str(data.get("expected_scope", "")),
         )
 
 
@@ -337,6 +344,11 @@ class ToolInvocationContext:
     working_memory_control: ToolWorkingMemoryControl | None = None
     task_spec_control: ToolTaskSpecControl | None = None
     workspace_path: WorkspacePathPort | None = None
+    additional_read_roots: tuple[Path, ...] = ()
+    resource_paths: Mapping[str, str] = field(default_factory=dict)
+    resource_candidates: Mapping[str, tuple[Mapping[str, str], ...]] = field(
+        default_factory=dict
+    )
 
 
 class ToolProviderPort(RuntimeAdapter, Protocol):

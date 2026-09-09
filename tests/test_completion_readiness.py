@@ -1,0 +1,312 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from tsm_agt.adapters.fixture import EchoModelProvider, EchoToolProvider
+from tsm_agt.adapters.rule_based_completion_readiness import (
+    RuleBasedCompletionReadinessPolicy,
+)
+from tsm_agt.bootstrap import compose_fixture_application
+from tsm_agt.core import AgentTurnResult, TaskState
+from tsm_agt.ports import (
+    CompletionGap, CompletionReadinessAction, CompletionReadinessProbe,
+    CompletionReadinessState, EvidenceQuestion, FinishReason, Message, MessageRole, ModelRequest,
+    ModelResponse, ModelStreamCompleted, ModelTextDelta, ModelUsage,
+    ProviderCapabilities, RuntimeStorePort, TextBlock, ToolCall, ToolCallBlock,
+    ToolInvocationContext, ToolResult, ToolResultBlock,
+)
+
+
+class RecoverableReadTool(EchoToolProvider):
+    """Read-only fixture that fails a configurable number of attempts."""
+
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.attempts = 0
+
+    async def invoke(
+        self, call: ToolCall, context: ToolInvocationContext,
+    ) -> ToolResult:
+        self.attempts += 1
+        if self.attempts <= self.failures:
+            return ToolResult(
+                call.call_id, False, error_code="PATH_CONTEXT_REQUIRED",
+                message="A more precise path is required.", retryable=True,
+                meta={"recoverable_input": True},
+            )
+        return await super().invoke(call, context)
+
+
+class BlockedReadTool(EchoToolProvider):
+    async def invoke(
+        self, call: ToolCall, context: ToolInvocationContext,
+    ) -> ToolResult:
+        return ToolResult(
+            call.call_id, False, error_code="PERMISSION_DENIED",
+            message="The required source is not authorized.",
+        )
+
+
+class ReadinessSequenceModel(EchoModelProvider):
+    """Proposes an early final, then follows Runtime completion feedback."""
+
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tool_calls = 0
+        self.requests: list[ModelRequest] = []
+
+    def _response(self, request: ModelRequest) -> ModelResponse:
+        self.requests.append(request)
+        results = [
+            block.result
+            for message in request.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock)
+        ]
+        correction = next((
+            message.text for message in reversed(request.messages)
+            if message.role is MessageRole.USER
+            and '"boundary":"completion_readiness"' in message.text
+        ), "")
+        if '"action":"REPORT_BLOCKED"' in correction:
+            return ModelResponse(
+                Message(
+                    "blocked-final", MessageRole.ASSISTANT,
+                    (TextBlock("Blocked: permission denied; source remains unverified."),),
+                ),
+                FinishReason.STOP, ModelUsage(1, 1),
+            )
+        if results and results[-1].ok:
+            return ModelResponse(
+                Message(
+                    "complete-final", MessageRole.ASSISTANT,
+                    (TextBlock("Required evidence collected."),),
+                ),
+                FinishReason.STOP, ModelUsage(1, 1),
+            )
+        if not results or (
+            '"action":"CONTINUE"' in correction
+            and self.tool_calls < 2
+        ):
+            self.tool_calls += 1
+            call = ToolCall(
+                f"read-{self.tool_calls}", "fixture.echo",
+                {"text": "evidence"},
+                EvidenceQuestion(
+                    "Q-required", "What fact is required for the answer?",
+                    expected_scope=".",
+                ),
+            )
+            return ModelResponse(
+                Message(
+                    f"tool-{self.tool_calls}", MessageRole.ASSISTANT,
+                    (ToolCallBlock(call),),
+                ),
+                FinishReason.TOOL_CALL, ModelUsage(1, 1),
+            )
+        return ModelResponse(
+            Message(
+                f"premature-{len(results)}", MessageRole.ASSISTANT,
+                (TextBlock("I can continue later if needed."),),
+            ),
+            FinishReason.STOP, ModelUsage(1, 1),
+        )
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        return self._response(request)
+
+
+class StreamingReadinessModel(ReadinessSequenceModel):
+    capabilities = ProviderCapabilities(
+        tools=True, stream_cancel=True, context_window=8192
+    )
+
+    async def stream_complete(self, request: ModelRequest):
+        response = self._response(request)
+        if response.message.text:
+            yield ModelTextDelta(response.message.text)
+        yield ModelStreamCompleted(response)
+
+
+async def executing_task(application, root: Path, task_id: str):
+    task = await application.kernel.create_task(
+        "collect the required fact", root, task_id=task_id
+    )
+    for state in (
+        TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+        TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING, TaskState.EXECUTING,
+    ):
+        task = await application.kernel.transition_task(
+            task.task_id, state, state.value
+        )
+    return task
+
+
+class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
+    async def test_forced_wrap_up_reports_gap_instead_of_opening_tools(self) -> None:
+        policy = RuleBasedCompletionReadinessPolicy()
+        await policy.start(None)  # type: ignore[arg-type]
+        try:
+            decision = await policy.evaluate(
+                CompletionReadinessProbe(
+                    goal="inspect",
+                    gaps=(CompletionGap(
+                        "gap", "EVIDENCE_QUESTION", "required fact",
+                        "OPEN", recoverable=True, expected_scope=".",
+                    ),),
+                    remaining_model_calls=2, remaining_tool_calls=2,
+                    available_read_tools=("fixture.echo",),
+                    forced_wrap_up=True,
+                ),
+                CompletionReadinessState(),
+            )
+            self.assertEqual(
+                decision.action, CompletionReadinessAction.REPORT_BLOCKED
+            )
+            self.assertEqual(decision.state.continue_attempts, 0)
+        finally:
+            await policy.stop(None)  # type: ignore[arg-type]
+
+    async def test_no_gap_finishes_without_extra_model_call(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            model = EchoModelProvider()
+            app = compose_fixture_application(
+                model_adapter=model, tool_adapters=(),
+                completion_readiness_policy_adapter=(
+                    RuleBasedCompletionReadinessPolicy()
+                ),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, Path(directory), "ready-no-gap")
+                result = await app.kernel.run_agent_turn(task.task_id, "answer")
+                self.assertEqual(result.model_calls, 1)
+                self.assertEqual(result.assistant_message.text, "answer")
+            finally:
+                await app.registry.stop_all()
+
+    async def test_recoverable_open_question_continues_and_resolves(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            model = ReadinessSequenceModel()
+            tool = RecoverableReadTool(failures=1)
+            app = compose_fixture_application(
+                model_adapter=model, tool_adapters=(tool,),
+                require_evidence_questions=True,
+                completion_readiness_policy_adapter=(
+                    RuleBasedCompletionReadinessPolicy()
+                ),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, Path(directory), "ready-continue")
+                result = await app.kernel.run_agent_turn(
+                    task.task_id, "inspect", max_model_calls=8, max_tool_calls=4
+                )
+                self.assertIsInstance(result, AgentTurnResult)
+                self.assertEqual(result.assistant_message.text, "Required evidence collected.")
+                self.assertEqual(tool.attempts, 2)
+                questions = await app.kernel.get_evidence_questions(task.task_id)
+                self.assertEqual(questions.records[0].status.value, "RESOLVED")
+                events = await app.registry.require(RuntimeStorePort).read_events(
+                    task.task_id
+                )
+                self.assertEqual(sum(
+                    event.event_type == "completion.continuation_requested"
+                    for event in events
+                ), 1)
+            finally:
+                await app.registry.stop_all()
+
+    async def test_blocked_question_requests_one_truthful_disclosure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            model = ReadinessSequenceModel()
+            app = compose_fixture_application(
+                model_adapter=model, tool_adapters=(BlockedReadTool(),),
+                require_evidence_questions=True,
+                completion_readiness_policy_adapter=(
+                    RuleBasedCompletionReadinessPolicy()
+                ),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, Path(directory), "ready-blocked")
+                result = await app.kernel.run_agent_turn(
+                    task.task_id, "inspect", max_model_calls=8, max_tool_calls=4
+                )
+                self.assertIn("permission denied", result.assistant_message.text)
+                self.assertFalse(model.requests[-1].allow_tool_calls)
+                events = await app.registry.require(RuntimeStorePort).read_events(
+                    task.task_id
+                )
+                self.assertEqual(sum(
+                    event.event_type == "completion.blocker_disclosure_requested"
+                    for event in events
+                ), 1)
+            finally:
+                await app.registry.stop_all()
+
+    async def test_continue_is_bounded_then_reports_persistent_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            model = ReadinessSequenceModel()
+            tool = RecoverableReadTool(failures=99)
+            app = compose_fixture_application(
+                model_adapter=model, tool_adapters=(tool,),
+                require_evidence_questions=True,
+                completion_readiness_policy_adapter=(
+                    RuleBasedCompletionReadinessPolicy(max_continue_attempts=1)
+                ),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, Path(directory), "ready-bounded")
+                result = await app.kernel.run_agent_turn(
+                    task.task_id, "inspect", max_model_calls=10, max_tool_calls=5
+                )
+                self.assertIn("remains unverified", result.assistant_message.text)
+                self.assertEqual(tool.attempts, 2)
+                events = await app.registry.require(RuntimeStorePort).read_events(
+                    task.task_id
+                )
+                self.assertEqual(sum(
+                    event.event_type == "completion.continuation_requested"
+                    for event in events
+                ), 1)
+                self.assertEqual(sum(
+                    event.event_type == "completion.blocker_disclosure_requested"
+                    for event in events
+                ), 1)
+            finally:
+                await app.registry.stop_all()
+
+    async def test_rejected_premature_stream_text_is_not_shown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            model = StreamingReadinessModel()
+            app = compose_fixture_application(
+                model_adapter=model, tool_adapters=(RecoverableReadTool(1),),
+                require_evidence_questions=True,
+                completion_readiness_policy_adapter=(
+                    RuleBasedCompletionReadinessPolicy()
+                ),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, Path(directory), "ready-stream")
+                output: list[str] = []
+                result = await app.kernel.run_agent_turn(
+                    task.task_id, "inspect", max_model_calls=8, max_tool_calls=4,
+                    on_text_delta=output.append,
+                )
+                self.assertEqual(output, ["Required evidence collected."])
+                self.assertNotIn("continue later", "".join(output))
+                self.assertEqual(result.assistant_message.text, "Required evidence collected.")
+            finally:
+                await app.registry.stop_all()
+
+
+if __name__ == "__main__":
+    unittest.main()

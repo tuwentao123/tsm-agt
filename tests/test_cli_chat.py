@@ -117,12 +117,97 @@ class FailOnceChatModel(EchoModelProvider):
     def __init__(self) -> None:
         super().__init__()
         self.calls = 0
+        self.requests: list[ModelRequest] = []
 
     async def complete(self, request):
         self.calls += 1
+        self.requests.append(request)
         if self.calls == 1:
             raise ConnectionError("fixture connection dropped")
         return await super().complete(request)
+
+
+class RecordingChatModel(EchoModelProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests: list[ModelRequest] = []
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        self.requests.append(request)
+        return await super().complete(request)
+
+
+class FixtureSessionInputResolver:
+    descriptor = AdapterDescriptor(
+        "fixture.session-input-resolver", "1.0",
+        "SessionInputResolverPort", "1.0",
+    )
+
+    def __init__(self, *, new_task_inputs: tuple[str, ...] = ()) -> None:
+        self.new_task_inputs = set(new_task_inputs)
+        self.contexts: list[dict] = []
+
+    async def start(self, context):
+        pass
+
+    async def health(self):
+        return HealthStatus(HealthState.HEALTHY, "ready")
+
+    async def stop(self, deadline):
+        pass
+
+    async def resolve_session_input(self, text, context):
+        self.contexts.append(dict(context))
+        if text in self.new_task_inputs:
+            return {
+                "action": "NEW_TASK", "task_id": None,
+                "confidence": 0.99, "reason_code": "fixture_new_task",
+                "clarification": None,
+            }
+        return {
+            "action": "RESUME_TASK",
+            "task_id": context["unfinished_tasks"][0]["task_id"],
+            "confidence": 0.99, "reason_code": "fixture_resume",
+            "clarification": None,
+        }
+
+
+class FixtureRuntimeInputClassifier:
+    descriptor = AdapterDescriptor(
+        "fixture.runtime-input-classifier", "1.0",
+        "RuntimeInputClassifierPort", "1.0",
+    )
+
+    async def start(self, context):
+        pass
+
+    async def health(self):
+        return HealthStatus(HealthState.HEALTHY)
+
+    async def stop(self, deadline):
+        pass
+
+    async def classify_runtime_input(self, text, context):
+        return {"intent": "STEER", "confidence": 0.99}
+
+
+class FixtureRuntimeInputClassifier:
+    descriptor = AdapterDescriptor(
+        "fixture.runtime-input-classifier", "1.0",
+        "RuntimeInputClassifierPort", "1.0",
+    )
+
+    async def start(self, context):
+        pass
+
+    async def health(self):
+        return HealthStatus(HealthState.HEALTHY)
+
+    async def stop(self, deadline):
+        pass
+
+    async def classify_runtime_input(self, text, context):
+        return {"intent": "STEER", "confidence": 0.99}
 
 
 class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
@@ -142,7 +227,8 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             model = BlockingChatModel()
             application = compose_fixture_application(
-                model_adapter=model, tool_adapters=()
+                model_adapter=model, tool_adapters=(),
+                runtime_input_classifier_adapter=FixtureRuntimeInputClassifier(),
             )
             terminal = AsyncScriptedTerminal([
                 "initial request", "另外不要修改公共 API", "/exit",
@@ -175,12 +261,14 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await application.registry.stop_all()
 
-    async def test_continue_resumes_same_task_after_unexpected_stop(self):
+    async def test_semantic_resolver_resumes_same_task_after_unexpected_stop(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = FailOnceChatModel()
+            resolver = FixtureSessionInputResolver()
             application = compose_fixture_application(
-                model_adapter=model, tool_adapters=()
+                model_adapter=model, tool_adapters=(),
+                session_input_resolver_adapter=resolver,
             )
             output: list[str] = []
             result = await _chat(
@@ -190,7 +278,10 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                 output_fn=output.append, application_factory=lambda: application,
             )
             self.assertEqual(result, 0)
-            self.assertIn("agent> inspect the original target", output)
+            self.assertTrue(any(
+                '"text":"继续"' in line or '"text": "继续"' in line
+                for line in output if line.startswith("agent> " )
+            ))
             self.assertTrue(any(
                 line.startswith("[恢复] 正在继续上次意外中断的任务")
                 for line in output
@@ -205,6 +296,9 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(len(task_ids), 2)
             self.assertEqual(task_ids[0], task_ids[1])
+            self.assertEqual(resolver.contexts[-1]["unfinished_tasks"][0][
+                "goal"
+            ], "inspect the original target")
             await application.registry.start_all()
             try:
                 tasks = await application.kernel.list_session_tasks(session_id)
@@ -220,12 +314,65 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await application.registry.stop_all()
 
-    async def test_retry_with_steering_resumes_original_task(self):
+    async def test_semantic_reference_finds_older_interrupted_task(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = FailOnceChatModel()
+            resolver = FixtureSessionInputResolver(
+                new_task_inputs=("answer an unrelated question",)
+            )
             application = compose_fixture_application(
-                model_adapter=model, tool_adapters=()
+                model_adapter=model, tool_adapters=(),
+                session_input_resolver_adapter=resolver,
+            )
+            output: list[str] = []
+            await _chat(
+                root, input_fn=ScriptedInput([
+                    "inspect the interrupted target",
+                    "answer an unrelated question",
+                    "return to the unfinished investigation and finish it",
+                    "/exit",
+                ]), output_fn=output.append,
+                application_factory=lambda: application,
+            )
+            session_id = next(
+                line.removeprefix("session: ") for line in output
+                if line.startswith("session: ")
+            )
+            await application.registry.start_all()
+            try:
+                tasks = await application.kernel.list_session_tasks(session_id)
+                self.assertEqual(len(tasks), 2)
+                self.assertEqual(
+                    [task.goal for task in tasks],
+                    [
+                        "inspect the interrupted target",
+                        "answer an unrelated question",
+                    ],
+                )
+                self.assertEqual(
+                    [task.state for task in tasks],
+                    [TaskState.SUCCEEDED, TaskState.SUCCEEDED],
+                )
+                self.assertTrue(any(
+                    "正在继续上次意外中断的任务：inspect the interrupted target"
+                    in line for line in output
+                ))
+                self.assertEqual(
+                    resolver.contexts[-1]["unfinished_tasks"][0]["goal"],
+                    "inspect the interrupted target",
+                )
+            finally:
+                await application.registry.stop_all()
+
+    async def test_resumed_task_receives_complete_current_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = FailOnceChatModel()
+            resolver = FixtureSessionInputResolver()
+            application = compose_fixture_application(
+                model_adapter=model, tool_adapters=(),
+                session_input_resolver_adapter=resolver,
             )
             output: list[str] = []
             await _chat(
@@ -237,7 +384,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                 application_factory=lambda: application,
             )
             self.assertTrue(any(
-                "已加入补充要求" in line for line in output
+                "已将本轮用户原文加入任务上下文" in line for line in output
             ))
             session_id = next(
                 line.removeprefix("session: ") for line in output
@@ -248,8 +395,17 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                 tasks = await application.kernel.list_session_tasks(session_id)
                 self.assertEqual(len(tasks), 1)
                 self.assertEqual(tasks[0].goal, "original target")
-                spec = await application.kernel.get_task_spec(tasks[0].task_id)
-                self.assertIn("但不要改公共组件", spec.constraints)
+                events = await application.kernel.dependencies.store.read_events(
+                    tasks[0].task_id
+                )
+                queued = [
+                    event for event in events
+                    if event.event_type == "steering.queued"
+                ]
+                self.assertEqual(
+                    queued[-1].payload["text"],
+                    "重新试试，但不要改公共组件",
+                )
             finally:
                 await application.registry.stop_all()
 
@@ -258,7 +414,8 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             model = BlockingChatModel()
             application = compose_fixture_application(
-                model_adapter=model, tool_adapters=()
+                model_adapter=model, tool_adapters=(),
+                runtime_input_classifier_adapter=FixtureRuntimeInputClassifier(),
             )
             terminal = AsyncScriptedTerminal([
                 "first request", "/followup queue",
@@ -294,21 +451,78 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await application.registry.stop_all()
 
-    async def test_continue_without_checkpoint_does_not_create_a_task(self):
+    async def test_continue_in_empty_session_is_ordinary_model_input(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            model = RecordingChatModel()
             application = compose_fixture_application(
-                model_adapter=EchoModelProvider(), tool_adapters=()
+                model_adapter=model, tool_adapters=()
             )
             output: list[str] = []
             await _chat(
                 root, input_fn=ScriptedInput(["继续", "/exit"]),
                 output_fn=output.append, application_factory=lambda: application,
             )
-            self.assertTrue(any(
-                "没有可以安全恢复" in line for line in output
+            self.assertIn("agent> 继续", output)
+            self.assertEqual(len(model.requests), 1)
+            self.assertEqual(model.requests[0].messages[-1].text, "继续")
+            self.assertFalse(any(
+                message.message_id.startswith("session-context-")
+                for message in model.requests[0].messages
             ))
-            self.assertFalse(any(line.startswith("task: ") for line in output))
+            session_id = next(
+                line.removeprefix("session: ") for line in output
+                if line.startswith("session: ")
+            )
+            await application.registry.start_all()
+            try:
+                tasks = await application.kernel.list_session_tasks(session_id)
+                self.assertEqual(len(tasks), 1)
+                self.assertEqual(tasks[0].goal, "继续")
+                self.assertEqual(tasks[0].state, TaskState.SUCCEEDED)
+            finally:
+                await application.registry.stop_all()
+
+    async def test_continue_after_completed_task_is_a_contextual_follow_up(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = RecordingChatModel()
+            application = compose_fixture_application(
+                model_adapter=model, tool_adapters=()
+            )
+            output: list[str] = []
+            await _chat(
+                root, input_fn=ScriptedInput([
+                    "先查清字段来源", "继续查", "/exit",
+                ]),
+                output_fn=output.append, application_factory=lambda: application,
+            )
+            self.assertEqual(len(model.requests), 2)
+            follow_up = model.requests[-1]
+            self.assertEqual(follow_up.messages[-1].text, "继续查")
+            session_context = [
+                message for message in follow_up.messages
+                if message.message_id.startswith("session-context-")
+            ]
+            self.assertEqual(len(session_context), 1)
+            self.assertIn("先查清字段来源", session_context[0].text)
+            session_id = next(
+                line.removeprefix("session: ") for line in output
+                if line.startswith("session: ")
+            )
+            await application.registry.start_all()
+            try:
+                tasks = await application.kernel.list_session_tasks(session_id)
+                self.assertEqual(
+                    [task.goal for task in tasks],
+                    ["先查清字段来源", "继续查"],
+                )
+                self.assertEqual(
+                    [task.state for task in tasks],
+                    [TaskState.SUCCEEDED, TaskState.SUCCEEDED],
+                )
+            finally:
+                await application.registry.stop_all()
 
     async def test_untrusted_workspace_explains_and_can_continue_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

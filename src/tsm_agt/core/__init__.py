@@ -30,12 +30,14 @@ from .flow import (
     build_flow_export_document,
 )
 from .approval import (
+    ApprovalKind,
     ApprovalDecision,
     ApprovalNotPending,
     ApprovalPayloadMismatch,
     ApprovalRequest,
     ApprovalRequired,
 )
+from .workspace_access import WorkspaceAccessCapability, WorkspaceAccessGrant
 from .clarification import (
     ClarificationChoice, ClarificationNotPending, ClarificationRequest,
     ClarificationRequired, ClarificationTokenMismatch,
@@ -67,9 +69,15 @@ from .task_spec import (
 from .session import SessionSnapshot, SessionState, standalone_session_id
 from .session_context import (
     SessionContextProjector, SessionConversationMessage,
-    SessionConversationProjection, SessionPromptProjection, SessionWorkingState,
+    SessionActiveCheckpoint, SessionConversationProjection,
+    SessionPromptProjection, SessionTaskSummary,
+    SessionWorkingState,
+)
+from .session_resources import (
+    SessionQuestionReference, SessionResourceKind, SessionResourceReference,
 )
 from .working_memory import (
+    EffectiveWorkingMemory, EffectiveWorkingMemoryProjector,
     WorkingEvidenceReference, WorkingMemoryProjector, WorkingMemorySnapshot,
     WorkingPlanStep, WorkingPlanStepStatus,
 )
@@ -77,9 +85,11 @@ from .steering import (
     SteeringInput, SteeringKind, SteeringProjection, SteeringProjector,
 )
 from .runtime_input import (
-    FollowUpMode, QueuedFollowUp, RetryInterruptedInput,
+    FollowUpMode, QueuedFollowUp,
     RuntimeInputContext, RuntimeInputIntent, RuntimeInputRoute, RuntimeInputRouter,
-    is_retry_last_interrupted_input, parse_retry_last_interrupted_input,
+    SessionContinuationDecision, SessionContinuationMode,
+    SessionResumeCandidate, SessionResumeSafety,
+    SessionInputAction, SessionInputDecision,
 )
 from .plan_guard import (
     ActionProgressState, GoalSlice, PlanGuard, PlanGuardDecision,
@@ -100,6 +110,10 @@ from .workspace import (
 )
 from .verification import (
     AcceptanceResult, AcceptanceStatus, Evidence, TaskVerificationResult,
+)
+from .evidence_question import (
+    EvidenceObservationKind, EvidenceQuestionProjector,
+    EvidenceQuestionProjection, EvidenceQuestionRecord, EvidenceQuestionStatus,
 )
 from .turn import InvalidModelResponse, InvalidTurnState, ModelInvocationFailed, TurnResult
 from .tool import (
@@ -151,10 +165,13 @@ __all__ = [
     "AgentTurnSuspended",
     "AgentClarificationSuspended",
     "ApprovalDecision",
+    "ApprovalKind",
     "ApprovalNotPending",
     "ApprovalPayloadMismatch",
     "ApprovalRequest",
     "ApprovalRequired",
+    "WorkspaceAccessCapability",
+    "WorkspaceAccessGrant",
     "ClarificationChoice",
     "ClarificationNotPending",
     "ClarificationRequest",
@@ -169,12 +186,15 @@ __all__ = [
     "RuntimeInputContext",
     "FollowUpMode",
     "QueuedFollowUp",
-    "RetryInterruptedInput",
     "RuntimeInputIntent",
     "RuntimeInputRoute",
     "RuntimeInputRouter",
-    "is_retry_last_interrupted_input",
-    "parse_retry_last_interrupted_input",
+    "SessionContinuationDecision",
+    "SessionContinuationMode",
+    "SessionResumeCandidate",
+    "SessionResumeSafety",
+    "SessionInputAction",
+    "SessionInputDecision",
     "IdempotencyConflict",
     "ToolCommitState",
     "ToolExecutionInProgress",
@@ -200,9 +220,16 @@ __all__ = [
     "SessionContextProjector",
     "SessionConversationMessage",
     "SessionConversationProjection",
+    "SessionActiveCheckpoint",
     "SessionPromptProjection",
+    "SessionTaskSummary",
     "SessionWorkingState",
+    "SessionQuestionReference",
+    "SessionResourceKind",
+    "SessionResourceReference",
     "WorkingEvidenceReference",
+    "EffectiveWorkingMemory",
+    "EffectiveWorkingMemoryProjector",
     "WorkingMemoryProjector",
     "WorkingMemorySnapshot",
     "WorkingPlanStep",
@@ -241,6 +268,11 @@ __all__ = [
     "AcceptanceStatus",
     "Evidence",
     "TaskVerificationResult",
+    "EvidenceObservationKind",
+    "EvidenceQuestionProjector",
+    "EvidenceQuestionProjection",
+    "EvidenceQuestionRecord",
+    "EvidenceQuestionStatus",
     "TurnResult",
     "DuplicateToolName",
     "InvalidToolArguments",

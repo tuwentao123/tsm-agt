@@ -16,12 +16,14 @@ from tsm_agt.ports import (
     AdapterDescriptor,
     HealthState,
     HealthStatus,
+    ResolvedWorkspacePath,
     ToolCall,
     ToolIdempotency,
     ToolInvocationContext,
     ToolResult,
     ToolRisk,
     ToolSpec,
+    is_sensitive_read_path,
 )
 
 _MAX_LIST_LIMIT = 1000
@@ -39,23 +41,6 @@ _GENERATED_DIRECTORY_NAMES = frozenset({
     "build", "dist", "node_modules", "out", "target", "vendor",
     "__pycache__",
 })
-
-_SENSITIVE_NAMES = frozenset(
-    {
-        ".git",
-        ".ssh",
-        ".npmrc",
-        ".pypirc",
-        "credentials",
-        "credentials.json",
-        "id_rsa",
-        "id_ed25519",
-    }
-)
-_SENSITIVE_SUFFIXES = frozenset(
-    {".jks", ".key", ".keystore", ".p12", ".pem", ".pfx"}
-)
-
 
 class _WorkspaceAccessError(ValueError):
     pass
@@ -87,10 +72,12 @@ class CoreReadOnlyToolProvider:
             description=(
                 "List files and directories under one workspace-relative path. Use it "
                 "to discover project structure; do not use it to read file contents. "
-                "Absolute paths, workspace escapes, escaped symlinks, .git, credentials, "
-                "environment files, and key material are unavailable. Parameters: path "
+                "An absolute outside path pauses for explicit Task-scoped directory read "
+                "approval. Escaped symlinks, .git, credentials, environment files, and "
+                "key material remain unavailable. Parameters: path "
                 "defaults to '.', recursive defaults to false, and limit is 1..1000. "
-                "Success returns ordered path/type/size entries and a truncation flag. "
+                "Success returns the requested path, authoritative resolved path/root, "
+                "ordered path/type/size entries, and a truncation flag. "
                 "Example: {\"path\": \"src\", \"recursive\": true, \"limit\": 200}."
             ),
             parameters={
@@ -117,8 +104,10 @@ class CoreReadOnlyToolProvider:
                 "required and supports *, ?, and **. A pattern without / matches the base "
                 "file name; a pattern containing / matches the relative path. path defaults "
                 "to '.', case_sensitive defaults to false, and limit is 1..500. Generated, "
-                "sensitive, escaped-symlink, and credential paths are skipped. Success "
-                "returns ordered path/size matches and scan metadata. Example: "
+                "sensitive, escaped-symlink, and credential paths are skipped. An absolute "
+                "outside path requires explicit Task-scoped directory read approval. Success "
+                "returns the authoritative resolved path/root, ordered path/size matches, "
+                "and scan metadata. Example: "
                 "{\"pattern\": \"dialog_call_confirm.xml\", \"path\": \"modules\"}."
             ),
             parameters={
@@ -140,23 +129,25 @@ class CoreReadOnlyToolProvider:
         ToolSpec(
             name="core.read_file",
             description=(
-                "Read a UTF-8 text file by line range inside the workspace. Use it after "
+                "Read a UTF-8 text file by path or by a resource_ref returned from a "
+                "prior list/find/search result in this Task. Use it after "
                 "locating a specific source or config file; do not use it for binary or "
-                "secret files. Absolute paths, workspace escapes, escaped symlinks, .git, "
-                "environment files, credentials, and key material are unavailable. "
+                "secret files. An absolute outside path pauses for explicit Task-scoped "
+                "directory read approval. Escaped symlinks, .git, environment files, "
+                "credentials, and key material remain unavailable. "
                 "start_line defaults to 1 and max_lines defaults to 200 (maximum 1000). "
-                "Success returns the whole-file sha256, content, actual line range, "
-                "total lines, and truncation. "
+                "Success returns the authoritative resolved path/root, whole-file sha256, "
+                "content, actual line range, total lines, and truncation. "
                 "Example: {\"path\": \"src/app.py\", \"start_line\": 1, \"max_lines\": 120}."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
+                    "resource_ref": {"type": "string"},
                     "start_line": {"type": "integer"},
                     "max_lines": {"type": "integer"},
                 },
-                "required": ["path"],
                 "additionalProperties": False,
             },
             risk=ToolRisk.R0,
@@ -169,11 +160,13 @@ class CoreReadOnlyToolProvider:
             description=(
                 "Search UTF-8 text files below a workspace-relative path. Use literal "
                 "search by default and enable regex only when pattern matching is required; "
-                "do not use it to search outside the workspace or inspect secrets. Binary, "
+                "an absolute outside path requires explicit Task-scoped directory read "
+                "approval and never permits inspecting secrets. Binary, "
                 "oversized, .git, environment, credential, and key files are skipped. "
                 "query is required; path defaults to '.', regex and case_sensitive default "
                 "to false, and max_matches is 1..500. Success returns ordered path, line, "
-                "and text matches plus scan/truncation metadata. Example: "
+                "and text matches plus authoritative resolved path/root and "
+                "scan/truncation metadata. Example: "
                 "{\"query\": \"class Kernel\", \"path\": \"src\"}."
             ),
             parameters={
@@ -250,7 +243,8 @@ class CoreReadOnlyToolProvider:
         limit = self._bounded_int(
             call.arguments, "limit", default=200, minimum=1, maximum=_MAX_LIST_LIMIT
         )
-        root, workspace = self._resolve_path(context, raw_path)
+        resolved = self._resolve_path(context, raw_path)
+        root = resolved.path
         if not root.exists():
             return self._error(call, "NOT_FOUND", f"path does not exist: {raw_path}")
         if not root.is_dir():
@@ -276,6 +270,7 @@ class CoreReadOnlyToolProvider:
             entries.append(
                 {
                     "path": relative.as_posix(),
+                    **self._resource_data(context, path, resolved.workspace),
                     "type": "directory" if path.is_dir() else "file",
                     "size": stat.st_size,
                 }
@@ -285,7 +280,8 @@ class CoreReadOnlyToolProvider:
             call_id=call.call_id,
             ok=True,
             data={
-                "path": self._display_path(workspace, root),
+                "path": self._display_path(resolved.workspace, root),
+                **self._resolved_path_data(context, raw_path, resolved),
                 "entries": entries,
                 "omitted_sensitive": omitted_sensitive,
             },
@@ -312,7 +308,8 @@ class CoreReadOnlyToolProvider:
             call.arguments, "limit", default=100, minimum=1,
             maximum=_MAX_FIND_LIMIT,
         )
-        root, workspace = self._resolve_path(context, raw_path)
+        resolved = self._resolve_path(context, raw_path)
+        root = resolved.path
         if not root.exists():
             return self._error(call, "NOT_FOUND", f"path does not exist: {raw_path}")
         if not root.is_dir():
@@ -347,6 +344,7 @@ class CoreReadOnlyToolProvider:
                 continue
             matches.append({
                 "path": relative_text,
+                **self._resource_data(context, path, resolved.workspace),
                 "size": path.stat().st_size,
             })
             if len(matches) >= limit:
@@ -357,7 +355,8 @@ class CoreReadOnlyToolProvider:
             call_id=call.call_id, ok=True,
             data={
                 "pattern": pattern,
-                "path": self._display_path(workspace, root),
+                "path": self._display_path(resolved.workspace, root),
+                **self._resolved_path_data(context, raw_path, resolved),
                 "matches": matches,
                 "scanned_entries": scanned_entries,
                 "skipped_entries": skipped_entries,
@@ -371,7 +370,7 @@ class CoreReadOnlyToolProvider:
     def _read_file(
         self, call: ToolCall, context: ToolInvocationContext
     ) -> ToolResult:
-        raw_path = self._string_argument(call.arguments, "path")
+        raw_path = self._read_target(call, context)
         start_line = self._bounded_int(
             call.arguments, "start_line", default=1, minimum=1
         )
@@ -382,8 +381,24 @@ class CoreReadOnlyToolProvider:
             minimum=1,
             maximum=_MAX_READ_LINES,
         )
-        path, workspace = self._resolve_path(context, raw_path)
+        resolved = self._resolve_path(context, raw_path)
+        path = resolved.path
         if not path.exists():
+            candidates = context.resource_candidates.get(raw_path, ())
+            if candidates and not Path(raw_path).is_absolute():
+                return ToolResult(
+                    call_id=call.call_id, ok=False,
+                    error_code="PATH_CONTEXT_REQUIRED",
+                    message=(
+                        "The relative path does not exist under the primary workspace, "
+                        "but the current Task previously discovered matching resources "
+                        "under another approved read root."
+                    ),
+                    hint="Retry core.read_file with one candidate resource_ref.",
+                    retryable=True,
+                    data={"requested_path": raw_path, "candidates": list(candidates)},
+                    meta={"untrusted_data": True, "recoverable_input": True},
+                )
             return self._error(call, "NOT_FOUND", f"file does not exist: {raw_path}")
         if not path.is_file():
             return self._error(call, "INVALID_PARAM", f"path is not a file: {raw_path}")
@@ -406,7 +421,8 @@ class CoreReadOnlyToolProvider:
             call_id=call.call_id,
             ok=True,
             data={
-                "path": self._display_path(workspace, path),
+                "path": self._display_path(resolved.workspace, path),
+                **self._resolved_path_data(context, raw_path, resolved),
                 "sha256": hashlib.sha256(raw).hexdigest(),
                 "start_line": start_line,
                 "end_line": actual_end,
@@ -435,7 +451,8 @@ class CoreReadOnlyToolProvider:
             minimum=1,
             maximum=_MAX_SEARCH_MATCHES,
         )
-        root, workspace = self._resolve_path(context, raw_path)
+        resolved = self._resolve_path(context, raw_path)
+        root = resolved.path
         if not root.exists():
             return self._error(call, "NOT_FOUND", f"path does not exist: {raw_path}")
         flags = 0 if case_sensitive else re.IGNORECASE
@@ -483,6 +500,7 @@ class CoreReadOnlyToolProvider:
                 matches.append(
                     {
                         "path": relative.as_posix(),
+                        **self._resource_data(context, path, resolved.workspace),
                         "line": line_number,
                         "text": line[:_MAX_MATCH_TEXT_CHARS],
                     }
@@ -497,7 +515,8 @@ class CoreReadOnlyToolProvider:
             ok=True,
             data={
                 "query": query,
-                "path": self._display_path(workspace, root),
+                "path": self._display_path(resolved.workspace, root),
+                **self._resolved_path_data(context, raw_path, resolved),
                 "matches": matches,
                 "scanned_files": scanned_files,
                 "skipped_files": skipped_files,
@@ -619,12 +638,12 @@ class CoreReadOnlyToolProvider:
     @classmethod
     def _resolve_path(
         cls, context: ToolInvocationContext, raw_path: str,
-    ) -> tuple[Path, Path]:
+    ) -> ResolvedWorkspacePath:
         if context.workspace_path is None:
             raise RuntimeError("workspace path capability is unavailable")
         try:
-            resolved = context.workspace_path.resolve_access_path(
-                context.workspace, raw_path
+            resolved = context.workspace_path.resolve_read_path(
+                context.workspace, raw_path, context.additional_read_roots
             )
         except PermissionError as error:
             raise _SensitivePathError(str(error)) from error
@@ -633,7 +652,69 @@ class CoreReadOnlyToolProvider:
         relative = Path(resolved.relative_path)
         if cls._is_sensitive(relative):
             raise _SensitivePathError("sensitive paths are not available to core tools")
-        return resolved.path, resolved.workspace
+        return resolved
+
+    @staticmethod
+    def _resolved_path_data(
+        context: ToolInvocationContext, requested_path: str,
+        resolved: ResolvedWorkspacePath,
+    ) -> dict[str, str]:
+        """Return explicit location facts so relative paths cannot be mistaken.
+
+        These fields describe what the path adapter actually resolved. They do not
+        infer the user's intent and do not grant access to another directory.
+        """
+        if context.workspace_path is None:
+            raise RuntimeError("workspace path capability is unavailable")
+        primary = context.workspace_path.normalize_workspace(context.workspace)
+        root_kind = (
+            "PRIMARY_WORKSPACE"
+            if resolved.workspace == primary
+            else "TASK_APPROVED_READ_ROOT"
+        )
+        return {
+            "requested_path": requested_path,
+            "resolved_path": str(resolved.path),
+            "resolved_root": str(resolved.workspace),
+            "root_alias": resolved.workspace.name or str(resolved.workspace),
+            "root_kind": root_kind,
+        }
+
+    @classmethod
+    def _resource_data(
+        cls, context: ToolInvocationContext, path: Path, root: Path,
+    ) -> dict[str, str]:
+        root_kind = cls._resolved_path_data(
+            context, str(path), ResolvedWorkspacePath(
+                root, path, path.relative_to(root).as_posix(), str(path)
+            ),
+        )["root_kind"]
+        raw = f"{context.task_id}\0{root}\0{path}".encode("utf-8")
+        return {
+            "resource_ref": "resource-" + hashlib.sha256(raw).hexdigest(),
+            "resolved_path": str(path),
+            "resolved_root": str(root),
+            "root_kind": root_kind,
+        }
+
+    @staticmethod
+    def _read_target(call: ToolCall, context: ToolInvocationContext) -> str:
+        raw_path = call.arguments.get("path")
+        resource_ref = call.arguments.get("resource_ref")
+        if raw_path is not None and resource_ref is not None:
+            raise ValueError("provide exactly one of path or resource_ref")
+        if resource_ref is not None:
+            if not isinstance(resource_ref, str) or not resource_ref.strip():
+                raise TypeError("resource_ref must be a non-empty string")
+            resolved = context.resource_paths.get(resource_ref)
+            if resolved is None:
+                raise ValueError(
+                    "resource_ref is unknown, expired, or belongs to another Task"
+                )
+            return resolved
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError("provide exactly one of path or resource_ref")
+        return raw_path
 
     @classmethod
     def _safe_relative(
@@ -642,10 +723,10 @@ class CoreReadOnlyToolProvider:
         if context.workspace_path is None:
             raise RuntimeError("workspace path capability is unavailable")
         try:
-            workspace = context.workspace_path.normalize_workspace(context.workspace)
-            relative = Path(context.workspace_path.resolve_access_path(
-                workspace, str(path.relative_to(workspace))
-            ).relative_path)
+            resolved = context.workspace_path.resolve_read_path(
+                context.workspace, str(path), context.additional_read_roots
+            )
+            relative = Path(resolved.relative_path)
         except PermissionError as error:
             raise _SensitivePathError(str(error)) from error
         except ValueError as error:
@@ -656,15 +737,7 @@ class CoreReadOnlyToolProvider:
 
     @staticmethod
     def _is_sensitive(relative: Path) -> bool:
-        for part in relative.parts:
-            lowered = part.lower()
-            if lowered in _SENSITIVE_NAMES:
-                return True
-            if lowered == ".env" or lowered.startswith(".env."):
-                return True
-            if Path(lowered).suffix in _SENSITIVE_SUFFIXES:
-                return True
-        return False
+        return is_sensitive_read_path(relative)
 
     @staticmethod
     def _display_path(workspace: Path, path: Path) -> str:

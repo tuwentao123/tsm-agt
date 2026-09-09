@@ -42,6 +42,16 @@ def validate_tool_arguments(spec: ToolSpec, arguments: Mapping[str, Any]) -> Non
         raise InvalidToolArguments(
             f"{spec.name} is missing required arguments: {', '.join(missing)}"
         )
+    if spec.name == "core.read_file":
+        supplied = sum(
+            isinstance(arguments.get(name), str)
+            and bool(str(arguments[name]).strip())
+            for name in ("path", "resource_ref")
+        )
+        if supplied != 1:
+            raise InvalidToolArguments(
+                "core.read_file requires exactly one of path or resource_ref"
+            )
 
     if schema.get("additionalProperties") is False:
         unknown = sorted(set(arguments) - set(properties))

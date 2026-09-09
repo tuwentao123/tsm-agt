@@ -661,6 +661,7 @@ def _approval_data(task: TaskSnapshot) -> Mapping[str, Any] | None:
         "preview": request.preview, "network_access": request.network_access,
         "data_transmission": request.data_transmission,
         "rollback": request.rollback,
+        "approval_kind": request.kind.value,
     }
 
 

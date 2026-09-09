@@ -24,6 +24,18 @@ from tsm_agt.adapters.rule_based_artifact_read import RuleBasedArtifactReadPolic
 from tsm_agt.adapters.rule_based_progressive_scope import (
     RuleBasedProgressiveScopePolicy,
 )
+from tsm_agt.adapters.rule_based_scope_consistency import (
+    RuleBasedToolScopeConsistencyPolicy,
+)
+from tsm_agt.adapters.rule_based_completion_readiness import (
+    RuleBasedCompletionReadinessPolicy,
+)
+from tsm_agt.adapters.rule_based_final_acceptance import (
+    RuleBasedFinalAcceptancePolicy,
+)
+from tsm_agt.adapters.rule_based_checkpoint_compatibility import (
+    RuleBasedCheckpointCompatibilityPolicy,
+)
 from tsm_agt.adapters.rule_based_exploration_budget import (
     RuleBasedExplorationBudgetPolicy,
 )
@@ -46,6 +58,8 @@ from tsm_agt.adapters.rule_based_investigation_flow import (
     RuleBasedInvestigationFlowProjector,
 )
 from tsm_agt.adapters.openai_compatible import OpenAICompatibleModelProvider
+from tsm_agt.adapters.model_session_input import ModelSessionInputResolver
+from tsm_agt.adapters.model_runtime_input import ModelRuntimeInputClassifier
 from tsm_agt.adapters.local_process import LocalProcessExecutor
 from tsm_agt.adapters.local_flow_export import (
     LocalFlowArtifactExporter, LocalReplayCursorStore,
@@ -87,11 +101,16 @@ from tsm_agt.ports import (
     ProjectMemoryPort,
     CodeIntelligencePort,
     RuntimeInputClassifierPort,
+    SessionInputResolverPort,
     EvidenceDeltaEvaluatorPort,
     SemanticActionClassifierPort,
     ReadHitsPolicyPort,
     ArtifactReadPolicyPort,
     ProgressiveScopePolicyPort,
+    ToolScopeConsistencyPolicyPort,
+    CompletionReadinessPolicyPort,
+    CheckpointCompatibilityPolicyPort,
+    FinalAcceptancePolicyPort,
     ExplorationBudgetPolicyPort,
     StopOrPivotPolicyPort,
     AgentProgressProjectorPort,
@@ -161,6 +180,16 @@ def _kernel_dependencies(
     classifiers = registry.all(RuntimeInputClassifierPort)
     if len(classifiers) > 1:
         raise ValueError("at most one RuntimeInputClassifierPort may be registered")
+    session_input_resolvers = registry.all(SessionInputResolverPort)
+    if len(session_input_resolvers) > 1:
+        raise ValueError("at most one SessionInputResolverPort may be registered")
+    checkpoint_compatibility_policies = registry.all(
+        CheckpointCompatibilityPolicyPort
+    )
+    if len(checkpoint_compatibility_policies) > 1:
+        raise ValueError(
+            "at most one CheckpointCompatibilityPolicyPort may be registered"
+        )
     evidence_evaluators = registry.all(EvidenceDeltaEvaluatorPort)
     if len(evidence_evaluators) > 1:
         raise ValueError(
@@ -180,6 +209,21 @@ def _kernel_dependencies(
     scope_policies = registry.all(ProgressiveScopePolicyPort)
     if len(scope_policies) > 1:
         raise ValueError("at most one ProgressiveScopePolicyPort may be registered")
+    scope_consistency_policies = registry.all(ToolScopeConsistencyPolicyPort)
+    if len(scope_consistency_policies) > 1:
+        raise ValueError(
+            "at most one ToolScopeConsistencyPolicyPort may be registered"
+        )
+    completion_readiness_policies = registry.all(CompletionReadinessPolicyPort)
+    if len(completion_readiness_policies) > 1:
+        raise ValueError(
+            "at most one CompletionReadinessPolicyPort may be registered"
+        )
+    final_acceptance_policies = registry.all(FinalAcceptancePolicyPort)
+    if len(final_acceptance_policies) > 1:
+        raise ValueError(
+            "at most one FinalAcceptancePolicyPort may be registered"
+        )
     budget_policies = registry.all(ExplorationBudgetPolicyPort)
     if len(budget_policies) > 1:
         raise ValueError("at most one ExplorationBudgetPolicyPort may be registered")
@@ -246,6 +290,16 @@ def _kernel_dependencies(
             artifact_read_policies[0] if artifact_read_policies else None
         ),
         progressive_scope_policy=(scope_policies[0] if scope_policies else None),
+        tool_scope_consistency_policy=(
+            scope_consistency_policies[0] if scope_consistency_policies else None
+        ),
+        completion_readiness_policy=(
+            completion_readiness_policies[0]
+            if completion_readiness_policies else None
+        ),
+        final_acceptance_policy=(
+            final_acceptance_policies[0] if final_acceptance_policies else None
+        ),
         exploration_budget_policy=(
             budget_policies[0] if budget_policies else None
         ),
@@ -277,6 +331,13 @@ def _kernel_dependencies(
             if investigation_flow_projectors else None
         ),
         runtime_input_classifier=(classifiers[0] if classifiers else None),
+        session_input_resolver=(
+            session_input_resolvers[0] if session_input_resolvers else None
+        ),
+        checkpoint_compatibility_policy=(
+            checkpoint_compatibility_policies[0]
+            if checkpoint_compatibility_policies else None
+        ),
         process_executor=registry.require(ProcessExecutorPort),
         tools=registry.all(ToolProviderPort),
         runtime_adapters=registry.runtime_adapters(),
@@ -361,12 +422,23 @@ def compose_fixture_application(
     context_manager: ContextWindowManager | None = None,
     enable_working_memory: bool = False,
     runtime_input_classifier_adapter: RuntimeInputClassifierPort | None = None,
+    session_input_resolver_adapter: SessionInputResolverPort | None = None,
+    checkpoint_compatibility_policy_adapter: (
+        CheckpointCompatibilityPolicyPort | None
+    ) = None,
     require_evidence_questions: bool = False,
     evidence_delta_evaluator_adapter: EvidenceDeltaEvaluatorPort | None = None,
     semantic_action_classifier_adapter: SemanticActionClassifierPort | None = None,
     read_hits_policy_adapter: ReadHitsPolicyPort | None = None,
     artifact_read_policy_adapter: ArtifactReadPolicyPort | None = None,
     progressive_scope_policy_adapter: ProgressiveScopePolicyPort | None = None,
+    tool_scope_consistency_policy_adapter: (
+        ToolScopeConsistencyPolicyPort | None
+    ) = None,
+    completion_readiness_policy_adapter: (
+        CompletionReadinessPolicyPort | None
+    ) = None,
+    final_acceptance_policy_adapter: FinalAcceptancePolicyPort | None = None,
     exploration_budget_policy_adapter: ExplorationBudgetPolicyPort | None = None,
     stop_or_pivot_policy_adapter: StopOrPivotPolicyPort | None = None,
     evidence_relation_provider_adapters: (
@@ -413,6 +485,15 @@ def compose_fixture_application(
         registry.register(
             RuntimeInputClassifierPort, runtime_input_classifier_adapter
         )
+    if session_input_resolver_adapter is not None:
+        registry.register(
+            SessionInputResolverPort, session_input_resolver_adapter
+        )
+    registry.register(
+        CheckpointCompatibilityPolicyPort,
+        checkpoint_compatibility_policy_adapter
+        or RuleBasedCheckpointCompatibilityPolicy(),
+    )
     if evidence_delta_evaluator_adapter is not None:
         registry.register(
             EvidenceDeltaEvaluatorPort, evidence_delta_evaluator_adapter
@@ -428,6 +509,18 @@ def compose_fixture_application(
     if progressive_scope_policy_adapter is not None:
         registry.register(
             ProgressiveScopePolicyPort, progressive_scope_policy_adapter
+        )
+    if tool_scope_consistency_policy_adapter is not None:
+        registry.register(
+            ToolScopeConsistencyPolicyPort, tool_scope_consistency_policy_adapter
+        )
+    if completion_readiness_policy_adapter is not None:
+        registry.register(
+            CompletionReadinessPolicyPort, completion_readiness_policy_adapter
+        )
+    if final_acceptance_policy_adapter is not None:
+        registry.register(
+            FinalAcceptancePolicyPort, final_acceptance_policy_adapter
         )
     if exploration_budget_policy_adapter is not None:
         registry.register(
@@ -584,6 +677,18 @@ def compose_openai_compatible_readonly_application(
         )
     )
     registry.register(
+        SessionInputResolverPort,
+        ModelSessionInputResolver(registry.require(ModelProviderPort)),
+    )
+    registry.register(
+        RuntimeInputClassifierPort,
+        ModelRuntimeInputClassifier(registry.require(ModelProviderPort)),
+    )
+    registry.register(
+        CheckpointCompatibilityPolicyPort,
+        RuleBasedCheckpointCompatibilityPolicy(),
+    )
+    registry.register(
         RuntimeStorePort,
         SQLiteRuntimeStore(database_path or Path.cwd() / ".agent" / "runtime.db"),
     )
@@ -601,6 +706,15 @@ def compose_openai_compatible_readonly_application(
     )
     registry.register(ReadHitsPolicyPort, RuleBasedReadHitsPolicy())
     registry.register(ArtifactReadPolicyPort, RuleBasedArtifactReadPolicy())
+    registry.register(
+        ToolScopeConsistencyPolicyPort, RuleBasedToolScopeConsistencyPolicy()
+    )
+    registry.register(
+        CompletionReadinessPolicyPort, RuleBasedCompletionReadinessPolicy()
+    )
+    registry.register(
+        FinalAcceptancePolicyPort, RuleBasedFinalAcceptancePolicy()
+    )
     exploration_profile = _register_exploration_profile(registry, budget.profile)
     registry.register(
         ExplorationBudgetPolicyPort,
@@ -691,6 +805,18 @@ def compose_openai_compatible_engineering_application(
         )
     )
     registry.register(
+        SessionInputResolverPort,
+        ModelSessionInputResolver(registry.require(ModelProviderPort)),
+    )
+    registry.register(
+        RuntimeInputClassifierPort,
+        ModelRuntimeInputClassifier(registry.require(ModelProviderPort)),
+    )
+    registry.register(
+        CheckpointCompatibilityPolicyPort,
+        RuleBasedCheckpointCompatibilityPolicy(),
+    )
+    registry.register(
         RuntimeStorePort,
         SQLiteRuntimeStore(database_path or Path.cwd() / ".agent" / "runtime.db"),
     )
@@ -708,6 +834,15 @@ def compose_openai_compatible_engineering_application(
     )
     registry.register(ReadHitsPolicyPort, RuleBasedReadHitsPolicy())
     registry.register(ArtifactReadPolicyPort, RuleBasedArtifactReadPolicy())
+    registry.register(
+        ToolScopeConsistencyPolicyPort, RuleBasedToolScopeConsistencyPolicy()
+    )
+    registry.register(
+        CompletionReadinessPolicyPort, RuleBasedCompletionReadinessPolicy()
+    )
+    registry.register(
+        FinalAcceptancePolicyPort, RuleBasedFinalAcceptancePolicy()
+    )
     exploration_profile = _register_exploration_profile(registry, budget.profile)
     registry.register(
         ExplorationBudgetPolicyPort,

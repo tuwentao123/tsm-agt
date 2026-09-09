@@ -135,7 +135,8 @@ class LocalEventApiTest(unittest.TestCase):
         self.assertEqual(status, 202)
         self.assertEqual(json.loads(raw)["result"]["kind"], "replace")
         status, _, raw = self.request(f"/v1/tasks/{task.task_id}/input", {
-            "text": "另外补上单元测试", "command_id": "api-input-1"
+            "text": "另外补上单元测试", "command_id": "api-input-1",
+            "intent": "steer",
         })
         self.assertEqual(status, 202)
         self.assertEqual(json.loads(raw)["result"]["intent"], "STEER")

@@ -443,6 +443,14 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
             schema["properties"]["evidence_question"]["properties"],
         )
         self.assertIn(
+            "expected_scope",
+            schema["properties"]["evidence_question"]["properties"],
+        )
+        self.assertIn(
+            "expected_scope",
+            schema["properties"]["evidence_question"]["required"],
+        )
+        self.assertIn(
             '"tool_arguments":{...}',
             transport.requests[0]["payload"]["tools"][0]["function"][
                 "description"
@@ -476,6 +484,7 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         assert call.evidence_question is not None
         self.assertTrue(call.evidence_question.question_id.startswith("Q-auto-"))
         self.assertIn("README.md", call.evidence_question.question)
+        self.assertEqual(call.evidence_question.expected_scope, "README.md")
 
     async def test_partial_evidence_envelope_is_marked_recoverable(self) -> None:
         provider, _ = await self._provider([{

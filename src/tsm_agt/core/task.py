@@ -17,6 +17,7 @@ from .workspace import MutationRecord, WorkspaceBaseline
 from .configuration import EffectiveConfigurationSnapshot
 from .onboarding import OnboardingCheckpoint, ProjectOnboardingSnapshot
 from .session import standalone_session_id
+from .workspace_access import WorkspaceAccessGrant
 
 
 class TaskState(StrEnum):
@@ -155,6 +156,7 @@ class TaskSnapshot:
     onboarding_snapshots: tuple[ProjectOnboardingSnapshot, ...] = ()
     active_onboarding_checkpoint: OnboardingCheckpoint | None = None
     session_id: str = ""
+    workspace_access_grants: tuple[WorkspaceAccessGrant, ...] = ()
 
     @classmethod
     def create(
@@ -244,6 +246,13 @@ class TaskSnapshot:
                 else None
             ),
             session_id=str(data.get("session_id") or standalone_session_id(str(data["task_id"]))),
+            workspace_access_grants=tuple(
+                WorkspaceAccessGrant.from_data(item)
+                for item in raw_access_grants
+                if isinstance(item, Mapping)
+            ) if isinstance(
+                (raw_access_grants := data.get("workspace_access_grants")), list
+            ) else (),
         )
 
     def transition(
@@ -276,6 +285,7 @@ class TaskSnapshot:
                 None if target.is_terminal else self.active_onboarding_checkpoint
             ),
             session_id=self.session_id,
+            workspace_access_grants=self.workspace_access_grants,
         )
 
     def await_approval(
@@ -305,6 +315,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            workspace_access_grants=self.workspace_access_grants,
         )
 
     def resolve_approval(self, now: datetime | None = None) -> TaskSnapshot:
@@ -332,6 +343,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            workspace_access_grants=self.workspace_access_grants,
         )
 
     def await_clarification(
@@ -384,6 +396,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            workspace_access_grants=self.workspace_access_grants,
         )
 
     def with_background_process(
@@ -408,6 +421,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            workspace_access_grants=self.workspace_access_grants,
         )
 
     def with_project_trust(
@@ -431,6 +445,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            workspace_access_grants=self.workspace_access_grants,
         )
 
     def with_workspace_baseline(
@@ -455,6 +470,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            workspace_access_grants=self.workspace_access_grants,
         )
 
     def with_mutation(
@@ -480,6 +496,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            workspace_access_grants=self.workspace_access_grants,
         )
 
     def with_effective_configuration(
@@ -510,6 +527,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            workspace_access_grants=self.workspace_access_grants,
         )
 
     def with_agent_checkpoint(
@@ -536,6 +554,25 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            workspace_access_grants=self.workspace_access_grants,
+        )
+
+    def with_workspace_access_grant(
+        self, grant: WorkspaceAccessGrant, now: datetime | None = None,
+    ) -> TaskSnapshot:
+        """Persist a non-duplicated Task-only external read grant."""
+        if grant.scope != "TASK":
+            raise ValueError("only TASK-scoped workspace access is supported")
+        if any(
+            item.capability is grant.capability
+            and item.canonical_root == grant.canonical_root
+            for item in self.workspace_access_grants
+        ):
+            return self
+        return replace(
+            self,
+            workspace_access_grants=self.workspace_access_grants + (grant,),
+            updated_at=now or datetime.now(timezone.utc),
         )
 
     def with_onboarding_checkpoint(
@@ -622,4 +659,7 @@ class TaskSnapshot:
                 self.active_onboarding_checkpoint.to_data()
                 if self.active_onboarding_checkpoint is not None else None
             ),
+            "workspace_access_grants": [
+                grant.to_data() for grant in self.workspace_access_grants
+            ],
         }

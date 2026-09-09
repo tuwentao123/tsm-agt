@@ -326,7 +326,7 @@ class SessionRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 from datetime import datetime, timezone
                 await store.stop(datetime.now(timezone.utc))
 
-    async def test_session_context_change_conflicts_with_active_checkpoint(self) -> None:
+    async def test_session_context_change_is_safe_rebase_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = BlockingModel()
@@ -346,12 +346,19 @@ class SessionRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     MemorySourceKind.USER_CONFIRMED, "user message", None,
                     "checkpoint-memory", "test",
                 )
-                with self.assertRaisesRegex(
-                    AgentCheckpointConflict, "session_context_hash"
-                ):
-                    await app.kernel.resume_checkpointed_agent_turn(task.task_id)
+                candidates = await app.kernel.list_session_resume_candidates(
+                    task.session_id, root
+                )
+                selected = next(
+                    item for item in candidates if item.task_id == task.task_id
+                )
+                self.assertEqual(selected.safety.value, "REBASE_REQUIRED")
                 self.assertEqual(
-                    (await app.kernel.get_task(task.task_id)).state, TaskState.CONFLICT
+                    selected.conflict_reasons, ("session_context_hash",)
+                )
+                self.assertEqual(
+                    (await app.kernel.get_task(task.task_id)).state,
+                    TaskState.EXECUTING,
                 )
             finally:
                 await app.registry.stop_all()

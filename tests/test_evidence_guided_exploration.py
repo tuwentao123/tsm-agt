@@ -157,6 +157,23 @@ class EvidenceGuidedExplorationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(update.rejection_state.rejection_counts, {})
         self.assertEqual(update.relation_state.successful_calls, 1)
 
+    async def test_recoverable_path_error_does_not_stop_or_increment_route(self):
+        state = ExplorationOutcomeState(2, "CHANGE_METHOD")
+        update = await self.coordinator.after_result(
+            self.call("recover-path", "src/missing.py"),
+            ToolResult(
+                "recover-path", False,
+                data={"candidates": [{"resource_ref": "resource-a"}]},
+                error_code="PATH_CONTEXT_REQUIRED",
+                retryable=True, meta={"recoverable_input": True},
+            ),
+            None, type("Delta", (), {"has_progress": False})(),
+            EvidenceRelationState(), RejectionLoopState(), state,
+        )
+        self.assertEqual(update.outcome.action.value, "CONTINUE")
+        self.assertEqual(update.outcome.reason, "recoverable_path_context")
+        self.assertEqual(update.outcome.state, state)
+
     async def test_state_is_framework_neutral(self):
         encoded = str(EvidenceRelationState(("Q1",), ("hash",), 1).to_data())
         for framework in ("android", "ios", "web", "backend"):

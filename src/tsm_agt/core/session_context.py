@@ -16,7 +16,12 @@ from typing import Any
 from tsm_agt.ports import Message, MessageRole, SessionEvent, TextBlock
 
 from .configuration import canonical_hash
+from .execution import ToolExecutionRecord
 from .session import SessionSnapshot
+from .session_resources import (
+    SessionQuestionReference, SessionResourceReference,
+)
+from .runtime_input import SessionResumeCandidate
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,11 +75,202 @@ class SessionWorkingState:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionTaskSummary:
+    """Bounded, authority-free handoff for one completed visible Turn.
+
+    This is the missing bridge between conversation text and the durable Task
+    ledger.  It keeps only inspectable execution facts needed by the next Turn;
+    raw Tool result bodies, approvals, credentials, process ownership and hidden
+    reasoning remain in their authoritative stores.
+    """
+
+    task_id: str
+    turn_id: str
+    goal: str
+    recorded_task_state: str
+    tool_counts: tuple[tuple[str, int], ...] = ()
+    important_actions: tuple[Mapping[str, Any], ...] = ()
+    confirmed: tuple[Mapping[str, Any], ...] = ()
+    completed_work: tuple[str, ...] = ()
+    remaining_work: tuple[str, ...] = ()
+    workspace_roots: tuple[str, ...] = ()
+    mutations: tuple[Mapping[str, Any], ...] = ()
+    verification_status: str | None = None
+
+    def __post_init__(self) -> None:
+        if not all((self.task_id, self.turn_id, self.goal, self.recorded_task_state)):
+            raise ValueError("session Task summary identity fields are required")
+        if (
+            len(self.important_actions) > 20
+            or len(self.confirmed) > 20
+            or len(self.mutations) > 20
+        ):
+            raise ValueError("session Task summary exceeds its bounded limit")
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "turn_id": self.turn_id,
+            "goal": self.goal,
+            "recorded_task_state": self.recorded_task_state,
+            "tool_counts": {name: count for name, count in self.tool_counts},
+            "important_actions": [dict(item) for item in self.important_actions],
+            "confirmed": [dict(item) for item in self.confirmed],
+            "completed_work": list(self.completed_work),
+            "remaining_work": list(self.remaining_work),
+            "workspace_roots": list(self.workspace_roots),
+            "mutations": [dict(item) for item in self.mutations],
+            "verification_status": self.verification_status,
+        }
+
+    def prompt_data(
+        self, execution_events: Sequence[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
+        """Render one non-redundant model view of this Task handoff."""
+        data = self.to_data()
+        if execution_events:
+            # Paired recent execution facts supersede the older coarse action
+            # list. Keep important_actions only as a durable compatibility
+            # fallback for old databases or unavailable Task ledgers.
+            data.pop("important_actions", None)
+            data["execution_events"] = [dict(item) for item in execution_events]
+        return data
+
+    @classmethod
+    def from_data(cls, data: Mapping[str, Any]) -> SessionTaskSummary:
+        raw_counts = data.get("tool_counts", {})
+        raw_actions = data.get("important_actions", [])
+        raw_confirmed = data.get("confirmed", [])
+        raw_completed = data.get("completed_work", [])
+        raw_remaining = data.get("remaining_work", [])
+        raw_roots = data.get("workspace_roots", [])
+        raw_mutations = data.get("mutations", [])
+        if not isinstance(raw_counts, Mapping):
+            raise ValueError("session Task summary tool counts must be an object")
+        if not all(isinstance(item, list) for item in (
+            raw_actions, raw_confirmed, raw_completed, raw_remaining, raw_roots,
+            raw_mutations,
+        )):
+            raise ValueError("session Task summary collections must be lists")
+        return cls(
+            task_id=str(data["task_id"]), turn_id=str(data["turn_id"]),
+            goal=str(data["goal"]),
+            recorded_task_state=str(data["recorded_task_state"]),
+            tool_counts=tuple(sorted(
+                (str(name), max(0, int(count)))
+                for name, count in raw_counts.items()
+            )),
+            important_actions=tuple(
+                dict(item) for item in raw_actions if isinstance(item, Mapping)
+            )[:20],
+            confirmed=tuple(
+                dict(item) for item in raw_confirmed if isinstance(item, Mapping)
+            )[:20],
+            completed_work=tuple(
+                str(item) for item in raw_completed if str(item)
+            ),
+            remaining_work=tuple(str(item) for item in raw_remaining if str(item)),
+            workspace_roots=tuple(str(item) for item in raw_roots if str(item)),
+            mutations=tuple(
+                dict(item) for item in raw_mutations if isinstance(item, Mapping)
+            )[:20],
+            verification_status=(
+                str(data["verification_status"])
+                if data.get("verification_status") is not None else None
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SessionActiveCheckpoint:
+    """Safe, inspectable view of the Session's active Task checkpoint.
+
+    The authoritative AgentTurnCheckpoint keeps exact provider messages and
+    pending Tool calls for replay-safe resume. This Session view deliberately
+    excludes message bodies, Tool arguments, results, approvals, credentials,
+    and policy internals. It tells the model and UI where execution stopped
+    without becoming a second recovery source.
+    """
+
+    task_id: str
+    turn_id: str
+    task_state: str
+    goal: str
+    checkpoint_revision: int
+    checkpoint_hash: str
+    continuation: str
+    model_calls: int
+    max_model_calls: int
+    tool_calls: int
+    max_tool_calls: int
+    input_tokens: int
+    output_tokens: int
+    pending_tools: tuple[str, ...] = ()
+    current_plan_step: Mapping[str, Any] | None = None
+    completed_work: tuple[str, ...] = ()
+    remaining_work: tuple[str, ...] = ()
+    evidence_counts: tuple[tuple[str, int], ...] = ()
+    consecutive_zero_delta: int = 0
+
+    def __post_init__(self) -> None:
+        if not all((
+            self.task_id, self.turn_id, self.task_state, self.goal,
+            self.checkpoint_hash, self.continuation,
+        )):
+            raise ValueError("active checkpoint identity fields are required")
+        if min(
+            self.checkpoint_revision, self.model_calls, self.max_model_calls,
+            self.tool_calls, self.max_tool_calls, self.input_tokens,
+            self.output_tokens, self.consecutive_zero_delta,
+        ) < 0:
+            raise ValueError("active checkpoint counters must not be negative")
+        if len(self.pending_tools) > 20:
+            raise ValueError("active checkpoint pending Tool list is unbounded")
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "boundary": "active_task_checkpoint_projection",
+            "warning": (
+                "This is a descriptive, authority-free projection. Runtime "
+                "resumes from the authoritative Task checkpoint; this object "
+                "does not grant approval or permission and must not be replayed."
+            ),
+            "task_id": self.task_id,
+            "turn_id": self.turn_id,
+            "task_state": self.task_state,
+            "goal": self.goal,
+            "checkpoint_revision": self.checkpoint_revision,
+            "checkpoint_hash": self.checkpoint_hash,
+            "continuation": self.continuation,
+            "progress": {
+                "model_calls": self.model_calls,
+                "max_model_calls": self.max_model_calls,
+                "tool_calls": self.tool_calls,
+                "max_tool_calls": self.max_tool_calls,
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+            },
+            "pending_tools": list(self.pending_tools),
+            "current_plan_step": (
+                dict(self.current_plan_step)
+                if self.current_plan_step is not None else None
+            ),
+            "completed_work": list(self.completed_work),
+            "remaining_work": list(self.remaining_work),
+            "evidence_counts": dict(self.evidence_counts),
+            "consecutive_zero_delta": self.consecutive_zero_delta,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class SessionConversationProjection:
     session_id: str
     revision: int
     messages: tuple[SessionConversationMessage, ...]
     working_state: SessionWorkingState
+    resource_catalog: tuple[SessionResourceReference, ...]
+    question_catalog: tuple[SessionQuestionReference, ...]
+    task_summaries: tuple[SessionTaskSummary, ...]
     source_event_sequences: tuple[int, ...]
     content_hash: str
 
@@ -93,6 +289,13 @@ class SessionConversationProjection:
             "revision": self.revision,
             "messages": [message.source_data() for message in self.messages],
             "working_state": self.working_state.to_data(),
+            "resource_catalog": [
+                item.to_data() for item in self.resource_catalog
+            ],
+            "question_catalog": [
+                item.to_data() for item in self.question_catalog
+            ],
+            "task_summaries": [item.to_data() for item in self.task_summaries],
             "source_event_sequences": list(self.source_event_sequences),
         }
 
@@ -117,13 +320,23 @@ class SessionPromptProjection:
 @dataclass(frozen=True, slots=True)
 class SessionContextProjector:
     recent_message_limit: int = 12
+    recent_task_summary_limit: int = 5
+    earlier_task_summary_limit: int = 20
+    recent_execution_limit: int = 12
+    recent_execution_per_task_limit: int = 6
+    execution_result_item_limit: int = 10
+    small_read_content_characters: int = 2000
     max_recent_characters: int = 8000
     max_summary_characters: int = 4000
     summary_item_characters: int = 500
 
     def __post_init__(self) -> None:
         if min(
-            self.recent_message_limit, self.max_recent_characters,
+            self.recent_message_limit, self.recent_task_summary_limit,
+            self.earlier_task_summary_limit,
+            self.recent_execution_limit, self.recent_execution_per_task_limit,
+            self.execution_result_item_limit, self.small_read_content_characters,
+            self.max_recent_characters,
             self.max_summary_characters, self.summary_item_characters,
         ) < 1:
             raise ValueError("Session context projection limits must be positive")
@@ -135,6 +348,9 @@ class SessionContextProjector:
         seen_message_ids: set[str] = set()
         sources: set[int] = set()
         explicit_state: dict[str, Any] = {}
+        resources: dict[str, SessionResourceReference] = {}
+        questions: dict[str, SessionQuestionReference] = {}
+        task_summaries: dict[str, SessionTaskSummary] = {}
 
         for event in sorted(events, key=lambda item: item.sequence):
             if event.session_id != snapshot.session_id:
@@ -153,9 +369,45 @@ class SessionContextProjector:
                     messages.append(projected)
                     sources.add(event.sequence)
                 self._apply_working_state(explicit_state, event.payload)
+                self._apply_catalogs(resources, questions, event.payload)
+                raw_summary = event.payload.get("task_summary")
+                if isinstance(raw_summary, Mapping):
+                    summary = SessionTaskSummary.from_data(raw_summary)
+                else:
+                    # Older runtime.db files predate task_summary. Rebuild the
+                    # smallest useful handoff from fields those events already
+                    # persisted so upgrading the CLI does not erase continuity.
+                    summary = self._legacy_task_summary(
+                        event.payload, task_id, turn_id, messages, resources
+                    )
+                if summary is not None:
+                    task_summaries.pop(summary.task_id, None)
+                    task_summaries[summary.task_id] = summary
             elif event.event_type == "session.context_state_updated":
                 self._apply_explicit_state(explicit_state, event.payload)
                 sources.add(event.sequence)
+            elif event.event_type == "session.task_state_updated":
+                task_id = str(event.payload.get("task_id") or "")
+                state = str(event.payload.get("task_state") or "")
+                prior = task_summaries.get(task_id)
+                if prior is not None and state:
+                    task_summaries[task_id] = SessionTaskSummary(
+                        task_id=prior.task_id, turn_id=prior.turn_id,
+                        goal=prior.goal, recorded_task_state=state,
+                        tool_counts=prior.tool_counts,
+                        important_actions=prior.important_actions,
+                        confirmed=prior.confirmed,
+                        completed_work=prior.completed_work,
+                        remaining_work=prior.remaining_work,
+                        workspace_roots=prior.workspace_roots,
+                        mutations=prior.mutations,
+                        verification_status=(
+                            str(event.payload["verification_status"])
+                            if event.payload.get("verification_status") is not None
+                            else prior.verification_status
+                        ),
+                    )
+                    sources.add(event.sequence)
 
         latest_goal = next(
             (message.text for message in reversed(messages)
@@ -176,48 +428,84 @@ class SessionContextProjector:
             "revision": snapshot.context_revision,
             "messages": [message.source_data() for message in messages],
             "working_state": state.to_data(),
+            "resource_catalog": [
+                item.to_data() for item in resources.values()
+            ],
+            "question_catalog": [
+                item.to_data() for item in questions.values()
+            ],
+            "task_summaries": [
+                item.to_data() for item in task_summaries.values()
+            ],
             "source_event_sequences": list(source_sequences),
         }
         return SessionConversationProjection(
             snapshot.session_id, snapshot.context_revision, tuple(messages), state,
+            tuple(resources.values()), tuple(questions.values()),
+            tuple(task_summaries.values()),
             source_sequences, canonical_hash(hash_source),
         )
 
     def for_prompt(
-        self, projection: SessionConversationProjection,
+        self, projection: SessionConversationProjection, *,
+        recent_executions: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+        active_checkpoint: SessionActiveCheckpoint | None = None,
+        suspended_tasks: Sequence[SessionResumeCandidate] = (),
     ) -> SessionPromptProjection:
         if not projection.messages and not any((
             projection.working_state.goal, projection.working_state.constraints,
             projection.working_state.decisions, projection.working_state.open_questions,
             projection.working_state.completed_work,
             projection.working_state.remaining_work,
+            projection.resource_catalog, projection.question_catalog,
+            projection.task_summaries,
+            active_checkpoint,
+            suspended_tasks,
         )):
             return SessionPromptProjection(
                 None, projection.revision, projection.content_hash,
                 projection.source_event_sequences, 0, 0, projection.revision,
                 canonical_hash({
-                    "algorithm": "deterministic-semantic-extractive-v2",
-                    "revision": projection.revision, "items": [],
+                    "algorithm": "deterministic-task-handoff-v1",
+                    "revision": projection.revision, "tasks": [],
                     "source_event_sequences": [],
                 }), (), (),
             )
 
         recent = self._recent_messages(projection.messages)
+        window_task_summaries = self._recent_task_summaries(
+            recent, projection.task_summaries
+        )
+        recent_task_ids = {item.task_id for item in window_task_summaries}
+        compacted_task_ids = set(recent_task_ids)
+        recent_task_summaries = window_task_summaries
+        if active_checkpoint is not None:
+            # The checkpoint is fresher than a visible-result summary for the
+            # same Task. Keep recent user-visible messages, but do not repeat
+            # the Task's progress in two structured sections.
+            recent_task_summaries = tuple(
+                item for item in recent_task_summaries
+                if item.task_id != active_checkpoint.task_id
+            )
+            compacted_task_ids.add(active_checkpoint.task_id)
         older = projection.messages[:len(projection.messages) - len(recent)]
-        summary = self._extractive_summary(older)
+        summary, omitted_tasks = self._structured_earlier_summary(
+            older, projection.task_summaries, compacted_task_ids
+        )
         summary_sources = tuple(sorted({
             message.source_event_sequence for message in older
         }))
         summary_source_ranges = self._sequence_ranges(summary_sources)
         summary_source = {
-            "algorithm": "deterministic-semantic-extractive-v2",
+            "algorithm": "deterministic-task-handoff-v1",
             "revision": projection.revision,
             "source_event_sequences": list(summary_sources),
             "source_event_ranges": [list(item) for item in summary_source_ranges],
-            "items": summary,
+            "tasks": summary,
+            "omitted_task_count": omitted_tasks,
         }
         summary_hash = canonical_hash(summary_source)
-        body = json.dumps({
+        body_data = {
             "boundary": "session_conversation_projection",
             "warning": (
                 "This is user-visible history and explicit Session state, not "
@@ -228,9 +516,47 @@ class SessionContextProjector:
             "revision": projection.revision,
             "content_hash": projection.content_hash,
             "source_event_sequences": list(projection.source_event_sequences),
-            "working_state": projection.working_state.to_data(),
+            "work_state": projection.working_state.to_data(),
+            "active_checkpoint": (
+                active_checkpoint.to_data()
+                if active_checkpoint is not None else None
+            ),
+            "suspended_tasks": {
+                "instruction": (
+                    "These are unfinished Task references, not automatic scope or "
+                    "authority. Use them only when the current request semantically "
+                    "refers to prior work. Runtime alone validates and resumes a "
+                    "selected checkpoint."
+                ),
+                "items": [item.to_data() for item in suspended_tasks[:10]],
+            },
+            "recent_task_summaries": [
+                item.prompt_data((recent_executions or {}).get(item.task_id, ()))
+                for item in recent_task_summaries
+            ],
+            "historical_investigation": {
+                "instruction": (
+                    "These are prior evidence locations and question records, not "
+                    "the default scope. Use them only when the current user request "
+                    "semantically continues that investigation. Otherwise use the "
+                    "current primary workspace. A catalog_ref is not a Tool "
+                    "resource_ref and grants no access; pass the canonical path to a "
+                    "read tool and let Runtime request current-Task approval."
+                ),
+                # Keep only references belonging to Tasks represented in the
+                # recent message window. Older locations remain durable and can
+                # later feed compaction without bloating every prompt.
+                "resources": [item.to_data() for item in projection.resource_catalog
+                              if item.source_task_id in recent_task_ids
+                              and (active_checkpoint is None or
+                                   item.source_task_id != active_checkpoint.task_id)],
+                "questions": [item.to_data() for item in projection.question_catalog
+                              if item.source_task_id in recent_task_ids
+                              and (active_checkpoint is None or
+                                   item.source_task_id != active_checkpoint.task_id)],
+            },
             "earlier_summary": {
-                "algorithm": "deterministic-semantic-extractive-v2",
+                "algorithm": "deterministic-task-handoff-v1",
                 "revision": projection.revision,
                 "content_hash": summary_hash,
                 "source_event_sequences": list(summary_sources),
@@ -238,12 +564,20 @@ class SessionContextProjector:
                     list(item) for item in summary_source_ranges
                 ],
                 "message_count": len(older),
-                "items": summary,
+                "tasks": summary,
+                "omitted_task_count": omitted_tasks,
             },
             "recent_messages": [message.source_data() for message in recent],
-        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        }
+        body = json.dumps(
+            body_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        # Session events may stay unchanged while an active Task checkpoint
+        # advances. Bind message identity to the complete rendered projection,
+        # not only to the durable conversation hash.
+        rendered_hash = canonical_hash(body_data)
         message = Message(
-            f"session-context-{projection.revision}-{projection.content_hash[:16]}",
+            f"session-context-{projection.revision}-{rendered_hash[:16]}",
             MessageRole.USER, (TextBlock(body),),
         )
         return SessionPromptProjection(
@@ -285,28 +619,320 @@ class SessionContextProjector:
             characters += size
         return tuple(reversed(selected))
 
-    def _extractive_summary(
-        self, messages: tuple[SessionConversationMessage, ...],
-    ) -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
-        used = 0
-        omitted = 0
-        for message in messages:
-            text = message.text[:self.summary_item_characters]
-            if len(message.text) > len(text):
-                text += "…"
-            if used + len(text) > self.max_summary_characters:
-                omitted += 1
-                continue
-            items.append({
-                "role": message.role.value, "text": text,
-                "task_id": message.task_id, "turn_id": message.turn_id,
-                "source_event_sequence": message.source_event_sequence,
+    def _recent_task_summaries(
+        self, recent_messages: tuple[SessionConversationMessage, ...],
+        task_summaries: tuple[SessionTaskSummary, ...],
+    ) -> tuple[SessionTaskSummary, ...]:
+        """Return summaries for Tasks actually present in recent conversation.
+
+        This is a deterministic join, not an intent classifier or historical
+        candidate search. If the recent window mentions more Tasks than the
+        configured bound, the most recent distinct Tasks win while their
+        chronological order is preserved for the model.
+        """
+        by_task = {item.task_id: item for item in task_summaries}
+        task_ids: list[str] = []
+        for message in recent_messages:
+            if message.task_id in by_task and message.task_id not in task_ids:
+                task_ids.append(message.task_id)
+        selected_ids = task_ids[-self.recent_task_summary_limit:]
+        return tuple(by_task[task_id] for task_id in selected_ids)
+
+    def recent_task_ids(
+        self, projection: SessionConversationProjection, *,
+        exclude_task_ids: Sequence[str] = (),
+    ) -> tuple[str, ...]:
+        """Return the exact Task IDs whose summaries enter the prompt."""
+        excluded = set(exclude_task_ids)
+        return tuple(item.task_id for item in self._recent_task_summaries(
+            self._recent_messages(projection.messages), projection.task_summaries
+        ) if item.task_id not in excluded)
+
+    def project_recent_executions(
+        self,
+        executions_by_task: Mapping[str, Sequence[ToolExecutionRecord]],
+    ) -> dict[str, tuple[dict[str, Any], ...]]:
+        """Build bounded atomic call/result observations for recent Tasks.
+
+        The returned objects are descriptive Session data, never native Provider
+        tool-protocol messages and never capabilities. Raw bodies remain in the
+        Task ledger. Small read-only observations may be copied transiently into
+        the prompt; commands, mutations and third-party Tools expose status only.
+        """
+        candidates: list[tuple[str, ToolExecutionRecord]] = []
+        for task_id, values in executions_by_task.items():
+            ordered = sorted(
+                values, key=lambda item: (item.updated_at, item.execution_id)
+            )[-self.recent_execution_per_task_limit:]
+            candidates.extend((task_id, item) for item in ordered)
+        candidates.sort(key=lambda item: (
+            item[1].updated_at, item[1].execution_id
+        ))
+        selected = candidates[-self.recent_execution_limit:]
+        projected: dict[str, list[dict[str, Any]]] = {}
+        for task_id, execution in selected:
+            projected.setdefault(task_id, []).append(
+                self._execution_event(execution)
+            )
+        return {task_id: tuple(items) for task_id, items in projected.items()}
+
+    def _execution_event(
+        self, execution: ToolExecutionRecord,
+    ) -> dict[str, Any]:
+        call = execution.call
+        safe_tool = call.name in {
+            "core.list_files", "core.find_files",
+            "core.read_file", "core.search_text",
+        }
+        call_data: dict[str, Any] = {
+            "call_id": call.call_id, "tool": call.name,
+        }
+        if safe_tool:
+            arguments: dict[str, Any] = {}
+            for key in (
+                "path", "query", "pattern", "start_line",
+                "max_lines", "recursive", "regex",
+                "case_sensitive", "max_matches", "limit",
+            ):
+                value = call.arguments.get(key)
+                if isinstance(value, (str, int, float, bool)):
+                    arguments[key] = (value[:500] if isinstance(value, str) else value)
+            if arguments:
+                call_data["arguments"] = arguments
+        if call.evidence_question is not None:
+            call_data["evidence_question"] = {
+                "question_id": call.evidence_question.question_id,
+                "question": call.evidence_question.question[:500],
+                "expected_scope": call.evidence_question.expected_scope[:1000],
+            }
+
+        result_data: dict[str, Any] = {
+            "execution_id": execution.execution_id,
+            "state": execution.state.value,
+        }
+        result = execution.result
+        if result is not None:
+            result_data.update({
+                "ok": result.ok, "error_code": result.error_code,
+                "truncated": result.truncated,
             })
-            used += len(text)
-        if omitted:
-            items.append({"omitted_message_count": omitted})
-        return items
+            if safe_tool and isinstance(result.data, Mapping):
+                result_data["observation"] = self._safe_read_observation(
+                    call.name, result.data
+                )
+        return {
+            "boundary": "prior_untrusted_tool_observation",
+            "call": call_data, "result": result_data,
+        }
+
+    def _safe_read_observation(
+        self, tool_name: str, data: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        observation: dict[str, Any] = {}
+        for key in (
+            "requested_path", "path", "resolved_path",
+            "resolved_root", "root_kind", "root_alias", "sha256",
+            "start_line", "end_line", "total_lines",
+            "scanned_files", "skipped_files", "scanned_entries",
+            "skipped_entries", "omitted_sensitive",
+            "generated_directories_skipped",
+        ):
+            value = data.get(key)
+            if isinstance(value, (str, int, float, bool)):
+                observation[key] = (value[:1000] if isinstance(value, str) else value)
+
+        for field in ("entries", "matches", "candidates"):
+            raw_items = data.get(field)
+            if not isinstance(raw_items, (list, tuple)):
+                continue
+            items: list[dict[str, Any]] = []
+            for raw in raw_items[:self.execution_result_item_limit]:
+                if not isinstance(raw, Mapping):
+                    continue
+                item: dict[str, Any] = {}
+                for key in (
+                    "path", "resolved_path", "resolved_root",
+                    "root_kind", "type", "size", "line",
+                ):
+                    value = raw.get(key)
+                    if isinstance(value, (str, int, float, bool)):
+                        item[key] = (
+                            value[:1000] if isinstance(value, str) else value
+                        )
+                text = raw.get("text")
+                if isinstance(text, str) and tool_name == "core.search_text":
+                    item["text"] = text[:200]
+                if item:
+                    items.append(item)
+            observation[field + "_count"] = len(raw_items)
+            observation[field] = items
+
+        content = data.get("content")
+        if isinstance(content, str) and tool_name == "core.read_file":
+            observation["content_characters"] = len(content)
+            if len(content) <= self.small_read_content_characters:
+                observation["content"] = content
+                observation["content_included"] = True
+            else:
+                observation["content_included"] = False
+        return observation
+
+    @classmethod
+    def _legacy_task_summary(
+        cls, payload: Mapping[str, Any], task_id: str, turn_id: str,
+        messages: list[SessionConversationMessage],
+        resources: Mapping[str, SessionResourceReference],
+    ) -> SessionTaskSummary | None:
+        if not task_id or not turn_id:
+            return None
+        raw_state = payload.get("working_state")
+        state = raw_state if isinstance(raw_state, Mapping) else {}
+        goal = cls._optional_text(state.get("goal"))
+        if goal is None:
+            goal = next((
+                message.text for message in reversed(messages)
+                if message.task_id == task_id and message.role is MessageRole.USER
+            ), None)
+        if goal is None:
+            return None
+        roots = tuple(dict.fromkeys(
+            item.resolved_root for item in resources.values()
+            if item.source_task_id == task_id and item.resolved_root
+        ))[:20]
+        return SessionTaskSummary(
+            task_id=task_id, turn_id=turn_id, goal=goal,
+            recorded_task_state=(
+                cls._optional_text(payload.get("task_state")) or "UNKNOWN"
+            ),
+            remaining_work=cls._text_tuple(state.get("remaining_work")),
+            completed_work=cls._text_tuple(state.get("completed_work")),
+            workspace_roots=roots,
+        )
+
+    def _structured_earlier_summary(
+        self, messages: tuple[SessionConversationMessage, ...],
+        task_summaries: tuple[SessionTaskSummary, ...],
+        recent_task_ids: set[str],
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Group older visible history into bounded engineering handoffs.
+
+        A Task that still appears in the recent window is deliberately omitted
+        here because its recent messages and recent_task_summaries already carry
+        the fresher state. This is deterministic compaction, not Task retrieval.
+        """
+        by_task = {item.task_id: item for item in task_summaries}
+        grouped: dict[str, list[SessionConversationMessage]] = {}
+        order: list[str] = []
+        for message in messages:
+            if message.task_id in recent_task_ids:
+                continue
+            if message.task_id not in grouped:
+                grouped[message.task_id] = []
+                order.append(message.task_id)
+            grouped[message.task_id].append(message)
+
+        candidates = order[-self.earlier_task_summary_limit:]
+        omitted = max(0, len(order) - len(candidates))
+        newest_first: list[dict[str, Any]] = []
+        used = 0
+        for index, task_id in enumerate(reversed(candidates)):
+            entry = self._earlier_task_entry(
+                task_id, grouped[task_id], by_task.get(task_id)
+            )
+            size = len(json.dumps(
+                entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ))
+            if newest_first and used + size > self.max_summary_characters:
+                # Entries are visited newest to oldest. Once the budget is
+                # full, stop instead of skipping one large recent Task and
+                # accidentally admitting a smaller but older Task.
+                omitted += len(candidates) - index
+                break
+            # Always keep one bounded Task so the summary cannot become empty
+            # solely because its first serialized entry crosses the soft limit.
+            newest_first.append(entry)
+            used += size
+        return list(reversed(newest_first)), omitted
+
+    def _earlier_task_entry(
+        self, task_id: str, messages: list[SessionConversationMessage],
+        summary: SessionTaskSummary | None,
+    ) -> dict[str, Any]:
+        user_messages = [
+            item for item in messages if item.role is MessageRole.USER
+        ]
+        assistant_messages = [
+            item for item in messages if item.role is MessageRole.ASSISTANT
+        ]
+        goal = (
+            summary.goal if summary is not None
+            else (user_messages[0].text if user_messages else "unknown historical Task")
+        )
+        entry: dict[str, Any] = {
+            "task_id": task_id,
+            "goal": self._bounded_text(goal, self.summary_item_characters),
+            "status": (
+                summary.recorded_task_state if summary is not None else "UNKNOWN"
+            ),
+            "verification_status": (
+                summary.verification_status if summary is not None else None
+            ),
+            "visible_result": (
+                self._bounded_text(
+                    assistant_messages[-1].text, self.summary_item_characters
+                )
+                if assistant_messages else None
+            ),
+            "completed_work": self._bounded_texts(
+                summary.completed_work if summary is not None else (), 10, 500
+            ),
+            "remaining_work": self._bounded_texts(
+                summary.remaining_work if summary is not None else (), 10, 500
+            ),
+            "important_locations": list(
+                (summary.workspace_roots if summary is not None else ())[:10]
+            ),
+            "tool_counts": (
+                {name: count for name, count in summary.tool_counts}
+                if summary is not None else {}
+            ),
+            "confirmed": [self._bounded_mapping(item) for item in (
+                summary.confirmed[:10] if summary is not None else ()
+            )],
+            "mutations": [self._bounded_mapping(item) for item in (
+                summary.mutations[:10] if summary is not None else ()
+            )],
+            "source_turn_ids": list(dict.fromkeys(
+                item.turn_id for item in messages
+            ))[:10],
+            "source_event_sequences": sorted({
+                item.source_event_sequence for item in messages
+            }),
+        }
+        return {
+            key: value for key, value in entry.items()
+            if value not in (None, [], {}, ())
+        }
+
+    @staticmethod
+    def _bounded_text(value: str, limit: int) -> str:
+        return value if len(value) <= limit else value[:limit] + "…"
+
+    @classmethod
+    def _bounded_texts(
+        cls, values: Sequence[str], count: int, characters: int,
+    ) -> list[str]:
+        return [cls._bounded_text(str(item), characters) for item in values[:count]]
+
+    @classmethod
+    def _bounded_mapping(cls, value: Mapping[str, Any]) -> dict[str, Any]:
+        safe: dict[str, Any] = {}
+        for key, item in value.items():
+            if isinstance(item, str):
+                safe[str(key)] = cls._bounded_text(item, 1000)
+            elif isinstance(item, (int, float, bool)) or item is None:
+                safe[str(key)] = item
+        return safe
 
     @staticmethod
     def _visible_message(
@@ -349,6 +975,33 @@ class SessionContextProjector:
         ):
             if key in raw:
                 target[key] = raw[key]
+
+    @staticmethod
+    def _apply_catalogs(
+        resources: dict[str, SessionResourceReference],
+        questions: dict[str, SessionQuestionReference],
+        payload: Mapping[str, Any],
+    ) -> None:
+        raw_resources = payload.get("resource_catalog", [])
+        if isinstance(raw_resources, list):
+            for raw in raw_resources:
+                if not isinstance(raw, Mapping):
+                    continue
+                reference = SessionResourceReference.from_data(raw)
+                resources.pop(reference.catalog_ref, None)
+                resources[reference.catalog_ref] = reference
+        raw_questions = payload.get("question_catalog", [])
+        if isinstance(raw_questions, list):
+            for raw in raw_questions:
+                if not isinstance(raw, Mapping):
+                    continue
+                reference = SessionQuestionReference.from_data(raw)
+                questions.pop(reference.question_ref, None)
+                questions[reference.question_ref] = reference
+        while len(resources) > 200:
+            resources.pop(next(iter(resources)))
+        while len(questions) > 100:
+            questions.pop(next(iter(questions)))
 
     @staticmethod
     def _optional_text(raw: Any) -> str | None:

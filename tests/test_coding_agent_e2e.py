@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -201,6 +202,65 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(final.state, TaskState.SUCCEEDED)
                 self.assertEqual(len(final.mutation_journal), 1)
+
+                # The Session handoff is rebuilt from SQLite, not from the
+                # in-memory Agent loop. It must retain the real changed file,
+                # trusted verification result, and terminal Task state.
+                conversation = await second.kernel.get_session_conversation(
+                    task.session_id
+                )
+                summary = next(
+                    item for item in conversation.task_summaries
+                    if item.task_id == task.task_id
+                )
+                self.assertEqual(summary.recorded_task_state, "SUCCEEDED")
+                self.assertEqual(summary.verification_status, "passed")
+                self.assertEqual(
+                    [item["path"] for item in summary.mutations], ["calc.py"]
+                )
+
+                # Push the completed coding Task outside the recent-message
+                # window. Its engineering handoff must then move into the
+                # structured earlier summary instead of degrading to clipped
+                # chat text.
+                for index in range(6):
+                    follow_up = await second.kernel.create_task(
+                        f"follow-up {index}", root,
+                        task_id=f"task-follow-up-{index}",
+                        session_id=task.session_id,
+                    )
+                    await second.kernel._record_session_task_result(
+                        follow_up.task_id, f"turn-follow-up-{index}",
+                        Message(
+                            f"user-follow-up-{index}", MessageRole.USER,
+                            (TextBlock(f"question {index}"),),
+                        ),
+                        Message(
+                            f"assistant-follow-up-{index}",
+                            MessageRole.ASSISTANT,
+                            (TextBlock(f"answer {index}"),),
+                        ),
+                    )
+                compacted = await second.kernel.get_session_conversation(
+                    task.session_id
+                )
+                prompt = (
+                    second.kernel.dependencies.session_context_projector.for_prompt(
+                        compacted
+                    )
+                )
+                assert prompt.message is not None
+                prompt_body = json.loads(prompt.message.text)
+                historical = next(
+                    item for item in prompt_body["earlier_summary"]["tasks"]
+                    if item["task_id"] == task.task_id
+                )
+                self.assertEqual(historical["status"], "SUCCEEDED")
+                self.assertEqual(historical["verification_status"], "passed")
+                self.assertEqual(
+                    [item["path"] for item in historical["mutations"]],
+                    ["calc.py"],
+                )
 
                 events = await second.registry.require(
                     RuntimeStorePort

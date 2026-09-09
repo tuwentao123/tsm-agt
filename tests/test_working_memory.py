@@ -12,8 +12,12 @@ from tsm_agt.adapters.fixture import EchoModelProvider
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
-    AgentCheckpointConflict, AgentTurnResult, FlowNodeKind, TaskState,
-    WorkingMemorySnapshot, WorkingPlanStepStatus,
+    AgentCheckpointConflict, AgentTurnResult, EffectiveWorkingMemoryProjector,
+    FlowNodeKind, TaskState, WorkingMemorySnapshot, WorkingPlanStepStatus,
+)
+from tsm_agt.core.evidence_question import (
+    EvidenceObservationKind, EvidenceQuestionProjection,
+    EvidenceQuestionRecord, EvidenceQuestionStatus,
 )
 from tsm_agt.cli import _working_memory_show
 from tsm_agt.ports import (
@@ -129,6 +133,66 @@ class WorkingMemoryTest(unittest.IsolatedAsyncioTestCase):
                 source_event_sequences=(8,),
             )
 
+    def test_effective_memory_derives_remaining_work_and_evidence(self) -> None:
+        authored = WorkingMemorySnapshot.from_update(
+            task_id="task-1", revision=2, state=working_state(),
+            source_event_sequences=(8,),
+        )
+        open_record = EvidenceQuestionRecord(
+            "Q-open", "Which file defines the route?",
+            EvidenceQuestionStatus.OPEN, "task-1", "turn-1",
+            ("call-open",), (), None, None, 1, 9, "src",
+        )
+        resolved_record = EvidenceQuestionRecord(
+            "Q-done", "What value is configured?",
+            EvidenceQuestionStatus.RESOLVED, "task-1", "turn-1",
+            ("call-done",), ("tool_call:call-done",),
+            EvidenceObservationKind.ARTIFACT_READ, None, 2, 12, "config.py",
+        )
+        effective = EffectiveWorkingMemoryProjector().project(
+            authored, EvidenceQuestionProjection(
+                "task-1", (open_record, resolved_record)
+            ),
+        )
+        self.assertTrue(
+            effective.remaining_work[0].startswith(
+                "Resolve evidence question: Which file defines the route?"
+            )
+        )
+        self.assertIn("Run the full test suite", effective.remaining_work)
+        self.assertEqual(
+            effective.runtime_evidence[0].reference, "tool_call:call-done"
+        )
+        self.assertEqual(effective.runtime_source_event_sequences, (9, 12))
+        self.assertEqual(
+            effective.to_data()["runtime_derived"]["projection_hash"],
+            effective.projection_hash,
+        )
+
+    def test_resolved_question_removes_runtime_remaining_without_rewriting_authored(self) -> None:
+        authored = WorkingMemorySnapshot.initial("task-1", "Investigate")
+        opened = EvidenceQuestionRecord(
+            "Q1", "Find the definition", EvidenceQuestionStatus.OPEN,
+            "task-1", "turn-1", ("call-1",), (), None, None, 1, 3, "src",
+        )
+        projector = EffectiveWorkingMemoryProjector()
+        before = projector.project(
+            authored, EvidenceQuestionProjection("task-1", (opened,))
+        )
+        resolved = EvidenceQuestionRecord(
+            "Q1", "Find the definition", EvidenceQuestionStatus.RESOLVED,
+            "task-1", "turn-1", ("call-1",),
+            ("tool_call:call-1",), EvidenceObservationKind.ARTIFACT_READ,
+            None, 2, 5, "src",
+        )
+        after = projector.project(
+            authored, EvidenceQuestionProjection("task-1", (resolved,))
+        )
+        self.assertEqual(len(before.runtime_remaining_work), 1)
+        self.assertEqual(after.runtime_remaining_work, ())
+        self.assertEqual(len(after.runtime_evidence), 1)
+        self.assertEqual(authored.revision, 1)
+
     async def test_agent_updates_scratchpad_without_approval_and_carries_state_to_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -192,7 +256,19 @@ class WorkingMemoryTest(unittest.IsolatedAsyncioTestCase):
                 context = await application.kernel._session_context_message(second.task_id)
                 assert context is not None
                 body = json.loads(context.text)
-                self.assertEqual(body["working_state"]["goal"], "Ship the feature")
+                self.assertEqual(body["work_state"]["goal"], "Ship the feature")
+                self.assertEqual(
+                    [item["task_id"] for item in body["recent_task_summaries"]],
+                    [task.task_id],
+                )
+                execution_message = await application.kernel._working_memory_context_message(
+                    task.task_id
+                )
+                assert execution_message is not None
+                execution = json.loads(execution_message.text)
+                self.assertNotIn("goal", execution)
+                self.assertNotIn("remaining_work", execution)
+                self.assertIn("plan", execution)
             finally:
                 await application.registry.stop_all()
 
@@ -245,6 +321,54 @@ class WorkingMemoryTest(unittest.IsolatedAsyncioTestCase):
             rendered = json.loads(output.getvalue())
             self.assertEqual(rendered["content_hash"], updated.content_hash)
             self.assertEqual(rendered["remaining_work"], ["Run the full test suite"])
+
+    async def test_runtime_derived_memory_rebuilds_identically_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".agent").mkdir()
+            database = root / ".agent" / "runtime.db"
+            first = compose_fixture_application(
+                model_adapter=WorkingMemoryModel(),
+                store_adapter=SQLiteRuntimeStore(database), tool_adapters=(),
+            )
+            await first.registry.start_all()
+            try:
+                task = await self._executing(first, root, "task-derived-restart")
+                bound = EvidenceQuestionRecord(
+                    "Q1", "Locate the configuration",
+                    EvidenceQuestionStatus.OPEN, task.task_id, "turn-1",
+                    ("call-1",), (), None, None, 1, 0, "config",
+                )
+                await first.kernel._append_events(task.task_id, ((
+                    "evidence.question_bound", {
+                        "turn_id": "turn-1", "tool_call_id": "call-1",
+                        "tool_name": "core.find_files",
+                        "question_ref": bound.question_ref,
+                        "question_id": bound.question_id,
+                        "question": bound.question,
+                        "expected_scope": bound.expected_scope,
+                        "scope_expansion_reason": "",
+                    },
+                ),))
+                before = await first.kernel.get_effective_working_memory(
+                    task.task_id
+                )
+            finally:
+                await first.registry.stop_all()
+
+            second = compose_fixture_application(
+                model_adapter=WorkingMemoryModel(),
+                store_adapter=SQLiteRuntimeStore(database), tool_adapters=(),
+            )
+            await second.registry.start_all()
+            try:
+                after = await second.kernel.get_effective_working_memory(
+                    "task-derived-restart"
+                )
+                self.assertEqual(after.to_data(), before.to_data())
+                self.assertEqual(len(after.runtime_remaining_work), 1)
+            finally:
+                await second.registry.stop_all()
 
     async def test_fake_evidence_and_stale_revision_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

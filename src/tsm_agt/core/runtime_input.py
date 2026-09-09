@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
@@ -10,60 +9,97 @@ from typing import Any
 from .configuration import canonical_hash
 
 
-_RETRY_ACTION = re.compile(
-    r"(?:继续|接着(?:做|来)?|恢复|重试|再试|重新试|重新跑|再跑|"
-    r"重新执行|再执行|再来|retry|continue)",
-    re.IGNORECASE,
-)
-_PREVIOUS_OR_INTERRUPTED = re.compile(
-    r"(?:刚才|上次|之前|原来|断了|中断|停了|失败|没完成|没跑完)",
-    re.IGNORECASE,
-)
-_NEW_TARGET_WITHOUT_BOUNDARY = re.compile(
-    r"^(?:继续|接着|恢复|重试|再试|重新试|重新跑|再跑|重新执行|再执行)"
-    r"(?:修改|分析|检查|实现|处理|查询|搜索|查看|写|删除|创建|修复).+",
-    re.IGNORECASE,
-)
-_RETRY_STEERING_SPLIT = re.compile(r"[，,；;：:]\s*", re.IGNORECASE)
+class SessionContinuationMode(StrEnum):
+    """Safe execution result after a Session Task was explicitly selected."""
+
+    RECOVER_TASK = "RECOVER_TASK"
+    CREATE_FOLLOW_UP = "CREATE_FOLLOW_UP"
+    AWAIT_USER_ACTION = "AWAIT_USER_ACTION"
+    BLOCKED = "BLOCKED"
+    MULTIPLE_CANDIDATES = "MULTIPLE_CANDIDATES"
+    EMPTY = "EMPTY"
+
+
+class SessionResumeSafety(StrEnum):
+    """How Runtime may use one durable Task checkpoint."""
+
+    EXACT_RESUME = "EXACT_RESUME"
+    REBASE_REQUIRED = "REBASE_REQUIRED"
+    AWAIT_USER_ACTION = "AWAIT_USER_ACTION"
+    REQUIRES_VALIDATION = "REQUIRES_VALIDATION"
+    BLOCKED = "BLOCKED"
 
 
 @dataclass(frozen=True, slots=True)
-class RetryInterruptedInput:
-    steering_text: str | None = None
+class SessionResumeCandidate:
+    """Authority-free index entry for one unfinished Session Task.
+
+    Runtime derives this view from the authoritative Task snapshot. It is safe
+    to show to the model or CLI because it contains no Tool arguments/results,
+    approvals, credentials, process handles, or permission grants.
+    """
+
+    task_id: str
+    goal: str
+    task_state: str
+    workspace: str
+    safety: SessionResumeSafety
+    reason_code: str
+    checkpoint_revision: int | None = None
+    conflict_reasons: tuple[str, ...] = ()
+    rebase_reasons: tuple[str, ...] = ()
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "goal": self.goal,
+            "task_state": self.task_state,
+            "workspace": self.workspace,
+            "safety": self.safety.value,
+            "reason_code": self.reason_code,
+            "checkpoint_revision": self.checkpoint_revision,
+            "conflict_reasons": list(self.conflict_reasons),
+            "rebase_reasons": list(self.rebase_reasons),
+        }
 
 
-def parse_retry_last_interrupted_input(
-    text: str,
-) -> RetryInterruptedInput | None:
-    """Parse resume intent and an optional requirement after punctuation."""
-    normalized = text.strip()
-    if not normalized:
-        return None
-    parts = _RETRY_STEERING_SPLIT.split(normalized, maxsplit=1)
-    resume_clause = re.sub(
-        r"[\s。.!！?？~～]+$", "", parts[0].strip()
-    )
-    if _NEW_TARGET_WITHOUT_BOUNDARY.search(resume_clause):
-        return None
-    has_action = _RETRY_ACTION.search(normalized) is not None
-    interrupted_reference = _PREVIOUS_OR_INTERRUPTED.search(resume_clause) is not None
-    compact = re.sub(r"\s+", "", resume_clause).lower()
-    content_free = len(compact) <= 24
-    if not has_action or not (content_free or interrupted_reference):
-        return None
-    first_has_action = _RETRY_ACTION.search(resume_clause) is not None
-    steering = (
-        parts[1].strip()
-        if first_has_action and len(parts) == 2 and parts[1].strip() else None
-    )
-    return RetryInterruptedInput(steering)
+@dataclass(frozen=True, slots=True)
+class SessionContinuationDecision:
+    mode: SessionContinuationMode
+    task_id: str | None
+    task_state: str | None
+    reason_code: str
+    resume_safety: SessionResumeSafety | None = None
+    candidates: tuple[SessionResumeCandidate, ...] = ()
 
 
-def is_retry_last_interrupted_input(text: str) -> bool:
-    return parse_retry_last_interrupted_input(text) is not None
+class SessionInputAction(StrEnum):
+    """Semantic action proposed for one ordinary Session input."""
+
+    NEW_TASK = "NEW_TASK"
+    RESUME_TASK = "RESUME_TASK"
+    CLARIFY = "CLARIFY"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionInputDecision:
+    action: SessionInputAction
+    task_id: str | None
+    confidence: float
+    reason_code: str
+    clarification: str | None = None
+    resolver_version: str = "runtime-default-v1"
+    candidates: tuple[SessionResumeCandidate, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.confidence <= 1:
+            raise ValueError("Session input confidence must be between 0 and 1")
+        if self.action is SessionInputAction.RESUME_TASK and not self.task_id:
+            raise ValueError("RESUME_TASK requires task_id")
 
 
 class FollowUpMode(StrEnum):
+    AUTO = "AUTO"
     STEER = "STEER"
     QUEUE = "QUEUE"
 
@@ -89,12 +125,14 @@ class RuntimeInputIntent(StrEnum):
 @dataclass(frozen=True, slots=True)
 class RuntimeInputContext:
     task_state: str
+    current_goal: str = ""
     awaiting_clarification: bool = False
     awaiting_approval: bool = False
 
     def to_classifier_data(self) -> dict[str, Any]:
         return {
             "task_state": self.task_state,
+            "current_goal": self.current_goal,
             "awaiting_clarification": self.awaiting_clarification,
             "awaiting_approval": self.awaiting_approval,
         }
@@ -133,27 +171,11 @@ class RuntimeInputRoute:
 
 
 class RuntimeInputRouter:
-    """Rules handle obvious cases; uncertain language is never auto-applied."""
+    """Apply only explicit UI choices and protocol-state safety gates.
 
-    _STATUS = re.compile(
-        r"(?:现在|目前)?.*(?:做到哪|进度|状态|卡住|修改了哪些|改了哪些|"
-        r"正在做什么|what.*status|progress)", re.IGNORECASE,
-    )
-    _REPLACE = re.compile(
-        r"(?:别|不要|不用|停止|取消)(?:再|继续)?(?:修|做|改|处理|执行)?.{0,12}"
-        r"(?:了|，|,|。|\s).*(?:改成|现在|只|转为)|"
-        r"(?:前面|之前|原来).{0,10}(?:取消|作废|不要).{0,16}(?:现在|改成)|"
-        r"^(?:改成|目标改为|新目标是|replace)", re.IGNORECASE,
-    )
-    _AFTER = re.compile(
-        r"(?:完成|做完|结束)(?:这个|当前|后|之后).{0,12}(?:再|然后|另外)|"
-        r"(?:下一个任务|另开(?:一个)?任务)", re.IGNORECASE,
-    )
-    _STEER = re.compile(
-        r"^(?:另外|还有|补充|顺便|记得|同时|要求|注意|不要|请确保|输出|"
-        r"并且|还要|也要)|(?:兼容|单元测试|不要修改|尽量简洁|约束)$",
-        re.IGNORECASE,
-    )
+    Ordinary language is deliberately not interpreted here.  A replaceable
+    RuntimeInputClassifierPort owns semantic understanding.
+    """
 
     def route(
         self, text: str, context: RuntimeInputContext,
@@ -184,23 +206,6 @@ class RuntimeInputRouter:
             return RuntimeInputRoute(
                 RuntimeInputIntent.CLARIFICATION_ANSWER, 0.98,
                 "pending_clarification", False,
-            )
-        if self._STATUS.search(normalized):
-            return RuntimeInputRoute(
-                RuntimeInputIntent.STATUS_QUERY, 0.96, "status_phrase", False,
-            )
-        if self._AFTER.search(normalized):
-            return RuntimeInputRoute(
-                RuntimeInputIntent.NEW_TASK_AFTER_CURRENT, 0.9,
-                "after_current_phrase", False,
-            )
-        if self._REPLACE.search(normalized):
-            return RuntimeInputRoute(
-                RuntimeInputIntent.REPLACE, 0.91, "replacement_phrase", False,
-            )
-        if self._STEER.search(normalized):
-            return RuntimeInputRoute(
-                RuntimeInputIntent.STEER, 0.88, "additive_phrase", False,
             )
         if fallback_intent is not None:
             if fallback_intent is not RuntimeInputIntent.STEER:

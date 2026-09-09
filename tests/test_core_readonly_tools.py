@@ -62,6 +62,12 @@ class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret.pem", paths)
         self.assertGreaterEqual(result.data["omitted_sensitive"], 2)
         self.assertTrue(result.meta["untrusted_data"])
+        self.assertEqual(result.data["requested_path"], ".")
+        canonical_workspace = self.workspace.resolve()
+        self.assertEqual(result.data["resolved_path"], str(canonical_workspace))
+        self.assertEqual(result.data["resolved_root"], str(canonical_workspace))
+        self.assertEqual(result.data["root_alias"], canonical_workspace.name)
+        self.assertEqual(result.data["root_kind"], "PRIMARY_WORKSPACE")
 
     async def test_reads_bounded_line_range(self) -> None:
         result = await self.provider.invoke(
@@ -167,6 +173,101 @@ class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(result.ok)
         self.assertEqual(result.error_code, "INVALID_PARAM")
+
+    async def test_external_read_root_supports_all_read_tools_but_hides_secrets(self) -> None:
+        external = self.workspace.parent / f"external-{self.workspace.name}"
+        external.mkdir()
+        try:
+            (external / "service.py").write_text(
+                "class ExternalService:\n    pass\n", encoding="utf-8"
+            )
+            (external / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+            context = ToolInvocationContext(
+                invocation_id="inv-external", task_id="task-1",
+                turn_id="turn-1", workspace=self.workspace,
+                deadline=datetime.now(timezone.utc) + timedelta(seconds=30),
+                workspace_path=self.path_service,
+                additional_read_roots=(external,),
+            )
+            read = await self.provider.invoke(ToolCall(
+                "read-external", "core.read_file",
+                {"path": str(external / "service.py")},
+            ), context)
+            listed = await self.provider.invoke(ToolCall(
+                "list-external", "core.list_files",
+                {"path": str(external), "recursive": True},
+            ), context)
+            found = await self.provider.invoke(ToolCall(
+                "find-external", "core.find_files",
+                {"path": str(external), "pattern": "service.py"},
+            ), context)
+            searched = await self.provider.invoke(ToolCall(
+                "search-external", "core.search_text",
+                {"path": str(external), "query": "ExternalService"},
+            ), context)
+            secret = await self.provider.invoke(ToolCall(
+                "secret-external", "core.read_file",
+                {"path": str(external / ".env")},
+            ), context)
+            self.assertTrue(read.ok)
+            self.assertEqual(read.data["path"], "service.py")
+            self.assertEqual([item["path"] for item in listed.data["entries"]], ["service.py"])
+            self.assertEqual(found.data["matches"][0]["path"], "service.py")
+            self.assertEqual(searched.data["matches"][0]["path"], "service.py")
+            canonical_external = external.resolve()
+            for result, requested in (
+                (read, str(external / "service.py")),
+                (listed, str(external)),
+                (found, str(external)),
+                (searched, str(external)),
+            ):
+                with self.subTest(call_id=result.call_id):
+                    self.assertEqual(result.data["requested_path"], requested)
+                    self.assertEqual(
+                        result.data["resolved_root"], str(canonical_external)
+                    )
+                    self.assertEqual(
+                        result.data["root_alias"], canonical_external.name
+                    )
+                    self.assertEqual(
+                        result.data["root_kind"], "TASK_APPROVED_READ_ROOT"
+                    )
+                    self.assertTrue(
+                        result.data["resolved_path"].startswith(
+                            str(canonical_external)
+                        )
+                    )
+            self.assertFalse(secret.ok)
+            self.assertEqual(secret.error_code, "PERMISSION_DENIED")
+        finally:
+            for child in external.iterdir():
+                child.unlink()
+            external.rmdir()
+
+    async def test_external_root_symlink_cannot_escape_approved_directory(self) -> None:
+        external = self.workspace.parent / f"external-link-{self.workspace.name}"
+        unapproved = self.workspace.parent / f"unapproved-{self.workspace.name}.txt"
+        external.mkdir()
+        unapproved.write_text("not approved\n", encoding="utf-8")
+        link = external / "escape.txt"
+        try:
+            os.symlink(unapproved, link)
+            context = ToolInvocationContext(
+                invocation_id="inv-link", task_id="task-1", turn_id="turn-1",
+                workspace=self.workspace,
+                deadline=datetime.now(timezone.utc) + timedelta(seconds=30),
+                workspace_path=self.path_service,
+                additional_read_roots=(external,),
+            )
+            result = await self.provider.invoke(ToolCall(
+                "read-link", "core.read_file", {"path": str(link)}
+            ), context)
+            self.assertFalse(result.ok)
+            self.assertEqual(result.error_code, "PERMISSION_DENIED")
+        finally:
+            link.unlink(missing_ok=True)
+            unapproved.unlink(missing_ok=True)
+            external.rmdir()
 
     async def test_recursive_list_omits_symlinked_directory_outside_workspace(self) -> None:
         outside = Path(self.temp_dir.name).parent / (

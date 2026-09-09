@@ -609,8 +609,11 @@ class OpenAICompatibleModelProvider:
                             "question_id": {"type": "string"},
                             "question": {"type": "string"},
                             "scope_expansion_reason": {"type": "string"},
+                            "expected_scope": {"type": "string"},
                         },
-                        "required": ["question_id", "question"],
+                        "required": [
+                            "question_id", "question", "expected_scope"
+                        ],
                         "additionalProperties": False,
                     },
                     "tool_arguments": parameters,
@@ -624,9 +627,12 @@ class OpenAICompatibleModelProvider:
                 "result should clarify. Put the tool's normal parameters in "
                 "tool_arguments. The function arguments must be exactly "
                 "{\"evidence_question\":{\"question_id\":\"Q1\","
-                "\"question\":\"What unknown will this resolve?\"},"
+                "\"question\":\"What unknown will this resolve?\","
+                "\"expected_scope\":\"the path this question is about\"},"
                 "\"tool_arguments\":{...}}. If deliberately expanding a previously narrowed "
-                "search scope, add scope_expansion_reason; otherwise omit it."
+                "search scope, add scope_expansion_reason; otherwise omit it. "
+                "For tools without a filesystem scope, expected_scope is an "
+                "empty string."
             )
         function = {
             "name": provider_name,
@@ -941,4 +947,11 @@ class OpenAICompatibleModelProvider:
         return EvidenceQuestion(
             question_id,
             f"What evidence does {tool_name} return for {target}?",
+            expected_scope=(
+                str(arguments.get("path", "")).strip()
+                if tool_name in {
+                    "core.read_file", "core.list_files",
+                    "core.find_files", "core.search_text",
+                } else ""
+            ),
         )

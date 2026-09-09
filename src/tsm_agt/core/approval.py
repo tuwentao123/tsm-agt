@@ -17,6 +17,11 @@ class ApprovalDecision(StrEnum):
     DENY = "deny"
 
 
+class ApprovalKind(StrEnum):
+    TOOL_ACTION = "tool_action"
+    WORKSPACE_READ = "workspace_read"
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovalRequest:
     request_id: str
@@ -35,6 +40,8 @@ class ApprovalRequest:
     rollback: str
     created_at: datetime
     agent_checkpoint: Mapping[str, Any] | None = None
+    kind: ApprovalKind = ApprovalKind.TOOL_ACTION
+    workspace_access_root: str = ""
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> ApprovalRequest:
@@ -70,6 +77,8 @@ class ApprovalRequest:
                 if isinstance(data.get("agent_checkpoint"), Mapping)
                 else None
             ),
+            kind=ApprovalKind(str(data.get("kind", ApprovalKind.TOOL_ACTION.value))),
+            workspace_access_root=str(data.get("workspace_access_root", "")),
         )
 
     def matches(self, request_id: str, payload_hash: str) -> bool:
@@ -97,6 +106,8 @@ class ApprovalRequest:
             "agent_checkpoint": (
                 dict(self.agent_checkpoint) if self.agent_checkpoint is not None else None
             ),
+            "kind": self.kind.value,
+            "workspace_access_root": self.workspace_access_root,
         }
 
 

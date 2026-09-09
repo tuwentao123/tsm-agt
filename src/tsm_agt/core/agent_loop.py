@@ -189,6 +189,7 @@ class AgentTurnCheckpoint:
     goal_revision: int = 1
     action_progress: Mapping[str, Any] = field(default_factory=dict)
     evidence_inventory: Mapping[str, Any] = field(default_factory=dict)
+    evidence_question_state: Mapping[str, Any] = field(default_factory=dict)
     read_hits_state: Mapping[str, Any] = field(default_factory=dict)
     artifact_read_state: Mapping[str, Any] = field(default_factory=dict)
     progressive_scope_state: Mapping[str, Any] = field(default_factory=dict)
@@ -197,6 +198,7 @@ class AgentTurnCheckpoint:
     evidence_relation_state: Mapping[str, Any] = field(default_factory=dict)
     rejection_loop_state: Mapping[str, Any] = field(default_factory=dict)
     exploration_outcome_state: Mapping[str, Any] = field(default_factory=dict)
+    completion_readiness_state: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> AgentTurnCheckpoint:
@@ -241,6 +243,10 @@ class AgentTurnCheckpoint:
                 dict(data["evidence_inventory"])
                 if isinstance(data.get("evidence_inventory"), Mapping) else {}
             ),
+            evidence_question_state=(
+                dict(data["evidence_question_state"])
+                if isinstance(data.get("evidence_question_state"), Mapping) else {}
+            ),
             read_hits_state=(
                 dict(data["read_hits_state"])
                 if isinstance(data.get("read_hits_state"), Mapping) else {}
@@ -273,18 +279,28 @@ class AgentTurnCheckpoint:
                 dict(data["exploration_outcome_state"])
                 if isinstance(data.get("exploration_outcome_state"), Mapping) else {}
             ),
+            completion_readiness_state=(
+                dict(data["completion_readiness_state"])
+                if isinstance(data.get("completion_readiness_state"), Mapping) else {}
+            ),
         )
         stored_hash = data.get("checkpoint_hash")
         if stored_hash is not None and str(stored_hash) != checkpoint.checkpoint_hash:
             legacy_content = checkpoint._content_data()
-            legacy_fields = (
+            evolved_fields = (
                 "evidence_relation_state", "rejection_loop_state",
-                "exploration_outcome_state",
+                "exploration_outcome_state", "evidence_question_state",
+                "completion_readiness_state",
             )
-            is_legacy = all(field not in data for field in legacy_fields)
-            for field in legacy_fields:
+            missing_fields = tuple(
+                field for field in evolved_fields if field not in data
+            )
+            for field in missing_fields:
                 legacy_content.pop(field, None)
-            if not is_legacy or str(stored_hash) != canonical_hash(legacy_content):
+            if (
+                not missing_fields
+                or str(stored_hash) != canonical_hash(legacy_content)
+            ):
                 raise ValueError("agent checkpoint integrity hash does not match")
         return checkpoint
 
@@ -317,6 +333,9 @@ class AgentTurnCheckpoint:
             "goal_revision": self.goal_revision,
             "action_progress": dict(self.action_progress or {}),
             "evidence_inventory": dict(self.evidence_inventory or {}),
+            "evidence_question_state": dict(
+                self.evidence_question_state or {}
+            ),
             "read_hits_state": dict(self.read_hits_state or {}),
             "artifact_read_state": dict(self.artifact_read_state or {}),
             "progressive_scope_state": dict(self.progressive_scope_state or {}),
@@ -328,6 +347,9 @@ class AgentTurnCheckpoint:
             "rejection_loop_state": dict(self.rejection_loop_state or {}),
             "exploration_outcome_state": dict(
                 self.exploration_outcome_state or {}
+            ),
+            "completion_readiness_state": dict(
+                self.completion_readiness_state or {}
             ),
         }
 
@@ -365,6 +387,7 @@ class AgentTurnSuspended:
     network_access: str
     data_transmission: str
     rollback: str
+    approval_kind: str = "tool_action"
 
 
 @dataclass(frozen=True, slots=True)

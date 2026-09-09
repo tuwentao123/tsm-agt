@@ -7,6 +7,7 @@ import json
 import math
 import re
 import secrets
+import shlex
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from collections.abc import Callable, Mapping
@@ -105,9 +106,15 @@ from tsm_agt.ports import (
     ToolSpec,
     WorkspaceFilesystemPort,
     WorkspacePathPort,
+    is_sensitive_read_path,
     LocalIdentityPort,
     ProjectMemoryPort,
     RuntimeInputClassifierPort,
+    SessionInputResolverPort,
+    CheckpointCompatibilityAction,
+    CheckpointCompatibilityDecision,
+    CheckpointCompatibilityPolicyPort,
+    CheckpointCompatibilityProbe,
     EvidenceRelationProviderPort,
     EvidenceRelationPolicyPort,
     EvidenceRelationState,
@@ -116,6 +123,23 @@ from tsm_agt.ports import (
     ExplorationOutcomePolicyPort,
     ExplorationOutcomeState,
     ExplorationOutcomeAction,
+    ToolScopeConsistencyAction,
+    ToolScopeConsistencyDecision,
+    ToolScopeConsistencyPolicyPort,
+    ToolScopeConsistencyProbe,
+    ToolScopeRelation,
+    CompletionGap,
+    CompletionReadinessAction,
+    CompletionReadinessDecision,
+    CompletionReadinessPolicyPort,
+    CompletionReadinessProbe,
+    CompletionReadinessState,
+    FinalAcceptanceAction,
+    FinalAcceptanceDecision,
+    FinalAcceptancePolicyPort,
+    FinalAcceptanceProbe,
+    FinalAcceptanceViolation,
+    FinalQuestionEvidence,
 )
 
 from .agent_loop import (
@@ -131,12 +155,14 @@ from .agent_loop import (
 )
 from .approval import (
     ApprovalDecision,
+    ApprovalKind,
     ApprovalNotPending,
     ApprovalPayloadMismatch,
     ApprovalRequest,
     ApprovalRequired,
     utc_now,
 )
+from .workspace_access import WorkspaceAccessCapability, WorkspaceAccessGrant
 from .clarification import (
     ClarificationChoice, ClarificationNotPending, ClarificationRequest,
     ClarificationRequired, ClarificationTokenMismatch,
@@ -179,13 +205,19 @@ from .task_spec import (
 )
 from .session import SessionSnapshot, SessionState, standalone_session_id
 from .session_context import (
-    SessionContextProjector, SessionConversationProjection, SessionWorkingState,
+    SessionActiveCheckpoint, SessionContextProjector,
+    SessionConversationProjection, SessionPromptProjection, SessionWorkingState,
 )
-from .working_memory import WorkingMemoryProjector, WorkingMemorySnapshot
+from .working_memory import (
+    EffectiveWorkingMemory, EffectiveWorkingMemoryProjector,
+    WorkingMemoryProjector, WorkingMemorySnapshot, WorkingPlanStepStatus,
+)
 from .steering import SteeringKind, SteeringProjection, SteeringProjector
 from .runtime_input import (
     QueuedFollowUp, RuntimeInputContext, RuntimeInputIntent, RuntimeInputRoute,
-    RuntimeInputRouter,
+    RuntimeInputRouter, SessionContinuationDecision, SessionContinuationMode,
+    SessionResumeCandidate, SessionResumeSafety,
+    SessionInputAction, SessionInputDecision,
 )
 from .exploration_coordinator import (
     ExplorationCoordinator, ExplorationCoordinatorAction,
@@ -212,6 +244,13 @@ from .workspace import (
 from .verification import (
     AcceptanceResult, AcceptanceStatus, Evidence, TaskVerificationResult,
 )
+from .evidence_question import (
+    EvidenceQuestionProjector, EvidenceQuestionProjection,
+    EvidenceQuestionStatus,
+)
+from .session_resources import (
+    SessionQuestionReference, SessionResourceKind, SessionResourceReference,
+)
 from .turn import InvalidModelResponse, InvalidTurnState, ModelInvocationFailed, TurnResult
 from .tool import (
     DuplicateToolName,
@@ -237,6 +276,9 @@ class KernelDependencies:
     read_hits_policy: ReadHitsPolicyPort | None = None
     artifact_read_policy: ArtifactReadPolicyPort | None = None
     progressive_scope_policy: ProgressiveScopePolicyPort | None = None
+    tool_scope_consistency_policy: ToolScopeConsistencyPolicyPort | None = None
+    completion_readiness_policy: CompletionReadinessPolicyPort | None = None
+    final_acceptance_policy: FinalAcceptancePolicyPort | None = None
     exploration_budget_policy: ExplorationBudgetPolicyPort | None = None
     stop_or_pivot_policy: StopOrPivotPolicyPort | None = None
     evidence_relation_providers: tuple[EvidenceRelationProviderPort, ...] = ()
@@ -251,6 +293,10 @@ class KernelDependencies:
     ) = None
     investigation_flow_projector: InvestigationFlowProjectorPort | None = None
     runtime_input_classifier: RuntimeInputClassifierPort | None = None
+    session_input_resolver: SessionInputResolverPort | None = None
+    checkpoint_compatibility_policy: (
+        CheckpointCompatibilityPolicyPort | None
+    ) = None
     process_executor: ProcessExecutorPort | None = None
     tools: tuple[ToolProviderPort, ...] = ()
     runtime_adapters: tuple[RuntimeAdapter, ...] = ()
@@ -267,6 +313,9 @@ class KernelDependencies:
     )
     working_memory_projector: WorkingMemoryProjector = field(
         default_factory=WorkingMemoryProjector
+    )
+    effective_working_memory_projector: EffectiveWorkingMemoryProjector = field(
+        default_factory=EffectiveWorkingMemoryProjector
     )
     require_evidence_questions: bool = True
 
@@ -414,6 +463,35 @@ def _is_verification_command(arguments: Mapping[str, Any]) -> bool:
             for arg in args
         )
     return False
+
+
+def _goal_matches_command_argv(
+    goal: str, arguments: Mapping[str, Any],
+) -> bool:
+    """Return true only when the user's whole goal is the executed command.
+
+    This intentionally does not infer commands from prose such as "run the
+    tests and explain failures". P0 only closes the provable false-success
+    case: the complete Task goal parses to the exact structured argv proposed
+    by core.run_command. Structured execution remains shell-free.
+    """
+    raw_argv = arguments.get("argv")
+    if (
+        not isinstance(raw_argv, (list, tuple))
+        or not raw_argv
+        or any(not isinstance(item, str) or not item for item in raw_argv)
+    ):
+        return False
+    normalized = goal.strip()
+    if not normalized or "\n" in normalized or "\r" in normalized:
+        return False
+    expected = tuple(raw_argv)
+    if tuple(normalized.split()) == expected:
+        return True
+    try:
+        return tuple(shlex.split(normalized, posix=True)) == expected
+    except ValueError:
+        return False
 
 @dataclass(frozen=True, slots=True)
 class _TaskProcessControl(ToolProcessControl):
@@ -668,7 +746,9 @@ class _TaskWorkingMemoryControl(ToolWorkingMemoryControl):
     idempotency_key: str
 
     async def read(self) -> Mapping[str, Any]:
-        return (await self.kernel.get_working_memory(self.task_id)).to_data()
+        return (
+            await self.kernel.get_effective_working_memory(self.task_id)
+        ).to_data()
 
     async def update(
         self, expected_revision: int, state: Mapping[str, Any], operation_id: str,
@@ -965,36 +1045,97 @@ class Kernel:
                 if "version conflict" not in str(error) or attempt == 4:
                     raise
 
-    async def find_recoverable_session_task(
-        self, session_id: str, workspace: Path | None = None,
-    ) -> TaskSnapshot | None:
-        """Return the newest Task that can safely resume from its checkpoint.
+    async def list_session_resume_candidates(
+        self, session_id: str, workspace: Path | None = None, *,
+        validate_compatibility: bool = True,
+    ) -> tuple[SessionResumeCandidate, ...]:
+        """Derive the Session's durable unfinished-Task directory.
 
-        EXECUTING is included because a process can disappear before it gets a
-        chance to persist the final EXECUTING -> INTERRUPTED transition.  A
-        started non-idempotent tool is deliberately excluded: repeating it may
-        duplicate an external side effect whose outcome is unknown.
+        The Session cursor only says which Task the UI selected most recently;
+        it is not a recovery index.  This method deliberately scans every Task
+        owned by the Session so a later unrelated Task cannot hide an older
+        interrupted checkpoint.  Newest entries are returned first.
         """
         session = await self.get_session(session_id)
-        normalized_workspace = (
+        requested_workspace = (
             self._dependencies.workspace_path.normalize_workspace(workspace)
             if workspace is not None else None
         )
-        if session.active_task_id is None:
-            return None
-        task = await self.get_task(session.active_task_id)
-        if task.state not in {TaskState.INTERRUPTED, TaskState.EXECUTING}:
-            return None
-        if task.active_agent_checkpoint is None:
-            return None
-        if (
-            normalized_workspace is not None
-            and self._dependencies.workspace_path.normalize_workspace(
-                Path(task.workspace)
-            ) != normalized_workspace
-        ):
-            return None
-        unsafe_execution = any(
+        visible_tools = (await self.list_tools()) if validate_compatibility else ()
+        candidates: list[SessionResumeCandidate] = []
+        candidate_states = {
+            TaskState.EXECUTING, TaskState.INTERRUPTED, TaskState.CONFLICT,
+            TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER,
+            TaskState.INTERRUPTING, TaskState.RESUMING,
+        }
+        for task_id in reversed(session.task_ids):
+            try:
+                task = await self.get_task(task_id)
+            except TaskNotFound:
+                continue
+            if task.state not in candidate_states:
+                continue
+            checkpoint = (
+                AgentTurnCheckpoint.from_data(task.active_agent_checkpoint)
+                if task.active_agent_checkpoint is not None else None
+            )
+            if (
+                checkpoint is None
+                and task.state not in {
+                    TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER,
+                }
+            ):
+                continue
+            safety = SessionResumeSafety.BLOCKED
+            reason = "checkpoint_missing"
+            conflicts: tuple[str, ...] = ()
+            decision: CheckpointCompatibilityDecision | None = None
+            if task.state in {TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER}:
+                safety = SessionResumeSafety.AWAIT_USER_ACTION
+                reason = (
+                    "explicit_approval_decision_required"
+                    if task.state is TaskState.AWAITING_APPROVAL
+                    else "clarification_answer_required"
+                )
+            elif requested_workspace is not None and (
+                self._dependencies.workspace_path.normalize_workspace(
+                    Path(task.workspace)
+                ) != requested_workspace
+            ):
+                reason = "task_workspace_mismatch"
+                conflicts = ("workspace",)
+            elif self._checkpoint_has_unknown_side_effect(task):
+                reason = "unknown_side_effect_outcome"
+                conflicts = ("tool_execution_outcome",)
+            elif checkpoint is not None:
+                if not validate_compatibility:
+                    safety = SessionResumeSafety.REQUIRES_VALIDATION
+                    reason = "runtime_validation_required_before_resume"
+                else:
+                    decision = await self._evaluate_checkpoint_compatibility(
+                        task, checkpoint, visible_tools
+                    )
+                    safety = SessionResumeSafety(decision.action.value)
+                    reason = decision.reason_code
+                    conflicts = (
+                        decision.conflict_reasons or decision.rebase_reasons
+                    )
+            candidates.append(SessionResumeCandidate(
+                task_id=task.task_id, goal=task.goal,
+                task_state=task.state.value, workspace=task.workspace,
+                safety=safety, reason_code=reason,
+                checkpoint_revision=(checkpoint.revision if checkpoint else None),
+                conflict_reasons=conflicts,
+                rebase_reasons=(
+                    decision.rebase_reasons if checkpoint is not None
+                    and decision is not None else ()
+                ),
+            ))
+        return tuple(candidates)
+
+    @staticmethod
+    def _checkpoint_has_unknown_side_effect(task: TaskSnapshot) -> bool:
+        return any(
             execution.state is ToolCommitState.UNKNOWN_OUTCOME
             or (
                 execution.state is ToolCommitState.RUNNING
@@ -1002,7 +1143,218 @@ class Kernel:
             )
             for execution in task.tool_executions.values()
         )
-        return None if unsafe_execution else task
+
+    async def find_recoverable_session_task(
+        self, session_id: str, workspace: Path | None = None,
+    ) -> TaskSnapshot | None:
+        """Compatibility helper returning the sole newest safe candidate."""
+        candidates = await self.list_session_resume_candidates(
+            session_id, workspace
+        )
+        candidate = next((
+            item for item in candidates if item.safety in {
+                SessionResumeSafety.EXACT_RESUME,
+                SessionResumeSafety.REBASE_REQUIRED,
+            }
+        ), None)
+        return await self.get_task(candidate.task_id) if candidate else None
+
+    async def resolve_session_continuation(
+        self, session_id: str, workspace: Path | None = None, *,
+        task_id: str | None = None,
+    ) -> SessionContinuationDecision:
+        """Resolve an explicit continuation request against all Session Tasks."""
+        candidates = await self.list_session_resume_candidates(session_id, workspace)
+        if task_id is not None:
+            selected = next((item for item in candidates if item.task_id == task_id), None)
+            if selected is None:
+                return SessionContinuationDecision(
+                    SessionContinuationMode.BLOCKED, task_id, None,
+                    "requested_task_is_not_resumable", candidates=candidates,
+                )
+            candidates = (selected,)
+        elif len(candidates) > 1:
+            return SessionContinuationDecision(
+                SessionContinuationMode.MULTIPLE_CANDIDATES, None, None,
+                "multiple_unfinished_tasks_require_selection",
+                candidates=candidates,
+            )
+        resumable = tuple(item for item in candidates if item.safety in {
+            SessionResumeSafety.EXACT_RESUME,
+            SessionResumeSafety.REBASE_REQUIRED,
+        })
+        if len(resumable) == 1:
+            selected = resumable[0]
+            return SessionContinuationDecision(
+                SessionContinuationMode.RECOVER_TASK, selected.task_id,
+                selected.task_state, selected.reason_code, selected.safety,
+                candidates,
+            )
+        awaiting = next((
+            item for item in candidates
+            if item.safety is SessionResumeSafety.AWAIT_USER_ACTION
+        ), None)
+        if awaiting is not None:
+            return SessionContinuationDecision(
+                SessionContinuationMode.AWAIT_USER_ACTION, awaiting.task_id,
+                awaiting.task_state, awaiting.reason_code, awaiting.safety,
+                candidates,
+            )
+        blocked = candidates[0] if candidates else None
+        return SessionContinuationDecision(
+            SessionContinuationMode.BLOCKED if blocked else SessionContinuationMode.EMPTY,
+            blocked.task_id if blocked else None,
+            blocked.task_state if blocked else None,
+            blocked.reason_code if blocked else "session_has_no_suspended_task",
+            blocked.safety if blocked else None, candidates,
+        )
+
+    async def resolve_session_input(
+        self, session_id: str, text: str, workspace: Path | None = None,
+    ) -> SessionInputDecision:
+        """Resolve ordinary Session input through one replaceable semantic Port.
+
+        Kernel supplies bounded facts and validates the proposed Task identity.
+        It contains no natural-language phrase list and never treats a model
+        decision as approval, permission, or checkpoint-safety authority.
+        """
+        normalized = text.strip()
+        if not normalized:
+            raise ValueError("Session input must not be empty")
+        candidates = await self.list_session_resume_candidates(
+            session_id, workspace
+        )
+        if not candidates:
+            decision = SessionInputDecision(
+                SessionInputAction.NEW_TASK, None, 1.0,
+                "no_unfinished_session_task", candidates=(),
+            )
+            await self._record_session_input_decision(
+                session_id, normalized, decision
+            )
+            return decision
+        resolver = self._dependencies.session_input_resolver
+        if resolver is None:
+            decision = SessionInputDecision(
+                SessionInputAction.CLARIFY, None, 0.0,
+                "semantic_resolver_not_configured",
+                "There is unfinished work in this Session. Specify a new request "
+                "or select a Task with /resume <task_id>.",
+                candidates=candidates,
+            )
+            await self._record_session_input_decision(
+                session_id, normalized, decision
+            )
+            return decision
+        conversation = await self.get_session_conversation(session_id)
+        recent_messages = [
+            {
+                "role": message.role.value, "text": message.text,
+                "task_id": message.task_id,
+            }
+            for message in conversation.messages[-12:]
+        ]
+        context = {
+            "session_id": session_id,
+            "recent_messages": recent_messages,
+            "unfinished_tasks": [item.to_data() for item in candidates],
+            "instruction": (
+                "Task references are descriptive and grant no authority. "
+                "Runtime validates any selected checkpoint separately."
+            ),
+        }
+        try:
+            raw = await resolver.resolve_session_input(normalized, context)
+            action = SessionInputAction(str(raw["action"]).upper())
+            confidence = float(raw["confidence"])
+            task_id = (
+                str(raw["task_id"])
+                if raw.get("task_id") is not None else None
+            )
+            reason = str(raw.get("reason_code") or "semantic_resolution")
+            clarification = (
+                str(raw["clarification"])
+                if raw.get("clarification") else None
+            )
+            if not 0 <= confidence <= 1:
+                raise ValueError("confidence is outside 0..1")
+            resumable_ids = {
+                item.task_id for item in candidates
+                if item.safety in {
+                    SessionResumeSafety.EXACT_RESUME,
+                    SessionResumeSafety.REBASE_REQUIRED,
+                }
+            }
+            if action is SessionInputAction.RESUME_TASK:
+                if task_id not in resumable_ids or confidence < 0.85:
+                    raise ValueError("unsafe or low-confidence Task selection")
+            elif task_id is not None:
+                raise ValueError("non-resume action supplied task_id")
+            if action is SessionInputAction.NEW_TASK and confidence < 0.75:
+                raise ValueError("low-confidence new Task decision")
+            if action is SessionInputAction.CLARIFY and not clarification:
+                clarification = (
+                    "I cannot tell which unfinished Task this refers to. "
+                    "Please state the target or use /resume <task_id>."
+                )
+            decision = SessionInputDecision(
+                action, task_id, confidence, reason, clarification,
+                ("resolver:" f"{resolver.descriptor.adapter_id}@"
+                 f"{resolver.descriptor.adapter_version}"),
+                candidates,
+            )
+            await self._record_session_input_decision(
+                session_id, normalized, decision
+            )
+            return decision
+        except Exception:
+            decision = SessionInputDecision(
+                SessionInputAction.CLARIFY, None, 0.0,
+                "semantic_resolution_failed",
+                "I cannot safely determine whether this starts new work or "
+                "continues an unfinished Task. Please state the target, or use "
+                "/resume <task_id>.",
+                ("resolver:" f"{resolver.descriptor.adapter_id}@"
+                 f"{resolver.descriptor.adapter_version}"),
+                candidates,
+            )
+            await self._record_session_input_decision(
+                session_id, normalized, decision
+            )
+            return decision
+
+    async def _record_session_input_decision(
+        self, session_id: str, text: str, decision: SessionInputDecision,
+    ) -> None:
+        """Audit Session routing without persisting the user's plaintext."""
+        for attempt in range(3):
+            stored = await self._dependencies.store.load_session(session_id)
+            if stored is None:
+                raise LookupError(f"session not found: {session_id}")
+            session = SessionSnapshot.from_data(stored.data)
+            self._authorize_session(session)
+            event = SessionEvent(
+                f"sevt-{uuid4().hex}", session_id,
+                stored.last_event_sequence + 1, "session.input_resolved", {
+                    "text_hash": canonical_hash(text),
+                    "action": decision.action.value,
+                    "task_id": decision.task_id,
+                    "confidence": decision.confidence,
+                    "reason_code": decision.reason_code,
+                    "resolver_version": decision.resolver_version,
+                    "candidate_task_ids": [
+                        item.task_id for item in decision.candidates
+                    ],
+                },
+            )
+            try:
+                await self._dependencies.store.commit_session(SessionUnitOfWork(
+                    session_id, stored.version, session.to_data(), (event,)
+                ))
+                return
+            except ValueError as error:
+                if "version conflict" not in str(error) or attempt == 2:
+                    raise
 
     async def get_session_conversation(
         self, session_id: str,
@@ -1017,6 +1369,24 @@ class Kernel:
         events = await self._dependencies.store.read_events(task_id)
         return self._dependencies.working_memory_projector.project(
             task_id, task.goal, events
+        )
+
+    async def get_effective_working_memory(
+        self, task_id: str,
+    ) -> EffectiveWorkingMemory:
+        """Combine authored scratchpad state with event-derived facts.
+
+        This read path does not create a new revision.  The derived portion is
+        reconstructed from the same durable Task events after every restart.
+        """
+        task = await self.get_task(task_id)
+        events = await self._dependencies.store.read_events(task_id)
+        snapshot = self._dependencies.working_memory_projector.project(
+            task_id, task.goal, events
+        )
+        questions = EvidenceQuestionProjector.project(task_id, events)
+        return self._dependencies.effective_working_memory_projector.project(
+            snapshot, questions
         )
 
     async def get_task_spec(self, task_id: str) -> TaskSpecSnapshot:
@@ -1163,7 +1533,8 @@ class Kernel:
                     str(existing.payload.get("router_version", "unknown")),
                 )
             context = RuntimeInputContext(
-                task.state.value, task.pending_clarification is not None,
+                task.state.value, task.goal,
+                task.pending_clarification is not None,
                 task.pending_approval is not None,
             )
             route = RuntimeInputRouter().route(
@@ -1174,10 +1545,10 @@ class Kernel:
                 route.intent is RuntimeInputIntent.AMBIGUOUS
                 and not context.awaiting_approval and classifier is not None
             ):
-                candidate = await classifier.classify_runtime_input(
-                    normalized, context.to_classifier_data()
-                )
                 try:
+                    candidate = await classifier.classify_runtime_input(
+                        normalized, context.to_classifier_data()
+                    )
                     intent = RuntimeInputIntent(str(candidate["intent"]).upper())
                     confidence = float(candidate["confidence"])
                     if intent in {
@@ -1193,9 +1564,9 @@ class Kernel:
                                 f"{classifier.descriptor.adapter_version}"
                             ),
                         )
-                except (KeyError, TypeError, ValueError):
+                except Exception:
                     # An invalid optional classifier answer cannot weaken the
-                    # deterministic safe fallback.
+                    # protocol-state safety fallback or interrupt the Task.
                     pass
             steering_kind = {
                 RuntimeInputIntent.STEER: SteeringKind.STEER,
@@ -3534,19 +3905,138 @@ class Kernel:
 
     async def _session_context_message(self, task_id: str) -> Message | None:
         task = await self.get_task(task_id)
-        projection = await self.get_session_conversation(task.session_id)
-        return self._dependencies.session_context_projector.for_prompt(
-            projection
-        ).message
+        return (await self.get_session_prompt_projection(task.session_id)).message
+
+    async def get_session_prompt_projection(
+        self, session_id: str,
+    ) -> SessionPromptProjection:
+        """Build the unified bounded Session view used by model and UI."""
+        projection = await self.get_session_conversation(session_id)
+        projector = self._dependencies.session_context_projector
+        active_checkpoint = await self.get_session_active_checkpoint(
+            session_id
+        )
+        executions_by_task: dict[str, tuple[Any, ...]] = {}
+        excluded = (
+            (active_checkpoint.task_id,)
+            if active_checkpoint is not None else ()
+        )
+        for recent_task_id in projector.recent_task_ids(
+            projection, exclude_task_ids=excluded
+        ):
+            try:
+                recent_task = await self.get_task(recent_task_id)
+            except TaskNotFound:
+                continue
+            executions_by_task[recent_task_id] = tuple(
+                recent_task.tool_executions.values()
+            )
+        recent_executions = projector.project_recent_executions(
+            executions_by_task
+        )
+        suspended_tasks = await self.list_session_resume_candidates(
+            session_id, validate_compatibility=False
+        )
+        return projector.for_prompt(
+            projection, recent_executions=recent_executions,
+            active_checkpoint=active_checkpoint,
+            suspended_tasks=suspended_tasks,
+        )
+
+    async def get_session_active_checkpoint(
+        self, session_id: str,
+    ) -> SessionActiveCheckpoint | None:
+        """Project the active Task's checkpoint without copying replay data.
+
+        Exact messages, Tool arguments/results, approvals, and policy state stay
+        exclusively in TaskSnapshot.active_agent_checkpoint. This method only
+        exposes bounded deterministic facts useful for model/UI orientation.
+        """
+        session = await self.get_session(session_id)
+        if session.active_task_id is None:
+            return None
+        try:
+            task = await self.get_task(session.active_task_id)
+        except TaskNotFound:
+            return None
+        if task.active_agent_checkpoint is None or task.state.is_terminal:
+            return None
+        checkpoint = AgentTurnCheckpoint.from_data(task.active_agent_checkpoint)
+        effective_memory = await self.get_effective_working_memory(task.task_id)
+        memory = effective_memory.snapshot
+        current_step = next((
+            step for step in memory.plan
+            if step.status is WorkingPlanStepStatus.IN_PROGRESS
+        ), None) or next((
+            step for step in memory.plan
+            if step.status is WorkingPlanStepStatus.PENDING
+        ), None)
+        inventory = EvidenceInventory.from_data(checkpoint.evidence_inventory)
+        continuation = {
+            TaskState.AWAITING_APPROVAL: "await_explicit_approval",
+            TaskState.AWAITING_USER: "await_clarification",
+            TaskState.INTERRUPTED: "resume_from_authoritative_checkpoint",
+            TaskState.CONFLICT: "resolve_checkpoint_conflict",
+            TaskState.RESUMING: "resume_in_progress",
+            TaskState.INTERRUPTING: "interruption_in_progress",
+        }.get(task.state, "execution_in_progress")
+        evidence_counts = tuple(sorted(
+            (category, len(fingerprints))
+            for category, fingerprints in inventory.fingerprints.items()
+            if fingerprints
+        ))
+        pending_tools = tuple(dict.fromkeys(
+            call.name for call in checkpoint.pending_tool_calls
+        ))[:20]
+        return SessionActiveCheckpoint(
+            task_id=task.task_id, turn_id=checkpoint.turn_id,
+            task_state=task.state.value, goal=memory.goal or task.goal,
+            checkpoint_revision=checkpoint.revision,
+            checkpoint_hash=checkpoint.checkpoint_hash,
+            continuation=continuation, model_calls=checkpoint.model_calls,
+            max_model_calls=checkpoint.max_model_calls,
+            tool_calls=checkpoint.tool_calls,
+            max_tool_calls=checkpoint.max_tool_calls,
+            input_tokens=checkpoint.input_tokens,
+            output_tokens=checkpoint.output_tokens,
+            pending_tools=pending_tools,
+            current_plan_step=(current_step.to_data() if current_step else None),
+            completed_work=memory.completed_work[:20],
+            remaining_work=effective_memory.remaining_work[:20],
+            evidence_counts=evidence_counts,
+            consecutive_zero_delta=inventory.consecutive_zero_delta,
+        )
 
     async def _working_memory_context_message(self, task_id: str) -> Message | None:
-        snapshot = await self.get_working_memory(task_id)
+        effective = await self.get_effective_working_memory(task_id)
+        snapshot = effective.snapshot
+        questions = await self.get_evidence_questions(task_id)
         if snapshot.revision == 1 and not any((
             snapshot.constraints, snapshot.facts, snapshot.decisions,
             snapshot.hypotheses, snapshot.open_questions, snapshot.plan,
-            snapshot.completed_work, snapshot.remaining_work, snapshot.evidence,
-        )):
+            snapshot.completed_work, effective.remaining_work, effective.evidence,
+        )) and not questions.records:
             return None
+        execution_state = {
+            "task_id": snapshot.task_id,
+            "revision": snapshot.revision,
+            "facts": list(snapshot.facts),
+            "hypotheses": list(snapshot.hypotheses),
+            "plan": [step.to_data() for step in snapshot.plan],
+            "evidence": [item.to_data() for item in effective.evidence],
+            "runtime_derived": {
+                "remaining_work": list(effective.runtime_remaining_work),
+                "evidence": [
+                    item.to_data() for item in effective.runtime_evidence
+                ],
+                "source_event_sequences": list(
+                    effective.runtime_source_event_sequences
+                ),
+                "projection_hash": effective.projection_hash,
+            },
+            "source_event_sequences": list(snapshot.source_event_sequences),
+            "content_hash": snapshot.content_hash,
+        }
         body = json.dumps({
             "boundary": "task_working_memory",
             "warning": (
@@ -3554,7 +4044,10 @@ class Kernel:
                 "durable memory, or private chain-of-thought. Validate hypotheses "
                 "and use only referenced evidence for completion claims."
             ),
-            **snapshot.to_data(),
+            "evidence_questions": [
+                record.to_data() for record in questions.records
+            ],
+            **execution_state,
         }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return Message(
             f"working-memory-context-{snapshot.revision}-{snapshot.content_hash[:16]}",
@@ -3648,12 +4141,27 @@ class Kernel:
 
     async def _task_spec_context_message(self, task_id: str) -> Message:
         snapshot = await self.get_task_spec(task_id)
+        task = await self.get_task(task_id)
+        workspace = self._dependencies.workspace_path.normalize_workspace(
+            Path(task.workspace)
+        )
         body = json.dumps({
             "boundary": "inspectable_task_spec",
             "instruction": (
                 "Use this completion contract to plan and verify work. Do not "
                 "weaken criteria or change the goal to claim success."
             ),
+            "runtime_environment": {
+                "primary_workspace": str(workspace),
+                "relative_path_base": str(workspace),
+                "path_semantics": (
+                    "Relative paths including '.' use this base; the base is not "
+                    "evidence that a user-named target is this workspace."
+                ),
+                "external_reads": (
+                    "Pass the requested path; Runtime may require Task-scoped approval."
+                ),
+            },
             "task_spec": snapshot.to_data(),
         }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return Message(
@@ -3667,7 +4175,16 @@ class Kernel:
     ) -> None:
         task = await self.get_task(task_id)
         message_data = assistant_message.to_data()
-        working_memory = await self.get_working_memory(task_id)
+        effective_memory = await self.get_effective_working_memory(task_id)
+        working_memory = effective_memory.snapshot
+        resource_catalog, question_catalog = await self._session_reference_catalogs(
+            task_id
+        )
+        task_summary = self._session_task_summary(
+            task, turn_id, working_memory, resource_catalog,
+            effective_remaining_work=effective_memory.remaining_work,
+            effective_evidence=effective_memory.evidence,
+        )
         for attempt in range(3):
             stored = await self._dependencies.store.load_session(task.session_id)
             if stored is None:
@@ -3685,9 +4202,16 @@ class Kernel:
                     "assistant_message": message_data,
                     "content_hash": canonical_hash(message_data),
                     "context_revision": updated.context_revision,
-                    "working_state": working_memory.session_state_data(),
+                    "working_state": effective_memory.session_state_data(),
                     "working_memory_revision": working_memory.revision,
                     "working_memory_hash": working_memory.content_hash,
+                    "resource_catalog": [
+                        item.to_data() for item in resource_catalog
+                    ],
+                    "question_catalog": [
+                        item.to_data() for item in question_catalog
+                    ],
+                    "task_summary": task_summary,
                 },
             )
             try:
@@ -3698,6 +4222,206 @@ class Kernel:
             except ValueError as error:
                 if "version conflict" not in str(error) or attempt == 2:
                     raise
+
+    @staticmethod
+    def _session_task_summary(
+        task: TaskSnapshot, turn_id: str, working_memory: WorkingMemorySnapshot,
+        resources: tuple[SessionResourceReference, ...],
+        *, effective_remaining_work: tuple[str, ...] | None = None,
+        effective_evidence: tuple[Any, ...] | None = None,
+    ) -> dict[str, Any]:
+        """Project one Turn's durable ledger into a bounded Session handoff."""
+        executions = sorted(
+            (item for item in task.tool_executions.values()
+             if item.turn_id == turn_id),
+            key=lambda item: (item.updated_at, item.execution_id),
+        )
+        counts: dict[str, int] = {}
+        actions: list[dict[str, Any]] = []
+        for execution in executions:
+            counts[execution.call.name] = counts.get(execution.call.name, 0) + 1
+            arguments = execution.call.arguments
+            action: dict[str, Any] = {
+                "tool": execution.call.name,
+                "state": execution.state.value,
+            }
+            # Only read-only navigation metadata is safe and useful for a later
+            # Turn. Never copy command argv/environment, patch bodies or arbitrary
+            # third-party Tool arguments into Session context.
+            safe_keys = (
+                ("path", "query", "pattern")
+                if execution.call.name in {
+                    "core.list_files", "core.find_files",
+                    "core.read_file", "core.search_text",
+                } else ()
+            )
+            for key in safe_keys:
+                value = arguments.get(key)
+                if isinstance(value, str) and value.strip():
+                    action[key] = value.strip()[:500]
+            if execution.result is not None:
+                action["ok"] = execution.result.ok
+                action["error_code"] = execution.result.error_code
+            actions.append(action)
+
+        roots = tuple(dict.fromkeys(
+            item.resolved_root for item in resources
+            if item.source_task_id == task.task_id and item.resolved_root
+        ))[:20]
+        confirmed = tuple({
+            "evidence_id": item.evidence_id,
+            "kind": item.kind,
+            "reference": item.reference,
+            "summary": item.summary,
+        } for item in (effective_evidence or working_memory.evidence)[:20])
+        mutations = tuple({
+            "mutation_id": item.mutation_id,
+            "path": item.path,
+            "operation": item.operation.value,
+            "after_hash": item.after_hash,
+        } for item in task.mutation_journal[-20:])
+        return {
+            "task_id": task.task_id,
+            "turn_id": turn_id,
+            "goal": working_memory.goal or task.goal,
+            "recorded_task_state": task.state.value,
+            "tool_counts": dict(sorted(counts.items())),
+            "important_actions": actions[-20:],
+            "confirmed": list(confirmed),
+            "completed_work": list(working_memory.completed_work),
+            "remaining_work": list(
+                effective_remaining_work
+                if effective_remaining_work is not None
+                else working_memory.remaining_work
+            ),
+            "workspace_roots": list(roots),
+            "mutations": list(mutations),
+            "verification_status": None,
+        }
+
+    async def _session_reference_catalogs(
+        self, task_id: str,
+    ) -> tuple[
+        tuple[SessionResourceReference, ...],
+        tuple[SessionQuestionReference, ...],
+    ]:
+        """Extract bounded authority-free references from successful results.
+
+        Tool result bodies and Task-local resource_ref values are deliberately
+        excluded. The absolute path is a historical location only; a later Task
+        must pass it through normal Workspace/Sandbox/Approval checks.
+        """
+        task = await self.get_task(task_id)
+        questions = await self.get_evidence_questions(task_id)
+        by_id = {record.question_id: record for record in questions.records}
+        session_question_refs = {
+            record.question_id: canonical_hash({
+                "task_id": task_id, "question_id": record.question_id,
+            })[:12]
+            for record in questions.records
+        }
+        resources: dict[str, SessionResourceReference] = {}
+        question_resources: dict[str, list[str]] = {}
+
+        def add(
+            *, path: object, root: object, root_kind: object,
+            resource_kind: SessionResourceKind, execution: Any,
+        ) -> None:
+            if not all(isinstance(value, str) and value for value in (
+                path, root, root_kind,
+            )):
+                return
+            question = execution.call.evidence_question
+            lifecycle = (
+                by_id.get(question.question_id) if question is not None else None
+            )
+            reference = SessionResourceReference.create(
+                canonical_path=str(path), resolved_root=str(root),
+                root_kind=str(root_kind), resource_kind=resource_kind,
+                source_task_id=task_id, source_turn_id=execution.turn_id,
+                source_tool=execution.call.name,
+                question_ref=(
+                    session_question_refs[lifecycle.question_id]
+                    if lifecycle else None
+                ),
+                question_status=(lifecycle.status if lifecycle else None),
+                evidence_references=(
+                    lifecycle.evidence_references if lifecycle else ()
+                ),
+            )
+            resources[reference.catalog_ref] = reference
+            if lifecycle is not None:
+                question_resources.setdefault(
+                    session_question_refs[lifecycle.question_id], []
+                ).append(
+                    reference.catalog_ref
+                )
+
+        executions = sorted(
+            task.tool_executions.values(), key=lambda item: item.updated_at
+        )
+        for execution in executions:
+            result = execution.result
+            if (
+                execution.state is not ToolCommitState.COMMITTED
+                or result is None or not result.ok
+                or not isinstance(result.data, Mapping)
+            ):
+                continue
+            data = result.data
+            resolved_root = data.get("resolved_root")
+            root_kind = data.get("root_kind")
+            resolved_path = data.get("resolved_path")
+            if isinstance(resolved_root, str) and resolved_root:
+                add(
+                    path=resolved_root, root=resolved_root,
+                    root_kind=root_kind, resource_kind=SessionResourceKind.ROOT,
+                    execution=execution,
+                )
+            # read_file's top-level resolved_path is the artifact that was read.
+            # Search/list tools use their top-level resolved_path as the search
+            # base, so treating it as an artifact would duplicate the ROOT entry;
+            # their concrete hits are collected from entries/matches below.
+            if (
+                execution.call.name == "core.read_file"
+                and isinstance(resolved_path, str)
+                and resolved_path
+            ):
+                add(
+                    path=resolved_path, root=resolved_root, root_kind=root_kind,
+                    resource_kind=SessionResourceKind.ARTIFACT,
+                    execution=execution,
+                )
+            for field in ("entries", "matches"):
+                values = data.get(field)
+                if not isinstance(values, (list, tuple)):
+                    continue
+                for value in values:
+                    if not isinstance(value, Mapping):
+                        continue
+                    add(
+                        path=value.get("resolved_path"),
+                        root=value.get("resolved_root"),
+                        root_kind=value.get("root_kind"),
+                        resource_kind=SessionResourceKind.ARTIFACT,
+                        execution=execution,
+                    )
+
+        resource_values = tuple(resources.values())[-200:]
+        available_refs = {item.catalog_ref for item in resource_values}
+        question_values = tuple(SessionQuestionReference(
+            session_question_refs[record.question_id], record.question,
+            record.status, task_id,
+            record.source_turn_id,
+            tuple(dict.fromkeys(
+                ref for ref in question_resources.get(
+                    session_question_refs[record.question_id], []
+                )
+                if ref in available_refs
+            )),
+            record.evidence_references, record.blocking_reason,
+        ) for record in questions.records[-100:])
+        return resource_values, question_values
 
     async def get_task(self, task_id: str) -> TaskSnapshot:
         stored = await self._dependencies.store.load_task(task_id)
@@ -3828,6 +4552,14 @@ class Kernel:
             latest_decision=latest_decision, model_calls=model_calls,
             tool_calls=tool_calls,
         ))
+
+    async def get_evidence_questions(
+        self, task_id: str,
+    ) -> EvidenceQuestionProjection:
+        """Rebuild inspectable question state from the durable Event Log."""
+        await self.get_task(task_id)
+        events = await self._dependencies.store.read_events(task_id)
+        return EvidenceQuestionProjector.project(task_id, events)
 
     async def get_effective_configuration(
         self, task_id: str, revision: int | None = None,
@@ -4010,6 +4742,45 @@ class Kernel:
                         "snapshot": updated_memory.to_data(),
                     },
                 )
+            question_projection = EvidenceQuestionProjector.project(
+                checkpoint.task_id, events
+            )
+            question_events: list[RuntimeEvent] = []
+            if replaced:
+                first_question_sequence = (
+                    stored.last_event_sequence
+                    + 3
+                    + (1 if working_memory_event is not None else 0)
+                )
+                question_projection, dropped_questions = (
+                    question_projection.drop_open(
+                        event_sequence=first_question_sequence,
+                        reason="goal_replaced",
+                    )
+                )
+                for record in dropped_questions:
+                    question_events.append(RuntimeEvent(
+                        f"evt-{uuid4().hex}", checkpoint.task_id,
+                        record.updated_event_sequence,
+                        "evidence.question_state_changed", {
+                            "turn_id": record.source_turn_id,
+                            "tool_call_id": (
+                                record.tool_call_ids[-1]
+                                if record.tool_call_ids else ""
+                            ),
+                            "tool_name": "runtime.redirect",
+                            "question_ref": record.question_ref,
+                            "previous_status": EvidenceQuestionStatus.OPEN.value,
+                            "next_status": record.status.value,
+                            "observation_kind": (
+                                record.observation_kind.value
+                                if record.observation_kind else None
+                            ),
+                            "blocking_reason": record.blocking_reason,
+                            "evidence_count": len(record.evidence_references),
+                            "record": record.to_data(),
+                        },
+                    ))
             updated_checkpoint = replace(
                 checkpoint, revision=checkpoint.revision + 1,
                 messages=tuple(messages),
@@ -4017,6 +4788,7 @@ class Kernel:
                 last_steering_inbound_sequence=pending[-1].inbound_sequence,
                 goal_revision=goal_revision,
                 working_memory_hash=working_memory_hash,
+                evidence_question_state=question_projection.to_data(),
                 exploration_budget_state=(
                     {} if replaced else checkpoint.exploration_budget_state
                 ),
@@ -4031,6 +4803,9 @@ class Kernel:
                 ),
                 exploration_outcome_state=(
                     {} if replaced else checkpoint.exploration_outcome_state
+                ),
+                completion_readiness_state=(
+                    {} if replaced else checkpoint.completion_readiness_state
                 ),
             )
             updated_task = task.with_agent_checkpoint(updated_checkpoint.to_data())
@@ -4056,6 +4831,7 @@ class Kernel:
                 committed = [event, task_spec_event]
                 if working_memory_event is not None:
                     committed.append(working_memory_event)
+                committed.extend(question_events)
                 await self._dependencies.store.commit(RuntimeUnitOfWork(
                     checkpoint.task_id, stored.version, updated_task.to_data(),
                     tuple(committed),
@@ -4116,6 +4892,197 @@ class Kernel:
             checkpoint.task_id, stored.version, updated.to_data(), events
         ))
 
+    async def _completion_readiness_gaps(
+        self, task_id: str, visible_tools: tuple[ToolSpec, ...],
+    ) -> tuple[CompletionGap, ...]:
+        """Build required completion gaps from durable, inspectable facts.
+
+        Free-form ``remaining_work`` and ``open_questions`` are intentionally not
+        hard gates: they may contain optional ideas. Only explicit Task criteria,
+        the tool-bound Evidence Question lifecycle, required plan steps, and
+        post-mutation verification can reject a proposed final answer.
+        """
+        task = await self.get_task(task_id)
+        events = await self._dependencies.store.read_events(task_id)
+        spec = TaskSpecProjector.project(task_id, task.goal, events)
+        memory = self._dependencies.working_memory_projector.project(
+            task_id, task.goal, events
+        )
+        questions = EvidenceQuestionProjector.project(task_id, events)
+        read_tools_available = any(
+            tool.is_read_only and not tool.is_internal_state
+            for tool in visible_tools
+        )
+        gaps: list[CompletionGap] = []
+
+        for criterion in spec.acceptance_criteria:
+            if criterion.verification_kind is not TaskCriterionKind.EVIDENCE_REFERENCE:
+                continue
+            reference = criterion.evidence_reference or ""
+            evidence = self._verify_task_spec_reference(
+                task, events, reference, criterion.description
+            )
+            if not evidence.passed:
+                gaps.append(CompletionGap(
+                    gap_id=f"task-spec:{criterion.criterion_id}",
+                    kind="TASK_SPEC_EVIDENCE",
+                    description=criterion.description,
+                    status="MISSING", required=True, recoverable=False,
+                    evidence_reference=reference,
+                ))
+
+        for record in questions.records:
+            if record.status not in {
+                EvidenceQuestionStatus.OPEN, EvidenceQuestionStatus.BLOCKED,
+            }:
+                continue
+            recoverable = bool(
+                record.status is EvidenceQuestionStatus.OPEN
+                and record.expected_scope.strip()
+                and read_tools_available
+            )
+            gaps.append(CompletionGap(
+                gap_id=f"evidence-question:{record.question_ref}",
+                kind="EVIDENCE_QUESTION", description=record.question,
+                status=record.status.value, required=True,
+                recoverable=recoverable,
+                evidence_reference=(
+                    record.evidence_references[-1]
+                    if record.evidence_references else ""
+                ),
+                expected_scope=record.expected_scope,
+            ))
+
+        for step in memory.plan:
+            if step.status not in {
+                WorkingPlanStepStatus.PENDING, WorkingPlanStepStatus.IN_PROGRESS,
+            }:
+                continue
+            gaps.append(CompletionGap(
+                gap_id=f"plan-step:{step.step_id}", kind="PLAN_STEP",
+                description=step.completion_criteria,
+                status=step.status.value, required=True, recoverable=False,
+            ))
+
+        if task.mutation_journal:
+            latest_mutation = max(
+                task.mutation_journal, key=lambda item: item.created_at
+            )
+            verified = any(
+                execution.call.name == "core.run_command"
+                and _is_verification_command(execution.call.arguments)
+                and execution.updated_at >= latest_mutation.created_at
+                and execution.state is ToolCommitState.COMMITTED
+                and execution.result is not None and execution.result.ok
+                and isinstance(execution.result.data, Mapping)
+                and execution.result.data.get("mode") == "foreground"
+                and execution.result.data.get("status") == "exited"
+                and execution.result.data.get("exit_code") == 0
+                for execution in task.tool_executions.values()
+            )
+            if not verified:
+                gaps.append(CompletionGap(
+                    gap_id="post-mutation-verification",
+                    kind="POST_MUTATION_VERIFICATION",
+                    description=(
+                        "The workspace changed but no successful foreground "
+                        "build or test was recorded after the latest mutation."
+                    ),
+                    status="MISSING", required=True, recoverable=False,
+                ))
+        return tuple(gaps)
+
+    async def _evaluate_completion_readiness(
+        self, task_id: str, turn_id: str, checkpoint: AgentTurnCheckpoint,
+        visible_tools: tuple[ToolSpec, ...], *, forced_wrap_up: bool,
+    ) -> CompletionReadinessDecision:
+        """Ask the replaceable policy whether a proposed final may finish."""
+        policy = self._dependencies.completion_readiness_policy
+        state = CompletionReadinessState.from_data(
+            checkpoint.completion_readiness_state
+        )
+        gaps = await self._completion_readiness_gaps(task_id, visible_tools)
+        available_read_tools = tuple(
+            sorted(tool.name for tool in visible_tools
+                   if tool.is_read_only and not tool.is_internal_state)
+        )
+        task = await self.get_task(task_id)
+        inventory = EvidenceInventory.from_data(checkpoint.evidence_inventory)
+        probe = CompletionReadinessProbe(
+            goal=task.goal, gaps=gaps,
+            remaining_model_calls=max(
+                0, checkpoint.max_model_calls - checkpoint.model_calls
+            ),
+            remaining_tool_calls=max(
+                0, checkpoint.max_tool_calls - checkpoint.tool_calls
+            ),
+            available_read_tools=available_read_tools,
+            forced_wrap_up=forced_wrap_up,
+            evidence_item_count=sum(
+                len(values) for values in inventory.fingerprints.values()
+            ),
+            successful_tool_calls=sum(
+                execution.state is ToolCommitState.COMMITTED
+                and execution.result is not None and execution.result.ok
+                for execution in task.tool_executions.values()
+            ),
+        )
+        if policy is None:
+            decision = CompletionReadinessDecision(
+                CompletionReadinessAction.COMPLETE, "policy_not_configured",
+                state, gaps,
+            )
+        else:
+            try:
+                decision = await policy.evaluate(probe, state)
+            except Exception as error:
+                await self._append_events(task_id, ((
+                    "completion.readiness_failed", {
+                        "turn_id": turn_id,
+                        "error_type": type(error).__name__,
+                    },
+                ),))
+                decision = CompletionReadinessDecision(
+                    CompletionReadinessAction.COMPLETE, "policy_failed",
+                    state, gaps,
+                )
+        await self._append_events(task_id, ((
+            "completion.readiness_evaluated", {
+                "turn_id": turn_id, "action": decision.action.value,
+                "reason": decision.reason,
+                "forced_wrap_up": forced_wrap_up,
+                "remaining_model_calls": probe.remaining_model_calls,
+                "remaining_tool_calls": probe.remaining_tool_calls,
+                "gap_count": len(decision.gaps),
+                "gaps": [gap.to_data() for gap in decision.gaps],
+                "state": decision.state.to_data(),
+            },
+        ),))
+        return decision
+
+    @staticmethod
+    def _completion_correction_message(
+        decision: CompletionReadinessDecision,
+    ) -> Message:
+        continue_work = decision.action is CompletionReadinessAction.CONTINUE
+        body = {
+            "boundary": "completion_readiness",
+            "action": decision.action.value,
+            "instruction": (
+                "The proposed final answer was not accepted. Perform the "
+                "remaining required in-scope read-only check now. Do not merely "
+                "offer to continue later."
+                if continue_work else
+                "Do not call tools. Give the user the exact blocker, completed "
+                "evidence, and unverified requirement. Do not claim success."
+            ),
+            "gaps": [gap.to_data() for gap in decision.gaps],
+        }
+        return Message(
+            f"completion-readiness-{uuid4().hex}", MessageRole.USER,
+            (TextBlock(json.dumps(body, sort_keys=True, separators=(",", ":"))),),
+        )
+
     async def _complete_agent_checkpoint(
         self, task_id: str, turn_id: str, model_calls: int, tool_calls: int,
     ) -> None:
@@ -4136,9 +5103,69 @@ class Kernel:
         self, task: TaskSnapshot, checkpoint: AgentTurnCheckpoint,
         visible_tools: tuple[ToolSpec, ...],
     ) -> None:
+        decision = await self._evaluate_checkpoint_compatibility(
+            task, checkpoint, visible_tools
+        )
+        if decision.action is CheckpointCompatibilityAction.EXACT_RESUME:
+            return
+        await self._mark_checkpoint_conflict(
+            task.task_id, checkpoint, decision.conflict_reasons
+        )
+        raise AgentCheckpointConflict(
+            "Agent checkpoint cannot resume because identities changed: "
+            + ", ".join(decision.conflict_reasons)
+        )
+
+    async def _evaluate_checkpoint_compatibility(
+        self, task: TaskSnapshot, checkpoint: AgentTurnCheckpoint,
+        visible_tools: tuple[ToolSpec, ...],
+    ) -> CheckpointCompatibilityDecision:
+        """Collect authoritative facts, then delegate classification.
+
+        Kernel owns identity and execution ledgers. The replaceable policy only
+        classifies those facts and can never resume a Tool or mutate a Task.
+        """
+        differences = await self._agent_checkpoint_conflicts(
+            task, checkpoint, visible_tools
+        )
+        policy = self._dependencies.checkpoint_compatibility_policy
+        if policy is None:
+            return CheckpointCompatibilityDecision(
+                CheckpointCompatibilityAction.EXACT_RESUME
+                if not differences else CheckpointCompatibilityAction.BLOCKED,
+                "safe_checkpoint_available"
+                if not differences else "checkpoint_compatibility_policy_missing",
+                conflict_reasons=differences,
+            )
+        unknown = sum(
+            execution.state is ToolCommitState.UNKNOWN_OUTCOME
+            for execution in task.tool_executions.values()
+        )
+        running_non_idempotent = sum(
+            execution.state is ToolCommitState.RUNNING
+            and execution.idempotency is ToolIdempotency.NON_IDEMPOTENT
+            for execution in task.tool_executions.values()
+        )
+        return await policy.evaluate(CheckpointCompatibilityProbe(
+            differences=differences,
+            pending_tool_call_count=len(checkpoint.pending_tool_calls),
+            tool_execution_count=len(task.tool_executions),
+            unknown_outcome_count=unknown,
+            running_non_idempotent_count=running_non_idempotent,
+            mutation_count=len(task.mutation_journal),
+            background_process_count=len(task.background_processes),
+        ))
+
+    async def _agent_checkpoint_conflicts(
+        self, task: TaskSnapshot, checkpoint: AgentTurnCheckpoint,
+        visible_tools: tuple[ToolSpec, ...],
+    ) -> tuple[str, ...]:
+        """Inspect checkpoint compatibility without mutating Task state."""
         conflicts: list[str] = []
         if checkpoint.task_id != task.task_id:
             conflicts.append("task_id")
+        if task.trust_subject != self._dependencies.local_identity.current_subject():
+            conflicts.append("local_subject")
         if checkpoint.session_id != task.session_id:
             conflicts.append("session_id")
         else:
@@ -4154,6 +5181,13 @@ class Kernel:
         working_memory = await self.get_working_memory(task.task_id)
         if checkpoint.working_memory_hash != working_memory.content_hash:
             conflicts.append("working_memory_hash")
+        question_projection = await self.get_evidence_questions(task.task_id)
+        if (
+            checkpoint.evidence_question_state
+            and dict(checkpoint.evidence_question_state)
+            != question_projection.to_data()
+        ):
+            conflicts.append("evidence_question_state")
         steering = await self.get_steering(task.task_id)
         if checkpoint.last_steering_inbound_sequence > steering.latest_inbound_sequence:
             conflicts.append("steering_inbound_sequence")
@@ -4191,13 +5225,7 @@ class Kernel:
                 conflicts.append("adapter_lock_hash")
         if checkpoint.toolset_hash != effective_toolset_hash(visible_tools):
             conflicts.append("toolset_hash")
-        if not conflicts:
-            return
-        await self._mark_checkpoint_conflict(task.task_id, checkpoint, tuple(conflicts))
-        raise AgentCheckpointConflict(
-            "Agent checkpoint cannot resume because identities changed: "
-            + ", ".join(conflicts)
-        )
+        return tuple(dict.fromkeys(conflicts))
 
     async def _mark_checkpoint_conflict(
         self, task_id: str, checkpoint: AgentTurnCheckpoint,
@@ -4231,6 +5259,83 @@ class Kernel:
         await self._dependencies.store.commit(RuntimeUnitOfWork(
             task_id, stored.version, conflicted.to_data(), events
         ))
+
+    async def _rebase_agent_checkpoint(
+        self, task: TaskSnapshot, checkpoint: AgentTurnCheckpoint,
+        visible_tools: tuple[ToolSpec, ...],
+        decision: CheckpointCompatibilityDecision,
+    ) -> AgentTurnCheckpoint:
+        """Rebuild dynamic context after a proven zero-side-effect upgrade."""
+        if decision.action is not CheckpointCompatibilityAction.REBASE_REQUIRED:
+            raise AgentCheckpointConflict(
+                "Agent checkpoint compatibility policy did not allow rebase"
+            )
+        if checkpoint.pending_tool_calls or task.tool_executions:
+            raise AgentCheckpointConflict(
+                "Agent checkpoint with Tool execution state cannot be rebased"
+            )
+        stored = await self._require_stored_task(task.task_id)
+        current = TaskSnapshot.from_data(stored.data)
+        configuration = await self._build_effective_configuration(
+            current, len(current.effective_configurations) + 1
+        )
+        updated = current.with_effective_configuration(configuration)
+        event = RuntimeEvent(
+            f"evt-{uuid4().hex}", current.task_id,
+            stored.last_event_sequence + 1, "config.rebased", {
+                "revision": configuration.revision,
+                "effective_config_hash": configuration.effective_config_hash,
+                "reason": decision.reason_code,
+                "rebase_reasons": list(decision.rebase_reasons),
+            },
+        )
+        await self._dependencies.store.commit(RuntimeUnitOfWork(
+            current.task_id, stored.version, updated.to_data(), (event,)
+        ))
+        current = updated
+        configuration = current.effective_configurations[-1]
+        session = await self.get_session(current.session_id)
+        refreshed_project_context = await self._project_context_messages(
+            current.task_id
+        )
+        generated_prefixes = (
+            "project-instructions-context-", "task-spec-context-",
+            "project-onboarding-context-", "project-memory-context-",
+            "session-context-", "working-memory-context-",
+        )
+        messages = tuple(
+            message for message in checkpoint.messages
+            if not message.message_id.startswith(generated_prefixes)
+        )
+        messages += refreshed_project_context
+        working_memory = await self.get_working_memory(current.task_id)
+        rebased = replace(
+            checkpoint, revision=checkpoint.revision + 1, messages=messages,
+            pending_tool_calls=(), seen_call_ids=(),
+            model_calls=0, tool_calls=0, input_tokens=0, output_tokens=0,
+            max_model_calls=self._dependencies.default_max_model_calls,
+            max_tool_calls=self._dependencies.default_max_tool_calls,
+            effective_config_hash=configuration.effective_config_hash,
+            prompt_manifest_hash=(configuration.prompt_manifest_hash or ""),
+            toolset_hash=effective_toolset_hash(visible_tools),
+            session_context_hash=session.context_hash,
+            working_memory_hash=working_memory.content_hash,
+            action_progress={}, read_hits_state={}, artifact_read_state={},
+            progressive_scope_state={}, exploration_budget_state={},
+            stop_or_pivot_state={}, evidence_relation_state={},
+            rejection_loop_state={}, exploration_outcome_state={},
+            completion_readiness_state={},
+        )
+        await self._save_agent_checkpoint(rebased, "turn-rebased")
+        await self._append_events(current.task_id, (("turn.rebased", {
+            "turn_id": checkpoint.turn_id,
+            "previous_revision": checkpoint.revision,
+            "revision": rebased.revision,
+            "conflicts": list(decision.rebase_reasons),
+            "reason_code": decision.reason_code,
+            "tool_calls_replayed": False,
+        }),))
+        return rebased
 
     async def _build_effective_configuration(
         self, task: TaskSnapshot, revision: int,
@@ -4285,6 +5390,23 @@ class Kernel:
         if stored is None:
             raise TaskNotFound(f"task not found: {task_id}")
         current = TaskSnapshot.from_data(stored.data)
+        if (
+            target in {TaskState.FINALIZING, TaskState.SUCCEEDED}
+            and self._dependencies.final_acceptance_policy is not None
+        ):
+            verification_events = [
+                event for event in await self._dependencies.store.read_events(task_id)
+                if event.event_type == "verify.completed"
+            ]
+            latest_status = (
+                str(verification_events[-1].payload.get("status", ""))
+                if verification_events else ""
+            )
+            if latest_status != AcceptanceStatus.PASSED.value:
+                raise InvalidTurnState(
+                    f"task {task_id} cannot enter {target.value} without a "
+                    "latest passed trusted verification"
+                )
         if (
             current.pending_approval is not None
             and target in {TaskState.EXECUTING, TaskState.RUNNING_WORKFLOW}
@@ -4341,6 +5463,8 @@ class Kernel:
                 events=tuple(events),
             )
         )
+        if target.is_terminal:
+            await self._record_session_task_state(updated)
         if target is TaskState.RESOLVING_PROJECT:
             await self.run_project_onboarding(task_id)
             # Inspect the one explicit optional instructions file during project
@@ -4348,6 +5472,42 @@ class Kernel:
             await self.get_project_instructions(task_id, audit=True)
             return await self.get_task(task_id)
         return updated
+
+    async def _record_session_task_state(self, task: TaskSnapshot) -> None:
+        """Mirror a terminal Task state into its authority-free Session view."""
+        verification_events = [
+            event for event in await self._dependencies.store.read_events(task.task_id)
+            if event.event_type == "verify.completed"
+        ]
+        verification_status = (
+            str(verification_events[-1].payload.get("status"))
+            if verification_events else None
+        )
+        for attempt in range(3):
+            stored = await self._dependencies.store.load_session(task.session_id)
+            if stored is None:
+                raise LookupError(f"session not found: {task.session_id}")
+            current = SessionSnapshot.from_data(stored.data)
+            self._authorize_session(current)
+            updated = current.bump_context()
+            event = SessionEvent(
+                f"sevt-{uuid4().hex}", task.session_id,
+                stored.last_event_sequence + 1, "session.task_state_updated",
+                {
+                    "task_id": task.task_id,
+                    "task_state": task.state.value,
+                    "verification_status": verification_status,
+                    "context_revision": updated.context_revision,
+                },
+            )
+            try:
+                await self._dependencies.store.commit_session(SessionUnitOfWork(
+                    task.session_id, stored.version, updated.to_data(), (event,)
+                ))
+                return
+            except ValueError as error:
+                if "version conflict" not in str(error) or attempt == 2:
+                    raise
 
     async def verify_task_acceptance(
         self, task_id: str,
@@ -4364,16 +5524,37 @@ class Kernel:
         mandatory_answer_completeness = any(
             event.event_type == "turn.completed" for event in events
         )
+        answer_evidence_result = (
+            self._verify_answer_evidence_sufficiency(task, events)
+            if mandatory_answer_completeness else None
+        )
         spec_kinds = {item.verification_kind for item in task_spec.acceptance_criteria}
         mandatory_post_mutation = bool(
             task.mutation_journal
             and TaskCriterionKind.POST_MUTATION_COMMAND not in spec_kinds
+        )
+        goal_command_result = self._verify_goal_command_outcome(
+            task, task_spec.goal
+        )
+        question_projection = EvidenceQuestionProjector.project(task_id, events)
+        incomplete_questions = tuple(
+            record for record in question_projection.records
+            if record.status in {
+                EvidenceQuestionStatus.OPEN, EvidenceQuestionStatus.BLOCKED,
+            }
+        )
+        final_acceptance = await self._evaluate_final_acceptance(
+            task, events, question_projection
         )
         await self._append_events(task_id, (("verify.started", {
             "criterion_count": (
                 len(task_spec.acceptance_criteria)
                 + (1 if mandatory_post_mutation else 0)
                 + (1 if mandatory_answer_completeness else 0)
+                + (1 if answer_evidence_result is not None else 0)
+                + (1 if goal_command_result is not None else 0)
+                + (1 if incomplete_questions else 0)
+                + (1 if final_acceptance is not None else 0)
             ),
             "mutation_count": len(task.mutation_journal),
             "task_spec_revision": task_spec.revision,
@@ -4383,6 +5564,45 @@ class Kernel:
         criteria: list[AcceptanceResult] = []
         if mandatory_answer_completeness:
             criteria.append(self._verify_answer_completeness(events))
+        if answer_evidence_result is not None:
+            criteria.append(answer_evidence_result)
+        if goal_command_result is not None:
+            criteria.append(goal_command_result)
+        if incomplete_questions:
+            criteria.append(AcceptanceResult(
+                "evidence-question-lifecycle", AcceptanceStatus.BLOCKED,
+                tuple(Evidence(
+                    "evidence_question",
+                    "a tool-bound evidence question obtained a trustworthy result",
+                    (
+                        f"question {record.question_ref} blocked: "
+                        f"{record.blocking_reason or 'UNKNOWN'}"
+                    ),
+                    record.tool_call_ids[-1] if record.tool_call_ids else "verifier",
+                    False,
+                ) for record in incomplete_questions),
+            ))
+        if final_acceptance is not None:
+            criteria.append(AcceptanceResult(
+                "final-evidence-integrity",
+                (AcceptanceStatus.PASSED
+                 if final_acceptance.action is FinalAcceptanceAction.PASS
+                 else AcceptanceStatus.BLOCKED),
+                tuple(
+                    Evidence(
+                        "final_evidence_integrity",
+                        "required final conclusions are backed by trusted, "
+                        "in-scope persisted evidence",
+                        violation.observed, violation.subject_ref, False,
+                    )
+                    for violation in final_acceptance.violations
+                ) or (Evidence(
+                    "final_evidence_integrity",
+                    "required final conclusions are backed by trusted, "
+                    "in-scope persisted evidence",
+                    final_acceptance.reason, "final-acceptance-policy", True,
+                ),),
+            ))
         workspace_evidence: list[Evidence] = []
         root = Path(task.workspace)
         active_mutations: dict[str, MutationRecord] = {}
@@ -4589,6 +5809,198 @@ class Kernel:
             ),))
         return result
 
+    async def _evaluate_final_acceptance(
+        self, task: TaskSnapshot, events: tuple[RuntimeEvent, ...],
+        questions: EvidenceQuestionProjection,
+    ) -> FinalAcceptanceDecision | None:
+        """Verify final traceability using only durable structured facts."""
+        policy = self._dependencies.final_acceptance_policy
+        if policy is None:
+            return None
+        scope_relations = {
+            str(event.payload.get("tool_call_id", "")): str(
+                event.payload.get("relation", "")
+            )
+            for event in events
+            if event.event_type == "tool.scope_consistency_evaluated"
+        }
+        executions_by_call = {
+            execution.call.call_id: execution
+            for execution in task.tool_executions.values()
+        }
+        question_facts: list[FinalQuestionEvidence] = []
+        for record in questions.records:
+            if record.status is EvidenceQuestionStatus.DROPPED:
+                continue
+            trusted: list[str] = []
+            wrong_scope: list[str] = []
+            for call_id in record.tool_call_ids:
+                reference = f"tool_call:{call_id}"
+                execution = executions_by_call.get(call_id)
+                relation = scope_relations.get(call_id, "")
+                is_scoped_file_call = bool(
+                    execution is not None
+                    and execution.call.name in {
+                        "core.read_file", "core.list_files",
+                        "core.find_files", "core.search_text",
+                    }
+                    and record.expected_scope.strip()
+                )
+                if relation == ToolScopeRelation.MISMATCH.value:
+                    wrong_scope.append(reference)
+                    continue
+                if (
+                    execution is not None
+                    and execution.state is ToolCommitState.COMMITTED
+                    and execution.result is not None
+                    and execution.result.ok
+                    and (
+                        not is_scoped_file_call
+                        or relation == ToolScopeRelation.MATCH.value
+                    )
+                ):
+                    trusted.append(reference)
+            question_facts.append(FinalQuestionEvidence(
+                record.question_ref, record.status.value, record.expected_scope,
+                tuple(trusted), tuple(wrong_scope),
+                record.blocking_reason or "",
+            ))
+
+        memory = self._dependencies.working_memory_projector.project(
+            task.task_id, task.goal, events
+        )
+        required_plan_steps = tuple(
+            f"plan-step:{step.step_id}"
+            for step in memory.plan
+            if step.status in {
+                WorkingPlanStepStatus.PENDING, WorkingPlanStepStatus.IN_PROGRESS,
+            }
+        )
+        readiness_events = [
+            event for event in events
+            if event.event_type == "completion.readiness_evaluated"
+        ]
+        completion_gaps: tuple[str, ...] = ()
+        if readiness_events:
+            raw_gaps = readiness_events[-1].payload.get("gaps", [])
+            if isinstance(raw_gaps, list):
+                completion_gaps = tuple(
+                    str(item.get("gap_id", ""))
+                    for item in raw_gaps if isinstance(item, Mapping)
+                    and bool(item.get("required", True))
+                    and str(item.get("gap_id", "")).strip()
+                )
+        probe = FinalAcceptanceProbe(
+            tuple(question_facts), required_plan_steps, completion_gaps
+        )
+        try:
+            decision = await policy.evaluate(probe)
+        except Exception as error:
+            decision = FinalAcceptanceDecision(
+                FinalAcceptanceAction.BLOCK, "final_acceptance_policy_failed",
+                (FinalAcceptanceViolation(
+                    "POLICY_FAILURE", "final-acceptance-policy",
+                    f"policy failed: {type(error).__name__}",
+                ),),
+            )
+        await self._append_events(task.task_id, ((
+            "verify.final_evidence_evaluated", {
+                "action": decision.action.value, "reason": decision.reason,
+                "question_count": len(question_facts),
+                "required_plan_step_count": len(required_plan_steps),
+                "completion_gap_count": len(completion_gaps),
+                "violations": [
+                    {
+                        "code": item.code,
+                        "subject_ref": item.subject_ref,
+                        "observed": item.observed,
+                    }
+                    for item in decision.violations
+                ],
+            },
+        ),))
+        return decision
+
+    @staticmethod
+    def _verify_goal_command_outcome(
+        task: TaskSnapshot, goal: str,
+    ) -> AcceptanceResult | None:
+        """Verify an exact direct-command goal from the persisted execution ledger.
+
+        P0 deliberately avoids guessing intent from natural-language tasks. The
+        criterion exists only when a core.run_command argv exactly represents
+        the complete Task goal. If the same command is retried, the latest
+        durable attempt decides the outcome.
+        """
+        attempts = [
+            execution for execution in task.tool_executions.values()
+            if execution.call.name == "core.run_command"
+            and _goal_matches_command_argv(goal, execution.call.arguments)
+        ]
+        if not attempts:
+            return None
+        latest = max(attempts, key=lambda item: item.updated_at)
+        result = latest.result
+        error_code = result.error_code if result is not None else None
+        status = AcceptanceStatus.BLOCKED
+        observed = "direct command has no trustworthy terminal result"
+        passed = False
+
+        if latest.state is ToolCommitState.COMMITTED and result is not None:
+            data = result.data if isinstance(result.data, Mapping) else {}
+            mode = str(data.get("mode", "foreground"))
+            if mode == "background":
+                passed = result.ok and bool(data.get("process_id"))
+                status = (
+                    AcceptanceStatus.PASSED
+                    if passed else AcceptanceStatus.FAILED
+                )
+                observed = (
+                    "direct background command started"
+                    if passed else "direct background command did not start"
+                )
+            else:
+                passed = bool(
+                    result.ok
+                    and data.get("status") == "exited"
+                    and data.get("exit_code") == 0
+                )
+                status = (
+                    AcceptanceStatus.PASSED
+                    if passed else AcceptanceStatus.FAILED
+                )
+                observed = (
+                    "direct command exited with code 0"
+                    if passed else
+                    f"direct command exit status={data.get('status', 'unknown')}; "
+                    f"exit_code={data.get('exit_code', 'unknown')}"
+                )
+        elif latest.state is ToolCommitState.FAILED:
+            status = (
+                AcceptanceStatus.BLOCKED
+                if error_code == "PERMISSION_DENIED"
+                else AcceptanceStatus.FAILED
+            )
+            observed = (
+                f"direct command was not executed: {error_code or 'TOOL_FAILED'}"
+                if status is AcceptanceStatus.BLOCKED else
+                f"direct command failed: {error_code or 'TOOL_FAILED'}"
+            )
+        elif latest.state in {
+            ToolCommitState.CANCELLED, ToolCommitState.UNKNOWN_OUTCOME,
+            ToolCommitState.PREPARED, ToolCommitState.RUNNING,
+        }:
+            observed = f"direct command outcome is {latest.state.value}"
+
+        return AcceptanceResult(
+            "goal-command-outcome", status,
+            (Evidence(
+                "process_outcome",
+                "the command requested as the complete Task goal succeeded",
+                observed, latest.invocation_id, passed,
+            ),),
+        )
+
     @staticmethod
     def _verify_answer_completeness(
         events: tuple[RuntimeEvent, ...],
@@ -4642,6 +6054,89 @@ class Kernel:
                     if model_events else "verifier"
                 ),
                 passed,
+            ),),
+        )
+
+    @staticmethod
+    def _verify_answer_evidence_sufficiency(
+        task: TaskSnapshot, events: tuple[RuntimeEvent, ...],
+    ) -> AcceptanceResult | None:
+        """Block a self-declared unverified answer after failed artifact reads.
+
+        This deliberately avoids inferring the project type or the user's domain. It
+        uses only two persisted facts from the latest Turn: every attempted artifact
+        read failed, and the final answer itself says the needed material was not read
+        or verified. A successful read in the same Turn disables this conservative
+        gate because the Verifier cannot infer which artifact was decisive.
+        """
+        completed = [
+            event for event in events if event.event_type == "turn.completed"
+        ]
+        if not completed:
+            return None
+        turn_id = str(completed[-1].payload.get("turn_id", ""))
+        reads = [
+            execution for execution in task.tool_executions.values()
+            if execution.turn_id == turn_id
+            and execution.call.name == "core.read_file"
+        ]
+        if not reads:
+            return None
+        successful = [
+            execution for execution in reads
+            if execution.state is ToolCommitState.COMMITTED
+            and execution.result is not None and execution.result.ok
+        ]
+        failed = [
+            execution for execution in reads
+            if execution.state is ToolCommitState.FAILED
+            or (execution.result is not None and not execution.result.ok)
+        ]
+        if successful or not failed:
+            return None
+        model_events = [
+            event for event in events
+            if event.event_type == "llm.completed"
+            and str(event.payload.get("turn_id", "")) == turn_id
+        ]
+        message = model_events[-1].payload.get("message") if model_events else None
+        content = message.get("content") if isinstance(message, Mapping) else None
+        text = "".join(
+            str(block.get("text", ""))
+            for block in content if isinstance(block, Mapping)
+            and block.get("type") == "text"
+        ).strip() if isinstance(content, list) else ""
+        if not text:
+            return None
+        unverified = re.search(
+            r"(?:没法|无法|不能|未能|还没|尚未|没有)(?:继续)?(?:成功)?"
+            r"(?:读取|读到|看到|查看|获得|验证|确认|检查|访问)|"
+            r"(?:could\s+not|couldn't|cannot|can't|unable\s+to|"
+            r"have\s+not|haven't|did\s+not|didn't)\s+(?:successfully\s+)?"
+            r"(?:read|inspect|access|verify|confirm|check)",
+            text, re.IGNORECASE,
+        )
+        if unverified is None:
+            return None
+        error_codes = sorted({
+            execution.result.error_code or "UNKNOWN"
+            for execution in failed if execution.result is not None
+        })
+        observed = (
+            "final answer explicitly says required material was not read or "
+            f"verified; latest Turn has {len(failed)} failed artifact read(s), "
+            f"no successful artifact read, errors={','.join(error_codes) or 'UNKNOWN'}"
+        )
+        return AcceptanceResult(
+            "answer-evidence-sufficiency", AcceptanceStatus.BLOCKED,
+            (Evidence(
+                "answer_evidence_sufficiency",
+                "a final behavior or implementation answer is backed by a successful "
+                "artifact read when the answer says source evidence is required",
+                observed,
+                (f"model-event:{model_events[-1].sequence}"
+                 if model_events else "verifier"),
+                False,
             ),),
         )
 
@@ -5032,6 +6527,9 @@ class Kernel:
                     },
                 },
             )
+        question_projection = await self._observe_evidence_question(
+            task_id, checkpoint.turn_id, approved_call, result, evidence_delta
+        )
         previous_action = ActionProgressState.from_data(
             checkpoint.action_progress
         )
@@ -5073,6 +6571,7 @@ class Kernel:
                 if evidence_delta is not None else checkpoint.action_progress
             ),
             evidence_inventory=evidence_inventory,
+            evidence_question_state=question_projection.to_data(),
             read_hits_state=read_hits_state,
             artifact_read_state=artifact_read_state,
             progressive_scope_state=checkpoint.progressive_scope_state,
@@ -5081,6 +6580,7 @@ class Kernel:
             evidence_relation_state=checkpoint.evidence_relation_state,
             rejection_loop_state=checkpoint.rejection_loop_state,
             exploration_outcome_state=checkpoint.exploration_outcome_state,
+            completion_readiness_state=checkpoint.completion_readiness_state,
         )
         tool_message = Message(
             message_id=f"msg-tool-{uuid4().hex}",
@@ -5121,7 +6621,26 @@ class Kernel:
             raise LookupError(f"task has no active Agent checkpoint: {task_id}")
         checkpoint = AgentTurnCheckpoint.from_data(task.active_agent_checkpoint)
         visible_tools = await self.list_tools()
-        await self._validate_agent_checkpoint(task, checkpoint, visible_tools)
+        decision = await self._evaluate_checkpoint_compatibility(
+            task, checkpoint, visible_tools
+        )
+        if decision.action is CheckpointCompatibilityAction.REBASE_REQUIRED:
+            checkpoint = await self._rebase_agent_checkpoint(
+                task, checkpoint, visible_tools, decision
+            )
+            task = await self.get_task(task_id)
+        elif decision.action is not CheckpointCompatibilityAction.EXACT_RESUME:
+            await self._mark_checkpoint_conflict(
+                task.task_id, checkpoint, decision.conflict_reasons
+            )
+            details = (
+                " (" + ", ".join(decision.conflict_reasons) + ")"
+                if decision.conflict_reasons else ""
+            )
+            raise AgentCheckpointConflict(
+                "Agent checkpoint cannot resume: "
+                + decision.reason_code + details
+            )
         if task.state in {TaskState.INTERRUPTED, TaskState.CONFLICT}:
             stored = await self._require_stored_task(task_id)
             current = TaskSnapshot.from_data(stored.data)
@@ -5232,6 +6751,11 @@ class Kernel:
             data={"answer": normalized_answer, "selected_choice": selected},
             meta={"request_id": request.request_id, "answered_by_user": True},
         )
+        question_projection = await self._observe_evidence_question(
+            task.task_id, request.turn_id, request.call, result, None
+        )
+        stored = await self._require_stored_task(task.task_id)
+        task = TaskSnapshot.from_data(stored.data)
         tool_message = Message(
             message_id=f"msg-tool-{uuid4().hex}", role=MessageRole.TOOL,
             content=(ToolResultBlock(result),),
@@ -5241,6 +6765,7 @@ class Kernel:
             messages=checkpoint.messages + (tool_message,),
             pending_tool_calls=checkpoint.pending_tool_calls[1:],
             tool_calls=checkpoint.tool_calls + 1,
+            evidence_question_state=question_projection.to_data(),
         )
         resumed = task.resolve_clarification().with_agent_checkpoint(
             resumed_checkpoint.to_data()
@@ -5414,14 +6939,13 @@ class Kernel:
                         f"pending tool call {call.call_id} lost its evidence_question"
                     )
                 if question is not None:
-                    await self._append_events(task_id, ((
-                        "evidence.question_bound", {
-                            "turn_id": turn_id,
-                            "tool_call_id": call.call_id,
-                            "tool_name": call.name,
-                            **question.to_data(),
-                        },
-                    ),))
+                    question_projection = await self._bind_evidence_question(
+                        task_id, turn_id, call
+                    )
+                    checkpoint = replace(
+                        checkpoint,
+                        evidence_question_state=question_projection.to_data(),
+                    )
                 task_before_action = await self.get_task(task_id)
                 memory_before_action = await self.get_working_memory(task_id)
                 semantic_action = await self._classify_semantic_action(
@@ -6020,6 +7544,7 @@ class Kernel:
                     goal_revision=checkpoint.goal_revision,
                     action_progress=checkpoint.action_progress,
                     evidence_inventory=checkpoint.evidence_inventory,
+                    evidence_question_state=checkpoint.evidence_question_state,
                     read_hits_state=checkpoint.read_hits_state,
                     artifact_read_state=checkpoint.artifact_read_state,
                     progressive_scope_state=checkpoint.progressive_scope_state,
@@ -6028,6 +7553,9 @@ class Kernel:
                     evidence_relation_state=checkpoint.evidence_relation_state,
                     rejection_loop_state=checkpoint.rejection_loop_state,
                     exploration_outcome_state=checkpoint.exploration_outcome_state,
+                    completion_readiness_state=(
+                        checkpoint.completion_readiness_state
+                    ),
                 )
                 await self._save_agent_checkpoint(
                     suspension, "before-tool-execution"
@@ -6075,6 +7603,7 @@ class Kernel:
                         network_access=request.network_access,
                         data_transmission=request.data_transmission,
                         rollback=request.rollback,
+                        approval_kind=request.kind.value,
                     )
                 except ClarificationRequired as required:
                     request = required.request
@@ -6098,6 +7627,9 @@ class Kernel:
                         task_id, turn_id, call, result,
                         checkpoint.evidence_inventory,
                     )
+                )
+                question_projection = await self._observe_evidence_question(
+                    task_id, turn_id, call, result, evidence_delta
                 )
                 if evidence_delta is not None:
                     result = replace(
@@ -6245,6 +7777,7 @@ class Kernel:
                         await self.get_working_memory(task_id)
                     ).content_hash,
                     evidence_inventory=evidence_inventory,
+                    evidence_question_state=question_projection.to_data(),
                     read_hits_state=read_hits_state,
                     artifact_read_state=artifact_read_state,
                     progressive_scope_state=progressive_scope_state,
@@ -6253,6 +7786,9 @@ class Kernel:
                     evidence_relation_state=evidence_relation_state,
                     rejection_loop_state=rejection_loop_state,
                     exploration_outcome_state=exploration_outcome_state,
+                    completion_readiness_state=(
+                        checkpoint.completion_readiness_state
+                    ),
                     action_progress=(
                         ActionProgressState(
                             decision.action_signature,
@@ -6290,6 +7826,13 @@ class Kernel:
             )
             remaining_model_calls = checkpoint.max_model_calls - model_call_count
             remaining_tool_calls = checkpoint.max_tool_calls - tool_call_count
+            completion_state = CompletionReadinessState.from_data(
+                checkpoint.completion_readiness_state
+            )
+            disclosure_only = (
+                completion_state.last_action
+                == CompletionReadinessAction.REPORT_BLOCKED.value
+            )
             wrap_up = (
                 remaining_model_calls <= wrap_up_threshold
                 or no_progress_stop
@@ -6299,7 +7842,14 @@ class Kernel:
             focus_state = ExplorationBudgetState.from_data(
                 checkpoint.exploration_budget_state
             )
-            if no_progress_stop or budget_wrap_up:
+            if disclosure_only:
+                runtime_instruction = (
+                    "Completion readiness found required work that cannot be "
+                    "safely completed in this Turn. Do not call tools. State the "
+                    "exact blocker, what evidence was completed, and what required "
+                    "fact remains unverified. Do not claim success."
+                )
+            elif no_progress_stop or budget_wrap_up:
                 if budget_wrap_up:
                     runtime_instruction = (
                         "The evidence-aware exploration budget has reached its "
@@ -6432,7 +7982,7 @@ class Kernel:
                 messages=prompt.messages,
                 max_output_tokens=checkpoint.max_output_tokens,
                 tools=visible_tools,
-                allow_tool_calls=not wrap_up,
+                allow_tool_calls=not (wrap_up or disclosure_only),
                 require_evidence_questions=(
                     self._dependencies.require_evidence_questions
                 ),
@@ -6460,9 +8010,17 @@ class Kernel:
                 max_tool_calls=checkpoint.max_tool_calls,
                 goal=live_goal,
             ))
+            buffered_text: list[str] = []
+            pre_model_gaps = (
+                await self._completion_readiness_gaps(task_id, visible_tools)
+                if self._dependencies.completion_readiness_policy is not None
+                else ()
+            )
+            should_buffer_text = any(gap.required for gap in pre_model_gaps)
             try:
                 response = await self._complete_agent_model_request(
-                    request, on_text_delta
+                    request,
+                    buffered_text.append if should_buffer_text else on_text_delta,
                 )
                 self._notify_agent_progress(on_progress, AgentProgress(
                     AgentProgressKind.MODEL_COMPLETED,
@@ -6596,10 +8154,37 @@ class Kernel:
                 > response_checkpoint.last_steering_inbound_sequence
                 for item in steering_after_model.pending
             )
+            readiness = CompletionReadinessDecision(
+                CompletionReadinessAction.COMPLETE, "not_a_final_candidate",
+                CompletionReadinessState.from_data(
+                    response_checkpoint.completion_readiness_state
+                ),
+            )
+            if (
+                not tool_calls and not has_late_steering
+                and self._dependencies.completion_readiness_policy is not None
+            ):
+                readiness = await self._evaluate_completion_readiness(
+                    task_id, turn_id, response_checkpoint, visible_tools,
+                    forced_wrap_up=wrap_up or disclosure_only,
+                )
+                response_checkpoint = replace(
+                    response_checkpoint,
+                    completion_readiness_state=readiness.state.to_data(),
+                )
+            final_response = bool(
+                not tool_calls and not has_late_steering
+                and readiness.action is CompletionReadinessAction.COMPLETE
+            )
             await self._commit_model_response_checkpoint(
                 response_checkpoint, response, prompt.receipt, prepared.budget,
-                final=not tool_calls and not has_late_steering,
+                final=final_response,
             )
+            if should_buffer_text and (
+                tool_calls or has_late_steering or final_response
+            ) and on_text_delta is not None:
+                for text_delta in buffered_text:
+                    on_text_delta(text_delta)
             if not tool_calls and has_late_steering:
                 response_checkpoint, _ = await self._apply_pending_steering(
                     response_checkpoint, "after-model-response"
@@ -6610,6 +8195,30 @@ class Kernel:
                 continue
 
             if not tool_calls:
+                if readiness.action is not CompletionReadinessAction.COMPLETE:
+                    correction = self._completion_correction_message(readiness)
+                    messages.append(correction)
+                    response_checkpoint = replace(
+                        response_checkpoint, messages=tuple(messages),
+                        pending_tool_calls=(),
+                        completion_readiness_state=readiness.state.to_data(),
+                    )
+                    event_type = (
+                        "completion.continuation_requested"
+                        if readiness.action is CompletionReadinessAction.CONTINUE
+                        else "completion.blocker_disclosure_requested"
+                    )
+                    await self._append_events(task_id, ((event_type, {
+                        "turn_id": turn_id, "reason": readiness.reason,
+                        "gap_count": len(readiness.gaps),
+                        "gap_ids": [gap.gap_id for gap in readiness.gaps],
+                    }),))
+                    await self._save_agent_checkpoint(
+                        response_checkpoint, "completion-readiness-correction"
+                    )
+                    checkpoint = response_checkpoint
+                    pending_tool_calls = []
+                    continue
                 source_user_message = next((
                     message for message in messages
                     if message.role is MessageRole.USER
@@ -6703,6 +8312,65 @@ class Kernel:
             },
         ),))
         return evaluation.inventory.to_data(), delta
+
+    async def _bind_evidence_question(
+        self, task_id: str, turn_id: str, call: ToolCall,
+    ) -> EvidenceQuestionProjection:
+        """Bind once per Tool Call and return the durable lifecycle state."""
+        question = call.evidence_question
+        projection = await self.get_evidence_questions(task_id)
+        if question is None:
+            return projection
+        current = projection.get(question.question_id)
+        if current is not None and call.call_id in current.tool_call_ids:
+            return projection
+        projection.bind(question, turn_id, call.call_id)
+        await self._append_events(task_id, ((
+            "evidence.question_bound", {
+                "turn_id": turn_id,
+                "tool_call_id": call.call_id,
+                "tool_name": call.name,
+                "question_ref": canonical_hash(question.question_id)[:12],
+                **question.to_data(),
+            },
+        ),))
+        return await self.get_evidence_questions(task_id)
+
+    async def _observe_evidence_question(
+        self, task_id: str, turn_id: str, call: ToolCall, result: ToolResult,
+        delta: EvidenceDelta | None,
+    ) -> EvidenceQuestionProjection:
+        """Advance lifecycle from a real Tool result, never model prose."""
+        projection = await self.get_evidence_questions(task_id)
+        question = call.evidence_question
+        if question is None:
+            return projection
+        current = projection.get(question.question_id)
+        if current is None:
+            raise ValueError("evidence question must be bound before observation")
+        events = await self._dependencies.store.read_events(task_id)
+        next_sequence = events[-1].sequence + 1 if events else 1
+        projection, record = projection.observe(
+            call, result, delta, event_sequence=next_sequence
+        )
+        await self._append_events(task_id, ((
+            "evidence.question_state_changed", {
+                "turn_id": turn_id,
+                "tool_call_id": call.call_id,
+                "tool_name": call.name,
+                "question_ref": record.question_ref,
+                "previous_status": current.status.value,
+                "next_status": record.status.value,
+                "observation_kind": (
+                    record.observation_kind.value
+                    if record.observation_kind else None
+                ),
+                "blocking_reason": record.blocking_reason,
+                "evidence_count": len(record.evidence_references),
+                "record": record.to_data(),
+            },
+        ),))
+        return await self.get_evidence_questions(task_id)
 
     async def _classify_semantic_action(
         self, task_id: str, turn_id: str, call: ToolCall,
@@ -7826,6 +9494,39 @@ class Kernel:
                 "decision": decision.to_data(),
             },
         )
+        external_read_root = self._external_read_root_requiring_approval(
+            task, call
+        )
+        if external_read_root is not None:
+            request = ApprovalRequest(
+                request_id=f"approval-{uuid4().hex}",
+                task_id=task_id, turn_id=turn_id, invocation_id=invocation_id,
+                policy_decision_id=decision.decision_id,
+                payload_hash=decision.payload_hash,
+                risk=ToolRisk.R0, call=call,
+                action=(
+                    f"Allow {call.name} to read one directory outside the "
+                    "current workspace"
+                ),
+                target=str(external_read_root),
+                preview=(
+                    "Permission: read-only; scope: current Task; "
+                    f"requested by {call.name}. Sensitive files remain blocked."
+                ),
+                network_access="not required",
+                data_transmission="none",
+                rollback="expires automatically when the current Task ends",
+                created_at=utc_now(),
+                agent_checkpoint=(
+                    dict(agent_checkpoint) if agent_checkpoint is not None else None
+                ),
+                kind=ApprovalKind.WORKSPACE_READ,
+                workspace_access_root=str(external_read_root),
+            )
+            await self._persist_approval_request(
+                stored, task, request, policy_event, agent_checkpoint
+            )
+            raise ApprovalRequired(request)
         if decision.requires_approval:
             request = ApprovalRequest(
                 request_id=f"approval-{uuid4().hex}",
@@ -7947,6 +9648,76 @@ class Kernel:
             initial_events=(policy_event,),
         )
 
+    def _external_read_root_requiring_approval(
+        self, task: TaskSnapshot, call: ToolCall,
+    ) -> Path | None:
+        """Return the narrow external directory that needs Task approval."""
+        if call.name not in {
+            "core.read_file", "core.list_files",
+            "core.find_files", "core.search_text",
+        }:
+            return None
+        raw_path = call.arguments.get("path", ".")
+        if not isinstance(raw_path, str):
+            return None
+        if is_sensitive_read_path(Path(raw_path)):
+            return None
+        workspace = self._dependencies.workspace_path.normalize_workspace(
+            Path(task.workspace)
+        )
+        approved_roots = tuple(
+            Path(grant.canonical_root)
+            for grant in task.workspace_access_grants
+            if grant.capability is WorkspaceAccessCapability.READ
+        )
+        try:
+            self._dependencies.workspace_path.resolve_read_path(
+                workspace, raw_path, approved_roots
+            )
+            return None
+        except PermissionError:
+            return None
+        except ValueError:
+            pass
+        return self._dependencies.workspace_path.external_read_approval_root(
+            workspace, raw_path
+        )
+
+    async def _persist_approval_request(
+        self, stored: Any, task: TaskSnapshot, request: ApprovalRequest,
+        policy_event: RuntimeEvent, agent_checkpoint: Mapping[str, Any] | None,
+    ) -> None:
+        """Persist either tool-action or external-directory approval uniformly."""
+        awaiting = task.await_approval(request)
+        approval_event = RuntimeEvent(
+            f"evt-{uuid4().hex}", task.task_id,
+            stored.last_event_sequence + 2, "approval.requested",
+            request.to_data(),
+        )
+        events: tuple[RuntimeEvent, ...] = (policy_event, approval_event)
+        sequence = stored.last_event_sequence + 3
+        if agent_checkpoint is not None:
+            events += (RuntimeEvent(
+                f"evt-{uuid4().hex}", task.task_id, sequence,
+                "checkpoint.saved", {
+                    "turn_id": request.turn_id,
+                    "request_id": request.request_id,
+                    "revision": agent_checkpoint.get("revision"),
+                },
+            ),)
+            sequence += 1
+        events += (RuntimeEvent(
+            f"evt-{uuid4().hex}", task.task_id, sequence,
+            "task.state_changed", {
+                "previous_state": task.state.value,
+                "next_state": awaiting.state.value,
+                "reason": f"approval required: {request.request_id}",
+            },
+        ),)
+        await self._dependencies.store.commit(RuntimeUnitOfWork(
+            task.task_id, stored.version, awaiting.to_data(), events
+        ))
+
     async def resolve_approval(
         self,
         task_id: str,
@@ -8014,16 +9785,51 @@ class Kernel:
         current_decision = self._tool_policy.evaluate(
             selected_spec, request.call, task.project_trust
         )
-        if (
+        policy_mismatch = (
             current_decision.payload_hash != request.payload_hash
             or current_decision.effective_risk is not request.risk
-            or not current_decision.requires_approval
-        ):
+        )
+        if request.kind is ApprovalKind.TOOL_ACTION:
+            policy_mismatch = policy_mismatch or not current_decision.requires_approval
+        elif request.kind is ApprovalKind.WORKSPACE_READ:
+            try:
+                root = self._dependencies.workspace_path.normalize_workspace(
+                    Path(request.workspace_access_root)
+                )
+            except (OSError, ValueError):
+                root = None
+            expected_root = self._external_read_root_requiring_approval(
+                task, request.call
+            )
+            policy_mismatch = (
+                policy_mismatch or not selected_spec.is_read_only
+                or request.call.name not in {
+                    "core.read_file", "core.list_files",
+                    "core.find_files", "core.search_text",
+                }
+                or root is None
+                or str(root) != request.workspace_access_root
+                or expected_root != root
+            )
+        else:
+            policy_mismatch = True
+        if policy_mismatch:
             raise ApprovalPayloadMismatch(
                 "the tool declaration, arguments, or effective risk changed after approval was requested"
             )
 
         resumed = task.resolve_approval()
+        if (
+            decision is ApprovalDecision.APPROVE
+            and request.kind is ApprovalKind.WORKSPACE_READ
+        ):
+            resumed = resumed.with_workspace_access_grant(WorkspaceAccessGrant(
+                grant_id=f"workspace-grant-{uuid4().hex}",
+                canonical_root=request.workspace_access_root,
+                capability=WorkspaceAccessCapability.READ,
+                approval_request_id=request.request_id,
+                granted_at=utc_now(),
+            ))
         resolved_event = RuntimeEvent(
             event_id=f"evt-{uuid4().hex}",
             task_id=task_id,
@@ -8240,6 +10046,11 @@ class Kernel:
                 execution.idempotency_key or payload_hash,
             ),
             workspace_path=self._dependencies.workspace_path,
+            additional_read_roots=self._additional_read_roots(
+                running_task, call.name
+            ),
+            resource_paths=self._resource_paths(running_task),
+            resource_candidates=self._resource_candidates(running_task),
         )
         try:
             async with asyncio.timeout(timeout_seconds):
@@ -8265,6 +10076,45 @@ class Kernel:
                 message=str(error),
                 retryable=False,
                 meta={"error_type": type(error).__name__},
+            )
+
+        scope_decision = await self._evaluate_tool_scope_consistency(
+            task_id, turn_id, current_task, call, result
+        )
+        if scope_decision.action is ToolScopeConsistencyAction.REPLAN:
+            probe = scope_decision.probe
+            # The filesystem operation happened, but its result does not answer
+            # the scope the model declared. Persist it as recoverable feedback so
+            # it cannot become Evidence or resolve the Evidence Question.
+            result = ToolResult(
+                call.call_id, False,
+                data={
+                    "expected_scope": probe.expected_scope,
+                    "requested_path": probe.requested_path,
+                    "resolved_path": probe.resolved_path,
+                    "resolved_root": probe.resolved_root,
+                    "root_kind": probe.root_kind,
+                },
+                error_code="TOOL_SCOPE_MISMATCH",
+                message=(
+                    "The tool ran in a different filesystem scope than the "
+                    "Evidence Question declared. Its hits or empty result cannot "
+                    "answer that question."
+                ),
+                hint=(
+                    "Replan with the intended path. Use the historical canonical "
+                    "path when continuing prior investigation, or use the current "
+                    "workspace only when that is the intended scope. Normal "
+                    "current-Task approval still applies."
+                ),
+                retryable=True,
+                meta={
+                    "recoverable_input": True,
+                    "runtime_guard": "TOOL_SCOPE_CONSISTENCY",
+                    "next_action": "REPLAN_WITH_INTENDED_SCOPE",
+                    "reason": scope_decision.reason,
+                    "original_tool_ok": result.ok,
+                },
             )
 
         after_tool = await self._dependencies.store.load_task(task_id)
@@ -8317,6 +10167,104 @@ class Kernel:
             )
         )
         return result
+
+    async def _evaluate_tool_scope_consistency(
+        self, task_id: str, turn_id: str, task: TaskSnapshot, call: ToolCall,
+        result: ToolResult,
+    ) -> ToolScopeConsistencyDecision:
+        """Compare model-declared scope with platform-normalized tool facts.
+
+        This is a correctness guard, not a permission check. It never changes the
+        requested path or adds an approved root. Policy failure is observable and
+        fails open because Workspace/Sandbox/Approval already enforced authority.
+        """
+        policy = self._dependencies.tool_scope_consistency_policy
+        scoped_file_tools = {
+            "core.read_file", "core.list_files",
+            "core.find_files", "core.search_text",
+        }
+        expected = (
+            call.evidence_question.expected_scope.strip()
+            if call.evidence_question is not None else ""
+        )
+        data = result.data if isinstance(result.data, Mapping) else {}
+        requested = str(data.get("requested_path") or "")
+        actual_path = str(data.get("resolved_path") or "")
+        actual_root = str(data.get("resolved_root") or "")
+        root_kind = str(data.get("root_kind") or "")
+        relation = ToolScopeRelation.NOT_APPLICABLE
+        if (
+            call.name in scoped_file_tools
+            and expected and result.ok and actual_path and actual_root
+        ):
+            relation = self._tool_scope_relation(
+                Path(task.workspace), expected, actual_path, actual_root,
+                tuple(
+                    Path(grant.canonical_root)
+                    for grant in task.workspace_access_grants
+                    if grant.capability is WorkspaceAccessCapability.READ
+                ),
+            )
+        elif call.name in scoped_file_tools and expected:
+            relation = ToolScopeRelation.UNRESOLVED
+        elif call.name in scoped_file_tools and actual_path and actual_root:
+            relation = ToolScopeRelation.UNDECLARED
+        probe = ToolScopeConsistencyProbe(
+            relation, expected, requested, actual_path, actual_root, root_kind
+        )
+        if policy is None:
+            return ToolScopeConsistencyDecision(
+                ToolScopeConsistencyAction.ALLOW, "policy_not_configured", probe
+            )
+        try:
+            decision = await policy.evaluate(call, result, probe)
+        except Exception as error:
+            await self._append_events(task_id, ((
+                "tool.scope_consistency_failed", {
+                    "turn_id": turn_id, "tool_call_id": call.call_id,
+                    "tool_name": call.name,
+                    "error_type": type(error).__name__,
+                },
+            ),))
+            return ToolScopeConsistencyDecision(
+                ToolScopeConsistencyAction.ALLOW, "policy_failed", probe
+            )
+        await self._append_events(task_id, ((
+            "tool.scope_consistency_evaluated", {
+                "turn_id": turn_id, "tool_call_id": call.call_id,
+                "tool_name": call.name, "action": decision.action.value,
+                "reason": decision.reason, "relation": probe.relation.value,
+                "expected_scope": probe.expected_scope,
+                "requested_path": probe.requested_path,
+                "resolved_path": probe.resolved_path,
+                "resolved_root": probe.resolved_root,
+                "root_kind": probe.root_kind,
+            },
+        ),))
+        return decision
+
+    def _tool_scope_relation(
+        self, workspace: Path, expected_scope: str, actual_path: str,
+        actual_root: str, approved_read_roots: tuple[Path, ...] = (),
+    ) -> ToolScopeRelation:
+        declared = Path(expected_scope).expanduser()
+        try:
+            expected_path = (
+                declared
+                if declared.is_absolute()
+                else self._dependencies.workspace_path.resolve_read_path(
+                    workspace, expected_scope, approved_read_roots
+                ).path
+            )
+        except (OSError, PermissionError, ValueError):
+            return ToolScopeRelation.UNRESOLVED
+        return (
+            ToolScopeRelation.MATCH
+            if self._dependencies.workspace_path.is_same_or_descendant(
+                Path(actual_path), expected_path
+            )
+            else ToolScopeRelation.MISMATCH
+        )
 
     async def recover_tool_execution(
         self, task_id: str, turn_id: str, call_id: str, timeout_seconds: float = 30.0
@@ -8585,6 +10533,11 @@ class Kernel:
                 execution.idempotency_key or execution.payload_hash,
             ),
             workspace_path=self._dependencies.workspace_path,
+            additional_read_roots=self._additional_read_roots(
+                running_task, execution.call.name
+            ),
+            resource_paths=self._resource_paths(running_task),
+            resource_candidates=self._resource_candidates(running_task),
         )
         try:
             async with asyncio.timeout(timeout_seconds):
@@ -8668,6 +10621,83 @@ class Kernel:
         if provider is None or selected_spec is None:
             raise ToolNotFound(f"tool not found: {name}")
         return provider, selected_spec
+
+    @staticmethod
+    def _additional_read_roots(
+        task: TaskSnapshot, tool_name: str,
+    ) -> tuple[Path, ...]:
+        """Expose Task grants only to the four built-in read operations."""
+        if tool_name not in {
+            "core.read_file", "core.list_files",
+            "core.find_files", "core.search_text",
+        }:
+            return ()
+        return tuple(
+            Path(grant.canonical_root)
+            for grant in task.workspace_access_grants
+            if grant.capability is WorkspaceAccessCapability.READ
+        )
+
+    @staticmethod
+    def _resource_records(
+        task: TaskSnapshot,
+    ) -> tuple[Mapping[str, str], ...]:
+        """Project persisted discovery results into a Task-local resource catalog.
+
+        Tool results remain the source of truth. No second database or live cache is
+        needed, so references survive SQLite restore and cannot cross Task identity.
+        """
+        records: dict[str, Mapping[str, str]] = {}
+        for execution in task.tool_executions.values():
+            result = execution.result
+            if (
+                execution.state is not ToolCommitState.COMMITTED
+                or result is None or not result.ok
+                or not isinstance(result.data, Mapping)
+            ):
+                continue
+            for field in ("entries", "matches"):
+                values = result.data.get(field)
+                if not isinstance(values, (list, tuple)):
+                    continue
+                for value in values:
+                    if not isinstance(value, Mapping):
+                        continue
+                    required = (
+                        value.get("resource_ref"), value.get("path"),
+                        value.get("resolved_path"), value.get("resolved_root"),
+                        value.get("root_kind"),
+                    )
+                    if not all(isinstance(item, str) and item for item in required):
+                        continue
+                    reference = str(required[0])
+                    records[reference] = {
+                        "resource_ref": reference,
+                        "path": str(required[1]),
+                        "resolved_path": str(required[2]),
+                        "resolved_root": str(required[3]),
+                        "root_kind": str(required[4]),
+                    }
+        return tuple(records[key] for key in sorted(records))
+
+    @classmethod
+    def _resource_paths(cls, task: TaskSnapshot) -> Mapping[str, str]:
+        return {
+            record["resource_ref"]: record["resolved_path"]
+            for record in cls._resource_records(task)
+        }
+
+    @classmethod
+    def _resource_candidates(
+        cls, task: TaskSnapshot,
+    ) -> Mapping[str, tuple[Mapping[str, str], ...]]:
+        grouped: dict[str, list[Mapping[str, str]]] = {}
+        for record in cls._resource_records(task):
+            grouped.setdefault(record["path"], []).append(record)
+        return {
+            path: tuple(sorted(values, key=lambda item: item["resolved_path"]))
+            for path, values in grouped.items()
+        }
 
     @staticmethod
     def _approval_target(call: ToolCall) -> str:

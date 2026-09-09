@@ -103,6 +103,17 @@ class RuleBasedExplorationBudgetPolicy:
         observation: ExplorationBudgetObservation, state: ExplorationBudgetState,
     ) -> ExplorationBudgetUpdate:
         self._require_started()
+        if (
+            not result.ok
+            and bool(result.meta.get("recoverable_input"))
+        ):
+            return ExplorationBudgetUpdate(
+                state, 0, "recoverable_input", 0, False,
+                max(0, int(observation.elapsed_milliseconds)),
+                self.max_scored_actions, self.max_total_tool_calls,
+                self.max_cumulative_tool_milliseconds,
+                self.max_low_value_streak, self.reserve_tool_calls,
+            )
         if not self._is_exploration(semantic_action):
             return ExplorationBudgetUpdate(
                 state, 0, "ignored", 0, False,

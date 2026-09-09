@@ -6,12 +6,77 @@ from pathlib import Path
 
 from tsm_agt.adapters.fixture import EchoModelProvider
 from tsm_agt.bootstrap import compose_fixture_application
-from tsm_agt.core import ModelInvocationFailed, TaskState
-from tsm_agt.ports import (
-    EvidenceQuestion, FinishReason, Message, MessageRole, ModelRequest,
-    ModelResponse, ProviderCapabilities, RuntimeStorePort, TextBlock, ToolCall,
-    ToolCallBlock, ToolResultBlock,
+from tsm_agt.core import (
+    EvidenceObservationKind, EvidenceQuestionProjection,
+    EvidenceQuestionStatus, ModelInvocationFailed, TaskState,
 )
+from tsm_agt.ports import (
+    EvidenceDelta, EvidenceItem, EvidenceQuestion, FinishReason, Message, MessageRole, ModelRequest,
+    ModelResponse, ProviderCapabilities, RuntimeStorePort, TextBlock, ToolCall,
+    ToolCallBlock, ToolResult, ToolResultBlock,
+)
+
+
+class EvidenceQuestionLifecycleTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.question = EvidenceQuestion("Q1", "Where is the behavior defined?")
+        self.call = ToolCall(
+            "call-1", "core.search_text", {"query": "Target"},
+            self.question,
+        )
+        self.bound = EvidenceQuestionProjection("task-1").bind(
+            self.question, "turn-1", self.call.call_id, event_sequence=1
+        )
+
+    def test_success_and_failure_are_distinct_observations(self) -> None:
+        exclusion = EvidenceDelta(
+            "Q1", (EvidenceItem(
+                "new_exclusions", "empty-hash", "no-results:search"
+            ),), "ok", 0,
+        )
+        succeeded, success = self.bound.observe(
+            self.call, ToolResult(
+                self.call.call_id, True, {"matches": []}
+            ), exclusion, event_sequence=2,
+        )
+        self.assertEqual(success.status, EvidenceQuestionStatus.RESOLVED)
+        self.assertEqual(
+            success.observation_kind, EvidenceObservationKind.EMPTY_RESULT
+        )
+        failed, failure = self.bound.observe(
+            self.call, ToolResult(
+                self.call.call_id, False, error_code="PERMISSION_DENIED"
+            ), None, event_sequence=2,
+        )
+        self.assertEqual(failure.status, EvidenceQuestionStatus.BLOCKED)
+        self.assertEqual(failure.blocking_reason, "PERMISSION_DENIED")
+        self.assertNotEqual(succeeded.to_data(), failed.to_data())
+
+    def test_recoverable_failure_stays_open_and_redirect_drops_it(self) -> None:
+        recoverable, record = self.bound.observe(
+            self.call, ToolResult(
+                self.call.call_id, False, error_code="PATH_CONTEXT_REQUIRED",
+                retryable=True, meta={"recoverable_input": True},
+            ), None, event_sequence=2,
+        )
+        self.assertEqual(record.status, EvidenceQuestionStatus.OPEN)
+        dropped, records = recoverable.drop_open(event_sequence=3)
+        self.assertEqual(len(records), 1)
+        dropped_record = dropped.get("Q1")
+        self.assertIsNotNone(dropped_record)
+        assert dropped_record is not None
+        self.assertEqual(dropped_record.status, EvidenceQuestionStatus.DROPPED)
+
+    def test_rephrased_stable_id_keeps_original_question_definition(self) -> None:
+        rebound = self.bound.bind(
+            EvidenceQuestion("Q1", "Where exactly is that behavior implemented?"),
+            "turn-1", "call-2",
+        )
+        record = rebound.get("Q1")
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.question, "Where is the behavior defined?")
+        self.assertEqual(record.tool_call_ids, ("call-1", "call-2"))
 
 
 class EvidenceQuestionModel(EchoModelProvider):
@@ -91,6 +156,26 @@ class EvidenceQuestionKernelTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     requested.payload["call"]["evidence_question"]["question_id"],
                     "E1",
+                )
+                lifecycle = await application.kernel.get_evidence_questions(
+                    task.task_id
+                )
+                record = lifecycle.get("E1")
+                self.assertIsNotNone(record)
+                assert record is not None
+                self.assertEqual(record.status, EvidenceQuestionStatus.RESOLVED)
+                self.assertEqual(record.tool_call_ids, ("call-evidence",))
+                changed = next(
+                    event for event in events
+                    if event.event_type == "evidence.question_state_changed"
+                )
+                self.assertEqual(changed.payload["previous_status"], "OPEN")
+                self.assertEqual(changed.payload["next_status"], "RESOLVED")
+                flow = await application.kernel.get_flow_projection(task.task_id)
+                rendered_flow = str(flow.to_data())
+                self.assertIn("evidence_question", rendered_flow)
+                self.assertNotIn(
+                    "What text does the fixture return?", rendered_flow
                 )
             finally:
                 await application.registry.stop_all()

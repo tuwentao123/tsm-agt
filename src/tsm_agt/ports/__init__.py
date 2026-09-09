@@ -50,13 +50,20 @@ from .process import (
 from .sandbox import SandboxDecision, SandboxPort, SandboxRequest
 from .cross_process_lock import CrossProcessLockPort
 from .workspace_filesystem import WorkspaceFilesystemPort
-from .workspace_path import ResolvedWorkspacePath, WorkspacePathPort
+from .workspace_path import (
+    ResolvedWorkspacePath, WorkspacePathPort, is_sensitive_read_path,
+)
 from .local_identity import LocalIdentityPort
 from .flow_artifact_export import FlowArtifactExportPort, FlowArtifactExportResult
 from .replay_cursor_store import ReplayCursor, ReplayCursorStorePort
 from .project_memory import MemoryOperationResult, ProjectMemoryPort, StoredMemory
 from .code_intelligence import CodeIntelligencePort
 from .runtime_input_classifier import RuntimeInputClassifierPort
+from .session_input_resolver import SessionInputResolverPort
+from .checkpoint_compatibility import (
+    CheckpointCompatibilityAction, CheckpointCompatibilityDecision,
+    CheckpointCompatibilityPolicyPort, CheckpointCompatibilityProbe,
+)
 from .evidence_delta import (
     EVIDENCE_CATEGORIES, EvidenceDelta, EvidenceDeltaEvaluatorPort,
     EvidenceEvaluation, EvidenceInventory, EvidenceItem,
@@ -77,6 +84,19 @@ from .progressive_scope_policy import (
     ProgressiveScopeAction, ProgressiveScopeDecision,
     ProgressiveScopePolicyPort, ProgressiveScopeState, ProgressiveScopeUpdate,
     ScopeProbe, ScopeTrack,
+)
+from .tool_scope_consistency import (
+    ToolScopeConsistencyAction, ToolScopeConsistencyDecision,
+    ToolScopeConsistencyPolicyPort, ToolScopeConsistencyProbe, ToolScopeRelation,
+)
+from .completion_readiness import (
+    CompletionGap, CompletionReadinessAction, CompletionReadinessDecision,
+    CompletionReadinessPolicyPort, CompletionReadinessProbe,
+    CompletionReadinessState,
+)
+from .final_acceptance import (
+    FinalAcceptanceAction, FinalAcceptanceDecision, FinalAcceptancePolicyPort,
+    FinalAcceptanceProbe, FinalAcceptanceViolation, FinalQuestionEvidence,
 )
 from .exploration_budget_policy import (
     ExplorationBudgetAction, ExplorationBudgetDecision,
@@ -143,6 +163,23 @@ __all__ = [
     "HealthStatus",
     "FinishReason",
     "EvidenceQuestion",
+    "CompletionGap",
+    "CompletionReadinessAction",
+    "CompletionReadinessDecision",
+    "CompletionReadinessPolicyPort",
+    "CompletionReadinessProbe",
+    "CompletionReadinessState",
+    "FinalAcceptanceAction",
+    "FinalAcceptanceDecision",
+    "FinalAcceptancePolicyPort",
+    "FinalAcceptanceProbe",
+    "FinalAcceptanceViolation",
+    "FinalQuestionEvidence",
+    "ToolScopeConsistencyAction",
+    "ToolScopeConsistencyDecision",
+    "ToolScopeConsistencyPolicyPort",
+    "ToolScopeConsistencyProbe",
+    "ToolScopeRelation",
     "FlowArtifactExportPort",
     "FlowArtifactExportResult",
     "ReplayCursor",
@@ -171,6 +208,11 @@ __all__ = [
     "ProcessStartRequest",
     "RuntimeAdapter",
     "RuntimeInputClassifierPort",
+    "SessionInputResolverPort",
+    "CheckpointCompatibilityAction",
+    "CheckpointCompatibilityDecision",
+    "CheckpointCompatibilityPolicyPort",
+    "CheckpointCompatibilityProbe",
     "EVIDENCE_CATEGORIES",
     "EvidenceDelta",
     "EvidenceDeltaEvaluatorPort",

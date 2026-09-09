@@ -31,6 +31,7 @@ class FlowNodeKind(StrEnum):
     CHECKPOINT = "checkpoint"
     STEERING = "steering"
     PLAN = "plan"
+    EVIDENCE_QUESTION = "evidence_question"
 
 
 class FlowNodeStatus(StrEnum):
@@ -476,6 +477,7 @@ class FlowProjection:
             FlowNodeKind.CLARIFICATION: FlowLane.USER,
             FlowNodeKind.STEERING: FlowLane.USER,
             FlowNodeKind.PLAN: FlowLane.CONTROL,
+            FlowNodeKind.EVIDENCE_QUESTION: FlowLane.CONTROL,
             FlowNodeKind.VERIFICATION: FlowLane.CONTROL,
             FlowNodeKind.PHASE: FlowLane.CONTROL,
             FlowNodeKind.CHECKPOINT: FlowLane.CONTROL,
@@ -1416,6 +1418,61 @@ class FlowProjector:
                         ),
                     }, node_id=node_id,
                 )
+            elif event_type in {
+                "evidence.question_bound",
+                "evidence.question_state_changed",
+            }:
+                turn_id = str(payload.get("turn_id", "unknown"))
+                question_ref = str(payload.get("question_ref", "unknown"))
+                node_id = f"evidence-question:{question_ref}"
+                if event_type == "evidence.question_bound":
+                    add_node(FlowNode(
+                        node_id, task_id, turn_parent(turn_id),
+                        FlowNodeKind.EVIDENCE_QUESTION,
+                        f"Evidence question {question_ref}",
+                        FlowNodeStatus.RUNNING, event.occurred_at, None, None,
+                        None, event.sequence, None,
+                    ))
+                else:
+                    next_status = str(payload.get("next_status", "OPEN"))
+                    status = {
+                        "OPEN": FlowNodeStatus.RUNNING,
+                        "RESOLVED": FlowNodeStatus.SUCCEEDED,
+                        "BLOCKED": FlowNodeStatus.WAITING_USER,
+                        "DROPPED": FlowNodeStatus.SKIPPED,
+                    }.get(next_status, FlowNodeStatus.FAILED)
+                    finish(
+                        node_id, event, status,
+                        wait_reason=(
+                            str(payload.get("blocking_reason"))
+                            if status is FlowNodeStatus.WAITING_USER
+                            and payload.get("blocking_reason") is not None
+                            else None
+                        ),
+                    )
+                    add_fact(
+                        FlowDiagnosticCategory.RESULT, event,
+                        "evidence.question-state", {
+                            "question_ref": question_ref,
+                            "previous_status": str(
+                                payload.get("previous_status", "")
+                            ),
+                            "next_status": next_status,
+                            "observation_kind": str(
+                                payload.get("observation_kind", "")
+                            ),
+                            "blocking_reason": (
+                                str(payload["blocking_reason"])
+                                if payload.get("blocking_reason") is not None
+                                else None
+                            ),
+                            "evidence_count": (
+                                int(payload["evidence_count"])
+                                if isinstance(payload.get("evidence_count"), int)
+                                else 0
+                            ),
+                        }, node_id=node_id,
+                    )
             elif event_type in {"steering.queued", "steering.applied"}:
                 turn_id = str(payload.get("turn_id", "unknown"))
                 steering_applied = event_type == "steering.applied"

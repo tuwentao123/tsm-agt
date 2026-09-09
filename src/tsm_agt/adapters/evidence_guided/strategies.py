@@ -211,6 +211,14 @@ class RuleBasedExplorationOutcomePolicy(_Lifecycle):
         state: ExplorationOutcomeState,
     ) -> ExplorationOutcomeDecision:
         self._require_started()
+        if (
+            not result.ok
+            and bool(result.meta.get("recoverable_input"))
+        ):
+            return ExplorationOutcomeDecision(
+                ExplorationOutcomeAction.CONTINUE,
+                "recoverable_path_context", state,
+            )
         has_progress = result.ok and (
             evidence_delta is None or evidence_delta.has_progress
         )

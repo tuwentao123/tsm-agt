@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
 import signal
 import sqlite3
 import subprocess
@@ -67,15 +68,26 @@ class ChatSigintIntegrationTest(unittest.TestCase):
                     "--workspace", str(workspace), "--title", "idle SIGINT",
                 ],
                 cwd=project_root, env=environment, stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             assert process.stdin is not None
-            process.stdin.write("n\n")
+            assert process.stdout is not None
+            process.stdin.write(b"n\n")
             process.stdin.flush()
-            time.sleep(0.5)
+            prefix = bytearray()
+            deadline = time.monotonic() + 8.0
+            while b"you> " not in prefix and time.monotonic() < deadline:
+                ready, _, _ = select.select([process.stdout], [], [], 0.1)
+                if ready:
+                    prefix.extend(os.read(process.stdout.fileno(), 4096))
+                if process.poll() is not None:
+                    break
+            self.assertIn(b"you> ", prefix, prefix.decode(errors="replace"))
             started = time.monotonic()
             process.send_signal(signal.SIGINT)
-            stdout, stderr = process.communicate(timeout=3.0)
+            remaining_stdout, raw_stderr = process.communicate(timeout=3.0)
+            stdout = (bytes(prefix) + remaining_stdout).decode(errors="replace")
+            stderr = raw_stderr.decode(errors="replace")
             elapsed = time.monotonic() - started
             self.assertEqual(process.returncode, 0, (stdout, stderr))
             self.assertLess(elapsed, 2.0)

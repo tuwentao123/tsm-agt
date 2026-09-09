@@ -54,6 +54,17 @@ class PosixWorkspacePath:
         self._require_started()
         return path.is_symlink()
 
+    def is_same_or_descendant(self, path: Path, root: Path) -> bool:
+        """Use canonical POSIX identity; this comparison grants no access."""
+        self._require_started()
+        candidate = path.expanduser().resolve(strict=False)
+        ancestor = root.expanduser().resolve(strict=False)
+        try:
+            candidate.relative_to(ancestor)
+        except ValueError:
+            return False
+        return True
+
     def resolve_mutation_path(
         self, workspace: Path, relative_path: str,
     ) -> ResolvedWorkspacePath:
@@ -95,6 +106,51 @@ class PosixWorkspacePath:
         return ResolvedWorkspacePath(
             root, resolved, relative.as_posix(), str(resolved)
         )
+
+    def resolve_read_path(
+        self, workspace: Path, requested_path: str,
+        additional_roots: tuple[Path, ...] = (),
+    ) -> ResolvedWorkspacePath:
+        self._require_started()
+        workspace_root = self.normalize_workspace(workspace)
+        candidate = Path(requested_path).expanduser()
+        resolved = (
+            candidate.resolve(strict=False)
+            if candidate.is_absolute()
+            else (workspace_root / candidate).resolve(strict=False)
+        )
+        roots = (workspace_root,) + tuple(
+            self.normalize_workspace(root) for root in additional_roots
+        )
+        for root in roots:
+            try:
+                relative = resolved.relative_to(root)
+            except ValueError:
+                continue
+            return ResolvedWorkspacePath(
+                root, resolved, relative.as_posix(), str(resolved)
+            )
+        raise ValueError("path escapes the approved read roots")
+
+    def external_read_approval_root(
+        self, workspace: Path, requested_path: str,
+    ) -> Path | None:
+        self._require_started()
+        workspace_root = self.normalize_workspace(workspace)
+        candidate = Path(requested_path).expanduser()
+        candidate = (
+            candidate.resolve(strict=False)
+            if candidate.is_absolute()
+            else (workspace_root / candidate).resolve(strict=False)
+        )
+        if not candidate.exists():
+            return None
+        root = candidate if candidate.is_dir() else candidate.parent
+        root = root.resolve(strict=True)
+        home = Path.home().resolve(strict=True)
+        if root == home or root == Path(root.anchor):
+            return None
+        return root
 
     def _require_started(self) -> None:
         if not self._started:

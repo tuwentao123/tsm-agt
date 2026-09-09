@@ -104,6 +104,30 @@ class RuleBasedExplorationBudgetPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(update.score, 10)
         self.assertEqual(update.value_band, "useful")
 
+    async def test_recoverable_path_error_does_not_consume_soft_budget(self):
+        call = ToolCall(
+            "recover-path", "core.read_file",
+            {"path": "src/external.py"},
+            EvidenceQuestion("Q-path", "Read the discovered file"),
+        )
+        action = await self.classifier.classify(call)
+        state = ExplorationBudgetState(
+            scored_actions=3, low_value_streak=2,
+            cumulative_tool_milliseconds=500,
+        )
+        update = await self.policy.after_result(
+            call, ToolResult(
+                call.call_id, False, data={"candidates": []},
+                error_code="PATH_CONTEXT_REQUIRED", retryable=True,
+                meta={"recoverable_input": True},
+            ), action, EvidenceDelta(
+                "Q-path", (), "recoverable:PATH_CONTEXT_REQUIRED", 2
+            ), ExplorationBudgetObservation(25), state,
+        )
+        self.assertEqual(update.state, state)
+        self.assertEqual(update.value_band, "recoverable_input")
+        self.assertEqual(update.score, 0)
+
     async def test_large_workspace_search_is_lead_generation_not_progress(self):
         call = search_call("broad-list")
         action = await self.classifier.classify(call)

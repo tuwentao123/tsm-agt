@@ -16,6 +16,9 @@ from typing import Any
 from tsm_agt.ports import RuntimeEvent
 
 from .configuration import canonical_hash
+from .evidence_question import (
+    EvidenceQuestionProjection, EvidenceQuestionStatus,
+)
 
 
 class WorkingPlanStepStatus(StrEnum):
@@ -204,6 +207,142 @@ class WorkingMemorySnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class EffectiveWorkingMemory:
+    """Read-only Task state assembled from authored memory and Runtime facts.
+
+    The model-authored snapshot remains revisioned and replaceable through the
+    working-memory tool.  Runtime-derived items are projected independently from
+    durable Evidence Question events, so a later model update cannot accidentally
+    erase a still-open question or preserve a question that has been resolved.
+    """
+
+    snapshot: WorkingMemorySnapshot
+    runtime_remaining_work: tuple[str, ...] = ()
+    runtime_evidence: tuple[WorkingEvidenceReference, ...] = ()
+    runtime_source_event_sequences: tuple[int, ...] = ()
+    projection_hash: str = ""
+
+    def __post_init__(self) -> None:
+        if tuple(sorted(set(self.runtime_source_event_sequences))) != (
+            self.runtime_source_event_sequences
+        ):
+            raise ValueError(
+                "effective working memory sources must be sorted and unique"
+            )
+        expected = canonical_hash(self.hash_source())
+        if self.projection_hash and self.projection_hash != expected:
+            raise ValueError(
+                "effective working memory projection hash does not match"
+            )
+        object.__setattr__(self, "projection_hash", expected)
+
+    @property
+    def remaining_work(self) -> tuple[str, ...]:
+        return _merge_bounded(
+            self.runtime_remaining_work, self.snapshot.remaining_work, limit=50
+        )
+
+    @property
+    def evidence(self) -> tuple[WorkingEvidenceReference, ...]:
+        merged: list[WorkingEvidenceReference] = []
+        seen: set[str] = set()
+        for item in self.runtime_evidence + self.snapshot.evidence:
+            if item.evidence_id in seen:
+                continue
+            seen.add(item.evidence_id)
+            merged.append(item)
+            if len(merged) >= 50:
+                break
+        return tuple(merged)
+
+    def hash_source(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "task_id": self.snapshot.task_id,
+            "base_revision": self.snapshot.revision,
+            "base_content_hash": self.snapshot.content_hash,
+            "runtime_remaining_work": list(self.runtime_remaining_work),
+            "runtime_evidence": [
+                item.to_data() for item in self.runtime_evidence
+            ],
+            "runtime_source_event_sequences": list(
+                self.runtime_source_event_sequences
+            ),
+        }
+
+    def to_data(self) -> dict[str, Any]:
+        """Keep the authored snapshot compatible and expose derived state."""
+        return {
+            **self.snapshot.to_data(),
+            "runtime_derived": {
+                "remaining_work": list(self.runtime_remaining_work),
+                "evidence": [item.to_data() for item in self.runtime_evidence],
+                "source_event_sequences": list(
+                    self.runtime_source_event_sequences
+                ),
+                "projection_hash": self.projection_hash,
+            },
+            "effective_remaining_work": list(self.remaining_work),
+            "effective_evidence": [item.to_data() for item in self.evidence],
+        }
+
+    def session_state_data(self) -> dict[str, Any]:
+        data = self.snapshot.session_state_data()
+        data["remaining_work"] = list(self.remaining_work)
+        return data
+
+
+@dataclass(frozen=True, slots=True)
+class EffectiveWorkingMemoryProjector:
+    """Derive minimum trusted progress from persisted Runtime events."""
+
+    def project(
+        self, snapshot: WorkingMemorySnapshot,
+        questions: EvidenceQuestionProjection,
+    ) -> EffectiveWorkingMemory:
+        if snapshot.task_id != questions.task_id:
+            raise ValueError(
+                "working memory and evidence questions belong to different Tasks"
+            )
+        remaining: list[str] = []
+        evidence: list[WorkingEvidenceReference] = []
+        sources: set[int] = set()
+        for record in questions.records:
+            if record.status in {
+                EvidenceQuestionStatus.OPEN, EvidenceQuestionStatus.BLOCKED,
+            }:
+                prefix = (
+                    "Resolve evidence question"
+                    if record.status is EvidenceQuestionStatus.OPEN
+                    else "Unblock evidence question"
+                )
+                detail = f"{prefix}: {record.question}"
+                if record.expected_scope:
+                    detail += f" (scope: {record.expected_scope})"
+                if record.blocking_reason:
+                    detail += f" (reason: {record.blocking_reason})"
+                remaining.append(detail[:1000])
+            elif (
+                record.status is EvidenceQuestionStatus.RESOLVED
+                and record.evidence_references
+            ):
+                evidence.append(WorkingEvidenceReference(
+                    evidence_id=f"runtime-question-{record.question_ref}",
+                    kind="evidence_question",
+                    reference=record.evidence_references[-1],
+                    summary=f"Resolved evidence question: {record.question}"[:1000],
+                ))
+            if record.updated_event_sequence > 0:
+                sources.add(record.updated_event_sequence)
+        return EffectiveWorkingMemory(
+            snapshot=snapshot,
+            runtime_remaining_work=tuple(remaining[-20:]),
+            runtime_evidence=tuple(evidence[-20:]),
+            runtime_source_event_sequences=tuple(sorted(sources)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class WorkingMemoryProjector:
     def project(
         self, task_id: str, default_goal: str, events: Sequence[RuntimeEvent],
@@ -277,3 +416,18 @@ def _object_tuple(data: Mapping[str, Any], key: str, factory):
     if any(not isinstance(item, Mapping) for item in raw):
         raise ValueError(f"working memory {key} entries must be objects")
     return tuple(factory(item) for item in raw)
+
+
+def _merge_bounded(
+    preferred: tuple[str, ...], authored: tuple[str, ...], *, limit: int,
+) -> tuple[str, ...]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for item in preferred + authored:
+        if item in seen:
+            continue
+        seen.add(item)
+        merged.append(item)
+        if len(merged) >= limit:
+            break
+    return tuple(merged)

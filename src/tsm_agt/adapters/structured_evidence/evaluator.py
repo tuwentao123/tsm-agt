@@ -79,7 +79,15 @@ class StructuredEvidenceDeltaEvaluator:
             new_items.append(item)
             if len(new_items) >= self._MAX_ITEMS:
                 break
-        zero_count = 0 if new_items else inventory.consecutive_zero_delta + 1
+        recoverable_input = (
+            not result.ok and bool(result.meta.get("recoverable_input"))
+        )
+        zero_count = (
+            inventory.consecutive_zero_delta
+            if recoverable_input
+            else 0 if new_items
+            else inventory.consecutive_zero_delta + 1
+        )
         next_inventory = EvidenceInventory(
             {category: tuple(sorted(values)) for category, values in known.items()},
             zero_count,
@@ -91,7 +99,12 @@ class StructuredEvidenceDeltaEvaluator:
         return EvidenceEvaluation(
             EvidenceDelta(
                 question_id, tuple(new_items),
-                "ok" if result.ok else f"error:{result.error_code or 'UNKNOWN'}",
+                (
+                    f"recoverable:{result.error_code or 'TOOL_FAILED'}"
+                    if recoverable_input
+                    else "ok" if result.ok
+                    else f"error:{result.error_code or 'UNKNOWN'}"
+                ),
                 zero_count,
             ),
             next_inventory,

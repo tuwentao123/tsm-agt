@@ -1,0 +1,96 @@
+"""Conservative project-neutral final-answer readiness policy."""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from tsm_agt.ports import (
+    AdapterContext, AdapterDescriptor, CompletionReadinessAction,
+    CompletionReadinessDecision, CompletionReadinessPolicyPort,
+    CompletionReadinessProbe, CompletionReadinessState, HealthState, HealthStatus,
+)
+
+
+class RuleBasedCompletionReadinessPolicy:
+    """Allow one work correction and one blocker-disclosure correction.
+
+    It does not understand Android, Web, backend, or natural-language phrases.
+    Kernel supplies only persisted gaps. Recoverable required gaps may continue
+    once when tools and hard budget remain. Persistent or external gaps get one
+    direct blocker-report correction, after which the Task must finish to avoid a
+    second infinite loop.
+    """
+
+    descriptor = AdapterDescriptor(
+        "builtin.rule-based-completion-readiness", "1.0.0",
+        "CompletionReadinessPolicyPort", "1.0",
+        frozenset({"project-neutral", "checkpointed", "bounded-correction"}),
+    )
+
+    def __init__(self, *, max_continue_attempts: int = 1) -> None:
+        if max_continue_attempts < 0:
+            raise ValueError("max_continue_attempts must not be negative")
+        self.max_continue_attempts = max_continue_attempts
+        self._started = False
+
+    async def start(self, context: AdapterContext) -> None:
+        self._started = True
+
+    async def stop(self, deadline: datetime) -> None:
+        self._started = False
+
+    async def health(self) -> HealthStatus:
+        return HealthStatus(
+            HealthState.HEALTHY if self._started else HealthState.UNHEALTHY,
+            "completion readiness policy ready"
+            if self._started else "not started",
+        )
+
+    async def evaluate(
+        self, probe: CompletionReadinessProbe, state: CompletionReadinessState,
+    ) -> CompletionReadinessDecision:
+        if not self._started:
+            raise RuntimeError("completion readiness policy is not started")
+        required = tuple(gap for gap in probe.gaps if gap.required)
+        if not required:
+            return self._decision(
+                CompletionReadinessAction.COMPLETE, "core_goal_has_no_known_gaps",
+                state, probe,
+            )
+        recoverable = tuple(gap for gap in required if gap.recoverable)
+        can_continue = bool(
+            recoverable and probe.available_read_tools
+            and probe.remaining_model_calls > 0
+            and probe.remaining_tool_calls > 0
+            and not probe.forced_wrap_up
+            and state.continue_attempts < self.max_continue_attempts
+        )
+        if can_continue:
+            next_state = CompletionReadinessState(
+                state.continue_attempts + 1, state.disclosure_attempts,
+                CompletionReadinessAction.CONTINUE.value,
+            )
+            return CompletionReadinessDecision(
+                CompletionReadinessAction.CONTINUE,
+                "required_low_risk_work_remains", next_state, recoverable,
+            )
+        if probe.remaining_model_calls > 0 and state.disclosure_attempts == 0:
+            next_state = CompletionReadinessState(
+                state.continue_attempts, 1,
+                CompletionReadinessAction.REPORT_BLOCKED.value,
+            )
+            return CompletionReadinessDecision(
+                CompletionReadinessAction.REPORT_BLOCKED,
+                "required_work_is_blocked_or_correction_limit_reached",
+                next_state, required,
+            )
+        return self._decision(
+            CompletionReadinessAction.COMPLETE,
+            "bounded_completion_corrections_exhausted", state, probe,
+        )
+
+    @staticmethod
+    def _decision(action, reason, state, probe):
+        return CompletionReadinessDecision(action, reason, CompletionReadinessState(
+            state.continue_attempts, state.disclosure_attempts, action.value
+        ), tuple(gap for gap in probe.gaps if gap.required))

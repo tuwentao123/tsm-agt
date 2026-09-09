@@ -102,6 +102,16 @@ class PromptManifestTest(unittest.TestCase):
         self.assertNotIn("inspect the project", str(data))
         self.assertNotIn("Read a workspace file", str(data))
 
+    def test_general_path_guidance_uses_runtime_facts_not_intent_regex(self) -> None:
+        segment = next(
+            item for item in self.template.static_segments
+            if item.segment_id == "harness-instructions"
+        )
+
+        self.assertIn("Honor user-named paths", segment.content)
+        self.assertIn("resolved_root over assumptions", segment.content)
+        self.assertNotIn("ExplicitScopeHint", segment.content)
+
 
 if __name__ == "__main__":
     unittest.main()
