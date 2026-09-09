@@ -12,9 +12,11 @@ from tsm_agt.ports import (
     HealthState,
     HealthStatus,
     ToolCall,
+    ToolEffect,
     ToolIdempotency,
     ToolInvocationContext,
     ToolResult,
+    ToolResultAuthority,
     ToolRisk,
     ToolSpec,
 )
@@ -71,6 +73,8 @@ class CoreProcessToolProvider:
                 "stop a returned background process; foreground filesystem or external "
                 "side effects require separate inspection and rollback"
             ),
+            effect=ToolEffect.EXECUTE,
+            result_authority=ToolResultAuthority.PROCESS_FACT,
         ),
         ToolSpec(
             name="core.process_status",
@@ -89,6 +93,8 @@ class CoreProcessToolProvider:
             is_read_only=True,
             is_concurrency_safe=True,
             idempotency=ToolIdempotency.IDEMPOTENT,
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.PROCESS_FACT,
         ),
         ToolSpec(
             name="core.process_logs",
@@ -111,6 +117,8 @@ class CoreProcessToolProvider:
             is_read_only=True,
             is_concurrency_safe=True,
             idempotency=ToolIdempotency.IDEMPOTENT,
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.PROCESS_FACT,
         ),
         ToolSpec(
             name="core.process_stop",
@@ -133,6 +141,8 @@ class CoreProcessToolProvider:
             is_concurrency_safe=False,
             idempotency=ToolIdempotency.IDEMPOTENT,
             rollback="cannot restart the same process; start a new process if still needed",
+            effect=ToolEffect.CONTROL,
+            result_authority=ToolResultAuthority.RUNTIME_FACT,
         ),
     )
 

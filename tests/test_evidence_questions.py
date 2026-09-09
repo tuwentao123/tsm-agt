@@ -9,6 +9,7 @@ from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     EvidenceObservationKind, EvidenceQuestionProjection,
     EvidenceQuestionStatus, ModelInvocationFailed, TaskState,
+    ToolActionDisposition,
 )
 from tsm_agt.ports import (
     EvidenceDelta, EvidenceItem, EvidenceQuestion, FinishReason, Message, MessageRole, ModelRequest,
@@ -77,6 +78,30 @@ class EvidenceQuestionLifecycleTest(unittest.TestCase):
         assert record is not None
         self.assertEqual(record.question, "Where is the behavior defined?")
         self.assertEqual(record.tool_call_ids, ("call-1", "call-2"))
+
+    def test_unexecuted_action_disposition_closes_or_blocks_without_evidence(self):
+        replaced, replaced_record = self.bound.dispose(
+            self.call, ToolActionDisposition.REPLACE, "change_method",
+            event_sequence=2,
+        )
+        self.assertIsNotNone(replaced_record)
+        assert replaced_record is not None
+        self.assertEqual(replaced_record.status, EvidenceQuestionStatus.DROPPED)
+        self.assertEqual(
+            replaced_record.observation_kind,
+            EvidenceObservationKind.ACTION_REPLACED,
+        )
+        self.assertEqual(replaced_record.evidence_references, ())
+
+        denied, denied_record = self.bound.dispose(
+            self.call, ToolActionDisposition.DENY, "policy_denied",
+            event_sequence=2,
+        )
+        self.assertIsNotNone(denied_record)
+        assert denied_record is not None
+        self.assertEqual(denied_record.status, EvidenceQuestionStatus.BLOCKED)
+        self.assertEqual(denied_record.evidence_references, ())
+        self.assertNotEqual(replaced.to_data(), denied.to_data())
 
 
 class EvidenceQuestionModel(EchoModelProvider):

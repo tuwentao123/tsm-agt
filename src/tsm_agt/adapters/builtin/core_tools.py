@@ -18,9 +18,11 @@ from tsm_agt.ports import (
     HealthStatus,
     ResolvedWorkspacePath,
     ToolCall,
+    ToolEffect,
     ToolIdempotency,
     ToolInvocationContext,
     ToolResult,
+    ToolResultAuthority,
     ToolRisk,
     ToolSpec,
     is_sensitive_read_path,
@@ -93,6 +95,8 @@ class CoreReadOnlyToolProvider:
             is_read_only=True,
             is_concurrency_safe=True,
             idempotency=ToolIdempotency.IDEMPOTENT,
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.WORKSPACE_FACT,
         ),
         ToolSpec(
             name="core.find_files",
@@ -125,6 +129,8 @@ class CoreReadOnlyToolProvider:
             is_read_only=True,
             is_concurrency_safe=True,
             idempotency=ToolIdempotency.IDEMPOTENT,
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.WORKSPACE_FACT,
         ),
         ToolSpec(
             name="core.read_file",
@@ -154,6 +160,8 @@ class CoreReadOnlyToolProvider:
             is_read_only=True,
             is_concurrency_safe=True,
             idempotency=ToolIdempotency.IDEMPOTENT,
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.WORKSPACE_FACT,
         ),
         ToolSpec(
             name="core.search_text",
@@ -185,6 +193,8 @@ class CoreReadOnlyToolProvider:
             is_read_only=True,
             is_concurrency_safe=True,
             idempotency=ToolIdempotency.IDEMPOTENT,
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.WORKSPACE_FACT,
         ),
     )
 

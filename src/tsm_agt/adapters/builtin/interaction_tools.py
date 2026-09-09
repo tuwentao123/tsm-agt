@@ -7,6 +7,7 @@ from datetime import datetime
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ToolCall,
     ToolIdempotency, ToolInvocationContext, ToolResult, ToolRisk, ToolSpec,
+    ToolEffect, ToolProtocol, ToolResultAuthority,
 )
 
 
@@ -50,6 +51,9 @@ class CoreInteractionToolProvider:
         idempotency=ToolIdempotency.KEYED, max_result_tokens=1000,
         data_transmission="the answer is returned only to the active model turn",
         rollback="no external side effect; the pending question can be left unanswered",
+        effect=ToolEffect.INTERACT,
+        result_authority=ToolResultAuthority.USER_INTENT,
+        protocol=ToolProtocol.WAIT_USER,
     )
 
     def __init__(self) -> None:

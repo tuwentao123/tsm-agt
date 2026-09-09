@@ -225,6 +225,21 @@ class StopOrPivotKernelTest(unittest.IsolatedAsyncioTestCase):
                 ])
                 self.assertNotIn("PivotTarget", payload)
                 self.assertNotIn("src/pivot.py", payload)
+                questions = await app.kernel.get_evidence_questions(task.task_id)
+                self.assertFalse(any(
+                    record.status.value in {"OPEN", "BLOCKED"}
+                    for record in questions.records
+                ))
+                disposed = [
+                    event for event in events
+                    if event.event_type == "tool.action_disposed"
+                ]
+                self.assertEqual(len(disposed), 1)
+                self.assertEqual(disposed[0].payload["disposition"], "REPLACE")
+                self.assertEqual(
+                    disposed[0].payload["reason"],
+                    "exploration_change_method_required",
+                )
             finally:
                 await app.registry.stop_all()
 

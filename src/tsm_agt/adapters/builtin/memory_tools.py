@@ -6,7 +6,8 @@ from datetime import datetime
 
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ToolCall,
-    ToolIdempotency, ToolInvocationContext, ToolResult, ToolRisk, ToolSpec,
+    ToolEffect, ToolIdempotency, ToolInvocationContext, ToolResult,
+    ToolResultAuthority, ToolRisk, ToolSpec,
 )
 
 
@@ -30,6 +31,8 @@ class CoreMemoryToolProvider:
                 "additionalProperties": False,
             },
             ToolRisk.R0, True, True, ToolIdempotency.IDEMPOTENT,
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.RUNTIME_FACT,
         ),
         ToolSpec(
             "core.memory_remember",
@@ -55,6 +58,8 @@ class CoreMemoryToolProvider:
             },
             ToolRisk.R1, False, False, ToolIdempotency.KEYED,
             rollback="delete the created memory by ID after reviewing dependent use",
+            effect=ToolEffect.INTERNAL,
+            result_authority=ToolResultAuthority.RUNTIME_FACT,
         ),
         ToolSpec(
             "core.memory_verify",
@@ -72,6 +77,8 @@ class CoreMemoryToolProvider:
             },
             ToolRisk.R1, False, False, ToolIdempotency.KEYED,
             rollback="verification appends a revision; prior provenance remains auditable",
+            effect=ToolEffect.INTERNAL,
+            result_authority=ToolResultAuthority.RUNTIME_FACT,
         ),
         ToolSpec(
             "core.memory_forget",
@@ -88,6 +95,8 @@ class CoreMemoryToolProvider:
             },
             ToolRisk.R1, False, False, ToolIdempotency.KEYED,
             rollback="recreate only from a reviewed source; deletion is not auto-restored",
+            effect=ToolEffect.INTERNAL,
+            result_authority=ToolResultAuthority.RUNTIME_FACT,
         ),
     )
 

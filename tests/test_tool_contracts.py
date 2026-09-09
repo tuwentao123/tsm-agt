@@ -7,14 +7,41 @@ from tsm_agt.core import ToolCommitState, ToolExecutionRecord
 from tsm_agt.ports import (
     EvidenceQuestion,
     ToolCall,
+    ToolEffect,
     ToolIdempotency,
+    ToolProtocol,
     ToolResult,
+    ToolResultAuthority,
     ToolRisk,
     ToolSpec,
 )
 
 
 class ToolContractTest(unittest.TestCase):
+    def test_tool_semantics_separate_evidence_from_user_interaction(self) -> None:
+        evidence_tool = ToolSpec(
+            "fixture.observe", "Observe one fact.",
+            {"type": "object", "properties": {}}, ToolRisk.R0,
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.WORKSPACE_FACT,
+        )
+        interaction_tool = ToolSpec(
+            "fixture.interact", "Ask the user.",
+            {"type": "object", "properties": {}}, ToolRisk.R0,
+            effect=ToolEffect.INTERACT,
+            result_authority=ToolResultAuthority.USER_INTENT,
+            protocol=ToolProtocol.WAIT_USER,
+        )
+        legacy_tool = ToolSpec(
+            "fixture.legacy", "Legacy adapter.",
+            {"type": "object", "properties": {}}, ToolRisk.R0,
+        )
+
+        self.assertTrue(evidence_tool.requires_evidence_question)
+        self.assertFalse(interaction_tool.requires_evidence_question)
+        self.assertTrue(legacy_tool.requires_evidence_question)
+        self.assertEqual(interaction_tool.to_data()["protocol"], "wait_user")
+
     def test_tool_contracts_serialize_provider_neutral_data(self) -> None:
         spec = ToolSpec(
             name="fixture.echo",

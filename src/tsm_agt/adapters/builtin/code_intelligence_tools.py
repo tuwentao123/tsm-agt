@@ -9,7 +9,7 @@ from typing import Any
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, CodeIntelligencePort, HealthState,
     HealthStatus, ToolCall, ToolIdempotency, ToolInvocationContext, ToolResult,
-    ToolRisk, ToolSpec,
+    ToolEffect, ToolResultAuthority, ToolRisk, ToolSpec,
 )
 
 
@@ -41,6 +41,8 @@ class CodeIntelligenceToolProvider:
         return ToolSpec(
             name, description, schema, ToolRisk.R0, is_read_only=True,
             is_concurrency_safe=True, idempotency=ToolIdempotency.IDEMPOTENT,
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.WORKSPACE_FACT,
         )
 
     _tools = (

@@ -7,7 +7,8 @@ from datetime import datetime
 
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ToolCall,
-    ToolIdempotency, ToolInvocationContext, ToolResult, ToolRisk, ToolSpec,
+    ToolEffect, ToolIdempotency, ToolInvocationContext, ToolResult,
+    ToolResultAuthority, ToolRisk, ToolSpec,
 )
 
 
@@ -24,6 +25,8 @@ class CoreTaskSpecToolProvider:
             "scope, constraints, and verifiable acceptance criteria.",
             {"type": "object", "properties": {}, "additionalProperties": False},
             ToolRisk.R0, True, True, ToolIdempotency.IDEMPOTENT,
+            effect=ToolEffect.INTERNAL,
+            result_authority=ToolResultAuthority.RUNTIME_FACT,
         ),
         ToolSpec(
             "core.task_spec_update",
@@ -62,6 +65,8 @@ class CoreTaskSpecToolProvider:
             ToolRisk.R0, False, False, ToolIdempotency.KEYED,
             rollback="append a corrected Task SPEC revision",
             is_internal_state=True,
+            effect=ToolEffect.INTERNAL,
+            result_authority=ToolResultAuthority.RUNTIME_FACT,
         ),
     )
 

@@ -6,17 +6,20 @@ from datetime import timedelta
 from pathlib import Path
 
 from tsm_agt.adapters.fixture import EchoModelProvider
+from tsm_agt.adapters.rule_based_final_acceptance import (
+    RuleBasedFinalAcceptancePolicy,
+)
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.cli import _chat
 from tsm_agt.core import (
     AgentClarificationSuspended, AgentTurnResult, ClarificationRequest,
-    ClarificationTokenMismatch, TaskState,
+    AcceptanceStatus, ClarificationTokenMismatch, TaskState,
 )
 from tsm_agt.ports import (
-    AdapterDescriptor, FinishReason, Message, MessageRole, ModelRequest,
+    AdapterDescriptor, EvidenceQuestion, FinishReason, Message, MessageRole, ModelRequest,
     ModelResponse, ModelUsage, ProviderCapabilities, RuntimeStorePort, TextBlock,
-    ToolCall, ToolCallBlock, ToolResultBlock,
+    ToolCall, ToolCallBlock, ToolResult, ToolResultBlock,
 )
 
 
@@ -135,6 +138,108 @@ class ClarificationProtocolTest(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("Which theme should I implement?", rendered_events)
                 self.assertNotIn("selected: dark", rendered_events)
                 self.assertNotIn(suspended.resume_token, str(waiting.to_data()))
+                questions = await application.kernel.get_evidence_questions(
+                    task.task_id
+                )
+                self.assertEqual(questions.records, ())
+            finally:
+                await application.registry.stop_all()
+
+    async def test_answered_interaction_is_not_final_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            application = compose_fixture_application(
+                model_adapter=ClarifyingModel(), tool_adapters=(),
+                require_evidence_questions=True,
+                final_acceptance_policy_adapter=RuleBasedFinalAcceptancePolicy(),
+            )
+            await application.registry.start_all()
+            try:
+                task = await self._executing_task(
+                    application, Path(directory), "task-interaction-acceptance"
+                )
+                suspended = await application.kernel.run_agent_turn(
+                    task.task_id, "build it"
+                )
+                self.assertIsInstance(suspended, AgentClarificationSuspended)
+                assert isinstance(suspended, AgentClarificationSuspended)
+                completed = await application.kernel.resolve_agent_clarification(
+                    suspended.request_id, suspended.resume_token, "dark"
+                )
+                self.assertIsInstance(completed, AgentTurnResult)
+                await application.kernel.transition_task(
+                    task.task_id, TaskState.VERIFYING, "verify interaction"
+                )
+                verification = await application.kernel.verify_task_acceptance(
+                    task.task_id
+                )
+                self.assertEqual(verification.status, AcceptanceStatus.PASSED)
+                criteria = {
+                    item.criterion_id: item for item in verification.criteria
+                }
+                self.assertEqual(
+                    criteria["final-evidence-integrity"].status,
+                    AcceptanceStatus.PASSED,
+                )
+                events = await application.registry.require(
+                    RuntimeStorePort
+                ).read_events(task.task_id)
+                self.assertFalse(any(
+                    event.event_type == "evidence.question_bound"
+                    for event in events
+                ))
+            finally:
+                await application.registry.stop_all()
+
+    async def test_legacy_interaction_question_does_not_block_verification(self) -> None:
+        """Old Events remain readable after interaction semantics upgrade."""
+        with tempfile.TemporaryDirectory() as directory:
+            application = compose_fixture_application(
+                model_adapter=ClarifyingModel(), tool_adapters=(),
+                final_acceptance_policy_adapter=RuleBasedFinalAcceptancePolicy(),
+            )
+            await application.registry.start_all()
+            try:
+                task = await self._executing_task(
+                    application, Path(directory), "task-legacy-interaction"
+                )
+                legacy_call = ToolCall(
+                    "legacy-request-input", "core.request_input",
+                    {"question": "Which option?", "reason": "material"},
+                    EvidenceQuestion("Q-legacy-interaction", "Which option?"),
+                )
+                await application.kernel._bind_evidence_question(
+                    task.task_id, "turn-legacy", legacy_call
+                )
+                await application.kernel._observe_evidence_question(
+                    task.task_id, "turn-legacy", legacy_call,
+                    ToolResult(
+                        legacy_call.call_id, True, data={"answer": "one"}
+                    ), None,
+                )
+                await application.kernel._append_events(task.task_id, (
+                    ("llm.completed", {
+                        "turn_id": "turn-legacy",
+                        "message": {
+                            "message_id": "legacy-answer",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Done."}],
+                        },
+                        "finish_reason": "stop",
+                    }),
+                    ("turn.completed", {"turn_id": "turn-legacy"}),
+                ))
+                await application.kernel.transition_task(
+                    task.task_id, TaskState.VERIFYING, "verify legacy interaction"
+                )
+                verification = await application.kernel.verify_task_acceptance(
+                    task.task_id
+                )
+                self.assertEqual(verification.status, AcceptanceStatus.PASSED)
+                final_integrity = next(
+                    item for item in verification.criteria
+                    if item.criterion_id == "final-evidence-integrity"
+                )
+                self.assertEqual(final_integrity.status, AcceptanceStatus.PASSED)
             finally:
                 await application.registry.stop_all()
 

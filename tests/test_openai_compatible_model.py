@@ -22,8 +22,11 @@ from tsm_agt.ports import (
     TextBlock,
     ToolCall,
     ToolCallBlock,
+    ToolEffect,
     ToolIdempotency,
+    ToolProtocol,
     ToolResult,
+    ToolResultAuthority,
     ToolResultBlock,
     ToolRisk,
     ToolSpec,
@@ -456,6 +459,50 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
                 "description"
             ],
         )
+
+    async def test_mixed_tools_use_per_tool_evidence_protocol(self) -> None:
+        provider, transport = await self._provider([{
+            "id": "chatcmpl-mixed-tools",
+            "choices": [{
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        }])
+        interaction = ToolSpec(
+            name="core.request_input",
+            description="Ask the user one material question.",
+            parameters={
+                "type": "object",
+                "properties": {"question": {"type": "string"}},
+                "required": ["question"],
+                "additionalProperties": False,
+            },
+            risk=ToolRisk.R0,
+            effect=ToolEffect.INTERACT,
+            result_authority=ToolResultAuthority.USER_INTENT,
+            protocol=ToolProtocol.WAIT_USER,
+        )
+
+        await provider.complete(ModelRequest(
+            "turn-mixed-tools", (),
+            tools=(self._tool_spec(), interaction),
+            require_evidence_questions=True,
+        ))
+
+        functions = {
+            item["function"]["name"]: item["function"]
+            for item in transport.requests[0]["payload"]["tools"]
+        }
+        read_schema = functions["core__read_file"]["parameters"]
+        interaction_schema = functions["core__request_input"]["parameters"]
+        self.assertEqual(
+            read_schema["required"], ["evidence_question", "tool_arguments"]
+        )
+        self.assertEqual(interaction_schema, dict(interaction.parameters))
+        self.assertNotIn("evidence question", functions[
+            "core__request_input"
+        ]["description"].casefold())
 
     async def test_missing_evidence_envelope_gets_auditable_default(self) -> None:
         provider, _ = await self._provider([{

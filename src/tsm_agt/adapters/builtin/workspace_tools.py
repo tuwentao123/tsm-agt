@@ -8,7 +8,8 @@ from typing import Any
 
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ToolCall,
-    ToolIdempotency, ToolInvocationContext, ToolResult, ToolRisk, ToolSpec,
+    ToolEffect, ToolIdempotency, ToolInvocationContext, ToolResult,
+    ToolResultAuthority, ToolRisk, ToolSpec,
 )
 
 
@@ -68,6 +69,8 @@ class CoreWorkspaceMutationToolProvider:
         is_concurrency_safe=False,
         idempotency=ToolIdempotency.NON_IDEMPOTENT,
         rollback="restore the journaled backup only if the current hash still matches the Agent result",
+        effect=ToolEffect.MUTATE,
+        result_authority=ToolResultAuthority.MUTATION_FACT,
     )
     _patch_many_spec = ToolSpec(
         name="core.apply_patches",
@@ -119,6 +122,8 @@ class CoreWorkspaceMutationToolProvider:
             "ordinary failures restore completed writes; committed mutations can "
             "later be rolled back from their journal records"
         ),
+        effect=ToolEffect.MUTATE,
+        result_authority=ToolResultAuthority.MUTATION_FACT,
     )
     _delete_spec = ToolSpec(
         name="core.delete_file",
@@ -145,6 +150,8 @@ class CoreWorkspaceMutationToolProvider:
         rollback=(
             "restore the journaled backup only while the deleted path is still absent"
         ),
+        effect=ToolEffect.MUTATE,
+        result_authority=ToolResultAuthority.MUTATION_FACT,
     )
     _rollback_spec = ToolSpec(
         name="core.rollback_mutation",
@@ -169,6 +176,8 @@ class CoreWorkspaceMutationToolProvider:
         rollback=(
             "the rollback itself is journaled; automatic redo is not performed"
         ),
+        effect=ToolEffect.MUTATE,
+        result_authority=ToolResultAuthority.MUTATION_FACT,
     )
     _rollback_many_spec = ToolSpec(
         name="core.rollback_mutations",
@@ -202,6 +211,8 @@ class CoreWorkspaceMutationToolProvider:
             "each rollback is journaled separately; automatic cascade redo is not "
             "performed"
         ),
+        effect=ToolEffect.MUTATE,
+        result_authority=ToolResultAuthority.MUTATION_FACT,
     )
     _rollback_batch_spec = ToolSpec(
         name="core.rollback_mutation_batch",
@@ -230,6 +241,8 @@ class CoreWorkspaceMutationToolProvider:
             "ordinary failures restore completed rollback writes; committed "
             "rollback records remain auditable and are not automatically redone"
         ),
+        effect=ToolEffect.MUTATE,
+        result_authority=ToolResultAuthority.MUTATION_FACT,
     )
     _rollback_groups_spec = ToolSpec(
         name="core.rollback_mutation_groups",
@@ -262,6 +275,8 @@ class CoreWorkspaceMutationToolProvider:
             "ordinary failures compensate changed files; committed per-mutation "
             "rollback records remain auditable and are not automatically redone"
         ),
+        effect=ToolEffect.MUTATE,
+        result_authority=ToolResultAuthority.MUTATION_FACT,
     )
 
     def __init__(self) -> None:

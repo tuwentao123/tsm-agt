@@ -32,6 +32,19 @@ class EvidenceObservationKind(StrEnum):
     RECOVERABLE_FAILURE = "RECOVERABLE_FAILURE"
     FAILURE = "FAILURE"
     DROPPED_BY_GOAL_REPLACEMENT = "DROPPED_BY_GOAL_REPLACEMENT"
+    ACTION_REPLACED = "ACTION_REPLACED"
+    ACTION_CANCELLED = "ACTION_CANCELLED"
+    ACTION_DENIED = "ACTION_DENIED"
+    WAITING_FOR_USER = "WAITING_FOR_USER"
+
+
+class ToolActionDisposition(StrEnum):
+    """Runtime disposition for a bound Tool Action that did not run."""
+
+    REPLACE = "REPLACE"
+    CANCEL = "CANCEL"
+    WAIT_FOR_USER = "WAIT_FOR_USER"
+    DENY = "DENY"
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +264,44 @@ class EvidenceQuestionProjection:
             projection = projection._replace(updated)
             dropped.append(updated)
         return projection, tuple(dropped)
+
+    def dispose(
+        self, call: ToolCall, disposition: ToolActionDisposition, reason: str,
+        *, event_sequence: int = 0,
+    ) -> tuple[EvidenceQuestionProjection, EvidenceQuestionRecord | None]:
+        """Record why a bound Action will not execute, without faking evidence."""
+        question = call.evidence_question
+        if question is None:
+            return self, None
+        current = self.get(question.question_id)
+        if current is None:
+            raise ValueError("evidence question must be bound before disposition")
+        if call.call_id not in current.tool_call_ids:
+            raise ValueError("disposition does not belong to the bound tool action")
+        status, kind = {
+            ToolActionDisposition.REPLACE: (
+                EvidenceQuestionStatus.DROPPED,
+                EvidenceObservationKind.ACTION_REPLACED,
+            ),
+            ToolActionDisposition.CANCEL: (
+                EvidenceQuestionStatus.DROPPED,
+                EvidenceObservationKind.ACTION_CANCELLED,
+            ),
+            ToolActionDisposition.WAIT_FOR_USER: (
+                EvidenceQuestionStatus.OPEN,
+                EvidenceObservationKind.WAITING_FOR_USER,
+            ),
+            ToolActionDisposition.DENY: (
+                EvidenceQuestionStatus.BLOCKED,
+                EvidenceObservationKind.ACTION_DENIED,
+            ),
+        }[disposition]
+        updated = replace(
+            current, status=status, observation_kind=kind,
+            blocking_reason=reason, revision=current.revision + 1,
+            updated_event_sequence=event_sequence,
+        )
+        return self._replace(updated), updated
 
     def _replace(self, updated: EvidenceQuestionRecord) -> EvidenceQuestionProjection:
         return replace(

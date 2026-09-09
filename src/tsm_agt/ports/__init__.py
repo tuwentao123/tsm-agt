@@ -136,6 +136,7 @@ from .investigation_flow import (
 from .tool import (
     EvidenceQuestion,
     ToolCall,
+    ToolEffect,
     ToolIdempotency,
     ToolInvocationContext,
     ToolMemoryControl,
@@ -145,7 +146,9 @@ from .tool import (
     ToolProcessControl,
     ToolWorkspaceControl,
     ToolResult,
+    ToolResultAuthority,
     ToolRisk,
+    ToolProtocol,
     ToolSpec,
 )
 
@@ -163,6 +166,9 @@ __all__ = [
     "HealthStatus",
     "FinishReason",
     "EvidenceQuestion",
+    "ToolEffect",
+    "ToolResultAuthority",
+    "ToolProtocol",
     "CompletionGap",
     "CompletionReadinessAction",
     "CompletionReadinessDecision",

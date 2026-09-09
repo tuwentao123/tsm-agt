@@ -340,6 +340,11 @@ class OpenAICompatibleModelProvider:
         return self._normalize_response(
             request.turn_id, response, provider_to_internal,
             require_evidence_questions=request.require_evidence_questions,
+            evidence_required_tools=frozenset(
+                tool.name for tool in request.tools
+                if request.require_evidence_questions
+                and tool.requires_evidence_question
+            ),
             allow_text_tool_fallback=request.allow_tool_calls,
         )
 
@@ -544,6 +549,11 @@ class OpenAICompatibleModelProvider:
             },
             provider_to_internal,
             require_evidence_questions=request.require_evidence_questions,
+            evidence_required_tools=frozenset(
+                tool.name for tool in request.tools
+                if request.require_evidence_questions
+                and tool.requires_evidence_question
+            ),
             allow_text_tool_fallback=request.allow_tool_calls,
         )
         # Exact text-form tool calls are either recovered by normalization or
@@ -572,7 +582,11 @@ class OpenAICompatibleModelProvider:
             "messages": [
                 self._message_to_provider(
                     message, internal_to_provider,
-                    request.require_evidence_questions,
+                    frozenset(
+                        tool.name for tool in request.tools
+                        if request.require_evidence_questions
+                        and tool.requires_evidence_question
+                    ),
                 )
                 for message in request.messages
             ],
@@ -583,7 +597,9 @@ class OpenAICompatibleModelProvider:
             for tool in request.tools:
                 provider_name = internal_to_provider[tool.name]
                 encoded_tools.append(self._tool_to_provider(
-                    tool, provider_name, request.require_evidence_questions,
+                    tool, provider_name,
+                    request.require_evidence_questions
+                    and tool.requires_evidence_question,
                     self._strict_tool_schema,
                 ))
             payload["tools"] = encoded_tools
@@ -649,7 +665,7 @@ class OpenAICompatibleModelProvider:
     @staticmethod
     def _message_to_provider(
         message: Message, internal_to_provider: Mapping[str, str],
-        require_evidence_questions: bool,
+        evidence_required_tools: frozenset[str],
     ) -> dict[str, Any]:
         if message.role is MessageRole.TOOL:
             result_blocks = [
@@ -692,7 +708,8 @@ class OpenAICompatibleModelProvider:
                                     ),
                                     "tool_arguments": dict(call.arguments),
                                 }
-                                if require_evidence_questions else dict(call.arguments)
+                                if call.name in evidence_required_tools
+                                else dict(call.arguments)
                             ),
                             ensure_ascii=False, separators=(",", ":")
                         ),
@@ -718,6 +735,7 @@ class OpenAICompatibleModelProvider:
         response: Mapping[str, Any],
         provider_to_internal: Mapping[str, str],
         *, require_evidence_questions: bool = False,
+        evidence_required_tools: frozenset[str] | None = None,
         allow_text_tool_fallback: bool = True,
     ) -> ModelResponse:
         choices = response.get("choices")
@@ -742,7 +760,15 @@ class OpenAICompatibleModelProvider:
             and isinstance(text, str)
         ):
             recovered = cls._recover_text_tool_calls(
-                text, provider_to_internal, require_evidence_questions
+                text, provider_to_internal,
+                evidence_required_tools=(
+                    evidence_required_tools
+                    if evidence_required_tools is not None
+                    else (
+                        frozenset(provider_to_internal.values())
+                        if require_evidence_questions else frozenset()
+                    )
+                ),
             )
             if recovered is not None:
                 if not allow_text_tool_fallback:
@@ -792,7 +818,12 @@ class OpenAICompatibleModelProvider:
                     f"provider requested an unadvertised tool: {name}"
                 )
             evidence_question = None
-            if require_evidence_questions:
+            requires_evidence = (
+                internal_name in evidence_required_tools
+                if evidence_required_tools is not None
+                else require_evidence_questions
+            )
+            if requires_evidence:
                 envelope_keys = {"evidence_question", "tool_arguments"}
                 if set(arguments) == envelope_keys:
                     raw_question = arguments.get("evidence_question")
@@ -864,7 +895,7 @@ class OpenAICompatibleModelProvider:
     @classmethod
     def _recover_text_tool_calls(
         cls, text: str, provider_to_internal: Mapping[str, str],
-        require_evidence_questions: bool,
+        evidence_required_tools: frozenset[str],
     ) -> list[dict[str, Any]] | None:
         """Recover exact top-level tool blocks emitted by compatible gateways."""
         block = re.compile(
@@ -890,7 +921,7 @@ class OpenAICompatibleModelProvider:
                 return None
             if not isinstance(arguments, Mapping):
                 return None
-            if require_evidence_questions:
+            if provider_to_internal[provider_name] in evidence_required_tools:
                 envelope_keys = {"evidence_question", "tool_arguments"}
                 if set(arguments) == envelope_keys:
                     question = arguments.get("evidence_question")

@@ -27,6 +27,45 @@ class ToolIdempotency(StrEnum):
     NON_IDEMPOTENT = "non_idempotent"
 
 
+class ToolEffect(StrEnum):
+    """Primary effect of a model-visible tool.
+
+    The effect describes what the action does; it does not grant authority or
+    replace the existing risk/approval policy.  ``UNSPECIFIED`` preserves the
+    conservative behavior of third-party tools created before this metadata
+    existed.
+    """
+
+    UNSPECIFIED = "unspecified"
+    OBSERVE = "observe"
+    MUTATE = "mutate"
+    EXECUTE = "execute"
+    INTERACT = "interact"
+    CONTROL = "control"
+    INTERNAL = "internal"
+
+
+class ToolResultAuthority(StrEnum):
+    """Kind of fact a successful result is allowed to establish."""
+
+    UNSPECIFIED = "unspecified"
+    NONE = "none"
+    USER_INTENT = "user_intent"
+    WORKSPACE_FACT = "workspace_fact"
+    PROCESS_FACT = "process_fact"
+    MUTATION_FACT = "mutation_fact"
+    RUNTIME_FACT = "runtime_fact"
+
+
+class ToolProtocol(StrEnum):
+    """How the Runtime coordinates an action with its host environment."""
+
+    IMMEDIATE = "immediate"
+    WAIT_USER = "wait_user"
+    POLICY_GATED = "policy_gated"
+    BACKGROUND_CAPABLE = "background_capable"
+
+
 @dataclass(frozen=True, slots=True)
 class EvidenceQuestion:
     """The concrete unknown that one model-requested tool call should resolve."""
@@ -85,6 +124,9 @@ class ToolSpec:
     data_transmission: str = "none"
     rollback: str = "tool-specific; review before approval"
     is_internal_state: bool = False
+    effect: ToolEffect = ToolEffect.UNSPECIFIED
+    result_authority: ToolResultAuthority = ToolResultAuthority.UNSPECIFIED
+    protocol: ToolProtocol = ToolProtocol.IMMEDIATE
 
     def __post_init__(self) -> None:
         if (
@@ -110,6 +152,28 @@ class ToolSpec:
             raise ValueError(
                 "internal state tools must be R0 with no network or transmission"
             )
+        if self.effect is ToolEffect.INTERACT and (
+            self.result_authority is not ToolResultAuthority.USER_INTENT
+            or self.protocol is not ToolProtocol.WAIT_USER
+        ):
+            raise ValueError(
+                "interaction tools must return user_intent via wait_user protocol"
+            )
+
+    @property
+    def requires_evidence_question(self) -> bool:
+        """Whether model calls need a fact-finding obligation envelope.
+
+        ``UNSPECIFIED`` deliberately stays conservative for existing external
+        adapters.  User interaction, mutation journals and Runtime control facts
+        have their own lifecycle and must not be forced into Evidence Questions.
+        """
+
+        return self.result_authority in {
+            ToolResultAuthority.UNSPECIFIED,
+            ToolResultAuthority.WORKSPACE_FACT,
+            ToolResultAuthority.PROCESS_FACT,
+        }
 
     def to_data(self) -> dict[str, Any]:
         return {
@@ -125,6 +189,9 @@ class ToolSpec:
             "data_transmission": self.data_transmission,
             "rollback": self.rollback,
             "is_internal_state": self.is_internal_state,
+            "effect": self.effect.value,
+            "result_authority": self.result_authority.value,
+            "protocol": self.protocol.value,
         }
 
 

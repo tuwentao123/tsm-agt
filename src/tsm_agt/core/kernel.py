@@ -246,7 +246,7 @@ from .verification import (
 )
 from .evidence_question import (
     EvidenceQuestionProjector, EvidenceQuestionProjection,
-    EvidenceQuestionStatus,
+    EvidenceQuestionStatus, ToolActionDisposition,
 )
 from .session_resources import (
     SessionQuestionReference, SessionResourceKind, SessionResourceReference,
@@ -5537,14 +5537,17 @@ class Kernel:
             task, task_spec.goal
         )
         question_projection = EvidenceQuestionProjector.project(task_id, events)
+        evidence_questions = await self._evidence_relevant_questions(
+            question_projection, events
+        )
         incomplete_questions = tuple(
-            record for record in question_projection.records
+            record for record in evidence_questions.records
             if record.status in {
                 EvidenceQuestionStatus.OPEN, EvidenceQuestionStatus.BLOCKED,
             }
         )
         final_acceptance = await self._evaluate_final_acceptance(
-            task, events, question_projection
+            task, events, evidence_questions
         )
         await self._append_events(task_id, (("verify.started", {
             "criterion_count": (
@@ -5808,6 +5811,41 @@ class Kernel:
                 "evidence.level_assessed", result.evidence_level.to_data()
             ),))
         return result
+
+    async def _evidence_relevant_questions(
+        self, projection: EvidenceQuestionProjection,
+        events: tuple[RuntimeEvent, ...],
+    ) -> EvidenceQuestionProjection:
+        """Exclude legacy questions created for non-evidence protocols.
+
+        Older checkpoints wrapped every Tool Call in an Evidence Question,
+        including user interaction.  ToolSpec result authority is now the source
+        of truth.  Unknown tools remain conservative; only records whose every
+        bound call belongs to a known non-evidence tool are excluded.
+        """
+        specs = {spec.name: spec for spec in await self.list_tools()}
+        tool_name_by_call = {
+            str(event.payload.get("tool_call_id", "")):
+            str(event.payload.get("tool_name", ""))
+            for event in events
+            if event.event_type == "evidence.question_bound"
+        }
+        relevant = []
+        for record in projection.records:
+            known_specs = []
+            has_unknown = False
+            for call_id in record.tool_call_ids:
+                name = tool_name_by_call.get(call_id, "")
+                spec = specs.get(name)
+                if spec is None:
+                    has_unknown = True
+                else:
+                    known_specs.append(spec)
+            if has_unknown or not known_specs or any(
+                spec.requires_evidence_question for spec in known_specs
+            ):
+                relevant.append(record)
+        return replace(projection, records=tuple(relevant))
 
     async def _evaluate_final_acceptance(
         self, task: TaskSnapshot, events: tuple[RuntimeEvent, ...],
@@ -6899,6 +6937,7 @@ class Kernel:
         budget_wrap_up_decision: ExplorationBudgetDecision | None = None
         protocol_retry_used = False
         protocol_correction: str | None = None
+        visible_tool_by_name = {tool.name: tool for tool in visible_tools}
 
         while True:
             checkpoint, replaced = await self._apply_pending_steering(
@@ -6930,15 +6969,25 @@ class Kernel:
                 if replaced:
                     break
                 call = pending_tool_calls[0]
-                question = call.evidence_question
-                if (
+                call_spec = visible_tool_by_name.get(call.name)
+                requires_question = (
                     self._dependencies.require_evidence_questions
-                    and question is None
-                ):
+                    and call_spec is not None
+                    and call_spec.requires_evidence_question
+                )
+                question = call.evidence_question
+                if requires_question and question is None:
                     raise InvalidModelResponse(
                         f"pending tool call {call.call_id} lost its evidence_question"
                     )
-                if question is not None:
+                if not requires_question and question is not None:
+                    # Compatibility for checkpoints written before ToolSpec carried
+                    # result authority.  A non-evidence protocol must not create a
+                    # second, contradictory lifecycle for the same interaction.
+                    call = replace(call, evidence_question=None)
+                    pending_tool_calls[0] = call
+                    question = None
+                if requires_question and question is not None:
                     question_projection = await self._bind_evidence_question(
                         task_id, turn_id, call
                     )
@@ -7023,11 +7072,17 @@ class Kernel:
                             role=MessageRole.TOOL,
                             content=(ToolResultBlock(result),),
                         ))
+                        question_projection = await self._dispose_evidence_question(
+                            task_id, turn_id, call,
+                            ToolActionDisposition.REPLACE,
+                            "exploration_route_rejected",
+                        )
                         pending_tool_calls.pop(0)
                         checkpoint = replace(
                             checkpoint, messages=tuple(messages),
                             pending_tool_calls=tuple(pending_tool_calls),
                             seen_call_ids=tuple(sorted(seen_call_ids)),
+                            evidence_question_state=question_projection.to_data(),
                         )
                         await self._save_agent_checkpoint(
                             checkpoint, "exploration-route-rejected"
@@ -7088,12 +7143,17 @@ class Kernel:
                         role=MessageRole.TOOL,
                         content=(ToolResultBlock(result),),
                     ))
+                    question_projection = await self._dispose_evidence_question(
+                        task_id, turn_id, call, ToolActionDisposition.REPLACE,
+                        "scope_expansion_reason_required",
+                    )
                     pending_tool_calls.pop(0)
                     checkpoint = replace(
                         checkpoint, messages=tuple(messages),
                         pending_tool_calls=tuple(pending_tool_calls),
                         seen_call_ids=tuple(sorted(seen_call_ids)),
                         stop_or_pivot_state=pivot_state,
+                        evidence_question_state=question_projection.to_data(),
                     )
                     await self._save_agent_checkpoint(
                         checkpoint, "scope-expansion-reason-required"
@@ -7177,11 +7237,17 @@ class Kernel:
                             role=MessageRole.TOOL,
                             content=(ToolResultBlock(result),),
                         ))
+                        question_projection = await self._dispose_evidence_question(
+                            task_id, turn_id, call,
+                            ToolActionDisposition.REPLACE,
+                            "exploration_focus_required",
+                        )
                         pending_tool_calls.pop(0)
                         checkpoint = replace(
                             checkpoint, messages=tuple(messages),
                             pending_tool_calls=tuple(pending_tool_calls),
                             seen_call_ids=tuple(sorted(seen_call_ids)),
+                            evidence_question_state=question_projection.to_data(),
                         )
                         await self._save_agent_checkpoint(
                             checkpoint, "exploration-focus-required"
@@ -7252,12 +7318,18 @@ class Kernel:
                             role=MessageRole.TOOL,
                             content=(ToolResultBlock(result),),
                         ))
+                        question_projection = await self._dispose_evidence_question(
+                            task_id, turn_id, call,
+                            ToolActionDisposition.REPLACE,
+                            "exploration_change_method_required",
+                        )
                         pending_tool_calls.pop(0)
                         checkpoint = replace(
                             checkpoint, messages=tuple(messages),
                             pending_tool_calls=tuple(pending_tool_calls),
                             seen_call_ids=tuple(sorted(seen_call_ids)),
                             stop_or_pivot_state=pivot_state,
+                            evidence_question_state=question_projection.to_data(),
                         )
                         await self._save_agent_checkpoint(
                             checkpoint, "exploration-change-method-required"
@@ -7286,6 +7358,10 @@ class Kernel:
                             role=MessageRole.TOOL,
                             content=(ToolResultBlock(result),),
                         ))
+                        question_projection = await self._dispose_evidence_question(
+                            task_id, turn_id, call, ToolActionDisposition.CANCEL,
+                            "exploration_budget_wrap_up",
+                        )
                         pending_tool_calls.pop(0)
                         budget_wrap_up = True
                         budget_wrap_up_decision = budget_decision
@@ -7294,6 +7370,7 @@ class Kernel:
                             pending_tool_calls=tuple(pending_tool_calls),
                             seen_call_ids=tuple(sorted(seen_call_ids)),
                             stop_or_pivot_state=pivot_state,
+                            evidence_question_state=question_projection.to_data(),
                         )
                         await self._save_agent_checkpoint(
                             checkpoint, "exploration-budget-wrap-up"
@@ -7350,12 +7427,17 @@ class Kernel:
                         role=MessageRole.TOOL,
                         content=(ToolResultBlock(result),),
                     ))
+                    question_projection = await self._dispose_evidence_question(
+                        task_id, turn_id, call, ToolActionDisposition.REPLACE,
+                        "read_hits_required",
+                    )
                     pending_tool_calls.pop(0)
                     checkpoint = replace(
                         checkpoint, messages=tuple(messages),
                         pending_tool_calls=tuple(pending_tool_calls),
                         seen_call_ids=tuple(sorted(seen_call_ids)),
                         stop_or_pivot_state=pivot_state,
+                        evidence_question_state=question_projection.to_data(),
                     )
                     await self._save_agent_checkpoint(
                         checkpoint, "read-hits-required"
@@ -7393,11 +7475,16 @@ class Kernel:
                         role=MessageRole.TOOL,
                         content=(ToolResultBlock(result),),
                     ))
+                    question_projection = await self._dispose_evidence_question(
+                        task_id, turn_id, call, ToolActionDisposition.REPLACE,
+                        "artifact_read_reuse_required",
+                    )
                     pending_tool_calls.pop(0)
                     checkpoint = replace(
                         checkpoint, messages=tuple(messages),
                         pending_tool_calls=tuple(pending_tool_calls),
                         seen_call_ids=tuple(sorted(seen_call_ids)),
+                        evidence_question_state=question_projection.to_data(),
                     )
                     await self._save_agent_checkpoint(
                         checkpoint, "artifact-read-reuse-required"
@@ -7468,6 +7555,10 @@ class Kernel:
                     goal=task_before_action.goal,
                 )
                 if pivot_decision.terminal:
+                    question_projection = await self._dispose_evidence_question(
+                        task_id, turn_id, call, ToolActionDisposition.CANCEL,
+                        "plan_no_progress_stopped",
+                    )
                     pending_tool_calls.clear()
                     stop_body = json.dumps({
                         "boundary": "runtime_no_progress_stop",
@@ -7487,7 +7578,8 @@ class Kernel:
                         MessageRole.USER, (TextBlock(stop_body),),
                     ))
                     checkpoint = replace(
-                        checkpoint, pending_tool_calls=(), messages=tuple(messages)
+                        checkpoint, pending_tool_calls=(), messages=tuple(messages),
+                        evidence_question_state=question_projection.to_data(),
                     )
                     no_progress_stop = True
                     await self._append_events(task_id, (("plan.no_progress_stopped", {
@@ -8033,8 +8125,10 @@ class Kernel:
                 ))
                 tool_calls = self._validate_agent_response(
                     response.message, response.finish_reason,
-                    require_evidence_questions=(
-                        self._dependencies.require_evidence_questions
+                    evidence_required_tools=frozenset(
+                        tool.name for tool in visible_tools
+                        if self._dependencies.require_evidence_questions
+                        and tool.requires_evidence_question
                     ),
                     allow_tool_calls=request.allow_tool_calls,
                 )
@@ -8349,7 +8443,9 @@ class Kernel:
         if current is None:
             raise ValueError("evidence question must be bound before observation")
         events = await self._dependencies.store.read_events(task_id)
-        next_sequence = events[-1].sequence + 1 if events else 1
+        # ``tool.action_disposed`` is appended first; the projected record is
+        # authored by the following ``evidence.question_state_changed`` event.
+        next_sequence = events[-1].sequence + 2 if events else 2
         projection, record = projection.observe(
             call, result, delta, event_sequence=next_sequence
         )
@@ -8370,6 +8466,52 @@ class Kernel:
                 "record": record.to_data(),
             },
         ),))
+        return await self.get_evidence_questions(task_id)
+
+    async def _dispose_evidence_question(
+        self, task_id: str, turn_id: str, call: ToolCall,
+        disposition: ToolActionDisposition, reason: str,
+    ) -> EvidenceQuestionProjection:
+        """Close a bound question when Runtime removes its Action pre-execution.
+
+        The disposition is an audited lifecycle fact, never successful evidence.
+        Keeping this transition in one Kernel boundary prevents policy adapters
+        from leaving orphan OPEN questions when they redirect or stop an Action.
+        """
+        projection = await self.get_evidence_questions(task_id)
+        if call.evidence_question is None:
+            return projection
+        current = projection.get(call.evidence_question.question_id)
+        if current is None:
+            raise ValueError("evidence question must be bound before disposition")
+        events = await self._dependencies.store.read_events(task_id)
+        next_sequence = events[-1].sequence + 1 if events else 1
+        projection, record = projection.dispose(
+            call, disposition, reason, event_sequence=next_sequence
+        )
+        if record is None:
+            return projection
+        await self._append_events(task_id, ((
+            "tool.action_disposed", {
+                "turn_id": turn_id, "tool_call_id": call.call_id,
+                "tool_name": call.name, "disposition": disposition.value,
+                "reason": reason, "question_ref": record.question_ref,
+            },
+        ), (
+            "evidence.question_state_changed", {
+                "turn_id": turn_id, "tool_call_id": call.call_id,
+                "tool_name": call.name, "question_ref": record.question_ref,
+                "previous_status": current.status.value,
+                "next_status": record.status.value,
+                "observation_kind": (
+                    record.observation_kind.value
+                    if record.observation_kind else None
+                ),
+                "blocking_reason": record.blocking_reason,
+                "evidence_count": len(record.evidence_references),
+                "record": record.to_data(),
+            },
+        )))
         return await self.get_evidence_questions(task_id)
 
     async def _classify_semantic_action(
@@ -9136,7 +9278,7 @@ class Kernel:
     @staticmethod
     def _validate_agent_response(
         message: Message, finish_reason: FinishReason, *,
-        require_evidence_questions: bool = False,
+        evidence_required_tools: frozenset[str] = frozenset(),
         allow_tool_calls: bool = True,
     ) -> tuple[ToolCall, ...]:
         if message.role is not MessageRole.ASSISTANT:
@@ -9153,14 +9295,16 @@ class Kernel:
             raise InvalidModelResponse(
                 "assistant response contains duplicate tool call_id values"
             )
-        if require_evidence_questions:
+        if evidence_required_tools:
             unbound = [
                 call.call_id for call in tool_calls
-                if call.evidence_question is None
+                if call.name in evidence_required_tools
+                and call.evidence_question is None
             ]
             if unbound:
                 raise InvalidModelResponse(
-                    "every tool call must bind one evidence_question: "
+                    "every evidence-producing tool call must bind one "
+                    "evidence_question: "
                     + ", ".join(unbound)
                 )
         if tool_calls and not allow_tool_calls:

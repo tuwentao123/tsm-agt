@@ -114,6 +114,7 @@ from .verification import (
 from .evidence_question import (
     EvidenceObservationKind, EvidenceQuestionProjector,
     EvidenceQuestionProjection, EvidenceQuestionRecord, EvidenceQuestionStatus,
+    ToolActionDisposition,
 )
 from .turn import InvalidModelResponse, InvalidTurnState, ModelInvocationFailed, TurnResult
 from .tool import (
