@@ -17,6 +17,67 @@ class SessionState(StrEnum):
     ARCHIVED = "ARCHIVED"
 
 
+class SessionInteractionKind(StrEnum):
+    CHOICE = "CHOICE"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionChoiceOption:
+    """One stable option exactly as it was shown to the user."""
+
+    option_id: str
+    ordinal: int
+    label: str
+    target_type: str
+    target_id: str
+    metadata: Mapping[str, Any]
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "option_id": self.option_id, "ordinal": self.ordinal,
+            "label": self.label, "target_type": self.target_type,
+            "target_id": self.target_id, "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_data(cls, data: Mapping[str, Any]) -> SessionChoiceOption:
+        return cls(
+            str(data["option_id"]), int(data["ordinal"]),
+            str(data["label"]), str(data["target_type"]),
+            str(data["target_id"]), dict(data.get("metadata", {})),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SessionInteractionRequest:
+    """Durable UI protocol state; it carries no execution authority."""
+
+    interaction_id: str
+    kind: SessionInteractionKind
+    prompt: str
+    options: tuple[SessionChoiceOption, ...]
+    created_at: datetime
+    source: str
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "interaction_id": self.interaction_id, "kind": self.kind.value,
+            "prompt": self.prompt,
+            "options": [item.to_data() for item in self.options],
+            "created_at": self.created_at.isoformat(), "source": self.source,
+        }
+
+    @classmethod
+    def from_data(cls, data: Mapping[str, Any]) -> SessionInteractionRequest:
+        return cls(
+            str(data["interaction_id"]),
+            SessionInteractionKind(str(data["kind"])), str(data["prompt"]),
+            tuple(SessionChoiceOption.from_data(item) for item in data["options"]),
+            datetime.fromisoformat(str(data["created_at"])),
+            str(data.get("source", "runtime")),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class SessionSnapshot:
     session_id: str
@@ -31,6 +92,7 @@ class SessionSnapshot:
     updated_at: datetime
     closed_at: datetime | None = None
     close_reason: str | None = None
+    pending_interaction: SessionInteractionRequest | None = None
 
     def __post_init__(self) -> None:
         if not self.session_id.strip() or not self.subject.strip() or not self.title.strip():
@@ -97,6 +159,23 @@ class SessionSnapshot:
             updated_at=now or datetime.now(timezone.utc),
         )
 
+    def request_interaction(
+        self, interaction: SessionInteractionRequest,
+        now: datetime | None = None,
+    ) -> SessionSnapshot:
+        if self.state is not SessionState.ACTIVE:
+            raise ValueError("only an ACTIVE Session may request interaction")
+        return replace(
+            self, pending_interaction=interaction,
+            updated_at=now or datetime.now(timezone.utc),
+        )
+
+    def clear_interaction(self, now: datetime | None = None) -> SessionSnapshot:
+        return replace(
+            self, pending_interaction=None,
+            updated_at=now or datetime.now(timezone.utc),
+        )
+
     def close(self, reason: str, now: datetime | None = None) -> SessionSnapshot:
         if self.state is not SessionState.ACTIVE:
             raise ValueError("only ACTIVE Session can be closed")
@@ -106,6 +185,7 @@ class SessionSnapshot:
         timestamp = now or datetime.now(timezone.utc)
         return replace(
             self, state=SessionState.CLOSED, active_task_id=None,
+            pending_interaction=None,
             updated_at=timestamp, closed_at=timestamp, close_reason=normalized,
         )
 
@@ -131,6 +211,10 @@ class SessionSnapshot:
             "updated_at": self.updated_at.isoformat(),
             "closed_at": self.closed_at.isoformat() if self.closed_at else None,
             "close_reason": self.close_reason,
+            "pending_interaction": (
+                self.pending_interaction.to_data()
+                if self.pending_interaction is not None else None
+            ),
         }
 
     @classmethod
@@ -159,6 +243,10 @@ class SessionSnapshot:
             close_reason=(
                 str(data["close_reason"])
                 if data.get("close_reason") is not None else None
+            ),
+            pending_interaction=(
+                SessionInteractionRequest.from_data(data["pending_interaction"])
+                if data.get("pending_interaction") is not None else None
             ),
         )
         if data.get("context_hash") and str(data["context_hash"]) != snapshot.context_hash:

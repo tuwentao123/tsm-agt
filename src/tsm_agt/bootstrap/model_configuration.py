@@ -20,6 +20,7 @@ MODEL_OPTIONAL_ENV_NAMES = (
     "TSM_AGT_MODEL_RETRY_BACKOFF_SECONDS",
     "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER",
     "TSM_AGT_MODEL_STRICT_TOOL_SCHEMA",
+    "TSM_AGT_MODEL_STREAMING",
 )
 MODEL_SUPPORTED_ENV_NAMES = MODEL_ENV_NAMES + MODEL_OPTIONAL_ENV_NAMES
 
@@ -33,6 +34,7 @@ TSM_AGT_MODEL_API_KEY=your-api-key
 # TSM_AGT_MODEL_RETRY_BACKOFF_SECONDS=1
 # TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=max_tokens
 # TSM_AGT_MODEL_STRICT_TOOL_SCHEMA=true
+# TSM_AGT_MODEL_STREAMING=true
 
 # Optional Agent-loop hard limits and exploration soft limits.
 # TSM_AGT_AGENT_MAX_MODEL_CALLS=15
@@ -83,6 +85,7 @@ class ModelConfiguration:
     retry_backoff_seconds: float = 1.0
     output_token_parameter: str = "max_tokens"
     strict_tool_schema: bool = True
+    streaming: bool = True
 
     @property
     def endpoint_origin(self) -> str:
@@ -172,6 +175,11 @@ def load_model_configuration(
         raise ValueError(
             "TSM_AGT_MODEL_STRICT_TOOL_SCHEMA must be 'true' or 'false'"
         )
+    raw_streaming = (values["TSM_AGT_MODEL_STREAMING"] or "true").casefold()
+    if raw_streaming not in {"true", "false"}:
+        raise ValueError(
+            "TSM_AGT_MODEL_STREAMING must be 'true' or 'false'"
+        )
     return ModelConfiguration(
         base_url=values["TSM_AGT_MODEL_BASE_URL"],
         model=values["TSM_AGT_MODEL"],
@@ -183,6 +191,7 @@ def load_model_configuration(
         retry_backoff_seconds=retry_backoff_seconds,
         output_token_parameter=output_token_parameter,
         strict_tool_schema=(raw_strict_tool_schema == "true"),
+        streaming=(raw_streaming == "true"),
     )
 
 
@@ -214,6 +223,9 @@ def model_configuration_sources(
         ),
         "model.strict_tool_schema": configuration.sources.get(
             "TSM_AGT_MODEL_STRICT_TOOL_SCHEMA", "default"
+        ),
+        "model.streaming": configuration.sources.get(
+            "TSM_AGT_MODEL_STREAMING", "default"
         ),
     }
 

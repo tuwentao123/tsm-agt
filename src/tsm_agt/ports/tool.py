@@ -201,12 +201,15 @@ class ToolCall:
     name: str
     arguments: Mapping[str, Any] = field(default_factory=dict)
     evidence_question: EvidenceQuestion | None = None
+    outcome_ref: str | None = None
 
     def __post_init__(self) -> None:
         if not self.call_id.strip():
             raise ValueError("tool call_id must not be empty")
         if not self.name.strip():
             raise ValueError("tool name must not be empty")
+        if self.outcome_ref is not None and not self.outcome_ref.strip():
+            raise ValueError("tool outcome_ref must not be empty")
 
     def to_data(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -216,6 +219,8 @@ class ToolCall:
         }
         if self.evidence_question is not None:
             data["evidence_question"] = self.evidence_question.to_data()
+        if self.outcome_ref is not None:
+            data["outcome_ref"] = self.outcome_ref
         return data
 
     @classmethod
@@ -233,6 +238,10 @@ class ToolCall:
             evidence_question=(
                 EvidenceQuestion.from_data(raw_question)
                 if isinstance(raw_question, Mapping) else None
+            ),
+            outcome_ref=(
+                str(data["outcome_ref"])
+                if data.get("outcome_ref") is not None else None
             ),
         )
 

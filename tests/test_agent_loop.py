@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     AgentLoopLimitExceeded,
+    AgentClarificationSuspended,
     AgentTurnResult,
     AgentTurnSuspended,
     ApprovalDecision,
@@ -16,6 +18,7 @@ from tsm_agt.core import (
     ModelInvocationFailed,
     ProviderCapabilityMismatch,
     TaskState,
+    ToolCommitState,
 )
 from tsm_agt.ports import (
     AdapterDescriptor,
@@ -31,6 +34,7 @@ from tsm_agt.ports import (
     TextBlock,
     ToolCall,
     ToolCallBlock,
+    ToolEffect,
     ToolIdempotency,
     ToolInvocationContext,
     ToolResult,
@@ -170,6 +174,45 @@ class TwoToolCallsModel(EchoModelProvider):
         )
 
 
+class TwoUnsafeCallsThenFinishModel(EchoModelProvider):
+    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        self.calls += 1
+        result = next((
+            block.result
+            for message in reversed(request.messages)
+            for block in message.content
+            if isinstance(block, ToolResultBlock)
+        ), None)
+        if result is not None:
+            return ModelResponse(
+                Message(
+                    "assistant-after-reconciliation", MessageRole.ASSISTANT,
+                    (TextBlock("Replanned after explicit reconciliation."),),
+                ),
+                FinishReason.STOP, ModelUsage(1, 1),
+            )
+        return ModelResponse(
+            Message(
+                "assistant-two-unsafe", MessageRole.ASSISTANT,
+                (
+                    ToolCallBlock(ToolCall(
+                        "unsafe-1", "fixture.write", {"text": "one"}
+                    )),
+                    ToolCallBlock(ToolCall(
+                        "unsafe-2", "fixture.write", {"text": "two"}
+                    )),
+                ),
+            ),
+            FinishReason.TOOL_CALL, ModelUsage(1, 1),
+        )
+
+
 class CorrectableProtocolModel(EchoModelProvider):
     capabilities = ProviderCapabilities(tools=True, context_window=4096)
 
@@ -207,7 +250,9 @@ class RiskyToolCallingModel(EchoModelProvider):
             return ModelResponse(
                 Message(
                     "assistant-risky-tool", MessageRole.ASSISTANT,
-                    (ToolCallBlock(ToolCall("call-write", "fixture.write", {"text": "change"})),),
+                    (ToolCallBlock(ToolCall(
+                        "call-write", "fixture.write", {"text": "change"}
+                    )),),
                 ),
                 FinishReason.TOOL_CALL,
                 ModelUsage(2, 1),
@@ -221,6 +266,24 @@ class RiskyToolCallingModel(EchoModelProvider):
             FinishReason.STOP,
             ModelUsage(3, 2),
         )
+
+
+class OutcomeRiskyToolCallingModel(RiskyToolCallingModel):
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        response = await super().complete(request)
+        if response.finish_reason is not FinishReason.TOOL_CALL:
+            return response
+        call = next(
+            block.call for block in response.message.content
+            if isinstance(block, ToolCallBlock)
+        )
+        return ModelResponse(Message(
+            response.message.message_id, response.message.role,
+            (ToolCallBlock(ToolCall(
+                call.call_id, call.name, call.arguments,
+                outcome_ref="workspace-change",
+            )),),
+        ), response.finish_reason, response.usage)
 
 
 class RiskyToolProvider:
@@ -242,6 +305,7 @@ class RiskyToolProvider:
         },
         risk=ToolRisk.R1,
         idempotency=ToolIdempotency.IDEMPOTENT,
+        effect=ToolEffect.MUTATE,
     )
 
     def __init__(self) -> None:
@@ -266,7 +330,167 @@ class RiskyToolProvider:
         return ToolResult(call.call_id, True, data={"changed": call.arguments["text"]})
 
 
+class SlowUnsafeToolProvider(RiskyToolProvider):
+    descriptor = AdapterDescriptor(
+        adapter_id="fixture.agent-slow-unsafe-tool",
+        adapter_version="0.1.0", port_name="ToolProviderPort",
+        port_version="1.0", capabilities=frozenset({"fixture.write"}),
+    )
+    _spec = ToolSpec(
+        name="fixture.write", description="Non-idempotent side effect.",
+        parameters={
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"], "additionalProperties": False,
+        },
+        risk=ToolRisk.R1, idempotency=ToolIdempotency.NON_IDEMPOTENT,
+        effect=ToolEffect.MUTATE,
+    )
+
+    async def invoke(
+        self, call: ToolCall, context: ToolInvocationContext
+    ) -> ToolResult:
+        self.invocation_count += 1
+        await asyncio.sleep(1)
+        return ToolResult(call.call_id, True, data={"changed": True})
+
+
 class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_outcome_stops_batch_until_explicit_reconciliation(self):
+        model = TwoUnsafeCallsThenFinishModel()
+        provider = SlowUnsafeToolProvider()
+        application = compose_fixture_application(
+            model_adapter=model, tool_adapters=(provider,),
+        )
+        await application.registry.start_all()
+        temp_dir = tempfile.TemporaryDirectory()
+        try:
+            task = await application.kernel.create_task(
+                "perform guarded effects", Path(temp_dir.name)
+            )
+            for state in (
+                TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                TaskState.EXECUTING,
+            ):
+                task = await application.kernel.transition_task(
+                    task.task_id, state, state.value
+                )
+            approval = await application.kernel.run_agent_turn(
+                task.task_id, "run both", tool_timeout_seconds=0.001,
+            )
+            self.assertIsInstance(approval, AgentTurnSuspended)
+            assert isinstance(approval, AgentTurnSuspended)
+            stopped = await application.kernel.resume_agent_turn(
+                task.task_id, approval.approval_request_id,
+                approval.payload_hash, ApprovalDecision.APPROVE,
+                "approved exact action",
+            )
+            self.assertIsInstance(stopped, AgentClarificationSuspended)
+            assert isinstance(stopped, AgentClarificationSuspended)
+            self.assertEqual(stopped.kind, "OUTCOME_RECONCILIATION")
+            self.assertEqual(provider.invocation_count, 1)
+            self.assertEqual(model.calls, 1)
+            waiting = await application.kernel.get_task(task.task_id)
+            self.assertEqual(waiting.state, TaskState.AWAITING_USER)
+            self.assertEqual(
+                waiting.tool_executions[
+                    f"{stopped.turn_id}:unsafe-1"
+                ].state,
+                ToolCommitState.UNKNOWN_OUTCOME,
+            )
+            self.assertEqual(
+                (waiting.active_agent_checkpoint or {})[
+                    "pending_tool_calls"
+                ], [],
+            )
+            completed = await application.kernel.resolve_agent_clarification(
+                stopped.request_id, stopped.resume_token,
+                selected_choice="CONFIRM_NOT_APPLIED",
+            )
+            self.assertIsInstance(completed, AgentTurnResult)
+            self.assertEqual(provider.invocation_count, 1)
+            self.assertEqual(model.calls, 2)
+            reconciled = (
+                await application.kernel.get_task(task.task_id)
+            ).tool_executions[f"{stopped.turn_id}:unsafe-1"]
+            self.assertEqual(reconciled.state, ToolCommitState.UNKNOWN_OUTCOME)
+            self.assertEqual(reconciled.reconciled_outcome, "NOT_APPLIED")
+            events = await application.registry.require(
+                RuntimeStorePort
+            ).read_events(task.task_id)
+            event_types = [item.event_type for item in events]
+            self.assertIn("outcome_reconciliation.requested", event_types)
+            self.assertIn("tool.outcome_reconciled", event_types)
+            self.assertEqual(event_types.count("tool.started"), 1)
+            candidates = await application.kernel.list_session_resume_candidates(
+                waiting.session_id, Path(temp_dir.name)
+            )
+            self.assertFalse(any(
+                item.reason_code == "unknown_side_effect_outcome"
+                for item in candidates
+            ))
+        finally:
+            temp_dir.cleanup()
+            await application.registry.stop_all()
+
+    async def test_unknown_outcome_reconciliation_survives_sqlite_restart(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        database = Path(temp_dir.name) / "runtime.db"
+        first_model = TwoUnsafeCallsThenFinishModel()
+        first_provider = SlowUnsafeToolProvider()
+        first = compose_fixture_application(
+            model_adapter=first_model, tool_adapters=(first_provider,),
+            store_adapter=SQLiteRuntimeStore(database),
+        )
+        await first.registry.start_all()
+        task = await first.kernel.create_task(
+            "restart guarded effect", Path(temp_dir.name)
+        )
+        for state in (
+            TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+            TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+            TaskState.EXECUTING,
+        ):
+            task = await first.kernel.transition_task(
+                task.task_id, state, state.value
+            )
+        approval = await first.kernel.run_agent_turn(
+            task.task_id, "run both", tool_timeout_seconds=0.001,
+        )
+        assert isinstance(approval, AgentTurnSuspended)
+        stopped = await first.kernel.resume_agent_turn(
+            task.task_id, approval.approval_request_id, approval.payload_hash,
+            ApprovalDecision.APPROVE, "approved exact action",
+        )
+        assert isinstance(stopped, AgentClarificationSuspended)
+        await first.registry.stop_all()
+
+        second_model = TwoUnsafeCallsThenFinishModel()
+        second_provider = SlowUnsafeToolProvider()
+        second = compose_fixture_application(
+            model_adapter=second_model, tool_adapters=(second_provider,),
+            store_adapter=SQLiteRuntimeStore(database),
+        )
+        await second.registry.start_all()
+        try:
+            restored = await second.kernel.get_task(task.task_id)
+            self.assertEqual(restored.state, TaskState.AWAITING_USER)
+            self.assertEqual(
+                restored.pending_clarification.kind.value,
+                "OUTCOME_RECONCILIATION",
+            )
+            completed = await second.kernel.resolve_agent_clarification(
+                stopped.request_id, stopped.resume_token,
+                selected_choice="CONFIRM_NOT_APPLIED",
+            )
+            self.assertIsInstance(completed, AgentTurnResult)
+            self.assertEqual(second_provider.invocation_count, 0)
+            self.assertEqual(second_model.calls, 1)
+        finally:
+            await second.registry.stop_all()
+            temp_dir.cleanup()
+
     async def _create_executing_task(self, model):
         application = compose_fixture_application(model_adapter=model)
         await application.registry.start_all()
@@ -286,10 +510,10 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
             )
         return application, temp_dir, task
 
-    async def _create_risky_agent(self, *, store=None):
+    async def _create_risky_agent(self, *, store=None, model=None):
         provider = RiskyToolProvider()
         application = compose_fixture_application(
-            model_adapter=RiskyToolCallingModel(),
+            model_adapter=model or RiskyToolCallingModel(),
             tool_adapters=(provider,),
             store_adapter=store,
         )
@@ -306,6 +530,31 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
                 task.task_id, state, f"move to {state.value}"
             )
         return application, temp_dir, task, provider
+
+    async def _install_mutation_outcome(self, application, task) -> None:
+        from tsm_agt.core import TaskSpecProposal, TaskSpecSnapshot
+        current = await application.kernel.get_task_spec(task.task_id)
+        proposal = TaskSpecProposal.from_data({
+            "schema_version": 1,
+            "goal": task.goal,
+            "scope": ["fixture"],
+            "constraints": [],
+            "outcomes": [{
+                "outcome_id": "workspace-change",
+                "description": "Commit the requested change",
+                "kind": "WORKSPACE_DELIVERY",
+                "required_effects": ["mutate"],
+                "required": True,
+            }],
+            "continuation_policy": {"mode": "NONE"},
+        })
+        spec = TaskSpecSnapshot.from_proposal(
+            task.task_id, current.revision + 1, proposal,
+            current.acceptance_criteria,
+        )
+        await application.kernel._append_events(task.task_id, ((
+            "task_spec.revised", {"snapshot": spec.to_data()},
+        ),))
 
     async def test_agent_approval_resumes_same_turn_and_finishes(self) -> None:
         application, temp_dir, task, provider = await self._create_risky_agent()
@@ -331,6 +580,12 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(completed.model_calls, 2)
             self.assertEqual(completed.tool_calls, 1)
             self.assertEqual(provider.invocation_count, 1)
+            live = await application.kernel.get_task(task.task_id)
+            self.assertEqual(
+                (live.active_agent_checkpoint or {}).get(
+                    "pending_user_action", {}
+                ), {},
+            )
             store = application.registry.require(RuntimeStorePort)
             event_types = [event.event_type for event in await store.read_events(task.task_id)]
             self.assertIn("checkpoint.saved", event_types)
@@ -384,6 +639,64 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
             assert isinstance(completed, AgentTurnResult)
             self.assertEqual(completed.assistant_message.text, "Tool outcome: approved")
             self.assertEqual(second_provider.invocation_count, 1)
+        finally:
+            await second.registry.stop_all()
+            workspace.cleanup()
+            temp_dir.cleanup()
+
+    async def test_outcome_ref_survives_approval_sqlite_restart(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        database = Path(temp_dir.name) / "runtime.db"
+        first, workspace, task, first_provider = await self._create_risky_agent(
+            store=SQLiteRuntimeStore(database),
+            model=OutcomeRiskyToolCallingModel(),
+        )
+        await self._install_mutation_outcome(first, task)
+        try:
+            suspended = await first.kernel.run_agent_turn(
+                task.task_id, "change it"
+            )
+            assert isinstance(suspended, AgentTurnSuspended)
+        finally:
+            await first.registry.stop_all()
+
+        second_provider = RiskyToolProvider()
+        second = compose_fixture_application(
+            model_adapter=OutcomeRiskyToolCallingModel(),
+            tool_adapters=(second_provider,),
+            store_adapter=SQLiteRuntimeStore(database),
+        )
+        await second.registry.start_all()
+        try:
+            completed = await second.kernel.resume_agent_turn(
+                task.task_id, suspended.approval_request_id,
+                suspended.payload_hash, ApprovalDecision.APPROVE,
+                "approved after restart",
+            )
+            self.assertIsInstance(completed, AgentTurnResult)
+            from tsm_agt.core import TaskOutcomeStatus
+            outcome = (
+                await second.kernel.get_task_spec(task.task_id)
+            ).outcomes[0]
+            self.assertEqual(outcome.status, TaskOutcomeStatus.DELIVERED)
+            events = await second.kernel.dependencies.store.read_events(
+                task.task_id
+            )
+            for event_type in (
+                "tool.requested", "policy.evaluated",
+                "approval.requested", "approval.resolved",
+                "tool.started", "tool.completed",
+            ):
+                event = next(
+                    item for item in events if item.event_type == event_type
+                )
+                if event_type in {"tool.requested", "tool.started"}:
+                    reference = event.payload["call"]["outcome_ref"]
+                elif event_type == "approval.requested":
+                    reference = event.payload["call"]["outcome_ref"]
+                else:
+                    reference = event.payload["outcome_ref"]
+                self.assertEqual(reference, "workspace-change", event_type)
         finally:
             await second.registry.stop_all()
             workspace.cleanup()

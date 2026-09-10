@@ -37,6 +37,9 @@ class ToolExecutionRecord:
     result: ToolResult | None
     started_at: datetime
     updated_at: datetime
+    reconciled_outcome: str | None = None
+    reconciliation_ref: str | None = None
+    reconciled_at: datetime | None = None
 
     @classmethod
     def start(
@@ -115,6 +118,22 @@ class ToolExecutionRecord:
             updated_at=datetime.now(timezone.utc),
         )
 
+    def reconcile(self, outcome: str, reference: str) -> ToolExecutionRecord:
+        """Attach a human-observed fact without rewriting tool history."""
+        if self.state is not ToolCommitState.UNKNOWN_OUTCOME:
+            raise ValueError("only UNKNOWN_OUTCOME execution can be reconciled")
+        normalized = outcome.strip().upper()
+        if normalized not in {"SUCCEEDED", "NOT_APPLIED"}:
+            raise ValueError("unsupported reconciled tool outcome")
+        if not reference.strip():
+            raise ValueError("tool reconciliation reference is required")
+        now = datetime.now(timezone.utc)
+        return replace(
+            self, reconciled_outcome=normalized,
+            reconciliation_ref=reference.strip(), reconciled_at=now,
+            updated_at=now,
+        )
+
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> ToolExecutionRecord:
         raw_call = data.get("call")
@@ -148,6 +167,18 @@ class ToolExecutionRecord:
             ),
             started_at=datetime.fromisoformat(str(data["started_at"])),
             updated_at=datetime.fromisoformat(str(data["updated_at"])),
+            reconciled_outcome=(
+                str(data["reconciled_outcome"])
+                if data.get("reconciled_outcome") is not None else None
+            ),
+            reconciliation_ref=(
+                str(data["reconciliation_ref"])
+                if data.get("reconciliation_ref") is not None else None
+            ),
+            reconciled_at=(
+                datetime.fromisoformat(str(data["reconciled_at"]))
+                if data.get("reconciled_at") is not None else None
+            ),
         )
 
     def to_data(self) -> dict[str, Any]:
@@ -166,6 +197,11 @@ class ToolExecutionRecord:
             "result": self.result.to_data() if self.result is not None else None,
             "started_at": self.started_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
+            "reconciled_outcome": self.reconciled_outcome,
+            "reconciliation_ref": self.reconciliation_ref,
+            "reconciled_at": (
+                self.reconciled_at.isoformat() if self.reconciled_at else None
+            ),
         }
 
 

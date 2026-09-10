@@ -9,10 +9,14 @@ from tsm_agt.adapters.fixture import EchoModelProvider
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
+    TASK_SPEC_PROPOSAL_SCHEMA_V1,
     AcceptanceStatus, AgentTurnCheckpoint, ProjectTrustLevel, SteeringKind,
-    TaskAcceptanceCriterion, TaskCriterionKind, TaskState,
+    TaskAcceptanceCriterion, TaskContinuationMode, TaskCriterionKind,
+    TaskOutcomeKind, TaskOutcomeStatus, TaskSpecProjector, TaskSpecProposal,
+    TaskSpecSnapshot,
+    TaskState, canonical_hash,
 )
-from tsm_agt.ports import Message, MessageRole, TextBlock, ToolCall
+from tsm_agt.ports import Message, MessageRole, TextBlock, ToolCall, ToolEffect
 
 
 async def move(application, task_id, states):
@@ -23,6 +27,109 @@ async def move(application, task_id, states):
 
 
 class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _delivery_proposal(goal: str = "fix and verify") -> TaskSpecProposal:
+        return TaskSpecProposal.from_data({
+            "schema_version": 1,
+            "goal": goal,
+            "scope": ["src"],
+            "constraints": ["preserve compatibility"],
+            "outcomes": [{
+                "outcome_id": "deliver-fix",
+                "description": "Implement the requested fix",
+                "kind": "WORKSPACE_DELIVERY",
+                "required_effects": ["observe", "mutate", "execute"],
+                "required": True,
+            }],
+            "continuation_policy": {"mode": "AFTER_COMPLETED_UNIT"},
+        })
+
+    async def _install_proposal_spec(self, app, task_id: str, goal: str):
+        current = await app.kernel.get_task_spec(task_id)
+        candidate = TaskSpecSnapshot.from_proposal(
+            task_id, current.revision + 1, self._delivery_proposal(goal),
+            current.acceptance_criteria,
+        )
+        await app.kernel._append_events(task_id, ((
+            "task_spec.revised", {"snapshot": candidate.to_data()},
+        ),))
+        return candidate
+
+    def test_proposal_protocol_rejects_runtime_authority_fields(self):
+        data = {
+            "schema_version": 1,
+            "goal": "fix and verify",
+            "scope": ["src"],
+            "constraints": ["preserve compatibility"],
+            "outcomes": [{
+                "outcome_id": "deliver-fix",
+                "description": "Implement the requested fix",
+                "kind": "WORKSPACE_DELIVERY",
+                "required_effects": ["observe", "mutate", "execute"],
+                "required": True,
+                "status": "DELIVERED",
+            }],
+            "continuation_policy": {"mode": "NONE"},
+        }
+        with self.assertRaisesRegex(ValueError, "unknown fields: status"):
+            TaskSpecProposal.from_data(data)
+        self.assertNotIn("task_id", TASK_SPEC_PROPOSAL_SCHEMA_V1["properties"])
+        self.assertNotIn("status", (
+            TASK_SPEC_PROPOSAL_SCHEMA_V1["properties"]["outcomes"]
+            ["items"]["properties"]
+        ))
+
+    def test_proposal_becomes_pending_runtime_snapshot_and_round_trips(self):
+        proposal = TaskSpecProposal.from_data({
+            "schema_version": 1,
+            "goal": "fix and verify",
+            "scope": ["src"],
+            "constraints": ["preserve compatibility"],
+            "outcomes": [{
+                "outcome_id": "deliver-fix",
+                "description": "Implement the requested fix",
+                "kind": "WORKSPACE_DELIVERY",
+                "required_effects": ["observe", "mutate", "execute"],
+                "required": True,
+            }],
+            "continuation_policy": {"mode": "AFTER_COMPLETED_UNIT"},
+        })
+        spec = TaskSpecSnapshot.from_proposal(
+            "task-proposal", 1, proposal,
+            (TaskAcceptanceCriterion(
+                "workspace-integrity", "workspace remains consistent",
+                TaskCriterionKind.WORKSPACE_INTEGRITY,
+            ),),
+        )
+        self.assertEqual(spec.outcomes[0].status, TaskOutcomeStatus.PENDING)
+        self.assertEqual(
+            spec.outcomes[0].required_effects,
+            (ToolEffect.OBSERVE, ToolEffect.MUTATE, ToolEffect.EXECUTE),
+        )
+        self.assertEqual(
+            spec.continuation_mode, TaskContinuationMode.AFTER_COMPLETED_UNIT
+        )
+        restored = TaskSpecSnapshot.from_data(spec.to_data())
+        self.assertEqual(restored, spec)
+        self.assertEqual(restored.content_hash, spec.content_hash)
+
+    def test_legacy_snapshot_replays_with_original_hash(self):
+        legacy = {
+            "task_id": "task-legacy", "revision": 1,
+            "goal": "legacy goal", "scope": [], "constraints": [],
+            "acceptance_criteria": [{
+                "criterion_id": "workspace-integrity",
+                "description": "Committed workspace effects still match the mutation journal",
+                "verification_kind": "workspace_integrity",
+                "evidence_reference": None,
+            }],
+        }
+        legacy["content_hash"] = canonical_hash(legacy)
+        restored = TaskSpecSnapshot.from_data(legacy)
+        self.assertEqual(restored.schema_version, 0)
+        self.assertFalse(restored.outcomes)
+        self.assertEqual(restored.content_hash, legacy["content_hash"])
+
     async def test_prompt_contains_authoritative_primary_workspace_fact(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -255,6 +362,9 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
             try:
                 one = await first.kernel.create_task("first goal", root, "task-one")
                 two = await first.kernel.create_task("second goal", root, "task-two")
+                installed = await self._install_proposal_spec(
+                    first, one.task_id, "first goal"
+                )
                 self.assertEqual((await first.kernel.get_task_spec(one.task_id)).goal, "first goal")
                 self.assertEqual((await first.kernel.get_task_spec(two.task_id)).goal, "second goal")
                 self.assertFalse(any(root.glob("*spec*")))
@@ -266,7 +376,9 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
             )
             await second.registry.start_all()
             try:
-                self.assertEqual((await second.kernel.get_task_spec("task-one")).revision, 1)
+                restored = await second.kernel.get_task_spec("task-one")
+                self.assertEqual(restored, installed)
+                self.assertEqual(restored.outcomes[0].outcome_id, "deliver-fix")
             finally:
                 await second.registry.stop_all()
 
@@ -276,24 +388,31 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
             await app.registry.start_all()
             try:
                 task = await app.kernel.create_task("fixed goal", Path(directory))
+                installed = await self._install_proposal_spec(
+                    app, task.task_id, "fixed goal"
+                )
                 criterion = TaskAcceptanceCriterion(
                     "evidence", "inspection evidence exists",
                     TaskCriterionKind.EVIDENCE_REFERENCE, "event:1",
                 )
                 updated = await app.kernel.revise_task_spec(
-                    task.task_id, 1, scope=("src",), constraints=("no API changes",),
+                    task.task_id, installed.revision, scope=("src",), constraints=("no API changes",),
                     acceptance_criteria=(criterion,), operation_id="spec-op",
                     writer="test",
                 )
                 replay = await app.kernel.revise_task_spec(
-                    task.task_id, 1, scope=("src",), constraints=("no API changes",),
+                    task.task_id, installed.revision, scope=("src",), constraints=("no API changes",),
                     acceptance_criteria=(criterion,), operation_id="spec-op",
                     writer="test",
                 )
                 self.assertEqual(updated, replay)
+                self.assertEqual(updated.outcomes, installed.outcomes)
+                self.assertEqual(
+                    updated.continuation_mode, installed.continuation_mode
+                )
                 with self.assertRaisesRegex(ValueError, "only through Runtime Replace"):
                     await app.kernel.revise_task_spec(
-                        task.task_id, 2, scope=(), constraints=(),
+                        task.task_id, updated.revision, scope=(), constraints=(),
                         acceptance_criteria=(criterion,), operation_id="goal-change",
                         writer="test", goal="changed goal",
                     )
@@ -335,6 +454,9 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
                     TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
                     TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING, TaskState.EXECUTING,
                 ))
+                installed = await self._install_proposal_spec(
+                    app, task.task_id, "old goal"
+                )
                 checkpoint = AgentTurnCheckpoint(
                     task.task_id, "turn-spec", 1,
                     (Message("user-spec", MessageRole.USER, (TextBlock("start"),)),),
@@ -346,11 +468,18 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
                 await app.kernel._save_agent_checkpoint(checkpoint, "test")
                 await app.kernel.queue_steering(task.task_id, SteeringKind.STEER, "兼容 Windows", "steer-1")
                 checkpoint, _ = await app.kernel._apply_pending_steering(checkpoint, "test")
-                self.assertIn("兼容 Windows", (await app.kernel.get_task_spec(task.task_id)).constraints)
+                steered = await app.kernel.get_task_spec(task.task_id)
+                self.assertIn("兼容 Windows", steered.constraints)
+                self.assertEqual(steered.outcomes, installed.outcomes)
+                self.assertEqual(
+                    steered.continuation_mode, installed.continuation_mode
+                )
                 await app.kernel.queue_steering(task.task_id, SteeringKind.REPLACE, "new goal", "replace-1")
                 await app.kernel._apply_pending_steering(checkpoint, "test")
                 spec = await app.kernel.get_task_spec(task.task_id)
                 self.assertEqual(spec.goal, "new goal")
                 self.assertFalse(spec.constraints)
+                self.assertFalse(spec.outcomes)
+                self.assertEqual(spec.continuation_mode, TaskContinuationMode.NONE)
             finally:
                 await app.registry.stop_all()

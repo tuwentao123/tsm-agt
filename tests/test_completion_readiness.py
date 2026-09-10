@@ -1,21 +1,30 @@
 from __future__ import annotations
 
+import hashlib
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+from tsm_agt.adapters.builtin import CoreProcessToolProvider
 from tsm_agt.adapters.fixture import EchoModelProvider, EchoToolProvider
+from tsm_agt.adapters.local_process import LocalProcessExecutor
+from tsm_agt.adapters.local_sandbox import LocalWorkspaceSandbox
+from tsm_agt.adapters.posix_path import PosixWorkspacePath
 from tsm_agt.adapters.rule_based_completion_readiness import (
     RuleBasedCompletionReadinessPolicy,
 )
 from tsm_agt.bootstrap import compose_fixture_application
-from tsm_agt.core import AgentTurnResult, TaskState
+from tsm_agt.core import (
+    AgentTurnCheckpoint, AgentTurnResult, AgentTurnSuspended, ApprovalDecision,
+    ProjectTrustLevel, TaskState,
+)
 from tsm_agt.ports import (
     CompletionGap, CompletionReadinessAction, CompletionReadinessProbe,
     CompletionReadinessState, EvidenceQuestion, FinishReason, Message, MessageRole, ModelRequest,
     ModelResponse, ModelStreamCompleted, ModelTextDelta, ModelUsage,
     ProviderCapabilities, RuntimeStorePort, TextBlock, ToolCall, ToolCallBlock,
-    ToolInvocationContext, ToolResult, ToolResultBlock,
+    ToolEffect, ToolInvocationContext, ToolResult, ToolResultBlock,
 )
 
 
@@ -133,6 +142,53 @@ class StreamingReadinessModel(ReadinessSequenceModel):
         yield ModelStreamCompleted(response)
 
 
+class PostMutationVerificationModel(EchoModelProvider):
+    """Propose an early final, then execute the capability named by the gap."""
+
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        results = [
+            block.result
+            for message in request.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock)
+        ]
+        correction = next((
+            message.text for message in reversed(request.messages)
+            if message.role is MessageRole.USER
+            and '"boundary":"completion_readiness"' in message.text
+        ), "")
+        if results:
+            return ModelResponse(
+                Message(
+                    "verified-final", MessageRole.ASSISTANT,
+                    (TextBlock("Change verified successfully."),),
+                ),
+                FinishReason.STOP, ModelUsage(1, 1),
+            )
+        if '"action":"CONTINUE"' in correction:
+            return ModelResponse(
+                Message(
+                    "verification-tool", MessageRole.ASSISTANT,
+                    (ToolCallBlock(ToolCall(
+                        "verify-change", "core.run_command", {
+                            "argv": [sys.executable, "-m", "compileall", "changed.py"],
+                            "mode": "foreground", "timeout_seconds": 30,
+                        },
+                    )),),
+                ),
+                FinishReason.TOOL_CALL, ModelUsage(1, 1),
+            )
+        return ModelResponse(
+            Message(
+                "early-final", MessageRole.ASSISTANT,
+                (TextBlock("Change written; verification can be run later."),),
+            ),
+            FinishReason.STOP, ModelUsage(1, 1),
+        )
+
+
 async def executing_task(application, root: Path, task_id: str):
     task = await application.kernel.create_task(
         "collect the required fact", root, task_id=task_id
@@ -148,6 +204,158 @@ async def executing_task(application, root: Path, task_id: str):
 
 
 class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
+    async def test_post_mutation_correction_can_request_approved_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "changed.py"
+            target.write_text("value = 1\n", encoding="utf-8")
+            workspace_path = PosixWorkspacePath()
+            app = compose_fixture_application(
+                model_adapter=PostMutationVerificationModel(),
+                tool_adapters=(CoreProcessToolProvider(),),
+                process_adapter=LocalProcessExecutor(),
+                sandbox_adapter=LocalWorkspaceSandbox(workspace_path),
+                workspace_path_adapter=workspace_path,
+                completion_readiness_policy_adapter=(
+                    RuleBasedCompletionReadinessPolicy()
+                ),
+            )
+            await app.registry.start_all()
+            try:
+                await app.kernel.set_project_trust(
+                    root, ProjectTrustLevel.TRUSTED_BUILD
+                )
+                task = await executing_task(app, root, "ready-verify-e2e")
+                await app.kernel.write_workspace_text(
+                    task.task_id, "change-file", target.name, "value = 2\n",
+                    hashlib.sha256(b"value = 1\n").hexdigest(),
+                )
+                suspended = await app.kernel.run_agent_turn(
+                    task.task_id, "finish and verify the change",
+                    max_model_calls=5, max_tool_calls=2,
+                )
+                self.assertIsInstance(suspended, AgentTurnSuspended)
+                assert isinstance(suspended, AgentTurnSuspended)
+                completed = await app.kernel.resolve_agent_approval(
+                    suspended.approval_request_id, ApprovalDecision.APPROVE,
+                    "approve the exact local compile check",
+                )
+                self.assertIsInstance(completed, AgentTurnResult)
+                assert isinstance(completed, AgentTurnResult)
+                self.assertEqual(
+                    completed.assistant_message.text,
+                    "Change verified successfully.",
+                )
+                events = await app.registry.require(RuntimeStorePort).read_events(
+                    task.task_id
+                )
+                self.assertEqual(sum(
+                    event.event_type == "completion.continuation_requested"
+                    for event in events
+                ), 1)
+                self.assertFalse(any(
+                    event.event_type == "completion.blocker_disclosure_requested"
+                    for event in events
+                ))
+            finally:
+                await app.registry.stop_all()
+
+    async def test_execute_gap_continues_when_execute_capability_is_visible(self) -> None:
+        policy = RuleBasedCompletionReadinessPolicy()
+        await policy.start(None)  # type: ignore[arg-type]
+        try:
+            decision = await policy.evaluate(
+                CompletionReadinessProbe(
+                    goal="verify change",
+                    gaps=(CompletionGap(
+                        "verification", "POST_MUTATION_VERIFICATION",
+                        "latest mutation needs verification", "MISSING",
+                        required_effects=(ToolEffect.EXECUTE,),
+                        candidate_tools=("core.run_command",),
+                    ),),
+                    remaining_model_calls=2, remaining_tool_calls=2,
+                    available_read_tools=(),
+                    available_effects=frozenset({ToolEffect.EXECUTE}),
+                    available_tools=("core.run_command",),
+                ),
+                CompletionReadinessState(),
+            )
+            self.assertEqual(decision.action, CompletionReadinessAction.CONTINUE)
+            self.assertEqual(decision.gaps[0].candidate_tools, ("core.run_command",))
+        finally:
+            await policy.stop(None)  # type: ignore[arg-type]
+
+    async def test_execute_gap_reports_blocked_without_execute_capability(self) -> None:
+        policy = RuleBasedCompletionReadinessPolicy()
+        await policy.start(None)  # type: ignore[arg-type]
+        try:
+            decision = await policy.evaluate(
+                CompletionReadinessProbe(
+                    goal="verify change",
+                    gaps=(CompletionGap(
+                        "verification", "POST_MUTATION_VERIFICATION",
+                        "latest mutation needs verification", "MISSING",
+                        required_effects=(ToolEffect.EXECUTE,),
+                    ),),
+                    remaining_model_calls=2, remaining_tool_calls=2,
+                    available_read_tools=("core.read_file",),
+                    available_effects=frozenset({ToolEffect.OBSERVE}),
+                ),
+                CompletionReadinessState(),
+            )
+            self.assertEqual(
+                decision.action, CompletionReadinessAction.REPORT_BLOCKED
+            )
+        finally:
+            await policy.stop(None)  # type: ignore[arg-type]
+
+    async def test_kernel_exposes_post_mutation_execute_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "changed.py"
+            target.write_text("before\n", encoding="utf-8")
+            app = compose_fixture_application(
+                tool_adapters=(CoreProcessToolProvider(),),
+                completion_readiness_policy_adapter=(
+                    RuleBasedCompletionReadinessPolicy()
+                ),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, root, "ready-mutation")
+                await app.kernel.write_workspace_text(
+                    task.task_id, "change-file", target.name, "after\n",
+                    hashlib.sha256(b"before\n").hexdigest(),
+                )
+                tools = await app.kernel.list_tools()
+                gaps = await app.kernel._completion_readiness_gaps(
+                    task.task_id, tools
+                )
+                gap = next(
+                    item for item in gaps
+                    if item.kind == "POST_MUTATION_VERIFICATION"
+                )
+                self.assertEqual(gap.required_effects, (ToolEffect.EXECUTE,))
+                self.assertEqual(gap.candidate_tools, ("core.run_command",))
+
+                checkpoint = AgentTurnCheckpoint(
+                    task.task_id, "turn-mutation", 1, (), (), (),
+                    0, 0, 0, 0, 3, 3, 512, 10.0,
+                )
+                decision = await app.kernel._evaluate_completion_readiness(
+                    task.task_id, checkpoint.turn_id, checkpoint, tools,
+                    forced_wrap_up=False,
+                )
+                self.assertEqual(
+                    decision.action, CompletionReadinessAction.CONTINUE
+                )
+                correction = app.kernel._completion_correction_message(decision)
+                self.assertNotIn("read-only", correction.text)
+                self.assertIn("normal argument validation", correction.text.lower())
+                self.assertIn("core.run_command", correction.text)
+            finally:
+                await app.registry.stop_all()
+
     async def test_forced_wrap_up_reports_gap_instead_of_opening_tools(self) -> None:
         policy = RuleBasedCompletionReadinessPolicy()
         await policy.start(None)  # type: ignore[arg-type]

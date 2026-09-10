@@ -16,6 +16,7 @@ from tsm_agt.bootstrap import (
 from tsm_agt.core import (
     AgentClarificationSuspended, AgentProgress, AgentTurnResult,
     AgentTurnSuspended,
+    AgentContinuationSuspended,
     ApprovalDecision, TaskSnapshot, TaskState, canonical_hash,
     SteeringKind,
     RuntimeInputIntent,
@@ -258,6 +259,22 @@ class EngineeringAgentClient:
         elif task.state in {TaskState.INTERRUPTED, TaskState.CONFLICT}:
             result = await kernel.resume_checkpointed_agent_turn(
                 task_id,
+                on_progress=lambda item: self._record_progress(task_id, item),
+            )
+        elif (
+            task.state is TaskState.AWAITING_USER
+            and task.pending_clarification is None
+            and isinstance(task.active_agent_checkpoint, Mapping)
+            and isinstance(
+                task.active_agent_checkpoint.get("pending_user_action"),
+                Mapping,
+            )
+            and task.active_agent_checkpoint["pending_user_action"].get(
+                "kind"
+            ) == "CONTINUATION"
+        ):
+            result = await kernel.resume_agent_continuation(
+                task_id, user_text, input_id=f"sdk-{uuid4().hex}",
                 on_progress=lambda item: self._record_progress(task_id, item),
             )
         else:
@@ -513,7 +530,8 @@ class EngineeringAgentClient:
         )
 
     async def answer_clarification(
-        self, request_id: str, resume_token: str, answer: str, *,
+        self, request_id: str, resume_token: str, answer: str | None = None, *,
+        selected_choice: str | None = None,
         command_id: str,
     ) -> RuntimeCommandResult:
         async def execute():
@@ -526,6 +544,7 @@ class EngineeringAgentClient:
             )
             result = await self.application.kernel.resolve_agent_clarification(
                 request_id, resume_token, answer,
+                selected_choice=selected_choice,
                 on_progress=(
                     (lambda item: self._record_progress(task_id, item))
                     if task_id else None
@@ -536,7 +555,11 @@ class EngineeringAgentClient:
             command_id, "clarification", {
                 "request_id": request_id, "resume_token_hash": canonical_hash(
                     resume_token
-                ), "answer_hash": canonical_hash(answer),
+                ),
+                "answer_hash": (
+                    canonical_hash(answer) if answer is not None else None
+                ),
+                "selected_choice": selected_choice,
             }, execute, lambda result: result.to_data(),
         )
 
@@ -550,12 +573,29 @@ class EngineeringAgentClient:
                 clarification={
                     "request_id": result.request_id,
                     "question": result.question, "reason": result.reason,
+                    "kind": result.kind,
                     "required": result.required,
+                    "input_mode": result.input_mode,
                     "choices": [
                         {"value": value, "label": label}
                         for value, label in result.choices
                     ],
                     "resume_token": result.resume_token,
+                },
+            )
+        elif isinstance(result, AgentContinuationSuspended):
+            base = await self.get_task_result(result.task_id)
+            task_result = RuntimeTaskResult(
+                base.task_id, base.state, "awaiting_user", base.cursor,
+                assistant_text=result.assistant_message.text,
+                clarification={
+                    "kind": "CONTINUATION",
+                    "completed_outcome_ids": list(
+                        result.completed_outcome_ids
+                    ),
+                    "remaining_outcome_ids": list(
+                        result.remaining_outcome_ids
+                    ),
                 },
             )
         elif isinstance(result, AgentTurnResult):
@@ -672,6 +712,8 @@ def _clarification_data(task: TaskSnapshot) -> Mapping[str, Any] | None:
     return {
         "request_id": request.request_id, "question": request.question,
         "reason": request.reason, "required": request.required,
+        "kind": request.kind.value,
+        "input_mode": request.input_mode,
         "choices": [choice.to_data() for choice in request.choices],
         "expires_at": request.expires_at.isoformat(),
         "resume_token": None,

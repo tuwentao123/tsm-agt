@@ -8,6 +8,7 @@ from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, CompletionReadinessAction,
     CompletionReadinessDecision, CompletionReadinessPolicyPort,
     CompletionReadinessProbe, CompletionReadinessState, HealthState, HealthStatus,
+    ToolEffect,
 )
 
 
@@ -15,10 +16,10 @@ class RuleBasedCompletionReadinessPolicy:
     """Allow one work correction and one blocker-disclosure correction.
 
     It does not understand Android, Web, backend, or natural-language phrases.
-    Kernel supplies only persisted gaps. Recoverable required gaps may continue
-    once when tools and hard budget remain. Persistent or external gaps get one
-    direct blocker-report correction, after which the Task must finish to avoid a
-    second infinite loop.
+    Kernel supplies only persisted gaps and a capability inventory. Required
+    gaps whose effects are available may continue once when tools and hard
+    budget remain. Persistent or external gaps get one direct blocker-report
+    correction, after which the Task must finish to avoid an infinite loop.
     """
 
     descriptor = AdapterDescriptor(
@@ -57,9 +58,17 @@ class RuleBasedCompletionReadinessPolicy:
                 CompletionReadinessAction.COMPLETE, "core_goal_has_no_known_gaps",
                 state, probe,
             )
-        recoverable = tuple(gap for gap in required if gap.recoverable)
+        available_effects = set(probe.available_effects)
+        # Compatibility for old probes/adapters that predate ToolEffect.
+        if probe.available_read_tools:
+            available_effects.add(ToolEffect.OBSERVE)
+        recoverable = tuple(
+            gap for gap in required
+            if gap.effective_required_effects
+            and gap.effective_required_effects.issubset(available_effects)
+        )
         can_continue = bool(
-            recoverable and probe.available_read_tools
+            recoverable
             and probe.remaining_model_calls > 0
             and probe.remaining_tool_calls > 0
             and not probe.forced_wrap_up
@@ -72,7 +81,7 @@ class RuleBasedCompletionReadinessPolicy:
             )
             return CompletionReadinessDecision(
                 CompletionReadinessAction.CONTINUE,
-                "required_low_risk_work_remains", next_state, recoverable,
+                "required_capability_is_available", next_state, recoverable,
             )
         if probe.remaining_model_calls > 0 and state.disclosure_attempts == 0:
             next_state = CompletionReadinessState(

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.patch_stdout import patch_stdout
 
 
 LineInput = Callable[[str], str]
@@ -33,6 +35,23 @@ class TerminalLineInput:
         sequential script contract.
         """
         return sys.stdin.isatty() and sys.stdout.isatty()
+
+    def output_context(self) -> AbstractContextManager[None]:
+        """Coordinate background output with an active editable prompt.
+
+        Prompt Toolkit redraws the current input line whenever the screen
+        changes.  Plain ``print`` calls made while ``prompt_async`` is active
+        can otherwise be overwritten by that redraw, most visibly losing the
+        final fragment of a streamed model answer.  ``patch_stdout`` routes
+        complete output lines above the prompt and then restores the user's
+        in-progress input.
+        """
+        if not self.supports_live_input:
+            return nullcontext()
+        # ``raw=True`` keeps streamed fragments byte-for-byte intact.  Each
+        # explicit flush from the CLI is still rendered above the prompt and
+        # followed by a safe prompt redraw.
+        return patch_stdout(raw=True)
 
     def __call__(self, prompt: str) -> str:
         if not sys.stdin.isatty() or not sys.stdout.isatty():

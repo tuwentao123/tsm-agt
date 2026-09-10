@@ -314,6 +314,7 @@ async def _probe_model(configuration: ModelConfiguration) -> None:
                 configuration.output_token_parameter
             ),
             model_strict_tool_schema=configuration.strict_tool_schema,
+            model_streaming=configuration.streaming,
         )
         await application.registry.start_all()
         try:

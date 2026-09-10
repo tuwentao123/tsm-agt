@@ -79,6 +79,13 @@ class KernelTurnTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(events[-3].payload["input_role"], "user")
             self.assertIn("effective_prompt_hash", events[-2].payload)
             self.assertIn("prompt_manifest_hash", events[-2].payload)
+            diagnostics = events[-2].payload["response_diagnostics"]
+            self.assertIsNone(
+                diagnostics["checks"]["transport_matches_adapter"]
+            )
+            self.assertTrue(
+                diagnostics["checks"]["kernel_matches_persisted"]
+            )
             self.assertEqual(
                 (await application.kernel.get_task(task.task_id)).state,
                 TaskState.EXECUTING,

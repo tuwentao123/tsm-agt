@@ -230,7 +230,10 @@ class LocalEventApiServer:
                         body = self._body()
                         result = owner._call(owner._client.answer_clarification(
                             parts[2], _required_text(body, "resume_token"),
-                            _required_text(body, "answer"),
+                            _optional_text(body, "answer"),
+                            selected_choice=_optional_text(
+                                body, "selected_choice"
+                            ),
                             command_id=_required_text(body, "command_id"),
                         ))
                         self._json(HTTPStatus.OK, result.to_data())

@@ -165,6 +165,39 @@ class CliLineEditingPtyTest(unittest.TestCase):
             "你 好" in line or "好 w" in line for line in screen.lines
         ), screen.text())
 
+    def test_live_control_prompt_does_not_overwrite_stream_tail(self) -> None:
+        source = (
+            "import asyncio,tempfile; from pathlib import Path; "
+            "from tsm_agt.bootstrap import compose_fixture_application; "
+            "from tsm_agt.adapters.fixture import EchoModelProvider; "
+            "from tsm_agt.cli import _chat; "
+            "from tsm_agt.ports import Message,MessageRole,ModelResponse,"
+            "ModelStreamCompleted,ModelTextDelta,TextBlock; "
+            "exec(\"class M(EchoModelProvider):\\n"
+            " async def stream_complete(self,r):\\n"
+            "  yield ModelTextDelta('当前轮次还没法')\\n"
+            "  await asyncio.sleep(.15)\\n"
+            "  yield ModelTextDelta('完成验证。')\\n"
+            "  yield ModelStreamCompleted(ModelResponse(Message("
+            "'m',MessageRole.ASSISTANT,(TextBlock('当前轮次还没法完成验证。'),))))\"); "
+            "d=tempfile.TemporaryDirectory(); root=Path(d.name); "
+            "app=compose_fixture_application(model_adapter=M(),tool_adapters=()); "
+            "raise SystemExit(asyncio.run(_chat(root,application_factory=lambda:app)))"
+        )
+        rendered, raw_output = self._run_pty(
+            source,
+            [
+                (b"you> ", b"test\n", 0.05),
+                (b"control> ", b"", 0.05),
+                ("完成验证。".encode(), b"/exit\n", 0.05),
+            ],
+            timeout=8.0,
+        )
+        self.assertIn("当前轮次还没法完成验证。", rendered)
+        screen = _AnsiScreen(100, 24)
+        screen.feed(raw_output)
+        self.assertIn("当前轮次还没法完成验证。", screen.text())
+
 
 class _AnsiScreen:
     """Minimal VT100 screen used to assert the visible result, not raw bytes."""

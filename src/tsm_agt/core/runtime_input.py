@@ -13,6 +13,7 @@ class SessionContinuationMode(StrEnum):
     """Safe execution result after a Session Task was explicitly selected."""
 
     RECOVER_TASK = "RECOVER_TASK"
+    RESUME_CONTINUATION = "RESUME_CONTINUATION"
     CREATE_FOLLOW_UP = "CREATE_FOLLOW_UP"
     AWAIT_USER_ACTION = "AWAIT_USER_ACTION"
     BLOCKED = "BLOCKED"
@@ -81,12 +82,26 @@ class SessionInputAction(StrEnum):
     CLARIFY = "CLARIFY"
 
 
+class SessionInputGrounding(StrEnum):
+    """Whether the current text can stand alone as a new Task goal.
+
+    This is semantic evidence supplied by the resolver, not an execution
+    decision.  Kernel uses it to prevent context-dependent utterances from
+    being silently converted into unrelated new Tasks.
+    """
+
+    SELF_CONTAINED = "SELF_CONTAINED"
+    CONTEXT_DEPENDENT = "CONTEXT_DEPENDENT"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
 @dataclass(frozen=True, slots=True)
 class SessionInputDecision:
     action: SessionInputAction
     task_id: str | None
     confidence: float
     reason_code: str
+    input_grounding: SessionInputGrounding
     clarification: str | None = None
     resolver_version: str = "runtime-default-v1"
     candidates: tuple[SessionResumeCandidate, ...] = ()

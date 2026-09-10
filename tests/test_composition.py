@@ -80,6 +80,9 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
         application = compose_fixture_application()
         await application.registry.start_all()
         try:
+            self.assertEqual(
+                application.kernel.dependencies.default_max_output_tokens, 1024
+            )
             self.assertIsNotNone(application.registry.require(ModelProviderPort))
             self.assertIsNotNone(application.registry.require(ProcessExecutorPort))
             self.assertIsNotNone(application.registry.require(RuntimeStorePort))
@@ -173,6 +176,9 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             application = compose_openai_compatible_engineering_application_from_env()
         await application.registry.start_all()
         try:
+            self.assertEqual(
+                application.kernel.dependencies.default_max_output_tokens, 8192
+            )
             model = application.registry.require(ModelProviderPort)
             self.assertTrue(model.capabilities.tools)
             sandbox = application.registry.require(SandboxPort)
@@ -354,7 +360,8 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                 "TSM_AGT_MODEL_MAX_RETRIES=4\n"
                 "TSM_AGT_MODEL_RETRY_BACKOFF_SECONDS=0.5\n"
                 "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=max_completion_tokens\n"
-                "TSM_AGT_MODEL_STRICT_TOOL_SCHEMA=false\n",
+                "TSM_AGT_MODEL_STRICT_TOOL_SCHEMA=false\n"
+                "TSM_AGT_MODEL_STREAMING=false\n",
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):
@@ -371,6 +378,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                 provider._output_token_parameter, "max_completion_tokens"
             )
             self.assertFalse(provider._strict_tool_schema)
+            self.assertFalse(provider._streaming)
             self.assertFalse(provider.capabilities.strict_json_schema)
 
     async def test_context_compaction_settings_enter_effective_configuration(self):

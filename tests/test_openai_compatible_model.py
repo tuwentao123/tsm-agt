@@ -56,6 +56,24 @@ class RecordingTransport:
         return self.responses.pop(0)
 
 
+class AttemptJsonTransport(RecordingTransport):
+    def __init__(self, attempts: list[Mapping[str, Any] | Exception]) -> None:
+        super().__init__([])
+        self.attempts = attempts
+
+    async def post_json(
+        self, url, headers, payload, timeout_seconds,
+    ) -> Mapping[str, Any]:
+        self.requests.append({
+            "url": url, "headers": dict(headers),
+            "payload": dict(payload), "timeout_seconds": timeout_seconds,
+        })
+        attempt = self.attempts.pop(0)
+        if isinstance(attempt, Exception):
+            raise attempt
+        return attempt
+
+
 class StreamingTransport(RecordingTransport):
     def __init__(self, events: list[str]) -> None:
         super().__init__([])
@@ -90,6 +108,119 @@ class AttemptStreamingTransport(RecordingTransport):
 
 
 class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
+    async def test_non_streaming_classifies_retryable_transport_failure_once(self):
+        transport = AttemptJsonTransport([
+            OpenAICompatibleProviderError(
+                "timed out", retryable=True, reason_code="read_timeout"
+            ),
+            {
+                "id": "chat-retried-json",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "recovered"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {},
+            },
+        ])
+        provider = OpenAICompatibleModelProvider(
+            "https://models.example.test/v1", "test-model", "secret",
+            max_retries=2, retry_backoff_seconds=0, streaming=False,
+            transport=transport,
+        )
+        await provider.start(AdapterContext(
+            config={}, emit_event=lambda _type, _payload: None
+        ))
+        with self.assertRaises(OpenAICompatibleProviderError) as caught:
+            await provider.complete(ModelRequest(
+                "turn-json-retry",
+                (Message("user", MessageRole.USER, (TextBlock("hello"),)),),
+            ))
+        self.assertEqual(caught.exception.reason_code, "read_timeout")
+        self.assertEqual(len(transport.requests), 1)
+
+    async def test_non_streaming_does_not_retry_permanent_provider_failure(self):
+        transport = AttemptJsonTransport([
+            OpenAICompatibleProviderError(
+                "unauthorized", retryable=False, reason_code="http_401"
+            ),
+        ])
+        provider = OpenAICompatibleModelProvider(
+            "https://models.example.test/v1", "test-model", "secret",
+            max_retries=2, retry_backoff_seconds=0, streaming=False,
+            transport=transport,
+        )
+        await provider.start(AdapterContext(
+            config={}, emit_event=lambda _type, _payload: None
+        ))
+        with self.assertRaises(OpenAICompatibleProviderError):
+            await provider.complete(ModelRequest(
+                "turn-json-no-retry",
+                (Message("user", MessageRole.USER, (TextBlock("hello"),)),),
+            ))
+        self.assertEqual(len(transport.requests), 1)
+
+    async def test_non_streaming_classifies_empty_message_for_resample(self):
+        transport = AttemptJsonTransport([
+            {
+                "id": "chat-empty",
+                "choices": [{
+                    "message": {"role": "assistant", "content": None},
+                    "finish_reason": "stop",
+                }],
+                "usage": {},
+            },
+            {
+                "id": "chat-recovered",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {},
+            },
+        ])
+        provider = OpenAICompatibleModelProvider(
+            "https://models.example.test/v1", "test-model", "secret",
+            max_retries=1, retry_backoff_seconds=0, streaming=False,
+            transport=transport,
+        )
+        await provider.start(AdapterContext(
+            config={}, emit_event=lambda _type, _payload: None
+        ))
+        with self.assertRaises(OpenAICompatibleProviderError) as caught:
+            await provider.complete(ModelRequest(
+                "turn-empty-recovery",
+                (Message("user", MessageRole.USER, (TextBlock("finish"),)),),
+            ))
+        self.assertEqual(caught.exception.reason_code, "empty_message")
+        self.assertEqual(caught.exception.retry_safety.value, "SAFE_RESAMPLE")
+        self.assertEqual(len(transport.requests), 1)
+
+    async def test_non_streaming_provider_does_not_own_attempt_limit(self):
+        empty = {
+            "id": "chat-empty",
+            "choices": [{
+                "message": {"role": "assistant", "content": None},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        }
+        transport = AttemptJsonTransport([empty, empty])
+        provider = OpenAICompatibleModelProvider(
+            "https://models.example.test/v1", "test-model", "secret",
+            max_retries=1, retry_backoff_seconds=0, streaming=False,
+            transport=transport,
+        )
+        await provider.start(AdapterContext(
+            config={}, emit_event=lambda _type, _payload: None
+        ))
+        with self.assertRaises(OpenAICompatibleProviderError) as caught:
+            await provider.complete(ModelRequest(
+                "turn-empty-failure",
+                (Message("user", MessageRole.USER, (TextBlock("finish"),)),),
+            ))
+        self.assertEqual(caught.exception.reason_code, "empty_message")
+        self.assertEqual(len(transport.requests), 1)
+
     async def _provider(self, responses: list[Mapping[str, Any]]):
         transport = RecordingTransport(responses)
         provider = OpenAICompatibleModelProvider(
@@ -131,7 +262,46 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.message.text, "hello world")
         self.assertEqual(response.usage.input_tokens, 7)
         self.assertEqual(response.usage.output_tokens, 2)
+        diagnostics = response.diagnostics
+        self.assertEqual(diagnostics["transport"]["kind"], "sse")
+        self.assertEqual(diagnostics["transport"]["chunk_count"], 3)
+        self.assertTrue(diagnostics["transport"]["saw_finish_reason"])
+        self.assertTrue(diagnostics["transport"]["saw_done"])
+        self.assertEqual(
+            diagnostics["transport"]["text"]["sha256"],
+            diagnostics["adapter"]["text"]["sha256"],
+        )
         self.assertTrue(transport.requests[0]["payload"]["stream"])
+
+    async def test_non_streaming_records_json_fingerprint_without_body(self) -> None:
+        answer = "private provider answer must not be copied into diagnostics"
+        provider, _ = await self._provider([{
+            "id": "chat-json-diagnostics",
+            "choices": [{
+                "message": {"role": "assistant", "content": answer},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4},
+        }])
+
+        response = await provider.complete(ModelRequest(
+            "turn-json-diagnostics",
+            (Message("user-1", MessageRole.USER, (TextBlock("hello"),)),),
+        ))
+
+        transport = response.diagnostics["transport"]
+        self.assertEqual(transport["kind"], "json")
+        self.assertEqual(transport["chunk_count"], 1)
+        self.assertTrue(transport["saw_finish_reason"])
+        self.assertIsNone(transport["saw_done"])
+        self.assertEqual(
+            transport["text"]["sha256"],
+            response.diagnostics["adapter"]["text"]["sha256"],
+        )
+        serialized = json.dumps(response.diagnostics, ensure_ascii=False)
+        self.assertNotIn(answer, serialized)
+        self.assertNotIn("body", serialized.lower())
+        self.assertNotIn("tail", serialized.lower())
 
     async def test_output_token_parameter_is_explicitly_replaceable(self) -> None:
         transport = RecordingTransport([{
@@ -194,7 +364,7 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(provider.capabilities.strict_json_schema)
         self.assertNotIn("strict-json-schema", provider.descriptor.capabilities)
 
-    async def test_stream_retries_transient_failure_without_new_logical_call(self):
+    async def test_stream_classifies_transient_failure_without_retrying(self):
         transport = AttemptStreamingTransport([
             OpenAICompatibleProviderError(
                 "timed out", retryable=True, reason_code="stream_failed"
@@ -211,18 +381,14 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         await provider.start(AdapterContext(
             config={}, emit_event=lambda _type, _payload: None
         ))
-        progress = []
         request = ModelRequest(
             "turn-retry",
             (Message("user-1", MessageRole.USER, (TextBlock("hello"),)),),
-            on_transport_progress=progress.append,
         )
-        events = [event async for event in provider.stream_complete(request)]
-        self.assertEqual(events[-1].response.message.text, "recovered")
-        self.assertEqual(len(transport.requests), 2)
-        self.assertEqual(progress[0].attempt, 2)
-        self.assertEqual(progress[0].max_attempts, 3)
-        self.assertEqual(progress[0].reason, "stream_failed")
+        with self.assertRaises(OpenAICompatibleProviderError) as caught:
+            _ = [event async for event in provider.stream_complete(request)]
+        self.assertEqual(caught.exception.reason_code, "stream_failed")
+        self.assertEqual(len(transport.requests), 1)
 
     async def test_stream_does_not_retry_after_user_visible_text(self):
         transport = AttemptStreamingTransport([[
@@ -245,6 +411,31 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         ):
             _ = [event async for event in provider.stream_complete(request)]
         self.assertEqual(len(transport.requests), 1)
+
+    async def test_streaming_can_be_disabled_for_gateway_compatibility(self):
+        transport = RecordingTransport([{
+            "id": "chat-non-streaming",
+            "choices": [{
+                "message": {"role": "assistant", "content": "complete"},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        }])
+        provider = OpenAICompatibleModelProvider(
+            "https://models.example.test/v1", "test-model", "test-secret",
+            streaming=False, transport=transport,
+        )
+        await provider.start(AdapterContext(
+            config={}, emit_event=lambda _type, _payload: None
+        ))
+        events = [event async for event in provider.stream_complete(ModelRequest(
+            "turn-non-streaming",
+            (Message("user", MessageRole.USER, (TextBlock("hello"),)),),
+        ))]
+        self.assertEqual(events[-1].response.message.text, "complete")
+        self.assertNotIn("stream", transport.requests[0]["payload"])
+        self.assertFalse(provider.capabilities.stream_cancel)
+        self.assertNotIn("streaming", provider.descriptor.capabilities)
 
     async def test_wrap_up_request_keeps_tool_schema_but_disables_tool_calls(self) -> None:
         provider, transport = await self._streaming_provider([
@@ -277,7 +468,7 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call.name, "core.read_file")
         self.assertEqual(call.arguments, {"path": "README.md"})
 
-    async def test_stream_accepts_complete_finish_without_done_but_rejects_incomplete_data(self) -> None:
+    async def test_stream_accepts_complete_finish_without_done_and_classifies_incomplete_data(self) -> None:
         request = ModelRequest("turn-bad", (Message(
             "user-1", MessageRole.USER, (TextBlock("hello"),)
         ),))
@@ -294,10 +485,22 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         provider, _ = await self._streaming_provider([
             '{"choices":[{"delta":{},"finish_reason":null}]}'
         ])
-        with self.assertRaisesRegex(
-            OpenAICompatibleProviderError, "without finish_reason"
-        ):
+        provider._transport.responses.append({
+            "id": "chat-fallback",
+            "choices": [{
+                "message": {"role": "assistant", "content": "fallback"},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        })
+        with self.assertRaises(OpenAICompatibleProviderError) as caught:
             _ = [event async for event in provider.stream_complete(request)]
+        self.assertEqual(caught.exception.reason_code, "incomplete_stream")
+        self.assertEqual(
+            caught.exception.retry_safety.value, "SAFE_FALLBACK_TRANSPORT"
+        )
+        self.assertEqual(len(provider._transport.requests), 1)
+        self.assertTrue(provider._transport.requests[0]["payload"]["stream"])
 
     @staticmethod
     def _tool_spec() -> ToolSpec:
@@ -802,6 +1005,41 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaisesRegex(OpenAICompatibleProviderError, "finish reason"):
             await provider.complete(ModelRequest("turn-1", ()))
+
+    async def test_outcome_ref_is_protocol_metadata_not_tool_argument(self) -> None:
+        provider, transport = await self._provider([{
+            "id": "chat-outcome",
+            "choices": [{
+                "message": {"role": "assistant", "tool_calls": [{
+                    "id": "call-outcome", "type": "function",
+                    "function": {
+                        "name": "core__read_file",
+                        "arguments": json.dumps({
+                            "path": "README.md",
+                            "outcome_ref": "inspect-source",
+                        }),
+                    },
+                }]},
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {},
+        }])
+        response = await provider.complete(ModelRequest(
+            "turn-outcome",
+            (Message("user", MessageRole.USER, (TextBlock("inspect"),)),),
+            tools=(self._tool_spec(),), outcome_refs=("inspect-source",),
+        ))
+        call = next(
+            block.call for block in response.message.content
+            if isinstance(block, ToolCallBlock)
+        )
+        self.assertEqual(call.outcome_ref, "inspect-source")
+        self.assertEqual(call.arguments, {"path": "README.md"})
+        schema = transport.requests[0]["payload"]["tools"][0]["function"]["parameters"]
+        self.assertEqual(
+            schema["properties"]["outcome_ref"]["enum"],
+            ["inspect-source"],
+        )
 
 
 if __name__ == "__main__":

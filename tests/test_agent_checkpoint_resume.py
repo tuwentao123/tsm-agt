@@ -658,6 +658,8 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
             "evidence_relation_state", "rejection_loop_state",
             "exploration_outcome_state", "evidence_question_state",
             "completion_readiness_state",
+            "task_spec_revision", "task_spec_hash",
+            "active_outcome_ids", "pending_user_action",
         ):
             legacy.pop(field)
         legacy["checkpoint_hash"] = canonical_hash(legacy)
@@ -667,6 +669,10 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.exploration_outcome_state, {})
         self.assertEqual(restored.evidence_question_state, {})
         self.assertEqual(restored.completion_readiness_state, {})
+        self.assertEqual(restored.task_spec_revision, 0)
+        self.assertEqual(restored.task_spec_hash, "")
+        self.assertEqual(restored.active_outcome_ids, ())
+        self.assertEqual(restored.pending_user_action, {})
 
 
 if __name__ == "__main__":

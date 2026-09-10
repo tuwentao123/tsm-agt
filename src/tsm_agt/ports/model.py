@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any, Protocol, runtime_checkable
@@ -26,12 +26,20 @@ class FinishReason(StrEnum):
     ERROR = "error"
 
 
+class ModelCallPurpose(StrEnum):
+    AGENT_TURN = "AGENT_TURN"
+    SESSION_ROUTING = "SESSION_ROUTING"
+    TASK_SPEC = "TASK_SPEC"
+    COMPACTION = "COMPACTION"
+
+
 class RecoverableToolProtocolError(RuntimeError):
     """One model response used a correctable tool-call wire format."""
 
-    def __init__(self, reason_code: str) -> None:
+    def __init__(self, reason_code: str, detail: str = "") -> None:
         self.reason_code = reason_code
-        super().__init__(reason_code)
+        self.detail = detail
+        super().__init__(detail or reason_code)
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +158,26 @@ class ModelTransportProgress:
     max_attempts: int
     reason: str = ""
     delay_seconds: float = 0.0
+    category: str = ""
+    retry_safety: str = ""
+    diagnostic_code: str = ""
+    recovery_action: str = ""
+    visible_output_emitted: bool = False
+    response_committed: bool = False
+    transport_mode: str = ""
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "kind": self.kind, "attempt": self.attempt,
+            "max_attempts": self.max_attempts, "reason": self.reason,
+            "delay_seconds": self.delay_seconds, "category": self.category,
+            "retry_safety": self.retry_safety,
+            "diagnostic_code": self.diagnostic_code,
+            "recovery_action": self.recovery_action,
+            "visible_output_emitted": self.visible_output_emitted,
+            "response_committed": self.response_committed,
+            "transport_mode": self.transport_mode,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,9 +188,17 @@ class ModelRequest:
     tools: tuple[ToolSpec, ...] = ()
     allow_tool_calls: bool = True
     require_evidence_questions: bool = False
+    outcome_refs: tuple[str, ...] = ()
     # This callback is process-local and is never serialized into a Checkpoint.
     # Adapters can expose retries without leaking HTTP/SSE details into Kernel.
     on_transport_progress: Callable[[ModelTransportProgress], None] | None = None
+    # Optional per-tool narrowing. Runtime computes this from the authoritative
+    # TaskSpec so Provider schemas do not advertise impossible Tool→Outcome pairs.
+    # Kept after the older callback field to preserve positional compatibility.
+    tool_outcome_refs: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    purpose: ModelCallPurpose = ModelCallPurpose.AGENT_TURN
+    timeout_seconds: float | None = None
+    max_provider_attempts: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +206,7 @@ class ModelResponse:
     message: Message
     finish_reason: FinishReason = FinishReason.STOP
     usage: ModelUsage = ModelUsage()
+    diagnostics: Mapping[str, object] = field(default_factory=dict)
 
 
 class ModelProviderPort(RuntimeAdapter, Protocol):
@@ -187,7 +224,12 @@ class ModelTextDelta:
 
 @dataclass(frozen=True, slots=True)
 class ModelStreamCompleted:
-    """The single normalized, fully validated result ending one stream."""
+    """The single normalized, fully validated result ending one stream.
+
+    A Provider may emit this as the only event for non-streaming compatibility
+    or a safe transport fallback.  If text deltas precede it, they must describe
+    the same assistant text as this committed response.
+    """
 
     response: ModelResponse
 

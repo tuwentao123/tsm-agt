@@ -8,6 +8,7 @@ from enum import StrEnum
 from typing import Any, Protocol
 
 from .adapter import RuntimeAdapter
+from .tool import ToolEffect
 
 
 class CompletionReadinessAction(StrEnum):
@@ -18,7 +19,13 @@ class CompletionReadinessAction(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class CompletionGap:
-    """One inspectable reason why the proposed final answer may be early."""
+    """One inspectable reason why the proposed final answer may be early.
+
+    required_effects describes the capability needed to close the gap. It does
+    not grant permission or select an invocation; normal tool validation, risk
+    policy, approval and sandboxing still apply. recoverable remains as a
+    compatibility hint where it means OBSERVE may recover the gap.
+    """
 
     gap_id: str
     kind: str
@@ -28,10 +35,25 @@ class CompletionGap:
     recoverable: bool = False
     evidence_reference: str = ""
     expected_scope: str = ""
+    required_effects: tuple[ToolEffect, ...] = ()
+    candidate_tools: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not all((self.gap_id.strip(), self.kind.strip(), self.description.strip())):
             raise ValueError("completion gap identity, kind, and description are required")
+        if ToolEffect.UNSPECIFIED in self.required_effects:
+            raise ValueError("completion gap cannot require an unspecified tool effect")
+        if any(not name.strip() for name in self.candidate_tools):
+            raise ValueError("completion gap candidate tool names must not be empty")
+
+    @property
+    def effective_required_effects(self) -> frozenset[ToolEffect]:
+        """Return explicit effects or the legacy read-recovery equivalent."""
+        if self.required_effects:
+            return frozenset(self.required_effects)
+        if self.recoverable:
+            return frozenset({ToolEffect.OBSERVE})
+        return frozenset()
 
     def to_data(self) -> dict[str, Any]:
         return {
@@ -41,6 +63,8 @@ class CompletionGap:
             "recoverable": self.recoverable,
             "evidence_reference": self.evidence_reference,
             "expected_scope": self.expected_scope,
+            "required_effects": [item.value for item in self.required_effects],
+            "candidate_tools": list(self.candidate_tools),
         }
 
 
@@ -91,6 +115,8 @@ class CompletionReadinessProbe:
     forced_wrap_up: bool = False
     evidence_item_count: int = 0
     successful_tool_calls: int = 0
+    available_effects: frozenset[ToolEffect] = frozenset()
+    available_tools: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

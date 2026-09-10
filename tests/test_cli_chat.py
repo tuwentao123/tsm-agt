@@ -10,14 +10,17 @@ from tsm_agt.adapters.fixture import EchoModelProvider
 from tsm_agt.adapters.builtin import CoreProcessToolProvider
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
-from tsm_agt.cli import _chat, _chat_error_guidance
-from tsm_agt.core import ProjectTrustLevel, TaskState
+from tsm_agt.cli import (
+    _chat, _chat_error_guidance, _resolve_session_input_with_progress,
+)
+from tsm_agt.core import ModelInvocationFailed, ProjectTrustLevel, TaskState
 from tsm_agt.ports import RuntimeStorePort
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, FinishReason, HealthState, HealthStatus,
     Message, MessageRole, ModelRequest, ModelResponse, ModelUsage,
     ProviderCapabilities, TextBlock, ToolCall, ToolCallBlock, ToolResultBlock,
     ToolIdempotency, ToolRisk, ToolSpec, ToolResult,
+    ModelFailureCategory, ModelRecoveryAction, ModelRetrySafety,
 )
 
 
@@ -127,6 +130,19 @@ class FailOnceChatModel(EchoModelProvider):
         return await super().complete(request)
 
 
+class FailFirstNChatModel(EchoModelProvider):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.calls = 0
+
+    async def complete(self, request):
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise ConnectionError("fixture interruption")
+        return await super().complete(request)
+
+
 class RecordingChatModel(EchoModelProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -161,14 +177,27 @@ class FixtureSessionInputResolver:
         if text in self.new_task_inputs:
             return {
                 "action": "NEW_TASK", "task_id": None,
+                "input_grounding": "SELF_CONTAINED",
                 "confidence": 0.99, "reason_code": "fixture_new_task",
                 "clarification": None,
             }
         return {
             "action": "RESUME_TASK",
+            "input_grounding": "CONTEXT_DEPENDENT",
             "task_id": context["unfinished_tasks"][0]["task_id"],
             "confidence": 0.99, "reason_code": "fixture_resume",
             "clarification": None,
+        }
+
+
+class ClarifyingSessionInputResolver(FixtureSessionInputResolver):
+    async def resolve_session_input(self, text, context):
+        self.contexts.append(dict(context))
+        return {
+            "action": "CLARIFY", "task_id": None,
+            "input_grounding": "AMBIGUOUS",
+            "confidence": 0.99, "reason_code": "multiple_candidates",
+            "clarification": "请选择要继续的未完成 Task。",
         }
 
 
@@ -211,6 +240,159 @@ class FixtureRuntimeInputClassifier:
 
 
 class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
+    async def test_clarify_then_fourth_choice_does_not_call_resolver_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = FailFirstNChatModel(4)
+            resolver = ClarifyingSessionInputResolver()
+            application = compose_fixture_application(
+                model_adapter=model, tool_adapters=(),
+                session_input_resolver_adapter=resolver,
+                store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
+            )
+            await application.registry.start_all()
+            session = await application.kernel.create_session("clarify journey")
+            try:
+                task_ids = []
+                for index in range(1, 5):
+                    task = await application.kernel.create_task(
+                        f"unfinished goal {index}", root,
+                        session_id=session.session_id,
+                    )
+                    task_ids.append(task.task_id)
+                    for state in (
+                        TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                        TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                        TaskState.EXECUTING,
+                    ):
+                        task = await application.kernel.transition_task(
+                            task.task_id, state, state.value
+                        )
+                    with self.assertRaises(ModelInvocationFailed):
+                        await application.kernel.run_agent_turn(
+                            task.task_id, task.goal
+                        )
+                displayed = await application.kernel.list_session_resume_candidates(
+                    session.session_id, root
+                )
+                displayed_fourth_id = displayed[3].task_id
+            finally:
+                await application.registry.stop_all()
+
+            output: list[str] = []
+            result = await _chat(
+                root, session_id=session.session_id,
+                input_fn=ScriptedInput(["继续呢", "第四个吧", "/exit"]),
+                output_fn=output.append, application_factory=lambda: application,
+            )
+            self.assertEqual(result, 0)
+            self.assertEqual(len(resolver.contexts), 1)
+            self.assertTrue(any(line.startswith("4. ") for line in output))
+            self.assertTrue(any(
+                "编号选择不调用模型" in line for line in output
+            ))
+            self.assertTrue(any(
+                "option-4" in line for line in output
+            ))
+            self.assertIn(f"task: {displayed_fourth_id}", output)
+            await application.registry.start_all()
+            try:
+                events = await application.kernel.dependencies.store.read_session_events(
+                    session.session_id
+                )
+                event_types = [event.event_type for event in events]
+                self.assertIn("session.interaction_requested", event_types)
+                self.assertIn("session.interaction_answered", event_types)
+            finally:
+                await application.registry.stop_all()
+
+    async def test_persisted_fourth_choice_resumes_without_semantic_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = FailFirstNChatModel(4)
+            resolver = FixtureSessionInputResolver()
+            application = compose_fixture_application(
+                model_adapter=model, tool_adapters=(),
+                session_input_resolver_adapter=resolver,
+                store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
+            )
+            await application.registry.start_all()
+            session = await application.kernel.create_session("choice journey")
+            try:
+                for index in range(1, 5):
+                    task = await application.kernel.create_task(
+                        f"unfinished goal {index}", root,
+                        session_id=session.session_id,
+                    )
+                    for state in (
+                        TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                        TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                        TaskState.EXECUTING,
+                    ):
+                        task = await application.kernel.transition_task(
+                            task.task_id, state, state.value
+                        )
+                    with self.assertRaises(ModelInvocationFailed):
+                        await application.kernel.run_agent_turn(
+                            task.task_id, task.goal
+                        )
+                candidates = await application.kernel.list_session_resume_candidates(
+                    session.session_id, root
+                )
+                fourth_id = candidates[3].task_id
+            finally:
+                await application.registry.stop_all()
+
+            output: list[str] = []
+            result = await _chat(
+                root, session_id=session.session_id,
+                input_fn=ScriptedInput(["/resume", "第四个吧", "/exit"]),
+                output_fn=output.append, application_factory=lambda: application,
+            )
+            self.assertEqual(result, 0)
+            self.assertEqual(resolver.contexts, [])
+            self.assertTrue(any(
+                line.startswith("4. ") for line in output
+            ))
+            self.assertTrue(any(
+                "option-4" in line for line in output
+            ))
+            self.assertIn(f"task: {fourth_id}", output)
+            await application.registry.start_all()
+            try:
+                selected = await application.kernel.get_task(fourth_id)
+                self.assertEqual(selected.state, TaskState.SUCCEEDED)
+                events = await application.kernel.dependencies.store.read_session_events(
+                    session.session_id
+                )
+                self.assertTrue(any(
+                    event.event_type == "session.interaction_answered"
+                    and event.payload["target_id"] == fourth_id
+                    for event in events
+                ))
+            finally:
+                await application.registry.stop_all()
+
+    async def test_session_routing_wait_is_visible_until_result(self):
+        class Kernel:
+            async def resolve_session_input(self, session_id, prompt, root):
+                await asyncio.sleep(0.035)
+                return "resolved"
+
+        class Application:
+            kernel = Kernel()
+
+        output: list[str] = []
+        result = await _resolve_session_input_with_progress(
+            Application(), "session-1", "ambiguous", Path("."),
+            output.append, heartbeat_seconds=0.01,
+        )
+        self.assertEqual(result, "resolved")
+        self.assertTrue(output[0].startswith("[会话] 正在识别"))
+        self.assertTrue(any(
+            "语义识别仍在进行" in line for line in output
+        ))
+
     def test_error_guidance_is_actionable(self):
         root = Path("/fixture")
         self.assertIn(
@@ -221,6 +403,16 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             "TRUSTED_BUILD",
             _chat_error_guidance(RuntimeError("PERMISSION_DENIED untrusted"), root)[0],
         )
+        exhausted = ModelInvocationFailed(
+            "turn-recovery", "provider attempts exhausted",
+            failure_category=ModelFailureCategory.INVALID_RESPONSE,
+            retry_safety=ModelRetrySafety.SAFE_RESAMPLE,
+            recovery_action=ModelRecoveryAction.PRESERVE_AND_INTERRUPT,
+        )
+        guidance = _chat_error_guidance(exhausted, root)[0]
+        self.assertIn("checkpoint", guidance)
+        self.assertIn("/resume", guidance)
+        self.assertNotIn("doctor --model-check", guidance)
 
     async def test_interactive_chat_accepts_runtime_input_while_model_runs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -704,6 +896,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(line.startswith("status: session=") for line in output))
             self.assertIn("goal: first task", output)
             self.assertTrue(any(line.startswith("Task SPEC r1:") for line in output))
+            self.assertIn("continuation: NONE", output)
             self.assertTrue(any(line.startswith("diff: +") for line in output))
 
     async def test_chat_handles_approval_without_leaving_repl(self) -> None:

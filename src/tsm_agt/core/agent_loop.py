@@ -199,6 +199,10 @@ class AgentTurnCheckpoint:
     rejection_loop_state: Mapping[str, Any] = field(default_factory=dict)
     exploration_outcome_state: Mapping[str, Any] = field(default_factory=dict)
     completion_readiness_state: Mapping[str, Any] = field(default_factory=dict)
+    task_spec_revision: int = 0
+    task_spec_hash: str = ""
+    active_outcome_ids: tuple[str, ...] = ()
+    pending_user_action: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> AgentTurnCheckpoint:
@@ -283,6 +287,15 @@ class AgentTurnCheckpoint:
                 dict(data["completion_readiness_state"])
                 if isinstance(data.get("completion_readiness_state"), Mapping) else {}
             ),
+            task_spec_revision=int(data.get("task_spec_revision", 0)),
+            task_spec_hash=str(data.get("task_spec_hash", "")),
+            active_outcome_ids=tuple(
+                str(item) for item in data.get("active_outcome_ids", [])
+            ),
+            pending_user_action=(
+                dict(data["pending_user_action"])
+                if isinstance(data.get("pending_user_action"), Mapping) else {}
+            ),
         )
         stored_hash = data.get("checkpoint_hash")
         if stored_hash is not None and str(stored_hash) != checkpoint.checkpoint_hash:
@@ -291,6 +304,8 @@ class AgentTurnCheckpoint:
                 "evidence_relation_state", "rejection_loop_state",
                 "exploration_outcome_state", "evidence_question_state",
                 "completion_readiness_state",
+                "task_spec_revision", "task_spec_hash",
+                "active_outcome_ids", "pending_user_action",
             )
             missing_fields = tuple(
                 field for field in evolved_fields if field not in data
@@ -351,6 +366,10 @@ class AgentTurnCheckpoint:
             "completion_readiness_state": dict(
                 self.completion_readiness_state or {}
             ),
+            "task_spec_revision": self.task_spec_revision,
+            "task_spec_hash": self.task_spec_hash,
+            "active_outcome_ids": list(self.active_outcome_ids),
+            "pending_user_action": dict(self.pending_user_action or {}),
         }
 
     @property
@@ -401,3 +420,25 @@ class AgentClarificationSuspended:
     reason: str
     required: bool
     resume_token: str
+    kind: str = "QUESTION"
+
+    @property
+    def input_mode(self) -> str:
+        return "single_choice" if self.choices else "free_text"
+
+
+@dataclass(frozen=True, slots=True)
+class AgentContinuationSuspended:
+    """A completed unit is visible, while later required Outcomes remain.
+
+    Unlike approval or clarification this grants no authority and carries no
+    secret token.  The next ordinary Session input is semantically routed by
+    the configured resolver before Runtime allows the same Task to continue.
+    """
+
+    task_id: str
+    turn_id: str
+    revision: int
+    completed_outcome_ids: tuple[str, ...]
+    remaining_outcome_ids: tuple[str, ...]
+    assistant_message: Message

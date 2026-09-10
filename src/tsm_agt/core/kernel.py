@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -73,6 +74,9 @@ from tsm_agt.ports import (
     ModelStreamCompleted,
     ModelTextDelta,
     ModelTransportProgress,
+    ModelAttemptFailure, ModelFailureCategory, ModelRecoveryAction,
+    ModelRecoveryExhausted, ModelRecoveryPolicyPort, ModelRecoveryProbe,
+    ModelRetrySafety,
     StreamingModelProviderPort,
     ModelUsage,
     ProcessExecutorPort,
@@ -92,6 +96,7 @@ from tsm_agt.ports import (
     TextBlock,
     ToolCall,
     ToolCallBlock,
+    ToolEffect,
     ToolIdempotency,
     ToolInvocationContext,
     ToolMemoryControl,
@@ -111,6 +116,7 @@ from tsm_agt.ports import (
     ProjectMemoryPort,
     RuntimeInputClassifierPort,
     SessionInputResolverPort,
+    TaskSpecPlannerPort,
     CheckpointCompatibilityAction,
     CheckpointCompatibilityDecision,
     CheckpointCompatibilityPolicyPort,
@@ -151,6 +157,7 @@ from .agent_loop import (
     AgentTurnResult,
     AgentTurnSuspended,
     AgentClarificationSuspended,
+    AgentContinuationSuspended,
     ProviderCapabilityMismatch,
 )
 from .approval import (
@@ -164,7 +171,7 @@ from .approval import (
 )
 from .workspace_access import WorkspaceAccessCapability, WorkspaceAccessGrant
 from .clarification import (
-    ClarificationChoice, ClarificationNotPending, ClarificationRequest,
+    ClarificationChoice, ClarificationKind, ClarificationNotPending, ClarificationRequest,
     ClarificationRequired, ClarificationTokenMismatch,
 )
 from .execution import (
@@ -200,10 +207,18 @@ from .process import (
 )
 from .task import LEGAL_TRANSITIONS, TaskNotFound, TaskSnapshot, TaskState
 from .task_spec import (
-    TaskAcceptanceCriterion, TaskCriterionKind, TaskSpecProjector,
-    TaskSpecSnapshot,
+    TaskAcceptanceCriterion, TaskContinuationMode, TaskCriterionKind,
+    TaskOutcomeKind, TaskOutcomeStatus,
+    TaskSpecProjector, TaskSpecProposal, TaskSpecSnapshot,
 )
-from .session import SessionSnapshot, SessionState, standalone_session_id
+from .session import (
+    SessionChoiceOption, SessionInteractionKind, SessionInteractionRequest,
+    SessionSnapshot, SessionState, standalone_session_id,
+)
+from .session_interaction import (
+    DeterministicSessionChoiceResolver, SessionChoiceAction,
+    SessionChoiceDecision,
+)
 from .session_context import (
     SessionActiveCheckpoint, SessionContextProjector,
     SessionConversationProjection, SessionPromptProjection, SessionWorkingState,
@@ -217,7 +232,7 @@ from .runtime_input import (
     QueuedFollowUp, RuntimeInputContext, RuntimeInputIntent, RuntimeInputRoute,
     RuntimeInputRouter, SessionContinuationDecision, SessionContinuationMode,
     SessionResumeCandidate, SessionResumeSafety,
-    SessionInputAction, SessionInputDecision,
+    SessionInputAction, SessionInputDecision, SessionInputGrounding,
 )
 from .exploration_coordinator import (
     ExplorationCoordinator, ExplorationCoordinatorAction,
@@ -271,6 +286,7 @@ class KernelDependencies:
     workspace_path: WorkspacePathPort
     local_identity: LocalIdentityPort
     project_memory: ProjectMemoryPort
+    model_recovery_policy: ModelRecoveryPolicyPort | None = None
     evidence_delta_evaluator: EvidenceDeltaEvaluatorPort | None = None
     semantic_action_classifier: SemanticActionClassifierPort | None = None
     read_hits_policy: ReadHitsPolicyPort | None = None
@@ -294,6 +310,7 @@ class KernelDependencies:
     investigation_flow_projector: InvestigationFlowProjectorPort | None = None
     runtime_input_classifier: RuntimeInputClassifierPort | None = None
     session_input_resolver: SessionInputResolverPort | None = None
+    task_spec_planner: TaskSpecPlannerPort | None = None
     checkpoint_compatibility_policy: (
         CheckpointCompatibilityPolicyPort | None
     ) = None
@@ -303,6 +320,7 @@ class KernelDependencies:
     configuration_metadata: Mapping[str, Any] = field(default_factory=dict)
     default_max_model_calls: int = 15
     default_max_tool_calls: int = 40
+    default_max_output_tokens: int = 1024
     finalization_model_calls: int = 2
     prompt_template: PromptTemplate = field(default_factory=PromptTemplate.default)
     context_manager: ContextWindowManager = field(
@@ -1090,7 +1108,22 @@ class Kernel:
             reason = "checkpoint_missing"
             conflicts: tuple[str, ...] = ()
             decision: CheckpointCompatibilityDecision | None = None
-            if task.state in {TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER}:
+            pending_kind = (
+                str(checkpoint.pending_user_action.get("kind", ""))
+                if checkpoint is not None else ""
+            )
+            if (
+                task.state is TaskState.AWAITING_USER
+                and pending_kind == "CONTINUATION"
+            ):
+                # A continuation boundary is not an approval and carries no
+                # privileged answer token.  It may be selected semantically,
+                # then Runtime resumes the same validated checkpoint.
+                safety = SessionResumeSafety.EXACT_RESUME
+                reason = "completed_unit_awaiting_continuation"
+            elif task.state in {
+                TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER,
+            }:
                 safety = SessionResumeSafety.AWAIT_USER_ACTION
                 reason = (
                     "explicit_approval_decision_required"
@@ -1136,7 +1169,10 @@ class Kernel:
     @staticmethod
     def _checkpoint_has_unknown_side_effect(task: TaskSnapshot) -> bool:
         return any(
-            execution.state is ToolCommitState.UNKNOWN_OUTCOME
+            (
+                execution.state is ToolCommitState.UNKNOWN_OUTCOME
+                and execution.reconciled_outcome is None
+            )
             or (
                 execution.state is ToolCommitState.RUNNING
                 and execution.idempotency is ToolIdempotency.NON_IDEMPOTENT
@@ -1185,6 +1221,24 @@ class Kernel:
         })
         if len(resumable) == 1:
             selected = resumable[0]
+            selected_task = await self.get_task(selected.task_id)
+            selected_checkpoint = (
+                AgentTurnCheckpoint.from_data(
+                    selected_task.active_agent_checkpoint
+                )
+                if selected_task.active_agent_checkpoint is not None else None
+            )
+            if (
+                selected_task.state is TaskState.AWAITING_USER
+                and selected_checkpoint is not None
+                and selected_checkpoint.pending_user_action.get("kind")
+                == "CONTINUATION"
+            ):
+                return SessionContinuationDecision(
+                    SessionContinuationMode.RESUME_CONTINUATION,
+                    selected.task_id, selected.task_state,
+                    selected.reason_code, selected.safety, candidates,
+                )
             return SessionContinuationDecision(
                 SessionContinuationMode.RECOVER_TASK, selected.task_id,
                 selected.task_state, selected.reason_code, selected.safety,
@@ -1227,7 +1281,8 @@ class Kernel:
         if not candidates:
             decision = SessionInputDecision(
                 SessionInputAction.NEW_TASK, None, 1.0,
-                "no_unfinished_session_task", candidates=(),
+                "no_unfinished_session_task",
+                SessionInputGrounding.SELF_CONTAINED, candidates=(),
             )
             await self._record_session_input_decision(
                 session_id, normalized, decision
@@ -1238,6 +1293,7 @@ class Kernel:
             decision = SessionInputDecision(
                 SessionInputAction.CLARIFY, None, 0.0,
                 "semantic_resolver_not_configured",
+                SessionInputGrounding.AMBIGUOUS,
                 "There is unfinished work in this Session. Specify a new request "
                 "or select a Task with /resume <task_id>.",
                 candidates=candidates,
@@ -1254,10 +1310,19 @@ class Kernel:
             }
             for message in conversation.messages[-12:]
         ]
+        session = await self.get_session(session_id)
+        pending_interaction = session.pending_interaction
         context = {
             "session_id": session_id,
             "recent_messages": recent_messages,
-            "unfinished_tasks": [item.to_data() for item in candidates],
+            "unfinished_tasks": [
+                {**item.to_data(), "candidate_index": index}
+                for index, item in enumerate(candidates, start=1)
+            ],
+            "pending_interaction": (
+                pending_interaction.to_data()
+                if pending_interaction is not None else None
+            ),
             "instruction": (
                 "Task references are descriptive and grant no authority. "
                 "Runtime validates any selected checkpoint separately."
@@ -1266,6 +1331,9 @@ class Kernel:
         try:
             raw = await resolver.resolve_session_input(normalized, context)
             action = SessionInputAction(str(raw["action"]).upper())
+            input_grounding = SessionInputGrounding(
+                str(raw["input_grounding"]).upper()
+            )
             confidence = float(raw["confidence"])
             task_id = (
                 str(raw["task_id"])
@@ -1292,13 +1360,47 @@ class Kernel:
                 raise ValueError("non-resume action supplied task_id")
             if action is SessionInputAction.NEW_TASK and confidence < 0.75:
                 raise ValueError("low-confidence new Task decision")
+            if (
+                action is SessionInputAction.NEW_TASK
+                and input_grounding is not SessionInputGrounding.SELF_CONTAINED
+            ):
+                decision = SessionInputDecision(
+                    SessionInputAction.CLARIFY, None, confidence,
+                    "new_task_requires_self_contained_input", input_grounding,
+                    "这条输入需要结合会话历史才能理解，尚未创建新 Task。"
+                    "请从下面的未完成任务中选择，或明确描述一个新目标。",
+                    ("resolver:" f"{resolver.descriptor.adapter_id}@"
+                     f"{resolver.descriptor.adapter_version}"),
+                    candidates,
+                )
+                await self._record_session_input_decision(
+                    session_id, normalized, decision
+                )
+                return decision
             if action is SessionInputAction.CLARIFY and not clarification:
                 clarification = (
                     "I cannot tell which unfinished Task this refers to. "
                     "Please state the target or use /resume <task_id>."
                 )
             decision = SessionInputDecision(
-                action, task_id, confidence, reason, clarification,
+                action, task_id, confidence, reason, input_grounding,
+                clarification,
+                ("resolver:" f"{resolver.descriptor.adapter_id}@"
+                 f"{resolver.descriptor.adapter_version}"),
+                candidates,
+            )
+            await self._record_session_input_decision(
+                session_id, normalized, decision
+            )
+            return decision
+        except (TimeoutError, asyncio.TimeoutError):
+            decision = SessionInputDecision(
+                SessionInputAction.CLARIFY, None, 0.0,
+                "semantic_resolution_timeout",
+                SessionInputGrounding.AMBIGUOUS,
+                "语义识别超时，尚未选择或修改任何 Task。"
+                "请从下面的候选中输入编号、完整 Task ID，或使用 "
+                "/resume <task_id>。",
                 ("resolver:" f"{resolver.descriptor.adapter_id}@"
                  f"{resolver.descriptor.adapter_version}"),
                 candidates,
@@ -1311,6 +1413,7 @@ class Kernel:
             decision = SessionInputDecision(
                 SessionInputAction.CLARIFY, None, 0.0,
                 "semantic_resolution_failed",
+                SessionInputGrounding.AMBIGUOUS,
                 "I cannot safely determine whether this starts new work or "
                 "continues an unfinished Task. Please state the target, or use "
                 "/resume <task_id>.",
@@ -1322,6 +1425,133 @@ class Kernel:
                 session_id, normalized, decision
             )
             return decision
+
+    async def request_session_task_choice(
+        self, session_id: str, candidates: tuple[SessionResumeCandidate, ...],
+        prompt: str, *, source: str = "session-input-resolution",
+    ) -> SessionInteractionRequest:
+        """Persist the exact choice order shown by a UI."""
+        if not candidates:
+            raise ValueError("a Session choice requires at least one candidate")
+        interaction = SessionInteractionRequest(
+            f"interaction-{uuid4().hex}", SessionInteractionKind.CHOICE,
+            prompt.strip(), tuple(
+                SessionChoiceOption(
+                    f"option-{index}", index, item.goal, "TASK",
+                    item.task_id, {
+                        "task_state": item.task_state,
+                        "resume_safety": item.safety.value,
+                    },
+                )
+                for index, item in enumerate(candidates, start=1)
+            ), utc_now(), source,
+        )
+        for _attempt in range(3):
+            stored = await self._dependencies.store.load_session(session_id)
+            if stored is None:
+                raise LookupError(f"session not found: {session_id}")
+            session = SessionSnapshot.from_data(stored.data)
+            self._authorize_session(session)
+            updated = session.request_interaction(interaction)
+            event = SessionEvent(
+                f"sevt-{uuid4().hex}", session_id,
+                stored.last_event_sequence + 1, "session.interaction_requested", {
+                    "interaction_id": interaction.interaction_id,
+                    "kind": interaction.kind.value, "source": source,
+                    "options": [{
+                        "option_id": item.option_id,
+                        "ordinal": item.ordinal,
+                        "target_type": item.target_type,
+                        "target_id": item.target_id,
+                    } for item in interaction.options],
+                },
+            )
+            try:
+                await self._dependencies.store.commit_session(SessionUnitOfWork(
+                    session_id, stored.version, updated.to_data(), (event,)
+                ))
+                return interaction
+            except RuntimeError as error:
+                if "version conflict" not in str(error).lower():
+                    raise
+        raise RuntimeError("Session interaction update conflicted repeatedly")
+
+    async def resolve_pending_session_choice(
+        self, session_id: str, text: str,
+    ) -> SessionChoiceDecision:
+        """Resolve one displayed choice locally and atomically consume it."""
+        session = await self.get_session(session_id)
+        interaction = session.pending_interaction
+        if interaction is None:
+            return SessionChoiceDecision(SessionChoiceAction.UNRESOLVED)
+        decision = DeterministicSessionChoiceResolver().select(text, interaction)
+        if decision.action is not SessionChoiceAction.SELECT:
+            return decision
+        for _attempt in range(3):
+            stored = await self._dependencies.store.load_session(session_id)
+            if stored is None:
+                raise LookupError(f"session not found: {session_id}")
+            live = SessionSnapshot.from_data(stored.data)
+            if (
+                live.pending_interaction is None
+                or live.pending_interaction.interaction_id
+                != interaction.interaction_id
+            ):
+                return SessionChoiceDecision(
+                    SessionChoiceAction.UNRESOLVED,
+                    reason_code="interaction_is_no_longer_pending",
+                )
+            updated = live.clear_interaction()
+            event = SessionEvent(
+                f"sevt-{uuid4().hex}", session_id,
+                stored.last_event_sequence + 1, "session.interaction_answered", {
+                    "interaction_id": interaction.interaction_id,
+                    "option_id": decision.option_id,
+                    "target_id": decision.target_id,
+                    "reason_code": decision.reason_code,
+                    "text_hash": canonical_hash(text.strip()),
+                },
+            )
+            try:
+                await self._dependencies.store.commit_session(SessionUnitOfWork(
+                    session_id, stored.version, updated.to_data(), (event,)
+                ))
+                return decision
+            except RuntimeError as error:
+                if "version conflict" not in str(error).lower():
+                    raise
+        raise RuntimeError("Session interaction answer conflicted repeatedly")
+
+    async def clear_pending_session_interaction(
+        self, session_id: str, reason: str,
+    ) -> None:
+        """Invalidate a displayed menu when the conversation moves elsewhere."""
+        for _attempt in range(3):
+            stored = await self._dependencies.store.load_session(session_id)
+            if stored is None:
+                raise LookupError(f"session not found: {session_id}")
+            session = SessionSnapshot.from_data(stored.data)
+            interaction = session.pending_interaction
+            if interaction is None:
+                return
+            updated = session.clear_interaction()
+            event = SessionEvent(
+                f"sevt-{uuid4().hex}", session_id,
+                stored.last_event_sequence + 1,
+                "session.interaction_invalidated", {
+                    "interaction_id": interaction.interaction_id,
+                    "reason_code": reason,
+                },
+            )
+            try:
+                await self._dependencies.store.commit_session(SessionUnitOfWork(
+                    session_id, stored.version, updated.to_data(), (event,)
+                ))
+                return
+            except RuntimeError as error:
+                if "version conflict" not in str(error).lower():
+                    raise
+        raise RuntimeError("Session interaction invalidation conflicted repeatedly")
 
     async def _record_session_input_decision(
         self, session_id: str, text: str, decision: SessionInputDecision,
@@ -1341,6 +1571,7 @@ class Kernel:
                     "task_id": decision.task_id,
                     "confidence": decision.confidence,
                     "reason_code": decision.reason_code,
+                    "input_grounding": decision.input_grounding.value,
                     "resolver_version": decision.resolver_version,
                     "candidate_task_ids": [
                         item.task_id for item in decision.candidates
@@ -1394,6 +1625,40 @@ class Kernel:
         events = await self._dependencies.store.read_events(task_id)
         return TaskSpecProjector.project(task_id, task.goal, events)
 
+    async def plan_task_spec(self, task_id: str) -> TaskSpecSnapshot:
+        """Ask the semantic Planner for a proposal; Runtime owns persistence."""
+        planner = self._dependencies.task_spec_planner
+        current = await self.get_task_spec(task_id)
+        if planner is None or current.outcomes:
+            return current
+        task = await self.get_task(task_id)
+        try:
+            raw = await planner.propose_task_spec(current.goal, {
+                "workspace": task.workspace,
+                "available_tool_effects": sorted({
+                    tool.effect.value for tool in await self.list_tools()
+                    if not tool.is_internal_state
+                }),
+            })
+            proposal = TaskSpecProposal.from_data(raw)
+            candidate = TaskSpecSnapshot.from_proposal(
+                task_id, current.revision + 1, proposal,
+                current.acceptance_criteria,
+            )
+            await self._append_events(task_id, (("task_spec.revised", {
+                "writer": "task-spec-planner",
+                "revision": candidate.revision,
+                "content_hash": candidate.content_hash,
+                "snapshot": candidate.to_data(),
+            }),))
+            return candidate
+        except Exception as error:
+            await self._append_events(task_id, (("task_spec.planning_failed", {
+                "recoverable": True, "error_type": type(error).__name__,
+                "message": str(error)[:1000],
+            }),))
+            raise
+
     async def revise_task_spec(
         self, task_id: str, expected_revision: int, *,
         scope: tuple[str, ...], constraints: tuple[str, ...],
@@ -1438,8 +1703,12 @@ class Kernel:
                 f"got {current.revision}"
             )
         candidate = TaskSpecSnapshot(
-            task_id, current.revision + 1, selected_goal, scope, constraints,
-            acceptance_criteria,
+            task_id=task_id, revision=current.revision + 1,
+            goal=selected_goal, scope=scope, constraints=constraints,
+            acceptance_criteria=acceptance_criteria,
+            outcomes=current.outcomes,
+            continuation_mode=current.continuation_mode,
+            schema_version=current.schema_version,
         )
         event = RuntimeEvent(
             f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
@@ -1821,6 +2090,7 @@ class Kernel:
                 blockers.append(f"{task_id}:{task.state.value}")
             if any(
                 execution.state is ToolCommitState.UNKNOWN_OUTCOME
+                and execution.reconciled_outcome is None
                 for execution in task.tool_executions.values()
             ):
                 blockers.append(f"{task_id}:UNKNOWN_OUTCOME")
@@ -3974,7 +4244,11 @@ class Kernel:
         inventory = EvidenceInventory.from_data(checkpoint.evidence_inventory)
         continuation = {
             TaskState.AWAITING_APPROVAL: "await_explicit_approval",
-            TaskState.AWAITING_USER: "await_clarification",
+            TaskState.AWAITING_USER: (
+                "await_completed_unit_continuation"
+                if checkpoint.pending_user_action.get("kind")
+                == "CONTINUATION" else "await_clarification"
+            ),
             TaskState.INTERRUPTED: "resume_from_authoritative_checkpoint",
             TaskState.CONFLICT: "resolve_checkpoint_conflict",
             TaskState.RESUMING: "resume_in_progress",
@@ -4005,6 +4279,13 @@ class Kernel:
             remaining_work=effective_memory.remaining_work[:20],
             evidence_counts=evidence_counts,
             consecutive_zero_delta=inventory.consecutive_zero_delta,
+            task_spec_revision=checkpoint.task_spec_revision,
+            task_spec_hash=checkpoint.task_spec_hash,
+            active_outcome_ids=checkpoint.active_outcome_ids,
+            pending_user_action=(
+                dict(checkpoint.pending_user_action)
+                if checkpoint.pending_user_action else None
+            ),
         )
 
     async def _working_memory_context_message(self, task_id: str) -> Message | None:
@@ -4149,7 +4430,10 @@ class Kernel:
             "boundary": "inspectable_task_spec",
             "instruction": (
                 "Use this completion contract to plan and verify work. Do not "
-                "weaken criteria or change the goal to claim success."
+                "weaken criteria or change the goal to claim success. Bind a "
+                "tool call to its outcome_id when more than one open outcome "
+                "could use the same tool effect. Runtime may safely auto-bind "
+                "only when there is exactly one candidate."
             ),
             "runtime_environment": {
                 "primary_workspace": str(workspace),
@@ -4180,10 +4464,12 @@ class Kernel:
         resource_catalog, question_catalog = await self._session_reference_catalogs(
             task_id
         )
+        task_spec = await self.get_task_spec(task_id)
         task_summary = self._session_task_summary(
             task, turn_id, working_memory, resource_catalog,
             effective_remaining_work=effective_memory.remaining_work,
             effective_evidence=effective_memory.evidence,
+            task_spec=task_spec,
         )
         for attempt in range(3):
             stored = await self._dependencies.store.load_session(task.session_id)
@@ -4229,6 +4515,7 @@ class Kernel:
         resources: tuple[SessionResourceReference, ...],
         *, effective_remaining_work: tuple[str, ...] | None = None,
         effective_evidence: tuple[Any, ...] | None = None,
+        task_spec: TaskSpecSnapshot | None = None,
     ) -> dict[str, Any]:
         """Project one Turn's durable ledger into a bounded Session handoff."""
         executions = sorted(
@@ -4297,6 +4584,21 @@ class Kernel:
             "workspace_roots": list(roots),
             "mutations": list(mutations),
             "verification_status": None,
+            "task_spec_revision": (task_spec.revision if task_spec else 0),
+            "continuation_mode": (
+                task_spec.continuation_mode.value if task_spec else "NONE"
+            ),
+            "outcomes": ([{
+                "outcome_id": outcome.outcome_id,
+                "description": outcome.description,
+                "kind": outcome.kind.value,
+                "status": outcome.status.value,
+                "required": outcome.required,
+                "required_effects": [
+                    effect.value for effect in outcome.required_effects
+                ],
+                "fulfillment_count": len(outcome.fulfillment_refs),
+            } for outcome in task_spec.outcomes] if task_spec else []),
         }
 
     async def _session_reference_catalogs(
@@ -4588,6 +4890,7 @@ class Kernel:
         configuration = task.effective_configurations[-1]
         session = await self.get_session(task.session_id)
         working_memory = await self.get_working_memory(task.task_id)
+        task_spec = await self.get_task_spec(task.task_id)
         return replace(
             checkpoint, workspace_fingerprint=task.project_fingerprint,
             effective_config_hash=configuration.effective_config_hash,
@@ -4596,11 +4899,26 @@ class Kernel:
             session_id=session.session_id,
             session_context_hash=session.context_hash,
             working_memory_hash=working_memory.content_hash,
+            task_spec_revision=task_spec.revision,
+            task_spec_hash=task_spec.content_hash,
+            active_outcome_ids=tuple(
+                outcome.outcome_id for outcome in task_spec.outcomes
+                if outcome.required and not outcome.status.is_closed
+            ),
         )
 
     async def _save_agent_checkpoint(
         self, checkpoint: AgentTurnCheckpoint, reason: str,
     ) -> None:
+        task_spec = await self.get_task_spec(checkpoint.task_id)
+        checkpoint = replace(
+            checkpoint, task_spec_revision=task_spec.revision,
+            task_spec_hash=task_spec.content_hash,
+            active_outcome_ids=tuple(
+                outcome.outcome_id for outcome in task_spec.outcomes
+                if outcome.required and not outcome.status.is_closed
+            ),
+        )
         stored = await self._require_stored_task(checkpoint.task_id)
         task = TaskSnapshot.from_data(stored.data)
         updated = task.with_agent_checkpoint(checkpoint.to_data())
@@ -4615,6 +4933,10 @@ class Kernel:
                 "model_calls": checkpoint.model_calls,
                 "tool_calls": checkpoint.tool_calls,
                 "pending_tool_calls": len(checkpoint.pending_tool_calls),
+                "task_spec_revision": checkpoint.task_spec_revision,
+                "task_spec_hash": checkpoint.task_spec_hash,
+                "active_outcome_ids": list(checkpoint.active_outcome_ids),
+                "pending_user_action": dict(checkpoint.pending_user_action),
             },
         )
         await self._dependencies.store.commit(RuntimeUnitOfWork(
@@ -4678,6 +5000,9 @@ class Kernel:
             spec_scope = current_spec.scope
             spec_constraints = list(current_spec.constraints)
             spec_criteria = current_spec.acceptance_criteria
+            spec_outcomes = current_spec.outcomes
+            continuation_mode = current_spec.continuation_mode
+            schema_version = current_spec.schema_version
             for item in pending:
                 if item.kind is SteeringKind.REPLACE:
                     replacement_spec = TaskSpecSnapshot.initial(
@@ -4687,11 +5012,22 @@ class Kernel:
                     spec_scope = replacement_spec.scope
                     spec_constraints = []
                     spec_criteria = replacement_spec.acceptance_criteria
+                    # Replace starts a new contract revision.  Old outcomes remain
+                    # facts in prior events but are not silently carried into the
+                    # replacement goal.  B2 will populate the replacement outcomes
+                    # from a validated model proposal.
+                    spec_outcomes = replacement_spec.outcomes
+                    continuation_mode = replacement_spec.continuation_mode
+                    schema_version = replacement_spec.schema_version
                 elif item.text not in spec_constraints:
                     spec_constraints.append(item.text)
             updated_spec = TaskSpecSnapshot(
-                checkpoint.task_id, current_spec.revision + 1, spec_goal,
-                spec_scope, tuple(spec_constraints), spec_criteria,
+                task_id=checkpoint.task_id, revision=current_spec.revision + 1,
+                goal=spec_goal, scope=spec_scope,
+                constraints=tuple(spec_constraints),
+                acceptance_criteria=spec_criteria, outcomes=spec_outcomes,
+                continuation_mode=continuation_mode,
+                schema_version=schema_version,
             )
             task_spec_event = RuntimeEvent(
                 f"evt-{uuid4().hex}", checkpoint.task_id,
@@ -4850,6 +5186,7 @@ class Kernel:
         stored = await self._require_stored_task(checkpoint.task_id)
         task = TaskSnapshot.from_data(stored.data)
         updated = task.with_agent_checkpoint(None if final else checkpoint.to_data())
+        response_diagnostics = self._response_diagnostics(response)
         llm_event = RuntimeEvent(
             f"evt-{uuid4().hex}", checkpoint.task_id,
             stored.last_event_sequence + 1, "llm.completed",
@@ -4859,6 +5196,7 @@ class Kernel:
                 "message": response.message.to_data(),
                 "finish_reason": response.finish_reason.value,
                 "usage": response.usage.to_data(),
+                "response_diagnostics": response_diagnostics,
                 "context_window": context_budget.context_window,
                 "context_estimated_input_tokens": (
                     context_budget.estimated_input_tokens
@@ -4909,11 +5247,87 @@ class Kernel:
             task_id, task.goal, events
         )
         questions = EvidenceQuestionProjector.project(task_id, events)
-        read_tools_available = any(
-            tool.is_read_only and not tool.is_internal_state
-            for tool in visible_tools
-        )
+        observe_tools = tuple(sorted(
+            tool.name for tool in visible_tools
+            if not tool.is_internal_state and (
+                tool.effect is ToolEffect.OBSERVE
+                or (
+                    tool.effect is ToolEffect.UNSPECIFIED
+                    and tool.is_read_only
+                )
+            )
+        ))
+        execute_tools = tuple(sorted(
+            tool.name for tool in visible_tools
+            if not tool.is_internal_state and tool.effect is ToolEffect.EXECUTE
+        ))
+        # Observation is Task-scoped evidence. A model can conservatively bind a
+        # read to a broader delivery Outcome even though the same committed fact
+        # also supports separate Evidence Outcomes. Reuse only successful
+        # observation references here; side-effect references remain strictly
+        # local to their declared Outcome. Final Acceptance still validates the
+        # completed answer and evidence-question integrity before closing work.
+        shared_observation_refs = tuple(dict.fromkeys(
+            reference
+            for candidate in spec.outcomes
+            for reference in candidate.fulfillment_refs
+            if reference.rsplit(":", 1)[-1] == ToolEffect.OBSERVE.value
+        ))
         gaps: list[CompletionGap] = []
+
+        for outcome in spec.outcomes:
+            if not outcome.required or outcome.status.is_closed:
+                continue
+            # A candidate assistant response itself can satisfy ANSWER; its text
+            # is verified and recorded before final Task acceptance. Other
+            # outcomes require durable structured facts.
+            if outcome.kind.value == "ANSWER":
+                continue
+            fulfilled_effects = {
+                ToolEffect(ref.rsplit(":", 1)[-1])
+                for ref in outcome.fulfillment_refs
+                if ref.rsplit(":", 1)[-1] in {item.value for item in ToolEffect}
+            }
+            if (
+                outcome.kind is TaskOutcomeKind.EVIDENCE
+                and shared_observation_refs
+            ):
+                fulfilled_effects.add(ToolEffect.OBSERVE)
+            remaining = tuple(
+                effect for effect in outcome.required_effects
+                if effect not in fulfilled_effects
+            )
+            synthesized_kind = (
+                outcome.kind is TaskOutcomeKind.EVIDENCE
+                or (
+                    outcome.kind is TaskOutcomeKind.ARTIFACT_DELIVERY
+                    and ToolEffect.MUTATE not in outcome.required_effects
+                )
+            )
+            # A final assistant response performs the synthesis for analysis
+            # and recommendation Outcomes. Once all declared effects have
+            # durable refs, let it reach Final Acceptance, which validates the
+            # visible answer before closing the Outcome.
+            if synthesized_kind and not remaining:
+                continue
+            candidate_tools = tuple(sorted(
+                tool.name for tool in visible_tools
+                if not tool.is_internal_state and tool.effect in remaining
+            ))
+            available_remaining = {
+                tool.effect for tool in visible_tools
+                if not tool.is_internal_state and tool.effect in remaining
+            }
+            gaps.append(CompletionGap(
+                gap_id=f"task-outcome:{outcome.outcome_id}",
+                kind="REQUIRED_OUTCOME_UNSATISFIED",
+                description=outcome.description,
+                status=outcome.status.value, required=True,
+                recoverable=bool(remaining) and set(remaining).issubset(
+                    available_remaining
+                ),
+                required_effects=remaining, candidate_tools=candidate_tools,
+            ))
 
         for criterion in spec.acceptance_criteria:
             if criterion.verification_kind is not TaskCriterionKind.EVIDENCE_REFERENCE:
@@ -4939,7 +5353,7 @@ class Kernel:
             recoverable = bool(
                 record.status is EvidenceQuestionStatus.OPEN
                 and record.expected_scope.strip()
-                and read_tools_available
+                and observe_tools
             )
             gaps.append(CompletionGap(
                 gap_id=f"evidence-question:{record.question_ref}",
@@ -4951,6 +5365,8 @@ class Kernel:
                     if record.evidence_references else ""
                 ),
                 expected_scope=record.expected_scope,
+                required_effects=(ToolEffect.OBSERVE,) if recoverable else (),
+                candidate_tools=observe_tools if recoverable else (),
             ))
 
         for step in memory.plan:
@@ -4989,6 +5405,8 @@ class Kernel:
                         "build or test was recorded after the latest mutation."
                     ),
                     status="MISSING", required=True, recoverable=False,
+                    required_effects=(ToolEffect.EXECUTE,),
+                    candidate_tools=execute_tools,
                 ))
         return tuple(gaps)
 
@@ -5006,6 +5424,20 @@ class Kernel:
             sorted(tool.name for tool in visible_tools
                    if tool.is_read_only and not tool.is_internal_state)
         )
+        available_effects = frozenset(
+            ToolEffect.OBSERVE
+            if tool.effect is ToolEffect.UNSPECIFIED and tool.is_read_only
+            else tool.effect
+            for tool in visible_tools
+            if not tool.is_internal_state
+            and (
+                tool.effect is not ToolEffect.UNSPECIFIED
+                or tool.is_read_only
+            )
+        )
+        available_tools = tuple(sorted(
+            tool.name for tool in visible_tools if not tool.is_internal_state
+        ))
         task = await self.get_task(task_id)
         inventory = EvidenceInventory.from_data(checkpoint.evidence_inventory)
         probe = CompletionReadinessProbe(
@@ -5017,6 +5449,8 @@ class Kernel:
                 0, checkpoint.max_tool_calls - checkpoint.tool_calls
             ),
             available_read_tools=available_read_tools,
+            available_effects=available_effects,
+            available_tools=available_tools,
             forced_wrap_up=forced_wrap_up,
             evidence_item_count=sum(
                 len(values) for values in inventory.fingerprints.values()
@@ -5053,6 +5487,9 @@ class Kernel:
                 "forced_wrap_up": forced_wrap_up,
                 "remaining_model_calls": probe.remaining_model_calls,
                 "remaining_tool_calls": probe.remaining_tool_calls,
+                "available_effects": sorted(
+                    effect.value for effect in probe.available_effects
+                ),
                 "gap_count": len(decision.gaps),
                 "gaps": [gap.to_data() for gap in decision.gaps],
                 "state": decision.state.to_data(),
@@ -5070,8 +5507,10 @@ class Kernel:
             "action": decision.action.value,
             "instruction": (
                 "The proposed final answer was not accepted. Perform the "
-                "remaining required in-scope read-only check now. Do not merely "
-                "offer to continue later."
+                "remaining required in-scope work now using an available "
+                "capability or candidate tool listed in the gaps. Normal "
+                "argument validation, policy, approval, and sandbox rules still "
+                "apply. Do not merely offer to continue later."
                 if continue_work else
                 "Do not call tools. Give the user the exact blocker, completed "
                 "evidence, and unverified requirement. Do not claim success."
@@ -5139,6 +5578,7 @@ class Kernel:
             )
         unknown = sum(
             execution.state is ToolCommitState.UNKNOWN_OUTCOME
+            and execution.reconciled_outcome is None
             for execution in task.tool_executions.values()
         )
         running_non_idempotent = sum(
@@ -5519,11 +5959,94 @@ class Kernel:
             raise InvalidTurnState(
                 f"task {task_id} must be VERIFYING, got {task.state.value}"
             )
-        task_spec = await self.get_task_spec(task_id)
         events = await self._dependencies.store.read_events(task_id)
+        task_spec = TaskSpecProjector.project(task_id, task.goal, events)
         mandatory_answer_completeness = any(
             event.event_type == "turn.completed" for event in events
         )
+        answer_result = (
+            self._verify_answer_completeness(events)
+            if mandatory_answer_completeness else None
+        )
+        answer_reference = next((
+            f"event:{event.sequence}" for event in reversed(events)
+            if event.event_type == "llm.completed"
+        ), "")
+        # Read/search evidence belongs to the Task, even when the semantic
+        # planner separates evidence collection from the final ANSWER outcome.
+        # Reuse only durable observation references here. Side-effect evidence
+        # (mutate/execute/control/interact) remains bound to its own Outcome and
+        # can never satisfy another result implicitly.
+        shared_observation_refs = tuple(dict.fromkeys(
+            reference
+            for candidate in task_spec.outcomes
+            for reference in candidate.fulfillment_refs
+            if reference.rsplit(":", 1)[-1] == ToolEffect.OBSERVE.value
+        ))
+        for outcome in task_spec.outcomes:
+            local_fulfilled_effects = {
+                ToolEffect(ref.rsplit(":", 1)[-1])
+                for ref in outcome.fulfillment_refs
+                if ref.rsplit(":", 1)[-1] in {
+                    item.value for item in ToolEffect
+                }
+            }
+            reusable_refs = (
+                tuple(
+                    reference for reference in shared_observation_refs
+                    if reference not in outcome.fulfillment_refs
+                )
+                if outcome.kind in {
+                    TaskOutcomeKind.ANSWER, TaskOutcomeKind.EVIDENCE,
+                }
+                and ToolEffect.OBSERVE in outcome.required_effects
+                else ()
+            )
+            fulfilled_effects = set(local_fulfilled_effects)
+            if reusable_refs:
+                fulfilled_effects.add(ToolEffect.OBSERVE)
+            synthesized_kind = (
+                outcome.kind in {
+                    TaskOutcomeKind.ANSWER, TaskOutcomeKind.EVIDENCE,
+                }
+                or (
+                    outcome.kind is TaskOutcomeKind.ARTIFACT_DELIVERY
+                    and ToolEffect.MUTATE not in outcome.required_effects
+                )
+            )
+            effects_ready = set(outcome.required_effects).issubset(
+                fulfilled_effects
+            )
+            if (
+                outcome.required and not outcome.status.is_closed
+                and synthesized_kind and effects_ready
+                and answer_result is not None
+                and answer_result.status is AcceptanceStatus.PASSED
+            ):
+                fulfillment_events = tuple(
+                    ("task_outcome.state_changed", {
+                        "outcome_id": outcome.outcome_id,
+                        "status": TaskOutcomeStatus.IN_PROGRESS.value,
+                        "fulfillment_ref": reference,
+                        "reason": "shared_task_observation",
+                    })
+                    for reference in reusable_refs
+                )
+                await self._append_events(task_id, fulfillment_events + ((
+                    "task_outcome.state_changed", {
+                        "outcome_id": outcome.outcome_id,
+                        "status": TaskOutcomeStatus.DELIVERED.value,
+                        "fulfillment_ref": answer_reference,
+                        "reason": (
+                            "verified_assistant_answer"
+                            if outcome.kind is TaskOutcomeKind.ANSWER
+                            else "verified_synthesized_outcome"
+                        ),
+                    },
+                ),))
+        if task_spec.outcomes:
+            events = await self._dependencies.store.read_events(task_id)
+            task_spec = TaskSpecProjector.project(task_id, task.goal, events)
         answer_evidence_result = (
             self._verify_answer_evidence_sufficiency(task, events)
             if mandatory_answer_completeness else None
@@ -5566,7 +6089,29 @@ class Kernel:
 
         criteria: list[AcceptanceResult] = []
         if mandatory_answer_completeness:
-            criteria.append(self._verify_answer_completeness(events))
+            assert answer_result is not None
+            criteria.append(answer_result)
+        if task_spec.outcomes:
+            open_required = tuple(
+                outcome for outcome in task_spec.outcomes
+                if outcome.required and not outcome.status.is_closed
+            )
+            criteria.append(AcceptanceResult(
+                "task-outcome-fulfillment",
+                (AcceptanceStatus.BLOCKED if open_required
+                 else AcceptanceStatus.PASSED),
+                tuple(Evidence(
+                    "task_outcome",
+                    "required Task outcome has durable fulfillment",
+                    f"{outcome.status.value}: {outcome.description}",
+                    outcome.outcome_id, False,
+                ) for outcome in open_required) or (Evidence(
+                    "task_outcome",
+                    "required Task outcomes have durable fulfillment",
+                    "all required outcomes are closed",
+                    "task-spec", True,
+                ),),
+            ))
         if answer_evidence_result is not None:
             criteria.append(answer_evidence_result)
         if goal_command_result is not None:
@@ -6255,9 +6800,13 @@ class Kernel:
                 )
 
     async def run_text_turn(
-        self, task_id: str, user_text: str, max_output_tokens: int = 1024
+        self, task_id: str, user_text: str, max_output_tokens: int | None = None
     ) -> TurnResult:
         normalized_text = user_text.strip()
+        max_output_tokens = (
+            self._dependencies.default_max_output_tokens
+            if max_output_tokens is None else max_output_tokens
+        )
         if not normalized_text:
             raise ValueError("user text must not be empty")
         if max_output_tokens <= 0:
@@ -6271,7 +6820,6 @@ class Kernel:
             raise InvalidTurnState(
                 f"task {task_id} must be EXECUTING, got {task.state.value}"
             )
-
         turn_id = f"turn-{uuid4().hex}"
         user_message = Message(
             message_id=f"msg-{uuid4().hex}",
@@ -6346,6 +6894,7 @@ class Kernel:
                     "message": response.message.to_data(),
                     "finish_reason": response.finish_reason.value,
                     "usage": response.usage.to_data(),
+                    "response_diagnostics": self._response_diagnostics(response),
                     "context_window": prepared.budget.context_window,
                     "context_estimated_input_tokens": (
                         prepared.budget.estimated_input_tokens
@@ -6400,7 +6949,7 @@ class Kernel:
         user_text: str,
         max_model_calls: int | None = None,
         max_tool_calls: int | None = None,
-        max_output_tokens: int = 1024,
+        max_output_tokens: int | None = None,
         tool_timeout_seconds: float = 30.0,
         on_text_delta: Callable[[str], None] | None = None,
         on_progress: Callable[[AgentProgress], None] | None = None,
@@ -6413,6 +6962,10 @@ class Kernel:
         max_tool_calls = (
             self._dependencies.default_max_tool_calls
             if max_tool_calls is None else max_tool_calls
+        )
+        max_output_tokens = (
+            self._dependencies.default_max_output_tokens
+            if max_output_tokens is None else max_output_tokens
         )
         if not normalized_text:
             raise ValueError("user text must not be empty")
@@ -6433,7 +6986,6 @@ class Kernel:
             raise InvalidTurnState(
                 f"task {task_id} must be EXECUTING, got {task.state.value}"
             )
-
         turn_id = f"turn-{uuid4().hex}"
         user_message = Message(
             message_id=f"msg-{uuid4().hex}",
@@ -6625,6 +7177,13 @@ class Kernel:
             role=MessageRole.TOOL,
             content=(ToolResultBlock(result),),
         )
+        if result.error_code == "UNKNOWN_OUTCOME":
+            blocked_checkpoint = replace(
+                resumed, messages=resumed.messages + (tool_message,),
+            )
+            return await self._suspend_unknown_tool_outcome(
+                blocked_checkpoint, approved_call, result
+            )
         return await self._continue_agent_turn(
             resumed, visible_tools, initial_tool_message=tool_message,
             on_text_delta=on_text_delta,
@@ -6718,6 +7277,102 @@ class Kernel:
             on_progress=on_progress,
         )
 
+    async def resume_agent_continuation(
+        self, task_id: str, user_text: str, *, input_id: str,
+        on_text_delta: Callable[[str], None] | None = None,
+        on_progress: Callable[[AgentProgress], None] | None = None,
+    ) -> (
+        AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended
+        | AgentContinuationSuspended
+    ):
+        """Resume a model-selected completed-unit boundary without authority."""
+        normalized = user_text.strip()
+        if not normalized or not input_id.strip():
+            raise ValueError("continuation input and input_id are required")
+        stored = await self._require_stored_task(task_id)
+        task = TaskSnapshot.from_data(stored.data)
+        if task.state is not TaskState.AWAITING_USER:
+            raise InvalidTurnState(
+                f"task {task_id} is not awaiting continuation"
+            )
+        if task.pending_clarification is not None:
+            raise ClarificationNotPending(
+                "clarification must be answered through its request protocol"
+            )
+        if task.active_agent_checkpoint is None:
+            raise LookupError("continuation lost its active Agent checkpoint")
+        checkpoint = AgentTurnCheckpoint.from_data(task.active_agent_checkpoint)
+        pending = checkpoint.pending_user_action
+        if pending.get("kind") != "CONTINUATION":
+            raise ClarificationNotPending("task has no pending continuation")
+        visible_tools = await self.list_tools()
+        await self._validate_agent_checkpoint(task, checkpoint, visible_tools)
+        resumed_checkpoint = replace(
+            checkpoint, revision=checkpoint.revision + 1,
+            pending_user_action={},
+        )
+        resumed_task = task.transition(TaskState.EXECUTING).with_agent_checkpoint(
+            resumed_checkpoint.to_data()
+        )
+        steering = SteeringProjector.project(
+            task_id, await self._dependencies.store.read_events(task_id)
+        )
+        steering_hash = canonical_hash({
+            "kind": SteeringKind.STEER.value, "text": normalized,
+        })
+        events = (
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", task_id,
+                stored.last_event_sequence + 1, "continuation.resolved", {
+                    "turn_id": checkpoint.turn_id,
+                    "input_id": input_id,
+                    "input_hash": canonical_hash(normalized),
+                    "completed_outcome_ids": list(
+                        pending.get("completed_outcome_ids", [])
+                    ),
+                    "remaining_outcome_ids": list(
+                        pending.get("remaining_outcome_ids", [])
+                    ),
+                },
+            ),
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", task_id,
+                stored.last_event_sequence + 2, "task.state_changed", {
+                    "previous_state": task.state.value,
+                    "next_state": resumed_task.state.value,
+                    "reason": "user input continued a completed unit",
+                },
+            ),
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", task_id,
+                stored.last_event_sequence + 3, "checkpoint.saved", {
+                    "turn_id": checkpoint.turn_id,
+                    "revision": resumed_checkpoint.revision,
+                    "checkpoint_hash": resumed_checkpoint.checkpoint_hash,
+                    "reason": "continuation-resolved",
+                    "pending_user_action": {},
+                },
+            ),
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", task_id,
+                stored.last_event_sequence + 4, "steering.queued", {
+                    "steering_id": input_id,
+                    "inbound_sequence": steering.latest_inbound_sequence + 1,
+                    "kind": SteeringKind.STEER.value,
+                    "text": normalized,
+                    "text_hash": canonical_hash(normalized),
+                    "request_hash": steering_hash,
+                },
+            ),
+        )
+        await self._dependencies.store.commit(RuntimeUnitOfWork(
+            task_id, stored.version, resumed_task.to_data(), events
+        ))
+        return await self._continue_agent_turn(
+            resumed_checkpoint, visible_tools,
+            on_text_delta=on_text_delta, on_progress=on_progress,
+        )
+
     async def resolve_agent_approval(
         self, request_id: str, decision: ApprovalDecision, reason: str,
         on_text_delta: Callable[[str], None] | None = None,
@@ -6741,16 +7396,22 @@ class Kernel:
         )
 
     async def resolve_agent_clarification(
-        self, request_id: str, resume_token: str, answer: str,
+        self, request_id: str, resume_token: str, answer: str | None = None, *,
+        selected_choice: str | None = None,
         on_text_delta: Callable[[str], None] | None = None,
         on_progress: Callable[[AgentProgress], None] | None = None,
     ) -> AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended:
         """Bind one answer to one pending request and resume the same turn."""
-        normalized_answer = answer.strip()
         if not request_id.strip() or not resume_token.strip():
             raise ValueError("request_id and resume_token must not be empty")
-        if not normalized_answer:
-            raise ValueError("clarification answer must not be empty")
+        normalized_answer = answer.strip() if answer is not None else ""
+        normalized_choice = (
+            selected_choice.strip() if selected_choice is not None else ""
+        )
+        if normalized_answer and normalized_choice:
+            raise ValueError(
+                "clarification accepts either answer or selected_choice, not both"
+            )
         stored = await self._dependencies.store.find_task_by_pending_clarification(
             request_id
         )
@@ -6771,6 +7432,20 @@ class Kernel:
         if task.active_agent_checkpoint is None:
             raise ClarificationNotPending("pending clarification lost its checkpoint")
         checkpoint = AgentTurnCheckpoint.from_data(task.active_agent_checkpoint)
+        if request.kind is ClarificationKind.OUTCOME_RECONCILIATION:
+            pending = checkpoint.pending_user_action
+            if (
+                pending.get("kind") != request.kind.value
+                or pending.get("request_id") != request.request_id
+                or pending.get("execution_id") != request.execution_id
+            ):
+                raise ClarificationTokenMismatch(
+                    "outcome reconciliation does not match the active checkpoint"
+                )
+            return await self._resolve_outcome_reconciliation(
+                task, request, checkpoint, normalized_answer,
+                normalized_choice, resume_token, on_text_delta, on_progress,
+            )
         if (
             checkpoint.task_id != task.task_id
             or checkpoint.turn_id != request.turn_id
@@ -6783,10 +7458,33 @@ class Kernel:
         visible_tools = await self.list_tools()
         await self._validate_agent_checkpoint(task, checkpoint, visible_tools)
         allowed_values = {choice.value for choice in request.choices}
-        selected = normalized_answer if normalized_answer in allowed_values else None
+        if request.choices:
+            # New clients submit selected_choice. For one compatibility cycle,
+            # an old client may still place the exact stable value in answer.
+            selected = normalized_choice or (
+                normalized_answer if normalized_answer in allowed_values else ""
+            )
+            if not selected or selected not in allowed_values:
+                raise ValueError(
+                    "single-choice clarification requires a valid selected_choice"
+                )
+            resolved_answer = selected
+        else:
+            if normalized_choice:
+                raise ValueError(
+                    "free-text clarification does not accept selected_choice"
+                )
+            if not normalized_answer:
+                raise ValueError("clarification answer must not be empty")
+            selected = None
+            resolved_answer = normalized_answer
         result = ToolResult(
             call_id=request.call.call_id, ok=True,
-            data={"answer": normalized_answer, "selected_choice": selected},
+            data={
+                "answer": resolved_answer,
+                "selected_choice": selected,
+                "input_mode": request.input_mode,
+            },
             meta={"request_id": request.request_id, "answered_by_user": True},
         )
         question_projection = await self._observe_evidence_question(
@@ -6804,11 +7502,14 @@ class Kernel:
             pending_tool_calls=checkpoint.pending_tool_calls[1:],
             tool_calls=checkpoint.tool_calls + 1,
             evidence_question_state=question_projection.to_data(),
+            pending_user_action={},
         )
         resumed = task.resolve_clarification().with_agent_checkpoint(
             resumed_checkpoint.to_data()
         )
-        answer_hash = canonical_hash({"answer": normalized_answer})
+        answer_hash = canonical_hash({
+            "answer": resolved_answer, "selected_choice": selected,
+        })
         events = (
             RuntimeEvent(
                 f"evt-{uuid4().hex}", task.task_id,
@@ -6816,8 +7517,10 @@ class Kernel:
                 {
                     "request_id": request.request_id,
                     "turn_id": request.turn_id,
+                    "outcome_ref": request.call.outcome_ref,
                     "answer_hash": answer_hash,
                     "selected_choice": selected,
+                    "input_mode": request.input_mode,
                 },
             ),
             RuntimeEvent(
@@ -6850,12 +7553,181 @@ class Kernel:
                 },
             ),
         )
+        if request.call.outcome_ref is not None:
+            spec = await self.get_task_spec(task.task_id)
+            outcome = next(
+                item for item in spec.outcomes
+                if item.outcome_id == request.call.outcome_ref
+            )
+            reference = f"user:{request.request_id}:interact"
+            next_status = (
+                TaskOutcomeStatus.DELIVERED
+                if set(outcome.required_effects).issubset({ToolEffect.INTERACT})
+                else TaskOutcomeStatus.IN_PROGRESS
+            )
+            events += (RuntimeEvent(
+                f"evt-{uuid4().hex}", task.task_id,
+                stored.last_event_sequence + len(events) + 1,
+                "task_outcome.state_changed", {
+                    "outcome_id": outcome.outcome_id,
+                    "status": next_status.value,
+                    "fulfillment_ref": reference,
+                    "reason": "user_decision_received",
+                    "tool_call_id": request.call.call_id,
+                    "tool_effect": ToolEffect.INTERACT.value,
+                },
+            ),)
         await self._dependencies.store.commit(RuntimeUnitOfWork(
             task.task_id, stored.version, resumed.to_data(), events
         ))
         return await self._continue_agent_turn(
             resumed_checkpoint, visible_tools, on_text_delta=on_text_delta,
             on_progress=on_progress,
+        )
+
+    async def _resolve_outcome_reconciliation(
+        self, task: TaskSnapshot, request: ClarificationRequest,
+        checkpoint: AgentTurnCheckpoint, normalized_answer: str,
+        normalized_choice: str, resume_token: str,
+        on_text_delta: Callable[[str], None] | None,
+        on_progress: Callable[[AgentProgress], None] | None,
+    ) -> AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended:
+        """Apply an explicit observation without rewriting tool history."""
+        allowed = {choice.value for choice in request.choices}
+        selected = normalized_choice or (
+            normalized_answer if normalized_answer in allowed else ""
+        )
+        if selected not in allowed:
+            raise ValueError(
+                "outcome reconciliation requires a displayed selected_choice"
+            )
+        if selected == "KEEP_BLOCKED":
+            return AgentClarificationSuspended(
+                task.task_id, request.turn_id, checkpoint.revision,
+                request.request_id, request.question,
+                tuple((item.value, item.label) for item in request.choices),
+                request.reason, request.required, resume_token, request.kind.value,
+            )
+        execution_id = request.execution_id or ""
+        execution = task.tool_executions.get(execution_id)
+        if execution is None or execution.state is not ToolCommitState.UNKNOWN_OUTCOME:
+            raise ClarificationNotPending(
+                "outcome reconciliation lost its UNKNOWN_OUTCOME execution"
+            )
+        reconciled_value = (
+            "SUCCEEDED" if selected == "CONFIRM_SUCCEEDED" else "NOT_APPLIED"
+        )
+        reference = f"user:{request.request_id}:outcome-reconciliation"
+        reconciled_execution = execution.reconcile(reconciled_value, reference)
+        result = ToolResult(
+            call_id=execution.call.call_id,
+            ok=reconciled_value == "SUCCEEDED",
+            data={
+                "reconciled_outcome": reconciled_value,
+                "execution_id": execution_id,
+            },
+            error_code=(
+                None if reconciled_value == "SUCCEEDED" else "NOT_APPLIED"
+            ),
+            message=(
+                "User confirmed the external action succeeded."
+                if reconciled_value == "SUCCEEDED" else
+                "User confirmed the external action did not take effect."
+            ),
+            retryable=reconciled_value == "NOT_APPLIED",
+            meta={
+                "request_id": request.request_id,
+                "reconciled_by_user": True,
+                "original_commit_state": ToolCommitState.UNKNOWN_OUTCOME.value,
+            },
+        )
+        tool_message = Message(
+            f"msg-tool-reconciled-{uuid4().hex}", MessageRole.TOOL,
+            (ToolResultBlock(result),),
+        )
+        resumed_checkpoint = replace(
+            checkpoint, revision=checkpoint.revision + 1,
+            messages=checkpoint.messages + (tool_message,),
+            pending_tool_calls=(), pending_user_action={},
+        )
+        stored = await self._require_stored_task(task.task_id)
+        live = TaskSnapshot.from_data(stored.data)
+        resumed = live.with_tool_execution(
+            reconciled_execution
+        ).resolve_clarification().with_agent_checkpoint(
+            resumed_checkpoint.to_data()
+        )
+        answer_hash = canonical_hash({
+            "selected_choice": selected, "execution_id": execution_id,
+        })
+        events: tuple[RuntimeEvent, ...] = (
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", task.task_id,
+                stored.last_event_sequence + 1, "tool.outcome_reconciled", {
+                    "request_id": request.request_id,
+                    "execution_id": execution_id,
+                    "reconciled_outcome": reconciled_value,
+                    "answer_hash": answer_hash,
+                    "outcome_ref": execution.call.outcome_ref,
+                },
+            ),
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", task.task_id,
+                stored.last_event_sequence + 2, "clarification.resolved", {
+                    "request_id": request.request_id,
+                    "turn_id": request.turn_id,
+                    "selected_choice": selected,
+                    "input_mode": request.input_mode,
+                    "kind": request.kind.value,
+                    "answer_hash": answer_hash,
+                },
+            ),
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", task.task_id,
+                stored.last_event_sequence + 3, "task.state_changed", {
+                    "previous_state": live.state.value,
+                    "next_state": resumed.state.value,
+                    "reason": "unknown tool outcome reconciled",
+                },
+            ),
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", task.task_id,
+                stored.last_event_sequence + 4, "checkpoint.saved", {
+                    "turn_id": request.turn_id,
+                    "revision": resumed_checkpoint.revision,
+                    "checkpoint_hash": resumed_checkpoint.checkpoint_hash,
+                    "reason": "unknown-outcome-reconciled",
+                },
+            ),
+        )
+        if execution.call.outcome_ref is not None:
+            events += (RuntimeEvent(
+                f"evt-{uuid4().hex}", task.task_id,
+                stored.last_event_sequence + len(events) + 1,
+                "task_outcome.state_changed", {
+                    "outcome_id": execution.call.outcome_ref,
+                    "status": (
+                        TaskOutcomeStatus.ALREADY_SATISFIED.value
+                        if reconciled_value == "SUCCEEDED" else
+                        TaskOutcomeStatus.PENDING.value
+                    ),
+                    "fulfillment_ref": (
+                        reference if reconciled_value == "SUCCEEDED" else ""
+                    ),
+                    "reason": "unknown_tool_outcome_reconciled",
+                    "tool_call_id": execution.call.call_id,
+                },
+            ),)
+        await self._dependencies.store.commit(RuntimeUnitOfWork(
+            task.task_id, stored.version, resumed.to_data(), events
+        ))
+        visible_tools = await self.list_tools()
+        await self._validate_agent_checkpoint(
+            await self.get_task(task.task_id), resumed_checkpoint, visible_tools
+        )
+        return await self._continue_agent_turn(
+            resumed_checkpoint, visible_tools,
+            on_text_delta=on_text_delta, on_progress=on_progress,
         )
 
     async def interrupt_agent_turn(
@@ -6916,6 +7788,20 @@ class Kernel:
     ) -> AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended:
         task_id = checkpoint.task_id
         turn_id = checkpoint.turn_id
+        await self.plan_task_spec(task_id)
+        live_spec = await self.get_task_spec(task_id)
+        closed_outcomes_at_entry = frozenset(
+            outcome.outcome_id for outcome in live_spec.outcomes
+            if outcome.required and outcome.status.is_closed
+        )
+        checkpoint = replace(
+            checkpoint, task_spec_revision=live_spec.revision,
+            task_spec_hash=live_spec.content_hash,
+            active_outcome_ids=tuple(
+                outcome.outcome_id for outcome in live_spec.outcomes
+                if outcome.required and not outcome.status.is_closed
+            ),
+        )
         messages = list(checkpoint.messages)
         if initial_tool_message is not None:
             messages.append(initial_tool_message)
@@ -6935,7 +7821,7 @@ class Kernel:
         no_progress_stop = False
         budget_wrap_up = False
         budget_wrap_up_decision: ExplorationBudgetDecision | None = None
-        protocol_retry_used = False
+        protocol_recovery_attempts = 0
         protocol_correction: str | None = None
         visible_tool_by_name = {tool.name: tool for tool in visible_tools}
 
@@ -6954,6 +7840,16 @@ class Kernel:
             pending_tool_calls = list(checkpoint.pending_tool_calls)
             if replaced:
                 pending_tool_calls.clear()
+                await self.plan_task_spec(task_id)
+                refreshed_spec = await self.get_task_spec(task_id)
+                checkpoint = replace(
+                    checkpoint, task_spec_revision=refreshed_spec.revision,
+                    task_spec_hash=refreshed_spec.content_hash,
+                    active_outcome_ids=tuple(
+                        outcome.outcome_id for outcome in refreshed_spec.outcomes
+                        if outcome.required and not outcome.status.is_closed
+                    ),
+                )
             while pending_tool_calls:
                 checkpoint, replaced = await self._apply_pending_steering(
                     replace(
@@ -6970,6 +7866,27 @@ class Kernel:
                     break
                 call = pending_tool_calls[0]
                 call_spec = visible_tool_by_name.get(call.name)
+                if call_spec is not None and call.outcome_ref is None:
+                    # Resolve the Action→Outcome edge before emitting any
+                    # lifecycle Event so requested/policy/approval/result all
+                    # carry the same authoritative reference.
+                    call = await self._bind_tool_call_outcome(
+                        task_id, call, call_spec
+                    )
+                    pending_tool_calls[0] = call
+                elif call_spec is not None:
+                    persisted = (await self.get_task(task_id)).tool_executions.get(
+                        ToolExecutionRecord.identity(turn_id, call.call_id)
+                    )
+                    call = await self._bind_tool_call_outcome(
+                        task_id, call, call_spec,
+                        # Calls in this list were already accepted into the
+                        # durable checkpoint while their Outcome was active.
+                        # This also lets pre-fix checkpoints finish a batch
+                        # whose first result closed the shared Outcome early.
+                        allow_closed_ref=True,
+                    )
+                    pending_tool_calls[0] = call
                 requires_question = (
                     self._dependencies.require_evidence_questions
                     and call_spec is not None
@@ -7679,6 +8596,7 @@ class Kernel:
                         task_id, turn_id, call, effective_tool_timeout_seconds,
                         agent_checkpoint=suspension.to_data(),
                         recover_interrupted=recover_interrupted,
+                        allow_closed_outcome_ref=True,
                     )
                 except ApprovalRequired as required:
                     request = required.request
@@ -7896,6 +8814,34 @@ class Kernel:
                 )
                 await self._save_agent_checkpoint(after_tool, "tool-result-recorded")
                 checkpoint = after_tool
+                if result.error_code == "UNKNOWN_OUTCOME":
+                    return await self._suspend_unknown_tool_outcome(
+                        after_tool, call, result
+                    )
+                continuation = await self._maybe_suspend_after_completed_unit(
+                    checkpoint, closed_outcomes_at_entry
+                )
+                if continuation is not None:
+                    source_user_message = next((
+                        message for message in messages
+                        if message.role is MessageRole.USER
+                        and not message.message_id.startswith((
+                            "project-onboarding-context-",
+                            "project-memory-context-", "session-context-",
+                            "working-memory-context-", "task-spec-context-",
+                            "project-instructions-context-",
+                        ))
+                    ), None)
+                    if source_user_message is None:
+                        raise RuntimeError(
+                            "Agent continuation lost its source user message"
+                        )
+                    await self._record_session_task_result(
+                        task_id, turn_id, source_user_message,
+                        continuation.assistant_message,
+                    )
+                    await self._refresh_continuation_session_identity(task_id)
+                    return continuation
 
             model_call_number = model_call_count + 1
             if model_call_number > checkpoint.max_model_calls:
@@ -8034,6 +8980,14 @@ class Kernel:
                 runtime_instruction = "\n\n".join(filter(None, (
                     runtime_instruction, protocol_correction,
                 )))
+            # Outcome state is event-sourced and may have changed after the
+            # previous tool result. Keep exactly one fresh protected Task SPEC
+            # message so compaction and restart never reintroduce stale state.
+            messages = [
+                message for message in messages
+                if not message.message_id.startswith("task-spec-context-")
+            ]
+            messages.append(await self._task_spec_context_message(task_id))
             try:
                 prepared = self._dependencies.context_manager.prepare(
                     conversation=tuple(messages), tools=visible_tools,
@@ -8069,6 +9023,48 @@ class Kernel:
             prompt = self._dependencies.prompt_template.assemble(
                 prepared.messages, visible_tools, runtime_instruction
             )
+            live_spec = await self.get_task_spec(task_id)
+            open_outcomes = tuple(
+                outcome for outcome in live_spec.outcomes
+                if outcome.required and not outcome.status.is_closed
+            )
+            transport_updates: list[ModelTransportProgress] = []
+
+            def record_transport(update: ModelTransportProgress) -> None:
+                transport_updates.append(update)
+                # attempt_started/attempt_completed describe every normal
+                # physical request and remain in the audit log below.  They
+                # are not retries.  A user-visible retry exists only after the
+                # recovery policy decides to issue another physical request.
+                retry_actions = {
+                    ModelRecoveryAction.RETRY_SAME_REQUEST.value,
+                    ModelRecoveryAction.RESAMPLE.value,
+                    ModelRecoveryAction.RESAMPLE_WITH_CORRECTION.value,
+                    ModelRecoveryAction.FALLBACK_TRANSPORT.value,
+                }
+                if (
+                    update.kind != "recovery_decided"
+                    or update.recovery_action not in retry_actions
+                ):
+                    return
+                reason = update.reason
+                if (
+                    update.recovery_action
+                    == ModelRecoveryAction.FALLBACK_TRANSPORT.value
+                ):
+                    reason = "stream_fallback:" + reason
+                self._notify_agent_progress(on_progress, AgentProgress(
+                    AgentProgressKind.MODEL_RETRY,
+                    model_call=model_call_number,
+                    max_model_calls=checkpoint.max_model_calls,
+                    tool_call=tool_call_count,
+                    max_tool_calls=checkpoint.max_tool_calls,
+                    goal=live_goal, reason=reason,
+                    transport_attempt=update.attempt,
+                    max_transport_attempts=update.max_attempts,
+                    retry_delay_seconds=update.delay_seconds,
+                ))
+
             request = ModelRequest(
                 turn_id=turn_id,
                 messages=prompt.messages,
@@ -8078,20 +9074,19 @@ class Kernel:
                 require_evidence_questions=(
                     self._dependencies.require_evidence_questions
                 ),
-                on_transport_progress=lambda update: (
-                    self._notify_agent_progress(on_progress, AgentProgress(
-                        AgentProgressKind.MODEL_RETRY,
-                        model_call=model_call_number,
-                        max_model_calls=checkpoint.max_model_calls,
-                        tool_call=tool_call_count,
-                        max_tool_calls=checkpoint.max_tool_calls,
-                        goal=live_goal,
-                        reason=update.reason,
-                        transport_attempt=update.attempt,
-                        max_transport_attempts=update.max_attempts,
-                        retry_delay_seconds=update.delay_seconds,
-                    ))
+                outcome_refs=tuple(
+                    outcome.outcome_id for outcome in open_outcomes
                 ),
+                tool_outcome_refs=tuple(
+                    (tool.name, tuple(
+                        outcome.outcome_id for outcome in open_outcomes
+                        if self._tool_effect_supports_outcome(
+                            tool.effect, outcome
+                        )
+                    ))
+                    for tool in visible_tools
+                ),
+                on_transport_progress=record_transport,
             )
             model_started_at = time.monotonic()
             live_goal = (await self.get_task(task_id)).goal
@@ -8113,6 +9108,9 @@ class Kernel:
                 response = await self._complete_agent_model_request(
                     request,
                     buffered_text.append if should_buffer_text else on_text_delta,
+                )
+                await self._record_model_attempt_events(
+                    task_id, turn_id, model_call_number, transport_updates
                 )
                 self._notify_agent_progress(on_progress, AgentProgress(
                     AgentProgressKind.MODEL_COMPLETED,
@@ -8140,18 +9138,79 @@ class Kernel:
                         "tool call_id must be unique within a turn: "
                         + ", ".join(duplicate_call_ids)
                     )
+                # Resolve every Action→Outcome edge against one consistent
+                # pre-batch snapshot. Later calls in the same accepted batch
+                # remain valid even if an earlier result changes Outcome state;
+                # a new model response still cannot target a closed Outcome.
+                bound_calls: list[ToolCall] = []
+                try:
+                    for call in tool_calls:
+                        call_spec = visible_tool_by_name.get(call.name)
+                        bound_calls.append(
+                            await self._bind_tool_call_outcome(
+                                task_id, call, call_spec
+                            )
+                            if call_spec is not None else call
+                        )
+                except InvalidToolArguments as error:
+                    raise RecoverableToolProtocolError(
+                        "invalid_outcome_binding", str(error)
+                    ) from error
+                tool_calls = tuple(bound_calls)
+                # A rejected response never consumes call IDs.  The corrected
+                # response may legitimately reuse the Provider-generated IDs.
                 seen_call_ids.update(call.call_id for call in tool_calls)
             except RecoverableToolProtocolError as error:
                 model_call_count = model_call_number
-                correction_allowed_while_wrapping = (
-                    error.reason_code == "tool_call_emitted_while_disabled"
+                protocol_recovery_attempts += 1
+                failure = ModelAttemptFailure(
+                    ModelFailureCategory.CORRECTABLE_PROTOCOL,
+                    ModelRetrySafety.SAFE_WITH_CORRECTION,
+                    error.reason_code, str(error),
+                )
+                policy = self._dependencies.model_recovery_policy
+                if policy is None:
+                    decision = None
+                else:
+                    decision = await policy.evaluate(ModelRecoveryProbe(
+                        failure, protocol_recovery_attempts, 2, False
+                    ))
+                recovery_action = (
+                    decision.action if decision is not None
+                    else (
+                        ModelRecoveryAction.RESAMPLE_WITH_CORRECTION
+                        if protocol_recovery_attempts == 1
+                        else ModelRecoveryAction.FAIL_TERMINAL
+                    )
+                )
+                recovery_reason = (
+                    decision.reason_code if decision is not None
+                    else "compatibility_protocol_recovery"
+                )
+                await self._record_model_attempt_events(
+                    task_id, turn_id, model_call_number, [
+                        ModelTransportProgress(
+                            "attempt_failed", protocol_recovery_attempts, 2,
+                            category=failure.category.value,
+                            retry_safety=failure.retry_safety.value,
+                            diagnostic_code=failure.diagnostic_code,
+                            reason=recovery_reason,
+                        ),
+                        ModelTransportProgress(
+                            "recovery_decided", protocol_recovery_attempts, 2,
+                            category=failure.category.value,
+                            retry_safety=failure.retry_safety.value,
+                            diagnostic_code=failure.diagnostic_code,
+                            recovery_action=recovery_action.value,
+                            reason=recovery_reason,
+                        ),
+                    ],
                 )
                 if (
-                    not protocol_retry_used
-                    and (not wrap_up or correction_allowed_while_wrapping)
+                    recovery_action
+                    is ModelRecoveryAction.RESAMPLE_WITH_CORRECTION
                     and model_call_count < checkpoint.max_model_calls
                 ):
-                    protocol_retry_used = True
                     protocol_correction = (
                         (
                             "Your previous response attempted a tool call after the "
@@ -8161,7 +9220,13 @@ class Kernel:
                             "evidence already collected, and explicitly state any "
                             "remaining uncertainty."
                         )
-                        if correction_allowed_while_wrapping else
+                        if error.reason_code == "tool_call_emitted_while_disabled" else (
+                            "Your previous tool call linked a tool to an incompatible "
+                            "Task outcome. Select only an outcome_ref allowed by that "
+                            "tool's current JSON Schema, or omit outcome_ref when no "
+                            "single outcome applies. Do not repeat the invalid call. "
+                            f"Runtime detail: {error.detail}"
+                        ) if error.reason_code == "invalid_outcome_binding" else
                         (
                             "Your previous response used an invalid tool-call envelope. "
                             "Retry the response once. For every tool call, pass exactly "
@@ -8189,10 +9254,7 @@ class Kernel:
                         checkpoint, "tool-protocol-retry-requested"
                     )
                     continue
-                if (
-                    error.reason_code == "tool_call_emitted_while_disabled"
-                    and model_call_count >= checkpoint.max_model_calls
-                ):
+                if model_call_count >= checkpoint.max_model_calls:
                     limit_error = AgentLoopLimitExceeded(
                         turn_id, "max_model_calls", checkpoint.max_model_calls,
                         model_calls=model_call_count, tool_calls=tool_call_count,
@@ -8205,23 +9267,63 @@ class Kernel:
                     )
                     raise limit_error from error
                 await self._record_turn_failure(
-                    task_id, turn_id, error, prompt.receipt
+                    task_id, turn_id, error, prompt.receipt,
+                    failure_kind="tool_protocol",
+                    failure_category=ModelFailureCategory.CORRECTABLE_PROTOCOL,
+                    retry_safety=ModelRetrySafety.SAFE_WITH_CORRECTION,
+                    recovery_action=recovery_action,
                 )
                 raise ModelInvocationFailed(
                     turn_id,
                     "model did not satisfy the tool-call protocol after one "
                     f"correction ({error.reason_code})",
+                    failure_kind="tool_protocol",
+                    failure_category=ModelFailureCategory.CORRECTABLE_PROTOCOL,
+                    retry_safety=ModelRetrySafety.SAFE_WITH_CORRECTION,
+                    recovery_action=recovery_action,
                 ) from error
             except Exception as error:
+                await self._record_model_attempt_events(
+                    task_id, turn_id, model_call_number, transport_updates
+                )
+                recovery = (
+                    error if isinstance(error, ModelRecoveryExhausted) else None
+                )
+                failure_category = (
+                    recovery.failure.category if recovery is not None
+                    else ModelFailureCategory.UNKNOWN
+                )
+                retry_safety = (
+                    recovery.failure.retry_safety if recovery is not None
+                    else ModelRetrySafety.NEVER
+                )
+                recovery_action = (
+                    recovery.decision.action if recovery is not None
+                    else ModelRecoveryAction.FAIL_TERMINAL
+                )
+                failure_kind = "model_response"
                 if isinstance(error, InvalidModelResponse):
                     await self._record_turn_failure(
-                        task_id, turn_id, error, prompt.receipt
+                        task_id, turn_id, error, prompt.receipt,
+                        failure_kind=failure_kind,
+                        failure_category=failure_category,
+                        retry_safety=retry_safety,
+                        recovery_action=recovery_action,
                     )
                 else:
                     await self._record_recoverable_turn_interruption(
-                        task_id, turn_id, error, prompt.receipt
+                        task_id, turn_id, error, prompt.receipt,
+                        failure_kind=failure_kind,
+                        failure_category=failure_category,
+                        retry_safety=retry_safety,
+                        recovery_action=recovery_action,
                     )
-                raise ModelInvocationFailed(turn_id, str(error)) from error
+                raise ModelInvocationFailed(
+                    turn_id, str(error), failure_kind=failure_kind,
+                    failure_category=failure_category,
+                    retry_safety=retry_safety,
+                    recovery_action=recovery_action,
+                ) from error
 
             input_tokens += response.usage.input_tokens
             output_tokens += response.usage.output_tokens
@@ -8374,6 +9476,282 @@ class Kernel:
         except Exception:
             # Rendering is observational and must never change Task correctness.
             return
+
+    async def _suspend_unknown_tool_outcome(
+        self, checkpoint: AgentTurnCheckpoint, call: ToolCall,
+        result: ToolResult,
+    ) -> AgentClarificationSuspended:
+        """Stop immediately when a started side effect has no known result.
+
+        This is a Runtime safety boundary, not a model decision.  Remaining
+        calls in the accepted batch are cancelled before another tool or model
+        request can run.  The original execution ledger remains immutable; a
+        later answer records a separate reconciliation observation.
+        """
+        stored = await self._require_stored_task(checkpoint.task_id)
+        task = TaskSnapshot.from_data(stored.data)
+        execution_id = ToolExecutionRecord.identity(
+            checkpoint.turn_id, call.call_id
+        )
+        execution = task.tool_executions.get(execution_id)
+        if (
+            execution is None
+            or execution.state is not ToolCommitState.UNKNOWN_OUTCOME
+        ):
+            raise RuntimeError(
+                "UNKNOWN_OUTCOME result is missing its execution ledger entry"
+            )
+        token = secrets.token_urlsafe(32)
+        created = datetime.now(timezone.utc)
+        choices = (
+            ClarificationChoice(
+                "CONFIRM_SUCCEEDED",
+                "已核对现场：操作确实成功",
+            ),
+            ClarificationChoice(
+                "CONFIRM_NOT_APPLIED",
+                "已核对现场：操作没有生效",
+            ),
+            ClarificationChoice(
+                "KEEP_BLOCKED",
+                "暂时无法确认，保持阻塞",
+            ),
+        )
+        request = ClarificationRequest(
+            request_id=f"clarification-{uuid4().hex}",
+            task_id=task.task_id, turn_id=checkpoint.turn_id, call=call,
+            question=(
+                "该操作已经开始，但 Runtime 没有收到可信的最终结果。"
+                "请先核对目标系统中的实际状态。"
+            ),
+            choices=choices,
+            reason=(
+                f"{call.name} returned UNKNOWN_OUTCOME; automatic retry and "
+                "dependent actions are unsafe"
+            ),
+            required=True,
+            resume_token_hash=ClarificationRequest.hash_resume_token(token),
+            created_at=created, expires_at=created + timedelta(hours=24),
+            kind=ClarificationKind.OUTCOME_RECONCILIATION,
+            execution_id=execution_id,
+        )
+        pending_user_action = {
+            "kind": ClarificationKind.OUTCOME_RECONCILIATION.value,
+            "request_id": request.request_id,
+            "execution_id": execution_id,
+            "tool_name": call.name,
+            "outcome_ref": call.outcome_ref,
+            "discarded_pending_call_count": len(
+                checkpoint.pending_tool_calls
+            ),
+        }
+        suspended_checkpoint = replace(
+            checkpoint, revision=checkpoint.revision + 1,
+            pending_tool_calls=(), pending_user_action=pending_user_action,
+        )
+        awaiting = task.await_clarification(request).with_agent_checkpoint(
+            suspended_checkpoint.to_data()
+        )
+        events: tuple[RuntimeEvent, ...] = (
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", task.task_id,
+                stored.last_event_sequence + 1,
+                "outcome_reconciliation.requested", {
+                    "request_id": request.request_id,
+                    "turn_id": checkpoint.turn_id,
+                    "execution_id": execution_id,
+                    "tool_name": call.name,
+                    "outcome_ref": call.outcome_ref,
+                    "choice_count": len(choices),
+                    "discarded_pending_call_count": len(
+                        checkpoint.pending_tool_calls
+                    ),
+                    "error_code": result.error_code,
+                },
+            ),
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", task.task_id,
+                stored.last_event_sequence + 2, "clarification.requested", {
+                    "request_id": request.request_id,
+                    "turn_id": checkpoint.turn_id,
+                    "outcome_ref": call.outcome_ref,
+                    "question_hash": canonical_hash({
+                        "question": request.question
+                    }),
+                    "choice_count": len(choices),
+                    "input_mode": request.input_mode,
+                    "required": True,
+                    "kind": request.kind.value,
+                    "expires_at": request.expires_at.isoformat(),
+                },
+            ),
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", task.task_id,
+                stored.last_event_sequence + 3, "checkpoint.saved", {
+                    "turn_id": checkpoint.turn_id,
+                    "revision": suspended_checkpoint.revision,
+                    "checkpoint_hash": suspended_checkpoint.checkpoint_hash,
+                    "reason": "unknown-tool-outcome-safety-stop",
+                    "pending_user_action": pending_user_action,
+                },
+            ),
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", task.task_id,
+                stored.last_event_sequence + 4, "task.state_changed", {
+                    "previous_state": task.state.value,
+                    "next_state": awaiting.state.value,
+                    "reason": "unknown tool outcome requires reconciliation",
+                },
+            ),
+        )
+        if call.outcome_ref is not None:
+            events += (RuntimeEvent(
+                f"evt-{uuid4().hex}", task.task_id,
+                stored.last_event_sequence + len(events) + 1,
+                "task_outcome.state_changed", {
+                    "outcome_id": call.outcome_ref,
+                    "status": TaskOutcomeStatus.BLOCKED.value,
+                    "fulfillment_ref": "",
+                    "reason": "unknown_tool_execution_outcome",
+                    "tool_call_id": call.call_id,
+                },
+            ),)
+        await self._dependencies.store.commit(RuntimeUnitOfWork(
+            task.task_id, stored.version, awaiting.to_data(), events
+        ))
+        return AgentClarificationSuspended(
+            task.task_id, checkpoint.turn_id, suspended_checkpoint.revision,
+            request.request_id, request.question,
+            tuple((choice.value, choice.label) for choice in choices),
+            request.reason, True, token, request.kind.value,
+        )
+
+    async def _maybe_suspend_after_completed_unit(
+        self, checkpoint: AgentTurnCheckpoint,
+        closed_outcomes_at_entry: frozenset[str],
+    ) -> AgentContinuationSuspended | None:
+        """Persist one policy-selected unit boundary from Outcome facts.
+
+        No user phrase is inspected here.  Runtime pauses only when this loop
+        newly closed a required Outcome and the Planner explicitly selected the
+        AFTER_COMPLETED_UNIT policy while later required Outcomes remain.
+        """
+        spec = await self.get_task_spec(checkpoint.task_id)
+        if spec.continuation_mode is not TaskContinuationMode.AFTER_COMPLETED_UNIT:
+            return None
+        closed = tuple(
+            outcome for outcome in spec.outcomes
+            if outcome.required and outcome.status.is_closed
+        )
+        newly_closed = tuple(
+            outcome for outcome in closed
+            if outcome.outcome_id not in closed_outcomes_at_entry
+        )
+        remaining = tuple(
+            outcome for outcome in spec.outcomes
+            if outcome.required and not outcome.status.is_closed
+        )
+        if not newly_closed or not remaining:
+            return None
+        pending = {
+            "kind": "CONTINUATION",
+            "task_id": checkpoint.task_id,
+            "turn_id": checkpoint.turn_id,
+            "completed_outcome_ids": [
+                outcome.outcome_id for outcome in newly_closed
+            ],
+            "remaining_outcome_ids": [
+                outcome.outcome_id for outcome in remaining
+            ],
+        }
+        suspended_checkpoint = replace(
+            checkpoint, revision=checkpoint.revision + 1,
+            pending_user_action=pending,
+            task_spec_revision=spec.revision, task_spec_hash=spec.content_hash,
+            active_outcome_ids=tuple(
+                outcome.outcome_id for outcome in remaining
+            ),
+        )
+        stored = await self._require_stored_task(checkpoint.task_id)
+        task = TaskSnapshot.from_data(stored.data)
+        if task.state is not TaskState.EXECUTING:
+            return None
+        awaiting = task.transition(TaskState.AWAITING_USER).with_agent_checkpoint(
+            suspended_checkpoint.to_data()
+        )
+        message = Message(
+            f"msg-continuation-{uuid4().hex}", MessageRole.ASSISTANT,
+            (TextBlock(
+                "Completed this unit: "
+                + "; ".join(outcome.description for outcome in newly_closed)
+                + ". Remaining required work: "
+                + "; ".join(outcome.description for outcome in remaining)
+                + "."
+            ),),
+        )
+        events = (
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", checkpoint.task_id,
+                stored.last_event_sequence + 1, "continuation.requested",
+                pending,
+            ),
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", checkpoint.task_id,
+                stored.last_event_sequence + 2, "checkpoint.saved", {
+                    "turn_id": checkpoint.turn_id,
+                    "revision": suspended_checkpoint.revision,
+                    "checkpoint_hash": suspended_checkpoint.checkpoint_hash,
+                    "reason": "completed-unit-continuation",
+                    "pending_user_action": pending,
+                },
+            ),
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", checkpoint.task_id,
+                stored.last_event_sequence + 3, "task.state_changed", {
+                    "previous_state": task.state.value,
+                    "next_state": awaiting.state.value,
+                    "reason": "completed unit awaits semantic continuation",
+                },
+            ),
+        )
+        await self._dependencies.store.commit(RuntimeUnitOfWork(
+            checkpoint.task_id, stored.version, awaiting.to_data(), events
+        ))
+        return AgentContinuationSuspended(
+            checkpoint.task_id, checkpoint.turn_id,
+            suspended_checkpoint.revision,
+            tuple(outcome.outcome_id for outcome in newly_closed),
+            tuple(outcome.outcome_id for outcome in remaining), message,
+        )
+
+    async def _refresh_continuation_session_identity(self, task_id: str) -> None:
+        """Bind a just-recorded Session handoff to its waiting checkpoint."""
+        stored = await self._require_stored_task(task_id)
+        task = TaskSnapshot.from_data(stored.data)
+        if task.active_agent_checkpoint is None:
+            return
+        checkpoint = AgentTurnCheckpoint.from_data(task.active_agent_checkpoint)
+        if checkpoint.pending_user_action.get("kind") != "CONTINUATION":
+            return
+        session = await self.get_session(task.session_id)
+        refreshed = replace(
+            checkpoint, revision=checkpoint.revision + 1,
+            session_context_hash=session.context_hash,
+        )
+        updated = task.with_agent_checkpoint(refreshed.to_data())
+        event = RuntimeEvent(
+            f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
+            "checkpoint.saved", {
+                "turn_id": checkpoint.turn_id,
+                "revision": refreshed.revision,
+                "checkpoint_hash": refreshed.checkpoint_hash,
+                "reason": "continuation-session-handoff-recorded",
+                "pending_user_action": dict(refreshed.pending_user_action),
+            },
+        )
+        await self._dependencies.store.commit(RuntimeUnitOfWork(
+            task_id, stored.version, updated.to_data(), (event,)
+        ))
 
     async def _evaluate_evidence_delta(
         self, task_id: str, turn_id: str, call: ToolCall, result: ToolResult,
@@ -9269,11 +10647,63 @@ class Kernel:
                 raise InvalidModelResponse("model stream emitted an unknown event")
         if completed is None:
             raise InvalidModelResponse("model stream ended without completion")
-        if "".join(text_parts) != completed.message.text:
+        # A StreamingModelProvider may legally finish atomically with only a
+        # ModelStreamCompleted event.  This is how non-streaming compatibility
+        # mode and safe stream-to-JSON fallback are exposed through the same
+        # port.  When deltas were emitted, however, their exact concatenation
+        # must still match the committed response so the UI cannot display one
+        # answer while the Event Log records another.
+        if text_parts and "".join(text_parts) != completed.message.text:
             raise InvalidModelResponse(
                 "model stream text does not match the completed response"
             )
         return completed
+
+    @staticmethod
+    def _response_text_fingerprint(text: str) -> dict[str, object]:
+        encoded = text.encode("utf-8")
+        return {
+            "characters": len(text),
+            "utf8_bytes": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+
+    @classmethod
+    def _response_diagnostics(cls, response: ModelResponse) -> dict[str, Any]:
+        inherited = dict(response.diagnostics)
+        kernel_text = cls._response_text_fingerprint(response.message.text)
+        persisted_text = cls._response_text_fingerprint(
+            Message.from_data(response.message.to_data()).text
+        )
+        inherited["kernel"] = {"text": kernel_text}
+        inherited["persisted"] = {"text": persisted_text}
+
+        def digest(layer: str) -> str | None:
+            value = inherited.get(layer)
+            if not isinstance(value, Mapping):
+                return None
+            text = value.get("text")
+            if not isinstance(text, Mapping):
+                return None
+            result = text.get("sha256")
+            return str(result) if isinstance(result, str) else None
+
+        transport_hash = digest("transport")
+        adapter_hash = digest("adapter")
+        kernel_hash = digest("kernel")
+        persisted_hash = digest("persisted")
+        inherited["checks"] = {
+            "transport_matches_adapter": (
+                transport_hash == adapter_hash
+                if transport_hash is not None and adapter_hash is not None
+                else None
+            ),
+            "adapter_matches_kernel": (
+                adapter_hash == kernel_hash if adapter_hash is not None else None
+            ),
+            "kernel_matches_persisted": kernel_hash == persisted_hash,
+        }
+        return inherited
 
     @staticmethod
     def _validate_agent_response(
@@ -9357,6 +10787,7 @@ class Kernel:
         timeout_seconds: float,
         agent_checkpoint: Mapping[str, Any] | None = None,
         recover_interrupted: bool = False,
+        allow_closed_outcome_ref: bool = False,
     ) -> ToolResult:
         try:
             if call.name == "core.request_input":
@@ -9367,6 +10798,7 @@ class Kernel:
                 task_id, turn_id, call, timeout_seconds=timeout_seconds,
                 agent_checkpoint=agent_checkpoint,
                 recover_interrupted=recover_interrupted,
+                allow_closed_outcome_ref=allow_closed_outcome_ref,
             )
         except ToolNotFound as error:
             result = ToolResult(
@@ -9392,6 +10824,7 @@ class Kernel:
                     {
                         "turn_id": turn_id,
                         "invocation_id": None,
+                        "outcome_ref": call.outcome_ref,
                         "result": result.to_data(),
                     },
                 ),
@@ -9468,7 +10901,19 @@ class Kernel:
             resume_token_hash=ClarificationRequest.hash_resume_token(token),
             created_at=created, expires_at=created + timedelta(hours=24),
         )
+        pending_user_action = {
+            "kind": "CLARIFICATION",
+            "request_id": request.request_id,
+            "task_id": task_id, "turn_id": turn_id,
+            "required": required,
+            "outcome_ref": call.outcome_ref,
+        }
+        checkpoint_data = replace(
+            AgentTurnCheckpoint.from_data(agent_checkpoint),
+            pending_user_action=pending_user_action,
+        ).to_data()
         awaiting = task.await_clarification(request)
+        awaiting = awaiting.with_agent_checkpoint(checkpoint_data)
         events = (
             RuntimeEvent(
                 f"evt-{uuid4().hex}", task_id,
@@ -9476,8 +10921,10 @@ class Kernel:
                 {
                     "request_id": request.request_id,
                     "turn_id": turn_id,
+                    "outcome_ref": call.outcome_ref,
                     "question_hash": canonical_hash({"question": question}),
                     "choice_count": len(choices),
+                    "input_mode": request.input_mode,
                     "required": required,
                     "expires_at": request.expires_at.isoformat(),
                 },
@@ -9490,6 +10937,7 @@ class Kernel:
                     "request_id": request.request_id,
                     "revision": agent_checkpoint.get("revision"),
                     "reason": "clarification-requested",
+                    "pending_user_action": pending_user_action,
                 },
             ),
             RuntimeEvent(
@@ -9534,6 +10982,41 @@ class Kernel:
             )
         )
 
+    async def _record_model_attempt_events(
+        self, task_id: str, turn_id: str, model_round: int,
+        updates: list[ModelTransportProgress],
+    ) -> None:
+        """Persist provider-neutral physical-attempt and recovery facts."""
+        if not updates:
+            return
+        event_data: list[tuple[str, Mapping[str, Any]]] = []
+        names = {
+            "attempt_started": "model.attempt_started",
+            "attempt_completed": "model.attempt_completed",
+            "attempt_failed": "model.attempt_failed",
+            "recovery_decided": "model.recovery_decided",
+        }
+        for update in updates:
+            event_type = names.get(update.kind)
+            if event_type is None:
+                continue
+            event_data.append((event_type, {
+                "turn_id": turn_id, "model_round": model_round,
+                "provider_attempt": update.attempt,
+                "max_provider_attempts": update.max_attempts,
+                "category": update.category,
+                "retry_safety": update.retry_safety,
+                "diagnostic_code": update.diagnostic_code,
+                "recovery_action": update.recovery_action,
+                "reason_code": update.reason,
+                "delay_seconds": update.delay_seconds,
+                "visible_output_emitted": update.visible_output_emitted,
+                "response_committed": update.response_committed,
+                "transport_mode": update.transport_mode,
+            }))
+        if event_data:
+            await self._append_events(task_id, tuple(event_data))
+
     async def list_tools(self) -> tuple[ToolSpec, ...]:
         tools: list[ToolSpec] = []
         names: set[str] = set()
@@ -9545,6 +11028,66 @@ class Kernel:
                 tools.append(spec)
         return tuple(tools)
 
+    async def _bind_tool_call_outcome(
+        self, task_id: str, call: ToolCall, tool: ToolSpec, *,
+        allow_closed_ref: bool = False,
+    ) -> ToolCall:
+        """Resolve an Action→Outcome edge without confusing support with delivery.
+
+        ``required_effects`` are effects that must occur before an Outcome can
+        close.  A read-only observation linked to an ANSWER is supporting
+        evidence: it may advance that Outcome to IN_PROGRESS, but the tool
+        result cannot deliver the answer.  Side effects remain valid only when
+        the TaskSpec explicitly requires their exact effect.
+        """
+        spec = await self.get_task_spec(task_id)
+        open_outcomes = tuple(
+            outcome for outcome in spec.outcomes
+            if outcome.required and not outcome.status.is_closed
+        )
+        if call.outcome_ref is not None:
+            selected = next((
+                outcome for outcome in spec.outcomes
+                if outcome.outcome_id == call.outcome_ref
+            ), None)
+            if selected is None or (
+                selected.status.is_closed and not allow_closed_ref
+            ):
+                raise InvalidToolArguments(
+                    f"unknown or closed outcome_ref: {call.outcome_ref}"
+                )
+            if not self._tool_effect_supports_outcome(tool.effect, selected):
+                raise InvalidToolArguments(
+                    f"tool effect {tool.effect.value} cannot support or fulfill "
+                    f"outcome {selected.outcome_id}"
+                )
+            return call
+        candidates = tuple(
+            outcome for outcome in open_outcomes
+            if self._tool_effect_supports_outcome(tool.effect, outcome)
+        )
+        if len(candidates) == 1:
+            return replace(call, outcome_ref=candidates[0].outcome_id)
+        return call
+
+    @staticmethod
+    def _tool_effect_supports_outcome(
+        effect: ToolEffect, outcome: TaskOutcomeSnapshot,
+    ) -> bool:
+        """Return whether an effect may be linked to an Outcome.
+
+        Observe is authority-free supporting evidence for a conversational
+        answer.  It deliberately does not authorize mutate, execute, control,
+        network, or interaction effects that the Planner omitted.
+        """
+        return (
+            effect in outcome.required_effects
+            or (
+                outcome.kind is TaskOutcomeKind.ANSWER
+                and effect is ToolEffect.OBSERVE
+            )
+        )
+
     async def invoke_tool(
         self,
         task_id: str,
@@ -9553,6 +11096,7 @@ class Kernel:
         timeout_seconds: float = 30.0,
         agent_checkpoint: Mapping[str, Any] | None = None,
         recover_interrupted: bool = False,
+        allow_closed_outcome_ref: bool = False,
     ) -> ToolResult:
         if not turn_id.strip():
             raise ValueError("turn_id must not be empty")
@@ -9594,10 +11138,16 @@ class Kernel:
                 stored = await self._require_stored_task(task_id)
 
         provider, selected_spec = await self._find_tool(call.name)
-        validate_tool_arguments(selected_spec, call.arguments)
         existing = task.tool_executions.get(
             ToolExecutionRecord.identity(turn_id, call.call_id)
         )
+        call = await self._bind_tool_call_outcome(
+            task_id, call, selected_spec,
+            allow_closed_ref=(
+                existing is not None or allow_closed_outcome_ref
+            ),
+        )
+        validate_tool_arguments(selected_spec, call.arguments)
         if existing is not None:
             expected_hash = self._tool_policy.payload_hash(
                 selected_spec, call, task.project_trust
@@ -9635,6 +11185,7 @@ class Kernel:
                 "turn_id": turn_id,
                 "invocation_id": invocation_id,
                 "tool_name": call.name,
+                "outcome_ref": call.outcome_ref,
                 "decision": decision.to_data(),
             },
         )
@@ -9765,6 +11316,7 @@ class Kernel:
                 payload={
                     "turn_id": turn_id,
                     "invocation_id": invocation_id,
+                    "outcome_ref": call.outcome_ref,
                     "result": denied.to_data(),
                 },
             )
@@ -9841,12 +11393,24 @@ class Kernel:
         events: tuple[RuntimeEvent, ...] = (policy_event, approval_event)
         sequence = stored.last_event_sequence + 3
         if agent_checkpoint is not None:
+            pending_user_action = {
+                "kind": "APPROVAL",
+                "request_id": request.request_id,
+                "task_id": task.task_id, "turn_id": request.turn_id,
+                "outcome_ref": request.call.outcome_ref,
+            }
+            checkpoint_data = replace(
+                AgentTurnCheckpoint.from_data(agent_checkpoint),
+                pending_user_action=pending_user_action,
+            ).to_data()
+            awaiting = awaiting.with_agent_checkpoint(checkpoint_data)
             events += (RuntimeEvent(
                 f"evt-{uuid4().hex}", task.task_id, sequence,
                 "checkpoint.saved", {
                     "turn_id": request.turn_id,
                     "request_id": request.request_id,
                     "revision": agent_checkpoint.get("revision"),
+                    "pending_user_action": pending_user_action,
                 },
             ),)
             sequence += 1
@@ -9963,6 +11527,21 @@ class Kernel:
             )
 
         resumed = task.resolve_approval()
+        if request.agent_checkpoint is not None and allow_agent_checkpoint:
+            resolved_checkpoint = replace(
+                AgentTurnCheckpoint.from_data(request.agent_checkpoint),
+                revision=(
+                    resume_revision
+                    if resume_revision is not None else
+                    AgentTurnCheckpoint.from_data(
+                        request.agent_checkpoint
+                    ).revision + 1
+                ),
+                pending_user_action={},
+            )
+            resumed = resumed.with_agent_checkpoint(
+                resolved_checkpoint.to_data()
+            )
         if (
             decision is ApprovalDecision.APPROVE
             and request.kind is ApprovalKind.WORKSPACE_READ
@@ -9982,8 +11561,10 @@ class Kernel:
             payload={
                 "request_id": request.request_id,
                 "payload_hash": request.payload_hash,
+                "outcome_ref": request.call.outcome_ref,
                 "decision": decision.value,
                 "reason": reason.strip(),
+                "pending_user_action": {},
             },
         )
         state_event = RuntimeEvent(
@@ -10033,6 +11614,7 @@ class Kernel:
                 payload={
                     "turn_id": request.turn_id,
                     "invocation_id": request.invocation_id,
+                    "outcome_ref": request.call.outcome_ref,
                     "result": denied.to_data(),
                 },
             )
@@ -10151,12 +11733,25 @@ class Kernel:
                 "idempotency_key": execution.idempotency_key,
             },
         )
+        started_events: tuple[RuntimeEvent, ...] = (started,)
+        if call.outcome_ref is not None:
+            started_events += (RuntimeEvent(
+                event_id=f"evt-{uuid4().hex}", task_id=task_id,
+                sequence=after_prepare.last_event_sequence + 2,
+                event_type="task_outcome.state_changed", payload={
+                    "outcome_id": call.outcome_ref,
+                    "status": TaskOutcomeStatus.IN_PROGRESS.value,
+                    "fulfillment_ref": "",
+                    "reason": "authorized_tool_started",
+                    "tool_call_id": call.call_id,
+                },
+            ),)
         await self._dependencies.store.commit(
             RuntimeUnitOfWork(
                 task_id=task_id,
                 expected_version=after_prepare.version,
                 next_state=running_task.to_data(),
-                events=(started,),
+                events=started_events,
             )
         )
 
@@ -10299,15 +11894,66 @@ class Kernel:
                 "invocation_id": invocation_id,
                 "result": result.to_data(),
                 "execution_id": execution.execution_id,
+                "outcome_ref": call.outcome_ref,
                 "commit_state": commit_state.value,
             },
         )
+        completed_events: tuple[RuntimeEvent, ...] = (completed,)
+        if result.ok and call.outcome_ref is not None:
+            live_spec = await self.get_task_spec(task_id)
+            outcome = next(
+                item for item in live_spec.outcomes
+                if item.outcome_id == call.outcome_ref
+            )
+            reference = (
+                f"tool:{execution.execution_id}:{selected_spec.effect.value}"
+            )
+            refs = outcome.fulfillment_refs + (reference,)
+            fulfilled_effects = {
+                ToolEffect(ref.rsplit(":", 1)[-1])
+                for ref in refs
+                if ref.rsplit(":", 1)[-1] in {item.value for item in ToolEffect}
+            }
+            # Observation proves that evidence was collected, not that a broad
+            # analysis or document result is semantically complete. Those
+            # synthesis-shaped Outcomes close only when the model presents a
+            # final candidate backed by all declared effects. Direct workspace,
+            # command and process deliveries can close on their ToolResult.
+            final_candidate_kinds = {
+                TaskOutcomeKind.ANSWER,
+                TaskOutcomeKind.EVIDENCE,
+            }
+            if (
+                outcome.kind is TaskOutcomeKind.ARTIFACT_DELIVERY
+                and ToolEffect.MUTATE not in outcome.required_effects
+            ):
+                final_candidate_kinds.add(TaskOutcomeKind.ARTIFACT_DELIVERY)
+            next_status = (
+                TaskOutcomeStatus.DELIVERED
+                if (
+                    outcome.kind not in final_candidate_kinds
+                    and set(outcome.required_effects).issubset(fulfilled_effects)
+                )
+                else TaskOutcomeStatus.IN_PROGRESS
+            )
+            completed_events += (RuntimeEvent(
+                event_id=f"evt-{uuid4().hex}", task_id=task_id,
+                sequence=after_tool.last_event_sequence + 2,
+                event_type="task_outcome.state_changed", payload={
+                    "outcome_id": call.outcome_ref,
+                    "status": next_status.value,
+                    "fulfillment_ref": reference,
+                    "reason": "committed_tool_result",
+                    "tool_call_id": call.call_id,
+                    "tool_effect": selected_spec.effect.value,
+                },
+            ),)
         await self._dependencies.store.commit(
             RuntimeUnitOfWork(
                 task_id=task_id,
                 expected_version=after_tool.version,
                 next_state=finished_task.to_data(),
-                events=(completed,),
+                events=completed_events,
             )
         )
         return result
@@ -10900,6 +12546,10 @@ class Kernel:
     async def _record_turn_failure(
         self, task_id: str, turn_id: str, error: Exception,
         prompt_receipt: PromptAssemblyReceipt | None = None,
+        *, failure_kind: str = "model_response",
+        failure_category: ModelFailureCategory = ModelFailureCategory.UNKNOWN,
+        retry_safety: ModelRetrySafety = ModelRetrySafety.NEVER,
+        recovery_action: ModelRecoveryAction = ModelRecoveryAction.FAIL_TERMINAL,
     ) -> None:
         stored = await self._dependencies.store.load_task(task_id)
         if stored is None:
@@ -10911,6 +12561,10 @@ class Kernel:
             "turn_id": turn_id,
             "error_type": type(error).__name__,
             "message": str(error),
+            "failure_kind": failure_kind,
+            "failure_category": failure_category.value,
+            "retry_safety": retry_safety.value,
+            "recovery_action": recovery_action.value,
             **(prompt_receipt.event_data() if prompt_receipt is not None else {}),
         }
         events = (
@@ -10936,7 +12590,11 @@ class Kernel:
                 payload={
                     "previous_state": current.state.value,
                     "next_state": failed.state.value,
-                    "reason": "model invocation failed",
+                    "reason": (
+                        "model tool protocol failed"
+                        if failure_kind == "tool_protocol"
+                        else "model invocation failed"
+                    ),
                 },
             ),
         )
@@ -10952,6 +12610,10 @@ class Kernel:
     async def _record_recoverable_turn_interruption(
         self, task_id: str, turn_id: str, error: Exception,
         prompt_receipt: PromptAssemblyReceipt | None = None,
+        *, failure_kind: str = "provider",
+        failure_category: ModelFailureCategory = ModelFailureCategory.UNKNOWN,
+        retry_safety: ModelRetrySafety = ModelRetrySafety.NEVER,
+        recovery_action: ModelRecoveryAction = ModelRecoveryAction.FAIL_TERMINAL,
     ) -> None:
         """Persist an unexpected stop while preserving its safe checkpoint."""
         stored = await self._dependencies.store.load_task(task_id)
@@ -10965,7 +12627,11 @@ class Kernel:
             or current.active_agent_checkpoint is None
         ):
             await self._record_turn_failure(
-                task_id, turn_id, error, prompt_receipt
+                task_id, turn_id, error, prompt_receipt,
+                failure_kind=failure_kind,
+                failure_category=failure_category,
+                retry_safety=retry_safety,
+                recovery_action=recovery_action,
             )
             return
         interrupting = current.transition(TaskState.INTERRUPTING)
@@ -10974,6 +12640,10 @@ class Kernel:
             "turn_id": turn_id,
             "error_type": type(error).__name__,
             "message": str(error),
+            "failure_kind": failure_kind,
+            "failure_category": failure_category.value,
+            "retry_safety": retry_safety.value,
+            "recovery_action": recovery_action.value,
             "recoverable": True,
             "checkpoint_preserved": True,
             **(prompt_receipt.event_data() if prompt_receipt is not None else {}),

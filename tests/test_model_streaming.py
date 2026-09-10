@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from tsm_agt.adapters.fixture import EchoModelProvider
+from tsm_agt.adapters.openai_compatible import OpenAICompatibleModelProvider
+from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.cli import _chat
 from tsm_agt.core import TaskState
 from tsm_agt.ports import (
-    Message, MessageRole, ModelRequest, ModelResponse, ModelStreamCompleted,
+    AdapterContext, Message, MessageRole, ModelRequest, ModelResponse, ModelStreamCompleted,
     ModelTextDelta, ModelUsage, ProviderCapabilities, RuntimeStorePort, TextBlock,
 )
 
@@ -49,6 +53,37 @@ class InterruptOnceModel(StreamingEchoModel):
             yield event
 
 
+class AtomicCompletionModel(StreamingEchoModel):
+    """Expose a non-streaming/fallback completion through the stream port."""
+
+    async def stream_complete(self, request: ModelRequest):
+        yield ModelStreamCompleted(await self.complete(request))
+
+
+class MismatchedStreamingModel(StreamingEchoModel):
+    async def stream_complete(self, request: ModelRequest):
+        yield ModelTextDelta("visible answer")
+        yield ModelStreamCompleted(ModelResponse(
+            Message(
+                f"mismatch-{request.turn_id}", MessageRole.ASSISTANT,
+                (TextBlock("different committed answer"),),
+            )
+        ))
+
+
+class DiagnosticStreamingTransport:
+    async def stream_sse(self, url, headers, payload, timeout_seconds):
+        yield json.dumps({
+            "id": "chat-diagnostic",
+            "choices": [{
+                "delta": {"content": "private complete answer"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3},
+        })
+        yield "[DONE]"
+
+
 async def executing_task(application, root: Path, *, session_id=None):
     task = await application.kernel.create_task(
         "streaming request", root, session_id=session_id
@@ -64,6 +99,92 @@ async def executing_task(application, root: Path, *, session_id=None):
 
 
 class ModelStreamingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_openai_stream_diagnostics_survive_sqlite_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "runtime.db"
+            provider = OpenAICompatibleModelProvider(
+                "https://models.example.test/v1", "test-model", "secret",
+                transport=DiagnosticStreamingTransport(),
+            )
+            application = compose_fixture_application(
+                model_adapter=provider, store_adapter=SQLiteRuntimeStore(database),
+                tool_adapters=(),
+            )
+            await application.registry.start_all()
+            try:
+                task = await executing_task(application, root)
+                result = await application.kernel.run_agent_turn(
+                    task.task_id, "diagnose response"
+                )
+                self.assertEqual(
+                    result.assistant_message.text, "private complete answer"
+                )
+            finally:
+                await application.registry.stop_all()
+
+            reopened = SQLiteRuntimeStore(database)
+            await reopened.start(AdapterContext(
+                config={}, emit_event=lambda _type, _payload: None
+            ))
+            try:
+                events = await reopened.read_events(task.task_id)
+            finally:
+                await reopened.stop(datetime.now(timezone.utc))
+            completed = next(
+                event for event in events if event.event_type == "llm.completed"
+            )
+            diagnostics = completed.payload["response_diagnostics"]
+            self.assertTrue(
+                diagnostics["checks"]["transport_matches_adapter"]
+            )
+            self.assertTrue(
+                diagnostics["checks"]["adapter_matches_kernel"]
+            )
+            self.assertTrue(
+                diagnostics["checks"]["kernel_matches_persisted"]
+            )
+            self.assertTrue(diagnostics["transport"]["saw_done"])
+            serialized = json.dumps(diagnostics, ensure_ascii=False)
+            self.assertNotIn("private complete answer", serialized)
+            self.assertNotIn("secret", serialized)
+
+    async def test_kernel_accepts_atomic_completion_without_text_deltas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = compose_fixture_application(
+                model_adapter=AtomicCompletionModel(), tool_adapters=()
+            )
+            await application.registry.start_all()
+            try:
+                task = await executing_task(application, root)
+                deltas: list[str] = []
+                result = await application.kernel.run_agent_turn(
+                    task.task_id, "atomic answer", on_text_delta=deltas.append
+                )
+                self.assertEqual(deltas, [])
+                self.assertEqual(result.assistant_message.text, "atomic answer")
+            finally:
+                await application.registry.stop_all()
+
+    async def test_kernel_rejects_mismatch_after_visible_text_deltas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = compose_fixture_application(
+                model_adapter=MismatchedStreamingModel(), tool_adapters=()
+            )
+            await application.registry.start_all()
+            try:
+                task = await executing_task(application, root)
+                with self.assertRaisesRegex(
+                    Exception, "stream text does not match"
+                ):
+                    await application.kernel.run_agent_turn(
+                        task.task_id, "mismatch", on_text_delta=lambda _text: None
+                    )
+            finally:
+                await application.registry.stop_all()
+
     async def test_kernel_delivers_deltas_and_commits_only_complete_response(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -88,6 +209,16 @@ class ModelStreamingTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     completed[0].payload["message"]["content"][0]["text"],
                     "hello stream",
+                )
+                diagnostics = completed[0].payload["response_diagnostics"]
+                self.assertIsNone(
+                    diagnostics["checks"]["transport_matches_adapter"]
+                )
+                self.assertIsNone(
+                    diagnostics["checks"]["adapter_matches_kernel"]
+                )
+                self.assertTrue(
+                    diagnostics["checks"]["kernel_matches_persisted"]
                 )
             finally:
                 await application.registry.stop_all()

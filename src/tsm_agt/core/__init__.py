@@ -8,6 +8,7 @@ from .agent_loop import (
     AgentTurnResult,
     AgentTurnSuspended,
     AgentClarificationSuspended,
+    AgentContinuationSuspended,
     ProviderCapabilityMismatch,
 )
 from .configuration import (
@@ -39,7 +40,7 @@ from .approval import (
 )
 from .workspace_access import WorkspaceAccessCapability, WorkspaceAccessGrant
 from .clarification import (
-    ClarificationChoice, ClarificationNotPending, ClarificationRequest,
+    ClarificationChoice, ClarificationKind, ClarificationNotPending, ClarificationRequest,
     ClarificationRequired, ClarificationTokenMismatch,
 )
 from .kernel import Kernel, KernelDependencies
@@ -63,10 +64,19 @@ from .process import (
 )
 from .task import InvalidTaskTransition, TaskNotFound, TaskSnapshot, TaskState
 from .task_spec import (
-    TaskAcceptanceCriterion, TaskCriterionKind, TaskSpecProjector,
-    TaskSpecSnapshot,
+    TASK_SPEC_PROPOSAL_SCHEMA_V1,
+    TaskAcceptanceCriterion, TaskContinuationMode, TaskCriterionKind,
+    TaskOutcomeKind, TaskOutcomeProposal, TaskOutcomeSnapshot,
+    TaskOutcomeStatus, TaskSpecProjector, TaskSpecProposal, TaskSpecSnapshot,
 )
-from .session import SessionSnapshot, SessionState, standalone_session_id
+from .session import (
+    SessionChoiceOption, SessionInteractionKind, SessionInteractionRequest,
+    SessionSnapshot, SessionState, standalone_session_id,
+)
+from .session_interaction import (
+    DeterministicSessionChoiceResolver, SessionChoiceAction,
+    SessionChoiceDecision,
+)
 from .session_context import (
     SessionContextProjector, SessionConversationMessage,
     SessionActiveCheckpoint, SessionConversationProjection,
@@ -89,7 +99,7 @@ from .runtime_input import (
     RuntimeInputContext, RuntimeInputIntent, RuntimeInputRoute, RuntimeInputRouter,
     SessionContinuationDecision, SessionContinuationMode,
     SessionResumeCandidate, SessionResumeSafety,
-    SessionInputAction, SessionInputDecision,
+    SessionInputAction, SessionInputDecision, SessionInputGrounding,
 )
 from .plan_guard import (
     ActionProgressState, GoalSlice, PlanGuard, PlanGuardDecision,
@@ -165,6 +175,7 @@ __all__ = [
     "AgentTurnResult",
     "AgentTurnSuspended",
     "AgentClarificationSuspended",
+    "AgentContinuationSuspended",
     "ApprovalDecision",
     "ApprovalKind",
     "ApprovalNotPending",
@@ -174,6 +185,7 @@ __all__ = [
     "WorkspaceAccessCapability",
     "WorkspaceAccessGrant",
     "ClarificationChoice",
+    "ClarificationKind",
     "ClarificationNotPending",
     "ClarificationRequest",
     "ClarificationRequired",
@@ -196,6 +208,7 @@ __all__ = [
     "SessionResumeSafety",
     "SessionInputAction",
     "SessionInputDecision",
+    "SessionInputGrounding",
     "IdempotencyConflict",
     "ToolCommitState",
     "ToolExecutionInProgress",
@@ -212,11 +225,24 @@ __all__ = [
     "TaskSnapshot",
     "TaskState",
     "TaskAcceptanceCriterion",
+    "TASK_SPEC_PROPOSAL_SCHEMA_V1",
+    "TaskContinuationMode",
     "TaskCriterionKind",
+    "TaskOutcomeKind",
+    "TaskOutcomeProposal",
+    "TaskOutcomeSnapshot",
+    "TaskOutcomeStatus",
     "TaskSpecProjector",
+    "TaskSpecProposal",
     "TaskSpecSnapshot",
     "SessionSnapshot",
     "SessionState",
+    "SessionChoiceOption",
+    "SessionInteractionKind",
+    "SessionInteractionRequest",
+    "DeterministicSessionChoiceResolver",
+    "SessionChoiceAction",
+    "SessionChoiceDecision",
     "standalone_session_id",
     "SessionContextProjector",
     "SessionConversationMessage",

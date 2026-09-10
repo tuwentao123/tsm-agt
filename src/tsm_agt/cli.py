@@ -32,6 +32,7 @@ from tsm_agt.core import (
     AgentTurnResult,
     AgentTurnSuspended,
     AgentClarificationSuspended,
+    AgentContinuationSuspended,
     ApprovalDecision,
     FlowNode,
     FlowNodeDiagnostic,
@@ -51,6 +52,7 @@ from tsm_agt.core import (
     SessionContinuationMode,
     SessionResumeSafety,
     SessionInputAction,
+    SessionChoiceAction,
     ModelInvocationFailed,
     SteeringKind,
     TaskState,
@@ -147,6 +149,15 @@ async def _print_chat_status(application, session, task_id, output_fn) -> None:
         output_fn("waiting: explicit approval (ordinary text cannot approve)")
     elif task.pending_clarification is not None:
         output_fn("waiting: clarification answer")
+    elif (
+        checkpoint is not None
+        and checkpoint.pending_user_action is not None
+        and checkpoint.pending_user_action.get("kind") == "CONTINUATION"
+    ):
+        output_fn(
+            "waiting: completed unit continuation (ordinary input is "
+            "semantically routed; it grants no approval)"
+        )
 
 
 async def _print_chat_plan(application, task_id, output_fn) -> None:
@@ -171,6 +182,18 @@ async def _print_chat_spec(application, task_id, output_fn) -> None:
         output_fn("scope: " + "; ".join(spec.scope))
     if spec.constraints:
         output_fn("constraints: " + "; ".join(spec.constraints))
+    output_fn(f"continuation: {spec.continuation_mode.value}")
+    if not spec.outcomes:
+        output_fn("outcomes: legacy Task (not planned yet)")
+    for index, outcome in enumerate(spec.outcomes, 1):
+        effects = ",".join(
+            effect.value for effect in outcome.required_effects
+        ) or "conversation"
+        output_fn(
+            f"outcome {index}: [{outcome.status.value}] "
+            f"{outcome.description} ({outcome.kind.value}; "
+            f"effects={effects}; proofs={len(outcome.fulfillment_refs)})"
+        )
     for index, criterion in enumerate(spec.acceptance_criteria, 1):
         reference = (
             f" [{criterion.evidence_reference}]"
@@ -236,9 +259,44 @@ async def _handle_active_chat_command(
 
 def _chat_error_guidance(error: Exception, root: Path) -> tuple[str, ...]:
     """Turn common Runtime failures into short, actionable recovery text."""
+    if (
+        isinstance(error, ModelInvocationFailed)
+        and error.failure_kind == "tool_protocol"
+    ):
+        return (
+            "recovery: the model connection succeeded, but its tool plan did not "
+            "match the current Task contract after one automatic correction; "
+            "use /flow to inspect the rejected tool and outcome mapping",
+        )
+    if (
+        isinstance(error, ModelInvocationFailed)
+        and error.recovery_action
+        is ModelRecoveryAction.PRESERVE_AND_INTERRUPT
+    ):
+        return (
+            "recovery: automatic model recovery was exhausted or unsafe; the "
+            "safe checkpoint and collected evidence were preserved, so use "
+            "/resume or enter a continuation request to continue from that point",
+        )
+    if isinstance(error, ModelInvocationFailed):
+        if error.failure_category is ModelFailureCategory.AUTHENTICATION:
+            return (
+                "recovery: model authentication or authorization failed; review "
+                "the private model credentials and endpoint permissions",
+            )
+        if error.failure_category is ModelFailureCategory.CONFIGURATION:
+            return (
+                "recovery: the model request or Provider configuration is invalid; "
+                "review the private model endpoint and compatibility settings",
+            )
+        if error.failure_category is ModelFailureCategory.CONTEXT_LIMIT:
+            return (
+                "recovery: the model context limit was reached; inspect /flow and "
+                "reduce or compact the active context before resuming",
+            )
     message = str(error).lower()
-    if any(word in message for word in (
-        "connection", "connect", "timeout", "model", "provider",
+    if not isinstance(error, ModelInvocationFailed) and any(word in message for word in (
+        "connection", "connect", "timeout",
     )):
         return (
             "recovery: check the model service and run "
@@ -264,9 +322,35 @@ def _chat_error_guidance(error: Exception, root: Path) -> tuple[str, ...]:
         "recovery: use /status and /flow to inspect the last safe state; "
         "the Session and Task remain persisted",
     )
+
+
+async def _resolve_session_input_with_progress(
+    application, session_id: str, prompt: str, root: Path, output_fn,
+    *, heartbeat_seconds: float = 5.0,
+):
+    """Run optional semantic routing with bounded, visible waiting."""
+    output_fn("[会话] 正在识别这条输入与未完成任务的关系……")
+    pending = asyncio.create_task(
+        application.kernel.resolve_session_input(session_id, prompt, root)
+    )
+    elapsed = 0
+    try:
+        while True:
+            done, _ = await asyncio.wait({pending}, timeout=heartbeat_seconds)
+            if done:
+                return pending.result()
+            elapsed += heartbeat_seconds
+            output_fn(
+                f"[会话] 语义识别仍在进行（{elapsed:g} 秒）；"
+                "可按 Ctrl+C 取消，不会修改或恢复任何 Task。"
+            )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        raise
 from tsm_agt.ports import (
     FlowArtifactExportPort, ReplayCursor, ReplayCursorStorePort,
-    RuntimeStorePort, ToolCall,
+    RuntimeStorePort, ToolCall, ModelFailureCategory, ModelRecoveryAction,
 )
 
 
@@ -740,6 +824,11 @@ def _render_agent_progress_lines(
             )
         return tuple(lines)
     if progress.kind is AgentProgressKind.MODEL_RETRY:
+        if progress.reason.startswith("stream_fallback:"):
+            return (
+                "[兼容] 模型流式响应没有完整收尾，正在自动改用"
+                "非流式完整请求。已完成的工具结果不会重跑。",
+            )
         detail = (
             f"（网络尝试 {progress.transport_attempt}/"
             f"{progress.max_transport_attempts}；{progress.reason}"
@@ -810,6 +899,14 @@ async def _chat(
     ))
     application = factory()
     await application.registry.start_all()
+    output_context = (
+        terminal_input.output_context()
+        if terminal_input is not None
+        and hasattr(terminal_input, "output_context")
+        else None
+    )
+    if output_context is not None:
+        output_context.__enter__()
     try:
         if session_id is None:
             session = await application.kernel.create_session(
@@ -972,13 +1069,24 @@ async def _chat(
                 )
                 if not candidates:
                     output_fn("no suspended tasks in this session")
-                for item in candidates:
+                interaction = (
+                    await application.kernel.request_session_task_choice(
+                        session.session_id, candidates,
+                        "请选择要恢复的 Task。", source="resume-command",
+                    )
+                    if candidates else None
+                )
+                for index, item in enumerate(candidates, start=1):
                     output_fn(
-                        f"{item.task_id} [{item.task_state}] "
+                        f"{index}. {item.task_id} [{item.task_state}] "
                         f"resume={item.safety.value} {item.goal}"
                     )
                 if candidates:
-                    output_fn("resume one with: /resume <task_id>")
+                    assert interaction is not None
+                    output_fn(
+                        "输入编号、完整 Task ID，或 /resume <task_id>；"
+                        "编号选择不调用模型。"
+                    )
                 continue
             if prompt.startswith("/resume "):
                 explicit_resume_task = prompt.removeprefix("/resume " ).strip()
@@ -1041,25 +1149,53 @@ async def _chat(
                 continue
 
             resume_mode = False
-            session_input = (
-                await application.kernel.resolve_session_input(
-                    session.session_id, prompt, root
+            continuation_resume = False
+            session_input = None
+            if explicit_resume_task is None and not explicit_new_task:
+                local_choice = (
+                    await application.kernel.resolve_pending_session_choice(
+                        session.session_id, prompt
+                    )
                 )
-                if explicit_resume_task is None and not explicit_new_task else None
-            )
+                if local_choice.action is SessionChoiceAction.SELECT:
+                    explicit_resume_task = local_choice.target_id
+                    output_fn(
+                        "[会话] 已按刚才展示的候选列表选择 "
+                        f"{local_choice.option_id}；正在校验恢复安全性。"
+                    )
+                else:
+                    session_input = await _resolve_session_input_with_progress(
+                        application, session.session_id, prompt, root, output_fn
+                    )
             if (
                 session_input is not None
                 and session_input.action is SessionInputAction.CLARIFY
             ):
-                output_fn(
-                    "[会话] " + (session_input.clarification or
+                clarification = (session_input.clarification or
                     "请明确说明要处理的新目标或选择未完成任务。")
+                interaction = await application.kernel.request_session_task_choice(
+                    session.session_id, session_input.candidates, clarification
                 )
-                for item in session_input.candidates:
+                output_fn("[会话] " + clarification)
+                for option, item in zip(
+                    interaction.options, session_input.candidates, strict=True
+                ):
                     output_fn(
-                        f"- {item.task_id} [{item.task_state}] {item.goal}"
+                        f"{option.ordinal}. {item.task_id} "
+                        f"[{item.task_state}] {item.goal}"
                     )
+                output_fn(
+                    "请输入编号、完整 Task ID，或 /resume <task_id>；"
+                    "编号选择不调用模型。"
+                )
                 continue
+            if (
+                session_input is not None
+                and session_input.action is SessionInputAction.NEW_TASK
+            ):
+                await application.kernel.clear_pending_session_interaction(
+                    session.session_id, "conversation_moved_to_new_task"
+                )
             selected_resume_task = (
                 explicit_resume_task
                 if explicit_resume_task is not None else (
@@ -1069,6 +1205,10 @@ async def _chat(
                     else None
                 )
             )
+            if selected_resume_task is not None:
+                await application.kernel.clear_pending_session_interaction(
+                    session.session_id, "task_selected_for_continuation"
+                )
             continuation = (
                 await application.kernel.resolve_session_continuation(
                     session.session_id, root, task_id=selected_resume_task
@@ -1118,17 +1258,41 @@ async def _chat(
                     )
             elif (
                 continuation is not None
+                and continuation.mode
+                is SessionContinuationMode.RESUME_CONTINUATION
+            ):
+                assert continuation.task_id is not None
+                task = await application.kernel.get_task(continuation.task_id)
+                session = await application.kernel.select_session_task(
+                    session.session_id, task.task_id
+                )
+                resume_mode = True
+                continuation_resume = True
+                output_fn(f"task: {task.task_id}")
+                output_fn("[续接] 正在根据本轮输入继续尚未完成的交付项。")
+            elif (
+                continuation is not None
                 and continuation.mode is SessionContinuationMode.MULTIPLE_CANDIDATES
             ):
-                output_fn(
-                    "[恢复] 找到多个未完成任务，无法安全猜测你要继续哪一个："
+                prompt_text = (
+                    "找到多个未完成任务，无法安全猜测你要继续哪一个。"
                 )
-                for item in continuation.candidates:
+                interaction = await application.kernel.request_session_task_choice(
+                    session.session_id, continuation.candidates, prompt_text,
+                    source="continuation-safety-resolution",
+                )
+                output_fn("[恢复] " + prompt_text)
+                for option, item in zip(
+                    interaction.options, continuation.candidates, strict=True
+                ):
                     output_fn(
-                        f"- {item.task_id} [{item.task_state}] "
+                        f"{option.ordinal}. {item.task_id} [{item.task_state}] "
                         f"resume={item.safety.value} {item.goal}"
                     )
-                output_fn("请输入 /resume <task_id> 明确选择。")
+                output_fn(
+                    "请输入编号、完整 Task ID，或 /resume <task_id>；"
+                    "编号选择不调用模型。"
+                )
                 continue
             elif (
                 continuation is not None
@@ -1198,6 +1362,9 @@ async def _chat(
                         )
                 streamed: list[str] = []
                 live_terminal = output_fn is print
+                prompt_safe_streaming = live_terminal and live_input_supported
+                pending_display = ""
+                displayed_agent_line = False
                 activity_heartbeat: asyncio.Task[None] | None = None
 
                 def stop_heartbeat() -> None:
@@ -1226,16 +1393,41 @@ async def _chat(
                     activity_heartbeat = asyncio.create_task(report_wait())
 
                 def on_text_delta(text: str) -> None:
+                    nonlocal pending_display, displayed_agent_line
                     stop_heartbeat()
-                    if live_terminal:
+                    if prompt_safe_streaming:
+                        # Prompt Toolkit can safely redraw complete lines above
+                        # an active ``control>`` prompt.  A raw token fragment,
+                        # however, is an incomplete terminal line and can be
+                        # split or overwritten by the next prompt redraw.  Keep
+                        # only that unfinished line buffered; complete lines
+                        # still appear progressively during long answers.
+                        pending_display += text
+                        while "\n" in pending_display:
+                            line, pending_display = pending_display.split(
+                                "\n", 1
+                            )
+                            prefix = "agent> " if not displayed_agent_line else ""
+                            print(prefix + line, flush=True)
+                            displayed_agent_line = True
+                    elif live_terminal:
                         if not streamed:
                             print("agent> ", end="", flush=True)
                         print(text, end="", flush=True)
                     streamed.append(text)
 
                 def finish_stream(result=None) -> None:
+                    nonlocal pending_display, displayed_agent_line
                     if streamed:
-                        if live_terminal:
+                        if prompt_safe_streaming:
+                            if pending_display or not displayed_agent_line:
+                                prefix = (
+                                    "agent> " if not displayed_agent_line else ""
+                                )
+                                print(prefix + pending_display, flush=True)
+                            pending_display = ""
+                            displayed_agent_line = False
+                        elif live_terminal:
                             print(flush=True)
                         else:
                             output_fn(f"agent> {''.join(streamed)}")
@@ -1254,6 +1446,10 @@ async def _chat(
                     }:
                         stop_heartbeat()
                     if progress.kind is AgentProgressKind.TOOL_STARTED:
+                        finish_stream()
+                    elif progress.kind is AgentProgressKind.MODEL_RETRY:
+                        # A genuine recovery decision is a separate status
+                        # line, never part of an assistant text stream.
                         finish_stream()
                     lines = (
                         render_progress(progress)
@@ -1287,6 +1483,12 @@ async def _chat(
                         )
 
                 async def run_current_agent():
+                    if continuation_resume:
+                        return await application.kernel.resume_agent_continuation(
+                            task.task_id, prompt, input_id=f"input-{uuid4().hex}",
+                            on_text_delta=on_text_delta,
+                            on_progress=on_progress,
+                        )
                     if resume_mode:
                         return await application.kernel.resume_checkpointed_agent_turn(
                             task.task_id, on_text_delta=on_text_delta,
@@ -1501,31 +1703,88 @@ async def _chat(
                 finish_stream(
                     result if isinstance(result, AgentTurnResult) else None
                 )
+                if isinstance(result, AgentContinuationSuspended):
+                    output_fn(f"agent> {result.assistant_message.text}")
+                    output_fn(
+                        "[续接] 本阶段已完成；后续必需交付项仍保留在同一 "
+                        "Task。下一条普通输入会由会话语义路由判断是继续、"
+                        "转向还是新任务。"
+                    )
+                    session = await application.kernel.get_session(
+                        session.session_id
+                    )
+                    continue
                 while isinstance(
                     result, (AgentTurnSuspended, AgentClarificationSuspended)
                 ):
                     if isinstance(result, AgentClarificationSuspended):
-                        output_fn("input required")
+                        output_fn(
+                            "result reconciliation required"
+                            if result.kind == "OUTCOME_RECONCILIATION"
+                            else "input required"
+                        )
                         output_fn(f"question: {result.question}")
                         output_fn(f"reason: {result.reason}")
-                        for value, label in result.choices:
-                            output_fn(f"- {value}: {label}")
-                        try:
-                            answer = (await read_input("answer> " )).strip()
-                        except (EOFError, KeyboardInterrupt):
-                            answer = ""
-                        if not answer:
+                        selected_choice = None
+                        answer = None
+                        if result.choices:
+                            for index, (_value, label) in enumerate(
+                                result.choices, start=1
+                            ):
+                                output_fn(f"{index}. {label}")
+                            try:
+                                selection = (
+                                    await read_input("choice> " )
+                                ).strip()
+                            except (EOFError, KeyboardInterrupt):
+                                selection = ""
+                            values = {value for value, _label in result.choices}
+                            if selection.isdigit():
+                                ordinal = int(selection)
+                                if 1 <= ordinal <= len(result.choices):
+                                    selected_choice = result.choices[ordinal - 1][0]
+                            elif selection in values:
+                                # Script/API-friendly stable value fallback.
+                                selected_choice = selection
+                            if selection and selected_choice is None:
+                                output_fn(
+                                    "invalid choice; enter a displayed number"
+                                )
+                                continue
+                        else:
+                            try:
+                                answer = (
+                                    await read_input("answer> " )
+                                ).strip()
+                            except (EOFError, KeyboardInterrupt):
+                                answer = ""
+                        if not selected_choice and not answer:
                             output_fn(
                                 "clarification left pending; continue with: "
                                 f"tsm-agt answer {result.request_id} "
-                                f"--token {result.resume_token} --answer '<text>' "
+                                f"--token {result.resume_token} "
+                                + (
+                                    "--choice '<value>' "
+                                    if result.choices else "--answer '<text>' "
+                                )
+                                +
                                 f"--workspace {root}"
                             )
                             return 0
                         result = await application.kernel.resolve_agent_clarification(
                             result.request_id, result.resume_token, answer,
+                            selected_choice=selected_choice,
                             on_text_delta=on_text_delta, on_progress=on_progress,
                         )
+                        if (
+                            selected_choice == "KEEP_BLOCKED"
+                            and isinstance(result, AgentClarificationSuspended)
+                        ):
+                            output_fn(
+                                "[安全停点] 结果仍未确认；Task 保持阻塞，"
+                                "后续不会自动重试或执行依赖操作。"
+                            )
+                            return 0
                         stop_heartbeat()
                         finish_stream(
                             result if isinstance(result, AgentTurnResult) else None
@@ -1664,6 +1923,8 @@ async def _chat(
         try:
             await application.registry.stop_all()
         finally:
+            if output_context is not None:
+                output_context.__exit__(*sys.exc_info())
             if previous_sigint is not None:
                 signal.signal(signal.SIGINT, previous_sigint)
 
@@ -1714,7 +1975,8 @@ async def _resolve_agent_approval(
 
 
 async def _resolve_agent_clarification(
-    request_id: str, resume_token: str, answer: str, workspace: Path,
+    request_id: str, resume_token: str, answer: str | None, workspace: Path,
+    *, selected_choice: str | None = None,
 ) -> int:
     root = workspace.expanduser().resolve()
     application = compose_openai_compatible_engineering_application_from_env(
@@ -1725,6 +1987,7 @@ async def _resolve_agent_clarification(
     try:
         result = await application.kernel.resolve_agent_clarification(
             request_id, resume_token, answer,
+            selected_choice=selected_choice,
             on_progress=_print_standalone_agent_progress,
         )
         _print_agent_result(result)
@@ -2661,14 +2924,21 @@ def _print_replay_snapshot(snapshot: FlowReplaySnapshot, as_json: bool) -> None:
 
 
 def _print_agent_result(
-    result: AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended,
+    result: (
+        AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended
+        | AgentContinuationSuspended
+    ),
 ) -> None:
     if isinstance(result, AgentClarificationSuspended):
-        print("input required")
+        print(
+            "result reconciliation required"
+            if result.kind == "OUTCOME_RECONCILIATION" else "input required"
+        )
         print(f"request_id: {result.request_id}")
         print(f"task_id: {result.task_id}")
         print(f"question: {result.question}")
         print(f"reason: {result.reason}")
+        print(f"kind: {result.kind}")
         for value, label in result.choices:
             print(f"- {value}: {label}")
         print(
@@ -2714,6 +2984,18 @@ def _print_agent_result(
         print(
             "or reject with: tsm-agt reject "
             f"{result.approval_request_id} --reason 'not approved'"
+        )
+        return
+    if isinstance(result, AgentContinuationSuspended):
+        print(result.assistant_message.text)
+        print(
+            "continuation required: completed="
+            + ",".join(result.completed_outcome_ids)
+            + " remaining=" + ",".join(result.remaining_outcome_ids)
+        )
+        print(
+            "continue this Session with ordinary input; Runtime will route it "
+            "without treating the text as approval"
         )
         return
     print(result.assistant_message.text)
@@ -2837,7 +3119,9 @@ def main() -> int:
     )
     answer.add_argument("request_id")
     answer.add_argument("--token", required=True)
-    answer.add_argument("--answer", required=True, dest="answer_text")
+    answer_value = answer.add_mutually_exclusive_group(required=True)
+    answer_value.add_argument("--answer", dest="answer_text")
+    answer_value.add_argument("--choice", dest="selected_choice")
     answer.add_argument("--workspace", type=Path, default=Path.cwd())
     trust = subparsers.add_parser(
         "trust", help="inspect or set trust for one canonical workspace"
@@ -3146,7 +3430,8 @@ def main() -> int:
     if args.command == "answer":
         try:
             return asyncio.run(_resolve_agent_clarification(
-                args.request_id, args.token, args.answer_text, args.workspace
+                args.request_id, args.token, args.answer_text, args.workspace,
+                selected_choice=args.selected_choice,
             ))
         except (ValueError, LookupError, PermissionError) as error:
             parser.error(str(error))

@@ -141,6 +141,7 @@ export TSM_AGT_MODEL_API_KEY="your-api-key"
 export TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER="max_tokens"
 # 兼容网关若拒绝 function.strict=true，可设为 false；Kernel 仍会本地校验参数。
 export TSM_AGT_MODEL_STRICT_TOOL_SCHEMA="true"
+export TSM_AGT_MODEL_STREAMING="true"
 
 uv run tsm-agt agent \
   "分析这个项目的入口文件" --workspace .
@@ -222,6 +223,8 @@ Agent 正在执行时，第二段普通输入默认使用 `AUTO`：可替换 `Ru
 
 如果在审批提示输入 `leave` 或 Ctrl+C，审批保持待处理且不授予权限，可再使用现有 `approve/reject` 命令处理。在 `answer>` 直接回车、EOF 或 Ctrl+C，则 Clarification 保持待处理，可使用上面的 `answer` 命令恢复。当前 REPL 支持模型流式输出、采样期间 Ctrl+C 快速取消，以及等待模型首个响应时每 5 秒一次的进度心跳。交互式终端使用精确锁定的 `prompt-toolkit==3.0.52` 处理 Unicode 显示宽度、中文 IME 提交、方向键、退格/Delete、历史和粘贴；管道/重定向输入仍使用普通 stdin。
 
+普通 Agent 与文本回合默认最多输出 `8192` tokens；Session 路由、运行中输入分类等内部短调用继续使用各自显式的小预算。
+
 ## Python SDK 与本地 Event API
 
 外部 Python 程序通过同一个 Runtime 门面创建、等待、恢复、审批、中断和订阅任务；SDK 不复制 Agent Loop：
@@ -276,6 +279,8 @@ tsm-agt api serve --workspace . --host 127.0.0.1 --port 8765
 `TSM_AGT_MODEL_BASE_URL` 应填写 `/v1` 根地址，Adapter 会请求其 `/chat/completions`。目前使用 Chat Completions 的函数工具协议；Provider 必须支持 `tools`、`tool_calls` 和 JSON Schema 参数。内部工具名如 `core.read_file` 会在 Adapter 内映射成兼容的函数名，模型结果进入 Kernel 前再还原。
 
 不同 OpenAI-compatible 网关可能只在可选字段上有差异：GPT-5 类模型常要求 `TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=max_completion_tokens`；部分网关收到 `function.strict=true` 会直接空断流，此时配置 `TSM_AGT_MODEL_STRICT_TOOL_SCHEMA=false`。关闭 strict 只是不向模型声明严格模式，工具调用进入 Kernel 后仍必须通过本地参数 Schema、Policy、Approval、Sandbox 和 Workspace Boundary 校验。
+
+如果网关可以正常返回非流式 JSON，但 SSE 响应总是在缺少 `finish_reason` 的情况下结束，可在私有 `.env` 设置 `TSM_AGT_MODEL_STREAMING=false`。Agent 的工具调用和多轮循环保持不变，只是不再逐字显示模型输出。默认值为 `true`。
 
 ## 依赖方向
 

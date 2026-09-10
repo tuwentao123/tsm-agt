@@ -139,7 +139,10 @@ class ChatSigintIntegrationTest(unittest.TestCase):
 
                 self.assertEqual(process.returncode, 130, (stdout, stderr))
                 self.assertLess(elapsed, 2.0)
-                self.assertIn("partial output", stdout)
+                # Planner/provider protocol fragments are internal state.  A
+                # user interrupt must preserve the resumable checkpoint without
+                # leaking an incomplete planning response into the transcript.
+                self.assertNotIn("partial output", stdout)
                 self.assertIn("interrupted safely; resume with:", stdout)
                 self.assertNotIn("Traceback", stdout + stderr)
                 self.assertNotIn("CancelledError", stdout + stderr)

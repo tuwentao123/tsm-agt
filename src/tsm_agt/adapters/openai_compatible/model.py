@@ -22,6 +22,7 @@ from tsm_agt.ports import (
     HealthStatus,
     Message,
     MessageRole,
+    ModelAttemptFailed, ModelAttemptFailure, ModelFailureCategory,
     ModelRequest,
     ModelResponse,
     ModelStreamCompleted,
@@ -29,6 +30,7 @@ from tsm_agt.ports import (
     ModelTextDelta,
     ModelUsage,
     ModelTransportProgress,
+    ModelRetrySafety,
     ProviderCapabilities,
     RecoverableToolProtocolError,
     TextBlock,
@@ -38,15 +40,31 @@ from tsm_agt.ports import (
 )
 
 
-class OpenAICompatibleProviderError(RuntimeError):
+class OpenAICompatibleProviderError(ModelAttemptFailed):
     """Normalized provider failure with an explicit retry classification."""
 
     def __init__(
-        self, message: str, *, retryable: bool = False, reason_code: str = ""
+        self, message: str, *, retryable: bool = False, reason_code: str = "",
+        category: ModelFailureCategory | None = None,
+        retry_safety: ModelRetrySafety | None = None,
     ) -> None:
-        super().__init__(message)
-        self.retryable = retryable
         self.reason_code = reason_code or "provider_error"
+        self.category = category or (
+            ModelFailureCategory.TRANSIENT_PROVIDER
+            if retryable else ModelFailureCategory.INVALID_RESPONSE
+        )
+        self.retry_safety = retry_safety or (
+            ModelRetrySafety.SAFE_SAME_REQUEST
+            if retryable else ModelRetrySafety.SAFE_RESAMPLE
+        )
+        self.retryable = self.retry_safety in {
+            ModelRetrySafety.SAFE_SAME_REQUEST,
+            ModelRetrySafety.SAFE_RESAMPLE,
+            ModelRetrySafety.SAFE_FALLBACK_TRANSPORT,
+        }
+        super().__init__(ModelAttemptFailure(
+            self.category, self.retry_safety, self.reason_code, message
+        ))
 
 
 class HttpJsonTransport(Protocol):
@@ -216,12 +234,36 @@ class UrllibHttpJsonTransport:
                 raw = response.read().decode("utf-8")
         except HTTPError as error:
             body = error.read().decode("utf-8", errors="replace")[:1000]
+            transient = error.code == 429 or 500 <= error.code < 600
             raise OpenAICompatibleProviderError(
-                f"provider returned HTTP {error.code}: {body}"
+                f"provider returned HTTP {error.code}: {body}",
+                retryable=transient,
+                reason_code=f"http_{error.code}",
+                category=(
+                    ModelFailureCategory.AUTHENTICATION
+                    if error.code in {401, 403}
+                    else ModelFailureCategory.TRANSIENT_PROVIDER
+                    if transient else ModelFailureCategory.CONFIGURATION
+                ),
+                retry_safety=(
+                    ModelRetrySafety.SAFE_SAME_REQUEST
+                    if transient else ModelRetrySafety.NEVER
+                ),
+            ) from error
+        except TimeoutError as error:
+            raise OpenAICompatibleProviderError(
+                "provider response timed out", retryable=True,
+                reason_code="read_timeout",
             ) from error
         except URLError as error:
             raise OpenAICompatibleProviderError(
-                f"provider connection failed: {error.reason}"
+                f"provider connection failed: {error.reason}",
+                retryable=True, reason_code="connection_failed",
+            ) from error
+        except OSError as error:
+            raise OpenAICompatibleProviderError(
+                f"provider connection failed: {error}", retryable=True,
+                reason_code="connection_failed",
             ) from error
         try:
             decoded = json.loads(raw)
@@ -262,6 +304,7 @@ class OpenAICompatibleModelProvider:
         retry_backoff_seconds: float = 1.0,
         output_token_parameter: str = "max_tokens",
         strict_tool_schema: bool = True,
+        streaming: bool = True,
         transport: HttpJsonTransport | None = None,
     ) -> None:
         normalized_url = base_url.strip().rstrip("/")
@@ -292,9 +335,10 @@ class OpenAICompatibleModelProvider:
         self._retry_backoff_seconds = retry_backoff_seconds
         self._output_token_parameter = output_token_parameter
         self._strict_tool_schema = strict_tool_schema
-        descriptor_capabilities = {
-            "text", "tools", "streaming", "stream-cancel"
-        }
+        self._streaming = streaming
+        descriptor_capabilities = {"text", "tools"}
+        if streaming:
+            descriptor_capabilities.update({"streaming", "stream-cancel"})
         if strict_tool_schema:
             descriptor_capabilities.add("strict-json-schema")
         self.descriptor = AdapterDescriptor(
@@ -306,7 +350,7 @@ class OpenAICompatibleModelProvider:
         )
         self.capabilities = ProviderCapabilities(
             tools=True, parallel_tools=False,
-            strict_json_schema=strict_tool_schema, stream_cancel=True,
+            strict_json_schema=strict_tool_schema, stream_cancel=streaming,
             context_window=128_000,
         )
         self._transport = transport or UrllibHttpJsonTransport()
@@ -334,10 +378,9 @@ class OpenAICompatibleModelProvider:
         response = await self._transport.post_json(
             f"{self._base_url}/chat/completions",
             {"Authorization": f"Bearer {self._api_key}"},
-            payload,
-            self._timeout_seconds,
+            payload, request.timeout_seconds or self._timeout_seconds,
         )
-        return self._normalize_response(
+        normalized = self._normalize_response(
             request.turn_id, response, provider_to_internal,
             require_evidence_questions=request.require_evidence_questions,
             evidence_required_tools=frozenset(
@@ -346,6 +389,12 @@ class OpenAICompatibleModelProvider:
                 and tool.requires_evidence_question
             ),
             allow_text_tool_fallback=request.allow_tool_calls,
+            allowed_outcome_refs=frozenset(request.outcome_refs),
+        )
+        raw_text = self._provider_text(response)
+        return self._with_response_diagnostics(
+            normalized, transport_kind="json", raw_text=raw_text,
+            chunk_count=1, saw_finish_reason=True, saw_done=None,
         )
 
     async def stream_complete(
@@ -353,29 +402,11 @@ class OpenAICompatibleModelProvider:
     ) -> AsyncIterator[ModelStreamEvent]:
         if not self._started:
             raise RuntimeError("adapter is not started")
-        attempt = 1
-        max_attempts = self._max_retries + 1
-        while True:
-            emitted_text = False
-            try:
-                async for event in self._stream_complete_once(request):
-                    if isinstance(event, ModelTextDelta):
-                        emitted_text = True
-                    yield event
-                return
-            except OpenAICompatibleProviderError as error:
-                if not error.retryable or emitted_text or attempt >= max_attempts:
-                    raise
-                delay = self._retry_backoff_seconds * (2 ** (attempt - 1))
-                attempt += 1
-                if request.on_transport_progress is not None:
-                    request.on_transport_progress(ModelTransportProgress(
-                        kind="retrying", attempt=attempt,
-                        max_attempts=max_attempts, reason=error.reason_code,
-                        delay_seconds=delay,
-                    ))
-                if delay:
-                    await asyncio.sleep(delay)
+        if not self._streaming:
+            yield ModelStreamCompleted(await self.complete(request))
+            return
+        async for event in self._stream_complete_once(request):
+            yield event
 
     async def _stream_complete_once(
         self, request: ModelRequest
@@ -392,6 +423,7 @@ class OpenAICompatibleModelProvider:
         usage: Mapping[str, Any] = {}
         saw_done = False
         saw_chunk = False
+        chunk_count = 0
 
         async for data in self._transport.stream_sse(
             f"{self._base_url}/chat/completions",
@@ -413,6 +445,7 @@ class OpenAICompatibleModelProvider:
                     "provider SSE chunk must be a JSON object"
                 )
             saw_chunk = True
+            chunk_count += 1
             chunk_id = chunk.get("id")
             if isinstance(chunk_id, str) and chunk_id:
                 message_id = chunk_id
@@ -511,12 +544,16 @@ class OpenAICompatibleModelProvider:
         if not saw_chunk:
             raise OpenAICompatibleProviderError(
                 "provider SSE stream ended without any data",
-                retryable=True, reason_code="empty_stream",
+                reason_code="empty_stream",
+                category=ModelFailureCategory.INVALID_RESPONSE,
+                retry_safety=ModelRetrySafety.SAFE_FALLBACK_TRANSPORT,
             )
         if finish_reason is None:
             raise OpenAICompatibleProviderError(
                 "provider SSE stream ended without finish_reason",
-                retryable=True, reason_code="incomplete_stream",
+                reason_code="incomplete_stream",
+                category=ModelFailureCategory.INVALID_RESPONSE,
+                retry_safety=ModelRetrySafety.SAFE_FALLBACK_TRANSPORT,
             )
         # Some OpenAI-compatible gateways close a semantically complete stream
         # after finish_reason without emitting the optional-looking [DONE]
@@ -555,6 +592,7 @@ class OpenAICompatibleModelProvider:
                 and tool.requires_evidence_question
             ),
             allow_text_tool_fallback=request.allow_tool_calls,
+            allowed_outcome_refs=frozenset(request.outcome_refs),
         )
         # Exact text-form tool calls are either recovered by normalization or
         # rejected when tools are disabled.  Ordinary text that merely began
@@ -562,7 +600,52 @@ class OpenAICompatibleModelProvider:
         # never prints raw tool markup before the Runtime validates it.
         if pending_text_parts and normalized.message.text:
             yield ModelTextDelta("".join(pending_text_parts))
-        yield ModelStreamCompleted(normalized)
+        yield ModelStreamCompleted(self._with_response_diagnostics(
+            normalized, transport_kind="sse",
+            raw_text="".join(text_parts), chunk_count=chunk_count,
+            saw_finish_reason=finish_reason is not None, saw_done=saw_done,
+        ))
+
+    @staticmethod
+    def _text_fingerprint(text: str) -> dict[str, object]:
+        encoded = text.encode("utf-8")
+        return {
+            "characters": len(text),
+            "utf8_bytes": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+
+    @staticmethod
+    def _provider_text(response: Mapping[str, Any]) -> str:
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        choice = choices[0]
+        if not isinstance(choice, Mapping):
+            return ""
+        message = choice.get("message")
+        if not isinstance(message, Mapping):
+            return ""
+        content = message.get("content")
+        return content if isinstance(content, str) else ""
+
+    @classmethod
+    def _with_response_diagnostics(
+        cls, response: ModelResponse, *, transport_kind: str, raw_text: str,
+        chunk_count: int, saw_finish_reason: bool, saw_done: bool | None,
+    ) -> ModelResponse:
+        transport = {
+            "kind": transport_kind,
+            "chunk_count": chunk_count,
+            "saw_finish_reason": saw_finish_reason,
+            "saw_done": saw_done,
+            "text": cls._text_fingerprint(raw_text),
+        }
+        adapter = {"text": cls._text_fingerprint(response.message.text)}
+        return ModelResponse(
+            response.message, response.finish_reason, response.usage,
+            {"transport": transport, "adapter": adapter},
+        )
 
     def _build_payload(
         self, request: ModelRequest
@@ -577,6 +660,7 @@ class OpenAICompatibleModelProvider:
                 )
             provider_to_internal[provider_name] = tool.name
             internal_to_provider[tool.name] = provider_name
+        tool_outcome_refs = dict(request.tool_outcome_refs)
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": [
@@ -587,6 +671,7 @@ class OpenAICompatibleModelProvider:
                         if request.require_evidence_questions
                         and tool.requires_evidence_question
                     ),
+                    frozenset(request.outcome_refs),
                 )
                 for message in request.messages
             ],
@@ -601,6 +686,7 @@ class OpenAICompatibleModelProvider:
                     request.require_evidence_questions
                     and tool.requires_evidence_question,
                     self._strict_tool_schema,
+                    tool_outcome_refs.get(tool.name, request.outcome_refs),
                 ))
             payload["tools"] = encoded_tools
             payload["tool_choice"] = (
@@ -612,6 +698,7 @@ class OpenAICompatibleModelProvider:
     def _tool_to_provider(
         tool: Any, provider_name: str, require_evidence_questions: bool,
         strict_tool_schema: bool,
+        outcome_refs: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         parameters = dict(tool.parameters)
         description = tool.description
@@ -650,6 +737,13 @@ class OpenAICompatibleModelProvider:
                 "For tools without a filesystem scope, expected_scope is an "
                 "empty string."
             )
+        if outcome_refs:
+            properties = dict(parameters.get("properties", {}))
+            properties["outcome_ref"] = {
+                "type": "string", "enum": list(outcome_refs),
+                "description": "Open Task outcome advanced by this action.",
+            }
+            parameters = {**parameters, "properties": properties}
         function = {
             "name": provider_name,
             "description": description,
@@ -666,6 +760,7 @@ class OpenAICompatibleModelProvider:
     def _message_to_provider(
         message: Message, internal_to_provider: Mapping[str, str],
         evidence_required_tools: frozenset[str],
+        outcome_refs: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         if message.role is MessageRole.TOOL:
             result_blocks = [
@@ -707,9 +802,15 @@ class OpenAICompatibleModelProvider:
                                         if call.evidence_question is not None else None
                                     ),
                                     "tool_arguments": dict(call.arguments),
+                                    **({"outcome_ref": call.outcome_ref}
+                                       if call.outcome_ref is not None else {}),
                                 }
                                 if call.name in evidence_required_tools
-                                else dict(call.arguments)
+                                else {
+                                    **dict(call.arguments),
+                                    **({"outcome_ref": call.outcome_ref}
+                                       if call.outcome_ref is not None else {}),
+                                }
                             ),
                             ensure_ascii=False, separators=(",", ":")
                         ),
@@ -737,6 +838,7 @@ class OpenAICompatibleModelProvider:
         *, require_evidence_questions: bool = False,
         evidence_required_tools: frozenset[str] | None = None,
         allow_text_tool_fallback: bool = True,
+        allowed_outcome_refs: frozenset[str] = frozenset(),
     ) -> ModelResponse:
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices:
@@ -812,6 +914,17 @@ class OpenAICompatibleModelProvider:
                 raise OpenAICompatibleProviderError(
                     f"tool call {call_id} arguments must be an object"
                 )
+            outcome_ref = arguments.get("outcome_ref")
+            if outcome_ref is not None:
+                if (
+                    not isinstance(outcome_ref, str)
+                    or outcome_ref not in allowed_outcome_refs
+                ):
+                    raise RecoverableToolProtocolError("invalid_outcome_ref")
+                arguments = {
+                    key: value for key, value in arguments.items()
+                    if key != "outcome_ref"
+                }
             internal_name = provider_to_internal.get(name)
             if internal_name is None:
                 raise OpenAICompatibleProviderError(
@@ -852,10 +965,20 @@ class OpenAICompatibleModelProvider:
                         call_id, internal_name, arguments
                     )
             content.append(ToolCallBlock(ToolCall(
-                call_id, internal_name, arguments, evidence_question
+                call_id, internal_name, arguments, evidence_question, outcome_ref
             )))
         if not content:
-            raise OpenAICompatibleProviderError("provider returned an empty message")
+            # A successful HTTP response with neither text nor a tool action is
+            # not a valid assistant turn. Compatible gateways can occasionally
+            # produce this transiently after a long tool history, so the caller
+            # may safely resample while nothing has been shown or executed from
+            # this response. Persistent emptiness still fails closed.
+            raise OpenAICompatibleProviderError(
+                "provider returned an empty message",
+                reason_code="empty_message",
+                category=ModelFailureCategory.INVALID_RESPONSE,
+                retry_safety=ModelRetrySafety.SAFE_RESAMPLE,
+            )
 
         reason_map = {
             "stop": FinishReason.STOP,

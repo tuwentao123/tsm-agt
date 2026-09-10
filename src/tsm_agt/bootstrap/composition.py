@@ -58,8 +58,13 @@ from tsm_agt.adapters.rule_based_investigation_flow import (
     RuleBasedInvestigationFlowProjector,
 )
 from tsm_agt.adapters.openai_compatible import OpenAICompatibleModelProvider
+from tsm_agt.adapters.resilient_model import ResilientModelProvider
+from tsm_agt.adapters.rule_based_model_recovery import (
+    RuleBasedModelRecoveryPolicy,
+)
 from tsm_agt.adapters.model_session_input import ModelSessionInputResolver
 from tsm_agt.adapters.model_runtime_input import ModelRuntimeInputClassifier
+from tsm_agt.adapters.model_task_spec_planner import ModelTaskSpecPlanner
 from tsm_agt.adapters.local_process import LocalProcessExecutor
 from tsm_agt.adapters.local_flow_export import (
     LocalFlowArtifactExporter, LocalReplayCursorStore,
@@ -91,6 +96,7 @@ from tsm_agt.ports import (
     FlowArtifactExportPort,
     ReplayCursorStorePort,
     ModelProviderPort,
+    ModelRecoveryPolicyPort,
     ProcessExecutorPort,
     RuntimeStorePort,
     SandboxPort,
@@ -102,6 +108,7 @@ from tsm_agt.ports import (
     CodeIntelligencePort,
     RuntimeInputClassifierPort,
     SessionInputResolverPort,
+    TaskSpecPlannerPort,
     EvidenceDeltaEvaluatorPort,
     SemanticActionClassifierPort,
     ReadHitsPolicyPort,
@@ -150,6 +157,7 @@ def _configuration_metadata(
     context_configuration: ContextConfiguration | None = None,
     output_token_parameter: str = "max_tokens",
     strict_tool_schema: bool = True,
+    streaming: bool = True,
 ) -> dict[str, object]:
     data: dict[str, object] = {
         "provider": provider,
@@ -157,6 +165,7 @@ def _configuration_metadata(
         "credentials_configured": credentials_configured,
         "output_token_parameter": output_token_parameter,
         "strict_tool_schema": strict_tool_schema,
+        "streaming": streaming,
     }
     if base_url is not None:
         data["endpoint_origin"] = _endpoint_origin(base_url)
@@ -175,7 +184,8 @@ def _configuration_metadata(
 def _kernel_dependencies(
     registry: AdapterRegistry, configuration_metadata: Mapping[str, object],
     context_manager: ContextWindowManager | None = None,
-    *, require_evidence_questions: bool = True,
+    *, default_max_output_tokens: int = 1024,
+    require_evidence_questions: bool = True,
 ) -> KernelDependencies:
     classifiers = registry.all(RuntimeInputClassifierPort)
     if len(classifiers) > 1:
@@ -183,6 +193,9 @@ def _kernel_dependencies(
     session_input_resolvers = registry.all(SessionInputResolverPort)
     if len(session_input_resolvers) > 1:
         raise ValueError("at most one SessionInputResolverPort may be registered")
+    task_spec_planners = registry.all(TaskSpecPlannerPort)
+    if len(task_spec_planners) > 1:
+        raise ValueError("at most one TaskSpecPlannerPort may be registered")
     checkpoint_compatibility_policies = registry.all(
         CheckpointCompatibilityPolicyPort
     )
@@ -266,6 +279,9 @@ def _kernel_dependencies(
         raise ValueError(
             "at most one InvestigationFlowProjectorPort may be registered"
         )
+    recovery_policies = registry.all(ModelRecoveryPolicyPort)
+    if len(recovery_policies) > 1:
+        raise ValueError("at most one ModelRecoveryPolicyPort may be registered")
     raw_budget = configuration_metadata.get("exploration_budget", {})
     budget = dict(raw_budget) if isinstance(raw_budget, Mapping) else {}
     return KernelDependencies(
@@ -277,6 +293,9 @@ def _kernel_dependencies(
         workspace_path=registry.require(WorkspacePathPort),
         local_identity=registry.require(LocalIdentityPort),
         project_memory=registry.require(ProjectMemoryPort),
+        model_recovery_policy=(
+            recovery_policies[0] if recovery_policies else None
+        ),
         evidence_delta_evaluator=(
             evidence_evaluators[0] if evidence_evaluators else None
         ),
@@ -334,6 +353,9 @@ def _kernel_dependencies(
         session_input_resolver=(
             session_input_resolvers[0] if session_input_resolvers else None
         ),
+        task_spec_planner=(
+            task_spec_planners[0] if task_spec_planners else None
+        ),
         checkpoint_compatibility_policy=(
             checkpoint_compatibility_policies[0]
             if checkpoint_compatibility_policies else None
@@ -344,6 +366,7 @@ def _kernel_dependencies(
         configuration_metadata=configuration_metadata,
         default_max_model_calls=int(budget.get("agent_max_model_calls", 15)),
         default_max_tool_calls=int(budget.get("agent_max_tool_calls", 40)),
+        default_max_output_tokens=default_max_output_tokens,
         finalization_model_calls=int(budget.get("finalization_model_calls", 2)),
         context_manager=context_manager or ContextWindowManager(),
         require_evidence_questions=require_evidence_questions,
@@ -423,6 +446,7 @@ def compose_fixture_application(
     enable_working_memory: bool = False,
     runtime_input_classifier_adapter: RuntimeInputClassifierPort | None = None,
     session_input_resolver_adapter: SessionInputResolverPort | None = None,
+    task_spec_planner_adapter: TaskSpecPlannerPort | None = None,
     checkpoint_compatibility_policy_adapter: (
         CheckpointCompatibilityPolicyPort | None
     ) = None,
@@ -456,9 +480,14 @@ def compose_fixture_application(
     investigation_flow_projector_adapter: (
         InvestigationFlowProjectorPort | None
     ) = None,
+    model_recovery_policy_adapter: ModelRecoveryPolicyPort | None = None,
 ) -> Application:
     registry = AdapterRegistry()
     registry.register(ModelProviderPort, model_adapter or EchoModelProvider())
+    registry.register(
+        ModelRecoveryPolicyPort,
+        model_recovery_policy_adapter or RuleBasedModelRecoveryPolicy(0),
+    )
     registry.register(RuntimeStorePort, store_adapter or InMemoryRuntimeStore())
     registry.register(SandboxPort, sandbox_adapter or DenyAllSandbox())
     registry.register(
@@ -489,6 +518,8 @@ def compose_fixture_application(
         registry.register(
             SessionInputResolverPort, session_input_resolver_adapter
         )
+    if task_spec_planner_adapter is not None:
+        registry.register(TaskSpecPlannerPort, task_spec_planner_adapter)
     registry.register(
         CheckpointCompatibilityPolicyPort,
         checkpoint_compatibility_policy_adapter
@@ -660,6 +691,7 @@ def compose_openai_compatible_readonly_application(
     model_retry_backoff_seconds: float = 1.0,
     model_output_token_parameter: str = "max_tokens",
     model_strict_tool_schema: bool = True,
+    model_streaming: bool = True,
     context_configuration: ContextConfiguration | None = None,
 ) -> Application:
     """Compose a real OpenAI-compatible model with built-in read-only tools."""
@@ -667,13 +699,20 @@ def compose_openai_compatible_readonly_application(
     registry = AdapterRegistry()
     budget = exploration_budget_configuration or ExplorationBudgetConfiguration()
     context = context_configuration or ContextConfiguration()
+    physical_model = OpenAICompatibleModelProvider(
+        base_url, model, api_key, timeout_seconds=model_timeout_seconds,
+        max_retries=0, retry_backoff_seconds=0,
+        output_token_parameter=model_output_token_parameter,
+        strict_tool_schema=model_strict_tool_schema, streaming=model_streaming,
+    )
+    recovery_policy = RuleBasedModelRecoveryPolicy(
+        model_retry_backoff_seconds
+    )
+    registry.register(ModelRecoveryPolicyPort, recovery_policy)
     registry.register(
-        ModelProviderPort, OpenAICompatibleModelProvider(
-            base_url, model, api_key, timeout_seconds=model_timeout_seconds,
-            max_retries=model_max_retries,
-            retry_backoff_seconds=model_retry_backoff_seconds,
-            output_token_parameter=model_output_token_parameter,
-            strict_tool_schema=model_strict_tool_schema,
+        ModelProviderPort, ResilientModelProvider(
+            physical_model, recovery_policy,
+            max_provider_attempts=model_max_retries + 1,
         )
     )
     registry.register(
@@ -683,6 +722,10 @@ def compose_openai_compatible_readonly_application(
     registry.register(
         RuntimeInputClassifierPort,
         ModelRuntimeInputClassifier(registry.require(ModelProviderPort)),
+    )
+    registry.register(
+        TaskSpecPlannerPort,
+        ModelTaskSpecPlanner(registry.require(ModelProviderPort)),
     )
     registry.register(
         CheckpointCompatibilityPolicyPort,
@@ -768,11 +811,13 @@ def compose_openai_compatible_readonly_application(
             context_configuration=context,
             output_token_parameter=model_output_token_parameter,
             strict_tool_schema=model_strict_tool_schema,
+            streaming=model_streaming,
         ),
         ContextWindowManager(
             trigger_ratio=context.compaction_ratio,
             latency_soft_input_tokens=context.latency_soft_tokens,
         ),
+        default_max_output_tokens=8192,
     )
     return Application(kernel=Kernel(dependencies), registry=registry)
 
@@ -787,6 +832,7 @@ def compose_openai_compatible_engineering_application(
     model_retry_backoff_seconds: float = 1.0,
     model_output_token_parameter: str = "max_tokens",
     model_strict_tool_schema: bool = True,
+    model_streaming: bool = True,
     context_configuration: ContextConfiguration | None = None,
 ) -> Application:
     """Compose the engineering Agent with workspace and process tools."""
@@ -795,13 +841,20 @@ def compose_openai_compatible_engineering_application(
     budget = exploration_budget_configuration or ExplorationBudgetConfiguration()
     context = context_configuration or ContextConfiguration()
     workspace_path = _platform_workspace_path()
+    physical_model = OpenAICompatibleModelProvider(
+        base_url, model, api_key, timeout_seconds=model_timeout_seconds,
+        max_retries=0, retry_backoff_seconds=0,
+        output_token_parameter=model_output_token_parameter,
+        strict_tool_schema=model_strict_tool_schema, streaming=model_streaming,
+    )
+    recovery_policy = RuleBasedModelRecoveryPolicy(
+        model_retry_backoff_seconds
+    )
+    registry.register(ModelRecoveryPolicyPort, recovery_policy)
     registry.register(
-        ModelProviderPort, OpenAICompatibleModelProvider(
-            base_url, model, api_key, timeout_seconds=model_timeout_seconds,
-            max_retries=model_max_retries,
-            retry_backoff_seconds=model_retry_backoff_seconds,
-            output_token_parameter=model_output_token_parameter,
-            strict_tool_schema=model_strict_tool_schema,
+        ModelProviderPort, ResilientModelProvider(
+            physical_model, recovery_policy,
+            max_provider_attempts=model_max_retries + 1,
         )
     )
     registry.register(
@@ -811,6 +864,10 @@ def compose_openai_compatible_engineering_application(
     registry.register(
         RuntimeInputClassifierPort,
         ModelRuntimeInputClassifier(registry.require(ModelProviderPort)),
+    )
+    registry.register(
+        TaskSpecPlannerPort,
+        ModelTaskSpecPlanner(registry.require(ModelProviderPort)),
     )
     registry.register(
         CheckpointCompatibilityPolicyPort,
@@ -896,11 +953,13 @@ def compose_openai_compatible_engineering_application(
             context_configuration=context,
             output_token_parameter=model_output_token_parameter,
             strict_tool_schema=model_strict_tool_schema,
+            streaming=model_streaming,
         ),
         ContextWindowManager(
             trigger_ratio=context.compaction_ratio,
             latency_soft_input_tokens=context.latency_soft_tokens,
         ),
+        default_max_output_tokens=8192,
     )
     return Application(Kernel(dependencies), registry)
 
@@ -939,6 +998,7 @@ def compose_openai_compatible_readonly_application_from_env(
         model_retry_backoff_seconds=configuration.retry_backoff_seconds,
         model_output_token_parameter=configuration.output_token_parameter,
         model_strict_tool_schema=configuration.strict_tool_schema,
+        model_streaming=configuration.streaming,
         context_configuration=context,
     )
 
@@ -976,5 +1036,6 @@ def compose_openai_compatible_engineering_application_from_env(
         model_retry_backoff_seconds=configuration.retry_backoff_seconds,
         model_output_token_parameter=configuration.output_token_parameter,
         model_strict_tool_schema=configuration.strict_tool_schema,
+        model_streaming=configuration.streaming,
         context_configuration=context,
     )

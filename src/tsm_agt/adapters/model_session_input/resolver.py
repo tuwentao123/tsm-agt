@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
 from datetime import datetime
@@ -11,6 +12,7 @@ from uuid import uuid4
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, Message,
     MessageRole, ModelProviderPort, ModelRequest, TextBlock,
+    ModelCallPurpose,
 )
 
 
@@ -23,8 +25,13 @@ class ModelSessionInputResolver:
         frozenset({"semantic-session-routing"}),
     )
 
-    def __init__(self, model: ModelProviderPort) -> None:
+    def __init__(
+        self, model: ModelProviderPort, *, timeout_seconds: float = 15.0,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("Session routing timeout must be positive")
         self._model = model
+        self._timeout_seconds = timeout_seconds
         self._started = False
 
     async def start(self, context: AdapterContext) -> None:
@@ -51,12 +58,18 @@ class ModelSessionInputResolver:
                 "Choose NEW_TASK for an independent request, RESUME_TASK only "
                 "when it semantically refers to one unfinished candidate, or "
                 "CLARIFY when ambiguous. Never infer approval, permission, or "
-                "tool safety. Return exactly one JSON object with action, "
-                "task_id, confidence, reason_code, clarification. task_id must "
+                "tool safety. Separately classify input_grounding as "
+                "SELF_CONTAINED only when current_input alone states a complete "
+                "new goal, CONTEXT_DEPENDENT when its meaning requires Session "
+                "history or candidates, or AMBIGUOUS when uncertain. Return "
+                "exactly one JSON object with action, input_grounding, task_id, "
+                "confidence, reason_code, clarification. NEW_TASK requires "
+                "SELF_CONTAINED grounding. task_id must "
                 "be null unless action is RESUME_TASK and exactly match a "
                 "supplied candidate. Only candidates whose safety is "
                 "EXACT_RESUME or REBASE_REQUIRED may be selected for "
-                "RESUME_TASK. confidence is 0..1."
+                "RESUME_TASK. candidate_index is the stable number shown by "
+                "the Harness; ordinal references may use it. confidence is 0..1."
             ),),
         )
         user = Message(
@@ -67,11 +80,16 @@ class ModelSessionInputResolver:
                 "session_context": dict(context),
             }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))),),
         )
-        response = await self._model.complete(ModelRequest(
-            turn_id=f"session-input-{uuid4().hex}",
-            messages=(system, user), max_output_tokens=256,
-            allow_tool_calls=False, require_evidence_questions=False,
-        ))
+        response = await asyncio.wait_for(
+            self._model.complete(ModelRequest(
+                turn_id=f"session-input-{uuid4().hex}",
+                messages=(system, user), max_output_tokens=256,
+                allow_tool_calls=False, require_evidence_questions=False,
+                purpose=ModelCallPurpose.SESSION_ROUTING,
+                timeout_seconds=self._timeout_seconds, max_provider_attempts=1,
+            )),
+            timeout=self._timeout_seconds + 1.0,
+        )
         raw = response.message.text.strip()
         start, end = raw.find("{"), raw.rfind("}")
         if start < 0 or end < start:

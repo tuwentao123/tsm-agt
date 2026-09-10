@@ -7,9 +7,17 @@ import hmac
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import StrEnum
 from typing import Any
 
 from tsm_agt.ports import ToolCall
+
+
+class ClarificationKind(StrEnum):
+    """Why Runtime is waiting for the user."""
+
+    QUESTION = "QUESTION"
+    OUTCOME_RECONCILIATION = "OUTCOME_RECONCILIATION"
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +50,8 @@ class ClarificationRequest:
     resume_token_hash: str
     created_at: datetime
     expires_at: datetime
+    kind: ClarificationKind = ClarificationKind.QUESTION
+    execution_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id.strip() or not self.question.strip():
@@ -52,6 +62,13 @@ class ClarificationRequest:
             raise ValueError("clarification supports at most 3 choices")
         if self.expires_at <= self.created_at:
             raise ValueError("clarification expiry must follow creation")
+        if (
+            self.kind is ClarificationKind.OUTCOME_RECONCILIATION
+            and not (self.execution_id or "").strip()
+        ):
+            raise ValueError(
+                "outcome reconciliation requires an execution identity"
+            )
 
     @staticmethod
     def hash_resume_token(token: str) -> str:
@@ -65,6 +82,15 @@ class ClarificationRequest:
             self.resume_token_hash, self.hash_resume_token(token),
         )
 
+    @property
+    def input_mode(self) -> str:
+        """Stable UI contract derived from the authoritative choices.
+
+        Keeping this derived makes pre-upgrade persisted requests compatible:
+        old rows without ``input_mode`` regain the correct mode on projection.
+        """
+        return "single_choice" if self.choices else "free_text"
+
     def to_data(self) -> dict[str, Any]:
         return {
             "request_id": self.request_id,
@@ -72,12 +98,15 @@ class ClarificationRequest:
             "turn_id": self.turn_id,
             "call": self.call.to_data(),
             "question": self.question,
+            "input_mode": self.input_mode,
             "choices": [choice.to_data() for choice in self.choices],
             "reason": self.reason,
             "required": self.required,
             "resume_token_hash": self.resume_token_hash,
             "created_at": self.created_at.isoformat(),
             "expires_at": self.expires_at.isoformat(),
+            "kind": self.kind.value,
+            "execution_id": self.execution_id,
         }
 
     @classmethod
@@ -86,7 +115,7 @@ class ClarificationRequest:
         raw_choices = data.get("choices", ())
         if not isinstance(raw_call, Mapping) or not isinstance(raw_choices, list):
             raise ValueError("stored clarification call/choices are malformed")
-        return cls(
+        request = cls(
             request_id=str(data["request_id"]),
             task_id=str(data["task_id"]),
             turn_id=str(data["turn_id"]),
@@ -101,7 +130,16 @@ class ClarificationRequest:
             resume_token_hash=str(data["resume_token_hash"]),
             created_at=datetime.fromisoformat(str(data["created_at"])),
             expires_at=datetime.fromisoformat(str(data["expires_at"])),
+            kind=ClarificationKind(str(data.get("kind", "QUESTION"))),
+            execution_id=(
+                str(data["execution_id"])
+                if data.get("execution_id") is not None else None
+            ),
         )
+        stored_mode = data.get("input_mode")
+        if stored_mode is not None and str(stored_mode) != request.input_mode:
+            raise ValueError("stored clarification input_mode conflicts with choices")
+        return request
 
 
 class ClarificationNotPending(LookupError):

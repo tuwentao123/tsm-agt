@@ -96,6 +96,9 @@ class SessionTaskSummary:
     workspace_roots: tuple[str, ...] = ()
     mutations: tuple[Mapping[str, Any], ...] = ()
     verification_status: str | None = None
+    task_spec_revision: int = 0
+    continuation_mode: str = "NONE"
+    outcomes: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not all((self.task_id, self.turn_id, self.goal, self.recorded_task_state)):
@@ -104,8 +107,11 @@ class SessionTaskSummary:
             len(self.important_actions) > 20
             or len(self.confirmed) > 20
             or len(self.mutations) > 20
+            or len(self.outcomes) > 30
         ):
             raise ValueError("session Task summary exceeds its bounded limit")
+        if self.task_spec_revision < 0:
+            raise ValueError("session Task summary SPEC revision is invalid")
 
     def to_data(self) -> dict[str, Any]:
         return {
@@ -121,6 +127,9 @@ class SessionTaskSummary:
             "workspace_roots": list(self.workspace_roots),
             "mutations": [dict(item) for item in self.mutations],
             "verification_status": self.verification_status,
+            "task_spec_revision": self.task_spec_revision,
+            "continuation_mode": self.continuation_mode,
+            "outcomes": [dict(item) for item in self.outcomes],
         }
 
     def prompt_data(
@@ -145,11 +154,12 @@ class SessionTaskSummary:
         raw_remaining = data.get("remaining_work", [])
         raw_roots = data.get("workspace_roots", [])
         raw_mutations = data.get("mutations", [])
+        raw_outcomes = data.get("outcomes", [])
         if not isinstance(raw_counts, Mapping):
             raise ValueError("session Task summary tool counts must be an object")
         if not all(isinstance(item, list) for item in (
             raw_actions, raw_confirmed, raw_completed, raw_remaining, raw_roots,
-            raw_mutations,
+            raw_mutations, raw_outcomes,
         )):
             raise ValueError("session Task summary collections must be lists")
         return cls(
@@ -178,6 +188,11 @@ class SessionTaskSummary:
                 str(data["verification_status"])
                 if data.get("verification_status") is not None else None
             ),
+            task_spec_revision=max(0, int(data.get("task_spec_revision", 0))),
+            continuation_mode=str(data.get("continuation_mode", "NONE")),
+            outcomes=tuple(
+                dict(item) for item in raw_outcomes if isinstance(item, Mapping)
+            )[:30],
         )
 
 
@@ -211,6 +226,10 @@ class SessionActiveCheckpoint:
     remaining_work: tuple[str, ...] = ()
     evidence_counts: tuple[tuple[str, int], ...] = ()
     consecutive_zero_delta: int = 0
+    task_spec_revision: int = 0
+    task_spec_hash: str = ""
+    active_outcome_ids: tuple[str, ...] = ()
+    pending_user_action: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not all((
@@ -259,6 +278,15 @@ class SessionActiveCheckpoint:
             "remaining_work": list(self.remaining_work),
             "evidence_counts": dict(self.evidence_counts),
             "consecutive_zero_delta": self.consecutive_zero_delta,
+            "task_spec": {
+                "revision": self.task_spec_revision,
+                "content_hash": self.task_spec_hash,
+                "active_outcome_ids": list(self.active_outcome_ids),
+            },
+            "pending_user_action": (
+                dict(self.pending_user_action)
+                if self.pending_user_action is not None else None
+            ),
         }
 
 
@@ -406,6 +434,9 @@ class SessionContextProjector:
                             if event.payload.get("verification_status") is not None
                             else prior.verification_status
                         ),
+                        task_spec_revision=prior.task_spec_revision,
+                        continuation_mode=prior.continuation_mode,
+                        outcomes=prior.outcomes,
                     )
                     sources.add(event.sequence)
 
@@ -901,6 +932,15 @@ class SessionContextProjector:
             )],
             "mutations": [self._bounded_mapping(item) for item in (
                 summary.mutations[:10] if summary is not None else ()
+            )],
+            "task_spec_revision": (
+                summary.task_spec_revision if summary is not None else 0
+            ),
+            "continuation_mode": (
+                summary.continuation_mode if summary is not None else "NONE"
+            ),
+            "outcomes": [self._bounded_mapping(item) for item in (
+                summary.outcomes if summary is not None else ()
             )],
             "source_turn_ids": list(dict.fromkeys(
                 item.turn_id for item in messages

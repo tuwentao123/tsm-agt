@@ -11,6 +11,7 @@ from .model import (
     FinishReason,
     Message,
     MessageRole,
+    ModelCallPurpose,
     ModelProviderPort,
     ModelRequest,
     ModelResponse,
@@ -25,6 +26,11 @@ from .model import (
     StreamingModelProviderPort,
     ToolCallBlock,
     ToolResultBlock,
+)
+from .model_recovery import (
+    ModelAttemptFailed, ModelAttemptFailure, ModelFailureCategory,
+    ModelRecoveryAction, ModelRecoveryDecision, ModelRecoveryExhausted,
+    ModelRecoveryPolicyPort, ModelRecoveryProbe, ModelRetrySafety,
 )
 from .runtime_store import (
     CommitResult,
@@ -60,6 +66,7 @@ from .project_memory import MemoryOperationResult, ProjectMemoryPort, StoredMemo
 from .code_intelligence import CodeIntelligencePort
 from .runtime_input_classifier import RuntimeInputClassifierPort
 from .session_input_resolver import SessionInputResolverPort
+from .task_spec_planner import TaskSpecPlannerPort
 from .checkpoint_compatibility import (
     CheckpointCompatibilityAction, CheckpointCompatibilityDecision,
     CheckpointCompatibilityPolicyPort, CheckpointCompatibilityProbe,
@@ -202,6 +209,15 @@ __all__ = [
     "ModelStreamEvent",
     "ModelTextDelta",
     "ModelUsage",
+    "ModelAttemptFailed",
+    "ModelAttemptFailure",
+    "ModelFailureCategory",
+    "ModelRecoveryAction",
+    "ModelRecoveryDecision",
+    "ModelRecoveryExhausted",
+    "ModelRecoveryPolicyPort",
+    "ModelRecoveryProbe",
+    "ModelRetrySafety",
     "ProviderCapabilities",
     "RecoverableToolProtocolError",
     "ProcessExecutorPort",
@@ -215,6 +231,7 @@ __all__ = [
     "RuntimeAdapter",
     "RuntimeInputClassifierPort",
     "SessionInputResolverPort",
+    "TaskSpecPlannerPort",
     "CheckpointCompatibilityAction",
     "CheckpointCompatibilityDecision",
     "CheckpointCompatibilityPolicyPort",

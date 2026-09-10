@@ -18,7 +18,8 @@ from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     AcceptanceStatus, AgentTurnResult, AgentTurnSuspended, ApprovalDecision,
-    ProjectTrustLevel, TaskState,
+    ProjectTrustLevel, TaskOutcomeStatus, TaskSpecProposal, TaskSpecSnapshot,
+    TaskState,
 )
 from tsm_agt.ports import (
     AdapterDescriptor, FinishReason, Message, MessageRole, ModelRequest,
@@ -34,9 +35,12 @@ class CodingLoopModel(EchoModelProvider):
     )
     capabilities = ProviderCapabilities(tools=True, context_window=8192)
 
-    def __init__(self, *, block_after_patch: bool = False) -> None:
+    def __init__(
+        self, *, block_after_patch: bool = False, bind_outcomes: bool = False,
+    ) -> None:
         super().__init__()
         self.block_after_patch = block_after_patch
+        self.bind_outcomes = bind_outcomes
         self.blocked = asyncio.Event()
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
@@ -81,15 +85,21 @@ class CodingLoopModel(EchoModelProvider):
             ), FinishReason.STOP, ModelUsage(4, 4),
         )
 
-    @staticmethod
     def _tool_response(
-        request: ModelRequest, suffix: str, name: str, arguments: dict,
+        self, request: ModelRequest, suffix: str, name: str, arguments: dict,
     ) -> ModelResponse:
+        outcome_ref = (
+            {"read": "inspect", "patch": "change", "test": "verify"}.get(
+                suffix
+            )
+            if self.bind_outcomes else None
+        )
         return ModelResponse(
             Message(
                 f"assistant-{suffix}-{request.turn_id}", MessageRole.ASSISTANT,
                 (ToolCallBlock(ToolCall(
                     f"call-{suffix}-{request.turn_id}", name, arguments,
+                    outcome_ref=outcome_ref,
                 )),),
             ), FinishReason.TOOL_CALL, ModelUsage(3, 2),
         )
@@ -143,10 +153,50 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
                 encoding="utf-8",
             )
             database = root / "runtime.db"
-            first_model = CodingLoopModel(block_after_patch=True)
+            first_model = CodingLoopModel(
+                block_after_patch=True, bind_outcomes=True
+            )
             first = self._compose(root, database, first_model)
             await first.registry.start_all()
             task = await self._create_executing_task(first, root)
+            initial_spec = await first.kernel.get_task_spec(task.task_id)
+            proposal = TaskSpecProposal.from_data({
+                "schema_version": 1,
+                "goal": task.goal,
+                "scope": ["calc.py", "tests"],
+                "constraints": ["Use Runtime-authorized tools only"],
+                "outcomes": [
+                    {
+                        "outcome_id": "inspect",
+                        "description": "Inspect the existing implementation",
+                        "kind": "EVIDENCE",
+                        "required_effects": ["observe"],
+                        "required": True,
+                    },
+                    {
+                        "outcome_id": "change",
+                        "description": "Deliver the requested workspace fix",
+                        "kind": "WORKSPACE_DELIVERY",
+                        "required_effects": ["mutate"],
+                        "required": True,
+                    },
+                    {
+                        "outcome_id": "verify",
+                        "description": "Run relevant verification",
+                        "kind": "COMMAND_RESULT",
+                        "required_effects": ["execute"],
+                        "required": True,
+                    },
+                ],
+                "continuation_policy": {"mode": "NONE"},
+            })
+            runtime_spec = TaskSpecSnapshot.from_proposal(
+                task.task_id, initial_spec.revision + 1, proposal,
+                initial_spec.acceptance_criteria,
+            )
+            await first.kernel._append_events(task.task_id, ((
+                "task_spec.revised", {"snapshot": runtime_spec.to_data()},
+            ),))
 
             patch_wait = await first.kernel.run_agent_turn(task.task_id, task.goal)
             self.assertIsInstance(patch_wait, AgentTurnSuspended)
@@ -173,7 +223,9 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
             )
             await first.registry.stop_all()
 
-            second = self._compose(root, database, CodingLoopModel())
+            second = self._compose(
+                root, database, CodingLoopModel(bind_outcomes=True)
+            )
             await second.registry.start_all()
             try:
                 command_wait = await second.kernel.resume_checkpointed_agent_turn(
@@ -194,6 +246,20 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
                 )
                 verification = await second.kernel.verify_task_acceptance(task.task_id)
                 self.assertEqual(verification.status, AcceptanceStatus.PASSED)
+                outcomes = await second.kernel.get_task_spec(task.task_id)
+                self.assertEqual(
+                    {item.outcome_id: item.status for item in outcomes.outcomes},
+                    {
+                        "inspect": TaskOutcomeStatus.DELIVERED,
+                        "change": TaskOutcomeStatus.DELIVERED,
+                        "verify": TaskOutcomeStatus.DELIVERED,
+                    },
+                )
+                outcome_criterion = next(
+                    item for item in verification.criteria
+                    if item.criterion_id == "task-outcome-fulfillment"
+                )
+                self.assertEqual(outcome_criterion.status, AcceptanceStatus.PASSED)
                 await second.kernel.transition_task(
                     task.task_id, TaskState.FINALIZING, "verified"
                 )
