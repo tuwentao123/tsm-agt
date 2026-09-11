@@ -987,6 +987,8 @@ async def _chat(
                 continue
             explicit_resume_task: str | None = None
             explicit_new_task = False
+            explicit_runtime_intent: RuntimeInputIntent | None = None
+            invalid_runtime_command = False
             if prompt in {"/exit", "/quit"}:
                 output_fn(
                     f"session saved: {session.session_id} "
@@ -1099,6 +1101,26 @@ async def _chat(
                     output_fn("usage: /new <goal>")
                     continue
                 explicit_new_task = True
+            for prefix, intent in (
+                ("/steer ", RuntimeInputIntent.STEER),
+                ("/redirect ", RuntimeInputIntent.REPLACE),
+                ("/replace ", RuntimeInputIntent.REPLACE),
+            ):
+                if prompt.startswith(prefix):
+                    prompt = prompt[len(prefix):].strip()
+                    if not prompt:
+                        output_fn(f"usage: {prefix.strip()} <instruction>")
+                        invalid_runtime_command = True
+                        break
+                    if session.active_task_id is None:
+                        output_fn("no active task in this session")
+                        invalid_runtime_command = True
+                        break
+                    explicit_runtime_intent = intent
+                    explicit_resume_task = session.active_task_id
+                    break
+            if invalid_runtime_command:
+                continue
             if prompt == "/sessions":
                 sessions = await application.kernel.list_sessions()
                 for item in sessions:
@@ -1150,6 +1172,7 @@ async def _chat(
 
             resume_mode = False
             continuation_resume = False
+            pending_approval_resolution = None
             session_input = None
             if explicit_resume_task is None and not explicit_new_task:
                 local_choice = (
@@ -1298,16 +1321,117 @@ async def _chat(
                 continuation is not None
                 and continuation.mode is SessionContinuationMode.AWAIT_USER_ACTION
             ):
-                output_fn(
-                    "[续接] 当前任务正在等待明确的审批决定或澄清答案；"
-                    "“继续”不会被当成同意，也不会新建任务。"
-                )
-                output_fn(
-                    f"[续接] task={continuation.task_id or '-'} "
-                    f"state={continuation.task_state or '-'} "
-                    f"reason={continuation.reason_code}"
-                )
-                continue
+                assert continuation.task_id is not None
+                task = await application.kernel.get_task(continuation.task_id)
+                if task.pending_approval is not None:
+                    route = await application.kernel.route_runtime_input(
+                        task.task_id, prompt, f"input-{uuid4().hex}",
+                        explicit_intent=explicit_runtime_intent,
+                    )
+                    if route.intent is RuntimeInputIntent.STATUS_QUERY:
+                        await _print_chat_status(
+                            application, session, task.task_id, output_fn
+                        )
+                        continue
+                    elif (
+                        route.intent
+                        is RuntimeInputIntent.REVIEW_PENDING_ACTION
+                    ):
+                        request = task.pending_approval
+                        assert request is not None
+                        checkpoint = dict(task.active_agent_checkpoint or {})
+                        output_fn(f"task: {task.task_id}")
+                        _print_chat_approval(AgentTurnSuspended(
+                            task_id=task.task_id, turn_id=request.turn_id,
+                            revision=int(checkpoint.get("revision", 0)),
+                            approval_request_id=request.request_id,
+                            payload_hash=request.payload_hash,
+                            action=request.action, target=request.target,
+                            preview=request.preview, risk=request.risk.value,
+                            network_access=request.network_access,
+                            data_transmission=request.data_transmission,
+                            rollback=request.rollback,
+                            approval_kind=request.kind.value,
+                        ), output_fn)
+                        try:
+                            answer = (await read_input(
+                                "这是当前尚未执行的操作。是否明确批准？ "
+                                "[y/N/leave] "
+                            )).strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            answer = "leave"
+                        if answer in {"leave", "l", "exit", "q"}:
+                            output_fn("审批保持等待；没有执行任何操作。")
+                            continue
+                        decision = (
+                            ApprovalDecision.APPROVE
+                            if answer in {"y", "yes", "approve"}
+                            else ApprovalDecision.DENY
+                        )
+                        reason = (
+                            "approved after reviewing restored pending action"
+                            if decision is ApprovalDecision.APPROVE else
+                            "rejected after reviewing restored pending action"
+                        )
+                        pending_approval_resolution = (
+                            request.request_id, decision, reason
+                        )
+                        session = await application.kernel.select_session_task(
+                            session.session_id, task.task_id
+                        )
+                        resume_mode = True
+                        output_fn(
+                            "[续接] 已记录明确的审批决定，正在继续同一 Task。"
+                        )
+                    elif route.intent is RuntimeInputIntent.NEW_TASK_AFTER_CURRENT:
+                        follow_up = await application.kernel.queue_session_follow_up(
+                            session.session_id, task.task_id, prompt,
+                            f"input-{uuid4().hex}",
+                        )
+                        output_fn(
+                            "[队列] 当前审批保持不变；已保存为完成后的第 "
+                            f"{follow_up.inbound_sequence} 条消息"
+                        )
+                        continue
+                    elif route.applied:
+                        session = await application.kernel.select_session_task(
+                            session.session_id, task.task_id
+                        )
+                        resume_mode = True
+                        output_fn(f"task: {task.task_id}")
+                        output_fn(
+                            "[续接] 已取消尚未执行的旧审批动作；它没有被批准，"
+                            "也不会在后台执行。"
+                        )
+                        output_fn(
+                            "[续接] 已将本轮输入加入同一 Task，正在从安全断点"
+                            "重新规划。若仍需风险操作，会重新请求授权。"
+                        )
+                    else:
+                        output_fn(
+                            "[续接] 当前 Task 正在等待审批。普通文字不会被"
+                            "当作批准；本轮输入也未能安全判定为修改任务方向。"
+                        )
+                        output_fn(
+                            "[续接] 可审批/拒绝原动作，或使用 /steer <补充要求>、"
+                            "/replace <新目标>、/new <独立任务>。"
+                        )
+                        output_fn(
+                            f"[续接] task={task.task_id} state={task.state.value} "
+                            f"reason={route.reason_code}"
+                        )
+                        continue
+                else:
+                    output_fn(
+                        "[续接] 当前任务正在等待明确的澄清答案；"
+                        "请先回答已显示的问题。"
+                    )
+                    output_fn(
+                        f"[续接] task={continuation.task_id or '-'} "
+                        f"state={continuation.task_state or '-'} "
+                        f"reason={continuation.reason_code}"
+                    )
+                    continue
             elif (
                 continuation is not None
                 and continuation.mode is SessionContinuationMode.BLOCKED
@@ -1483,6 +1607,13 @@ async def _chat(
                         )
 
                 async def run_current_agent():
+                    if pending_approval_resolution is not None:
+                        request_id, decision, reason = pending_approval_resolution
+                        return await application.kernel.resolve_agent_approval(
+                            request_id, decision, reason,
+                            on_text_delta=on_text_delta,
+                            on_progress=on_progress,
+                        )
                     if continuation_resume:
                         return await application.kernel.resume_agent_continuation(
                             task.task_id, prompt, input_id=f"input-{uuid4().hex}",

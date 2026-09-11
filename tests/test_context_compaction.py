@@ -231,6 +231,83 @@ class ContextWindowManagerTest(unittest.TestCase):
             prepared.compaction.protected_sections,
         )
 
+    def test_session_compaction_preserves_all_task_indexes_and_artifacts(self) -> None:
+        manager = ContextWindowManager(trigger_ratio=0.50, recent_message_floor=2)
+        session_body = {
+            "boundary": "session_conversation_projection",
+            "work_state": {"goal": "continue design"},
+            "task_index": [
+                {
+                    "task_id": f"task-{index}",
+                    "goal": f"goal {index}",
+                    "status": "SUCCEEDED",
+                    "artifacts": [f"plan-{index}.md"],
+                    "source_event_sequences": [index],
+                }
+                for index in range(1, 7)
+            ],
+            "recent_task_summaries": [
+                {
+                    "task_id": f"task-{index}",
+                    "goal": "detail " * 100,
+                }
+                for index in range(1, 7)
+            ],
+            "historical_investigation": {
+                "resources": [
+                    {"source_task_id": f"task-{index}",
+                     "canonical_path": f"plan-{index}.md"}
+                    for index in range(1, 7)
+                ],
+                "questions": [],
+            },
+            "recent_messages": [
+                {
+                    "task_id": f"task-{index}", "role": "assistant",
+                    "text": "large visible result " * 100,
+                }
+                for index in range(1, 7)
+            ],
+        }
+        session = text(
+            "session-context-12-a", MessageRole.USER,
+            json.dumps(session_body),
+        )
+        prepared = manager.prepare(
+            conversation=(
+                text("goal", MessageRole.USER, "current request"), session,
+            ),
+            tools=(), prompt_template=self.template,
+            context_window=3000, max_output_tokens=256,
+        )
+
+        self.assertIsNotNone(prepared.compaction)
+        compacted_session = next(
+            item for item in prepared.messages
+            if item.message_id.startswith("session-context-")
+        )
+        body = json.loads(compacted_session.text)
+        self.assertEqual(
+            [item["task_id"] for item in body["task_index"]],
+            [f"task-{index}" for index in range(1, 7)],
+        )
+        self.assertEqual(
+            [item["artifacts"] for item in body["task_index"]],
+            [[f"plan-{index}.md"] for index in range(1, 7)],
+        )
+        self.assertEqual(len(body["recent_messages"]), 2)
+        self.assertEqual(
+            [item["task_id"] for item in body["recent_task_summaries"]],
+            ["task-5", "task-6"],
+        )
+        assert prepared.compaction is not None
+        self.assertIn(
+            "session_task_index", prepared.compaction.protected_sections
+        )
+        self.assertIn(
+            "session_artifact_paths", prepared.compaction.protected_sections
+        )
+
     def test_fails_when_protected_context_cannot_fit(self) -> None:
         manager = ContextWindowManager(recent_message_floor=12)
         with self.assertRaisesRegex(ContextWindowExceeded, "cannot fit"):

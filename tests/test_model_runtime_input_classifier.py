@@ -45,3 +45,6 @@ class ModelRuntimeInputClassifierTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(request.allow_tool_calls)
         self.assertEqual(request.tools, ())
         self.assertIn("repair CLI", request.messages[-1].text)
+        self.assertIn(
+            "REVIEW_PENDING_ACTION", request.messages[0].text
+        )

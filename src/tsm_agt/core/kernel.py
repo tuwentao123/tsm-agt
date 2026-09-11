@@ -1320,12 +1320,28 @@ class Kernel:
                 for index, item in enumerate(candidates, start=1)
             ],
             "pending_interaction": (
-                pending_interaction.to_data()
+                {
+                    "interaction_id": pending_interaction.interaction_id,
+                    "kind": pending_interaction.kind.value,
+                    "source": pending_interaction.source,
+                    "options": [
+                        {
+                            "option_id": option.option_id,
+                            "ordinal": option.ordinal,
+                            "target_type": option.target_type,
+                            "target_id": option.target_id,
+                            "metadata": dict(option.metadata),
+                        }
+                        for option in pending_interaction.options
+                    ],
+                }
                 if pending_interaction is not None else None
             ),
             "instruction": (
-                "Task references are descriptive and grant no authority. "
-                "Runtime validates any selected checkpoint separately."
+                "Selecting any listed unfinished Task is descriptive and grants "
+                "no authority, including candidates awaiting approval or user "
+                "input. Runtime applies the candidate's separate safety protocol "
+                "only after selection."
             ),
         }
         try:
@@ -1346,16 +1362,15 @@ class Kernel:
             )
             if not 0 <= confidence <= 1:
                 raise ValueError("confidence is outside 0..1")
-            resumable_ids = {
-                item.task_id for item in candidates
-                if item.safety in {
-                    SessionResumeSafety.EXACT_RESUME,
-                    SessionResumeSafety.REBASE_REQUIRED,
-                }
-            }
+            # Selecting a Task establishes conversational context; it does not
+            # execute the checkpoint or grant approval.  Every unfinished
+            # candidate may therefore be selected here.  The subsequent
+            # continuation gate still enforces EXACT_RESUME, approval,
+            # clarification, compatibility, and conflict protocols separately.
+            selectable_ids = {item.task_id for item in candidates}
             if action is SessionInputAction.RESUME_TASK:
-                if task_id not in resumable_ids or confidence < 0.85:
-                    raise ValueError("unsafe or low-confidence Task selection")
+                if task_id not in selectable_ids or confidence < 0.85:
+                    raise ValueError("unknown or low-confidence Task selection")
             elif task_id is not None:
                 raise ValueError("non-resume action supplied task_id")
             if action is SessionInputAction.NEW_TASK and confidence < 0.75:
@@ -1381,6 +1396,14 @@ class Kernel:
                 clarification = (
                     "I cannot tell which unfinished Task this refers to. "
                     "Please state the target or use /resume <task_id>."
+                )
+            elif action is SessionInputAction.CLARIFY:
+                # The model detects ambiguity; Runtime owns the selectable UI.
+                # Suppressing model-authored options prevents an apparent "2"
+                # from conflicting with a one-item authoritative Task list.
+                clarification = (
+                    "无法确定这条输入对应哪个未完成 Task。请从下面的真实"
+                    "候选中选择，或使用 /new <目标> 明确创建新任务。"
                 )
             decision = SessionInputDecision(
                 action, task_id, confidence, reason, input_grounding,
@@ -1805,6 +1828,14 @@ class Kernel:
                 task.state.value, task.goal,
                 task.pending_clarification is not None,
                 task.pending_approval is not None,
+                (task.pending_approval.kind.value
+                 if task.pending_approval is not None else ""),
+                (task.pending_approval.action
+                 if task.pending_approval is not None else ""),
+                (task.pending_approval.target
+                 if task.pending_approval is not None else ""),
+                (task.pending_approval.risk.value
+                 if task.pending_approval is not None else ""),
             )
             route = RuntimeInputRouter().route(
                 normalized, context, explicit_intent, fallback_intent
@@ -1812,7 +1843,7 @@ class Kernel:
             classifier = self._dependencies.runtime_input_classifier
             if (
                 route.intent is RuntimeInputIntent.AMBIGUOUS
-                and not context.awaiting_approval and classifier is not None
+                and classifier is not None
             ):
                 try:
                     candidate = await classifier.classify_runtime_input(
@@ -1822,6 +1853,7 @@ class Kernel:
                     confidence = float(candidate["confidence"])
                     if intent in {
                         RuntimeInputIntent.STEER, RuntimeInputIntent.REPLACE,
+                        RuntimeInputIntent.REVIEW_PENDING_ACTION,
                         RuntimeInputIntent.STATUS_QUERY,
                         RuntimeInputIntent.NEW_TASK_AFTER_CURRENT,
                     } and 0 <= confidence <= 1:
@@ -1842,6 +1874,19 @@ class Kernel:
                 RuntimeInputIntent.REPLACE: SteeringKind.REPLACE,
             }.get(route.intent)
             applied = steering_kind is not None and not route.requires_confirmation
+            checkpoint: AgentTurnCheckpoint | None = None
+            if applied and context.awaiting_approval:
+                if task.active_agent_checkpoint is None:
+                    route = RuntimeInputRoute(
+                        route.intent, route.confidence,
+                        "approval_has_no_resumable_agent_checkpoint", True,
+                        router_version=route.router_version,
+                    )
+                    applied = False
+                else:
+                    checkpoint = AgentTurnCheckpoint.from_data(
+                        task.active_agent_checkpoint
+                    )
             route = route.with_applied(applied)
             projection = SteeringProjector.project(task_id, events)
             payload = route.to_event_data(normalized, normalized_id)
@@ -1850,10 +1895,104 @@ class Kernel:
                 f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
                 "runtime_input.routed", payload,
             )]
+            next_task = task
+            if applied and checkpoint is not None:
+                approval = task.pending_approval
+                assert approval is not None
+                evidence_projection = EvidenceQuestionProjector.project(
+                    task_id, events
+                )
+                evidence_record = None
+                if approval.call.evidence_question is not None:
+                    current_evidence = evidence_projection.get(
+                        approval.call.evidence_question.question_id
+                    )
+                    if (
+                        current_evidence is not None
+                        and approval.call.call_id in current_evidence.tool_call_ids
+                    ):
+                        evidence_projection, evidence_record = evidence_projection.dispose(
+                            approval.call, ToolActionDisposition.REPLACE,
+                            "pending approval superseded by runtime input",
+                        )
+                cancellation_messages = tuple(
+                    Message(
+                        f"msg-superseded-{call.call_id}-{uuid4().hex}",
+                        MessageRole.TOOL,
+                        (ToolResultBlock(ToolResult(
+                            call.call_id, False, error_code="ACTION_SUPERSEDED",
+                            message=(
+                                "The pending action was cancelled before execution "
+                                "because the user supplied a new Task direction."
+                            ),
+                            hint="Re-plan from the latest user input.",
+                        )),),
+                    )
+                    for call in checkpoint.pending_tool_calls
+                )
+                checkpoint = replace(
+                    checkpoint, revision=checkpoint.revision + 1,
+                    messages=checkpoint.messages + cancellation_messages,
+                    pending_tool_calls=(), pending_user_action={},
+                )
+                next_task = task.resolve_approval().with_agent_checkpoint(
+                    checkpoint.to_data()
+                )
+                sequence = stored.last_event_sequence + len(committed_events) + 1
+                committed_events.append(RuntimeEvent(
+                    f"evt-{uuid4().hex}", task_id, sequence,
+                    "approval.resolved", {
+                        "request_id": approval.request_id,
+                        "payload_hash": approval.payload_hash,
+                        "outcome_ref": approval.call.outcome_ref,
+                        "decision": "superseded",
+                        "reason": "user supplied a new Task direction",
+                        "pending_user_action": {},
+                    },
+                ))
+                if evidence_record is not None:
+                    current_record = current_evidence
+                    assert current_record is not None
+                    sequence += 1
+                    evidence_record = replace(
+                        evidence_record, updated_event_sequence=sequence
+                    )
+                    committed_events.append(RuntimeEvent(
+                        f"evt-{uuid4().hex}", task_id, sequence,
+                        "evidence.question_state_changed", {
+                            "turn_id": approval.turn_id,
+                            "tool_call_id": approval.call.call_id,
+                            "tool_name": approval.call.name,
+                            "question_ref": evidence_record.question_ref,
+                            "previous_status": current_record.status.value,
+                            "next_status": evidence_record.status.value,
+                            "observation_kind": (
+                                evidence_record.observation_kind.value
+                                if evidence_record.observation_kind else None
+                            ),
+                            "blocking_reason": evidence_record.blocking_reason,
+                            "evidence_count": len(
+                                evidence_record.evidence_references
+                            ),
+                            "record": evidence_record.to_data(),
+                        },
+                    ))
+                sequence += 1
+                committed_events.append(RuntimeEvent(
+                    f"evt-{uuid4().hex}", task_id, sequence,
+                    "tool.action_disposed", {
+                        "turn_id": approval.turn_id,
+                        "tool_call_id": approval.call.call_id,
+                        "tool_name": approval.call.name,
+                        "disposition": ToolActionDisposition.REPLACE.value,
+                        "reason": "pending approval superseded by runtime input",
+                    },
+                ))
             if applied and steering_kind is not None:
+                sequence = stored.last_event_sequence + len(committed_events) + 1
                 committed_events.append(RuntimeEvent(
                     f"evt-{uuid4().hex}", task_id,
-                    stored.last_event_sequence + 2, "steering.queued", {
+                    sequence, "steering.queued", {
                         "steering_id": normalized_id,
                         "inbound_sequence": projection.latest_inbound_sequence + 1,
                         "kind": steering_kind.value, "text": normalized,
@@ -1863,9 +2002,33 @@ class Kernel:
                         }),
                     },
                 ))
+            if applied and checkpoint is not None:
+                sequence = stored.last_event_sequence + len(committed_events) + 1
+                committed_events.append(RuntimeEvent(
+                    f"evt-{uuid4().hex}", task_id, sequence,
+                    "checkpoint.saved", {
+                        "turn_id": checkpoint.turn_id,
+                        "revision": checkpoint.revision,
+                        "checkpoint_hash": checkpoint.checkpoint_hash,
+                        "reason": "approval-superseded-by-runtime-input",
+                        "model_calls": checkpoint.model_calls,
+                        "tool_calls": checkpoint.tool_calls,
+                        "pending_tool_calls": 0,
+                        "pending_user_action": {},
+                    },
+                ))
+                sequence += 1
+                committed_events.append(RuntimeEvent(
+                    f"evt-{uuid4().hex}", task_id, sequence,
+                    "task.state_changed", {
+                        "previous_state": task.state.value,
+                        "next_state": next_task.state.value,
+                        "reason": "pending approval superseded by runtime input",
+                    },
+                ))
             try:
                 await self._dependencies.store.commit(RuntimeUnitOfWork(
-                    task_id, stored.version, task.to_data(),
+                    task_id, stored.version, next_task.to_data(),
                     tuple(committed_events),
                 ))
                 return route

@@ -131,6 +131,7 @@ class QueuedFollowUp:
 class RuntimeInputIntent(StrEnum):
     STEER = "STEER"
     REPLACE = "REPLACE"
+    REVIEW_PENDING_ACTION = "REVIEW_PENDING_ACTION"
     STATUS_QUERY = "STATUS_QUERY"
     NEW_TASK_AFTER_CURRENT = "NEW_TASK_AFTER_CURRENT"
     CLARIFICATION_ANSWER = "CLARIFICATION_ANSWER"
@@ -143,6 +144,10 @@ class RuntimeInputContext:
     current_goal: str = ""
     awaiting_clarification: bool = False
     awaiting_approval: bool = False
+    pending_approval_kind: str = ""
+    pending_approval_action: str = ""
+    pending_approval_target: str = ""
+    pending_approval_risk: str = ""
 
     def to_classifier_data(self) -> dict[str, Any]:
         return {
@@ -150,6 +155,12 @@ class RuntimeInputContext:
             "current_goal": self.current_goal,
             "awaiting_clarification": self.awaiting_clarification,
             "awaiting_approval": self.awaiting_approval,
+            "pending_approval": ({
+                "kind": self.pending_approval_kind,
+                "action": self.pending_approval_action,
+                "target": self.pending_approval_target,
+                "risk": self.pending_approval_risk,
+            } if self.awaiting_approval else None),
         }
 
 
@@ -215,7 +226,7 @@ class RuntimeInputRouter:
         if context.awaiting_approval:
             return RuntimeInputRoute(
                 RuntimeInputIntent.AMBIGUOUS, 1.0,
-                "approval_requires_explicit_decision", True,
+                "approval_protected_semantic_routing", True,
             )
         if context.awaiting_clarification:
             return RuntimeInputRoute(

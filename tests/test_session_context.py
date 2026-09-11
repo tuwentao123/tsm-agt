@@ -71,7 +71,7 @@ class SessionContextProjectorTest(unittest.TestCase):
             },
         )
 
-    def test_projection_is_deterministic_and_summarizes_older_messages(self) -> None:
+    def test_projection_is_deterministic_and_keeps_all_tasks_before_budgeting(self) -> None:
         snapshot = SessionSnapshot.create(
             "session-1", "uid:1", "projection",
             datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -81,7 +81,7 @@ class SessionContextProjectorTest(unittest.TestCase):
             self._event(index, f"question {index}", f"answer {index}")
             for index in range(1, 4)
         )
-        projector = SessionContextProjector(recent_message_limit=2)
+        projector = SessionContextProjector()
 
         first = projector.project(snapshot, events)
         second = projector.project(snapshot, tuple(reversed(events)))
@@ -92,42 +92,41 @@ class SessionContextProjectorTest(unittest.TestCase):
         prompt = projector.for_prompt(first)
         assert prompt.message is not None
         body = json.loads(prompt.message.text)
-        self.assertEqual(prompt.recent_message_count, 2)
-        self.assertEqual(prompt.summarized_message_count, 4)
+        self.assertEqual(prompt.recent_message_count, 6)
+        self.assertEqual(prompt.summarized_message_count, 0)
         self.assertEqual(
             [item["text"] for item in body["recent_messages"]],
-            ["question 3", "answer 3"],
+            [
+                "question 1", "answer 1", "question 2",
+                "answer 2", "question 3", "answer 3",
+            ],
         )
-        self.assertEqual(body["earlier_summary"]["message_count"], 4)
+        self.assertEqual(body["earlier_summary"]["message_count"], 0)
         self.assertEqual(
             body["earlier_summary"]["algorithm"],
-            "deterministic-task-handoff-v1",
+            "provider-budget-managed-session-v2",
         )
         self.assertEqual(body["earlier_summary"]["revision"], first.revision)
-        self.assertEqual(body["earlier_summary"]["source_event_sequences"], [1, 2])
-        self.assertEqual(body["earlier_summary"]["source_event_ranges"], [[1, 2]])
-        self.assertEqual(prompt.summary_source_event_sequences, (1, 2))
-        self.assertEqual(prompt.summary_source_event_ranges, ((1, 2),))
+        self.assertEqual(body["earlier_summary"]["source_event_sequences"], [])
+        self.assertEqual(body["earlier_summary"]["source_event_ranges"], [])
+        self.assertEqual(prompt.summary_source_event_sequences, ())
+        self.assertEqual(prompt.summary_source_event_ranges, ())
         self.assertEqual(prompt.summary_hash, body["earlier_summary"]["content_hash"])
         self.assertEqual(body["content_hash"], first.content_hash)
         self.assertEqual(
-            [item["task_id"] for item in body["earlier_summary"]["tasks"]],
-            ["task-1", "task-2"],
-        )
-        self.assertEqual(
-            body["earlier_summary"]["tasks"][0]["completed_work"],
-            ["completed 1"],
+            [item["task_id"] for item in body["task_index"]],
+            ["task-1", "task-2", "task-3"],
         )
         self.assertEqual(
             [item["task_id"] for item in body["recent_task_summaries"]],
-            ["task-3"],
+            ["task-1", "task-2", "task-3"],
         )
         self.assertEqual(
             body["recent_task_summaries"][0]["tool_counts"],
-            {"core.search_text": 3},
+            {"core.search_text": 1},
         )
 
-    def test_recent_task_summaries_follow_recent_messages_and_are_bounded(self) -> None:
+    def test_all_task_summaries_enter_projection_before_token_budgeting(self) -> None:
         snapshot = SessionSnapshot.create(
             "session-1", "uid:1", "recent summaries",
             datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -138,25 +137,21 @@ class SessionContextProjectorTest(unittest.TestCase):
             self._event(index, f"question {index}", f"answer {index}")
             for index in range(1, 8)
         )
-        projector = SessionContextProjector(
-            recent_message_limit=12, recent_task_summary_limit=5
-        )
+        projector = SessionContextProjector()
         body = json.loads(projector.for_prompt(
             projector.project(snapshot, events)
         ).message.text)
 
-        # Twelve messages cover Tasks 2..7, but the explicit Task-summary cap
-        # keeps only the five most recent distinct Tasks.
         self.assertEqual(
             [item["task_id"] for item in body["recent_task_summaries"]],
-            ["task-3", "task-4", "task-5", "task-6", "task-7"],
+            [f"task-{index}" for index in range(1, 8)],
         )
-        self.assertNotIn(
-            "task-2",
-            json.dumps(body["recent_task_summaries"], ensure_ascii=False),
+        self.assertEqual(
+            [item["task_id"] for item in body["task_index"]],
+            [f"task-{index}" for index in range(1, 8)],
         )
 
-    def test_earlier_summary_groups_one_task_and_does_not_repeat_recent_task(self) -> None:
+    def test_task_index_keeps_artifact_and_handoff_facts(self) -> None:
         snapshot = SessionSnapshot.create(
             "session-1", "uid:1", "grouped history",
             datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -189,24 +184,19 @@ class SessionContextProjectorTest(unittest.TestCase):
             },
         )
         recent = self._event(3, "new topic", "new answer")
-        projector = SessionContextProjector(recent_message_limit=2)
+        projector = SessionContextProjector()
         body = json.loads(projector.for_prompt(
             projector.project(snapshot, (first, second, recent))
         ).message.text)
-        tasks = body["earlier_summary"]["tasks"]
-        self.assertEqual(len(tasks), 1)
-        self.assertEqual(tasks[0]["task_id"], "task-1")
-        self.assertEqual(tasks[0]["visible_result"], "found caller")
-        self.assertEqual(tasks[0]["completed_work"], ["found entry", "found caller"])
-        self.assertEqual(tasks[0]["remaining_work"], ["verify route"])
-        self.assertEqual(tasks[0]["verification_status"], "passed")
-        self.assertEqual(tasks[0]["mutations"][0]["path"], "src/service.py")
-        self.assertEqual(
-            [item["task_id"] for item in body["recent_task_summaries"]],
-            ["task-3"],
-        )
+        task = body["task_index"][0]
+        self.assertEqual(task["task_id"], "task-1")
+        self.assertEqual(task["completed_work"], ["found entry", "found caller"])
+        self.assertEqual(task["remaining_work"], ["verify route"])
+        self.assertEqual(task["verification_status"], "passed")
+        self.assertEqual(task["artifacts"], ["src/service.py"])
+        self.assertEqual(task["source_event_sequences"], [1, 2])
 
-    def test_earlier_summary_is_bounded_by_task_count_and_characters(self) -> None:
+    def test_character_volume_does_not_omit_tasks_before_token_budgeting(self) -> None:
         snapshot = SessionSnapshot.create(
             "session-1", "uid:1", "bounded history",
             datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -217,17 +207,15 @@ class SessionContextProjectorTest(unittest.TestCase):
             self._event(index, "q" * 300, "a" * 300)
             for index in range(1, 6)
         )
-        projector = SessionContextProjector(
-            recent_message_limit=2, earlier_task_summary_limit=2,
-            max_summary_characters=1200, summary_item_characters=100,
-        )
+        projector = SessionContextProjector()
         body = json.loads(projector.for_prompt(
             projector.project(snapshot, events)
         ).message.text)
-        earlier = body["earlier_summary"]
-        self.assertLessEqual(len(earlier["tasks"]), 2)
-        self.assertGreaterEqual(earlier["omitted_task_count"], 2)
-        self.assertNotIn("items", earlier)
+        self.assertEqual(
+            [item["task_id"] for item in body["task_index"]],
+            [f"task-{index}" for index in range(1, 6)],
+        )
+        self.assertEqual(body["earlier_summary"]["omitted_task_count"], 0)
 
     @staticmethod
     def _execution(

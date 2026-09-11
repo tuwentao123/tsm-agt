@@ -66,10 +66,19 @@ class ModelSessionInputResolver:
                 "confidence, reason_code, clarification. NEW_TASK requires "
                 "SELF_CONTAINED grounding. task_id must "
                 "be null unless action is RESUME_TASK and exactly match a "
-                "supplied candidate. Only candidates whose safety is "
-                "EXACT_RESUME or REBASE_REQUIRED may be selected for "
-                "RESUME_TASK. candidate_index is the stable number shown by "
-                "the Harness; ordinal references may use it. confidence is 0..1."
+                "supplied candidate. Selecting a candidate only identifies which "
+                "Task the message refers to; it does not execute a checkpoint, "
+                "approve an action, answer a clarification, or grant authority. "
+                "Any supplied unfinished candidate may therefore be selected, "
+                "including AWAIT_USER_ACTION candidates; Runtime applies its "
+                "safety protocol after selection. candidate_index is the stable "
+                "number shown by the Harness; ordinal references may use it. "
+                "pending_interaction, when present, contains only authoritative "
+                "identifiers from an earlier UI choice; it does not mean the "
+                "current message answered that choice. "
+                "If action is CLARIFY, do not invent choices or numbered options; "
+                "the Harness renders the authoritative candidate list. confidence "
+                "is 0..1."
             ),),
         )
         user = Message(

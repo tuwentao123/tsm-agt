@@ -166,6 +166,51 @@ class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
+    async def test_classifier_is_consulted_while_approval_is_protected(self):
+        context = RuntimeInputContext(
+            "AWAITING_APPROVAL", "original goal",
+            awaiting_approval=True, pending_approval_kind="tool_action",
+            pending_approval_action="write a file",
+            pending_approval_target="example.txt", pending_approval_risk="R1",
+        )
+        route = RuntimeInputRouter().route("continue with a narrower goal", context)
+        self.assertEqual(route.intent, RuntimeInputIntent.AMBIGUOUS)
+        self.assertEqual(route.reason_code, "approval_protected_semantic_routing")
+        self.assertTrue(route.requires_confirmation)
+        classifier_data = context.to_classifier_data()
+        self.assertTrue(classifier_data["awaiting_approval"])
+        self.assertEqual(
+            classifier_data["pending_approval"]["target"], "example.txt"
+        )
+
+    async def test_pending_action_review_does_not_apply_or_cancel_any_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            classifier = FixtureClassifier("REVIEW_PENDING_ACTION")
+            app = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+                runtime_input_classifier_adapter=classifier,
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, Path(directory))
+                # This contract test supplies approval state through the router
+                # context; full durable approval behavior is covered by the CLI
+                # and Agent-loop production journeys.
+                context = RuntimeInputContext(
+                    TaskState.AWAITING_APPROVAL.value, task.goal,
+                    awaiting_approval=True,
+                )
+                candidate = await classifier.classify_runtime_input(
+                    "continue the current blocked step",
+                    context.to_classifier_data(),
+                )
+                self.assertEqual(
+                    candidate["intent"], "REVIEW_PENDING_ACTION"
+                )
+                self.assertTrue(context.awaiting_approval)
+            finally:
+                await app.registry.stop_all()
+
     async def test_ambiguous_input_is_recorded_but_not_applied(self):
         with tempfile.TemporaryDirectory() as directory:
             app = compose_fixture_application(

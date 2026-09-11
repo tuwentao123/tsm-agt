@@ -19,7 +19,7 @@ from .configuration import canonical_hash
 from .execution import ToolExecutionRecord
 from .session import SessionSnapshot
 from .session_resources import (
-    SessionQuestionReference, SessionResourceReference,
+    SessionQuestionReference, SessionResourceKind, SessionResourceReference,
 )
 from .runtime_input import SessionResumeCandidate
 
@@ -347,25 +347,15 @@ class SessionPromptProjection:
 
 @dataclass(frozen=True, slots=True)
 class SessionContextProjector:
-    recent_message_limit: int = 12
-    recent_task_summary_limit: int = 5
-    earlier_task_summary_limit: int = 20
     recent_execution_limit: int = 12
     recent_execution_per_task_limit: int = 6
     execution_result_item_limit: int = 10
     small_read_content_characters: int = 2000
-    max_recent_characters: int = 8000
-    max_summary_characters: int = 4000
-    summary_item_characters: int = 500
 
     def __post_init__(self) -> None:
         if min(
-            self.recent_message_limit, self.recent_task_summary_limit,
-            self.earlier_task_summary_limit,
             self.recent_execution_limit, self.recent_execution_per_task_limit,
             self.execution_result_item_limit, self.small_read_content_characters,
-            self.max_recent_characters,
-            self.max_summary_characters, self.summary_item_characters,
         ) < 1:
             raise ValueError("Session context projection limits must be positive")
 
@@ -503,37 +493,31 @@ class SessionContextProjector:
                 }), (), (),
             )
 
-        recent = self._recent_messages(projection.messages)
-        window_task_summaries = self._recent_task_summaries(
-            recent, projection.task_summaries
-        )
-        recent_task_ids = {item.task_id for item in window_task_summaries}
-        compacted_task_ids = set(recent_task_ids)
-        recent_task_summaries = window_task_summaries
+        # Do not perform a second, character-based compaction here. Every Task
+        # remains represented before ContextWindowManager evaluates the actual
+        # Provider token budget. This projector only turns durable Session data
+        # into a deterministic model view; it does not decide what history fits.
+        visible_messages = projection.messages
+        visible_task_summaries = projection.task_summaries
+        visible_task_ids = {item.task_id for item in visible_task_summaries}
+        task_index = self._task_index(projection)
         if active_checkpoint is not None:
             # The checkpoint is fresher than a visible-result summary for the
             # same Task. Keep recent user-visible messages, but do not repeat
             # the Task's progress in two structured sections.
-            recent_task_summaries = tuple(
-                item for item in recent_task_summaries
+            visible_task_summaries = tuple(
+                item for item in visible_task_summaries
                 if item.task_id != active_checkpoint.task_id
             )
-            compacted_task_ids.add(active_checkpoint.task_id)
-        older = projection.messages[:len(projection.messages) - len(recent)]
-        summary, omitted_tasks = self._structured_earlier_summary(
-            older, projection.task_summaries, compacted_task_ids
-        )
-        summary_sources = tuple(sorted({
-            message.source_event_sequence for message in older
-        }))
+        summary_sources: tuple[int, ...] = ()
         summary_source_ranges = self._sequence_ranges(summary_sources)
         summary_source = {
-            "algorithm": "deterministic-task-handoff-v1",
+            "algorithm": "provider-budget-managed-session-v2",
             "revision": projection.revision,
             "source_event_sequences": list(summary_sources),
             "source_event_ranges": [list(item) for item in summary_source_ranges],
-            "tasks": summary,
-            "omitted_task_count": omitted_tasks,
+            "tasks": [],
+            "omitted_task_count": 0,
         }
         summary_hash = canonical_hash(summary_source)
         body_data = {
@@ -561,9 +545,10 @@ class SessionContextProjector:
                 ),
                 "items": [item.to_data() for item in suspended_tasks[:10]],
             },
+            "task_index": task_index,
             "recent_task_summaries": [
                 item.prompt_data((recent_executions or {}).get(item.task_id, ()))
-                for item in recent_task_summaries
+                for item in visible_task_summaries
             ],
             "historical_investigation": {
                 "instruction": (
@@ -574,31 +559,30 @@ class SessionContextProjector:
                     "resource_ref and grants no access; pass the canonical path to a "
                     "read tool and let Runtime request current-Task approval."
                 ),
-                # Keep only references belonging to Tasks represented in the
-                # recent message window. Older locations remain durable and can
-                # later feed compaction without bloating every prompt.
                 "resources": [item.to_data() for item in projection.resource_catalog
-                              if item.source_task_id in recent_task_ids
+                              if item.source_task_id in visible_task_ids
                               and (active_checkpoint is None or
                                    item.source_task_id != active_checkpoint.task_id)],
                 "questions": [item.to_data() for item in projection.question_catalog
-                              if item.source_task_id in recent_task_ids
+                              if item.source_task_id in visible_task_ids
                               and (active_checkpoint is None or
                                    item.source_task_id != active_checkpoint.task_id)],
             },
             "earlier_summary": {
-                "algorithm": "deterministic-task-handoff-v1",
+                "algorithm": "provider-budget-managed-session-v2",
                 "revision": projection.revision,
                 "content_hash": summary_hash,
                 "source_event_sequences": list(summary_sources),
                 "source_event_ranges": [
                     list(item) for item in summary_source_ranges
                 ],
-                "message_count": len(older),
-                "tasks": summary,
-                "omitted_task_count": omitted_tasks,
+                "message_count": 0,
+                "tasks": [],
+                "omitted_task_count": 0,
             },
-            "recent_messages": [message.source_data() for message in recent],
+            "recent_messages": [
+                message.source_data() for message in visible_messages
+            ],
         }
         body = json.dumps(
             body_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -613,7 +597,7 @@ class SessionContextProjector:
         )
         return SessionPromptProjection(
             message, projection.revision, projection.content_hash,
-            projection.source_event_sequences, len(recent), len(older),
+            projection.source_event_sequences, len(visible_messages), 0,
             projection.revision, summary_hash, summary_sources,
             summary_source_ranges,
         )
@@ -635,49 +619,20 @@ class SessionContextProjector:
         ranges.append((start, previous))
         return tuple(ranges)
 
-    def _recent_messages(
-        self, messages: tuple[SessionConversationMessage, ...],
-    ) -> tuple[SessionConversationMessage, ...]:
-        selected: list[SessionConversationMessage] = []
-        characters = 0
-        for message in reversed(messages):
-            if len(selected) >= self.recent_message_limit:
-                break
-            size = len(message.text)
-            if selected and characters + size > self.max_recent_characters:
-                break
-            selected.append(message)
-            characters += size
-        return tuple(reversed(selected))
-
-    def _recent_task_summaries(
-        self, recent_messages: tuple[SessionConversationMessage, ...],
-        task_summaries: tuple[SessionTaskSummary, ...],
-    ) -> tuple[SessionTaskSummary, ...]:
-        """Return summaries for Tasks actually present in recent conversation.
-
-        This is a deterministic join, not an intent classifier or historical
-        candidate search. If the recent window mentions more Tasks than the
-        configured bound, the most recent distinct Tasks win while their
-        chronological order is preserved for the model.
-        """
-        by_task = {item.task_id: item for item in task_summaries}
-        task_ids: list[str] = []
-        for message in recent_messages:
-            if message.task_id in by_task and message.task_id not in task_ids:
-                task_ids.append(message.task_id)
-        selected_ids = task_ids[-self.recent_task_summary_limit:]
-        return tuple(by_task[task_id] for task_id in selected_ids)
-
     def recent_task_ids(
         self, projection: SessionConversationProjection, *,
         exclude_task_ids: Sequence[str] = (),
     ) -> tuple[str, ...]:
-        """Return the exact Task IDs whose summaries enter the prompt."""
+        """Return newest Tasks whose detailed Tool observations may enter."""
         excluded = set(exclude_task_ids)
-        return tuple(item.task_id for item in self._recent_task_summaries(
-            self._recent_messages(projection.messages), projection.task_summaries
-        ) if item.task_id not in excluded)
+        selected: list[str] = []
+        for message in reversed(projection.messages):
+            if message.task_id in excluded or message.task_id in selected:
+                continue
+            selected.append(message.task_id)
+            if len(selected) >= self.recent_execution_limit:
+                break
+        return tuple(reversed(selected))
 
     def project_recent_executions(
         self,
@@ -706,6 +661,61 @@ class SessionContextProjector:
                 self._execution_event(execution)
             )
         return {task_id: tuple(items) for task_id, items in projected.items()}
+
+    def _task_index(
+        self, projection: SessionConversationProjection,
+    ) -> list[dict[str, Any]]:
+        """Build one minimal, traceable directory entry for every Task.
+
+        The index is intentionally smaller than a Task summary, but it keeps the
+        facts most likely to be referenced later: identity, goal, state, concrete
+        artifacts, completed work, remaining work, and source Event sequences.
+        It is retained when the unified context manager compacts old detail.
+        """
+        messages_by_task: dict[str, list[SessionConversationMessage]] = {}
+        for message in projection.messages:
+            messages_by_task.setdefault(message.task_id, []).append(message)
+        resources_by_task: dict[str, list[str]] = {}
+        for resource in projection.resource_catalog:
+            if resource.resource_kind is not SessionResourceKind.ARTIFACT:
+                continue
+            resources_by_task.setdefault(resource.source_task_id, []).append(
+                resource.canonical_path
+            )
+        entries: list[dict[str, Any]] = []
+        for summary in projection.task_summaries:
+            artifacts = list(dict.fromkeys(
+                resources_by_task.get(summary.task_id, ())
+            ))
+            for mutation in summary.mutations:
+                path = mutation.get("path")
+                if isinstance(path, str) and path and path not in artifacts:
+                    artifacts.append(path)
+            task_messages = messages_by_task.get(summary.task_id, ())
+            entries.append({
+                "task_id": summary.task_id,
+                "goal": self._bounded_text(summary.goal, 500),
+                "status": summary.recorded_task_state,
+                "verification_status": summary.verification_status,
+                "artifacts": artifacts[:50],
+                "completed_work": self._bounded_texts(
+                    summary.completed_work, 10, 500
+                ),
+                "remaining_work": self._bounded_texts(
+                    summary.remaining_work, 10, 500
+                ),
+                "confirmed": [
+                    self._bounded_mapping(item) for item in summary.confirmed[:10]
+                ],
+                "outcomes": [
+                    self._bounded_mapping(item) for item in summary.outcomes[:10]
+                ],
+                "source_turn_id": summary.turn_id,
+                "source_event_sequences": sorted({
+                    item.source_event_sequence for item in task_messages
+                }),
+            })
+        return entries
 
     def _execution_event(
         self, execution: ToolExecutionRecord,
@@ -839,120 +849,6 @@ class SessionContextProjector:
             completed_work=cls._text_tuple(state.get("completed_work")),
             workspace_roots=roots,
         )
-
-    def _structured_earlier_summary(
-        self, messages: tuple[SessionConversationMessage, ...],
-        task_summaries: tuple[SessionTaskSummary, ...],
-        recent_task_ids: set[str],
-    ) -> tuple[list[dict[str, Any]], int]:
-        """Group older visible history into bounded engineering handoffs.
-
-        A Task that still appears in the recent window is deliberately omitted
-        here because its recent messages and recent_task_summaries already carry
-        the fresher state. This is deterministic compaction, not Task retrieval.
-        """
-        by_task = {item.task_id: item for item in task_summaries}
-        grouped: dict[str, list[SessionConversationMessage]] = {}
-        order: list[str] = []
-        for message in messages:
-            if message.task_id in recent_task_ids:
-                continue
-            if message.task_id not in grouped:
-                grouped[message.task_id] = []
-                order.append(message.task_id)
-            grouped[message.task_id].append(message)
-
-        candidates = order[-self.earlier_task_summary_limit:]
-        omitted = max(0, len(order) - len(candidates))
-        newest_first: list[dict[str, Any]] = []
-        used = 0
-        for index, task_id in enumerate(reversed(candidates)):
-            entry = self._earlier_task_entry(
-                task_id, grouped[task_id], by_task.get(task_id)
-            )
-            size = len(json.dumps(
-                entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ))
-            if newest_first and used + size > self.max_summary_characters:
-                # Entries are visited newest to oldest. Once the budget is
-                # full, stop instead of skipping one large recent Task and
-                # accidentally admitting a smaller but older Task.
-                omitted += len(candidates) - index
-                break
-            # Always keep one bounded Task so the summary cannot become empty
-            # solely because its first serialized entry crosses the soft limit.
-            newest_first.append(entry)
-            used += size
-        return list(reversed(newest_first)), omitted
-
-    def _earlier_task_entry(
-        self, task_id: str, messages: list[SessionConversationMessage],
-        summary: SessionTaskSummary | None,
-    ) -> dict[str, Any]:
-        user_messages = [
-            item for item in messages if item.role is MessageRole.USER
-        ]
-        assistant_messages = [
-            item for item in messages if item.role is MessageRole.ASSISTANT
-        ]
-        goal = (
-            summary.goal if summary is not None
-            else (user_messages[0].text if user_messages else "unknown historical Task")
-        )
-        entry: dict[str, Any] = {
-            "task_id": task_id,
-            "goal": self._bounded_text(goal, self.summary_item_characters),
-            "status": (
-                summary.recorded_task_state if summary is not None else "UNKNOWN"
-            ),
-            "verification_status": (
-                summary.verification_status if summary is not None else None
-            ),
-            "visible_result": (
-                self._bounded_text(
-                    assistant_messages[-1].text, self.summary_item_characters
-                )
-                if assistant_messages else None
-            ),
-            "completed_work": self._bounded_texts(
-                summary.completed_work if summary is not None else (), 10, 500
-            ),
-            "remaining_work": self._bounded_texts(
-                summary.remaining_work if summary is not None else (), 10, 500
-            ),
-            "important_locations": list(
-                (summary.workspace_roots if summary is not None else ())[:10]
-            ),
-            "tool_counts": (
-                {name: count for name, count in summary.tool_counts}
-                if summary is not None else {}
-            ),
-            "confirmed": [self._bounded_mapping(item) for item in (
-                summary.confirmed[:10] if summary is not None else ()
-            )],
-            "mutations": [self._bounded_mapping(item) for item in (
-                summary.mutations[:10] if summary is not None else ()
-            )],
-            "task_spec_revision": (
-                summary.task_spec_revision if summary is not None else 0
-            ),
-            "continuation_mode": (
-                summary.continuation_mode if summary is not None else "NONE"
-            ),
-            "outcomes": [self._bounded_mapping(item) for item in (
-                summary.outcomes if summary is not None else ()
-            )],
-            "source_turn_ids": list(dict.fromkeys(
-                item.turn_id for item in messages
-            ))[:10],
-            "source_event_sequences": sorted({
-                item.source_event_sequence for item in messages
-            }),
-        }
-        return {
-            key: value for key, value in entry.items()
-            if value not in (None, [], {}, ())
-        }
 
     @staticmethod
     def _bounded_text(value: str, limit: int) -> str:

@@ -13,7 +13,10 @@ from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.cli import (
     _chat, _chat_error_guidance, _resolve_session_input_with_progress,
 )
-from tsm_agt.core import ModelInvocationFailed, ProjectTrustLevel, TaskState
+from tsm_agt.core import (
+    ModelInvocationFailed, ProjectTrustLevel, SessionResumeCandidate,
+    SessionResumeSafety, TaskState,
+)
 from tsm_agt.ports import RuntimeStorePort
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, FinishReason, HealthState, HealthStatus,
@@ -220,6 +223,11 @@ class FixtureRuntimeInputClassifier:
         return {"intent": "STEER", "confidence": 0.99}
 
 
+class ReviewPendingActionClassifier(FixtureRuntimeInputClassifier):
+    async def classify_runtime_input(self, text, context):
+        return {"intent": "REVIEW_PENDING_ACTION", "confidence": 0.99}
+
+
 class FixtureRuntimeInputClassifier:
     descriptor = AdapterDescriptor(
         "fixture.runtime-input-classifier", "1.0",
@@ -240,6 +248,137 @@ class FixtureRuntimeInputClassifier:
 
 
 class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
+    async def test_continue_reviews_pending_approval_without_replanning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = ApprovalModel()
+            tool = ApprovalTool()
+            resolver = FixtureSessionInputResolver()
+            application = compose_fixture_application(
+                model_adapter=model, tool_adapters=(tool,),
+                session_input_resolver_adapter=resolver,
+                runtime_input_classifier_adapter=ReviewPendingActionClassifier(),
+                store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
+            )
+            await application.registry.start_all()
+            session = await application.kernel.create_session("approval review")
+            try:
+                task = await application.kernel.create_task(
+                    "original guarded work", root, session_id=session.session_id
+                )
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    task = await application.kernel.transition_task(
+                        task.task_id, state, state.value
+                    )
+                await application.kernel.run_agent_turn(task.task_id, task.goal)
+                self.assertEqual(tool.invocations, 0)
+            finally:
+                await application.registry.stop_all()
+
+            output: list[str] = []
+            result = await _chat(
+                root, session_id=session.session_id,
+                input_fn=ScriptedInput(["继续", "y", "/exit"]),
+                output_fn=output.append, application_factory=lambda: application,
+            )
+            self.assertEqual(result, 0)
+            self.assertEqual(tool.invocations, 1)
+            self.assertIn("approval required", output)
+            self.assertTrue(any(
+                "已记录明确的审批决定" in line for line in output
+            ), output)
+            self.assertFalse(any(
+                "已取消尚未执行的旧审批动作" in line for line in output
+            ), output)
+            await application.registry.start_all()
+            try:
+                restored = await application.kernel.get_task(task.task_id)
+                self.assertEqual(restored.state, TaskState.SUCCEEDED)
+                events = await application.kernel.dependencies.store.read_events(
+                    task.task_id
+                )
+                self.assertFalse(any(
+                    event.event_type == "approval.resolved"
+                    and event.payload.get("decision") == "superseded"
+                    for event in events
+                ))
+            finally:
+                await application.registry.stop_all()
+    async def test_restored_approval_can_continue_by_superseding_old_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = ApprovalModel()
+            tool = ApprovalTool()
+            resolver = FixtureSessionInputResolver()
+            application = compose_fixture_application(
+                model_adapter=model, tool_adapters=(tool,),
+                session_input_resolver_adapter=resolver,
+                runtime_input_classifier_adapter=FixtureRuntimeInputClassifier(),
+                store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
+            )
+            await application.registry.start_all()
+            session = await application.kernel.create_session("approval resume")
+            try:
+                task = await application.kernel.create_task(
+                    "original guarded work", root, session_id=session.session_id
+                )
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    task = await application.kernel.transition_task(
+                        task.task_id, state, state.value
+                    )
+                suspended = await application.kernel.run_agent_turn(
+                    task.task_id, task.goal
+                )
+                self.assertEqual(
+                    (await application.kernel.get_task(task.task_id)).state,
+                    TaskState.AWAITING_APPROVAL,
+                )
+                self.assertEqual(tool.invocations, 0)
+                await application.kernel.request_session_task_choice(
+                    session.session_id,
+                    (SessionResumeCandidate(
+                        task.task_id, task.goal, TaskState.AWAITING_APPROVAL.value,
+                        str(root), SessionResumeSafety.AWAIT_USER_ACTION,
+                        "explicit_approval_decision_required",
+                    ),),
+                    (
+                        "旧模型提示：1）继续原方案；2）修改范围。"
+                        "这段文案不应污染下一次语义路由。"
+                    ),
+                )
+            finally:
+                await application.registry.stop_all()
+
+            output: list[str] = []
+            result = await _chat(
+                root, session_id=session.session_id,
+                input_fn=ScriptedInput(["继续，但按最新要求重新规划", "/exit"]),
+                output_fn=output.append, application_factory=lambda: application,
+            )
+            self.assertEqual(result, 0)
+            self.assertEqual(tool.invocations, 0)
+            self.assertTrue(any(
+                "已取消尚未执行的旧审批动作" in line for line in output
+            ), output)
+            self.assertFalse(any(
+                "旧模型提示" in line for line in output
+            ), output)
+            await application.registry.start_all()
+            try:
+                restored = await application.kernel.get_task(task.task_id)
+                self.assertEqual(restored.state, TaskState.SUCCEEDED)
+                self.assertIsNone(restored.pending_approval)
+            finally:
+                await application.registry.stop_all()
+
     async def test_clarify_then_fourth_choice_does_not_call_resolver_twice(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

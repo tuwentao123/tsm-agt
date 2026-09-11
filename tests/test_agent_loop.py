@@ -330,6 +330,28 @@ class RiskyToolProvider:
         return ToolResult(call.call_id, True, data={"changed": call.arguments["text"]})
 
 
+class ApprovalSteeringClassifier:
+    """Fixture semantic router; it proposes intent but grants no authority."""
+
+    descriptor = AdapterDescriptor(
+        "fixture.approval-steering-classifier", "1.0",
+        "RuntimeInputClassifierPort", "1.0",
+    )
+
+    async def start(self, context) -> None:
+        pass
+
+    async def health(self):
+        from tsm_agt.ports import HealthState, HealthStatus
+        return HealthStatus(HealthState.HEALTHY)
+
+    async def stop(self, deadline) -> None:
+        pass
+
+    async def classify_runtime_input(self, text, context):
+        return {"intent": "STEER", "confidence": 0.99}
+
+
 class SlowUnsafeToolProvider(RiskyToolProvider):
     descriptor = AdapterDescriptor(
         adapter_id="fixture.agent-slow-unsafe-tool",
@@ -356,6 +378,73 @@ class SlowUnsafeToolProvider(RiskyToolProvider):
 
 
 class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
+    async def test_new_direction_supersedes_pending_approval_without_approving_it(self):
+        model = RiskyToolCallingModel()
+        provider = RiskyToolProvider()
+        application = compose_fixture_application(
+            model_adapter=model, tool_adapters=(provider,),
+            runtime_input_classifier_adapter=ApprovalSteeringClassifier(),
+        )
+        await application.registry.start_all()
+        temp_dir = tempfile.TemporaryDirectory()
+        try:
+            task = await application.kernel.create_task(
+                "perform guarded effect", Path(temp_dir.name)
+            )
+            for state in (
+                TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                TaskState.EXECUTING,
+            ):
+                task = await application.kernel.transition_task(
+                    task.task_id, state, state.value
+                )
+            approval = await application.kernel.run_agent_turn(
+                task.task_id, "perform the original work"
+            )
+            self.assertIsInstance(approval, AgentTurnSuspended)
+            assert isinstance(approval, AgentTurnSuspended)
+            self.assertEqual(provider.invocation_count, 0)
+
+            route = await application.kernel.route_runtime_input(
+                task.task_id, "change the remaining direction", "new-direction"
+            )
+            self.assertTrue(route.applied)
+            current = await application.kernel.get_task(task.task_id)
+            self.assertEqual(current.state, TaskState.EXECUTING)
+            self.assertIsNone(current.pending_approval)
+            self.assertEqual(provider.invocation_count, 0)
+            with self.assertRaises(ApprovalNotPending):
+                await application.kernel.resolve_agent_approval(
+                    approval.approval_request_id, ApprovalDecision.APPROVE,
+                    "stale approval must not execute",
+                )
+
+            completed = await application.kernel.resume_checkpointed_agent_turn(
+                task.task_id
+            )
+            self.assertIsInstance(completed, AgentTurnResult)
+            self.assertEqual(provider.invocation_count, 0)
+            self.assertIn(
+                "ACTION_SUPERSEDED", completed.assistant_message.text
+            )
+            events = await application.kernel.dependencies.store.read_events(
+                task.task_id
+            )
+            resolution = next(
+                event for event in events
+                if event.event_type == "approval.resolved"
+            )
+            self.assertEqual(resolution.payload["decision"], "superseded")
+            queued = next(
+                event for event in events
+                if event.event_type == "steering.queued"
+            )
+            self.assertEqual(queued.payload["text"], "change the remaining direction")
+        finally:
+            temp_dir.cleanup()
+            await application.registry.stop_all()
+
     async def test_unknown_outcome_stops_batch_until_explicit_reconciliation(self):
         model = TwoUnsafeCallsThenFinishModel()
         provider = SlowUnsafeToolProvider()

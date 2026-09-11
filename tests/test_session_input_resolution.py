@@ -192,6 +192,97 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model.requests[-1].purpose.value, "SESSION_ROUTING")
         self.assertEqual(model.requests[-1].timeout_seconds, 15.0)
         self.assertEqual(model.requests[-1].max_provider_attempts, 1)
+        system_text = model.requests[-1].messages[0].text
+        self.assertIn(
+            "Any supplied unfinished candidate may therefore be selected",
+            system_text,
+        )
+        self.assertNotIn(
+            "Only candidates whose safety is EXACT_RESUME", system_text
+        )
+
+    async def test_awaiting_user_action_candidate_can_be_selected_as_context(self):
+        resolver = FixtureResolver({
+            "action": "RESUME_TASK", "task_id": "task-awaiting",
+            "input_grounding": "CONTEXT_DEPENDENT",
+            "confidence": 0.99, "reason_code": "pending_task_reference",
+            "clarification": None,
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+                session_input_resolver_adapter=resolver,
+            )
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("awaiting selection")
+                candidate = SessionResumeCandidate(
+                    "task-awaiting", "pending goal", "AWAITING_APPROVAL",
+                    str(root), SessionResumeSafety.AWAIT_USER_ACTION,
+                    "explicit_approval_decision_required",
+                )
+                with patch.object(
+                    app.kernel, "list_session_resume_candidates",
+                    AsyncMock(return_value=(candidate,)),
+                ):
+                    decision = await app.kernel.resolve_session_input(
+                        session.session_id, "continue pending work", root
+                    )
+                self.assertEqual(decision.action, SessionInputAction.RESUME_TASK)
+                self.assertEqual(decision.task_id, "task-awaiting")
+                self.assertEqual(
+                    decision.candidates[0].safety,
+                    SessionResumeSafety.AWAIT_USER_ACTION,
+                )
+            finally:
+                await app.registry.stop_all()
+
+    async def test_old_clarification_prose_is_not_replayed_to_semantic_resolver(self):
+        resolver = FixtureResolver({
+            "action": "RESUME_TASK", "task_id": "task-awaiting",
+            "input_grounding": "CONTEXT_DEPENDENT",
+            "confidence": 0.99, "reason_code": "pending_task_reference",
+            "clarification": None,
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+                session_input_resolver_adapter=resolver,
+            )
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("stale prompt isolation")
+                candidate = SessionResumeCandidate(
+                    "task-awaiting", "pending goal", "AWAITING_APPROVAL",
+                    str(root), SessionResumeSafety.AWAIT_USER_ACTION,
+                    "explicit_approval_decision_required",
+                )
+                stale_prompt = (
+                    "old model prose: choose 1 to continue or 2 to change scope"
+                )
+                await app.kernel.request_session_task_choice(
+                    session.session_id, (candidate,), stale_prompt
+                )
+                with patch.object(
+                    app.kernel, "list_session_resume_candidates",
+                    AsyncMock(return_value=(candidate,)),
+                ):
+                    decision = await app.kernel.resolve_session_input(
+                        session.session_id, "continue with a narrower scope", root
+                    )
+                self.assertEqual(decision.action, SessionInputAction.RESUME_TASK)
+                routed_context = resolver.inputs[-1][1]
+                pending = routed_context["pending_interaction"]
+                self.assertNotIn("prompt", pending)
+                self.assertNotIn("label", pending["options"][0])
+                self.assertNotIn(stale_prompt, json.dumps(pending))
+                self.assertEqual(
+                    pending["options"][0]["target_id"], "task-awaiting"
+                )
+            finally:
+                await app.registry.stop_all()
 
     async def test_context_dependent_input_cannot_become_new_task(self):
         app, session, _resolver, decision = (

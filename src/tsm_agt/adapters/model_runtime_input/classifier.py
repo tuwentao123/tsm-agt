@@ -52,7 +52,14 @@ class ModelRuntimeInputClassifier:
                 "to the same Task, REPLACE when it changes the current goal, "
                 "NEW_TASK_AFTER_CURRENT when it requests independent later work, "
                 "or STATUS_QUERY when it only asks about execution state. Do not "
-                "infer approval, permission, or tool safety. Return exactly one "
+                "infer approval, permission, or tool safety. When an approval is "
+                "pending, choose REVIEW_PENDING_ACTION when the user only wants "
+                "to continue or revisit the current blocked step without changing "
+                "the goal. This only asks Runtime to show the exact pending action "
+                "again; it is never approval. Choose STEER or REPLACE only when "
+                "the user actually adds constraints, narrows scope, or changes the "
+                "goal. Ordinary text can never approve the pending action. Return "
+                "exactly one "
                 "JSON object with intent and confidence (0..1)."
             ),),
         )

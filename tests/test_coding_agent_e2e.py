@@ -287,8 +287,8 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
 
                 # Push the completed coding Task outside the recent-message
                 # window. Its engineering handoff must then move into the
-                # structured earlier summary instead of degrading to clipped
-                # chat text.
+                # the durable Task index instead of degrading to clipped chat
+                # text before Provider-budget compaction is required.
                 for index in range(6):
                     follow_up = await second.kernel.create_task(
                         f"follow-up {index}", root,
@@ -318,15 +318,12 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
                 assert prompt.message is not None
                 prompt_body = json.loads(prompt.message.text)
                 historical = next(
-                    item for item in prompt_body["earlier_summary"]["tasks"]
+                    item for item in prompt_body["task_index"]
                     if item["task_id"] == task.task_id
                 )
                 self.assertEqual(historical["status"], "SUCCEEDED")
                 self.assertEqual(historical["verification_status"], "passed")
-                self.assertEqual(
-                    [item["path"] for item in historical["mutations"]],
-                    ["calc.py"],
-                )
+                self.assertIn("calc.py", historical["artifacts"])
 
                 events = await second.registry.require(
                     RuntimeStorePort
