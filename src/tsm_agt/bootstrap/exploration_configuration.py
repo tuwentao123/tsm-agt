@@ -12,6 +12,9 @@ EXPLORATION_ENV_NAMES = (
     "TSM_AGT_AGENT_MAX_MODEL_CALLS",
     "TSM_AGT_AGENT_MAX_TOOL_CALLS",
     "TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS",
+    "TSM_AGT_AGENT_EXECUTION_RESERVE_MODEL_CALLS",
+    "TSM_AGT_AGENT_RECOVERY_RESERVE_MODEL_CALLS",
+    "TSM_AGT_AGENT_VERIFICATION_RESERVE_MODEL_CALLS",
     "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS",
     "TSM_AGT_EXPLORATION_MAX_ACTIONS",
     "TSM_AGT_EXPLORATION_MAX_TOOL_SECONDS",
@@ -28,6 +31,9 @@ class ExplorationBudgetConfiguration:
     agent_max_model_calls: int = 15
     agent_max_tool_calls: int = 40
     finalization_model_calls: int = 2
+    execution_reserve_model_calls: int = 1
+    recovery_reserve_model_calls: int = 1
+    verification_reserve_model_calls: int = 1
     max_tool_calls: int = 24
     max_actions: int = 24
     max_tool_seconds: int = 120
@@ -41,6 +47,9 @@ class ExplorationBudgetConfiguration:
         values = (
             self.agent_max_model_calls, self.agent_max_tool_calls,
             self.finalization_model_calls,
+            self.execution_reserve_model_calls,
+            self.recovery_reserve_model_calls,
+            self.verification_reserve_model_calls,
             self.max_tool_calls, self.max_actions, self.max_tool_seconds,
             self.low_value_streak, self.reserve_tool_calls, self.minimum_actions,
         )
@@ -55,6 +64,17 @@ class ExplorationBudgetConfiguration:
             raise ValueError(
                 "TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS must be smaller than "
                 "TSM_AGT_AGENT_MAX_MODEL_CALLS"
+            )
+        if (
+            self.finalization_model_calls
+            + self.execution_reserve_model_calls
+            + self.recovery_reserve_model_calls
+            + self.verification_reserve_model_calls
+            >= self.agent_max_model_calls
+        ):
+            raise ValueError(
+                "Agent execution, recovery, verification and finalization reserves "
+                "must leave at least one normal model call"
             )
         if self.reserve_tool_calls >= self.max_tool_calls:
             raise ValueError(
@@ -87,6 +107,9 @@ class ExplorationBudgetConfiguration:
             "agent_max_model_calls": self.agent_max_model_calls,
             "agent_max_tool_calls": self.agent_max_tool_calls,
             "finalization_model_calls": self.finalization_model_calls,
+            "execution_reserve_model_calls": self.execution_reserve_model_calls,
+            "recovery_reserve_model_calls": self.recovery_reserve_model_calls,
+            "verification_reserve_model_calls": self.verification_reserve_model_calls,
             "max_tool_calls": self.max_tool_calls,
             "max_actions": self.max_actions,
             "max_tool_seconds": self.max_tool_seconds,
@@ -101,6 +124,9 @@ _FIELD_BY_ENV = {
     "TSM_AGT_AGENT_MAX_MODEL_CALLS": "agent_max_model_calls",
     "TSM_AGT_AGENT_MAX_TOOL_CALLS": "agent_max_tool_calls",
     "TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS": "finalization_model_calls",
+    "TSM_AGT_AGENT_EXECUTION_RESERVE_MODEL_CALLS": "execution_reserve_model_calls",
+    "TSM_AGT_AGENT_RECOVERY_RESERVE_MODEL_CALLS": "recovery_reserve_model_calls",
+    "TSM_AGT_AGENT_VERIFICATION_RESERVE_MODEL_CALLS": "verification_reserve_model_calls",
     "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS": "max_tool_calls",
     "TSM_AGT_EXPLORATION_MAX_ACTIONS": "max_actions",
     "TSM_AGT_EXPLORATION_MAX_TOOL_SECONDS": "max_tool_seconds",

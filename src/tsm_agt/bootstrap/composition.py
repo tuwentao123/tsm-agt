@@ -368,6 +368,15 @@ def _kernel_dependencies(
         default_max_tool_calls=int(budget.get("agent_max_tool_calls", 40)),
         default_max_output_tokens=default_max_output_tokens,
         finalization_model_calls=int(budget.get("finalization_model_calls", 2)),
+        execution_reserve_model_calls=int(
+            budget.get("execution_reserve_model_calls", 1)
+        ),
+        recovery_reserve_model_calls=int(
+            budget.get("recovery_reserve_model_calls", 1)
+        ),
+        verification_reserve_model_calls=int(
+            budget.get("verification_reserve_model_calls", 1)
+        ),
         context_manager=context_manager or ContextWindowManager(),
         require_evidence_questions=require_evidence_questions,
     )

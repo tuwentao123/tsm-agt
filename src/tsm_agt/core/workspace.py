@@ -172,6 +172,7 @@ class MutationRecord:
 
 @dataclass(frozen=True, slots=True)
 class PreparedWorkspaceMutation:
+    workspace: Path
     path: Path
     relative_path: str
     operation: MutationOperation
@@ -181,6 +182,7 @@ class PreparedWorkspaceMutation:
     after_bytes: bytes
     previous_mode: int | None
     result_mode: int | None
+    parent_directories: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,8 +358,12 @@ def prepare_workspace_bytes_write(
 ) -> PreparedWorkspaceMutation:
     if not isinstance(content, bytes):
         raise TypeError("workspace content must be bytes")
-    _root, path, normalized = _resolve_mutation_path(
-        workspace, relative_path, path_service
+    resolver = (
+        path_service.resolve_create_path
+        if expected_hash is None else path_service.resolve_mutation_path
+    )
+    root, path, normalized = _resolve_mutation_path(
+        workspace, relative_path, path_service, resolver=resolver
     )
     if path.is_symlink():
         raise PermissionError("workspace mutation cannot replace a symlink")
@@ -381,9 +387,10 @@ def prepare_workspace_bytes_write(
     if len(after_bytes) > _MAX_FILE_BYTES:
         raise ValueError(f"workspace mutation exceeds {_MAX_FILE_BYTES} byte limit")
     return PreparedWorkspaceMutation(
-        path, normalized, operation, actual_hash, before_bytes,
+        root, path, normalized, operation, actual_hash, before_bytes,
         _hash_bytes(after_bytes), after_bytes, previous_mode,
         previous_mode if result_mode is None else result_mode,
+        _workspace_parent_chain(root, path.parent),
     )
 
 
@@ -413,13 +420,18 @@ def prepare_workspace_file_delete(
 
 def commit_prepared_workspace_mutation(
     mutation: PreparedWorkspaceMutation, filesystem: WorkspaceFilesystemPort,
-) -> None:
+) -> tuple[Path, ...]:
+    """Commit one file and return parent directories created by this call."""
     _assert_precondition(mutation)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{mutation.path.name}.tsm-agt-", dir=mutation.path.parent
+    created_directories = _ensure_workspace_parent_directories(
+        mutation, filesystem
     )
-    temporary = Path(temporary_name)
+    temporary: Path | None = None
     try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{mutation.path.name}.tsm-agt-", dir=mutation.path.parent
+        )
+        temporary = Path(temporary_name)
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(mutation.after_bytes)
             stream.flush()
@@ -429,14 +441,23 @@ def commit_prepared_workspace_mutation(
         _assert_precondition(mutation)
         filesystem.replace(temporary, mutation.path)
         filesystem.sync_directory(mutation.path.parent)
-    finally:
+        if file_sha256(mutation.path) != mutation.after_hash:
+            raise OSError(
+                "workspace mutation verification failed after atomic replace"
+            )
+    except Exception:
+        if temporary is not None:
+            _remove_temporary_file(temporary, filesystem)
+        _remove_created_parent_directories(created_directories, filesystem)
+        raise
+    if temporary is not None:
         _remove_temporary_file(temporary, filesystem)
-    if file_sha256(mutation.path) != mutation.after_hash:
-        raise OSError("workspace mutation verification failed after atomic replace")
+    return created_directories
 
 
 def restore_prepared_workspace_mutation(
     mutation: PreparedWorkspaceMutation, filesystem: WorkspaceFilesystemPort,
+    created_directories: tuple[Path, ...] = (),
 ) -> None:
     current_hash = file_sha256(mutation.path)
     if current_hash != mutation.after_hash:
@@ -446,6 +467,7 @@ def restore_prepared_workspace_mutation(
     if mutation.before_bytes is None:
         filesystem.unlink(mutation.path)
         filesystem.sync_directory(mutation.path.parent)
+        _remove_created_parent_directories(created_directories, filesystem)
         return
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{mutation.path.name}.tsm-agt-restore-", dir=mutation.path.parent
@@ -462,6 +484,68 @@ def restore_prepared_workspace_mutation(
         filesystem.sync_directory(mutation.path.parent)
     finally:
         _remove_temporary_file(temporary, filesystem)
+    _remove_created_parent_directories(created_directories, filesystem)
+
+
+def _workspace_parent_chain(root: Path, parent: Path) -> tuple[Path, ...]:
+    """Return all lexical parents below the workspace, shallowest first."""
+    relative = parent.relative_to(root)
+    current = root
+    result: list[Path] = []
+    for part in relative.parts:
+        current = current / part
+        result.append(current)
+    return tuple(result)
+
+
+def _ensure_workspace_parent_directories(
+    mutation: PreparedWorkspaceMutation, filesystem: WorkspaceFilesystemPort,
+) -> tuple[Path, ...]:
+    """Create safe missing parents and track exactly which directories we own."""
+    created: list[Path] = []
+    try:
+        for directory in mutation.parent_directories:
+            if directory.is_symlink():
+                raise PermissionError(
+                    "workspace mutation parent cannot contain a link-like path"
+                )
+            if directory.exists():
+                if not directory.is_dir():
+                    raise ValueError(
+                        "workspace mutation parent is not a directory"
+                    )
+                continue
+            try:
+                filesystem.make_directory(directory)
+            except FileExistsError:
+                if directory.is_symlink() or not directory.is_dir():
+                    raise PermissionError(
+                        "workspace mutation parent was replaced concurrently"
+                    )
+            else:
+                created.append(directory)
+                filesystem.sync_directory(directory.parent)
+        return tuple(created)
+    except Exception:
+        _remove_created_parent_directories(tuple(created), filesystem)
+        raise
+
+
+def _remove_created_parent_directories(
+    directories: tuple[Path, ...], filesystem: WorkspaceFilesystemPort,
+) -> None:
+    """Remove only transaction-created directories that remain empty."""
+    for directory in reversed(directories):
+        if directory.is_symlink():
+            continue
+        try:
+            filesystem.remove_directory(directory)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            # Concurrent content now owns this directory; retaining it is safe.
+            continue
+        filesystem.sync_directory(directory.parent)
 
 
 def commit_prepared_workspace_deletion(
@@ -717,9 +801,16 @@ def workspace_mutation_lock_key(
 ) -> str:
     """Return one canonical lock key for a workspace mutation target."""
 
-    _resolve_mutation_path(workspace, relative_path, path_service)
-    resolved = path_service.resolve_mutation_path(workspace, relative_path)
-    return resolved.canonical_key
+    # Lock identity must also exist before a CREATE's parents do. The create
+    # resolver provides a stable lexical identity while enforcing containment
+    # and link checks; the later prepare step still selects create vs modify.
+    _root, _path, _normalized = _resolve_mutation_path(
+        workspace, relative_path, path_service,
+        resolver=path_service.resolve_create_path,
+    )
+    return path_service.resolve_create_path(
+        workspace, os.path.normpath(relative_path)
+    ).canonical_key
 
 
 def workspace_mutation_lock_file(
@@ -737,6 +828,7 @@ def workspace_mutation_lock_file(
 
 def _resolve_mutation_path(
     workspace: Path, relative_path: str, path_service: WorkspacePathPort,
+    *, resolver=None,
 ) -> tuple[Path, Path, str]:
     if not relative_path or "\x00" in relative_path:
         raise ValueError("workspace path must not be empty or contain NUL")
@@ -747,7 +839,9 @@ def _resolve_mutation_path(
         or (lexical.parts and lexical.parts[0] in {".git", ".agent"})
     ):
         raise PermissionError("sensitive or runtime paths cannot be mutated")
-    resolved = path_service.resolve_mutation_path(workspace, relative_path)
+    resolved = (resolver or path_service.resolve_mutation_path)(
+        workspace, lexical.as_posix()
+    )
     normalized = Path(resolved.relative_path)
     if (
         _is_sensitive(normalized)

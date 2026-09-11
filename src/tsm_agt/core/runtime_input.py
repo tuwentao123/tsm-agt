@@ -25,6 +25,7 @@ class SessionResumeSafety(StrEnum):
     """How Runtime may use one durable Task checkpoint."""
 
     EXACT_RESUME = "EXACT_RESUME"
+    RECONCILE_REQUIRED = "RECONCILE_REQUIRED"
     REBASE_REQUIRED = "REBASE_REQUIRED"
     AWAIT_USER_ACTION = "AWAIT_USER_ACTION"
     REQUIRES_VALIDATION = "REQUIRES_VALIDATION"

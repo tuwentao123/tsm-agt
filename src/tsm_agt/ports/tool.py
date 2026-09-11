@@ -66,6 +66,22 @@ class ToolProtocol(StrEnum):
     BACKGROUND_CAPABLE = "background_capable"
 
 
+class ToolRecoveryKind(StrEnum):
+    """Machine-readable recovery semantics for a failed tool invocation.
+
+    The producer that understands the failure assigns the category. The Agent
+    loop consumes it without parsing human error text or choosing a business
+    action on the model's behalf.
+    """
+
+    NONE = "none"
+    RETRY_SAME = "retry_same"
+    RETRY_AFTER_STATE_CHANGE = "retry_after_state_change"
+    USER_ACTION_REQUIRED = "user_action_required"
+    TERMINAL = "terminal"
+    UNKNOWN_OUTCOME = "unknown_outcome"
+
+
 @dataclass(frozen=True, slots=True)
 class EvidenceQuestion:
     """The concrete unknown that one model-requested tool call should resolve."""
@@ -255,6 +271,8 @@ class ToolResult:
     message: str | None = None
     hint: str | None = None
     retryable: bool = False
+    recovery_kind: ToolRecoveryKind = ToolRecoveryKind.NONE
+    recovery_action: Mapping[str, Any] = field(default_factory=dict)
     truncated: bool = False
     meta: Mapping[str, Any] = field(default_factory=dict)
 
@@ -265,9 +283,24 @@ class ToolResult:
             raise ValueError("successful tool result cannot have an error_code")
         if not self.ok and not self.error_code:
             raise ValueError("failed tool result must have an error_code")
+        if self.ok and self.recovery_kind is not ToolRecoveryKind.NONE:
+            raise ValueError("successful tool result cannot require recovery")
+        if self.ok and self.recovery_action:
+            raise ValueError("successful tool result cannot have a recovery action")
+
+    @property
+    def effective_recovery_kind(self) -> ToolRecoveryKind:
+        """Interpret legacy retryable results without breaking old adapters."""
+        if self.recovery_kind is not ToolRecoveryKind.NONE:
+            return self.recovery_kind
+        if self.error_code == "UNKNOWN_OUTCOME":
+            return ToolRecoveryKind.UNKNOWN_OUTCOME
+        if self.retryable:
+            return ToolRecoveryKind.RETRY_SAME
+        return ToolRecoveryKind.NONE if self.ok else ToolRecoveryKind.TERMINAL
 
     def to_data(self) -> dict[str, Any]:
-        return {
+        result = {
             "call_id": self.call_id,
             "ok": self.ok,
             "data": self.data,
@@ -278,12 +311,20 @@ class ToolResult:
             "truncated": self.truncated,
             "meta": dict(self.meta),
         }
+        if not self.ok:
+            result["recovery_kind"] = self.effective_recovery_kind.value
+            if self.recovery_action:
+                result["recovery_action"] = dict(self.recovery_action)
+        return result
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> ToolResult:
         meta = data.get("meta", {})
         if not isinstance(meta, Mapping):
             raise ValueError("tool result meta must be an object")
+        recovery_action = data.get("recovery_action", {})
+        if not isinstance(recovery_action, Mapping):
+            raise ValueError("tool result recovery_action must be an object")
         return cls(
             call_id=str(data["call_id"]),
             ok=bool(data["ok"]),
@@ -294,6 +335,10 @@ class ToolResult:
             message=(str(data["message"]) if data.get("message") is not None else None),
             hint=str(data["hint"]) if data.get("hint") is not None else None,
             retryable=bool(data.get("retryable", False)),
+            recovery_kind=ToolRecoveryKind(
+                str(data.get("recovery_kind", "none"))
+            ),
+            recovery_action=dict(recovery_action),
             truncated=bool(data.get("truncated", False)),
             meta=dict(meta),
         )

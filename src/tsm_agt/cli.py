@@ -1271,6 +1271,14 @@ async def _chat(
                         "重新组装上下文；不会重放旧工具调用。"
                     )
                     output_fn(f"[恢复] 升级差异：{reasons}")
+                elif (
+                    continuation.resume_safety
+                    is SessionResumeSafety.RECONCILE_REQUIRED
+                ):
+                    output_fn(
+                        "[恢复] 检测到事件日志已领先于旧断点；将复用已经"
+                        "提交的工具结果并刷新执行现场，不会重复运行工具。"
+                    )
                 if explicit_resume_task is None:
                     await application.kernel.queue_steering(
                         task.task_id, SteeringKind.STEER,

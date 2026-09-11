@@ -44,6 +44,16 @@ class PosixWorkspaceFilesystem:
         self._require_started()
         path.unlink()
 
+    def make_directory(self, path: Path) -> None:
+        """Create exactly one directory; the core validates its location."""
+        self._require_started()
+        path.mkdir()
+
+    def remove_directory(self, path: Path) -> None:
+        """Remove exactly one empty directory."""
+        self._require_started()
+        path.rmdir()
+
     def sync_directory(self, directory: Path) -> None:
         self._require_started()
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)

@@ -56,6 +56,12 @@ class WorkspacePathPort(RuntimeAdapter, Protocol):
         self, workspace: Path, relative_path: str,
     ) -> ResolvedWorkspacePath: ...
 
+    def resolve_create_path(
+        self, workspace: Path, relative_path: str,
+    ) -> ResolvedWorkspacePath:
+        """Resolve a file-creation path whose ordinary parents may be missing."""
+        ...
+
     def resolve_access_path(
         self, workspace: Path, relative_path: str,
     ) -> ResolvedWorkspacePath: ...

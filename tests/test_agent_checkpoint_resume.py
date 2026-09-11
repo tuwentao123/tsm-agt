@@ -4,6 +4,7 @@ import asyncio
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from tsm_agt.adapters.fixture import EchoModelProvider, EchoToolProvider
@@ -17,7 +18,7 @@ from tsm_agt.core.configuration import canonical_hash
 from tsm_agt.ports import (
     AdapterDescriptor, FinishReason, Message, MessageRole, ModelRequest,
     ModelResponse, ModelUsage, ProviderCapabilities, RuntimeStorePort, TextBlock,
-    ToolCall, ToolCallBlock, ToolResultBlock,
+    EvidenceQuestion, ToolCall, ToolCallBlock, ToolResultBlock,
 )
 
 
@@ -91,6 +92,39 @@ class UpgradedRestartableModel(RestartableToolModel):
         )
 
 
+class EvidenceCheckpointModel(RestartableToolModel):
+    """Expose the commit-to-checkpoint crash window deterministically."""
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        self.invocation_count += 1
+        result = next((
+            block.result
+            for message in request.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock)
+        ), None)
+        if self.block_after_tool and result is not None:
+            self.entered.set()
+            await asyncio.Event().wait()
+        if result is None:
+            return ModelResponse(
+                Message(
+                    "assistant-evidence-tool", MessageRole.ASSISTANT,
+                    (ToolCallBlock(ToolCall(
+                        "checkpoint-evidence-call", "fixture.echo",
+                        {"text": "durable-result"},
+                        EvidenceQuestion("Q1", "What did the tool return?"),
+                    )),),
+                ), FinishReason.TOOL_CALL, ModelUsage(1, 1),
+            )
+        return ModelResponse(
+            Message(
+                "assistant-evidence-final", MessageRole.ASSISTANT,
+                (TextBlock(f"resumed: {result.data['text']}"),),
+            ), FinishReason.STOP, ModelUsage(1, 1),
+        )
+
+
 class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
     async def _create_task(self, application, workspace: Path):
         task = await application.kernel.create_task(
@@ -151,6 +185,119 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("turn.resumed", [event.event_type for event in events])
             self.assertEqual(
                 sum(event.event_type == "tool.completed" for event in events), 1
+            )
+        finally:
+            await second.registry.stop_all()
+            temporary.cleanup()
+
+    async def test_restart_reconciles_event_log_ahead_of_checkpoint(self) -> None:
+        """Committed result/Evidence wins without replaying the Tool."""
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        database = root / "runtime.db"
+        first_model = EvidenceCheckpointModel(block_after_tool=True)
+        first_tool = CountingEchoTool()
+        first = compose_fixture_application(
+            model_adapter=first_model, tool_adapters=(first_tool,),
+            store_adapter=SQLiteRuntimeStore(database),
+            require_evidence_questions=True,
+        )
+        await first.registry.start_all()
+        task = await self._create_task(first, root)
+        running = asyncio.create_task(
+            first.kernel.run_agent_turn(task.task_id, "start")
+        )
+        await first_model.entered.wait()
+        running.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await running
+        await first.kernel.interrupt_agent_turn(
+            task.task_id, "crash after durable evidence event"
+        )
+        interrupted = await first.kernel.get_task(task.task_id)
+        assert interrupted.active_agent_checkpoint is not None
+        live = AgentTurnCheckpoint.from_data(
+            interrupted.active_agent_checkpoint
+        )
+        execution = next(iter(interrupted.tool_executions.values()))
+        live_evidence = dict(live.evidence_question_state)
+        stale_records = [dict(item) for item in live_evidence["records"]]
+        stale_records[0].update({
+            "status": "OPEN", "evidence_references": [],
+            "observation_kind": None, "blocking_reason": None,
+            "revision": stale_records[0]["revision"] - 1,
+            "updated_event_sequence": max(
+                0, stale_records[0]["updated_event_sequence"] - 1
+            ),
+        })
+        stale_evidence = {**live_evidence, "records": stale_records}
+        stale = replace(
+            live, revision=live.revision + 1,
+            messages=tuple(
+                message for message in live.messages
+                if not any(
+                    isinstance(block, ToolResultBlock)
+                    for block in message.content
+                )
+            ),
+            pending_tool_calls=(execution.call,), tool_calls=0,
+            evidence_question_state=stale_evidence,
+        )
+        await first.kernel._save_agent_checkpoint(
+            stale, "fixture-stale-after-event-commit"
+        )
+        self.assertEqual(first_tool.invocation_count, 1)
+        await first.registry.stop_all()
+
+        second_model = EvidenceCheckpointModel()
+        second_tool = CountingEchoTool()
+        second = compose_fixture_application(
+            model_adapter=second_model, tool_adapters=(second_tool,),
+            store_adapter=SQLiteRuntimeStore(database),
+            require_evidence_questions=True,
+        )
+        await second.registry.start_all()
+        try:
+            candidates = await second.kernel.list_session_resume_candidates(
+                interrupted.session_id, root
+            )
+            selected = next(
+                item for item in candidates if item.task_id == task.task_id
+            )
+            self.assertEqual(
+                selected.safety, SessionResumeSafety.RECONCILE_REQUIRED
+            )
+            self.assertEqual(
+                selected.reason_code, "checkpoint_projection_refresh_required"
+            )
+            result = await second.kernel.resume_checkpointed_agent_turn(
+                task.task_id
+            )
+            self.assertIsInstance(result, AgentTurnResult)
+            assert isinstance(result, AgentTurnResult)
+            self.assertEqual(
+                result.assistant_message.text, "resumed: durable-result"
+            )
+            self.assertEqual(second_tool.invocation_count, 0)
+            completed = await second.kernel.get_task(task.task_id)
+            self.assertIsNone(completed.active_agent_checkpoint)
+            events = await second.registry.require(
+                RuntimeStorePort
+            ).read_events(task.task_id)
+            reconciled = next(
+                event for event in events
+                if event.event_type == "checkpoint.reconciled"
+            )
+            self.assertFalse(reconciled.payload["tool_calls_replayed"])
+            saved = next(
+                event for event in events
+                if event.event_type == "checkpoint.saved"
+                and event.payload.get("reason") == "event-log-reconciled"
+            )
+            self.assertEqual(saved.payload["pending_tool_calls"], 0)
+            self.assertEqual(
+                sum(event.event_type == "tool.completed" for event in events),
+                1,
             )
         finally:
             await second.registry.stop_all()

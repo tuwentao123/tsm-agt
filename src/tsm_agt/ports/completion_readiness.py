@@ -14,6 +14,7 @@ from .tool import ToolEffect
 class CompletionReadinessAction(StrEnum):
     COMPLETE = "COMPLETE"
     CONTINUE = "CONTINUE"
+    REPORT_INCOMPLETE_RECOVERABLE = "REPORT_INCOMPLETE_RECOVERABLE"
     REPORT_BLOCKED = "REPORT_BLOCKED"
 
 

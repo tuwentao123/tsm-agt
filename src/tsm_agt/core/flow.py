@@ -736,6 +736,10 @@ class FlowProjector:
                     if result.get("error_code") is not None else None
                 ),
                 "retryable": bool(result.get("retryable", False)),
+                "recovery_kind": (
+                    str(result["recovery_kind"])
+                    if result.get("recovery_kind") is not None else None
+                ),
                 "truncated": bool(result.get("truncated", False)),
                 "error_type": (
                     str(meta["error_type"])

@@ -504,6 +504,9 @@ class ExplorationBudgetCompositionTest(unittest.TestCase):
         configuration = ExplorationBudgetConfiguration()
         self.assertEqual(configuration.agent_max_model_calls, 15)
         self.assertEqual(configuration.finalization_model_calls, 2)
+        self.assertEqual(configuration.execution_reserve_model_calls, 1)
+        self.assertEqual(configuration.recovery_reserve_model_calls, 1)
+        self.assertEqual(configuration.verification_reserve_model_calls, 1)
         self.assertEqual(configuration.max_tool_calls, 24)
         self.assertEqual(configuration.max_actions, 24)
 

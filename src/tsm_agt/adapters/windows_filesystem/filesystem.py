@@ -58,6 +58,16 @@ class WindowsWorkspaceFilesystem:
         self._require_started()
         self._retry(path.unlink)
 
+    def make_directory(self, path: Path) -> None:
+        """Create exactly one directory; the core validates its location."""
+        self._require_started()
+        self._retry(path.mkdir)
+
+    def remove_directory(self, path: Path) -> None:
+        """Remove exactly one empty directory."""
+        self._require_started()
+        self._retry(path.rmdir)
+
     def sync_directory(self, directory: Path) -> None:
         self._require_started()
         import ctypes

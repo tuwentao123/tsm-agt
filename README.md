@@ -156,6 +156,9 @@ uv run tsm-agt agent \
 TSM_AGT_AGENT_MAX_MODEL_CALLS=20
 TSM_AGT_AGENT_MAX_TOOL_CALLS=50
 TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS=2
+TSM_AGT_AGENT_EXECUTION_RESERVE_MODEL_CALLS=1
+TSM_AGT_AGENT_RECOVERY_RESERVE_MODEL_CALLS=1
+TSM_AGT_AGENT_VERIFICATION_RESERVE_MODEL_CALLS=1
 TSM_AGT_EXPLORATION_PROFILE=balanced
 TSM_AGT_EXPLORATION_MAX_TOOL_CALLS=30
 TSM_AGT_EXPLORATION_MAX_ACTIONS=30
@@ -172,7 +175,7 @@ Approval 和 Tool Risk。`legacy` 只用于兼容旧目录策略；未知 Profil
 失败，不会偷偷退回宽松策略。Profile 和具体 Adapter ID/版本会进入 Effective
 Configuration，活动 Turn 恢复时仍由配置 Hash 防止无痕换策略。
 
-这些值用于新 Turn；活动 Turn 已把调用上限保存在 Checkpoint，配置变化不会在执行途中偷偷改额度，恢复校验发现规则变化时会进入冲突并要求重新开始。`AGENT_MAX_*` 是防止失控循环的最后硬上限；`AGENT_FINALIZATION_MODEL_CALLS` 是模型调用硬上限中专门留给最终回答和一次格式纠正的次数，默认 2，必须小于模型调用硬上限。它取代了旧版“剩余固定 20% 就关工具”的机械规则：默认 15 次模型调用时，剩余 3 次仍可做一次真正有价值的定点取证，剩余 2 次才停止工具调用并回答。`EXPLORATION_MAX_TOOL_CALLS` 不能大于 Agent 工具硬上限。`EXPLORATION_MAX_TOOL_CALLS` 统计本 Turn 中全部已用工具，`EXPLORATION_MAX_ACTIONS` 统计被策略评分的调查动作，二者用于不同的保护维度。
+这些值用于新 Turn；活动 Turn 已把调用上限保存在 Checkpoint，配置变化不会在执行途中偷偷改额度，恢复校验发现规则变化时会进入冲突并要求重新开始。`AGENT_MAX_*` 是防止失控循环的最后硬上限；`FINALIZATION`、`EXECUTION`、`RECOVERY`、`VERIFICATION` 四类预留分别保护最终回答、首次实施、失败恢复和实施后验证，默认是 2/1/1/1。它们不会机械地给每个阶段各执行一次模型请求，而是在存在对应未完成 Outcome 时阻止宽泛探索提前吃光后续额度。若本 Turn 的硬额度确实用完，但工作仍可恢复，Task 会保存 Checkpoint 并进入“未完成、可继续”，不会误报 `BLOCKED`；下一次继续沿同一 Task 增加新一轮额度，不重放已完成工具。`EXPLORATION_MAX_TOOL_CALLS` 不能大于 Agent 工具硬上限。`EXPLORATION_MAX_TOOL_CALLS` 统计本 Turn 中全部已用工具，`EXPLORATION_MAX_ACTIONS` 统计被策略评分的调查动作，二者用于不同的保护维度。
 
 CLI 的实时进度会明确写成“本次 Task”，并显示当前用户目标、要确认的完整问题、实际工具及参数、路径/查询范围、范围为何扩大，以及四类探索计数：动作、工具调用、累计工具耗时、连续低收益。开始收尾时不再笼统显示“预算即将耗尽”，而是显示真实触发项及“已用/上限”。这些限制只约束当前 Task，不是一整个 Session 的累计上限；Session 中下一个 Task 会得到自己的一份新预算。
 

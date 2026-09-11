@@ -13,6 +13,7 @@ class CheckpointCompatibilityAction(StrEnum):
     """What Runtime may safely do with a persisted checkpoint."""
 
     EXACT_RESUME = "EXACT_RESUME"
+    RECONCILE_REQUIRED = "RECONCILE_REQUIRED"
     REBASE_REQUIRED = "REBASE_REQUIRED"
     REQUIRES_VALIDATION = "REQUIRES_VALIDATION"
     BLOCKED = "BLOCKED"
@@ -23,6 +24,8 @@ class CheckpointCompatibilityProbe:
     """Project-neutral facts collected by Kernel; contains no model judgment."""
 
     differences: tuple[str, ...] = ()
+    reconcilable_differences: tuple[str, ...] = ()
+    committed_pending_tool_count: int = 0
     pending_tool_call_count: int = 0
     tool_execution_count: int = 0
     unknown_outcome_count: int = 0

@@ -107,6 +107,7 @@ from tsm_agt.ports import (
     ToolProviderPort,
     ToolResult,
     ToolResultBlock,
+    ToolRecoveryKind,
     ToolRisk,
     ToolSpec,
     WorkspaceFilesystemPort,
@@ -322,6 +323,9 @@ class KernelDependencies:
     default_max_tool_calls: int = 40
     default_max_output_tokens: int = 1024
     finalization_model_calls: int = 2
+    execution_reserve_model_calls: int = 1
+    recovery_reserve_model_calls: int = 1
+    verification_reserve_model_calls: int = 1
     prompt_template: PromptTemplate = field(default_factory=PromptTemplate.default)
     context_manager: ContextWindowManager = field(
         default_factory=ContextWindowManager
@@ -1190,6 +1194,7 @@ class Kernel:
         candidate = next((
             item for item in candidates if item.safety in {
                 SessionResumeSafety.EXACT_RESUME,
+                SessionResumeSafety.RECONCILE_REQUIRED,
                 SessionResumeSafety.REBASE_REQUIRED,
             }
         ), None)
@@ -1217,6 +1222,7 @@ class Kernel:
             )
         resumable = tuple(item for item in candidates if item.safety in {
             SessionResumeSafety.EXACT_RESUME,
+            SessionResumeSafety.RECONCILE_REQUIRED,
             SessionResumeSafety.REBASE_REQUIRED,
         })
         if len(resumable) == 1:
@@ -3018,7 +3024,7 @@ class Kernel:
                 backup_ref=backup_ref, created_at=datetime.now(timezone.utc),
                 before_mode=prepared.previous_mode,
             )
-            commit_prepared_workspace_mutation(
+            created_directories = commit_prepared_workspace_mutation(
                 prepared, self._dependencies.workspace_filesystem
             )
             updated = task.with_mutation(mutation)
@@ -3035,7 +3041,8 @@ class Kernel:
             except Exception:
                 try:
                     restore_prepared_workspace_mutation(
-                        prepared, self._dependencies.workspace_filesystem
+                        prepared, self._dependencies.workspace_filesystem,
+                        created_directories,
                     )
                 except Exception as restore_error:
                     raise RuntimeError(
@@ -3114,13 +3121,24 @@ class Kernel:
                 self._dependencies.workspace_path,
             )
 
-            attempted: list[Any] = []
+            attempted: list[tuple[Any, tuple[Path, ...]]] = []
             try:
                 for item in prepared:
-                    attempted.append(item)
-                    commit_prepared_workspace_mutation(
+                    # Register the action before calling it: a fault may be raised
+                    # after the atomic replace has already happened. The candidate
+                    # parents are narrowed to the commit's authoritative return on
+                    # the ordinary success path.
+                    attempted.append((
+                        item,
+                        tuple(
+                            directory for directory in item.parent_directories
+                            if not directory.exists()
+                        ),
+                    ))
+                    created_directories = commit_prepared_workspace_mutation(
                         item, self._dependencies.workspace_filesystem
                     )
+                    attempted[-1] = (item, created_directories or ())
                 updated = task
                 for record in records:
                     updated = updated.with_mutation(record)
@@ -3138,9 +3156,11 @@ class Kernel:
                 ))
             except Exception:
                 restoration_errors: list[Exception] = []
-                for item in reversed(attempted):
+                for item, created_directories in reversed(attempted):
                     try:
-                        self._compensate_prepared_mutation(item)
+                        self._compensate_prepared_mutation(
+                            item, created_directories
+                        )
                     except Exception as restore_error:
                         restoration_errors.append(restore_error)
                 if restoration_errors:
@@ -3656,12 +3676,15 @@ class Kernel:
                 pass
             return all_records
 
-    def _compensate_prepared_mutation(self, prepared: Any) -> None:
+    def _compensate_prepared_mutation(
+        self, prepared: Any, created_directories: tuple[Path, ...] = (),
+    ) -> None:
         """Restore an applied write, accept an untouched target, reject ambiguity."""
         current_hash = file_sha256(prepared.path)
         if current_hash == prepared.after_hash:
             restore_prepared_workspace_mutation(
-                prepared, self._dependencies.workspace_filesystem
+                prepared, self._dependencies.workspace_filesystem,
+                created_directories,
             )
             return
         untouched = (
@@ -5665,6 +5688,10 @@ class Kernel:
         decision: CompletionReadinessDecision,
     ) -> Message:
         continue_work = decision.action is CompletionReadinessAction.CONTINUE
+        incomplete_recoverable = (
+            decision.action
+            is CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE
+        )
         body = {
             "boundary": "completion_readiness",
             "action": decision.action.value,
@@ -5675,8 +5702,14 @@ class Kernel:
                 "argument validation, policy, approval, and sandbox rules still "
                 "apply. Do not merely offer to continue later."
                 if continue_work else
-                "Do not call tools. Give the user the exact blocker, completed "
-                "evidence, and unverified requirement. Do not claim success."
+                (
+                    "Do not call tools. Report that this Turn is incomplete but "
+                    "resumable, identify the last safe checkpoint and remaining "
+                    "required work, and do not describe it as blocked or successful."
+                    if incomplete_recoverable else
+                    "Do not call tools. Give the user the exact blocker, completed "
+                    "evidence, and unverified requirement. Do not claim success."
+                )
             ),
             "gaps": [gap.to_data() for gap in decision.gaps],
         }
@@ -5751,6 +5784,23 @@ class Kernel:
         )
         return await policy.evaluate(CheckpointCompatibilityProbe(
             differences=differences,
+            reconcilable_differences=(
+                await self._reconcilable_checkpoint_differences(
+                    task, checkpoint, differences
+                )
+            ),
+            committed_pending_tool_count=sum(
+                1 for call in checkpoint.pending_tool_calls
+                if (execution := task.tool_executions.get(
+                    ToolExecutionRecord.identity(checkpoint.turn_id, call.call_id)
+                )) is not None
+                and execution.call == call
+                and execution.result is not None
+                and execution.state in {
+                    ToolCommitState.COMMITTED, ToolCommitState.FAILED,
+                    ToolCommitState.CANCELLED,
+                }
+            ),
             pending_tool_call_count=len(checkpoint.pending_tool_calls),
             tool_execution_count=len(task.tool_executions),
             unknown_outcome_count=unknown,
@@ -5758,6 +5808,270 @@ class Kernel:
             mutation_count=len(task.mutation_journal),
             background_process_count=len(task.background_processes),
         ))
+
+    async def _reconcilable_checkpoint_differences(
+        self, task: TaskSnapshot, checkpoint: AgentTurnCheckpoint,
+        differences: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        """Prove stale projections are a one-way Event Log advance.
+
+        Only Evidence generated by an exact terminal Tool call that is still
+        pending in the checkpoint is refreshable. Identity, configuration,
+        workspace, and unknown-outcome differences remain conflicts.
+        """
+        if "evidence_question_state" not in differences:
+            return ()
+        terminal_calls = {
+            call.call_id
+            for call in checkpoint.pending_tool_calls
+            if (execution := task.tool_executions.get(
+                ToolExecutionRecord.identity(checkpoint.turn_id, call.call_id)
+            )) is not None
+            and execution.call == call
+            and execution.result is not None
+            and execution.state in {
+                ToolCommitState.COMMITTED, ToolCommitState.FAILED,
+                ToolCommitState.CANCELLED,
+            }
+        }
+        if not terminal_calls:
+            return ()
+        try:
+            stale = EvidenceQuestionProjection.from_data(
+                task.task_id, checkpoint.evidence_question_state
+            )
+            current = await self.get_evidence_questions(task.task_id)
+        except (KeyError, TypeError, ValueError):
+            return ()
+        stale_by_id = {record.question_id: record for record in stale.records}
+        current_by_id = {record.question_id: record for record in current.records}
+        if not set(stale_by_id).issubset(current_by_id):
+            return ()
+        advanced = False
+        for question_id, old in stale_by_id.items():
+            live = current_by_id[question_id]
+            if (
+                old.question != live.question
+                or old.source_task_id != live.source_task_id
+                or old.source_turn_id != live.source_turn_id
+                or old.expected_scope != live.expected_scope
+                or old.revision > live.revision
+                or old.updated_event_sequence > live.updated_event_sequence
+                or not set(old.tool_call_ids).issubset(live.tool_call_ids)
+                or not set(old.evidence_references).issubset(
+                    live.evidence_references
+                )
+            ):
+                return ()
+            if old != live:
+                if not terminal_calls.intersection(live.tool_call_ids):
+                    return ()
+                advanced = True
+        for question_id, live in current_by_id.items():
+            if question_id in stale_by_id:
+                continue
+            if not terminal_calls.intersection(live.tool_call_ids):
+                return ()
+            advanced = True
+        return ("evidence_question_state",) if advanced else ()
+
+    async def _reconcile_agent_checkpoint(
+        self, task: TaskSnapshot, checkpoint: AgentTurnCheckpoint,
+        visible_tools: tuple[ToolSpec, ...],
+        decision: CheckpointCompatibilityDecision,
+    ) -> AgentTurnCheckpoint:
+        """Refresh execution state from committed Event and Tool ledgers.
+
+        This does not invoke a provider. Exact terminal results are represented
+        to the model once, removed from pending work, and audited as reused.
+        """
+        if decision.action is not CheckpointCompatibilityAction.RECONCILE_REQUIRED:
+            raise AgentCheckpointConflict(
+                "checkpoint compatibility policy did not allow reconciliation"
+            )
+        messages = list(checkpoint.messages)
+        represented_call_ids = {
+            block.result.call_id
+            for message in messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock)
+        }
+        remaining: list[ToolCall] = []
+        reconciled: list[ToolExecutionRecord] = []
+        for call in checkpoint.pending_tool_calls:
+            execution = task.tool_executions.get(
+                ToolExecutionRecord.identity(checkpoint.turn_id, call.call_id)
+            )
+            if (
+                execution is None or execution.call != call
+                or execution.result is None
+                or execution.state not in {
+                    ToolCommitState.COMMITTED, ToolCommitState.FAILED,
+                    ToolCommitState.CANCELLED,
+                }
+            ):
+                remaining.append(call)
+                continue
+            reconciled.append(execution)
+            if call.call_id not in represented_call_ids:
+                messages.append(Message(
+                    f"msg-tool-reconciled-{canonical_hash(call.call_id)[:16]}",
+                    MessageRole.TOOL, (ToolResultBlock(execution.result),),
+                ))
+                represented_call_ids.add(call.call_id)
+        if not reconciled:
+            raise AgentCheckpointConflict(
+                "checkpoint reconciliation found no exact committed pending call"
+            )
+        safe_runtime_differences = {
+            "session_context_hash", "effective_config_hash",
+            "prompt_manifest_hash", "model_configuration",
+            "provider_capabilities_hash", "policy_hash",
+            "adapter_lock_hash", "toolset_hash",
+        }
+        runtime_rebind = bool(
+            safe_runtime_differences.intersection(decision.conflict_reasons)
+        )
+        current = task
+        if runtime_rebind:
+            stored = await self._require_stored_task(task.task_id)
+            current = TaskSnapshot.from_data(stored.data)
+            configuration = await self._build_effective_configuration(
+                current, len(current.effective_configurations) + 1
+            )
+            current = current.with_effective_configuration(configuration)
+            await self._dependencies.store.commit(RuntimeUnitOfWork(
+                current.task_id, stored.version, current.to_data(),
+                (RuntimeEvent(
+                    f"evt-{uuid4().hex}", current.task_id,
+                    stored.last_event_sequence + 1, "config.reconciled", {
+                        "revision": configuration.revision,
+                        "effective_config_hash": (
+                            configuration.effective_config_hash
+                        ),
+                        "reason": decision.reason_code,
+                        "rebind_reasons": list(decision.conflict_reasons),
+                    },
+                ),),
+            ))
+            generated_prefixes = (
+                "project-instructions-context-", "task-spec-context-",
+                "project-onboarding-context-", "project-memory-context-",
+                "session-context-", "working-memory-context-",
+            )
+            messages = [
+                message for message in messages
+                if not message.message_id.startswith(generated_prefixes)
+            ]
+            messages.extend(await self._project_context_messages(current.task_id))
+        question_projection = await self.get_evidence_questions(task.task_id)
+        evidence_inventory = await self._rebuild_evidence_inventory(
+            task.task_id, checkpoint.turn_id
+        )
+        terminal_tool_calls = sum(
+            execution.turn_id == checkpoint.turn_id
+            and execution.result is not None
+            and execution.state in {
+                ToolCommitState.COMMITTED, ToolCommitState.FAILED,
+                ToolCommitState.CANCELLED, ToolCommitState.UNKNOWN_OUTCOME,
+            }
+            for execution in task.tool_executions.values()
+        )
+        configuration = current.effective_configurations[-1]
+        session = await self.get_session(current.session_id)
+        working_memory = await self.get_working_memory(current.task_id)
+        refreshed = replace(
+            checkpoint, revision=checkpoint.revision + 1,
+            messages=tuple(messages), pending_tool_calls=tuple(remaining),
+            tool_calls=max(checkpoint.tool_calls, terminal_tool_calls),
+            evidence_inventory=evidence_inventory,
+            evidence_question_state=question_projection.to_data(),
+            effective_config_hash=configuration.effective_config_hash,
+            prompt_manifest_hash=(configuration.prompt_manifest_hash or ""),
+            toolset_hash=effective_toolset_hash(visible_tools),
+            session_context_hash=session.context_hash,
+            working_memory_hash=working_memory.content_hash,
+            action_progress={} if runtime_rebind else checkpoint.action_progress,
+            read_hits_state={} if runtime_rebind else checkpoint.read_hits_state,
+            artifact_read_state=(
+                {} if runtime_rebind else checkpoint.artifact_read_state
+            ),
+            progressive_scope_state=(
+                {} if runtime_rebind else checkpoint.progressive_scope_state
+            ),
+            exploration_budget_state=(
+                {} if runtime_rebind else checkpoint.exploration_budget_state
+            ),
+            stop_or_pivot_state=(
+                {} if runtime_rebind else checkpoint.stop_or_pivot_state
+            ),
+            evidence_relation_state=(
+                {} if runtime_rebind else checkpoint.evidence_relation_state
+            ),
+            rejection_loop_state=(
+                {} if runtime_rebind else checkpoint.rejection_loop_state
+            ),
+            exploration_outcome_state=(
+                {} if runtime_rebind else checkpoint.exploration_outcome_state
+            ),
+            completion_readiness_state=(
+                {} if runtime_rebind else checkpoint.completion_readiness_state
+            ),
+        )
+        await self._save_agent_checkpoint(refreshed, "event-log-reconciled")
+        for execution in reconciled:
+            await self._record_tool_result_reused(
+                task.task_id, checkpoint.turn_id, execution
+            )
+        await self._append_events(task.task_id, ((
+            "checkpoint.reconciled", {
+                "turn_id": checkpoint.turn_id,
+                "previous_revision": checkpoint.revision,
+                "revision": refreshed.revision,
+                "reason_code": decision.reason_code,
+                "refreshed_projections": list(decision.conflict_reasons),
+                "reused_execution_ids": [
+                    execution.execution_id for execution in reconciled
+                ],
+                "tool_calls_replayed": False,
+                "runtime_rebound": runtime_rebind,
+            },
+        ),))
+        return refreshed
+
+    async def _rebuild_evidence_inventory(
+        self, task_id: str, turn_id: str,
+    ) -> Mapping[str, Any]:
+        """Rebuild Turn evidence fingerprints from their durable Events."""
+        fingerprints: dict[str, set[str]] = {
+            category: set() for category in EVIDENCE_CATEGORIES
+        }
+        consecutive_zero_delta = 0
+        for event in await self._dependencies.store.read_events(task_id):
+            if (
+                event.event_type != "evidence.delta_evaluated"
+                or event.payload.get("turn_id") != turn_id
+            ):
+                continue
+            raw_items = event.payload.get("items", [])
+            if isinstance(raw_items, list):
+                for item in raw_items:
+                    if not isinstance(item, Mapping):
+                        continue
+                    category = str(item.get("category", ""))
+                    fingerprint = str(item.get("fingerprint", ""))
+                    if category in fingerprints and fingerprint:
+                        fingerprints[category].add(fingerprint)
+            consecutive_zero_delta = max(
+                0, int(event.payload.get("consecutive_zero_delta", 0))
+            )
+        return EvidenceInventory(
+            {
+                category: tuple(sorted(values))
+                for category, values in fingerprints.items()
+            },
+            consecutive_zero_delta,
+        ).to_data()
 
     async def _agent_checkpoint_conflicts(
         self, task: TaskSnapshot, checkpoint: AgentTurnCheckpoint,
@@ -7384,7 +7698,12 @@ class Kernel:
         decision = await self._evaluate_checkpoint_compatibility(
             task, checkpoint, visible_tools
         )
-        if decision.action is CheckpointCompatibilityAction.REBASE_REQUIRED:
+        if decision.action is CheckpointCompatibilityAction.RECONCILE_REQUIRED:
+            checkpoint = await self._reconcile_agent_checkpoint(
+                task, checkpoint, visible_tools, decision
+            )
+            task = await self.get_task(task_id)
+        elif decision.action is CheckpointCompatibilityAction.REBASE_REQUIRED:
             checkpoint = await self._rebase_agent_checkpoint(
                 task, checkpoint, visible_tools, decision
             )
@@ -7468,11 +7787,26 @@ class Kernel:
         pending = checkpoint.pending_user_action
         if pending.get("kind") != "CONTINUATION":
             raise ClarificationNotPending("task has no pending continuation")
+        replenish_capacity = pending.get("reason") == "incomplete_recoverable"
         visible_tools = await self.list_tools()
         await self._validate_agent_checkpoint(task, checkpoint, visible_tools)
         resumed_checkpoint = replace(
             checkpoint, revision=checkpoint.revision + 1,
             pending_user_action={},
+            max_model_calls=(
+                checkpoint.model_calls + self._dependencies.default_max_model_calls
+                if replenish_capacity else checkpoint.max_model_calls
+            ),
+            max_tool_calls=(
+                checkpoint.tool_calls + self._dependencies.default_max_tool_calls
+                if replenish_capacity else checkpoint.max_tool_calls
+            ),
+            exploration_budget_state=(
+                {} if replenish_capacity else checkpoint.exploration_budget_state
+            ),
+            completion_readiness_state=(
+                {} if replenish_capacity else checkpoint.completion_readiness_state
+            ),
         )
         resumed_task = task.transition(TaskState.EXECUTING).with_agent_checkpoint(
             resumed_checkpoint.to_data()
@@ -7496,6 +7830,7 @@ class Kernel:
                     "remaining_outcome_ids": list(
                         pending.get("remaining_outcome_ids", [])
                     ),
+                    "capacity_replenished": replenish_capacity,
                 },
             ),
             RuntimeEvent(
@@ -7948,7 +8283,10 @@ class Kernel:
         recover_interrupted: bool = False,
         on_text_delta: Callable[[str], None] | None = None,
         on_progress: Callable[[AgentProgress], None] | None = None,
-    ) -> AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended:
+    ) -> (
+        AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended
+        | AgentContinuationSuspended
+    ):
         task_id = checkpoint.task_id
         turn_id = checkpoint.turn_id
         await self.plan_task_spec(task_id)
@@ -9031,8 +9369,10 @@ class Kernel:
                 checkpoint.completion_readiness_state
             )
             disclosure_only = (
-                completion_state.last_action
-                == CompletionReadinessAction.REPORT_BLOCKED.value
+                completion_state.last_action in {
+                    CompletionReadinessAction.REPORT_BLOCKED.value,
+                    CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE.value,
+                }
             )
             wrap_up = (
                 remaining_model_calls <= wrap_up_threshold
@@ -9040,16 +9380,66 @@ class Kernel:
                 or budget_wrap_up
             )
             runtime_instruction = None
+            required_gaps = await self._completion_readiness_gaps(
+                task_id, visible_tools
+            )
+            available_effects_for_turn = {
+                ToolEffect.OBSERVE
+                if tool.effect is ToolEffect.UNSPECIFIED and tool.is_read_only
+                else tool.effect
+                for tool in visible_tools
+                if not tool.is_internal_state
+            }
+            recoverable_required_work = any(
+                gap.required and gap.effective_required_effects
+                and gap.effective_required_effects.issubset(
+                    available_effects_for_turn
+                )
+                for gap in required_gaps
+            )
+            last_tool_result = next((
+                block.result
+                for message in reversed(messages)
+                for block in reversed(message.content)
+                if isinstance(block, ToolResultBlock)
+            ), None)
+            structured_recovery = (
+                last_tool_result is not None and not last_tool_result.ok
+                and last_tool_result.effective_recovery_kind in {
+                    ToolRecoveryKind.RETRY_SAME,
+                    ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+                }
+            )
+            # A soft exploration stop must not consume capacity reserved for a
+            # known recovery or a required executable outcome. Keep one final
+            # model call, while allowing the preceding call to use tools.
+            can_finish_required_work = (
+                remaining_model_calls > 1
+                and (structured_recovery or recoverable_required_work)
+            )
+            if can_finish_required_work:
+                wrap_up = False
             focus_state = ExplorationBudgetState.from_data(
                 checkpoint.exploration_budget_state
             )
             if disclosure_only:
-                runtime_instruction = (
-                    "Completion readiness found required work that cannot be "
-                    "safely completed in this Turn. Do not call tools. State the "
-                    "exact blocker, what evidence was completed, and what required "
-                    "fact remains unverified. Do not claim success."
-                )
+                if (
+                    completion_state.last_action
+                    == CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE.value
+                ):
+                    runtime_instruction = (
+                        "This Turn has no remaining capacity to finish work that is "
+                        "still recoverable. Do not call tools. Report it as incomplete "
+                        "and resumable, list the remaining required work and the last "
+                        "safe checkpoint, and do not call it blocked or successful."
+                    )
+                else:
+                    runtime_instruction = (
+                        "Completion readiness found required work that cannot be "
+                        "safely completed in this Turn. Do not call tools. State the "
+                        "exact blocker, what evidence was completed, and what required "
+                        "fact remains unverified. Do not claim success."
+                    )
             elif no_progress_stop or budget_wrap_up:
                 if budget_wrap_up:
                     runtime_instruction = (
@@ -9127,6 +9517,28 @@ class Kernel:
                     goal=(await self.get_task(task_id)).goal,
                     reason="execution_budget_nearly_exhausted",
                 ))
+            elif structured_recovery and last_tool_result is not None:
+                action = dict(last_tool_result.recovery_action)
+                runtime_instruction = (
+                    "The previous tool failure has structured recovery kind "
+                    f"{last_tool_result.effective_recovery_kind.value}. "
+                    f"Recovery requirements: {json.dumps(action, ensure_ascii=False)}. "
+                    "The required Task outcome remains open. Choose a legal recovery "
+                    "action or an alternative tool; do not merely restate the error. "
+                    "When same_call_safe is false, do not repeat the unchanged call."
+                )
+            elif recoverable_required_work and remaining_model_calls <= (
+                self._dependencies.finalization_model_calls
+                + self._dependencies.execution_reserve_model_calls
+                + self._dependencies.recovery_reserve_model_calls
+                + self._dependencies.verification_reserve_model_calls
+            ):
+                runtime_instruction = (
+                    "Execution capacity is reserved for required outcomes. Stop broad "
+                    "exploration. Use the available tool effect needed to implement, "
+                    "recover, or verify the remaining required work, while preserving "
+                    "one final model response."
+                )
             elif focus_state.focus_mode:
                 runtime_instruction = (
                     "The exploration soft threshold has been reached. This is "
@@ -9535,9 +9947,14 @@ class Kernel:
                 not tool_calls and not has_late_steering
                 and readiness.action is CompletionReadinessAction.COMPLETE
             )
+            incomplete_recovery_boundary = bool(
+                final_response and disclosure_only
+                and completion_state.last_action
+                == CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE.value
+            )
             await self._commit_model_response_checkpoint(
                 response_checkpoint, response, prompt.receipt, prepared.budget,
-                final=final_response,
+                final=final_response and not incomplete_recovery_boundary,
             )
             if should_buffer_text and (
                 tool_calls or has_late_steering or final_response
@@ -9554,6 +9971,28 @@ class Kernel:
                 continue
 
             if not tool_calls:
+                if incomplete_recovery_boundary:
+                    suspension = await self._suspend_incomplete_recoverable(
+                        response_checkpoint, response.message, required_gaps
+                    )
+                    source_user_message = next((
+                        message for message in messages
+                        if message.role is MessageRole.USER
+                        and not message.message_id.startswith((
+                            "project-onboarding-context-",
+                            "project-memory-context-", "session-context-",
+                            "working-memory-context-", "task-spec-context-",
+                            "project-instructions-context-",
+                            "completion-readiness-",
+                        ))
+                    ), None)
+                    if source_user_message is not None:
+                        await self._record_session_task_result(
+                            task_id, turn_id, source_user_message,
+                            response.message,
+                        )
+                        await self._refresh_continuation_session_identity(task_id)
+                    return suspension
                 if readiness.action is not CompletionReadinessAction.COMPLETE:
                     correction = self._completion_correction_message(readiness)
                     messages.append(correction)
@@ -9565,7 +10004,11 @@ class Kernel:
                     event_type = (
                         "completion.continuation_requested"
                         if readiness.action is CompletionReadinessAction.CONTINUE
-                        else "completion.blocker_disclosure_requested"
+                        else (
+                            "completion.incomplete_recoverable_requested"
+                            if readiness.action is CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE
+                            else "completion.blocker_disclosure_requested"
+                        )
                     )
                     await self._append_events(task_id, ((event_type, {
                         "turn_id": turn_id, "reason": readiness.reason,
@@ -9885,6 +10328,76 @@ class Kernel:
             suspended_checkpoint.revision,
             tuple(outcome.outcome_id for outcome in newly_closed),
             tuple(outcome.outcome_id for outcome in remaining), message,
+        )
+
+    async def _suspend_incomplete_recoverable(
+        self, checkpoint: AgentTurnCheckpoint, message: Message,
+        gaps: tuple[CompletionGap, ...],
+    ) -> AgentContinuationSuspended:
+        """Persist exhausted-but-recoverable work as a resumable boundary.
+
+        This differs from BLOCKED: no new authority is needed. A later Session
+        input resumes the same checkpoint after the normal compatibility gate.
+        """
+        spec = await self.get_task_spec(checkpoint.task_id)
+        remaining_outcome_ids = tuple(
+            outcome.outcome_id for outcome in spec.outcomes
+            if outcome.required and not outcome.status.is_closed
+        )
+        pending = {
+            "kind": "CONTINUATION",
+            "reason": "incomplete_recoverable",
+            "task_id": checkpoint.task_id,
+            "turn_id": checkpoint.turn_id,
+            "completed_outcome_ids": [],
+            "remaining_outcome_ids": list(remaining_outcome_ids),
+            "gap_ids": [gap.gap_id for gap in gaps if gap.required],
+        }
+        suspended_checkpoint = replace(
+            checkpoint, revision=checkpoint.revision + 1,
+            pending_user_action=pending,
+            task_spec_revision=spec.revision, task_spec_hash=spec.content_hash,
+            active_outcome_ids=remaining_outcome_ids,
+        )
+        stored = await self._require_stored_task(checkpoint.task_id)
+        task = TaskSnapshot.from_data(stored.data)
+        if task.state is not TaskState.EXECUTING:
+            raise InvalidTurnState(
+                "recoverable completion boundary requires an executing Task"
+            )
+        awaiting = task.transition(TaskState.AWAITING_USER).with_agent_checkpoint(
+            suspended_checkpoint.to_data()
+        )
+        events = (
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", checkpoint.task_id,
+                stored.last_event_sequence + 1, "continuation.requested", pending,
+            ),
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", checkpoint.task_id,
+                stored.last_event_sequence + 2, "checkpoint.saved", {
+                    "turn_id": checkpoint.turn_id,
+                    "revision": suspended_checkpoint.revision,
+                    "checkpoint_hash": suspended_checkpoint.checkpoint_hash,
+                    "reason": "incomplete-recoverable-continuation",
+                    "pending_user_action": pending,
+                },
+            ),
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", checkpoint.task_id,
+                stored.last_event_sequence + 3, "task.state_changed", {
+                    "previous_state": task.state.value,
+                    "next_state": awaiting.state.value,
+                    "reason": "recoverable work awaits a later Turn",
+                },
+            ),
+        )
+        await self._dependencies.store.commit(RuntimeUnitOfWork(
+            checkpoint.task_id, stored.version, awaiting.to_data(), events
+        ))
+        return AgentContinuationSuspended(
+            checkpoint.task_id, checkpoint.turn_id,
+            suspended_checkpoint.revision, (), remaining_outcome_ids, message,
         )
 
     async def _refresh_continuation_session_identity(self, task_id: str) -> None:
@@ -11968,6 +12481,11 @@ class Kernel:
                 error_code="TIMEOUT",
                 message=f"tool exceeded {timeout_seconds:g} second deadline",
                 retryable=selected_spec.idempotency.value != "non_idempotent",
+                recovery_kind=(
+                    ToolRecoveryKind.RETRY_SAME
+                    if selected_spec.idempotency.value != "non_idempotent"
+                    else ToolRecoveryKind.UNKNOWN_OUTCOME
+                ),
                 meta={"error_type": type(error).__name__},
             )
         except Exception as error:
@@ -12010,6 +12528,11 @@ class Kernel:
                     "current-Task approval still applies."
                 ),
                 retryable=True,
+                recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+                recovery_action={
+                    "required_change": "select_intended_filesystem_scope",
+                    "same_call_safe": False,
+                },
                 meta={
                     "recoverable_input": True,
                     "runtime_guard": "TOOL_SCOPE_CONSISTENCY",
@@ -12039,6 +12562,7 @@ class Kernel:
                 ),
                 hint="Inspect the target system before deciding whether to retry.",
                 retryable=False,
+                recovery_kind=ToolRecoveryKind.UNKNOWN_OUTCOME,
                 meta=result.meta,
             )
         else:

@@ -39,13 +39,38 @@ class CheckpointCompatibilityPolicyTest(unittest.IsolatedAsyncioTestCase):
         for difference in (
             "task_id", "session_id", "local_subject",
             "workspace_fingerprint", "working_memory_hash",
-            "evidence_question_state",
         ):
             with self.subTest(difference=difference):
                 decision = await self._evaluate(differences=(difference,))
                 self.assertEqual(
                     decision.action, CheckpointCompatibilityAction.BLOCKED
                 )
+
+    async def test_committed_pending_tool_allows_projection_reconciliation(self) -> None:
+        decision = await self._evaluate(
+            differences=("evidence_question_state",),
+            reconcilable_differences=("evidence_question_state",),
+            committed_pending_tool_count=1, pending_tool_call_count=1,
+        )
+        self.assertEqual(
+            decision.action, CheckpointCompatibilityAction.RECONCILE_REQUIRED
+        )
+
+    async def test_reconciliation_can_rebind_safe_runtime_upgrade(self) -> None:
+        decision = await self._evaluate(
+            differences=("evidence_question_state", "policy_hash"),
+            reconcilable_differences=("evidence_question_state",),
+            committed_pending_tool_count=1, pending_tool_call_count=1,
+        )
+        self.assertEqual(
+            decision.action, CheckpointCompatibilityAction.RECONCILE_REQUIRED
+        )
+
+    async def test_unproven_evidence_difference_remains_blocked(self) -> None:
+        decision = await self._evaluate(
+            differences=("evidence_question_state",),
+        )
+        self.assertEqual(decision.action, CheckpointCompatibilityAction.BLOCKED)
 
     async def test_unknown_or_non_idempotent_execution_is_blocked(self) -> None:
         for changes in (

@@ -233,6 +233,87 @@ class CoreApplyPatchesTest(unittest.IsolatedAsyncioTestCase):
             ["modify", "create"],
         )
 
+    async def test_nested_create_makes_missing_parents_in_batch(self) -> None:
+        existing = self.workspace / "registry.txt"
+        existing.write_text("before\n", encoding="utf-8")
+        patches = [
+            {
+                "path": "src/providers/search.py", "expected_hash": None,
+                "edits": [{"old_text": "", "new_text": "search\n"}],
+            },
+            {
+                "path": "src/providers/web.py", "expected_hash": None,
+                "edits": [{"old_text": "", "new_text": "web\n"}],
+            },
+            {
+                "path": existing.name, "expected_hash": sha256("before\n"),
+                "edits": [{"old_text": "before", "new_text": "after"}],
+            },
+        ]
+        _request, result = await self.approve(
+            self.call("call-nested-create", patches), "turn-nested-create"
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            (self.workspace / "src/providers/search.py").read_text(),
+            "search\n",
+        )
+        self.assertEqual(
+            (self.workspace / "src/providers/web.py").read_text(), "web\n"
+        )
+        self.assertEqual(existing.read_text(), "after\n")
+
+    async def test_batch_failure_removes_transaction_created_empty_parents(self) -> None:
+        existing = self.workspace / "existing.txt"
+        existing.write_text("before\n", encoding="utf-8")
+        patches = [
+            {
+                "path": "new/nested/created.txt", "expected_hash": None,
+                "edits": [{"old_text": "", "new_text": "created\n"}],
+            },
+            {
+                "path": existing.name, "expected_hash": sha256("before\n"),
+                "edits": [{"old_text": "before", "new_text": "after"}],
+            },
+        ]
+        self.store.fail_batch = True
+        _request, result = await self.approve(
+            self.call("call-nested-rollback", patches), "turn-nested-rollback"
+        )
+        self.assertFalse(result.ok)
+        self.assertFalse((self.workspace / "new").exists())
+        self.assertEqual(existing.read_text(), "before\n")
+
+    async def test_nested_create_rejects_symlink_parent(self) -> None:
+        outside = self.workspace.parent / f"{self.workspace.name}-outside"
+        outside.mkdir()
+        linked = self.workspace / "linked"
+        try:
+            linked.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("directory symlinks are unavailable")
+        try:
+            patches = [
+                {
+                    "path": "linked/escape.txt", "expected_hash": None,
+                    "edits": [{"old_text": "", "new_text": "escape\n"}],
+                },
+                {
+                    "path": "safe.txt", "expected_hash": None,
+                    "edits": [{"old_text": "", "new_text": "safe\n"}],
+                },
+            ]
+            _request, result = await self.approve(
+                self.call("call-symlink-parent", patches), "turn-symlink-parent"
+            )
+            self.assertFalse(result.ok)
+            self.assertEqual(result.error_code, "PERMISSION_DENIED")
+            self.assertFalse((outside / "escape.txt").exists())
+            self.assertFalse((self.workspace / "safe.txt").exists())
+        finally:
+            linked.unlink(missing_ok=True)
+            outside.rmdir()
+
     async def test_journal_failure_restores_every_written_file(self) -> None:
         first, second, patches = self.two_modifications()
         self.store.fail_batch = True

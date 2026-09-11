@@ -28,7 +28,7 @@ class RuleBasedCheckpointCompatibilityPolicy:
     _HARD_IDENTITY_DIFFERENCES = frozenset({
         "task_id", "session_id", "session_missing", "session_state",
         "local_subject", "workspace_fingerprint",
-        "working_memory_hash", "evidence_question_state",
+        "working_memory_hash",
         "steering_inbound_sequence", "effective_configuration_missing",
     })
     _SAFE_REBASE_DIFFERENCES = frozenset({
@@ -60,6 +60,7 @@ class RuleBasedCheckpointCompatibilityPolicy:
         if not self._started:
             raise RuntimeError("checkpoint compatibility policy is not started")
         differences = tuple(dict.fromkeys(probe.differences))
+        reconcilable = tuple(dict.fromkeys(probe.reconcilable_differences))
         hard = tuple(
             item for item in differences
             if item in self._HARD_IDENTITY_DIFFERENCES
@@ -78,6 +79,20 @@ class RuleBasedCheckpointCompatibilityPolicy:
             return CheckpointCompatibilityDecision(
                 CheckpointCompatibilityAction.BLOCKED,
                 "unsafe_tool_execution_state", tuple(dict.fromkeys(reasons)),
+            )
+        if (
+            differences
+            and set(differences).issubset(
+                set(reconcilable) | self._SAFE_REBASE_DIFFERENCES
+            )
+            and probe.committed_pending_tool_count > 0
+            and probe.committed_pending_tool_count
+            == probe.pending_tool_call_count
+        ):
+            return CheckpointCompatibilityDecision(
+                CheckpointCompatibilityAction.RECONCILE_REQUIRED,
+                "checkpoint_projection_refresh_required",
+                conflict_reasons=differences,
             )
         if hard or unknown:
             return CheckpointCompatibilityDecision(

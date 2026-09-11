@@ -568,6 +568,10 @@ class ContextWindowManager:
         }
         if result.error_code is not None:
             summary["error_code"] = result.error_code
+        if not result.ok:
+            summary["recovery_kind"] = result.effective_recovery_kind.value
+            if result.recovery_action:
+                summary["recovery_action"] = dict(result.recovery_action)
         if result.truncated:
             summary["truncated"] = True
         if call_summary is not None:

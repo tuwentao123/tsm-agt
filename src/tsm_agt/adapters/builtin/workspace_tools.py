@@ -37,7 +37,8 @@ class CoreWorkspaceMutationToolProvider:
             "and pass its sha256 as expected_hash. Each old_text must occur exactly once "
             "at the time it is applied; ambiguous or stale patches fail without writing. "
             "To create a file, pass expected_hash=null and exactly one edit with empty "
-            "old_text. This R1 action requires approval and is journaled."
+            "old_text. Missing ordinary parent directories are created inside the "
+            "same transaction. This R1 action requires approval and is journaled."
         ),
         parameters={
             "type": "object",
@@ -78,7 +79,8 @@ class CoreWorkspaceMutationToolProvider:
             "Apply exact text replacements to 2 to 50 distinct workspace files. "
             "Each item follows core.apply_patch rules and includes a current sha256, "
             "or null when creating it. The runtime validates every patch before "
-            "writing, locks all paths in deterministic order, and commits all "
+            "writing, safely creates missing ordinary parent directories, locks all "
+            "paths in deterministic order, and commits all "
             "Mutation Journal records together. Ordinary write or journal failures "
             "restore already-written files in reverse order. This R1 action requires "
             "approval of the exact ordered patch payload."

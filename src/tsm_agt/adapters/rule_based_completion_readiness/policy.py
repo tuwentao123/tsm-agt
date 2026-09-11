@@ -83,6 +83,19 @@ class RuleBasedCompletionReadinessPolicy:
                 CompletionReadinessAction.CONTINUE,
                 "required_capability_is_available", next_state, recoverable,
             )
+        if (
+            recoverable and probe.remaining_model_calls > 0
+            and state.disclosure_attempts == 0
+        ):
+            next_state = CompletionReadinessState(
+                state.continue_attempts, state.disclosure_attempts + 1,
+                CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE.value,
+            )
+            return CompletionReadinessDecision(
+                CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE,
+                "required_work_is_recoverable_but_turn_capacity_is_exhausted",
+                next_state, recoverable,
+            )
         if probe.remaining_model_calls > 0 and state.disclosure_attempts == 0:
             next_state = CompletionReadinessState(
                 state.continue_attempts, 1,

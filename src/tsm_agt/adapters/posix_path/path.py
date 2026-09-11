@@ -90,6 +90,50 @@ class PosixWorkspacePath:
         relative = canonical.relative_to(root).as_posix()
         return ResolvedWorkspacePath(root, canonical, relative, str(canonical))
 
+    def resolve_create_path(
+        self, workspace: Path, relative_path: str,
+    ) -> ResolvedWorkspacePath:
+        self._require_started()
+        candidate = Path(relative_path)
+        if candidate.is_absolute():
+            raise ValueError("absolute workspace mutation paths are not allowed")
+        root = self.normalize_workspace(workspace)
+        parent = self._resolve_mutation_parent(root, candidate.parent)
+        canonical = parent / candidate.name
+        relative = canonical.relative_to(root).as_posix()
+        return ResolvedWorkspacePath(root, canonical, relative, str(canonical))
+
+    def _resolve_mutation_parent(self, root: Path, parent: Path) -> Path:
+        """Resolve an existing prefix while retaining safe missing descendants."""
+        current = root
+        missing = False
+        for part in parent.parts:
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                raise ValueError("workspace mutation path escapes the workspace")
+            child = current / part
+            if child.is_symlink():
+                raise PermissionError(
+                    "workspace mutation parent cannot contain a symlink"
+                )
+            if not missing and child.exists():
+                if not child.is_dir():
+                    raise ValueError(
+                        "workspace mutation parent is not a directory"
+                    )
+                current = child.resolve(strict=True)
+                try:
+                    current.relative_to(root)
+                except ValueError as error:
+                    raise ValueError(
+                        "workspace mutation path escapes the workspace"
+                    ) from error
+            else:
+                missing = True
+                current = child
+        return current
+
     def resolve_access_path(
         self, workspace: Path, relative_path: str,
     ) -> ResolvedWorkspacePath:

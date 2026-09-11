@@ -16,8 +16,8 @@ from tsm_agt.adapters.rule_based_completion_readiness import (
 )
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
-    AgentTurnCheckpoint, AgentTurnResult, AgentTurnSuspended, ApprovalDecision,
-    ProjectTrustLevel, TaskState,
+    AgentContinuationSuspended, AgentTurnCheckpoint, AgentTurnResult,
+    AgentTurnSuspended, ApprovalDecision, ProjectTrustLevel, TaskState,
 )
 from tsm_agt.ports import (
     CompletionGap, CompletionReadinessAction, CompletionReadinessProbe,
@@ -87,6 +87,14 @@ class ReadinessSequenceModel(EchoModelProvider):
                 Message(
                     "blocked-final", MessageRole.ASSISTANT,
                     (TextBlock("Blocked: permission denied; source remains unverified."),),
+                ),
+                FinishReason.STOP, ModelUsage(1, 1),
+            )
+        if '"action":"REPORT_INCOMPLETE_RECOVERABLE"' in correction:
+            return ModelResponse(
+                Message(
+                    "incomplete-final", MessageRole.ASSISTANT,
+                    (TextBlock("Incomplete: required source remains unverified."),),
                 ),
                 FinishReason.STOP, ModelUsage(1, 1),
             )
@@ -304,7 +312,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 CompletionReadinessState(),
             )
             self.assertEqual(
-                decision.action, CompletionReadinessAction.REPORT_BLOCKED
+                decision.action, CompletionReadinessAction.REPORT_BLOCKED,
             )
         finally:
             await policy.stop(None)  # type: ignore[arg-type]
@@ -374,7 +382,8 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 CompletionReadinessState(),
             )
             self.assertEqual(
-                decision.action, CompletionReadinessAction.REPORT_BLOCKED
+                decision.action,
+                CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE,
             )
             self.assertEqual(decision.state.continue_attempts, 0)
         finally:
@@ -476,7 +485,15 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                     task.task_id, "inspect", max_model_calls=10, max_tool_calls=5
                 )
                 self.assertIn("remains unverified", result.assistant_message.text)
+                self.assertIsInstance(result, AgentContinuationSuspended)
                 self.assertEqual(tool.attempts, 2)
+                suspended = await app.kernel.get_task(task.task_id)
+                self.assertEqual(suspended.state, TaskState.AWAITING_USER)
+                self.assertIsNotNone(suspended.active_agent_checkpoint)
+                candidates = await app.kernel.list_session_resume_candidates(
+                    suspended.session_id
+                )
+                self.assertEqual(candidates[0].task_id, task.task_id)
                 events = await app.registry.require(RuntimeStorePort).read_events(
                     task.task_id
                 )
@@ -485,9 +502,29 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                     for event in events
                 ), 1)
                 self.assertEqual(sum(
-                    event.event_type == "completion.blocker_disclosure_requested"
+                    event.event_type == "completion.incomplete_recoverable_requested"
                     for event in events
                 ), 1)
+                resumed_result = await app.kernel.resume_agent_continuation(
+                    task.task_id, "continue the remaining work",
+                    input_id="input-recoverable-resume",
+                )
+                self.assertIsInstance(
+                    resumed_result, AgentContinuationSuspended
+                )
+                resumed_task = await app.kernel.get_task(task.task_id)
+                resumed_checkpoint = AgentTurnCheckpoint.from_data(
+                    resumed_task.active_agent_checkpoint or {}
+                )
+                self.assertGreater(resumed_checkpoint.max_model_calls, 10)
+                resumed_events = await app.registry.require(
+                    RuntimeStorePort
+                ).read_events(task.task_id)
+                self.assertTrue(any(
+                    event.event_type == "continuation.resolved"
+                    and event.payload.get("capacity_replenished") is True
+                    for event in resumed_events
+                ))
             finally:
                 await app.registry.stop_all()
 
