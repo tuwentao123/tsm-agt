@@ -740,8 +740,11 @@ class OpenAICompatibleModelProvider:
         if outcome_refs:
             properties = dict(parameters.get("properties", {}))
             properties["outcome_ref"] = {
-                "type": "string", "enum": list(outcome_refs),
-                "description": "Open Task outcome advanced by this action.",
+                "type": "string",
+                "description": (
+                    "Task outcome the action should advance. Runtime validates "
+                    "existence, execution focus, dependencies, and effect compatibility."
+                ),
             }
             parameters = {**parameters, "properties": properties}
         function = {
@@ -916,10 +919,7 @@ class OpenAICompatibleModelProvider:
                 )
             outcome_ref = arguments.get("outcome_ref")
             if outcome_ref is not None:
-                if (
-                    not isinstance(outcome_ref, str)
-                    or outcome_ref not in allowed_outcome_refs
-                ):
+                if not isinstance(outcome_ref, str) or not outcome_ref.strip():
                     raise RecoverableToolProtocolError("invalid_outcome_ref")
                 arguments = {
                     key: value for key, value in arguments.items()

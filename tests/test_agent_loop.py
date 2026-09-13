@@ -874,21 +874,18 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
             temp_dir.cleanup()
             await application.registry.stop_all()
 
-    async def test_unknown_tool_result_is_returned_to_model(self) -> None:
+    async def test_unknown_tool_rejects_entire_batch_before_execution(self) -> None:
         application, temp_dir, task = await self._create_executing_task(
             UnknownToolThenFinishModel()
         )
         try:
-            result = await application.kernel.run_agent_turn(task.task_id, "hello")
-            self.assertEqual(result.assistant_message.text, "Handled NOT_FOUND")
-            tool_message = next(
-                message for message in result.messages
-                if message.role is MessageRole.TOOL
-            )
-            self.assertEqual(tool_message.content[0].result.error_code, "NOT_FOUND")
+            with self.assertRaisesRegex(
+                ModelInvocationFailed, "invalid_tool_batch"
+            ):
+                await application.kernel.run_agent_turn(task.task_id, "hello")
             store = application.registry.require(RuntimeStorePort)
-            self.assertIn(
-                "tool.failed",
+            self.assertNotIn(
+                "tool.started",
                 [event.event_type for event in await store.read_events(task.task_id)],
             )
         finally:
@@ -964,7 +961,7 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
             ))
             self.assertEqual(
                 (await application.kernel.get_task(task.task_id)).state,
-                TaskState.FAILED,
+                TaskState.INTERRUPTED,
             )
         finally:
             temp_dir.cleanup()

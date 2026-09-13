@@ -14,6 +14,7 @@ from tsm_agt.core import (
     TaskAcceptanceCriterion, TaskContinuationMode, TaskCriterionKind,
     TaskOutcomeKind, TaskOutcomeStatus, TaskSpecProjector, TaskSpecProposal,
     TaskSpecSnapshot,
+    TaskExecutionFocusProjector, TaskOutcomeEligibilityCalculator,
     TaskState, canonical_hash,
 )
 from tsm_agt.ports import Message, MessageRole, TextBlock, ToolCall, ToolEffect
@@ -112,6 +113,88 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
         restored = TaskSpecSnapshot.from_data(spec.to_data())
         self.assertEqual(restored, spec)
         self.assertEqual(restored.content_hash, spec.content_hash)
+
+    def test_optional_outcome_is_eligible_but_not_initially_selected(self):
+        data = self._delivery_proposal().to_data()
+        data["outcomes"].append({
+            "outcome_id": "optional-validation",
+            "description": "Run optional validation",
+            "kind": "COMMAND_RESULT",
+            "required_effects": ["execute"],
+            "required": False,
+        })
+        proposal = TaskSpecProposal.from_data(data)
+        spec = TaskSpecSnapshot.from_proposal(
+            "task-focus", 1, proposal,
+            (TaskAcceptanceCriterion(
+                "workspace-integrity", "workspace remains consistent",
+                TaskCriterionKind.WORKSPACE_INTEGRITY,
+            ),),
+        )
+        self.assertEqual(
+            [item.outcome_id for item in TaskOutcomeEligibilityCalculator.eligible(spec)],
+            ["deliver-fix", "optional-validation"],
+        )
+        focus = TaskExecutionFocusProjector.project(spec, ())
+        self.assertEqual(focus.selected_outcome_ids, ("deliver-fix",))
+        migrated = TaskExecutionFocusProjector.project(
+            spec, (), legacy_active_outcome_ids=("optional-validation",)
+        )
+        self.assertEqual(
+            migrated.selected_outcome_ids, ("optional-validation",)
+        )
+        self.assertEqual(
+            migrated.selection_reason, "legacy_active_outcome_migration"
+        )
+
+    def test_outcome_dependency_cycle_is_rejected(self):
+        data = self._delivery_proposal().to_data()
+        data["outcomes"][0]["depends_on"] = ["verify"]
+        data["outcomes"].append({
+            "outcome_id": "verify",
+            "description": "Verify delivery",
+            "kind": "COMMAND_RESULT",
+            "required_effects": ["execute"],
+            "required": True,
+            "depends_on": ["deliver-fix"],
+        })
+        with self.assertRaisesRegex(ValueError, "contain a cycle"):
+            TaskSpecProposal.from_data(data)
+
+    async def test_optional_outcome_can_be_selected_structurally(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(tool_adapters=())
+            await app.registry.start_all()
+            try:
+                task = await app.kernel.create_task("implement and validate", Path(directory))
+                current = await app.kernel.get_task_spec(task.task_id)
+                data = self._delivery_proposal(task.goal).to_data()
+                data["outcomes"].append({
+                    "outcome_id": "optional-validation",
+                    "description": "Run optional validation",
+                    "kind": "COMMAND_RESULT",
+                    "required_effects": ["execute"],
+                    "required": False,
+                })
+                spec = TaskSpecSnapshot.from_proposal(
+                    task.task_id, 2, TaskSpecProposal.from_data(data),
+                    current.acceptance_criteria,
+                )
+                await app.kernel._append_events(task.task_id, ((
+                    "task_spec.revised", {"snapshot": spec.to_data()},
+                ),))
+                focus = await app.kernel.select_task_outcomes(
+                    task.task_id, ("optional-validation",),
+                    reason="model selected user's requested next unit",
+                    source_input_id="input-1",
+                )
+                self.assertEqual(
+                    focus.selected_outcome_ids, ("optional-validation",)
+                )
+                restored = await app.kernel.get_task_execution_focus(task.task_id)
+                self.assertEqual(restored, focus)
+            finally:
+                await app.registry.stop_all()
 
     def test_legacy_snapshot_replays_with_original_hash(self):
         legacy = {
@@ -444,7 +527,7 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
-    async def test_steer_adds_constraint_and_replace_resets_goal(self):
+    async def test_steer_preserves_contract_and_replace_resets_goal(self):
         with tempfile.TemporaryDirectory() as directory:
             app = compose_fixture_application(tool_adapters=())
             await app.registry.start_all()
@@ -469,7 +552,8 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
                 await app.kernel.queue_steering(task.task_id, SteeringKind.STEER, "兼容 Windows", "steer-1")
                 checkpoint, _ = await app.kernel._apply_pending_steering(checkpoint, "test")
                 steered = await app.kernel.get_task_spec(task.task_id)
-                self.assertIn("兼容 Windows", steered.constraints)
+                self.assertEqual(steered.constraints, installed.constraints)
+                self.assertIn("兼容 Windows", checkpoint.messages[-1].text)
                 self.assertEqual(steered.outcomes, installed.outcomes)
                 self.assertEqual(
                     steered.continuation_mode, installed.continuation_mode

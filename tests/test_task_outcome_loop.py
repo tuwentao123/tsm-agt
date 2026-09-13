@@ -251,6 +251,40 @@ class SharedOutcomeBatchModel(EchoModelProvider):
         ), FinishReason.STOP, ModelUsage(1, 1))
 
 
+class CrossOutcomeBatchModel(EchoModelProvider):
+    """One response closes an Outcome before its second call executes."""
+
+    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+
+    def __init__(self):
+        super().__init__()
+        self.requests = []
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        self.requests.append(request)
+        results = [
+            block.result for message in request.messages
+            for block in message.content if isinstance(block, ToolResultBlock)
+        ]
+        if not results:
+            return ModelResponse(Message(
+                "cross-outcome-batch", MessageRole.ASSISTANT, (
+                    ToolCallBlock(ToolCall(
+                        "close-first", "core.list_files", {"path": "."},
+                        outcome_ref="inspect-a",
+                    )),
+                    ToolCallBlock(ToolCall(
+                        "run-second", "core.list_files", {"path": "."},
+                        outcome_ref="inspect-b",
+                    )),
+                ),
+            ), FinishReason.TOOL_CALL, ModelUsage(1, 1))
+        return ModelResponse(Message(
+            "cross-outcome-final", MessageRole.ASSISTANT,
+            (TextBlock("Both accepted calls completed."),),
+        ), FinishReason.STOP, ModelUsage(1, 1))
+
+
 class AnswerEvidenceModel(EchoModelProvider):
     """Read project evidence for an ANSWER before synthesizing its text."""
 
@@ -716,21 +750,28 @@ class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
             )
             try:
                 first = await app.kernel.invoke_tool(
-                    task.task_id, "turn-ambiguous",
-                    ToolCall("list-a", "core.list_files", {"path": "."}),
-                )
-                self.assertTrue(first.ok)
-                self.assertTrue(all(
-                    outcome.status is TaskOutcomeStatus.PENDING
-                    for outcome in (await app.kernel.get_task_spec(task.task_id)).outcomes
-                ))
-                second = await app.kernel.invoke_tool(
                     task.task_id, "turn-explicit", ToolCall(
                         "list-b", "core.list_files", {"path": "."},
                         outcome_ref="inspect-b",
                     ),
                 )
-                self.assertTrue(second.ok)
+                self.assertTrue(first.ok)
+                # Multiple compatible selected outcomes cannot be guessed.
+                with self.assertRaisesRegex(
+                    Exception, "OUTCOME_SELECTION_AMBIGUOUS"
+                ):
+                    await app.kernel.invoke_tool(
+                        task.task_id, "turn-ambiguous",
+                        ToolCall(
+                            "list-a", "core.list_files", {"path": "."}
+                        ),
+                    )
+                self.assertTrue(all(
+                    outcome.status is TaskOutcomeStatus.PENDING
+                    if outcome.outcome_id == "inspect-a" else
+                    outcome.status is TaskOutcomeStatus.IN_PROGRESS
+                    for outcome in (await app.kernel.get_task_spec(task.task_id)).outcomes
+                ))
                 outcomes = {
                     item.outcome_id: item
                     for item in (await app.kernel.get_task_spec(task.task_id)).outcomes
@@ -999,6 +1040,61 @@ class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
+    async def test_completed_unit_cannot_split_an_open_tool_batch(self):
+        """Regression for the real two-call Provider protocol failure."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = CrossOutcomeBatchModel()
+            app = compose_fixture_application(
+                model_adapter=model,
+                tool_adapters=(CoreReadOnlyToolProvider(),),
+            )
+            await app.registry.start_all()
+            try:
+                task = await app.kernel.create_task("inspect two units", root)
+                current = await app.kernel.get_task_spec(task.task_id)
+                data = proposal(
+                    task.goal, ("inspect-a", "inspect-b"),
+                    "AFTER_COMPLETED_UNIT",
+                )
+                for item in data["outcomes"]:
+                    item["kind"] = "COMMAND_RESULT"
+                spec = TaskSpecSnapshot.from_proposal(
+                    task.task_id, 2, TaskSpecProposal.from_data(data),
+                    current.acceptance_criteria,
+                )
+                await app.kernel._append_events(task.task_id, ((
+                    "task_spec.revised", {"snapshot": spec.to_data()},
+                ),))
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    task = await app.kernel.transition_task(
+                        task.task_id, state, state.value
+                    )
+                turn = await app.kernel.run_agent_turn(task.task_id, task.goal)
+                self.assertEqual(turn.tool_calls, 2)
+                self.assertEqual(len(model.requests), 2)
+                second = model.requests[1].messages
+                assistant_index = next(
+                    index for index, message in enumerate(second)
+                    if message.message_id == "cross-outcome-batch"
+                )
+                following = second[assistant_index + 1:assistant_index + 3]
+                self.assertEqual(
+                    [message.role for message in following],
+                    [MessageRole.TOOL, MessageRole.TOOL],
+                )
+                self.assertEqual({
+                    block.result.call_id for message in following
+                    for block in message.content
+                    if isinstance(block, ToolResultBlock)
+                }, {"close-first", "run-second"})
+            finally:
+                await app.registry.stop_all()
+
     async def test_legacy_pending_call_can_reopen_prematurely_closed_outcome(self):
         """An accepted pre-fix batch survives upgrade without new authority."""
         with tempfile.TemporaryDirectory() as directory:
@@ -1025,7 +1121,7 @@ class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
                     },
                 ),))
                 with self.assertRaisesRegex(
-                    Exception, "unknown or closed outcome_ref"
+                    Exception, "OUTCOME_ALREADY_CLOSED"
                 ):
                     await app.kernel.invoke_tool(
                         task.task_id, "new-turn", ToolCall(

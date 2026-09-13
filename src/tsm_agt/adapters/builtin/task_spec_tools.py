@@ -16,7 +16,10 @@ class CoreTaskSpecToolProvider:
     descriptor = AdapterDescriptor(
         "builtin.core-task-spec-tools", "0.1.0",
         "ToolProviderPort", "1.0",
-        frozenset({"core.task_spec_read", "core.task_spec_update"}),
+        frozenset({
+            "core.task_spec_read", "core.task_spec_update",
+            "core.task_outcome_select",
+        }),
     )
     _tools = (
         ToolSpec(
@@ -26,6 +29,28 @@ class CoreTaskSpecToolProvider:
             {"type": "object", "properties": {}, "additionalProperties": False},
             ToolRisk.R0, True, True, ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.INTERNAL,
+            result_authority=ToolResultAuthority.RUNTIME_FACT,
+        ),
+        ToolSpec(
+            "core.task_outcome_select",
+            "Select eligible Task outcomes for following actions. This changes "
+            "execution focus only and grants no authority or completion.",
+            {
+                "type": "object",
+                "properties": {
+                    "outcome_ids": {
+                        "type": "array", "minItems": 1,
+                        "uniqueItems": True,
+                        "items": {"type": "string"},
+                    },
+                    "reason": {"type": "string"},
+                    "source_input_id": {"type": "string"},
+                },
+                "required": ["outcome_ids", "reason"],
+                "additionalProperties": False,
+            },
+            ToolRisk.R0, False, False, ToolIdempotency.IDEMPOTENT,
+            is_internal_state=True, effect=ToolEffect.INTERNAL,
             result_authority=ToolResultAuthority.RUNTIME_FACT,
         ),
         ToolSpec(
@@ -104,6 +129,15 @@ class CoreTaskSpecToolProvider:
                     tuple(str(item) for item in call.arguments["scope"]),
                     tuple(str(item) for item in call.arguments["constraints"]),
                     tuple(raw), str(call.arguments["operation_id"]),
+                )
+            elif call.name == "core.task_outcome_select":
+                raw_ids = call.arguments["outcome_ids"]
+                if not isinstance(raw_ids, (list, tuple)):
+                    raise ValueError("outcome_ids must be an array")
+                data = await control.select_outcomes(
+                    tuple(str(item) for item in raw_ids),
+                    str(call.arguments["reason"]),
+                    str(call.arguments.get("source_input_id", "")),
                 )
             else:
                 return ToolResult(call.call_id, False, error_code="NOT_FOUND", message="unknown Task SPEC tool")

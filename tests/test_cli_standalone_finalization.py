@@ -47,7 +47,8 @@ class StandaloneFinalizationTest(unittest.IsolatedAsyncioTestCase):
         )
 
         exit_code = await _finalize_standalone_agent_result(
-            self.application, self.task.task_id, result, lines.append
+            self.application, self.task.task_id, result, lines.append,
+            verbose=True,
         )
 
         self.assertEqual(exit_code, 0)

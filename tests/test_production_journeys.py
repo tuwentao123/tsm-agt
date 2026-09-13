@@ -408,6 +408,9 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(any(
                     event.event_type == "tool.started" for event in events
                 ))
+                interrupted = await app.kernel.get_task(task.task_id)
+                self.assertEqual(interrupted.state, TaskState.INTERRUPTED)
+                self.assertIsNotNone(interrupted.active_agent_checkpoint)
             finally:
                 await app.registry.stop_all()
 

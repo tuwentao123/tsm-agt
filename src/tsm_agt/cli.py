@@ -549,7 +549,7 @@ async def _agent(
         )
         _print_agent_result(result)
         return await _finalize_standalone_agent_result(
-            application, task.task_id, result
+            application, task.task_id, result, verbose=verbose_progress
         )
     finally:
         await application.registry.stop_all()
@@ -557,7 +557,7 @@ async def _agent(
 
 async def _finalize_standalone_agent_result(
     application, task_id: str, result,
-    output_fn: Callable[[str], None] = print,
+    output_fn: Callable[[str], None] = print, *, verbose: bool = False,
 ) -> int:
     """Give every one-shot continuation the same trusted Task ending."""
     if not isinstance(result, AgentTurnResult):
@@ -567,21 +567,23 @@ async def _finalize_standalone_agent_result(
         task.task_id, TaskState.VERIFYING, "standalone verifier started"
     )
     verification = await application.kernel.verify_task_acceptance(task.task_id)
-    if verification.evidence_level is not None:
+    if verbose and verification.evidence_level is not None:
         output_fn(_render_evidence_level(verification.evidence_level))
-    for criterion in verification.criteria:
-        output_fn(
-            f"verification criterion: {criterion.criterion_id} "
-            f"{criterion.status.value}"
-        )
+    if verbose:
+        for criterion in verification.criteria:
+            output_fn(
+                f"verification criterion: {criterion.criterion_id} "
+                f"{criterion.status.value}"
+            )
     if verification.passed:
         for target in (TaskState.FINALIZING, TaskState.SUCCEEDED):
             task = await application.kernel.transition_task(
                 task.task_id, target, f"standalone {target.value.lower()}",
             )
-        output_fn(
-            f"verification: passed ({len(verification.criteria)} criteria)"
-        )
+        if verbose:
+            output_fn(
+                f"verification: passed ({len(verification.criteria)} criteria)"
+            )
         return 0
     await application.kernel.transition_task(
         task.task_id, TaskState.FAILED,
@@ -1979,22 +1981,24 @@ async def _chat(
                 verification = await application.kernel.verify_task_acceptance(
                     task.task_id
                 )
-                if verification.evidence_level is not None:
+                if verbose_progress and verification.evidence_level is not None:
                     output_fn(_render_evidence_level(verification.evidence_level))
-                for criterion in verification.criteria:
-                    output_fn(
-                        f"verification criterion: {criterion.criterion_id} "
-                        f"{criterion.status.value}"
-                    )
+                if verbose_progress:
+                    for criterion in verification.criteria:
+                        output_fn(
+                            f"verification criterion: {criterion.criterion_id} "
+                            f"{criterion.status.value}"
+                        )
                 if verification.passed:
                     for target in (TaskState.FINALIZING, TaskState.SUCCEEDED):
                         task = await application.kernel.transition_task(
                             task.task_id, target,
                             f"interactive {target.value.lower()}",
                         )
-                    output_fn(
-                        f"verification: passed ({len(verification.criteria)} criteria)"
-                    )
+                    if verbose_progress:
+                        output_fn(
+                            f"verification: passed ({len(verification.criteria)} criteria)"
+                        )
                 else:
                     task = await application.kernel.transition_task(
                         task.task_id, TaskState.FAILED,

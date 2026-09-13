@@ -1016,7 +1016,7 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
                         "name": "core__read_file",
                         "arguments": json.dumps({
                             "path": "README.md",
-                            "outcome_ref": "inspect-source",
+                            "outcome_ref": "model-proposed-outcome",
                         }),
                     },
                 }]},
@@ -1033,13 +1033,15 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
             block.call for block in response.message.content
             if isinstance(block, ToolCallBlock)
         )
-        self.assertEqual(call.outcome_ref, "inspect-source")
+        # Provider parses metadata but deliberately does not enforce the
+        # advertised set; Kernel owns semantic validation and observability.
+        self.assertEqual(call.outcome_ref, "model-proposed-outcome")
         self.assertEqual(call.arguments, {"path": "README.md"})
         schema = transport.requests[0]["payload"]["tools"][0]["function"]["parameters"]
         self.assertEqual(
-            schema["properties"]["outcome_ref"]["enum"],
-            ["inspect-source"],
+            schema["properties"]["outcome_ref"]["type"], "string"
         )
+        self.assertNotIn("enum", schema["properties"]["outcome_ref"])
 
 
 if __name__ == "__main__":

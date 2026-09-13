@@ -228,7 +228,7 @@ class SessionActiveCheckpoint:
     consecutive_zero_delta: int = 0
     task_spec_revision: int = 0
     task_spec_hash: str = ""
-    active_outcome_ids: tuple[str, ...] = ()
+    execution_focus: Mapping[str, Any] | None = None
     pending_user_action: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
@@ -281,7 +281,10 @@ class SessionActiveCheckpoint:
             "task_spec": {
                 "revision": self.task_spec_revision,
                 "content_hash": self.task_spec_hash,
-                "active_outcome_ids": list(self.active_outcome_ids),
+                "execution_focus": (
+                    dict(self.execution_focus)
+                    if self.execution_focus is not None else None
+                ),
             },
             "pending_user_action": (
                 dict(self.pending_user_action)

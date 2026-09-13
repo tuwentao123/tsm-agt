@@ -155,6 +155,7 @@ from .agent_loop import (
     AgentLoopLimitExceeded,
     AgentCheckpointConflict,
     AgentTurnCheckpoint,
+    ToolBatchSnapshot, ToolBatchStatus,
     AgentTurnResult,
     AgentTurnSuspended,
     AgentClarificationSuspended,
@@ -209,6 +210,9 @@ from .process import (
 from .task import LEGAL_TRANSITIONS, TaskNotFound, TaskSnapshot, TaskState
 from .task_spec import (
     TaskAcceptanceCriterion, TaskContinuationMode, TaskCriterionKind,
+    OutcomeBindingAction, OutcomeBindingDecision, OutcomeBindingReason,
+    TaskExecutionFocus, TaskExecutionFocusProjector,
+    TaskOutcomeCompletionPolicy, TaskOutcomeEligibilityCalculator,
     TaskOutcomeKind, TaskOutcomeStatus,
     TaskSpecProjector, TaskSpecProposal, TaskSpecSnapshot,
 )
@@ -815,6 +819,14 @@ class _TaskSpecControl(ToolTaskSpecControl):
             self.task_id, expected_revision, scope=scope,
             constraints=constraints, acceptance_criteria=criteria,
             operation_id=scoped_operation, writer=self.invocation_id,
+        )).to_data()
+
+    async def select_outcomes(
+        self, outcome_ids: tuple[str, ...], reason: str, source_input_id: str,
+    ) -> Mapping[str, Any]:
+        return (await self.kernel.select_task_outcomes(
+            self.task_id, outcome_ids, reason=reason,
+            source_input_id=source_input_id, writer=self.invocation_id,
         )).to_data()
 
 class Kernel:
@@ -1653,6 +1665,58 @@ class Kernel:
         task = await self.get_task(task_id)
         events = await self._dependencies.store.read_events(task_id)
         return TaskSpecProjector.project(task_id, task.goal, events)
+
+    async def get_task_execution_focus(
+        self, task_id: str, *, legacy_active_outcome_ids: tuple[str, ...] = (),
+    ) -> TaskExecutionFocus:
+        """Project durable execution selection independently of obligations."""
+        task = await self.get_task(task_id)
+        events = await self._dependencies.store.read_events(task_id)
+        spec = TaskSpecProjector.project(task_id, task.goal, events)
+        return TaskExecutionFocusProjector.project(
+            spec, events,
+            legacy_active_outcome_ids=legacy_active_outcome_ids,
+        )
+
+    async def select_task_outcomes(
+        self, task_id: str, outcome_ids: tuple[str, ...], *, reason: str,
+        source_input_id: str = "", writer: str = "runtime",
+    ) -> TaskExecutionFocus:
+        """Validate and persist a model-proposed execution focus change."""
+        if not outcome_ids or len(set(outcome_ids)) != len(outcome_ids):
+            raise ValueError("outcome selection must contain unique IDs")
+        if not reason.strip() or not writer.strip():
+            raise ValueError("outcome selection reason and writer are required")
+        stored = await self._require_stored_task(task_id)
+        task = TaskSnapshot.from_data(stored.data)
+        events = await self._dependencies.store.read_events(task_id)
+        spec = TaskSpecProjector.project(task_id, task.goal, events)
+        eligible_ids = tuple(
+            item.outcome_id
+            for item in TaskOutcomeEligibilityCalculator.eligible(spec)
+        )
+        invalid = tuple(item for item in outcome_ids if item not in eligible_ids)
+        if invalid:
+            raise ValueError(
+                "outcome selection contains ineligible IDs: "
+                + ", ".join(invalid)
+            )
+        current = TaskExecutionFocusProjector.project(spec, events)
+        focus = TaskExecutionFocus(
+            outcome_ids, current.selection_revision + 1, reason.strip(),
+            source_input_id.strip(),
+        )
+        event = RuntimeEvent(
+            f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
+            "task_execution_focus.changed", {
+                "writer": writer, "focus": focus.to_data(),
+                "eligible_outcome_ids": list(eligible_ids),
+            },
+        )
+        await self._dependencies.store.commit(RuntimeUnitOfWork(
+            task_id, stored.version, task.to_data(), (event,)
+        ))
+        return focus
 
     async def plan_task_spec(self, task_id: str) -> TaskSpecSnapshot:
         """Ask the semantic Planner for a proposal; Runtime owns persistence."""
@@ -4467,7 +4531,7 @@ class Kernel:
             consecutive_zero_delta=inventory.consecutive_zero_delta,
             task_spec_revision=checkpoint.task_spec_revision,
             task_spec_hash=checkpoint.task_spec_hash,
-            active_outcome_ids=checkpoint.active_outcome_ids,
+            execution_focus=dict(checkpoint.execution_focus),
             pending_user_action=(
                 dict(checkpoint.pending_user_action)
                 if checkpoint.pending_user_action else None
@@ -4608,18 +4672,19 @@ class Kernel:
 
     async def _task_spec_context_message(self, task_id: str) -> Message:
         snapshot = await self.get_task_spec(task_id)
+        focus = await self.get_task_execution_focus(task_id)
+        eligible = TaskOutcomeEligibilityCalculator.eligible(snapshot)
         task = await self.get_task(task_id)
         workspace = self._dependencies.workspace_path.normalize_workspace(
             Path(task.workspace)
         )
-        body = json.dumps({
+        eligible_ids = tuple(item.outcome_id for item in eligible)
+        context_data = {
             "boundary": "inspectable_task_spec",
             "instruction": (
-                "Use this completion contract to plan and verify work. Do not "
-                "weaken criteria or change the goal to claim success. Bind a "
-                "tool call to its outcome_id when more than one open outcome "
-                "could use the same tool effect. Runtime may safely auto-bind "
-                "only when there is exactly one candidate."
+                "Follow this contract without weakening it. Bind actions to a "
+                "selected outcome_id. To change focus, first call "
+                "core.task_outcome_select; selection grants no authority."
             ),
             "runtime_environment": {
                 "primary_workspace": str(workspace),
@@ -4633,7 +4698,13 @@ class Kernel:
                 ),
             },
             "task_spec": snapshot.to_data(),
-        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            "execution_focus": focus.to_data(),
+        }
+        if eligible_ids != focus.selected_outcome_ids:
+            context_data["eligible_outcome_ids"] = list(eligible_ids)
+        body = json.dumps(
+            context_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
         return Message(
             f"task-spec-context-r{snapshot.revision}-{snapshot.content_hash[:16]}",
             MessageRole.SYSTEM, (TextBlock(body),),
@@ -5077,6 +5148,10 @@ class Kernel:
         session = await self.get_session(task.session_id)
         working_memory = await self.get_working_memory(task.task_id)
         task_spec = await self.get_task_spec(task.task_id)
+        focus = await self.get_task_execution_focus(
+            task.task_id,
+            legacy_active_outcome_ids=checkpoint.active_outcome_ids,
+        )
         return replace(
             checkpoint, workspace_fingerprint=task.project_fingerprint,
             effective_config_hash=configuration.effective_config_hash,
@@ -5087,23 +5162,21 @@ class Kernel:
             working_memory_hash=working_memory.content_hash,
             task_spec_revision=task_spec.revision,
             task_spec_hash=task_spec.content_hash,
-            active_outcome_ids=tuple(
-                outcome.outcome_id for outcome in task_spec.outcomes
-                if outcome.required and not outcome.status.is_closed
-            ),
+            execution_focus=focus.to_data(),
         )
 
     async def _save_agent_checkpoint(
         self, checkpoint: AgentTurnCheckpoint, reason: str,
     ) -> None:
         task_spec = await self.get_task_spec(checkpoint.task_id)
+        focus = await self.get_task_execution_focus(
+            checkpoint.task_id,
+            legacy_active_outcome_ids=checkpoint.active_outcome_ids,
+        )
         checkpoint = replace(
             checkpoint, task_spec_revision=task_spec.revision,
             task_spec_hash=task_spec.content_hash,
-            active_outcome_ids=tuple(
-                outcome.outcome_id for outcome in task_spec.outcomes
-                if outcome.required and not outcome.status.is_closed
-            ),
+            execution_focus=focus.to_data(),
         )
         stored = await self._require_stored_task(checkpoint.task_id)
         task = TaskSnapshot.from_data(stored.data)
@@ -5119,9 +5192,13 @@ class Kernel:
                 "model_calls": checkpoint.model_calls,
                 "tool_calls": checkpoint.tool_calls,
                 "pending_tool_calls": len(checkpoint.pending_tool_calls),
+                "tool_batch": (
+                    checkpoint.tool_batch.to_data()
+                    if checkpoint.tool_batch is not None else None
+                ),
                 "task_spec_revision": checkpoint.task_spec_revision,
                 "task_spec_hash": checkpoint.task_spec_hash,
-                "active_outcome_ids": list(checkpoint.active_outcome_ids),
+                "execution_focus": dict(checkpoint.execution_focus),
                 "pending_user_action": dict(checkpoint.pending_user_action),
             },
         )
@@ -5132,7 +5209,16 @@ class Kernel:
     async def _apply_pending_steering(
         self, checkpoint: AgentTurnCheckpoint, safe_point: str,
     ) -> tuple[AgentTurnCheckpoint, bool]:
-        """Atomically merge ordered input into the active checkpoint."""
+        """Atomically merge ordered input only at a model-safe boundary.
+
+        Steering is accepted and durably queued by ``queue_steering`` while a
+        tool runs.  It is deliberately not inserted into Provider messages
+        until every call from the current assistant tool batch has a result.
+        """
+        if checkpoint.pending_tool_calls or (
+            checkpoint.tool_batch is not None and checkpoint.tool_batch.is_open
+        ):
+            return checkpoint, False
         for attempt in range(5):
             stored = await self._require_stored_task(checkpoint.task_id)
             task = TaskSnapshot.from_data(stored.data)
@@ -5205,30 +5291,34 @@ class Kernel:
                     spec_outcomes = replacement_spec.outcomes
                     continuation_mode = replacement_spec.continuation_mode
                     schema_version = replacement_spec.schema_version
-                elif item.text not in spec_constraints:
-                    spec_constraints.append(item.text)
-            updated_spec = TaskSpecSnapshot(
-                task_id=checkpoint.task_id, revision=current_spec.revision + 1,
-                goal=spec_goal, scope=spec_scope,
-                constraints=tuple(spec_constraints),
-                acceptance_criteria=spec_criteria, outcomes=spec_outcomes,
-                continuation_mode=continuation_mode,
-                schema_version=schema_version,
-            )
-            task_spec_event = RuntimeEvent(
-                f"evt-{uuid4().hex}", checkpoint.task_id,
-                stored.last_event_sequence + 2, "task_spec.revised", {
-                    "operation_id": canonical_hash({
-                        "kind": "runtime-steering",
-                        "steering_ids": applied_ids,
-                    }),
-                    "request_hash": canonical_hash(updated_spec.to_data()),
-                    "writer": "runtime-steering",
-                    "revision": updated_spec.revision,
-                    "content_hash": updated_spec.content_hash,
-                    "snapshot": updated_spec.to_data(),
-                },
-            )
+            # Ordinary steering is conversation input, not a durable Task
+            # constraint. Only explicit Replace revises the Task contract; a
+            # model may later propose structured scope/constraint/focus changes.
+            updated_spec = current_spec
+            task_spec_event: RuntimeEvent | None = None
+            if replaced:
+                updated_spec = TaskSpecSnapshot(
+                    task_id=checkpoint.task_id,
+                    revision=current_spec.revision + 1, goal=spec_goal,
+                    scope=spec_scope, constraints=tuple(spec_constraints),
+                    acceptance_criteria=spec_criteria, outcomes=spec_outcomes,
+                    continuation_mode=continuation_mode,
+                    schema_version=schema_version,
+                )
+                task_spec_event = RuntimeEvent(
+                    f"evt-{uuid4().hex}", checkpoint.task_id,
+                    stored.last_event_sequence + 2, "task_spec.revised", {
+                        "operation_id": canonical_hash({
+                            "kind": "runtime-steering",
+                            "steering_ids": applied_ids,
+                        }),
+                        "request_hash": canonical_hash(updated_spec.to_data()),
+                        "writer": "runtime-steering",
+                        "revision": updated_spec.revision,
+                        "content_hash": updated_spec.content_hash,
+                        "snapshot": updated_spec.to_data(),
+                    },
+                )
             if replacement_goal is not None:
                 current_memory = self._dependencies.working_memory_projector.project(
                     checkpoint.task_id, task.goal, events
@@ -5306,7 +5396,7 @@ class Kernel:
             updated_checkpoint = replace(
                 checkpoint, revision=checkpoint.revision + 1,
                 messages=tuple(messages),
-                pending_tool_calls=() if replaced else checkpoint.pending_tool_calls,
+                pending_tool_calls=checkpoint.pending_tool_calls,
                 last_steering_inbound_sequence=pending[-1].inbound_sequence,
                 goal_revision=goal_revision,
                 working_memory_hash=working_memory_hash,
@@ -5338,9 +5428,7 @@ class Kernel:
                     "steering_ids": applied_ids,
                     "inbound_sequences": [item.inbound_sequence for item in pending],
                     "safe_point": safe_point, "goal_revision": goal_revision,
-                    "replaced_pending_tool_calls": (
-                        len(checkpoint.pending_tool_calls) if replaced else 0
-                    ),
+                    "replaced_pending_tool_calls": 0,
                     "committed_mutation_count": len(task.mutation_journal),
                     "completed_tool_execution_count": len(task.tool_executions),
                     "checkpoint_hash": updated_checkpoint.checkpoint_hash,
@@ -5350,7 +5438,9 @@ class Kernel:
                 },
             )
             try:
-                committed = [event, task_spec_event]
+                committed = [event]
+                if task_spec_event is not None:
+                    committed.append(task_spec_event)
                 if working_memory_event is not None:
                     committed.append(working_memory_event)
                 committed.extend(question_events)
@@ -5363,6 +5453,60 @@ class Kernel:
                 if "version conflict" not in str(error) or attempt == 4:
                     raise
         raise RuntimeError("unreachable steering apply retry state")
+
+    async def _cancel_open_batch_for_queued_replace(
+        self, checkpoint: AgentTurnCheckpoint,
+    ) -> AgentTurnCheckpoint:
+        """Close unstarted calls when a queued Replace supersedes them.
+
+        This is protocol bookkeeping, not natural-language interpretation. The
+        input router already classified Replace; here the Kernel only preserves
+        one ToolResult for every accepted ToolCall before exposing new input to
+        the model. Started/unknown calls are handled by the execution ledger.
+        """
+        if not checkpoint.pending_tool_calls:
+            return checkpoint
+        events = await self._dependencies.store.read_events(checkpoint.task_id)
+        projection = SteeringProjector.project(checkpoint.task_id, events)
+        pending_inputs = tuple(
+            item for item in projection.pending
+            if item.inbound_sequence > checkpoint.last_steering_inbound_sequence
+        )
+        if not any(item.kind is SteeringKind.REPLACE for item in pending_inputs):
+            return checkpoint
+        task = await self.get_task(checkpoint.task_id)
+        cancellable: list[ToolCall] = []
+        for call in checkpoint.pending_tool_calls:
+            execution = task.tool_executions.get(
+                ToolExecutionRecord.identity(checkpoint.turn_id, call.call_id)
+            )
+            if execution is not None and execution.state in {
+                ToolCommitState.RUNNING, ToolCommitState.UNKNOWN_OUTCOME,
+            }:
+                return checkpoint
+            cancellable.append(call)
+        messages = list(checkpoint.messages)
+        for call in cancellable:
+            messages.append(Message(
+                f"msg-tool-cancelled-{uuid4().hex}", MessageRole.TOOL,
+                (ToolResultBlock(ToolResult(
+                    call.call_id, False, error_code="CANCELLED_BY_REPLACE",
+                    message="The call was not started because the user replaced the goal.",
+                    recovery_kind=ToolRecoveryKind.TERMINAL,
+                    meta={"cancelled_by_user_input": True},
+                )),),
+            ))
+        updated = replace(
+            checkpoint, revision=checkpoint.revision + 1,
+            messages=tuple(messages), pending_tool_calls=(),
+            tool_batch=(
+                checkpoint.tool_batch.with_pending(
+                    (), status=ToolBatchStatus.CANCELLED
+                ) if checkpoint.tool_batch is not None else None
+            ),
+        )
+        await self._save_agent_checkpoint(updated, "tool-batch-cancelled-by-replace")
+        return updated
 
     async def _commit_model_response_checkpoint(
         self, checkpoint: AgentTurnCheckpoint, response: Any,
@@ -5983,6 +6127,10 @@ class Kernel:
         refreshed = replace(
             checkpoint, revision=checkpoint.revision + 1,
             messages=tuple(messages), pending_tool_calls=tuple(remaining),
+            tool_batch=(
+                checkpoint.tool_batch.with_pending(tuple(remaining))
+                if checkpoint.tool_batch is not None else None
+            ),
             tool_calls=max(checkpoint.tool_calls, terminal_tool_calls),
             evidence_inventory=evidence_inventory,
             evidence_question_state=question_projection.to_data(),
@@ -7606,6 +7754,11 @@ class Kernel:
             revision=checkpoint.revision + 1,
             messages=checkpoint.messages,
             pending_tool_calls=checkpoint.pending_tool_calls[1:],
+            tool_batch=(
+                checkpoint.tool_batch.with_pending(
+                    checkpoint.pending_tool_calls[1:]
+                ) if checkpoint.tool_batch is not None else None
+            ),
             seen_call_ids=checkpoint.seen_call_ids,
             model_calls=checkpoint.model_calls,
             tool_calls=checkpoint.tool_calls + 1,
@@ -7998,6 +8151,11 @@ class Kernel:
             checkpoint, revision=checkpoint.revision + 1,
             messages=checkpoint.messages + (tool_message,),
             pending_tool_calls=checkpoint.pending_tool_calls[1:],
+            tool_batch=(
+                checkpoint.tool_batch.with_pending(
+                    checkpoint.pending_tool_calls[1:]
+                ) if checkpoint.tool_batch is not None else None
+            ),
             tool_calls=checkpoint.tool_calls + 1,
             evidence_question_state=question_projection.to_data(),
             pending_user_action={},
@@ -8143,10 +8301,26 @@ class Kernel:
             f"msg-tool-reconciled-{uuid4().hex}", MessageRole.TOOL,
             (ToolResultBlock(result),),
         )
+        reconciled_messages = tuple(
+            message for message in checkpoint.messages
+            if not (
+                message.role is MessageRole.TOOL
+                and any(
+                    isinstance(block, ToolResultBlock)
+                    and block.result.call_id == execution.call.call_id
+                    for block in message.content
+                )
+            )
+        )
         resumed_checkpoint = replace(
             checkpoint, revision=checkpoint.revision + 1,
-            messages=checkpoint.messages + (tool_message,),
+            messages=reconciled_messages + (tool_message,),
             pending_tool_calls=(), pending_user_action={},
+            tool_batch=(
+                checkpoint.tool_batch.with_pending(
+                    (), status=ToolBatchStatus.CLOSED
+                ) if checkpoint.tool_batch is not None else None
+            ),
         )
         stored = await self._require_stored_task(task.task_id)
         live = TaskSnapshot.from_data(stored.data)
@@ -8291,6 +8465,9 @@ class Kernel:
         turn_id = checkpoint.turn_id
         await self.plan_task_spec(task_id)
         live_spec = await self.get_task_spec(task_id)
+        live_focus = await self.get_task_execution_focus(
+            task_id, legacy_active_outcome_ids=checkpoint.active_outcome_ids
+        )
         closed_outcomes_at_entry = frozenset(
             outcome.outcome_id for outcome in live_spec.outcomes
             if outcome.required and outcome.status.is_closed
@@ -8298,10 +8475,7 @@ class Kernel:
         checkpoint = replace(
             checkpoint, task_spec_revision=live_spec.revision,
             task_spec_hash=live_spec.content_hash,
-            active_outcome_ids=tuple(
-                outcome.outcome_id for outcome in live_spec.outcomes
-                if outcome.required and not outcome.status.is_closed
-            ),
+            execution_focus=live_focus.to_data(),
         )
         messages = list(checkpoint.messages)
         if initial_tool_message is not None:
@@ -8325,8 +8499,19 @@ class Kernel:
         protocol_recovery_attempts = 0
         protocol_correction: str | None = None
         visible_tool_by_name = {tool.name: tool for tool in visible_tools}
+        checkpoint = self._synchronize_tool_batch(checkpoint)
+        pending_tool_calls = list(checkpoint.pending_tool_calls)
 
         while True:
+            checkpoint = self._synchronize_tool_batch(replace(
+                checkpoint, messages=tuple(messages),
+                pending_tool_calls=tuple(pending_tool_calls),
+            ))
+            checkpoint = await self._cancel_open_batch_for_queued_replace(
+                checkpoint
+            )
+            messages = list(checkpoint.messages)
+            pending_tool_calls = list(checkpoint.pending_tool_calls)
             checkpoint, replaced = await self._apply_pending_steering(
                 replace(
                     checkpoint, messages=tuple(messages),
@@ -8343,13 +8528,11 @@ class Kernel:
                 pending_tool_calls.clear()
                 await self.plan_task_spec(task_id)
                 refreshed_spec = await self.get_task_spec(task_id)
+                refreshed_focus = await self.get_task_execution_focus(task_id)
                 checkpoint = replace(
                     checkpoint, task_spec_revision=refreshed_spec.revision,
                     task_spec_hash=refreshed_spec.content_hash,
-                    active_outcome_ids=tuple(
-                        outcome.outcome_id for outcome in refreshed_spec.outcomes
-                        if outcome.required and not outcome.status.is_closed
-                    ),
+                    execution_focus=refreshed_focus.to_data(),
                 )
             while pending_tool_calls:
                 checkpoint, replaced = await self._apply_pending_steering(
@@ -8367,7 +8550,18 @@ class Kernel:
                     break
                 call = pending_tool_calls[0]
                 call_spec = visible_tool_by_name.get(call.name)
-                if call_spec is not None and call.outcome_ref is None:
+                frozen_call = (
+                    next((item for item in checkpoint.tool_batch.calls
+                          if item.call_id == call.call_id), None)
+                    if checkpoint.tool_batch is not None else None
+                )
+                if frozen_call is not None:
+                    # Outcome bindings and normalized arguments were accepted
+                    # atomically with the batch. Never reinterpret them after a
+                    # previous call changes Task state.
+                    call = frozen_call
+                    pending_tool_calls[0] = call
+                elif call_spec is not None and call.outcome_ref is None:
                     # Resolve the Action→Outcome edge before emitting any
                     # lifecycle Event so requested/policy/approval/result all
                     # carry the same authoritative reference.
@@ -8977,6 +9171,22 @@ class Kernel:
                         task_id, turn_id, call, ToolActionDisposition.CANCEL,
                         "plan_no_progress_stopped",
                     )
+                    cancelled_calls = tuple(pending_tool_calls)
+                    for cancelled in cancelled_calls:
+                        messages.append(Message(
+                            f"msg-tool-cancelled-{uuid4().hex}",
+                            MessageRole.TOOL,
+                            (ToolResultBlock(ToolResult(
+                                cancelled.call_id, False,
+                                error_code="CANCELLED_BY_RUNTIME_POLICY",
+                                message=(
+                                    "The accepted call was not started because "
+                                    "the Runtime reached a no-progress safety stop."
+                                ),
+                                recovery_kind=ToolRecoveryKind.TERMINAL,
+                                meta={"runtime_guard": "NO_PROGRESS"},
+                            )),),
+                        ))
                     pending_tool_calls.clear()
                     stop_body = json.dumps({
                         "boundary": "runtime_no_progress_stop",
@@ -8997,6 +9207,11 @@ class Kernel:
                     ))
                     checkpoint = replace(
                         checkpoint, pending_tool_calls=(), messages=tuple(messages),
+                        tool_batch=(
+                            checkpoint.tool_batch.with_pending(
+                                (), status=ToolBatchStatus.CANCELLED
+                            ) if checkpoint.tool_batch is not None else None
+                        ),
                         evidence_question_state=question_projection.to_data(),
                     )
                     no_progress_stop = True
@@ -9032,6 +9247,12 @@ class Kernel:
                     revision=checkpoint.revision,
                     messages=tuple(messages),
                     pending_tool_calls=tuple(pending_tool_calls),
+                    tool_batch=(
+                        checkpoint.tool_batch.with_pending(
+                            tuple(pending_tool_calls),
+                            status=ToolBatchStatus.EXECUTING,
+                        ) if checkpoint.tool_batch is not None else None
+                    ),
                     seen_call_ids=tuple(sorted(seen_call_ids)),
                     model_calls=model_call_count,
                     tool_calls=tool_call_count,
@@ -9279,6 +9500,11 @@ class Kernel:
                 after_tool = replace(
                     suspension, messages=tuple(messages),
                     pending_tool_calls=tuple(pending_tool_calls),
+                    tool_batch=(
+                        suspension.tool_batch.with_pending(
+                            tuple(pending_tool_calls)
+                        ) if suspension.tool_batch is not None else None
+                    ),
                     tool_calls=tool_call_count,
                     workspace_fingerprint=workspace_fingerprint(
                         Path((await self.get_task(task_id)).workspace),
@@ -9344,6 +9570,14 @@ class Kernel:
                     await self._refresh_continuation_session_identity(task_id)
                     return continuation
 
+            checkpoint = self._synchronize_tool_batch(replace(
+                checkpoint, messages=tuple(messages),
+                pending_tool_calls=tuple(pending_tool_calls),
+            ))
+            messages = list(self._normalize_and_validate_model_boundary(
+                checkpoint.messages
+            ))
+            checkpoint = replace(checkpoint, messages=tuple(messages))
             model_call_number = model_call_count + 1
             if model_call_number > checkpoint.max_model_calls:
                 error = AgentLoopLimitExceeded(
@@ -9555,6 +9789,25 @@ class Kernel:
                 runtime_instruction = "\n\n".join(filter(None, (
                     runtime_instruction, protocol_correction,
                 )))
+            live_spec = await self.get_task_spec(task_id)
+            live_focus = await self.get_task_execution_focus(task_id)
+            eligible_outcomes = TaskOutcomeEligibilityCalculator.eligible(live_spec)
+            selected_ids = set(live_focus.selected_outcome_ids)
+            selected_outcomes = tuple(
+                outcome for outcome in eligible_outcomes
+                if outcome.outcome_id in selected_ids
+            )
+            unselected_outcomes = tuple(
+                outcome for outcome in eligible_outcomes
+                if outcome.outcome_id not in selected_ids
+            )
+            # Expose the focus-selection protocol only when it can perform a
+            # valid transition. This keeps ordinary single-focus turns small.
+            model_visible_tools = tuple(
+                tool for tool in visible_tools
+                if tool.name != "core.task_outcome_select"
+                or bool(unselected_outcomes)
+            )
             # Outcome state is event-sourced and may have changed after the
             # previous tool result. Keep exactly one fresh protected Task SPEC
             # message so compaction and restart never reintroduce stale state.
@@ -9565,7 +9818,7 @@ class Kernel:
             messages.append(await self._task_spec_context_message(task_id))
             try:
                 prepared = self._dependencies.context_manager.prepare(
-                    conversation=tuple(messages), tools=visible_tools,
+                    conversation=tuple(messages), tools=model_visible_tools,
                     prompt_template=self._dependencies.prompt_template,
                     context_window=(
                         self._dependencies.model.capabilities.context_window
@@ -9596,12 +9849,7 @@ class Kernel:
                     compacted_checkpoint, "context-compacted"
                 )
             prompt = self._dependencies.prompt_template.assemble(
-                prepared.messages, visible_tools, runtime_instruction
-            )
-            live_spec = await self.get_task_spec(task_id)
-            open_outcomes = tuple(
-                outcome for outcome in live_spec.outcomes
-                if outcome.required and not outcome.status.is_closed
+                prepared.messages, model_visible_tools, runtime_instruction
             )
             transport_updates: list[ModelTransportProgress] = []
 
@@ -9644,22 +9892,22 @@ class Kernel:
                 turn_id=turn_id,
                 messages=prompt.messages,
                 max_output_tokens=checkpoint.max_output_tokens,
-                tools=visible_tools,
+                tools=model_visible_tools,
                 allow_tool_calls=not (wrap_up or disclosure_only),
                 require_evidence_questions=(
                     self._dependencies.require_evidence_questions
                 ),
                 outcome_refs=tuple(
-                    outcome.outcome_id for outcome in open_outcomes
+                    outcome.outcome_id for outcome in selected_outcomes
                 ),
                 tool_outcome_refs=tuple(
                     (tool.name, tuple(
-                        outcome.outcome_id for outcome in open_outcomes
+                        outcome.outcome_id for outcome in selected_outcomes
                         if self._tool_effect_supports_outcome(
                             tool.effect, outcome
                         )
                     ))
-                    for tool in visible_tools
+                    for tool in model_visible_tools
                 ),
                 on_transport_progress=record_transport,
             )
@@ -9732,6 +9980,15 @@ class Kernel:
                         "invalid_outcome_binding", str(error)
                     ) from error
                 tool_calls = tuple(bound_calls)
+                self._validate_tool_batch_proposal(
+                    tool_calls, visible_tool_by_name, seen_call_ids
+                )
+                accepted_batch = (
+                    await self._new_tool_batch(
+                        task_id, response.message, tool_calls
+                    )
+                    if tool_calls else None
+                )
                 # A rejected response never consumes call IDs.  The corrected
                 # response may legitimately reuse the Provider-generated IDs.
                 seen_call_ids.update(call.call_id for call in tool_calls)
@@ -9796,10 +10053,11 @@ class Kernel:
                             "remaining uncertainty."
                         )
                         if error.reason_code == "tool_call_emitted_while_disabled" else (
-                            "Your previous tool call linked a tool to an incompatible "
-                            "Task outcome. Select only an outcome_ref allowed by that "
-                            "tool's current JSON Schema, or omit outcome_ref when no "
-                            "single outcome applies. Do not repeat the invalid call. "
+                            "Your previous tool call could not bind to the current "
+                            "Task execution focus. Inspect Runtime detail below. If "
+                            "the intended eligible outcome is not selected, first call "
+                            "core.task_outcome_select; otherwise correct or omit the "
+                            "outcome_ref. Do not repeat the invalid call unchanged. "
                             f"Runtime detail: {error.detail}"
                         ) if error.reason_code == "invalid_outcome_binding" else
                         (
@@ -9829,7 +10087,10 @@ class Kernel:
                         checkpoint, "tool-protocol-retry-requested"
                     )
                     continue
-                if model_call_count >= checkpoint.max_model_calls:
+                if (
+                    error.reason_code == "tool_call_emitted_while_disabled"
+                    and model_call_count >= checkpoint.max_model_calls
+                ):
                     limit_error = AgentLoopLimitExceeded(
                         turn_id, "max_model_calls", checkpoint.max_model_calls,
                         model_calls=model_call_count, tool_calls=tool_call_count,
@@ -9841,7 +10102,17 @@ class Kernel:
                         task_id, turn_id, limit_error
                     )
                     raise limit_error from error
-                await self._record_turn_failure(
+                checkpoint = replace(
+                    checkpoint, messages=tuple(messages),
+                    pending_tool_calls=(),
+                    seen_call_ids=tuple(sorted(seen_call_ids)),
+                    model_calls=model_call_count, tool_calls=tool_call_count,
+                    input_tokens=input_tokens, output_tokens=output_tokens,
+                )
+                await self._save_agent_checkpoint(
+                    checkpoint, "tool-protocol-recovery-exhausted"
+                )
+                await self._record_recoverable_turn_interruption(
                     task_id, turn_id, error, prompt.receipt,
                     failure_kind="tool_protocol",
                     failure_category=ModelFailureCategory.CORRECTABLE_PROTOCOL,
@@ -9908,6 +10179,7 @@ class Kernel:
             response_checkpoint = replace(
                 checkpoint, messages=tuple(messages),
                 pending_tool_calls=tuple(tool_calls),
+                tool_batch=accepted_batch,
                 seen_call_ids=tuple(sorted(seen_call_ids)),
                 model_calls=model_call_count, tool_calls=tool_call_count,
                 input_tokens=input_tokens, output_tokens=output_tokens,
@@ -10151,9 +10423,31 @@ class Kernel:
                 checkpoint.pending_tool_calls
             ),
         }
+        cancellation_messages = tuple(
+            Message(
+                f"msg-tool-cancelled-{uuid4().hex}", MessageRole.TOOL,
+                (ToolResultBlock(ToolResult(
+                    pending.call_id, False,
+                    error_code="CANCELLED_AFTER_UNKNOWN_OUTCOME",
+                    message=(
+                        "The call was not started because an earlier call in "
+                        "the same batch has an unknown external outcome."
+                    ),
+                    recovery_kind=ToolRecoveryKind.TERMINAL,
+                    meta={"batch_cancelled": True},
+                )),),
+            )
+            for pending in checkpoint.pending_tool_calls
+        )
         suspended_checkpoint = replace(
             checkpoint, revision=checkpoint.revision + 1,
+            messages=checkpoint.messages + cancellation_messages,
             pending_tool_calls=(), pending_user_action=pending_user_action,
+            tool_batch=(
+                checkpoint.tool_batch.with_pending(
+                    (), status=ToolBatchStatus.RECONCILING
+                ) if checkpoint.tool_batch is not None else None
+            ),
         )
         awaiting = task.await_clarification(request).with_agent_checkpoint(
             suspended_checkpoint.to_data()
@@ -10242,6 +10536,10 @@ class Kernel:
         newly closed a required Outcome and the Planner explicitly selected the
         AFTER_COMPLETED_UNIT policy while later required Outcomes remain.
         """
+        if checkpoint.pending_tool_calls or (
+            checkpoint.tool_batch is not None and checkpoint.tool_batch.is_open
+        ):
+            return None
         spec = await self.get_task_spec(checkpoint.task_id)
         if spec.continuation_mode is not TaskContinuationMode.AFTER_COMPLETED_UNIT:
             return None
@@ -10274,9 +10572,9 @@ class Kernel:
             checkpoint, revision=checkpoint.revision + 1,
             pending_user_action=pending,
             task_spec_revision=spec.revision, task_spec_hash=spec.content_hash,
-            active_outcome_ids=tuple(
-                outcome.outcome_id for outcome in remaining
-            ),
+            execution_focus=(await self.get_task_execution_focus(
+                checkpoint.task_id
+            )).to_data(),
         )
         stored = await self._require_stored_task(checkpoint.task_id)
         task = TaskSnapshot.from_data(stored.data)
@@ -10357,7 +10655,9 @@ class Kernel:
             checkpoint, revision=checkpoint.revision + 1,
             pending_user_action=pending,
             task_spec_revision=spec.revision, task_spec_hash=spec.content_hash,
-            active_outcome_ids=remaining_outcome_ids,
+            execution_focus=(await self.get_task_execution_focus(
+                checkpoint.task_id
+            )).to_data(),
         )
         stored = await self._require_stored_task(checkpoint.task_id)
         task = TaskSnapshot.from_data(stored.data)
@@ -11442,6 +11742,159 @@ class Kernel:
         return tool_calls
 
     @staticmethod
+    def _validate_tool_batch_proposal(
+        calls: tuple[ToolCall, ...],
+        visible_tool_by_name: Mapping[str, ToolSpec],
+        seen_call_ids: set[str],
+    ) -> None:
+        """Validate a proposed batch completely before executing any call."""
+        duplicate = [call.call_id for call in calls if call.call_id in seen_call_ids]
+        if duplicate:
+            raise InvalidModelResponse(
+                "tool call_id must be unique within a turn: "
+                + ", ".join(duplicate)
+            )
+        errors: list[str] = []
+        for call in calls:
+            spec = visible_tool_by_name.get(call.name)
+            if spec is None:
+                errors.append(f"{call.call_id}: unknown tool {call.name}")
+                continue
+            try:
+                validate_tool_arguments(spec, call.arguments)
+            except InvalidToolArguments as error:
+                errors.append(f"{call.call_id}: {error}")
+        if errors:
+            raise RecoverableToolProtocolError(
+                "invalid_tool_batch", "; ".join(errors)
+            )
+
+    async def _new_tool_batch(
+        self, task_id: str, source_message: Message,
+        calls: tuple[ToolCall, ...],
+    ) -> ToolBatchSnapshot:
+        """Freeze accepted calls and their Task/Focus revisions."""
+        spec = await self.get_task_spec(task_id)
+        focus = await self.get_task_execution_focus(task_id)
+        return ToolBatchSnapshot(
+            batch_id=f"batch-{uuid4().hex}",
+            source_message_id=source_message.message_id,
+            calls=calls,
+            pending_call_ids=tuple(call.call_id for call in calls),
+            status=ToolBatchStatus.ACCEPTED,
+            task_spec_revision=spec.revision,
+            execution_focus_revision=focus.selection_revision,
+        )
+
+    @staticmethod
+    def _synchronize_tool_batch(
+        checkpoint: AgentTurnCheckpoint,
+    ) -> AgentTurnCheckpoint:
+        """Migrate old checkpoints and keep batch pending state authoritative."""
+        pending = checkpoint.pending_tool_calls
+        batch = checkpoint.tool_batch
+        if batch is None and pending:
+            source = next((
+                message for message in reversed(checkpoint.messages)
+                if message.role is MessageRole.ASSISTANT
+                and any(isinstance(block, ToolCallBlock)
+                        for block in message.content)
+            ), None)
+            batch = ToolBatchSnapshot(
+                batch_id=(
+                    "legacy-batch-" + canonical_hash({
+                        "turn_id": checkpoint.turn_id,
+                        "calls": [call.to_data() for call in pending],
+                    })[:20]
+                ),
+                source_message_id=(
+                    source.message_id if source is not None else "legacy-unknown"
+                ),
+                calls=pending, pending_call_ids=tuple(
+                    call.call_id for call in pending
+                ),
+                status=ToolBatchStatus.RECONCILING,
+                task_spec_revision=checkpoint.task_spec_revision,
+                execution_focus_revision=int(
+                    checkpoint.execution_focus.get("selection_revision", 0)
+                ),
+            )
+        elif batch is not None:
+            batch = batch.with_pending(pending)
+        return replace(checkpoint, tool_batch=batch)
+
+    @staticmethod
+    def _normalize_and_validate_model_boundary(
+        messages: tuple[Message, ...],
+    ) -> tuple[Message, ...]:
+        """Enforce Provider ToolCall/ToolResult adjacency before HTTP.
+
+        Tool results may be persisted one message per call.  This accepts that
+        representation but rejects user/assistant interleaving and orphaned or
+        duplicate results locally, before a Provider can return HTTP 400.
+        """
+        normalized: list[Message] = []
+        consumed: set[int] = set()
+        index = 0
+        while index < len(messages):
+            if index in consumed:
+                index += 1
+                continue
+            message = messages[index]
+            calls = tuple(
+                block.call.call_id for block in message.content
+                if isinstance(block, ToolCallBlock)
+            )
+            if message.role is not MessageRole.ASSISTANT or not calls:
+                if message.role is MessageRole.TOOL:
+                    raise AgentCheckpointConflict(
+                        "orphaned ToolResult message at model boundary"
+                    )
+                normalized.append(message)
+                index += 1
+                continue
+            normalized.append(message)
+            expected = set(calls)
+            observed: set[str] = set()
+            result_messages: list[Message] = []
+            cursor = index + 1
+            while cursor < len(messages) and observed != expected:
+                candidate = messages[cursor]
+                if cursor in consumed or candidate.role is not MessageRole.TOOL:
+                    cursor += 1
+                    continue
+                result_ids = {
+                    block.result.call_id for block in candidate.content
+                    if isinstance(block, ToolResultBlock)
+                }
+                if not result_ids.intersection(expected):
+                    cursor += 1
+                    continue
+                for block in candidate.content:
+                    if not isinstance(block, ToolResultBlock):
+                        raise AgentCheckpointConflict(
+                            "tool message contains a non-result block"
+                        )
+                    call_id = block.result.call_id
+                    if call_id not in expected or call_id in observed:
+                        raise AgentCheckpointConflict(
+                            f"orphaned or duplicate ToolResult: {call_id}"
+                        )
+                    observed.add(call_id)
+                result_messages.append(candidate)
+                consumed.add(cursor)
+                cursor += 1
+            missing = expected - observed
+            if missing:
+                raise AgentCheckpointConflict(
+                    "model boundary has unresolved ToolCall IDs: "
+                    + ", ".join(sorted(missing))
+                )
+            normalized.extend(result_messages)
+            index += 1
+        return tuple(normalized)
+
+    @staticmethod
     def _looks_like_exact_text_tool_call(text: str) -> bool:
         """Fail closed when the whole response looks like tool protocol.
 
@@ -11708,43 +12161,146 @@ class Kernel:
         self, task_id: str, call: ToolCall, tool: ToolSpec, *,
         allow_closed_ref: bool = False,
     ) -> ToolCall:
-        """Resolve an Action→Outcome edge without confusing support with delivery.
+        """Resolve one Action→Outcome edge in Kernel, never in Provider."""
+        decision = await self._decide_tool_call_outcome(
+            task_id, call, tool, allow_closed_ref=allow_closed_ref
+        )
+        if (
+            call.outcome_ref is not None
+            or decision.selected_outcome_ids
+            or decision.eligible_outcome_ids
+            or decision.compatible_outcome_ids
+            or decision.action is not OutcomeBindingAction.ACCEPT
+        ):
+            await self._append_events(task_id, ((
+                "task_outcome.binding_decided", {
+                    "tool_call": call.to_data(),
+                    "tool_effect": tool.effect.value,
+                    **decision.to_data(),
+                },
+            ),))
+        if (
+            decision.action is OutcomeBindingAction.ACCEPT
+            or (
+                decision.action is OutcomeBindingAction.CORRECT
+                and decision.bound_outcome_id is not None
+            )
+        ):
+            return (
+                replace(call, outcome_ref=decision.bound_outcome_id)
+                if decision.bound_outcome_id is not None else call
+            )
+        raise InvalidToolArguments(
+            json.dumps(decision.to_data(), sort_keys=True, separators=(",", ":"))
+        )
 
-        ``required_effects`` are effects that must occur before an Outcome can
-        close.  A read-only observation linked to an ANSWER is supporting
-        evidence: it may advance that Outcome to IN_PROGRESS, but the tool
-        result cannot deliver the answer.  Side effects remain valid only when
-        the TaskSpec explicitly requires their exact effect.
-        """
+    async def _decide_tool_call_outcome(
+        self, task_id: str, call: ToolCall, tool: ToolSpec, *,
+        allow_closed_ref: bool = False,
+    ) -> OutcomeBindingDecision:
+        """Return a deterministic, fully inspectable binding decision."""
         spec = await self.get_task_spec(task_id)
-        open_outcomes = tuple(
-            outcome for outcome in spec.outcomes
-            if outcome.required and not outcome.status.is_closed
+        if not spec.outcomes or tool.effect is ToolEffect.INTERNAL:
+            if call.outcome_ref is not None and not spec.outcomes:
+                return OutcomeBindingDecision(
+                    OutcomeBindingAction.REJECT,
+                    OutcomeBindingReason.OUTCOME_NOT_FOUND,
+                    requested_outcome_id=call.outcome_ref,
+                )
+            return OutcomeBindingDecision(
+                OutcomeBindingAction.ACCEPT,
+                requested_outcome_id=call.outcome_ref,
+                bound_outcome_id=call.outcome_ref,
+            )
+        task = await self.get_task(task_id)
+        legacy_ids: tuple[str, ...] = ()
+        if task.active_agent_checkpoint is not None:
+            legacy_ids = tuple(
+                str(item) for item in
+                task.active_agent_checkpoint.get("active_outcome_ids", [])
+            )
+        focus = await self.get_task_execution_focus(
+            task_id, legacy_active_outcome_ids=legacy_ids
         )
+        eligible = TaskOutcomeEligibilityCalculator.eligible(spec)
+        eligible_ids = tuple(item.outcome_id for item in eligible)
+        selected_ids = tuple(
+            item for item in focus.selected_outcome_ids if item in eligible_ids
+        )
+        compatible_ids = tuple(
+            item.outcome_id for item in eligible
+            if self._tool_effect_supports_outcome(tool.effect, item)
+        )
+
+        def result(
+            action: OutcomeBindingAction, reason: OutcomeBindingReason,
+            bound: str | None = None,
+        ) -> OutcomeBindingDecision:
+            return OutcomeBindingDecision(
+                action, reason, call.outcome_ref, bound, selected_ids,
+                eligible_ids, compatible_ids,
+            )
+
         if call.outcome_ref is not None:
-            selected = next((
-                outcome for outcome in spec.outcomes
-                if outcome.outcome_id == call.outcome_ref
+            target = next((
+                item for item in spec.outcomes
+                if item.outcome_id == call.outcome_ref
             ), None)
-            if selected is None or (
-                selected.status.is_closed and not allow_closed_ref
-            ):
-                raise InvalidToolArguments(
-                    f"unknown or closed outcome_ref: {call.outcome_ref}"
+            if target is None:
+                return result(
+                    OutcomeBindingAction.REJECT,
+                    OutcomeBindingReason.OUTCOME_NOT_FOUND,
                 )
-            if not self._tool_effect_supports_outcome(tool.effect, selected):
-                raise InvalidToolArguments(
-                    f"tool effect {tool.effect.value} cannot support or fulfill "
-                    f"outcome {selected.outcome_id}"
+            if target.status.is_closed:
+                return result(
+                    OutcomeBindingAction.ACCEPT if allow_closed_ref
+                    else OutcomeBindingAction.REJECT,
+                    OutcomeBindingReason.NONE if allow_closed_ref
+                    else OutcomeBindingReason.OUTCOME_ALREADY_CLOSED,
+                    target.outcome_id if allow_closed_ref else None,
                 )
-            return call
-        candidates = tuple(
-            outcome for outcome in open_outcomes
-            if self._tool_effect_supports_outcome(tool.effect, outcome)
+            if target.outcome_id not in eligible_ids:
+                return result(
+                    OutcomeBindingAction.CORRECT,
+                    OutcomeBindingReason.OUTCOME_DEPENDENCY_UNSATISFIED,
+                )
+            if not self._tool_effect_supports_outcome(tool.effect, target):
+                return result(
+                    OutcomeBindingAction.CORRECT,
+                    OutcomeBindingReason.OUTCOME_EFFECT_MISMATCH,
+                )
+            if target.outcome_id not in selected_ids:
+                return result(
+                    OutcomeBindingAction.REQUIRE_SELECTION,
+                    OutcomeBindingReason.OUTCOME_NOT_SELECTED,
+                )
+            return result(
+                OutcomeBindingAction.ACCEPT, OutcomeBindingReason.NONE,
+                target.outcome_id,
+            )
+
+        selected_compatible = tuple(
+            item for item in compatible_ids if item in selected_ids
         )
-        if len(candidates) == 1:
-            return replace(call, outcome_ref=candidates[0].outcome_id)
-        return call
+        if len(selected_compatible) == 1:
+            return result(
+                OutcomeBindingAction.CORRECT, OutcomeBindingReason.NONE,
+                selected_compatible[0],
+            )
+        if len(selected_compatible) > 1:
+            return result(
+                OutcomeBindingAction.REQUIRE_SELECTION,
+                OutcomeBindingReason.OUTCOME_SELECTION_AMBIGUOUS,
+            )
+        if compatible_ids:
+            return result(
+                OutcomeBindingAction.REQUIRE_SELECTION,
+                OutcomeBindingReason.OUTCOME_NOT_SELECTED,
+            )
+        return result(
+            OutcomeBindingAction.ACCEPT,
+            OutcomeBindingReason.NO_COMPATIBLE_OUTCOME,
+        )
 
     @staticmethod
     def _tool_effect_supports_outcome(
@@ -11817,13 +12373,18 @@ class Kernel:
         existing = task.tool_executions.get(
             ToolExecutionRecord.identity(turn_id, call.call_id)
         )
+        validate_tool_arguments(selected_spec, call.arguments)
         call = await self._bind_tool_call_outcome(
             task_id, call, selected_spec,
             allow_closed_ref=(
                 existing is not None or allow_closed_outcome_ref
             ),
         )
-        validate_tool_arguments(selected_spec, call.arguments)
+        # Binding emits its own audit event. Refresh the optimistic-lock base
+        # before policy/execution commits so observability cannot create a
+        # false version conflict.
+        stored = await self._require_stored_task(task_id)
+        task = TaskSnapshot.from_data(stored.data)
         if existing is not None:
             expected_hash = self._tool_policy.payload_hash(
                 selected_spec, call, task.project_trust
@@ -12618,7 +13179,11 @@ class Kernel:
             next_status = (
                 TaskOutcomeStatus.DELIVERED
                 if (
-                    outcome.kind not in final_candidate_kinds
+                    (
+                        outcome.completion_policy
+                        is TaskOutcomeCompletionPolicy.REQUIRED_EFFECTS
+                        or outcome.kind not in final_candidate_kinds
+                    )
                     and set(outcome.required_effects).issubset(fulfilled_effects)
                 )
                 else TaskOutcomeStatus.IN_PROGRESS

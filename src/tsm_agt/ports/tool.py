@@ -446,6 +446,10 @@ class ToolTaskSpecControl(Protocol):
         operation_id: str,
     ) -> Mapping[str, Any]: ...
 
+    async def select_outcomes(
+        self, outcome_ids: tuple[str, ...], reason: str, source_input_id: str,
+    ) -> Mapping[str, Any]: ...
+
 
 @dataclass(frozen=True, slots=True)
 class ToolInvocationContext:

@@ -205,6 +205,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                     "core.working_memory_read",
                     "core.working_memory_update",
                     "core.task_spec_read",
+                    "core.task_outcome_select",
                     "core.task_spec_update",
                     "code.symbol_overview", "code.definition",
                     "code.references", "code.implementations",

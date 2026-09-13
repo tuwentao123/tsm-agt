@@ -162,6 +162,93 @@ class AgentCheckpointConflict(RuntimeError):
     pass
 
 
+class ToolBatchStatus(StrEnum):
+    """Durable lifecycle of one assistant message's tool-call set.
+
+    A batch is the protocol boundary between one assistant message and all of
+    its Tool Results.  Individual tools may run sequentially, but the Runtime
+    may not sample the model or inject user input until the batch is closed.
+    """
+
+    ACCEPTED = "ACCEPTED"
+    EXECUTING = "EXECUTING"
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
+    CLOSED = "CLOSED"
+    CANCELLED = "CANCELLED"
+    RECONCILING = "RECONCILING"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolBatchSnapshot:
+    """Frozen, restart-safe record of one accepted model tool batch."""
+
+    batch_id: str
+    source_message_id: str
+    calls: tuple[ToolCall, ...]
+    pending_call_ids: tuple[str, ...]
+    status: ToolBatchStatus
+    task_spec_revision: int
+    execution_focus_revision: int
+
+    def __post_init__(self) -> None:
+        call_ids = tuple(call.call_id for call in self.calls)
+        if not self.batch_id or not self.source_message_id or not self.calls:
+            raise ValueError("tool batch identity and calls are required")
+        if len(call_ids) != len(set(call_ids)):
+            raise ValueError("tool batch call IDs must be unique")
+        if not set(self.pending_call_ids).issubset(call_ids):
+            raise ValueError("tool batch pending calls must belong to the batch")
+        if self.status is ToolBatchStatus.CLOSED and self.pending_call_ids:
+            raise ValueError("closed tool batch cannot contain pending calls")
+
+    @property
+    def is_open(self) -> bool:
+        return self.status not in {
+            ToolBatchStatus.CLOSED, ToolBatchStatus.CANCELLED,
+        }
+
+    def with_pending(
+        self, pending_calls: tuple[ToolCall, ...], *,
+        status: ToolBatchStatus | None = None,
+    ) -> ToolBatchSnapshot:
+        pending_ids = tuple(call.call_id for call in pending_calls)
+        resolved_status = status or (
+            ToolBatchStatus.EXECUTING
+            if pending_ids else ToolBatchStatus.CLOSED
+        )
+        return ToolBatchSnapshot(
+            self.batch_id, self.source_message_id, self.calls, pending_ids,
+            resolved_status, self.task_spec_revision,
+            self.execution_focus_revision,
+        )
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "batch_id": self.batch_id,
+            "source_message_id": self.source_message_id,
+            "calls": [call.to_data() for call in self.calls],
+            "pending_call_ids": list(self.pending_call_ids),
+            "status": self.status.value,
+            "task_spec_revision": self.task_spec_revision,
+            "execution_focus_revision": self.execution_focus_revision,
+        }
+
+    @classmethod
+    def from_data(cls, data: Mapping[str, Any]) -> ToolBatchSnapshot:
+        raw_calls = data.get("calls")
+        raw_pending = data.get("pending_call_ids")
+        if not isinstance(raw_calls, list) or not isinstance(raw_pending, list):
+            raise ValueError("tool batch calls and pending IDs must be lists")
+        return cls(
+            str(data["batch_id"]), str(data["source_message_id"]),
+            tuple(ToolCall.from_data(item) for item in raw_calls),
+            tuple(str(item) for item in raw_pending),
+            ToolBatchStatus(str(data["status"])),
+            int(data.get("task_spec_revision", 0)),
+            int(data.get("execution_focus_revision", 0)),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class AgentTurnCheckpoint:
     task_id: str
@@ -201,6 +288,9 @@ class AgentTurnCheckpoint:
     completion_readiness_state: Mapping[str, Any] = field(default_factory=dict)
     task_spec_revision: int = 0
     task_spec_hash: str = ""
+    execution_focus: Mapping[str, Any] = field(default_factory=dict)
+    tool_batch: ToolBatchSnapshot | None = None
+    # Deprecated migration input. New code reads execution_focus exclusively.
     active_outcome_ids: tuple[str, ...] = ()
     pending_user_action: Mapping[str, Any] = field(default_factory=dict)
 
@@ -289,6 +379,14 @@ class AgentTurnCheckpoint:
             ),
             task_spec_revision=int(data.get("task_spec_revision", 0)),
             task_spec_hash=str(data.get("task_spec_hash", "")),
+            execution_focus=(
+                dict(data["execution_focus"])
+                if isinstance(data.get("execution_focus"), Mapping) else {}
+            ),
+            tool_batch=(
+                ToolBatchSnapshot.from_data(data["tool_batch"])
+                if isinstance(data.get("tool_batch"), Mapping) else None
+            ),
             active_outcome_ids=tuple(
                 str(item) for item in data.get("active_outcome_ids", [])
             ),
@@ -305,7 +403,8 @@ class AgentTurnCheckpoint:
                 "exploration_outcome_state", "evidence_question_state",
                 "completion_readiness_state",
                 "task_spec_revision", "task_spec_hash",
-                "active_outcome_ids", "pending_user_action",
+                "execution_focus", "active_outcome_ids",
+                "pending_user_action", "tool_batch",
             )
             missing_fields = tuple(
                 field for field in evolved_fields if field not in data
@@ -368,6 +467,10 @@ class AgentTurnCheckpoint:
             ),
             "task_spec_revision": self.task_spec_revision,
             "task_spec_hash": self.task_spec_hash,
+            "execution_focus": dict(self.execution_focus or {}),
+            "tool_batch": (
+                self.tool_batch.to_data() if self.tool_batch is not None else None
+            ),
             "active_outcome_ids": list(self.active_outcome_ids),
             "pending_user_action": dict(self.pending_user_action or {}),
         }

@@ -210,8 +210,8 @@ class RuntimeSteeringKernelTest(unittest.IsolatedAsyncioTestCase):
                 applied = next(
                     event for event in events if event.event_type == "steering.applied"
                 )
-                self.assertEqual(applied.payload["safe_point"], "before-tool-batch")
-                self.assertEqual(applied.payload["replaced_pending_tool_calls"], 1)
+                self.assertEqual(applied.payload["safe_point"], "before-model")
+                self.assertEqual(applied.payload["replaced_pending_tool_calls"], 0)
                 self.assertTrue(applied.payload["working_memory_revised"])
                 memory = await app.kernel.get_working_memory(task.task_id)
                 self.assertEqual(memory.goal, "replace while model is running")
@@ -264,8 +264,13 @@ class RuntimeSteeringKernelTest(unittest.IsolatedAsyncioTestCase):
                 task = await executing_task(app, root, "replace-task")
                 user = Message("original-user", MessageRole.USER, (TextBlock("old"),))
                 pending = ToolCall("never-run", "fixture.missing", {})
+                assistant = Message(
+                    "original-assistant", MessageRole.ASSISTANT,
+                    (ToolCallBlock(pending),),
+                )
                 checkpoint = AgentTurnCheckpoint(
-                    task.task_id, "turn-replace", 1, (user,), (pending,), (),
+                    task.task_id, "turn-replace", 1, (user, assistant),
+                    (pending,), (),
                     0, 0, 0, 0, 5, 5, 256, 10.0,
                 )
                 visible = await app.kernel.list_tools()
@@ -285,7 +290,15 @@ class RuntimeSteeringKernelTest(unittest.IsolatedAsyncioTestCase):
                 applied = next(
                     event for event in events if event.event_type == "steering.applied"
                 )
-                self.assertEqual(applied.payload["replaced_pending_tool_calls"], 1)
+                self.assertEqual(applied.payload["replaced_pending_tool_calls"], 0)
+                cancellation = next(
+                    message for message in model.requests[0].messages
+                    if message.role is MessageRole.TOOL
+                )
+                self.assertEqual(
+                    cancellation.content[0].result.error_code,
+                    "CANCELLED_BY_REPLACE",
+                )
                 self.assertTrue(applied.payload["working_memory_revised"])
                 memory = await app.kernel.get_working_memory(task.task_id)
                 self.assertEqual(memory.goal, "Do the new goal instead")

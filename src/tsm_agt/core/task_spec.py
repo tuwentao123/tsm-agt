@@ -12,6 +12,34 @@ from tsm_agt.ports import RuntimeEvent, ToolEffect
 from .configuration import canonical_hash
 
 
+def _validate_outcome_dependencies(
+    outcomes: Sequence[TaskOutcomeProposal | TaskOutcomeSnapshot],
+) -> None:
+    """Reject unknown and cyclic Outcome dependencies deterministically."""
+    graph = {item.outcome_id: item.depends_on for item in outcomes}
+    if any(
+        dependency not in graph
+        for dependencies in graph.values() for dependency in dependencies
+    ):
+        raise ValueError("Task outcome dependency references unknown outcome")
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(outcome_id: str) -> None:
+        if outcome_id in visiting:
+            raise ValueError("Task outcome dependencies contain a cycle")
+        if outcome_id in visited:
+            return
+        visiting.add(outcome_id)
+        for dependency in graph[outcome_id]:
+            visit(dependency)
+        visiting.remove(outcome_id)
+        visited.add(outcome_id)
+
+    for outcome_id in graph:
+        visit(outcome_id)
+
+
 class TaskCriterionKind(StrEnum):
     WORKSPACE_INTEGRITY = "workspace_integrity"
     POST_MUTATION_COMMAND = "post_mutation_command"
@@ -50,6 +78,38 @@ class TaskOutcomeStatus(StrEnum):
         }
 
 
+class TaskOutcomeCompletionPolicy(StrEnum):
+    """How evidence is accepted as delivery for one Outcome.
+
+    The default deliberately requires an explicit acceptance step.  Merely
+    running a compatible tool therefore records progress but does not silently
+    declare the user's requested result complete.
+    """
+
+    EXPLICIT_ACCEPTANCE = "EXPLICIT_ACCEPTANCE"
+    REQUIRED_EFFECTS = "REQUIRED_EFFECTS"
+
+
+class OutcomeBindingAction(StrEnum):
+    """Kernel decision for binding one model ToolCall to an Outcome."""
+
+    ACCEPT = "ACCEPT"
+    CORRECT = "CORRECT"
+    REQUIRE_SELECTION = "REQUIRE_SELECTION"
+    REJECT = "REJECT"
+
+
+class OutcomeBindingReason(StrEnum):
+    NONE = "NONE"
+    OUTCOME_NOT_FOUND = "OUTCOME_NOT_FOUND"
+    OUTCOME_ALREADY_CLOSED = "OUTCOME_ALREADY_CLOSED"
+    OUTCOME_NOT_SELECTED = "OUTCOME_NOT_SELECTED"
+    OUTCOME_DEPENDENCY_UNSATISFIED = "OUTCOME_DEPENDENCY_UNSATISFIED"
+    OUTCOME_EFFECT_MISMATCH = "OUTCOME_EFFECT_MISMATCH"
+    OUTCOME_SELECTION_AMBIGUOUS = "OUTCOME_SELECTION_AMBIGUOUS"
+    NO_COMPATIBLE_OUTCOME = "NO_COMPATIBLE_OUTCOME"
+
+
 class TaskContinuationMode(StrEnum):
     NONE = "NONE"
     WHEN_USER_DECISION_REQUIRED = "WHEN_USER_DECISION_REQUIRED"
@@ -65,6 +125,10 @@ class TaskOutcomeProposal:
     kind: TaskOutcomeKind
     required_effects: tuple[ToolEffect, ...]
     required: bool = True
+    depends_on: tuple[str, ...] = ()
+    completion_policy: TaskOutcomeCompletionPolicy = (
+        TaskOutcomeCompletionPolicy.EXPLICIT_ACCEPTANCE
+    )
 
     def __post_init__(self) -> None:
         if not self.outcome_id.strip() or not self.description.strip():
@@ -87,32 +151,51 @@ class TaskOutcomeProposal:
             )
         if len(set(self.required_effects)) != len(self.required_effects):
             raise ValueError("Task outcome required effects must be unique")
+        if any(not item.strip() or item == self.outcome_id for item in self.depends_on):
+            raise ValueError("Task outcome dependencies must name other outcomes")
+        if len(set(self.depends_on)) != len(self.depends_on):
+            raise ValueError("Task outcome dependencies must be unique")
 
     def to_data(self) -> dict[str, Any]:
-        return {
+        data = {
             "outcome_id": self.outcome_id.strip(),
             "description": self.description.strip(),
             "kind": self.kind.value,
             "required_effects": [item.value for item in self.required_effects],
             "required": self.required,
         }
+        # Omit new defaulted fields so snapshots written before this evolution
+        # retain their original event-sourced content hash.
+        if self.depends_on:
+            data["depends_on"] = list(self.depends_on)
+        if self.completion_policy is not TaskOutcomeCompletionPolicy.EXPLICIT_ACCEPTANCE:
+            data["completion_policy"] = self.completion_policy.value
+        return data
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> TaskOutcomeProposal:
         _reject_unknown_fields(data, {
             "outcome_id", "description", "kind", "required_effects", "required",
+            "depends_on", "completion_policy",
         }, "Task outcome proposal")
         raw_effects = data.get("required_effects")
         if not isinstance(raw_effects, list):
             raise ValueError("Task outcome proposal required_effects must be a list")
         if not isinstance(data.get("required", True), bool):
             raise ValueError("Task outcome proposal required must be boolean")
+        raw_dependencies = data.get("depends_on", [])
+        if not isinstance(raw_dependencies, list):
+            raise ValueError("Task outcome proposal depends_on must be a list")
         return cls(
             str(data.get("outcome_id", "")).strip(),
             str(data.get("description", "")).strip(),
             TaskOutcomeKind(str(data.get("kind", ""))),
             tuple(ToolEffect(str(item)) for item in raw_effects),
             bool(data.get("required", True)),
+            tuple(str(item).strip() for item in raw_dependencies),
+            TaskOutcomeCompletionPolicy(str(
+                data.get("completion_policy", "EXPLICIT_ACCEPTANCE")
+            )),
         )
 
 
@@ -136,6 +219,7 @@ class TaskSpecProposal:
             raise ValueError("Task SPEC proposal requires 1-30 outcomes")
         if len({item.outcome_id for item in self.outcomes}) != len(self.outcomes):
             raise ValueError("Task SPEC proposal outcome IDs must be unique")
+        _validate_outcome_dependencies(self.outcomes)
         if len(self.scope) > 50 or len(self.constraints) > 50:
             raise ValueError("Task SPEC proposal scope or constraints exceed limits")
         for value in self.scope + self.constraints:
@@ -191,11 +275,16 @@ class TaskOutcomeSnapshot:
     status: TaskOutcomeStatus = TaskOutcomeStatus.PENDING
     required: bool = True
     fulfillment_refs: tuple[str, ...] = ()
+    depends_on: tuple[str, ...] = ()
+    completion_policy: TaskOutcomeCompletionPolicy = (
+        TaskOutcomeCompletionPolicy.EXPLICIT_ACCEPTANCE
+    )
 
     def __post_init__(self) -> None:
         TaskOutcomeProposal(
             self.outcome_id, self.description, self.kind,
             self.required_effects, self.required,
+            self.depends_on, self.completion_policy,
         )
         if any(not value.strip() for value in self.fulfillment_refs):
             raise ValueError("Task outcome fulfillment references must not be empty")
@@ -207,7 +296,7 @@ class TaskOutcomeSnapshot:
         return cls(
             proposal.outcome_id, proposal.description, proposal.kind,
             proposal.required_effects, TaskOutcomeStatus.PENDING,
-            proposal.required, (),
+            proposal.required, (), proposal.depends_on, proposal.completion_policy,
         )
 
     def to_data(self) -> dict[str, Any]:
@@ -215,6 +304,7 @@ class TaskOutcomeSnapshot:
             **TaskOutcomeProposal(
                 self.outcome_id, self.description, self.kind,
                 self.required_effects, self.required,
+                self.depends_on, self.completion_policy,
             ).to_data(),
             "status": self.status.value,
             "fulfillment_refs": list(self.fulfillment_refs),
@@ -224,11 +314,12 @@ class TaskOutcomeSnapshot:
     def from_data(cls, data: Mapping[str, Any]) -> TaskOutcomeSnapshot:
         _reject_unknown_fields(data, {
             "outcome_id", "description", "kind", "required_effects", "required",
-            "status", "fulfillment_refs",
+            "status", "fulfillment_refs", "depends_on", "completion_policy",
         }, "Task outcome snapshot")
         proposal = TaskOutcomeProposal.from_data({
             key: data[key] for key in (
-                "outcome_id", "description", "kind", "required_effects", "required"
+                "outcome_id", "description", "kind", "required_effects", "required",
+                "depends_on", "completion_policy",
             ) if key in data
         })
         raw_refs = data.get("fulfillment_refs", [])
@@ -239,6 +330,87 @@ class TaskOutcomeSnapshot:
             proposal.required_effects,
             TaskOutcomeStatus(str(data.get("status", "PENDING"))),
             proposal.required, tuple(str(item) for item in raw_refs),
+            proposal.depends_on, proposal.completion_policy,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TaskExecutionFocus:
+    """Durable current execution selection, separate from Task obligations."""
+
+    selected_outcome_ids: tuple[str, ...] = ()
+    selection_revision: int = 1
+    selection_reason: str = "task_contract_default"
+    source_input_id: str = ""
+
+    def __post_init__(self) -> None:
+        if self.selection_revision < 1:
+            raise ValueError("execution focus revision must be positive")
+        if len(set(self.selected_outcome_ids)) != len(self.selected_outcome_ids):
+            raise ValueError("selected outcome IDs must be unique")
+        if any(not item.strip() for item in self.selected_outcome_ids):
+            raise ValueError("selected outcome IDs must not be empty")
+        if not self.selection_reason.strip():
+            raise ValueError("execution focus selection reason is required")
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "selected_outcome_ids": list(self.selected_outcome_ids),
+            "selection_revision": self.selection_revision,
+            "selection_reason": self.selection_reason,
+            "source_input_id": self.source_input_id,
+        }
+
+    @classmethod
+    def from_data(cls, data: Mapping[str, Any]) -> TaskExecutionFocus:
+        raw = data.get("selected_outcome_ids", [])
+        if not isinstance(raw, list):
+            raise ValueError("selected_outcome_ids must be a list")
+        return cls(
+            tuple(str(item) for item in raw),
+            int(data.get("selection_revision", 1)),
+            str(data.get("selection_reason", "task_contract_default")),
+            str(data.get("source_input_id", "")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OutcomeBindingDecision:
+    """Complete, observable Kernel result for one Action→Outcome edge."""
+
+    action: OutcomeBindingAction
+    reason: OutcomeBindingReason = OutcomeBindingReason.NONE
+    requested_outcome_id: str | None = None
+    bound_outcome_id: str | None = None
+    selected_outcome_ids: tuple[str, ...] = ()
+    eligible_outcome_ids: tuple[str, ...] = ()
+    compatible_outcome_ids: tuple[str, ...] = ()
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "action": self.action.value, "reason": self.reason.value,
+            "requested_outcome_id": self.requested_outcome_id,
+            "bound_outcome_id": self.bound_outcome_id,
+            "selected_outcome_ids": list(self.selected_outcome_ids),
+            "eligible_outcome_ids": list(self.eligible_outcome_ids),
+            "compatible_outcome_ids": list(self.compatible_outcome_ids),
+        }
+
+
+class TaskOutcomeEligibilityCalculator:
+    """Deterministically derives executable Outcomes from contract state."""
+
+    @staticmethod
+    def eligible(spec: TaskSpecSnapshot) -> tuple[TaskOutcomeSnapshot, ...]:
+        statuses = {item.outcome_id: item.status for item in spec.outcomes}
+        return tuple(
+            outcome for outcome in spec.outcomes
+            if not outcome.status.is_closed
+            and outcome.status is not TaskOutcomeStatus.BLOCKED
+            and all(
+                dependency in statuses and statuses[dependency].is_closed
+                for dependency in outcome.depends_on
+            )
         )
 
 
@@ -273,6 +445,16 @@ TASK_SPEC_PROPOSAL_SCHEMA_V1: Mapping[str, Any] = {
                         ]},
                     },
                     "required": {"type": "boolean"},
+                    "depends_on": {
+                        "type": "array", "uniqueItems": True,
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                    "completion_policy": {
+                        "type": "string",
+                        "enum": [
+                            item.value for item in TaskOutcomeCompletionPolicy
+                        ],
+                    },
                 },
                 "required": [
                     "outcome_id", "description", "kind", "required_effects", "required",
@@ -370,6 +552,7 @@ class TaskSpecSnapshot:
             raise ValueError("Task SPEC supports at most 30 outcomes")
         if len({item.outcome_id for item in self.outcomes}) != len(self.outcomes):
             raise ValueError("Task SPEC outcome IDs must be unique")
+        _validate_outcome_dependencies(self.outcomes)
         if len({item.criterion_id for item in self.acceptance_criteria}) != len(
             self.acceptance_criteria
         ):
@@ -510,3 +693,50 @@ class TaskSpecProjector:
                 raise ValueError("Task SPEC snapshot belongs to another Task")
             current = candidate
         return current
+
+
+class TaskExecutionFocusProjector:
+    """Rebuild current Outcome selection from durable Task events.
+
+    Old checkpoints used ``active_outcome_ids``.  Migration is intentionally
+    isolated here: new runtime code consumes TaskExecutionFocus only.
+    """
+
+    @staticmethod
+    def project(
+        spec: TaskSpecSnapshot, events: Sequence[RuntimeEvent], *,
+        legacy_active_outcome_ids: Sequence[str] = (),
+    ) -> TaskExecutionFocus:
+        latest: RuntimeEvent | None = None
+        for event in sorted(events, key=lambda item: item.sequence):
+            if event.task_id != spec.task_id:
+                raise ValueError("execution focus event belongs to another Task")
+            if event.event_type == "task_execution_focus.changed":
+                latest = event
+        eligible_ids = {
+            item.outcome_id for item in TaskOutcomeEligibilityCalculator.eligible(spec)
+        }
+        if latest is not None:
+            raw = latest.payload.get("focus")
+            if not isinstance(raw, Mapping):
+                raise ValueError("execution focus event is missing focus")
+            focus = TaskExecutionFocus.from_data(raw)
+            selected = tuple(
+                item for item in focus.selected_outcome_ids if item in eligible_ids
+            )
+            return replace(focus, selected_outcome_ids=selected)
+        migrated = tuple(
+            item for item in legacy_active_outcome_ids if item in eligible_ids
+        )
+        if migrated:
+            return TaskExecutionFocus(
+                migrated, 1, "legacy_active_outcome_migration", ""
+            )
+        # Initial focus contains all mandatory currently eligible obligations.
+        # Optional work is visible as eligible, but requires a model proposal.
+        required = tuple(
+            item.outcome_id
+            for item in TaskOutcomeEligibilityCalculator.eligible(spec)
+            if item.required
+        )
+        return TaskExecutionFocus(required)
