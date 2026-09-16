@@ -46,6 +46,9 @@ class CoreProcessToolProvider:
                 "No shell parses the arguments. Use foreground mode for bounded commands "
                 "such as builds and tests; use background mode for servers, watchers, or "
                 "log streams, then manage the returned process_id with process tools. "
+                "Do not use inline scripts or command-line HTTP clients for public "
+                "web retrieval when dedicated web.search or web.fetch_markdown "
+                "tools are available. "
                 "The environment starts minimal and rejects credential-like variable names. "
                 "This action requires approval."
             ),

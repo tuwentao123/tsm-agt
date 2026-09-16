@@ -1042,6 +1042,8 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
             schema["properties"]["outcome_ref"]["type"], "string"
         )
         self.assertNotIn("enum", schema["properties"]["outcome_ref"])
+        self.assertNotIn("outcome_binding_mode", schema["properties"])
+        self.assertNotIn("outcome_binding_mode", call.arguments)
 
 
 if __name__ == "__main__":

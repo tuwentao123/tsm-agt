@@ -354,11 +354,17 @@ class SessionContextProjector:
     recent_execution_per_task_limit: int = 6
     execution_result_item_limit: int = 10
     small_read_content_characters: int = 2000
+    recent_visible_message_limit: int = 12
+    detailed_task_summary_limit: int = 8
+    historical_resource_limit: int = 40
+    historical_question_limit: int = 20
 
     def __post_init__(self) -> None:
         if min(
             self.recent_execution_limit, self.recent_execution_per_task_limit,
             self.execution_result_item_limit, self.small_read_content_characters,
+            self.recent_visible_message_limit, self.detailed_task_summary_limit,
+            self.historical_resource_limit, self.historical_question_limit,
         ) < 1:
             raise ValueError("Session context projection limits must be positive")
 
@@ -496,12 +502,19 @@ class SessionContextProjector:
                 }), (), (),
             )
 
-        # Do not perform a second, character-based compaction here. Every Task
-        # remains represented before ContextWindowManager evaluates the actual
-        # Provider token budget. This projector only turns durable Session data
-        # into a deterministic model view; it does not decide what history fits.
-        visible_messages = projection.messages
-        visible_task_summaries = projection.task_summaries
+        # Every Task remains represented in task_index. Verbose user-visible
+        # text and detailed handoffs are bounded deterministically before they
+        # become protected Session context; this is retention, not routing.
+        visible_messages = projection.messages[-self.recent_visible_message_limit:]
+        recent_task_ids = list(dict.fromkeys(
+            message.task_id for message in reversed(visible_messages)
+        ))
+        recent_task_id_set = set(recent_task_ids)
+        summaries_by_id = {item.task_id: item for item in projection.task_summaries}
+        visible_task_summaries = tuple(
+            item for item in projection.task_summaries
+            if item.task_id in recent_task_id_set
+        )[-self.detailed_task_summary_limit:]
         visible_task_ids = {item.task_id for item in visible_task_summaries}
         task_index = self._task_index(projection)
         if active_checkpoint is not None:
@@ -512,14 +525,21 @@ class SessionContextProjector:
                 item for item in visible_task_summaries
                 if item.task_id != active_checkpoint.task_id
             )
-        summary_sources: tuple[int, ...] = ()
+        visible_sequences = {item.source_event_sequence for item in visible_messages}
+        summary_sources = tuple(
+            item for item in projection.source_event_sequences
+            if item not in visible_sequences
+        )
         summary_source_ranges = self._sequence_ranges(summary_sources)
         summary_source = {
             "algorithm": "provider-budget-managed-session-v2",
             "revision": projection.revision,
             "source_event_sequences": list(summary_sources),
             "source_event_ranges": [list(item) for item in summary_source_ranges],
-            "tasks": [],
+            "tasks": [
+                item for item in task_index
+                if item["task_id"] not in recent_task_ids
+            ],
             "omitted_task_count": 0,
         }
         summary_hash = canonical_hash(summary_source)
@@ -562,14 +582,12 @@ class SessionContextProjector:
                     "resource_ref and grants no access; pass the canonical path to a "
                     "read tool and let Runtime request current-Task approval."
                 ),
-                "resources": [item.to_data() for item in projection.resource_catalog
-                              if item.source_task_id in visible_task_ids
-                              and (active_checkpoint is None or
-                                   item.source_task_id != active_checkpoint.task_id)],
-                "questions": [item.to_data() for item in projection.question_catalog
-                              if item.source_task_id in visible_task_ids
-                              and (active_checkpoint is None or
-                                   item.source_task_id != active_checkpoint.task_id)],
+                "resources": self._prompt_resource_catalog(
+                    projection, visible_task_ids, active_checkpoint
+                ),
+                "questions": self._prompt_question_catalog(
+                    projection, visible_task_ids, active_checkpoint
+                ),
             },
             "earlier_summary": {
                 "algorithm": "provider-budget-managed-session-v2",
@@ -579,8 +597,8 @@ class SessionContextProjector:
                 "source_event_ranges": [
                     list(item) for item in summary_source_ranges
                 ],
-                "message_count": 0,
-                "tasks": [],
+                "message_count": len(projection.messages) - len(visible_messages),
+                "tasks": summary_source["tasks"],
                 "omitted_task_count": 0,
             },
             "recent_messages": [
@@ -600,10 +618,62 @@ class SessionContextProjector:
         )
         return SessionPromptProjection(
             message, projection.revision, projection.content_hash,
-            projection.source_event_sequences, len(visible_messages), 0,
+            projection.source_event_sequences, len(visible_messages),
+            len(projection.messages) - len(visible_messages),
             projection.revision, summary_hash, summary_sources,
             summary_source_ranges,
         )
+
+    def _prompt_resource_catalog(
+        self, projection: SessionConversationProjection,
+        visible_task_ids: set[str],
+        active_checkpoint: SessionActiveCheckpoint | None,
+    ) -> list[dict[str, Any]]:
+        eligible = [
+            item for item in projection.resource_catalog
+            if item.source_task_id in visible_task_ids
+            and (active_checkpoint is None or
+                 item.source_task_id != active_checkpoint.task_id)
+        ][-self.historical_resource_limit:]
+        return [{
+            "catalog_ref": item.catalog_ref,
+            "canonical_path": self._bounded_text(item.canonical_path, 1000),
+            "resolved_root": self._bounded_text(item.resolved_root, 1000),
+            "root_kind": item.root_kind,
+            "resource_kind": item.resource_kind.value,
+            "source_task_id": item.source_task_id,
+            "source_turn_id": item.source_turn_id,
+            "source_tool": item.source_tool,
+            "question_ref": item.question_ref,
+            "ledger_reference_count": len(item.evidence_references),
+            "authority_inherited": False,
+        } for item in eligible]
+
+    def _prompt_question_catalog(
+        self, projection: SessionConversationProjection,
+        visible_task_ids: set[str],
+        active_checkpoint: SessionActiveCheckpoint | None,
+    ) -> list[dict[str, Any]]:
+        eligible = [
+            item for item in projection.question_catalog
+            if item.source_task_id in visible_task_ids
+            and (active_checkpoint is None or
+                 item.source_task_id != active_checkpoint.task_id)
+        ][-self.historical_question_limit:]
+        return [{
+            "question_ref": item.question_ref,
+            "question": self._bounded_text(item.question, 1000),
+            "status": item.status.value,
+            "source_task_id": item.source_task_id,
+            "source_turn_id": item.source_turn_id,
+            "catalog_ref_count": len(item.catalog_refs),
+            "ledger_reference_count": len(item.evidence_references),
+            "blocking_reason": (
+                self._bounded_text(item.blocking_reason, 1000)
+                if item.blocking_reason else None
+            ),
+            "authority_inherited": False,
+        } for item in eligible]
 
     @staticmethod
     def _sequence_ranges(

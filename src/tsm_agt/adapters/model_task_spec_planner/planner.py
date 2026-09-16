@@ -74,7 +74,13 @@ class ModelTaskSpecPlanner:
                     "workspace, files, runtime state, or other tool-observable facts "
                     "must require observe (or use a separate EVIDENCE outcome). "
                     "Read-only observation may support an ANSWER without directly "
-                    "completing it. Never claim completion, status, "
+                    "completing it. Use the default EXPLICIT_ACCEPTANCE for "
+                    "analysis, implementation, multi-file changes, commands plus "
+                    "explanation, and every dynamically discovered workflow. Use "
+                    "ATOMIC_ACTION only when one exact tool call is the entire user "
+                    "result; then include atomic_action.tool_name and the exact "
+                    "atomic_action.arguments. Never use REQUIRED_EFFECTS for new "
+                    "work. Never claim completion, status, "
                     "IDs owned by Runtime, approval, or permission." + correction
                 ),),
             )

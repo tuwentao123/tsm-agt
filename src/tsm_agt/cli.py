@@ -51,7 +51,7 @@ from tsm_agt.core import (
     RuntimeInputIntent,
     SessionContinuationMode,
     SessionResumeSafety,
-    SessionInputAction,
+    SessionRouteDisposition, SessionTaskRelation,
     SessionChoiceAction,
     ModelInvocationFailed,
     SteeringKind,
@@ -263,10 +263,30 @@ def _chat_error_guidance(error: Exception, root: Path) -> tuple[str, ...]:
         isinstance(error, ModelInvocationFailed)
         and error.failure_kind == "tool_protocol"
     ):
+        detail = getattr(error, "diagnostic_detail", "")
+        requested = ""
+        compatible = ""
+        selected = ""
+        try:
+            parsed = json.loads(detail) if detail else {}
+            requested = str(parsed.get("requested_outcome_id") or "")
+            compatible = ", ".join(
+                str(item) for item in parsed.get("compatible_outcome_ids", [])
+            )
+            selected = ", ".join(
+                str(item) for item in parsed.get("selected_outcome_ids", [])
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        mapping = (
+            f" requested={requested or 'none'}; selected={selected or 'none'}; "
+            f"compatible_open={compatible or 'none'}."
+        )
         return (
-            "recovery: the model connection succeeded, but its tool plan did not "
-            "match the current Task contract after one automatic correction; "
-            "use /flow to inspect the rejected tool and outcome mapping",
+            "recovery: the model connection succeeded, but the rejected tool "
+            "call could not be assigned to one safe Task outcome after correction;"
+            + mapping + " The rejected call was not executed; earlier successful "
+            "work and the checkpoint were preserved. Use /flow for the full mapping.",
         )
     if (
         isinstance(error, ModelInvocationFailed)
@@ -324,30 +344,9 @@ def _chat_error_guidance(error: Exception, root: Path) -> tuple[str, ...]:
     )
 
 
-async def _resolve_session_input_with_progress(
-    application, session_id: str, prompt: str, root: Path, output_fn,
-    *, heartbeat_seconds: float = 5.0,
-):
-    """Run optional semantic routing with bounded, visible waiting."""
-    output_fn("[会话] 正在识别这条输入与未完成任务的关系……")
-    pending = asyncio.create_task(
-        application.kernel.resolve_session_input(session_id, prompt, root)
-    )
-    elapsed = 0
-    try:
-        while True:
-            done, _ = await asyncio.wait({pending}, timeout=heartbeat_seconds)
-            if done:
-                return pending.result()
-            elapsed += heartbeat_seconds
-            output_fn(
-                f"[会话] 语义识别仍在进行（{elapsed:g} 秒）；"
-                "可按 Ctrl+C 取消，不会修改或恢复任何 Task。"
-            )
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pending.cancel()
-        await asyncio.gather(pending, return_exceptions=True)
-        raise
+def _should_print_result_body(response_text_was_emitted: bool) -> bool:
+    """Decide from durable display state, never a cleared token buffer."""
+    return not response_text_was_emitted
 from tsm_agt.ports import (
     FlowArtifactExportPort, ReplayCursor, ReplayCursorStorePort,
     RuntimeStorePort, ToolCall, ModelFailureCategory, ModelRecoveryAction,
@@ -927,7 +926,8 @@ async def _chat(
         )
         output_fn(
             "follow-up mode: AUTO "
-            "(ordinary messages are resolved semantically; /followup changes it)"
+            "(ordinary messages go directly to the active Session context; "
+            "/followup changes live-Task behavior)"
         )
         trust = await application.kernel.get_project_trust(root)
         visible_tool_names = {tool.name for tool in await application.kernel.list_tools()}
@@ -1000,7 +1000,7 @@ async def _chat(
             if prompt == "/help":
                 output_fn(
                     "Enter a request to run one Agent Task. While it runs, type "
-                    "ordinary language using AUTO semantic routing, or use "
+                    "ordinary language to update the active Task, or use "
                     "/steer, /queue, /redirect and /interrupt. /followup shows or "
                     "changes the mode. /status, /plan, /diff and "
                     "/spec, /permissions are read-only; /sessions and /use switch "
@@ -1020,7 +1020,7 @@ async def _chat(
                 output_fn(
                     f"follow-up mode: {follow_up_mode.value}; "
                     + (
-                        "ordinary messages will be resolved from their meaning"
+                        "ordinary messages use the active Session/Task state"
                         if follow_up_mode is FollowUpMode.AUTO else (
                             "new messages will adjust the running Task at a safe point"
                             if follow_up_mode is FollowUpMode.STEER else
@@ -1175,7 +1175,11 @@ async def _chat(
             resume_mode = False
             continuation_resume = False
             pending_approval_resolution = None
-            session_input = None
+            state_selected_resume = False
+            route_source_task_id = None
+            route_relation = SessionTaskRelation.INDEPENDENT
+            route_goal = prompt
+            session = await application.kernel.get_session(session.session_id)
             if explicit_resume_task is None and not explicit_new_task:
                 local_choice = (
                     await application.kernel.resolve_pending_session_choice(
@@ -1183,53 +1187,52 @@ async def _chat(
                     )
                 )
                 if local_choice.action is SessionChoiceAction.SELECT:
-                    explicit_resume_task = local_choice.target_id
-                    output_fn(
-                        "[会话] 已按刚才展示的候选列表选择 "
-                        f"{local_choice.option_id}；正在校验恢复安全性。"
+                    disposition = SessionRouteDisposition(
+                        str(local_choice.metadata.get(
+                            "disposition", SessionRouteDisposition.RESUME_TASK.value
+                        ))
                     )
+                    if disposition is SessionRouteDisposition.RESUME_TASK:
+                        explicit_resume_task = local_choice.target_id
+                        output_fn(
+                            f"[会话] 已按候选 {local_choice.option_id} 选择继续"
+                            f"未完成 Task {local_choice.target_id}；正在校验恢复安全性。"
+                        )
+                    else:
+                        route_source_task_id = str(
+                            local_choice.metadata["source_task_id"]
+                        )
+                        route_relation = SessionTaskRelation(
+                            str(local_choice.metadata["relation"])
+                        )
+                        route_goal = str(local_choice.metadata["resolved_goal"])
+                        prompt = route_goal
+                        output_fn(
+                            "[会话] 已选择基于历史 Task 创建后续工作："
+                            f"{route_source_task_id}"
+                        )
                 else:
-                    session_input = await _resolve_session_input_with_progress(
-                        application, session.session_id, prompt, root, output_fn
-                    )
-            if (
-                session_input is not None
-                and session_input.action is SessionInputAction.CLARIFY
-            ):
-                clarification = (session_input.clarification or
-                    "请明确说明要处理的新目标或选择未完成任务。")
-                interaction = await application.kernel.request_session_task_choice(
-                    session.session_id, session_input.candidates, clarification
-                )
-                output_fn("[会话] " + clarification)
-                for option, item in zip(
-                    interaction.options, session_input.candidates, strict=True
-                ):
-                    output_fn(
-                        f"{option.ordinal}. {item.task_id} "
-                        f"[{item.task_state}] {item.goal}"
-                    )
-                output_fn(
-                    "请输入编号、完整 Task ID，或 /resume <task_id>；"
-                    "编号选择不调用模型。"
-                )
-                continue
-            if (
-                session_input is not None
-                and session_input.action is SessionInputAction.NEW_TASK
-            ):
-                await application.kernel.clear_pending_session_interaction(
-                    session.session_id, "conversation_moved_to_new_task"
-                )
-            selected_resume_task = (
-                explicit_resume_task
-                if explicit_resume_task is not None else (
-                    session_input.task_id
-                    if session_input is not None
-                    and session_input.action is SessionInputAction.RESUME_TASK
-                    else None
-                )
-            )
+                    # Ordinary language always reaches the main engineering
+                    # model. Harness chooses only the execution container from
+                    # durable state; it never classifies the message semantics.
+                    if session.pending_interaction is not None:
+                        await application.kernel.clear_pending_session_interaction(
+                            session.session_id,
+                            "session_first_ordinary_input_superseded_choice",
+                        )
+                        session = await application.kernel.get_session(
+                            session.session_id
+                        )
+                    if session.active_task_id is not None:
+                        active = await application.kernel.get_task(
+                            session.active_task_id
+                        )
+                        if not active.state.is_terminal:
+                            explicit_resume_task = active.task_id
+                            state_selected_resume = True
+                        else:
+                            route_relation = SessionTaskRelation.CONTEXTUAL
+            selected_resume_task = explicit_resume_task
             if selected_resume_task is not None:
                 await application.kernel.clear_pending_session_interaction(
                     session.session_id, "task_selected_for_continuation"
@@ -1281,7 +1284,7 @@ async def _chat(
                         "[恢复] 检测到事件日志已领先于旧断点；将复用已经"
                         "提交的工具结果并刷新执行现场，不会重复运行工具。"
                     )
-                if explicit_resume_task is None:
+                if state_selected_resume:
                     await application.kernel.queue_steering(
                         task.task_id, SteeringKind.STEER,
                         prompt, f"input-{uuid4().hex}",
@@ -1296,9 +1299,6 @@ async def _chat(
             ):
                 assert continuation.task_id is not None
                 task = await application.kernel.get_task(continuation.task_id)
-                session = await application.kernel.select_session_task(
-                    session.session_id, task.task_id
-                )
                 resume_mode = True
                 continuation_resume = True
                 output_fn(f"task: {task.task_id}")
@@ -1334,19 +1334,7 @@ async def _chat(
                 assert continuation.task_id is not None
                 task = await application.kernel.get_task(continuation.task_id)
                 if task.pending_approval is not None:
-                    route = await application.kernel.route_runtime_input(
-                        task.task_id, prompt, f"input-{uuid4().hex}",
-                        explicit_intent=explicit_runtime_intent,
-                    )
-                    if route.intent is RuntimeInputIntent.STATUS_QUERY:
-                        await _print_chat_status(
-                            application, session, task.task_id, output_fn
-                        )
-                        continue
-                    elif (
-                        route.intent
-                        is RuntimeInputIntent.REVIEW_PENDING_ACTION
-                    ):
+                    if explicit_runtime_intent is None:
                         request = task.pending_approval
                         assert request is not None
                         checkpoint = dict(task.active_agent_checkpoint or {})
@@ -1393,44 +1381,34 @@ async def _chat(
                         output_fn(
                             "[续接] 已记录明确的审批决定，正在继续同一 Task。"
                         )
-                    elif route.intent is RuntimeInputIntent.NEW_TASK_AFTER_CURRENT:
-                        follow_up = await application.kernel.queue_session_follow_up(
-                            session.session_id, task.task_id, prompt,
-                            f"input-{uuid4().hex}",
-                        )
-                        output_fn(
-                            "[队列] 当前审批保持不变；已保存为完成后的第 "
-                            f"{follow_up.inbound_sequence} 条消息"
-                        )
-                        continue
-                    elif route.applied:
-                        session = await application.kernel.select_session_task(
-                            session.session_id, task.task_id
-                        )
-                        resume_mode = True
-                        output_fn(f"task: {task.task_id}")
-                        output_fn(
-                            "[续接] 已取消尚未执行的旧审批动作；它没有被批准，"
-                            "也不会在后台执行。"
-                        )
-                        output_fn(
-                            "[续接] 已将本轮输入加入同一 Task，正在从安全断点"
-                            "重新规划。若仍需风险操作，会重新请求授权。"
-                        )
                     else:
-                        output_fn(
-                            "[续接] 当前 Task 正在等待审批。普通文字不会被"
-                            "当作批准；本轮输入也未能安全判定为修改任务方向。"
+                        route = await application.kernel.route_runtime_input(
+                            task.task_id, prompt, f"input-{uuid4().hex}",
+                            explicit_intent=explicit_runtime_intent,
                         )
-                        output_fn(
-                            "[续接] 可审批/拒绝原动作，或使用 /steer <补充要求>、"
-                            "/replace <新目标>、/new <独立任务>。"
-                        )
-                        output_fn(
-                            f"[续接] task={task.task_id} state={task.state.value} "
-                            f"reason={route.reason_code}"
-                        )
-                        continue
+                        if route.applied:
+                            session = await application.kernel.select_session_task(
+                                session.session_id, task.task_id
+                            )
+                            resume_mode = True
+                            output_fn(f"task: {task.task_id}")
+                            output_fn(
+                                "[续接] 已取消尚未执行的旧审批动作；它没有被批准，"
+                                "也不会在后台执行。"
+                            )
+                            output_fn(
+                                "[续接] 已将本轮输入加入同一 Task，正在从安全断点"
+                                "重新规划。若仍需风险操作，会重新请求授权。"
+                            )
+                        else:
+                            output_fn(
+                                "[续接] 显式运行时命令未能应用；审批保持等待。"
+                            )
+                            output_fn(
+                                f"[续接] task={task.task_id} "
+                                f"state={task.state.value} reason={route.reason_code}"
+                            )
+                            continue
                 else:
                     output_fn(
                         "[续接] 当前任务正在等待明确的澄清答案；"
@@ -1471,30 +1449,41 @@ async def _chat(
                 continue
             else:
                 task = await application.kernel.create_task(
-                    prompt, root, session_id=session.session_id,
+                    route_goal, root, session_id=session.session_id,
                     command_id=(
                         f"follow-up:{queued_follow_up.input_id}"
                         if queued_follow_up is not None else None
                     ),
+                    source_task_id=route_source_task_id,
+                    task_relation=route_relation,
                 )
                 if queued_follow_up is not None:
                     await application.kernel.mark_session_follow_up_dispatched(
                         queued_follow_up, task.task_id
                     )
                 output_fn(f"task: {task.task_id}")
+                if route_relation is SessionTaskRelation.CONTEXTUAL:
+                    output_fn(
+                        "[会话] 当前输入按 contextual conversation 处理；"
+                        "复用完整 Task Runtime 执行路径，并注入 session 上下文。"
+                    )
                 output_fn("[进度] 正在识别项目、加载工具并准备上下文…")
             try:
                 if not resume_mode:
-                    for target in (
-                        TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
-                        TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    transition_targets = [
+                        TaskState.INTAKE,
+                        TaskState.RESOLVING_PROJECT,
+                        TaskState.SELECTING_EXTENSIONS,
+                        TaskState.ROUTING,
                         TaskState.EXECUTING,
-                    ):
+                    ]
+                    for target in transition_targets:
                         task = await application.kernel.transition_task(
                             task.task_id, target,
                             f"interactive {target.value.lower()}"
                         )
                 streamed: list[str] = []
+                response_text_was_emitted = False
                 live_terminal = output_fn is print
                 prompt_safe_streaming = live_terminal and live_input_supported
                 pending_display = ""
@@ -1528,6 +1517,7 @@ async def _chat(
 
                 def on_text_delta(text: str) -> None:
                     nonlocal pending_display, displayed_agent_line
+                    nonlocal response_text_was_emitted
                     stop_heartbeat()
                     if prompt_safe_streaming:
                         # Prompt Toolkit can safely redraw complete lines above
@@ -1549,6 +1539,7 @@ async def _chat(
                             print("agent> ", end="", flush=True)
                         print(text, end="", flush=True)
                     streamed.append(text)
+                    response_text_was_emitted = True
 
                 def finish_stream(result=None) -> None:
                     nonlocal pending_display, displayed_agent_line
@@ -1795,7 +1786,10 @@ async def _chat(
                                         explicit_intent=explicit,
                                         fallback_intent=(
                                             RuntimeInputIntent.STEER
-                                            if follow_up_mode is FollowUpMode.STEER
+                                            if follow_up_mode in {
+                                                FollowUpMode.AUTO,
+                                                FollowUpMode.STEER,
+                                            }
                                             else None
                                         ),
                                     )
@@ -1841,15 +1835,17 @@ async def _chat(
                     )
                     return 130
                 stop_heartbeat()
+                response_was_streamed = response_text_was_emitted
                 finish_stream(
                     result if isinstance(result, AgentTurnResult) else None
                 )
                 if isinstance(result, AgentContinuationSuspended):
-                    output_fn(f"agent> {result.assistant_message.text}")
+                    if _should_print_result_body(response_was_streamed):
+                        output_fn(f"agent> {result.assistant_message.text}")
                     output_fn(
                         "[续接] 本阶段已完成；后续必需交付项仍保留在同一 "
-                        "Task。下一条普通输入会由会话语义路由判断是继续、"
-                        "转向还是新任务。"
+                        "Task。下一条普通输入将按持久化 Task 状态继续；"
+                        "使用 /new 可显式创建独立任务。"
                     )
                     session = await application.kernel.get_session(
                         session.session_id
@@ -1930,6 +1926,7 @@ async def _chat(
                         finish_stream(
                             result if isinstance(result, AgentTurnResult) else None
                         )
+                        response_was_streamed = response_text_was_emitted
                         continue
                     _print_chat_approval(result, output_fn)
                     try:
@@ -1973,7 +1970,38 @@ async def _chat(
                     finish_stream(
                         result if isinstance(result, AgentTurnResult) else None
                     )
+                    response_was_streamed = response_text_was_emitted
+                if isinstance(result, AgentContinuationSuspended):
+                    if _should_print_result_body(response_was_streamed):
+                        output_fn(f"agent> {result.assistant_message.text}")
+                    output_fn(
+                        "[续接] 当前阶段已安全停止；后续工作仍保留在同一 "
+                        "Task，不会在等待状态下启动最终验证。"
+                    )
+                    session = await application.kernel.get_session(
+                        session.session_id
+                    )
+                    continue
+                if not isinstance(result, AgentTurnResult):
+                    # Runtime suspension is a durable terminal condition for
+                    # this CLI iteration, not a completed answer. Never force
+                    # AWAITING_USER/AWAITING_APPROVAL into VERIFYING.
+                    session = await application.kernel.get_session(
+                        session.session_id
+                    )
+                    continue
                 task = await application.kernel.get_task(task.task_id)
+                if task.state not in {
+                    TaskState.EXECUTING, TaskState.RUNNING_WORKFLOW,
+                }:
+                    output_fn(
+                        f"[状态] Task 当前为 {task.state.value}；"
+                        "未启动最终验证。"
+                    )
+                    session = await application.kernel.get_session(
+                        session.session_id
+                    )
+                    continue
                 task = await application.kernel.transition_task(
                     task.task_id, TaskState.VERIFYING,
                     "interactive verifier started",

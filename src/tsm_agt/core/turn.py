@@ -20,11 +20,13 @@ class ModelInvocationFailed(RuntimeError):
         failure_category: ModelFailureCategory = ModelFailureCategory.UNKNOWN,
         retry_safety: ModelRetrySafety = ModelRetrySafety.NEVER,
         recovery_action: ModelRecoveryAction = ModelRecoveryAction.FAIL_TERMINAL,
+        diagnostic_detail: str = "",
     ) -> None:
         self.failure_kind = failure_kind
         self.failure_category = failure_category
         self.retry_safety = retry_safety
         self.recovery_action = recovery_action
+        self.diagnostic_detail = diagnostic_detail
         label = (
             "model tool protocol failed"
             if failure_kind == "tool_protocol"

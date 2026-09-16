@@ -160,6 +160,28 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("$(touch must-not-exist)", rendered)
         self.assertNotIn("problem", rendered)
 
+    async def test_foreground_internal_timeout_is_definitive_not_unknown(self) -> None:
+        script = Path(self.temporary.name) / "slow_command.py"
+        script.write_text(
+            "import time\nprint('started', flush=True)\ntime.sleep(30)\n",
+            encoding="utf-8",
+        )
+        result = await self._approve_call(ToolCall(
+            "call-command-timeout", "core.run_command", {
+                "argv": [sys.executable, script.name],
+                "mode": "foreground", "timeout_seconds": 0.2,
+                "termination_grace_seconds": 0.05,
+            },
+        ), "turn-timeout")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["status"], "timed_out")
+        task = await self.application.kernel.get_task(self.task.task_id)
+        execution = task.tool_executions[
+            "turn-timeout:call-command-timeout"
+        ]
+        self.assertEqual(execution.state.value, "COMMITTED")
+        self.assertNotEqual(result.error_code, "UNKNOWN_OUTCOME")
+
     async def test_run_command_background_returns_managed_process(self) -> None:
         script = Path(self.temporary.name) / "background_command.py"
         script.write_text(

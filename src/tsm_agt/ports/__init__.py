@@ -65,7 +65,9 @@ from .replay_cursor_store import ReplayCursor, ReplayCursorStorePort
 from .project_memory import MemoryOperationResult, ProjectMemoryPort, StoredMemory
 from .code_intelligence import CodeIntelligencePort
 from .runtime_input_classifier import RuntimeInputClassifierPort
-from .session_input_resolver import SessionInputResolverPort
+from .session_input_resolver import (
+    SessionInputResolverPort, SessionRouteResolutionError,
+)
 from .task_spec_planner import TaskSpecPlannerPort
 from .checkpoint_compatibility import (
     CheckpointCompatibilityAction, CheckpointCompatibilityDecision,
@@ -142,6 +144,7 @@ from .investigation_flow import (
 )
 from .tool import (
     EvidenceQuestion,
+    OutcomeBindingMode,
     ToolCall,
     ToolEffect,
     ToolIdempotency,
@@ -232,6 +235,7 @@ __all__ = [
     "RuntimeAdapter",
     "RuntimeInputClassifierPort",
     "SessionInputResolverPort",
+    "SessionRouteResolutionError",
     "TaskSpecPlannerPort",
     "CheckpointCompatibilityAction",
     "CheckpointCompatibilityDecision",

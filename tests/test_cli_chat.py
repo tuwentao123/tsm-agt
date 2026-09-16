@@ -11,7 +11,7 @@ from tsm_agt.adapters.builtin import CoreProcessToolProvider
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.cli import (
-    _chat, _chat_error_guidance, _resolve_session_input_with_progress,
+    _chat, _chat_error_guidance, _should_print_result_body,
 )
 from tsm_agt.core import (
     ModelInvocationFailed, ProjectTrustLevel, SessionResumeCandidate,
@@ -197,14 +197,18 @@ class ClarifyingSessionInputResolver(FixtureSessionInputResolver):
     async def resolve_session_input(self, text, context):
         self.contexts.append(dict(context))
         return {
-            "action": "CLARIFY", "task_id": None,
+            "disposition": "CLARIFY", "relation": "UNCERTAIN",
+            "source_task_id": None, "resolved_goal": None,
             "input_grounding": "AMBIGUOUS",
             "confidence": 0.99, "reason_code": "multiple_candidates",
             "clarification": "请选择要继续的未完成 Task。",
+            "candidate_task_ids": [
+                item["task_id"] for item in context["task_catalog"]
+            ],
         }
 
 
-class FixtureRuntimeInputClassifier:
+class FailingRuntimeInputClassifier:
     descriptor = AdapterDescriptor(
         "fixture.runtime-input-classifier", "1.0",
         "RuntimeInputClassifierPort", "1.0",
@@ -220,35 +224,15 @@ class FixtureRuntimeInputClassifier:
         pass
 
     async def classify_runtime_input(self, text, context):
-        return {"intent": "STEER", "confidence": 0.99}
-
-
-class ReviewPendingActionClassifier(FixtureRuntimeInputClassifier):
-    async def classify_runtime_input(self, text, context):
-        return {"intent": "REVIEW_PENDING_ACTION", "confidence": 0.99}
-
-
-class FixtureRuntimeInputClassifier:
-    descriptor = AdapterDescriptor(
-        "fixture.runtime-input-classifier", "1.0",
-        "RuntimeInputClassifierPort", "1.0",
-    )
-
-    async def start(self, context):
-        pass
-
-    async def health(self):
-        return HealthStatus(HealthState.HEALTHY)
-
-    async def stop(self, deadline):
-        pass
-
-    async def classify_runtime_input(self, text, context):
-        return {"intent": "STEER", "confidence": 0.99}
+        raise AssertionError("ordinary chat input must not use semantic routing")
 
 
 class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
-    async def test_continue_reviews_pending_approval_without_replanning(self):
+    def test_streamed_continuation_body_is_not_printed_twice(self):
+        self.assertFalse(_should_print_result_body(True))
+        self.assertTrue(_should_print_result_body(False))
+
+    async def test_pending_approval_review_is_state_driven(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = ApprovalModel()
@@ -257,7 +241,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             application = compose_fixture_application(
                 model_adapter=model, tool_adapters=(tool,),
                 session_input_resolver_adapter=resolver,
-                runtime_input_classifier_adapter=ReviewPendingActionClassifier(),
+                runtime_input_classifier_adapter=FailingRuntimeInputClassifier(),
                 store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
             )
             await application.registry.start_all()
@@ -282,7 +266,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             output: list[str] = []
             result = await _chat(
                 root, session_id=session.session_id,
-                input_fn=ScriptedInput(["继续", "y", "/exit"]),
+                input_fn=ScriptedInput(["arbitrary payload 42", "y", "/exit"]),
                 output_fn=output.append, application_factory=lambda: application,
             )
             self.assertEqual(result, 0)
@@ -317,7 +301,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             application = compose_fixture_application(
                 model_adapter=model, tool_adapters=(tool,),
                 session_input_resolver_adapter=resolver,
-                runtime_input_classifier_adapter=FixtureRuntimeInputClassifier(),
+                runtime_input_classifier_adapter=FailingRuntimeInputClassifier(),
                 store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
             )
             await application.registry.start_all()
@@ -360,7 +344,9 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             output: list[str] = []
             result = await _chat(
                 root, session_id=session.session_id,
-                input_fn=ScriptedInput(["继续，但按最新要求重新规划", "/exit"]),
+                input_fn=ScriptedInput([
+                    "/replace 按最新要求重新规划", "/exit",
+                ]),
                 output_fn=output.append, application_factory=lambda: application,
             )
             self.assertEqual(result, 0)
@@ -379,7 +365,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await application.registry.stop_all()
 
-    async def test_clarify_then_fourth_choice_does_not_call_resolver_twice(self):
+    async def test_explicit_resume_then_fourth_choice_uses_no_semantic_router(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = FailFirstNChatModel(4)
@@ -421,11 +407,11 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             output: list[str] = []
             result = await _chat(
                 root, session_id=session.session_id,
-                input_fn=ScriptedInput(["继续呢", "第四个吧", "/exit"]),
+                input_fn=ScriptedInput(["/resume", "第四个吧", "/exit"]),
                 output_fn=output.append, application_factory=lambda: application,
             )
             self.assertEqual(result, 0)
-            self.assertEqual(len(resolver.contexts), 1)
+            self.assertEqual(len(resolver.contexts), 0)
             self.assertTrue(any(line.startswith("4. ") for line in output))
             self.assertTrue(any(
                 "编号选择不调用模型" in line for line in output
@@ -512,26 +498,6 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await application.registry.stop_all()
 
-    async def test_session_routing_wait_is_visible_until_result(self):
-        class Kernel:
-            async def resolve_session_input(self, session_id, prompt, root):
-                await asyncio.sleep(0.035)
-                return "resolved"
-
-        class Application:
-            kernel = Kernel()
-
-        output: list[str] = []
-        result = await _resolve_session_input_with_progress(
-            Application(), "session-1", "ambiguous", Path("."),
-            output.append, heartbeat_seconds=0.01,
-        )
-        self.assertEqual(result, "resolved")
-        self.assertTrue(output[0].startswith("[会话] 正在识别"))
-        self.assertTrue(any(
-            "语义识别仍在进行" in line for line in output
-        ))
-
     def test_error_guidance_is_actionable(self):
         root = Path("/fixture")
         self.assertIn(
@@ -553,16 +519,32 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/resume", guidance)
         self.assertNotIn("doctor --model-check", guidance)
 
+        protocol = ModelInvocationFailed(
+            "turn-protocol", "invalid outcome binding",
+            failure_kind="tool_protocol",
+            diagnostic_detail=(
+                '{"requested_outcome_id":"closed-work",'
+                '"selected_outcome_ids":["verification"],'
+                '"compatible_outcome_ids":["supporting-work"]}'
+            ),
+        )
+        guidance = _chat_error_guidance(protocol, root)[0]
+        self.assertIn("requested=closed-work", guidance)
+        self.assertIn("selected=verification", guidance)
+        self.assertIn("compatible_open=supporting-work", guidance)
+        self.assertIn("was not executed", guidance)
+        self.assertIn("checkpoint were preserved", guidance)
+
     async def test_interactive_chat_accepts_runtime_input_while_model_runs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = BlockingChatModel()
             application = compose_fixture_application(
                 model_adapter=model, tool_adapters=(),
-                runtime_input_classifier_adapter=FixtureRuntimeInputClassifier(),
+                runtime_input_classifier_adapter=FailingRuntimeInputClassifier(),
             )
             terminal = AsyncScriptedTerminal([
-                "initial request", "另外不要修改公共 API", "/exit",
+                "initial request", "arbitrary payload 42", "/exit",
             ])
             output: list[str] = []
             with patch("tsm_agt.cli.platform_line_input", return_value=terminal):
@@ -589,10 +571,18 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(any(
                     event.event_type == "runtime_input.routed" for event in events
                 ))
+                routed = next(
+                    event for event in events
+                    if event.event_type == "runtime_input.routed"
+                )
+                self.assertEqual(routed.payload["intent"], "STEER")
+                self.assertEqual(
+                    routed.payload["reason_code"], "follow_up_mode_default"
+                )
             finally:
                 await application.registry.stop_all()
 
-    async def test_semantic_resolver_resumes_same_task_after_unexpected_stop(self):
+    async def test_active_interrupted_task_resumes_without_semantic_router(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = FailOnceChatModel()
@@ -604,13 +594,18 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             output: list[str] = []
             result = await _chat(
                 root, input_fn=ScriptedInput([
-                    "inspect the original target", "继续", "/exit",
+                    "inspect the original target",
+                    "Use the preserved checkpoint with this exact input",
+                    "/exit",
                 ]),
                 output_fn=output.append, application_factory=lambda: application,
             )
             self.assertEqual(result, 0)
             self.assertTrue(any(
-                '"text":"继续"' in line or '"text": "继续"' in line
+                '"text":"Use the preserved checkpoint with this exact input"'
+                in line
+                or '"text": "Use the preserved checkpoint with this exact input"'
+                in line
                 for line in output if line.startswith("agent> " )
             ))
             self.assertTrue(any(
@@ -627,9 +622,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(len(task_ids), 2)
             self.assertEqual(task_ids[0], task_ids[1])
-            self.assertEqual(resolver.contexts[-1]["unfinished_tasks"][0][
-                "goal"
-            ], "inspect the original target")
+            self.assertEqual(resolver.contexts, [])
             await application.registry.start_all()
             try:
                 tasks = await application.kernel.list_session_tasks(session_id)
@@ -645,7 +638,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await application.registry.stop_all()
 
-    async def test_semantic_reference_finds_older_interrupted_task(self):
+    async def test_older_interrupted_task_requires_explicit_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = FailOnceChatModel()
@@ -660,8 +653,8 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             await _chat(
                 root, input_fn=ScriptedInput([
                     "inspect the interrupted target",
-                    "answer an unrelated question",
-                    "return to the unfinished investigation and finish it",
+                    "/new answer an unrelated question",
+                    "/resume", "1",
                     "/exit",
                 ]), output_fn=output.append,
                 application_factory=lambda: application,
@@ -689,14 +682,11 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                     "正在继续上次意外中断的任务：inspect the interrupted target"
                     in line for line in output
                 ))
-                self.assertEqual(
-                    resolver.contexts[-1]["unfinished_tasks"][0]["goal"],
-                    "inspect the interrupted target",
-                )
+                self.assertEqual(resolver.contexts, [])
             finally:
                 await application.registry.stop_all()
 
-    async def test_resumed_task_receives_complete_current_input(self):
+    async def test_active_interrupted_task_routes_by_state_not_input_phrase(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = FailOnceChatModel()
@@ -709,7 +699,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             await _chat(
                 root, input_fn=ScriptedInput([
                     "original target",
-                    "重新试试，但不要改公共组件",
+                    "A semantically unrelated sentence must still follow state",
                     "/exit",
                 ]), output_fn=output.append,
                 application_factory=lambda: application,
@@ -735,7 +725,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                 ]
                 self.assertEqual(
                     queued[-1].payload["text"],
-                    "重新试试，但不要改公共组件",
+                    "A semantically unrelated sentence must still follow state",
                 )
             finally:
                 await application.registry.stop_all()
@@ -746,7 +736,6 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             model = BlockingChatModel()
             application = compose_fixture_application(
                 model_adapter=model, tool_adapters=(),
-                runtime_input_classifier_adapter=FixtureRuntimeInputClassifier(),
             )
             terminal = AsyncScriptedTerminal([
                 "first request", "/followup queue",
@@ -852,6 +841,86 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                     [task.state for task in tasks],
                     [TaskState.SUCCEEDED, TaskState.SUCCEEDED],
                 )
+            finally:
+                await application.registry.stop_all()
+
+    async def test_session_first_four_turn_journey_bypasses_semantic_router(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = RecordingChatModel()
+            resolver = FixtureSessionInputResolver()
+            application = compose_fixture_application(
+                model_adapter=model, tool_adapters=(),
+                session_input_resolver_adapter=resolver,
+            )
+            prompts = [
+                "分析当前工程能力",
+                "继续补充必要项",
+                "基于当前对话生成交付文档",
+                "执行文档中仍未完成的工作",
+            ]
+            output: list[str] = []
+            result = await _chat(
+                root, input_fn=ScriptedInput(prompts + ["/exit"]),
+                output_fn=output.append, application_factory=lambda: application,
+            )
+            self.assertEqual(result, 0)
+            self.assertEqual(resolver.contexts, [])
+            self.assertEqual(len(model.requests), 4)
+            self.assertEqual(
+                [request.messages[-1].text for request in model.requests],
+                prompts,
+            )
+            for index, request in enumerate(model.requests[1:], start=1):
+                context = next(
+                    message for message in request.messages
+                    if message.message_id.startswith("session-context-")
+                )
+                for earlier in prompts[:index]:
+                    self.assertIn(earlier, context.text)
+            self.assertFalse(any(
+                "正在识别这条输入与未完成任务的关系" in line
+                for line in output
+            ))
+            session_id = next(
+                line.removeprefix("session: ") for line in output
+                if line.startswith("session: ")
+            )
+            await application.registry.start_all()
+            try:
+                tasks = await application.kernel.list_session_tasks(session_id)
+                self.assertEqual([task.goal for task in tasks], prompts)
+                self.assertTrue(all(task.state is TaskState.SUCCEEDED for task in tasks))
+            finally:
+                await application.registry.stop_all()
+
+    async def test_session_first_input_clears_unselected_legacy_menu(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+            )
+            await application.registry.start_all()
+            session = await application.kernel.create_session("legacy menu")
+            candidate = SessionResumeCandidate(
+                "legacy-task", "old unfinished work", "INTERRUPTED",
+                str(root), SessionResumeSafety.EXACT_RESUME, "checkpoint",
+            )
+            await application.kernel.request_session_task_choice(
+                session.session_id, (candidate,), "old menu"
+            )
+            await application.registry.stop_all()
+            output: list[str] = []
+            await _chat(
+                root, session_id=session.session_id,
+                input_fn=ScriptedInput(["new ordinary turn", "/exit"]),
+                output_fn=output.append, application_factory=lambda: application,
+            )
+            await application.registry.start_all()
+            try:
+                restored = await application.kernel.get_session(session.session_id)
+                self.assertIsNone(restored.pending_interaction)
+                self.assertIn("agent> new ordinary turn", output)
             finally:
                 await application.registry.stop_all()
 

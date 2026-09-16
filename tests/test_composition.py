@@ -34,8 +34,10 @@ from tsm_agt.ports import (
     ReplayCursorStorePort,
     ModelProviderPort,
     ProcessExecutorPort,
+    RuntimeInputClassifierPort,
     RuntimeStorePort,
     SandboxPort,
+    SessionInputResolverPort,
     ToolCall,
     ToolProviderPort,
     WorkspaceFilesystemPort,
@@ -100,6 +102,12 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(
                 application.registry.all(SemanticActionClassifierPort), ()
+            )
+            self.assertEqual(
+                application.registry.all(SessionInputResolverPort), ()
+            )
+            self.assertEqual(
+                application.registry.all(RuntimeInputClassifierPort), ()
             )
             self.assertEqual(len(application.registry.all(ToolProviderPort)), 1)
             for port in (
@@ -179,6 +187,12 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 application.kernel.dependencies.default_max_output_tokens, 8192
             )
+            self.assertEqual(
+                application.registry.all(SessionInputResolverPort), ()
+            )
+            self.assertEqual(
+                application.registry.all(RuntimeInputClassifierPort), ()
+            )
             model = application.registry.require(ModelProviderPort)
             self.assertTrue(model.capabilities.tools)
             sandbox = application.registry.require(SandboxPort)
@@ -192,6 +206,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                 [
                     "core.list_files", "core.find_files",
                     "core.read_file", "core.search_text",
+                    "web.search", "content.summarize",
                     "core.run_command",
                     "core.process_status", "core.process_logs",
                     "core.process_stop", "core.apply_patch",
@@ -206,6 +221,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                     "core.working_memory_update",
                     "core.task_spec_read",
                     "core.task_outcome_select",
+                    "core.task_outcome_complete",
                     "core.task_spec_update",
                     "code.symbol_overview", "code.definition",
                     "code.references", "code.implementations",

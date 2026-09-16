@@ -456,10 +456,11 @@ class EngineeringAgentClient:
         self, task_id: str, text: str, *, command_id: str,
         intent: str | None = None,
     ) -> RuntimeCommandResult:
-        """Route ordinary input received while ``task_id`` is active.
+        """Apply input to an active Task using a protocol intent.
 
-        ``intent`` is an optional explicit UI override (steer, replace, or
-        new_task_after_current).  Omitting it uses the shared Runtime router.
+        ``intent`` may explicitly select steer, replace, or
+        new_task_after_current. Omitting it deterministically means STEER;
+        Runtime never infers control intent from the user's wording.
         """
         explicit = None
         if intent is not None:
@@ -472,7 +473,10 @@ class EngineeringAgentClient:
 
         async def execute():
             return await self.application.kernel.route_runtime_input(
-                task_id, text, command_id, explicit_intent=explicit
+                task_id, text, command_id, explicit_intent=explicit,
+                fallback_intent=(
+                    RuntimeInputIntent.STEER if explicit is None else None
+                ),
             )
 
         return await self._command(

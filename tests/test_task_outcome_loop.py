@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from tsm_agt.adapters.builtin import CoreReadOnlyToolProvider
+from tsm_agt.adapters.builtin import (
+    CoreReadOnlyToolProvider, CoreTaskSpecToolProvider,
+)
 from tsm_agt.adapters.fixture import EchoModelProvider
 from tsm_agt.adapters.model_task_spec_planner import ModelTaskSpecPlanner
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
@@ -14,13 +17,15 @@ from tsm_agt.core import (
     AcceptanceStatus, AgentContinuationSuspended, SessionContinuationMode,
     AgentClarificationSuspended, AgentTurnSuspended, ApprovalDecision,
     ApprovalRequired,
+    InvalidToolArguments,
     ProjectTrustLevel, TaskAcceptanceCriterion, TaskCriterionKind,
-    TaskOutcomeStatus, TaskSpecProposal, TaskSpecSnapshot, TaskState,
+    TaskOutcomeEligibilityCalculator, TaskOutcomeStatus, TaskSpecProposal,
+    TaskSpecSnapshot, TaskState, ToolBatchSnapshot, ToolBatchStatus,
 )
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, FinishReason, HealthState, HealthStatus,
     Message, MessageRole, ModelRequest, ModelResponse, ModelUsage,
-    ProviderCapabilities, TaskSpecPlannerPort, TextBlock, ToolCall,
+    OutcomeBindingMode, ProviderCapabilities, TaskSpecPlannerPort, TextBlock, ToolCall,
     ToolCallBlock, ToolEffect, ToolIdempotency, ToolInvocationContext,
     ToolResult, ToolResultBlock, ToolRisk, ToolSpec,
 )
@@ -41,7 +46,7 @@ def proposal(goal: str, outcome_ids=("inspect",), continuation="NONE"):
 
 
 class TwoUnitModel(EchoModelProvider):
-    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
 
     def __init__(self, tool_name: str = "core.list_files"):
         super().__init__()
@@ -251,6 +256,44 @@ class SharedOutcomeBatchModel(EchoModelProvider):
         ), FinishReason.STOP, ModelUsage(1, 1))
 
 
+class ExplicitCompletionModel(EchoModelProvider):
+    """Complete a composite Outcome through the public internal-state tool."""
+
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        results = [
+            block.result for message in request.messages
+            for block in message.content if isinstance(block, ToolResultBlock)
+        ]
+        if not results:
+            return ModelResponse(Message(
+                "explicit-read", MessageRole.ASSISTANT,
+                (ToolCallBlock(ToolCall(
+                    "explicit-read", "core.list_files", {"path": "."},
+                    outcome_ref="inspection",
+                )),),
+            ), FinishReason.TOOL_CALL, ModelUsage(1, 1))
+        if len(results) == 1:
+            turn_id = request.turn_id
+            reference = f"tool:{turn_id}:explicit-read:observe"
+            return ModelResponse(Message(
+                "explicit-complete", MessageRole.ASSISTANT,
+                (ToolCallBlock(ToolCall(
+                    "explicit-complete", "core.task_outcome_complete", {
+                        "outcome_id": "inspection",
+                        "completion_summary": "Inspection completed",
+                        "evidence_refs": [reference],
+                        "remaining_work": [],
+                    },
+                )),),
+            ), FinishReason.TOOL_CALL, ModelUsage(1, 1))
+        return ModelResponse(Message(
+            "explicit-final", MessageRole.ASSISTANT,
+            (TextBlock("Inspection completed and accepted."),),
+        ), FinishReason.STOP, ModelUsage(1, 1))
+
+
 class CrossOutcomeBatchModel(EchoModelProvider):
     """One response closes an Outcome before its second call executes."""
 
@@ -334,6 +377,243 @@ class SeparateEvidenceAnswerModel(EchoModelProvider):
 
 
 class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
+    async def test_locked_downstream_observation_is_support_only(self):
+        """Preparatory reads may inspect active work without completing it."""
+        with tempfile.TemporaryDirectory() as directory:
+            observe = EffectToolProvider(ToolEffect.OBSERVE)
+            mutate = EffectToolProvider(ToolEffect.MUTATE)
+            execute = EffectToolProvider(ToolEffect.EXECUTE)
+            app = compose_fixture_application(
+                model_adapter=EchoModelProvider(),
+                tool_adapters=(observe,),
+            )
+            await app.registry.start_all()
+            try:
+                task = await app.kernel.create_task(
+                    "implement and verify", Path(directory)
+                )
+                current = await app.kernel.get_task_spec(task.task_id)
+                data = proposal(task.goal)
+                data["outcomes"] = [
+                    {
+                        "outcome_id": "implementation",
+                        "description": "Implement the change",
+                        "kind": "WORKSPACE_DELIVERY",
+                        "required_effects": ["mutate"],
+                        "required": True,
+                    },
+                    {
+                        "outcome_id": "verification",
+                        "description": "Verify the implementation",
+                        "kind": "EVIDENCE",
+                        "required_effects": ["observe"],
+                        "required": True,
+                        "depends_on": ["implementation"],
+                    },
+                    {
+                        "outcome_id": "other_implementation",
+                        "description": "Implement an unrelated change",
+                        "kind": "WORKSPACE_DELIVERY",
+                        "required_effects": ["mutate"],
+                        "required": True,
+                    },
+                    {
+                        "outcome_id": "other_verification",
+                        "description": "Verify the unrelated change",
+                        "kind": "EVIDENCE",
+                        "required_effects": ["observe"],
+                        "required": True,
+                        "depends_on": ["other_implementation"],
+                    },
+                ]
+                spec = TaskSpecSnapshot.from_proposal(
+                    task.task_id, 2, TaskSpecProposal.from_data(data),
+                    current.acceptance_criteria,
+                )
+                await app.kernel._append_events(task.task_id, ((
+                    "task_spec.revised", {"snapshot": spec.to_data()},
+                ),))
+                await app.kernel.select_task_outcomes(
+                    task.task_id, ("implementation",),
+                    reason="fixture_active_implementation",
+                )
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    task = await app.kernel.transition_task(
+                        task.task_id, state, state.value
+                    )
+
+                supporting = await app.kernel._bind_tool_call_outcome(
+                    task.task_id, ToolCall(
+                        "supporting-read", observe.name, {},
+                        outcome_ref="verification",
+                    ), (await observe.list_tools())[0],
+                )
+                self.assertEqual(
+                    supporting.outcome_binding_mode,
+                    OutcomeBindingMode.SUPPORTING,
+                )
+                result = await app.kernel.invoke_tool(
+                    task.task_id, "turn-supporting", supporting
+                )
+                self.assertTrue(result.ok)
+                outcomes = {
+                    item.outcome_id: item for item in
+                    (await app.kernel.get_task_spec(task.task_id)).outcomes
+                }
+                self.assertEqual(
+                    outcomes["verification"].status,
+                    TaskOutcomeStatus.PENDING,
+                )
+                self.assertFalse(outcomes["verification"].fulfillment_refs)
+                events = await app.kernel.dependencies.store.read_events(
+                    task.task_id
+                )
+                self.assertTrue(any(
+                    event.event_type == "task_outcome.support_observed"
+                    and event.payload["outcome_id"] == "verification"
+                    for event in events
+                ))
+                self.assertFalse(any(
+                    event.event_type == "task_outcome.state_changed"
+                    and event.payload["outcome_id"] == "verification"
+                    and event.payload.get("tool_call_id") == "supporting-read"
+                    for event in events
+                ))
+
+                for provider in (mutate, execute):
+                    with self.assertRaisesRegex(
+                        InvalidToolArguments,
+                        "OUTCOME_DEPENDENCY_UNSATISFIED",
+                    ):
+                        await app.kernel._bind_tool_call_outcome(
+                            task.task_id, ToolCall(
+                                f"locked-{provider.effect.value}",
+                                provider.name, {}, outcome_ref="verification",
+                            ), (await provider.list_tools())[0],
+                        )
+
+                with self.assertRaisesRegex(
+                    InvalidToolArguments, "OUTCOME_DEPENDENCY_UNSATISFIED"
+                ):
+                    await app.kernel._bind_tool_call_outcome(
+                        task.task_id, ToolCall(
+                            "unrelated-read", observe.name, {},
+                            outcome_ref="other_verification",
+                        ), (await observe.list_tools())[0],
+                    )
+
+                await app.kernel._append_events(task.task_id, ((
+                    "task_outcome.state_changed", {
+                        "outcome_id": "implementation",
+                        "status": TaskOutcomeStatus.DELIVERED.value,
+                        "fulfillment_ref": "fixture:implementation:mutate",
+                        "reason": "fixture_dependency_ready",
+                    },
+                ),))
+                fulfillment = await app.kernel._bind_tool_call_outcome(
+                    task.task_id, ToolCall(
+                        "verification-read", observe.name, {},
+                        outcome_ref="verification",
+                    ), (await observe.list_tools())[0],
+                )
+                self.assertEqual(
+                    fulfillment.outcome_binding_mode,
+                    OutcomeBindingMode.FULFILLMENT,
+                )
+            finally:
+                await app.registry.stop_all()
+
+    def test_supporting_binding_survives_storage_and_legacy_defaults(self):
+        supporting = ToolCall(
+            "support", "core.list_files", {"path": "."},
+            outcome_ref="verification",
+            outcome_binding_mode=OutcomeBindingMode.SUPPORTING,
+        )
+        restored = ToolCall.from_data(supporting.to_data())
+        self.assertEqual(
+            restored.outcome_binding_mode, OutcomeBindingMode.SUPPORTING
+        )
+        legacy = supporting.to_data()
+        legacy.pop("outcome_binding_mode")
+        self.assertEqual(
+            ToolCall.from_data(legacy).outcome_binding_mode,
+            OutcomeBindingMode.FULFILLMENT,
+        )
+        batch = ToolBatchSnapshot(
+            "batch-support", "message-support", (supporting,),
+            (supporting.call_id,), ToolBatchStatus.ACCEPTED, 2, 3,
+        )
+        self.assertEqual(
+            ToolBatchSnapshot.from_data(batch.to_data()).calls[0]
+            .outcome_binding_mode,
+            OutcomeBindingMode.SUPPORTING,
+        )
+
+    def test_dependency_with_fulfilled_effects_allows_verification_before_acceptance(self):
+        """Modification can be verified before its final acceptance closes."""
+        proposed = proposal("modify then verify", ("workspace", "verification"))
+        proposed["outcomes"][0].update({
+            "kind": "WORKSPACE_DELIVERY",
+            "required_effects": ["observe", "mutate"],
+        })
+        proposed["outcomes"][1].update({
+            "kind": "EVIDENCE",
+            "required_effects": ["execute", "observe"],
+            "depends_on": ["workspace"],
+        })
+        initial = TaskSpecSnapshot.initial("task-dag", "modify then verify")
+        spec = TaskSpecSnapshot.from_proposal(
+            "task-dag", 2, TaskSpecProposal.from_data(proposed),
+            initial.acceptance_criteria,
+        )
+        workspace = replace(
+            spec.outcomes[0], status=TaskOutcomeStatus.IN_PROGRESS,
+            fulfillment_refs=(
+                "tool:read:observe", "tool:patch:mutate",
+            ),
+        )
+        spec = replace(
+            spec, outcomes=(workspace, spec.outcomes[1]), content_hash=""
+        )
+        eligible = TaskOutcomeEligibilityCalculator.eligible(spec)
+        self.assertEqual(
+            [item.outcome_id for item in eligible],
+            ["workspace", "verification"],
+        )
+        self.assertFalse(workspace.status.is_closed)
+
+    def test_dependency_missing_one_effect_keeps_downstream_ineligible(self):
+        proposed = proposal("modify then verify", ("workspace", "verification"))
+        proposed["outcomes"][0].update({
+            "kind": "WORKSPACE_DELIVERY",
+            "required_effects": ["observe", "mutate"],
+        })
+        proposed["outcomes"][1].update({
+            "required_effects": ["execute"],
+            "depends_on": ["workspace"],
+        })
+        initial = TaskSpecSnapshot.initial("task-dag", "modify then verify")
+        spec = TaskSpecSnapshot.from_proposal(
+            "task-dag", 2, TaskSpecProposal.from_data(proposed),
+            initial.acceptance_criteria,
+        )
+        workspace = replace(
+            spec.outcomes[0], status=TaskOutcomeStatus.IN_PROGRESS,
+            fulfillment_refs=("tool:patch:mutate",),
+        )
+        spec = replace(
+            spec, outcomes=(workspace, spec.outcomes[1]), content_hash=""
+        )
+        self.assertEqual(
+            [item.outcome_id for item in
+             TaskOutcomeEligibilityCalculator.eligible(spec)],
+            ["workspace"],
+        )
+
     async def test_misbound_reads_close_evidence_but_not_workspace_delivery(self):
         """Task-scoped reads can support evidence, never fake a mutation."""
         with tempfile.TemporaryDirectory() as directory:
@@ -785,6 +1065,114 @@ class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
+    async def test_closed_ref_auto_binds_unique_open_outcome_before_approval(self):
+        """Real P037 shape: stale focus/ref cannot interrupt deterministic work."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tool = EffectToolProvider(ToolEffect.MUTATE)
+            app = compose_fixture_application(tool_adapters=(tool,))
+            await app.registry.start_all()
+            try:
+                task = await app.kernel.create_task(
+                    "implement, wire, and verify tools", root,
+                )
+                current = await app.kernel.get_task_spec(task.task_id)
+                data = {
+                    "schema_version": 1,
+                    "goal": task.goal,
+                    "scope": ["."],
+                    "constraints": [],
+                    "outcomes": [
+                        {
+                            "outcome_id": "tool_definitions",
+                            "description": "Create tool definitions",
+                            "kind": "WORKSPACE_DELIVERY",
+                            "required_effects": ["mutate"],
+                            "required": True,
+                        },
+                        {
+                            "outcome_id": "supporting_updates",
+                            "description": "Wire supporting files",
+                            "kind": "WORKSPACE_DELIVERY",
+                            "required_effects": ["mutate"],
+                            "required": True,
+                        },
+                        {
+                            "outcome_id": "verification",
+                            "description": "Run verification",
+                            "kind": "COMMAND_RESULT",
+                            "required_effects": ["execute"],
+                            "required": True,
+                        },
+                    ],
+                    "continuation_policy": {"mode": "NONE"},
+                }
+                spec = TaskSpecSnapshot.from_proposal(
+                    task.task_id, 2, TaskSpecProposal.from_data(data),
+                    current.acceptance_criteria,
+                )
+                await app.kernel._append_events(task.task_id, (
+                    ("task_spec.revised", {"snapshot": spec.to_data()}),
+                    ("task_outcome.state_changed", {
+                        "outcome_id": "tool_definitions",
+                        "status": TaskOutcomeStatus.DELIVERED.value,
+                        "fulfillment_ref": "fixture:definitions:mutate",
+                        "reason": "fixture_completed",
+                    }),
+                ))
+                await app.kernel.select_task_outcomes(
+                    task.task_id, ("verification",),
+                    reason="fixture_stale_verification_focus",
+                )
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    task = await app.kernel.transition_task(
+                        task.task_id, state, state.value
+                    )
+
+                with self.assertRaises(ApprovalRequired) as caught:
+                    await app.kernel.invoke_tool(
+                        task.task_id, "turn-p037", ToolCall(
+                            "mutate-supporting", tool.name, {},
+                            outcome_ref="tool_definitions",
+                        ),
+                    )
+
+                # Runtime repaired only the bookkeeping edge.  The original R1
+                # approval remains mandatory and no tool ran before approval.
+                request = caught.exception.request
+                self.assertEqual(
+                    request.call.outcome_ref, "supporting_updates"
+                )
+                events = await app.kernel.dependencies.store.read_events(
+                    task.task_id
+                )
+                binding = next(
+                    event for event in reversed(events)
+                    if event.event_type == "task_outcome.binding_decided"
+                )
+                self.assertEqual(binding.payload["action"], "CORRECT")
+                self.assertEqual(
+                    binding.payload["reason"],
+                    "UNIQUE_COMPATIBLE_OPEN_OUTCOME",
+                )
+                self.assertEqual(
+                    binding.payload["requested_outcome_id"],
+                    "tool_definitions",
+                )
+                self.assertEqual(
+                    binding.payload["bound_outcome_id"],
+                    "supporting_updates",
+                )
+                self.assertFalse(any(
+                    event.event_type == "tool.started" for event in events
+                ))
+            finally:
+                await app.registry.stop_all()
+
     async def test_tool_effects_fulfill_matching_outcomes_and_link_events(self):
         """All project-neutral execution effects use the same Outcome path."""
         for effect, kind, outcome_name in (
@@ -819,6 +1207,13 @@ class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
                         "kind": kind,
                         "required_effects": [effect.value],
                     })
+                    if effect is not ToolEffect.OBSERVE:
+                        data["outcomes"][0].update({
+                            "completion_policy": "ATOMIC_ACTION",
+                            "atomic_action": {
+                                "tool_name": tool.name, "arguments": {},
+                            },
+                        })
                     spec = TaskSpecSnapshot.from_proposal(
                         task.task_id, 2, TaskSpecProposal.from_data(data),
                         current.acceptance_criteria,
@@ -905,6 +1300,197 @@ class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
                         )
                 finally:
                     await app.registry.stop_all()
+
+    async def test_explicit_outcome_stays_open_until_completion_request(self):
+        """One successful action is progress, not multi-step completion."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = compose_fixture_application(
+                tool_adapters=(CoreReadOnlyToolProvider(),),
+            )
+            await app.registry.start_all()
+            try:
+                task = await app.kernel.create_task("inspect two files", root)
+                current = await app.kernel.get_task_spec(task.task_id)
+                data = proposal(task.goal)
+                data["outcomes"][0].update({
+                    "outcome_id": "inspection",
+                    "kind": "COMMAND_RESULT",
+                    "description": "Complete the full inspection",
+                })
+                spec = TaskSpecSnapshot.from_proposal(
+                    task.task_id, 2, TaskSpecProposal.from_data(data),
+                    current.acceptance_criteria,
+                )
+                await app.kernel._append_events(task.task_id, ((
+                    "task_spec.revised", {"snapshot": spec.to_data()},
+                ),))
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    task = await app.kernel.transition_task(
+                        task.task_id, state, state.value
+                    )
+                await app.kernel.invoke_tool(
+                    task.task_id, "turn-explicit", ToolCall(
+                        "inspect-one", "core.list_files", {"path": "."},
+                        outcome_ref="inspection",
+                    ),
+                )
+                progress = (await app.kernel.get_task_spec(task.task_id)).outcomes[0]
+                self.assertEqual(progress.status, TaskOutcomeStatus.IN_PROGRESS)
+
+                rejected = await app.kernel.request_task_outcome_completion(
+                    task.task_id, "inspection",
+                    completion_summary="The first inspection step completed",
+                    evidence_refs=progress.fulfillment_refs,
+                    remaining_work=("Inspect the second target",),
+                    writer="test-explicit-rejected",
+                )
+                self.assertFalse(rejected["accepted"])
+                self.assertEqual(
+                    rejected["completion_gaps"][0]["kind"], "REMAINING_WORK"
+                )
+                self.assertEqual(
+                    (await app.kernel.get_task_spec(task.task_id)).outcomes[0].status,
+                    TaskOutcomeStatus.IN_PROGRESS,
+                )
+
+                accepted = await app.kernel.request_task_outcome_completion(
+                    task.task_id, "inspection",
+                    completion_summary="All declared inspection work completed",
+                    evidence_refs=progress.fulfillment_refs, remaining_work=(),
+                    writer="test-explicit-accepted",
+                )
+                self.assertTrue(accepted["accepted"])
+                self.assertEqual(
+                    (await app.kernel.get_task_spec(task.task_id)).outcomes[0].status,
+                    TaskOutcomeStatus.DELIVERED,
+                )
+                events = await app.kernel.dependencies.store.read_events(
+                    task.task_id
+                )
+                statuses = [
+                    item.payload.get("status") for item in events
+                    if item.event_type == "task_outcome.state_changed"
+                    and item.payload.get("outcome_id") == "inspection"
+                ]
+                self.assertIn("COMPLETION_REQUESTED", statuses)
+            finally:
+                await app.registry.stop_all()
+
+    async def test_agent_loop_uses_explicit_completion_tool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(
+                model_adapter=ExplicitCompletionModel(),
+                tool_adapters=(
+                    CoreReadOnlyToolProvider(), CoreTaskSpecToolProvider(),
+                ),
+            )
+            await app.registry.start_all()
+            try:
+                task = await app.kernel.create_task(
+                    "inspect workspace", Path(directory)
+                )
+                current = await app.kernel.get_task_spec(task.task_id)
+                data = proposal(task.goal)
+                data["outcomes"][0].update({
+                    "outcome_id": "inspection",
+                    "kind": "COMMAND_RESULT",
+                    "description": "Complete workspace inspection",
+                })
+                spec = TaskSpecSnapshot.from_proposal(
+                    task.task_id, 2, TaskSpecProposal.from_data(data),
+                    current.acceptance_criteria,
+                )
+                await app.kernel._append_events(task.task_id, ((
+                    "task_spec.revised", {"snapshot": spec.to_data()},
+                ),))
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    task = await app.kernel.transition_task(
+                        task.task_id, state, state.value
+                    )
+                result = await app.kernel.run_agent_turn(task.task_id, task.goal)
+                self.assertEqual(result.tool_calls, 2)
+                events = await app.kernel.dependencies.store.read_events(task.task_id)
+                executions = tuple(
+                    (await app.kernel.get_task(task.task_id)).tool_executions.values()
+                )
+                complete_execution = next((
+                    item for item in executions
+                    if item.call.name == "core.task_outcome_complete"
+                ), None)
+                self.assertIsNotNone(
+                    complete_execution, {
+                        "executions": [item.call.name for item in executions],
+                        "messages": [item.to_data() for item in result.messages],
+                    }
+                )
+                assert complete_execution is not None
+                self.assertTrue(complete_execution.result.ok)
+                outcome = (await app.kernel.get_task_spec(task.task_id)).outcomes[0]
+                self.assertEqual(
+                    outcome.status, TaskOutcomeStatus.DELIVERED,
+                    complete_execution.result.data,
+                )
+                self.assertTrue(any(
+                    item.event_type == "task_outcome.completion_requested"
+                    for item in events
+                ))
+            finally:
+                await app.registry.stop_all()
+
+    async def test_legacy_required_effects_stays_open_after_one_tool(self):
+        """Old Task streams keep their facts but gain safe completion semantics."""
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(
+                tool_adapters=(CoreReadOnlyToolProvider(),),
+            )
+            await app.registry.start_all()
+            try:
+                task = await app.kernel.create_task(
+                    "legacy inspection", Path(directory)
+                )
+                current = await app.kernel.get_task_spec(task.task_id)
+                data = proposal(task.goal)
+                data["outcomes"][0].update({
+                    "kind": "COMMAND_RESULT",
+                    "completion_policy": "REQUIRED_EFFECTS",
+                })
+                spec = TaskSpecSnapshot.from_proposal(
+                    task.task_id, 2, TaskSpecProposal.from_data(data),
+                    current.acceptance_criteria,
+                )
+                await app.kernel._append_events(task.task_id, ((
+                    "task_spec.revised", {"snapshot": spec.to_data()},
+                ),))
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    task = await app.kernel.transition_task(
+                        task.task_id, state, state.value
+                    )
+                await app.kernel.invoke_tool(
+                    task.task_id, "turn-legacy", ToolCall(
+                        "legacy-read", "core.list_files", {"path": "."},
+                        outcome_ref="inspect",
+                    ),
+                )
+                outcome = (await app.kernel.get_task_spec(task.task_id)).outcomes[0]
+                self.assertEqual(outcome.status, TaskOutcomeStatus.IN_PROGRESS)
+                self.assertEqual(
+                    outcome.completion_policy.value, "REQUIRED_EFFECTS"
+                )
+            finally:
+                await app.registry.stop_all()
 
     async def test_user_decision_fulfills_interact_outcome(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1059,6 +1645,11 @@ class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
                 )
                 for item in data["outcomes"]:
                     item["kind"] = "COMMAND_RESULT"
+                    item["completion_policy"] = "ATOMIC_ACTION"
+                    item["atomic_action"] = {
+                        "tool_name": "core.list_files",
+                        "arguments": {"path": "."},
+                    }
                 spec = TaskSpecSnapshot.from_proposal(
                     task.task_id, 2, TaskSpecProposal.from_data(data),
                     current.acceptance_criteria,
@@ -1315,6 +1906,11 @@ class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
                 )
                 for item in data["outcomes"]:
                     item["kind"] = "COMMAND_RESULT"
+                    item["completion_policy"] = "ATOMIC_ACTION"
+                    item["atomic_action"] = {
+                        "tool_name": "core.list_files",
+                        "arguments": {"path": "."},
+                    }
                 spec = TaskSpecSnapshot.from_proposal(
                     task.task_id, 2, TaskSpecProposal.from_data(data),
                     current.acceptance_criteria,
@@ -1385,6 +1981,11 @@ class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
             )
             for item in data["outcomes"]:
                 item["kind"] = "COMMAND_RESULT"
+                item["completion_policy"] = "ATOMIC_ACTION"
+                item["atomic_action"] = {
+                    "tool_name": "core.list_files",
+                    "arguments": {"path": "."},
+                }
             spec = TaskSpecSnapshot.from_proposal(
                 task.task_id, 2, TaskSpecProposal.from_data(data),
                 current.acceptance_criteria,

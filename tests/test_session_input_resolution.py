@@ -15,11 +15,12 @@ from tsm_agt.core import (
     DeterministicSessionChoiceResolver, SessionChoiceAction,
     SessionChoiceOption, SessionInputAction, SessionInteractionKind,
     SessionInteractionRequest, SessionResumeCandidate, SessionResumeSafety,
-    TaskState,
+    SessionRouteDisposition, SessionTaskRelation, TaskState,
 )
 from tsm_agt.ports import (
     AdapterDescriptor, FinishReason, HealthState, HealthStatus, Message,
-    MessageRole, ModelResponse, ModelUsage, TextBlock,
+    MessageRole, ModelResponse, ModelUsage, ProviderCapabilities, TextBlock,
+    ToolCall, ToolCallBlock,
 )
 
 
@@ -58,6 +59,27 @@ class JsonModel(EchoModelProvider):
         )
 
 
+class RouteToolModel(EchoModelProvider):
+    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+
+    def __init__(self, data):
+        super().__init__()
+        self.data = data
+        self.requests = []
+
+    async def complete(self, request):
+        self.requests.append(request)
+        return ModelResponse(
+            Message(
+                "resolver-tool-result", MessageRole.ASSISTANT,
+                (ToolCallBlock(ToolCall(
+                    "route-proposal", "session.submit_route_proposal",
+                    self.data,
+                )),),
+            ), FinishReason.TOOL_CALL, ModelUsage(1, 1),
+        )
+
+
 async def interrupted_task(app, root: Path):
     session = await app.kernel.create_session("generic resolution")
     task = await app.kernel.create_task(
@@ -75,6 +97,119 @@ async def interrupted_task(app, root: Path):
 
 
 class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
+    async def test_follow_up_completed_task_wins_over_unrelated_unfinished_task(self):
+        resolver = FixtureResolver({})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+                session_input_resolver_adapter=resolver,
+            )
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("mixed history")
+                completed = await app.kernel.create_task(
+                    "compare Codex and Hermes", root,
+                    session_id=session.session_id,
+                )
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    completed = await app.kernel.transition_task(
+                        completed.task_id, state, state.value
+                    )
+                await app.kernel.run_agent_turn(
+                    completed.task_id, completed.goal
+                )
+                for state in (
+                    TaskState.VERIFYING, TaskState.FINALIZING, TaskState.SUCCEEDED
+                ):
+                    completed = await app.kernel.transition_task(
+                        completed.task_id, state, state.value
+                    )
+                unrelated = SessionResumeCandidate(
+                    "task-nba", "query today's NBA news", "AWAITING_USER",
+                    str(root), SessionResumeSafety.AWAIT_USER_ACTION,
+                    "clarification_required",
+                )
+                resolver.response = {
+                    "disposition": "CREATE_TASK",
+                    "relation": "FOLLOW_UP",
+                    "source_task_id": completed.task_id,
+                    "resolved_goal": (
+                        "基于 Codex 和 Hermes 的比较，说明还需补充哪些能力"
+                    ),
+                    "input_grounding": "CONTEXT_DEPENDENT",
+                    "confidence": 0.96,
+                    "reason_code": "references_completed_result",
+                    "clarification": None,
+                    "candidate_task_ids": [],
+                }
+                with patch.object(
+                    app.kernel, "list_session_resume_candidates",
+                    AsyncMock(return_value=(unrelated,)),
+                ):
+                    decision = await app.kernel.resolve_session_input(
+                        session.session_id, "那现在还需要补充哪些", root
+                    )
+                self.assertEqual(
+                    decision.disposition, SessionRouteDisposition.CREATE_TASK,
+                    (decision.reason_code, [item.to_data() for item in decision.task_catalog]),
+                )
+                self.assertEqual(decision.relation, SessionTaskRelation.FOLLOW_UP)
+                self.assertEqual(decision.source_task_id, completed.task_id)
+                self.assertEqual(
+                    {item.task_id for item in decision.task_catalog},
+                    {unrelated.task_id, completed.task_id},
+                )
+                routed_context = resolver.inputs[-1][1]
+                self.assertEqual(
+                    routed_context["conversation_anchor_task_id"],
+                    completed.task_id,
+                )
+                self.assertEqual(
+                    routed_context["task_catalog"][0]["task_id"],
+                    completed.task_id,
+                )
+                self.assertTrue(
+                    routed_context["task_catalog"][0]
+                    ["is_conversation_anchor"]
+                )
+                self.assertFalse(next(
+                    item["is_conversation_anchor"]
+                    for item in routed_context["task_catalog"]
+                    if item["task_id"] == unrelated.task_id
+                ))
+                derived = await app.kernel.create_task(
+                    decision.resolved_goal or "missing", root,
+                    session_id=session.session_id,
+                    source_task_id=decision.source_task_id,
+                    task_relation=decision.relation,
+                )
+                self.assertEqual(derived.state, TaskState.CREATED)
+                self.assertIsNone(derived.pending_approval)
+                self.assertIsNone(derived.pending_clarification)
+                self.assertEqual(derived.workspace_access_grants, ())
+                self.assertIsNone(derived.active_agent_checkpoint)
+                events = await app.kernel.dependencies.store.read_session_events(
+                    session.session_id
+                )
+                attached = [
+                    event for event in events
+                    if event.event_type == "session.task_attached"
+                    and event.payload["task_id"] == derived.task_id
+                ][0]
+                self.assertEqual(
+                    attached.payload["source_task_id"], completed.task_id
+                )
+                self.assertEqual(
+                    attached.payload["task_relation"], "FOLLOW_UP"
+                )
+            finally:
+                await app.registry.stop_all()
+
     async def _resolve_with_unfinished_candidate(self, response):
         resolver = FixtureResolver(response)
         directory = tempfile.TemporaryDirectory()
@@ -185,7 +320,9 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
             "go back to the investigation before the last one",
             {"unfinished_tasks": [{"task_id": "task-a"}]},
         )
-        self.assertEqual(result["action"], "RESUME_TASK")
+        self.assertEqual(result["disposition"], "RESUME_TASK")
+        self.assertEqual(result["relation"], "CONTINUE")
+        self.assertEqual(result["source_task_id"], "task-a")
         self.assertEqual(result["input_grounding"], "CONTEXT_DEPENDENT")
         self.assertFalse(model.requests[-1].allow_tool_calls)
         self.assertEqual(model.requests[-1].tools, ())
@@ -200,6 +337,34 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             "Only candidates whose safety is EXACT_RESUME", system_text
         )
+
+    async def test_tool_capable_resolver_uses_structured_route_submission(self):
+        model = RouteToolModel({
+            "disposition": "CREATE_TASK",
+            "relation": "INDEPENDENT",
+            "source_task_id": None,
+            "resolved_goal": "explain the current implementation",
+            "input_grounding": "SELF_CONTAINED",
+            "confidence": 0.98,
+            "reason_code": "self_contained_question",
+            "clarification": None,
+            "candidate_task_ids": [],
+        })
+        resolver = ModelSessionInputResolver(model)
+        from tsm_agt.ports import AdapterContext
+        await model.start(AdapterContext({}, lambda *_: None))
+        await resolver.start(AdapterContext({}, lambda *_: None))
+        result = await resolver.resolve_session_input(
+            "explain the current implementation", {"task_catalog": []}
+        )
+        self.assertEqual(result["disposition"], "CREATE_TASK")
+        request = model.requests[-1]
+        self.assertTrue(request.allow_tool_calls)
+        self.assertEqual(
+            [tool.name for tool in request.tools],
+            ["session.submit_route_proposal"],
+        )
+        self.assertEqual(request.max_output_tokens, 512)
 
     async def test_awaiting_user_action_candidate_can_be_selected_as_context(self):
         resolver = FixtureResolver({
@@ -284,7 +449,7 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
-    async def test_context_dependent_input_cannot_become_new_task(self):
+    async def test_unanchored_context_dependent_input_degrades_without_menu(self):
         app, session, _resolver, decision = (
             await self._resolve_with_unfinished_candidate({
                 "action": "NEW_TASK", "task_id": None,
@@ -293,10 +458,12 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                 "clarification": None,
             })
         )
-        self.assertEqual(decision.action, SessionInputAction.CLARIFY)
+        self.assertEqual(decision.action, SessionInputAction.NEW_TASK)
+        self.assertEqual(decision.relation, SessionTaskRelation.CONTEXTUAL)
         self.assertEqual(
-            decision.reason_code, "new_task_requires_self_contained_input"
+            decision.reason_code, "semantic_clarification_unanchored_degraded"
         )
+        self.assertEqual(decision.candidate_task_ids, ())
         self.assertEqual(
             await app.kernel.list_session_tasks(session.session_id), ()
         )
@@ -312,7 +479,62 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(decision.action, SessionInputAction.NEW_TASK)
 
-    async def test_missing_grounding_fails_closed_to_clarification(self):
+    async def test_genuine_multi_task_ambiguity_preserves_specific_choice(self):
+        resolver = FixtureResolver({
+            "disposition": "CLARIFY",
+            "relation": "UNCERTAIN",
+            "source_task_id": None,
+            "resolved_goal": None,
+            "input_grounding": "AMBIGUOUS",
+            "confidence": 0.55,
+            "reason_code": "two_plausible_referents",
+            "clarification": "请选择要继续的调查。",
+            "candidate_task_ids": ["task-a", "task-b"],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+                session_input_resolver_adapter=resolver,
+            )
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("real ambiguity")
+                for task_id in ("task-a", "task-b"):
+                    task = await app.kernel.create_task(
+                        f"investigate {task_id}", root, task_id=task_id,
+                        session_id=session.session_id,
+                    )
+                    for state in (
+                        TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                        TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                        TaskState.EXECUTING,
+                    ):
+                        task = await app.kernel.transition_task(
+                            task.task_id, state, state.value
+                        )
+                candidates = tuple(
+                    SessionResumeCandidate(
+                        task_id, f"investigate {task_id}", "INTERRUPTED",
+                        str(root), SessionResumeSafety.EXACT_RESUME, "checkpoint",
+                    )
+                    for task_id in ("task-a", "task-b")
+                )
+                with patch.object(
+                    app.kernel, "list_session_resume_candidates",
+                    AsyncMock(return_value=candidates),
+                ):
+                    decision = await app.kernel.resolve_session_input(
+                        session.session_id, "继续之前那个调查", root
+                    )
+                self.assertEqual(decision.action, SessionInputAction.CLARIFY)
+                self.assertEqual(
+                    decision.candidate_task_ids, ("task-a", "task-b")
+                )
+            finally:
+                await app.registry.stop_all()
+
+    async def test_missing_grounding_degrades_to_contextual_task(self):
         _app, _session, _resolver, decision = (
             await self._resolve_with_unfinished_candidate({
                 "action": "NEW_TASK", "task_id": None,
@@ -321,7 +543,11 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
             })
         )
         self.assertEqual(decision.action, SessionInputAction.CLARIFY)
-        self.assertEqual(decision.reason_code, "semantic_resolution_failed")
+        self.assertEqual(decision.relation, SessionTaskRelation.UNCERTAIN)
+        self.assertEqual(
+            decision.reason_code, "semantic_router_protocol_degraded"
+        )
+        self.assertEqual(decision.candidate_task_ids, ())
 
     async def test_semantic_resolver_has_one_short_cancellable_deadline(self):
         class SlowModel(JsonModel):
@@ -367,7 +593,7 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
-    async def test_invalid_or_low_confidence_selection_requires_clarification(self):
+    async def test_invalid_selection_never_resumes_and_degrades_safely(self):
         # Kernel validates Resolver output; the Adapter cannot invent a Task ID
         # or turn a weak guess into execution authority.
         from tsm_agt.core import (
@@ -417,6 +643,10 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                     session.session_id, "refer to some earlier work", root
                 )
                 self.assertEqual(decision.action, SessionInputAction.CLARIFY)
-                self.assertEqual(decision.reason_code, "semantic_resolution_failed")
+                self.assertEqual(decision.relation, SessionTaskRelation.UNCERTAIN)
+                self.assertIsNone(decision.source_task_id)
+                self.assertEqual(
+                    decision.reason_code, "semantic_router_protocol_degraded"
+                )
             finally:
                 await app.registry.stop_all()

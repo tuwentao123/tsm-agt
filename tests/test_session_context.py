@@ -144,12 +144,13 @@ class SessionContextProjectorTest(unittest.TestCase):
 
         self.assertEqual(
             [item["task_id"] for item in body["recent_task_summaries"]],
-            [f"task-{index}" for index in range(1, 8)],
+            [f"task-{index}" for index in range(2, 8)],
         )
         self.assertEqual(
             [item["task_id"] for item in body["task_index"]],
             [f"task-{index}" for index in range(1, 8)],
         )
+        self.assertEqual(body["earlier_summary"]["message_count"], 2)
 
     def test_task_index_keeps_artifact_and_handoff_facts(self) -> None:
         snapshot = SessionSnapshot.create(
@@ -397,7 +398,9 @@ class SessionContextProjectorTest(unittest.TestCase):
                 "source_tool": "core.read_file",
                 "question_ref": f"question-{task_id}-{index}",
                 "question_status": "RESOLVED",
-                "evidence_references": [],
+                "evidence_references": [
+                    f"evidence-{task_id}-{value}" for value in range(50)
+                ],
                 "authority_inherited": False,
             } for index in range(105)]
             questions = [{
@@ -409,7 +412,9 @@ class SessionContextProjectorTest(unittest.TestCase):
                 "source_task_id": task_id,
                 "source_turn_id": f"turn-{sequence}",
                 "catalog_refs": [f"catalog-{offset + index}"],
-                "evidence_references": [],
+                "evidence_references": [
+                    f"evidence-{task_id}-{value}" for value in range(50)
+                ],
                 "blocking_reason": None,
                 "authority_inherited": False,
             } for index in range(55)]
@@ -418,6 +423,20 @@ class SessionContextProjectorTest(unittest.TestCase):
                 "session.task_result_recorded",
                 {
                     "task_id": task_id, "turn_id": f"turn-{sequence}",
+                    "user_message": Message(
+                        f"user-{sequence}", MessageRole.USER,
+                        (TextBlock(f"inspect {task_id}"),),
+                    ).to_data(),
+                    "assistant_message": Message(
+                        f"assistant-{sequence}", MessageRole.ASSISTANT,
+                        (TextBlock(f"inspected {task_id}"),),
+                    ).to_data(),
+                    "task_summary": {
+                        "task_id": task_id,
+                        "turn_id": f"turn-{sequence}",
+                        "goal": f"inspect {task_id}",
+                        "recorded_task_state": "SUCCEEDED",
+                    },
                     "resource_catalog": resources,
                     "question_catalog": questions,
                 },
@@ -434,6 +453,14 @@ class SessionContextProjectorTest(unittest.TestCase):
         self.assertEqual(
             {item.source_task_id for item in q1_records}, {"task-a", "task-b"}
         )
+        prompt = SessionContextProjector().for_prompt(projection)
+        assert prompt.message is not None
+        body = json.loads(prompt.message.text)
+        historical = body["historical_investigation"]
+        self.assertEqual(len(historical["resources"]), 40)
+        self.assertEqual(len(historical["questions"]), 20)
+        self.assertNotIn("evidence_references", json.dumps(historical))
+        self.assertLess(len(prompt.message.text), 100_000)
 
 
 class SessionContextRuntimeTest(unittest.IsolatedAsyncioTestCase):

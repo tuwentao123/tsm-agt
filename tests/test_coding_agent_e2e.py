@@ -137,6 +137,26 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
             task = await application.kernel.transition_task(
                 task.task_id, state, state.value
             )
+        initial = await application.kernel.get_task_spec(task.task_id)
+        proposal = TaskSpecProposal.from_data({
+            "schema_version": 1, "goal": task.goal,
+            "scope": ["."], "constraints": [],
+            "outcomes": [{
+                "outcome_id": "verification_required",
+                "description": "Run the verification required by this coding task",
+                "kind": "COMMAND_RESULT",
+                "required_effects": ["execute"],
+                "required": True,
+            }],
+            "continuation_policy": {"mode": "NONE"},
+        })
+        spec = TaskSpecSnapshot.from_proposal(
+            task.task_id, initial.revision + 1, proposal,
+            initial.acceptance_criteria,
+        )
+        await application.kernel._append_events(task.task_id, ((
+            "task_spec.revised", {"snapshot": spec.to_data()},
+        ),))
         return task
 
     async def test_real_files_process_approvals_interrupt_resume_and_verify(self) -> None:
@@ -240,6 +260,19 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(completed, AgentTurnResult)
                 assert isinstance(completed, AgentTurnResult)
                 self.assertIn("verified", completed.assistant_message.text)
+
+                progress = await second.kernel.get_task_spec(task.task_id)
+                by_id = {item.outcome_id: item for item in progress.outcomes}
+                for outcome_id in ("change", "verify"):
+                    completion = await second.kernel.request_task_outcome_completion(
+                        task.task_id, outcome_id,
+                        completion_summary=(
+                            "Workspace fix and its verification are complete"
+                        ),
+                        evidence_refs=by_id[outcome_id].fulfillment_refs,
+                        remaining_work=(), writer=f"e2e-{outcome_id}",
+                    )
+                    self.assertTrue(completion["accepted"], completion)
 
                 await second.kernel.transition_task(
                     task.task_id, TaskState.VERIFYING, "run trusted verifier"
@@ -470,6 +503,99 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
                 )
                 result = await app.kernel.verify_task_acceptance(task.task_id)
                 self.assertEqual(result.status, AcceptanceStatus.FAILED)
+            finally:
+                await app.registry.stop_all()
+
+    async def test_verification_command_is_eligible_after_workspace_effects(self) -> None:
+        """A modify→verify DAG must not require final delivery before testing."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = self._compose(root, root / "runtime.db", CodingLoopModel())
+            await app.registry.start_all()
+            try:
+                task = await self._create_executing_task(app, root)
+                initial = await app.kernel.get_task_spec(task.task_id)
+                proposal = TaskSpecProposal.from_data({
+                    "schema_version": 1,
+                    "goal": task.goal,
+                    "scope": ["."],
+                    "constraints": [],
+                    "outcomes": [
+                        {
+                            "outcome_id": "workspace_search_fix",
+                            "description": "Implement the workspace change",
+                            "kind": "WORKSPACE_DELIVERY",
+                            "required_effects": ["observe", "mutate"],
+                            "required": True,
+                        },
+                        {
+                            "outcome_id": "verification_results",
+                            "description": "Compile and verify the change",
+                            "kind": "COMMAND_RESULT",
+                            "required_effects": ["execute", "observe"],
+                            "required": True,
+                            "depends_on": ["workspace_search_fix"],
+                        },
+                    ],
+                    "continuation_policy": {"mode": "NONE"},
+                })
+                spec = TaskSpecSnapshot.from_proposal(
+                    task.task_id, initial.revision + 1, proposal,
+                    initial.acceptance_criteria,
+                )
+                await app.kernel._append_events(task.task_id, (
+                    ("task_spec.revised", {"snapshot": spec.to_data()}),
+                    ("task_outcome.state_changed", {
+                        "outcome_id": "workspace_search_fix",
+                        "status": TaskOutcomeStatus.IN_PROGRESS.value,
+                        "fulfillment_ref": "tool:read-source:observe",
+                        "reason": "source_inspected",
+                    }),
+                    ("task_outcome.state_changed", {
+                        "outcome_id": "workspace_search_fix",
+                        "status": TaskOutcomeStatus.IN_PROGRESS.value,
+                        "fulfillment_ref": "tool:apply-change:mutate",
+                        "reason": "change_applied",
+                    }),
+                ))
+
+                from tsm_agt.core import ApprovalRequired
+                with self.assertRaises(ApprovalRequired) as caught:
+                    await app.kernel.invoke_tool(
+                        task.task_id, "turn-verify-dag", ToolCall(
+                            "compile-change", "core.run_command", {
+                                "argv": [
+                                    __import__("sys").executable, "-m",
+                                    "py_compile", "calc.py",
+                                ],
+                                "mode": "foreground",
+                            },
+                            outcome_ref="verification_results",
+                        ),
+                    )
+
+                self.assertEqual(
+                    caught.exception.request.call.outcome_ref,
+                    "verification_results",
+                )
+                events = await app.kernel.dependencies.store.read_events(
+                    task.task_id
+                )
+                binding = next(
+                    event for event in reversed(events)
+                    if event.event_type == "task_outcome.binding_decided"
+                )
+                self.assertEqual(binding.payload["action"], "ACCEPT")
+                self.assertEqual(
+                    binding.payload["bound_outcome_id"],
+                    "verification_results",
+                )
+                self.assertIn(
+                    "verification_results",
+                    binding.payload["eligible_outcome_ids"],
+                )
+                workspace = (await app.kernel.get_task_spec(task.task_id)).outcomes[0]
+                self.assertEqual(workspace.status, TaskOutcomeStatus.IN_PROGRESS)
             finally:
                 await app.registry.stop_all()
 

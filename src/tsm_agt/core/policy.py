@@ -56,6 +56,7 @@ class CoreToolPolicy:
     _POLICY_VERSION = 1
     _INTERNAL_STATE_TOOLS = frozenset({
         "core.working_memory_update", "core.task_spec_update",
+        "core.task_outcome_select", "core.task_outcome_complete",
     })
 
     @classmethod

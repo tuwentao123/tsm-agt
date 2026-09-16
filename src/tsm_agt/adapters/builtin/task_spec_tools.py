@@ -18,7 +18,7 @@ class CoreTaskSpecToolProvider:
         "ToolProviderPort", "1.0",
         frozenset({
             "core.task_spec_read", "core.task_spec_update",
-            "core.task_outcome_select",
+            "core.task_outcome_select", "core.task_outcome_complete",
         }),
     )
     _tools = (
@@ -47,6 +47,38 @@ class CoreTaskSpecToolProvider:
                     "source_input_id": {"type": "string"},
                 },
                 "required": ["outcome_ids", "reason"],
+                "additionalProperties": False,
+            },
+            ToolRisk.R0, False, False, ToolIdempotency.IDEMPOTENT,
+            is_internal_state=True, effect=ToolEffect.INTERNAL,
+            result_authority=ToolResultAuthority.RUNTIME_FACT,
+        ),
+        ToolSpec(
+            "core.task_outcome_complete",
+            "Request Runtime validation for one open Outcome after all of its "
+            "work and verification are complete. A successful request closes the "
+            "Outcome; a rejected request returns structured completion gaps. This "
+            "tool grants no file, command, network, approval, or sandbox authority.",
+            {
+                "type": "object",
+                "properties": {
+                    "outcome_id": {"type": "string", "minLength": 1},
+                    "completion_summary": {
+                        "type": "string", "minLength": 1, "maxLength": 2000,
+                    },
+                    "evidence_refs": {
+                        "type": "array", "uniqueItems": True,
+                        "items": {"type": "string"}, "maxItems": 100,
+                    },
+                    "remaining_work": {
+                        "type": "array",
+                        "items": {"type": "string"}, "maxItems": 50,
+                    },
+                },
+                "required": [
+                    "outcome_id", "completion_summary",
+                    "evidence_refs", "remaining_work",
+                ],
                 "additionalProperties": False,
             },
             ToolRisk.R0, False, False, ToolIdempotency.IDEMPOTENT,
@@ -138,6 +170,19 @@ class CoreTaskSpecToolProvider:
                     tuple(str(item) for item in raw_ids),
                     str(call.arguments["reason"]),
                     str(call.arguments.get("source_input_id", "")),
+                )
+            elif call.name == "core.task_outcome_complete":
+                raw_refs = call.arguments["evidence_refs"]
+                raw_remaining = call.arguments["remaining_work"]
+                if not isinstance(raw_refs, (list, tuple)):
+                    raise ValueError("evidence_refs must be an array")
+                if not isinstance(raw_remaining, (list, tuple)):
+                    raise ValueError("remaining_work must be an array")
+                data = await control.complete_outcome(
+                    str(call.arguments["outcome_id"]),
+                    str(call.arguments["completion_summary"]),
+                    tuple(str(item) for item in raw_refs),
+                    tuple(str(item) for item in raw_remaining),
                 )
             else:
                 return ToolResult(call.call_id, False, error_code="NOT_FOUND", message="unknown Task SPEC tool")

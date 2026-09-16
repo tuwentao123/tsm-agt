@@ -105,6 +105,7 @@ from .runtime_input import (
     SessionContinuationDecision, SessionContinuationMode,
     SessionResumeCandidate, SessionResumeSafety,
     SessionInputAction, SessionInputDecision, SessionInputGrounding,
+    SessionRouteDisposition, SessionTaskCatalogEntry, SessionTaskRelation,
 )
 from .plan_guard import (
     ActionProgressState, GoalSlice, PlanGuard, PlanGuardDecision,
@@ -214,6 +215,9 @@ __all__ = [
     "SessionInputAction",
     "SessionInputDecision",
     "SessionInputGrounding",
+    "SessionRouteDisposition",
+    "SessionTaskCatalogEntry",
+    "SessionTaskRelation",
     "IdempotencyConflict",
     "ToolCommitState",
     "ToolExecutionInProgress",

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 from .session import SessionInteractionRequest
 
@@ -20,6 +21,7 @@ class SessionChoiceDecision:
     target_id: str | None = None
     option_id: str | None = None
     reason_code: str = "not_a_deterministic_choice"
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class DeterministicSessionChoiceResolver:
@@ -73,5 +75,6 @@ class DeterministicSessionChoiceResolver:
     @staticmethod
     def _selected(option, reason: str) -> SessionChoiceDecision:
         return SessionChoiceDecision(
-            SessionChoiceAction.SELECT, option.target_id, option.option_id, reason
+            SessionChoiceAction.SELECT, option.target_id, option.option_id, reason,
+            dict(option.metadata),
         )

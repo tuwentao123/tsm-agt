@@ -141,10 +141,12 @@ class LocalEventApiTest(unittest.TestCase):
         self.assertEqual(status, 202)
         self.assertEqual(json.loads(raw)["result"]["intent"], "STEER")
         status, _, raw = self.request(f"/v1/tasks/{task.task_id}/input", {
-            "text": "这个方向不太对", "command_id": "api-input-2"
+            "text": "arbitrary payload 42", "command_id": "api-input-2"
         })
-        self.assertEqual(status, 200)
-        self.assertTrue(json.loads(raw)["result"]["requires_confirmation"])
+        self.assertEqual(status, 202)
+        default_route = json.loads(raw)["result"]
+        self.assertEqual(default_route["intent"], "STEER")
+        self.assertFalse(default_route["requires_confirmation"])
 
     def test_task_spec_get_and_revision_route(self) -> None:
         task = self.server._call(self.server._client.create_task(

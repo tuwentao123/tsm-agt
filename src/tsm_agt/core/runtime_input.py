@@ -96,22 +96,112 @@ class SessionInputGrounding(StrEnum):
     AMBIGUOUS = "AMBIGUOUS"
 
 
+class SessionRouteDisposition(StrEnum):
+    """What Runtime should do after validating a semantic proposal."""
+
+    CREATE_TASK = "CREATE_TASK"
+    RESUME_TASK = "RESUME_TASK"
+    CLARIFY = "CLARIFY"
+
+
+class SessionTaskRelation(StrEnum):
+    """Semantic relationship between the input and prior Session work."""
+
+    INDEPENDENT = "INDEPENDENT"
+    # A safe, isolated Task that receives ordinary Session context but is not
+    # bound to, resumed from, or authorized by any particular historical Task.
+    CONTEXTUAL = "CONTEXTUAL"
+    CONTINUE = "CONTINUE"
+    FOLLOW_UP = "FOLLOW_UP"
+    BRANCH = "BRANCH"
+    UNCERTAIN = "UNCERTAIN"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionTaskCatalogEntry:
+    """Bounded, authority-free Task reference supplied to routing models.
+
+    It is an index, not a checkpoint.  In particular it carries no approvals,
+    permission grants, Tool arguments/results, process handles, or credentials.
+    """
+
+    task_id: str
+    goal: str
+    task_state: str
+    workspace: str
+    completed_work: tuple[str, ...] = ()
+    remaining_work: tuple[str, ...] = ()
+    verification_status: str | None = None
+    outcome_summaries: tuple[str, ...] = ()
+    resume_safety: SessionResumeSafety | None = None
+    recency_index: int = 0
+    is_conversation_anchor: bool = False
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.task_state in {"SUCCEEDED", "CANCELLED", "FAILED"}
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id, "goal": self.goal,
+            "task_state": self.task_state, "workspace": self.workspace,
+            "completed_work": list(self.completed_work),
+            "remaining_work": list(self.remaining_work),
+            "verification_status": self.verification_status,
+            "outcome_summaries": list(self.outcome_summaries),
+            "resume_safety": (
+                self.resume_safety.value if self.resume_safety else None
+            ),
+            "recency_index": self.recency_index,
+            "is_conversation_anchor": self.is_conversation_anchor,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class SessionInputDecision:
-    action: SessionInputAction
-    task_id: str | None
+    disposition: SessionRouteDisposition
+    relation: SessionTaskRelation
+    source_task_id: str | None
+    resolved_goal: str | None
     confidence: float
     reason_code: str
     input_grounding: SessionInputGrounding
     clarification: str | None = None
-    resolver_version: str = "runtime-default-v1"
+    resolver_version: str = "runtime-route-v2"
     candidates: tuple[SessionResumeCandidate, ...] = ()
+    task_catalog: tuple[SessionTaskCatalogEntry, ...] = ()
+    candidate_task_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not 0 <= self.confidence <= 1:
             raise ValueError("Session input confidence must be between 0 and 1")
-        if self.action is SessionInputAction.RESUME_TASK and not self.task_id:
-            raise ValueError("RESUME_TASK requires task_id")
+        if self.disposition is SessionRouteDisposition.RESUME_TASK:
+            if not self.source_task_id:
+                raise ValueError("RESUME_TASK requires source_task_id")
+            if self.relation is not SessionTaskRelation.CONTINUE:
+                raise ValueError("RESUME_TASK requires CONTINUE relation")
+        if (
+            self.disposition is SessionRouteDisposition.CREATE_TASK
+            and self.relation in {
+                SessionTaskRelation.FOLLOW_UP, SessionTaskRelation.BRANCH
+            }
+            and not self.source_task_id
+        ):
+            raise ValueError("derived CREATE_TASK requires source_task_id")
+
+    @property
+    def action(self) -> SessionInputAction:
+        """Compatibility view for callers using the v1 action names."""
+        return {
+            SessionRouteDisposition.CREATE_TASK: SessionInputAction.NEW_TASK,
+            SessionRouteDisposition.RESUME_TASK: SessionInputAction.RESUME_TASK,
+            SessionRouteDisposition.CLARIFY: SessionInputAction.CLARIFY,
+        }[self.disposition]
+
+    @property
+    def task_id(self) -> str | None:
+        """Compatibility alias for the selected source Task."""
+        return self.source_task_id
 
 
 class FollowUpMode(StrEnum):
@@ -200,8 +290,8 @@ class RuntimeInputRoute:
 class RuntimeInputRouter:
     """Apply only explicit UI choices and protocol-state safety gates.
 
-    Ordinary language is deliberately not interpreted here.  A replaceable
-    RuntimeInputClassifierPort owns semantic understanding.
+    Ordinary language is deliberately not interpreted here. Callers must use
+    an explicit protocol intent or a deterministic mode default.
     """
 
     def route(

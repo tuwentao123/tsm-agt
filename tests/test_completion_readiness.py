@@ -18,6 +18,7 @@ from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     AgentContinuationSuspended, AgentTurnCheckpoint, AgentTurnResult,
     AgentTurnSuspended, ApprovalDecision, ProjectTrustLevel, TaskState,
+    TaskSpecProposal, TaskSpecSnapshot,
 )
 from tsm_agt.ports import (
     CompletionGap, CompletionReadinessAction, CompletionReadinessProbe,
@@ -181,7 +182,10 @@ class PostMutationVerificationModel(EchoModelProvider):
                     "verification-tool", MessageRole.ASSISTANT,
                     (ToolCallBlock(ToolCall(
                         "verify-change", "core.run_command", {
-                            "argv": [sys.executable, "-m", "compileall", "changed.py"],
+                            "argv": [
+                                sys.executable, "-m", "unittest",
+                                "test_changed",
+                            ],
                             "mode": "foreground", "timeout_seconds": 30,
                         },
                     )),),
@@ -212,11 +216,40 @@ async def executing_task(application, root: Path, task_id: str):
 
 
 class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
+    async def _require_command_verification(self, app, task) -> None:
+        current = await app.kernel.get_task_spec(task.task_id)
+        proposal = TaskSpecProposal.from_data({
+            "schema_version": 1, "goal": task.goal,
+            "scope": ["."], "constraints": [],
+            "outcomes": [{
+                "outcome_id": "verification",
+                "description": "Run required behavioral verification",
+                "kind": "COMMAND_RESULT",
+                "required_effects": ["execute"], "required": True,
+            }],
+            "continuation_policy": {"mode": "NONE"},
+        })
+        spec = TaskSpecSnapshot.from_proposal(
+            task.task_id, current.revision + 1, proposal,
+            current.acceptance_criteria,
+        )
+        await app.kernel._append_events(task.task_id, ((
+            "task_spec.revised", {"snapshot": spec.to_data()},
+        ),))
+
     async def test_post_mutation_correction_can_request_approved_verification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target = root / "changed.py"
             target.write_text("value = 1\n", encoding="utf-8")
+            (root / "test_changed.py").write_text(
+                "import unittest\n"
+                "import changed\n\n"
+                "class ChangedTest(unittest.TestCase):\n"
+                "    def test_value(self):\n"
+                "        self.assertEqual(changed.value, 2)\n",
+                encoding="utf-8",
+            )
             workspace_path = PosixWorkspacePath()
             app = compose_fixture_application(
                 model_adapter=PostMutationVerificationModel(),
@@ -234,6 +267,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                     root, ProjectTrustLevel.TRUSTED_BUILD
                 )
                 task = await executing_task(app, root, "ready-verify-e2e")
+                await self._require_command_verification(app, task)
                 await app.kernel.write_workspace_text(
                     task.task_id, "change-file", target.name, "value = 2\n",
                     hashlib.sha256(b"value = 1\n").hexdigest(),
@@ -246,7 +280,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 assert isinstance(suspended, AgentTurnSuspended)
                 completed = await app.kernel.resolve_agent_approval(
                     suspended.approval_request_id, ApprovalDecision.APPROVE,
-                    "approve the exact local compile check",
+                    "approve the exact local unit test",
                 )
                 self.assertIsInstance(completed, AgentTurnResult)
                 assert isinstance(completed, AgentTurnResult)
@@ -257,14 +291,17 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 events = await app.registry.require(RuntimeStorePort).read_events(
                     task.task_id
                 )
-                self.assertEqual(sum(
+                self.assertGreaterEqual(sum(
                     event.event_type == "completion.continuation_requested"
                     for event in events
                 ), 1)
-                self.assertFalse(any(
-                    event.event_type == "completion.blocker_disclosure_requested"
-                    for event in events
-                ))
+                command_results = [
+                    event.payload["result"]
+                    for event in events if event.event_type == "tool.completed"
+                    and event.payload.get("result", {}).get("call_id")
+                    == "verify-change"
+                ]
+                self.assertEqual(command_results[-1]["data"]["exit_code"], 0)
             finally:
                 await app.registry.stop_all()
 
@@ -331,6 +368,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
             await app.registry.start_all()
             try:
                 task = await executing_task(app, root, "ready-mutation")
+                await self._require_command_verification(app, task)
                 await app.kernel.write_workspace_text(
                     task.task_id, "change-file", target.name, "after\n",
                     hashlib.sha256(b"before\n").hexdigest(),
@@ -361,6 +399,53 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("read-only", correction.text)
                 self.assertIn("normal argument validation", correction.text.lower())
                 self.assertIn("core.run_command", correction.text)
+            finally:
+                await app.registry.stop_all()
+
+    async def test_mutation_only_delivery_does_not_invent_command_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "delivery.txt"
+            target.write_text("before\n", encoding="utf-8")
+            app = compose_fixture_application(
+                tool_adapters=(CoreProcessToolProvider(),),
+                completion_readiness_policy_adapter=(
+                    RuleBasedCompletionReadinessPolicy()
+                ),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, root, "mutation-only")
+                current = await app.kernel.get_task_spec(task.task_id)
+                proposal = TaskSpecProposal.from_data({
+                    "schema_version": 1, "goal": task.goal,
+                    "scope": ["delivery.txt"], "constraints": [],
+                    "outcomes": [{
+                        "outcome_id": "delivery",
+                        "description": "Deliver one workspace file",
+                        "kind": "WORKSPACE_DELIVERY",
+                        "required_effects": ["mutate"],
+                        "required": True,
+                    }],
+                    "continuation_policy": {"mode": "NONE"},
+                })
+                spec = TaskSpecSnapshot.from_proposal(
+                    task.task_id, current.revision + 1, proposal,
+                    current.acceptance_criteria,
+                )
+                await app.kernel._append_events(task.task_id, ((
+                    "task_spec.revised", {"snapshot": spec.to_data()},
+                ),))
+                await app.kernel.write_workspace_text(
+                    task.task_id, "write-delivery", target.name, "after\n",
+                    hashlib.sha256(b"before\n").hexdigest(),
+                )
+                gaps = await app.kernel._completion_readiness_gaps(
+                    task.task_id, await app.kernel.list_tools()
+                )
+                self.assertFalse(any(
+                    gap.kind == "POST_MUTATION_VERIFICATION" for gap in gaps
+                ))
             finally:
                 await app.registry.stop_all()
 
@@ -498,10 +583,10 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                     task.task_id
                 )
                 self.assertEqual(sum(
-                    event.event_type == "completion.continuation_requested"
+                    event.event_type == "completion.automatic_resume_started"
                     for event in events
                 ), 1)
-                self.assertEqual(sum(
+                self.assertGreaterEqual(sum(
                     event.event_type == "completion.incomplete_recoverable_requested"
                     for event in events
                 ), 1)

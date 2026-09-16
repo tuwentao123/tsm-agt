@@ -55,6 +55,8 @@ class ToolResultAuthority(StrEnum):
     PROCESS_FACT = "process_fact"
     MUTATION_FACT = "mutation_fact"
     RUNTIME_FACT = "runtime_fact"
+    EXTERNAL_SERVICE = "external_service"
+    DERIVED = "derived"
 
 
 class ToolProtocol(StrEnum):
@@ -80,6 +82,13 @@ class ToolRecoveryKind(StrEnum):
     USER_ACTION_REQUIRED = "user_action_required"
     TERMINAL = "terminal"
     UNKNOWN_OUTCOME = "unknown_outcome"
+
+
+class OutcomeBindingMode(StrEnum):
+    """Runtime-owned meaning of a ToolCall→Outcome relationship."""
+
+    FULFILLMENT = "FULFILLMENT"
+    SUPPORTING = "SUPPORTING"
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +198,8 @@ class ToolSpec:
             ToolResultAuthority.UNSPECIFIED,
             ToolResultAuthority.WORKSPACE_FACT,
             ToolResultAuthority.PROCESS_FACT,
+            ToolResultAuthority.EXTERNAL_SERVICE,
+            ToolResultAuthority.DERIVED,
         }
 
     def to_data(self) -> dict[str, Any]:
@@ -218,6 +229,9 @@ class ToolCall:
     arguments: Mapping[str, Any] = field(default_factory=dict)
     evidence_question: EvidenceQuestion | None = None
     outcome_ref: str | None = None
+    # Runtime-owned and persisted after binding. Provider adapters never accept
+    # this value from model-generated arguments.
+    outcome_binding_mode: OutcomeBindingMode = OutcomeBindingMode.FULFILLMENT
 
     def __post_init__(self) -> None:
         if not self.call_id.strip():
@@ -237,6 +251,8 @@ class ToolCall:
             data["evidence_question"] = self.evidence_question.to_data()
         if self.outcome_ref is not None:
             data["outcome_ref"] = self.outcome_ref
+        if self.outcome_binding_mode is not OutcomeBindingMode.FULFILLMENT:
+            data["outcome_binding_mode"] = self.outcome_binding_mode.value
         return data
 
     @classmethod
@@ -259,6 +275,9 @@ class ToolCall:
                 str(data["outcome_ref"])
                 if data.get("outcome_ref") is not None else None
             ),
+            outcome_binding_mode=OutcomeBindingMode(str(
+                data.get("outcome_binding_mode", "FULFILLMENT")
+            )),
         )
 
 
@@ -448,6 +467,11 @@ class ToolTaskSpecControl(Protocol):
 
     async def select_outcomes(
         self, outcome_ids: tuple[str, ...], reason: str, source_input_id: str,
+    ) -> Mapping[str, Any]: ...
+
+    async def complete_outcome(
+        self, outcome_id: str, completion_summary: str,
+        evidence_refs: tuple[str, ...], remaining_work: tuple[str, ...],
     ) -> Mapping[str, Any]: ...
 
 

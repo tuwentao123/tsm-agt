@@ -13,6 +13,7 @@ from tsm_agt.adapters.builtin import (
     CoreWorkspaceMutationToolProvider, CoreMemoryToolProvider,
     CodeIntelligenceToolProvider, CoreInteractionToolProvider,
     CoreWorkingMemoryToolProvider, CoreTaskSpecToolProvider,
+    NetworkToolProvider,
 )
 from tsm_agt.adapters.text_code_intelligence import TextCodeIntelligenceProvider
 from tsm_agt.adapters.structured_evidence import StructuredEvidenceDeltaEvaluator
@@ -62,8 +63,6 @@ from tsm_agt.adapters.resilient_model import ResilientModelProvider
 from tsm_agt.adapters.rule_based_model_recovery import (
     RuleBasedModelRecoveryPolicy,
 )
-from tsm_agt.adapters.model_session_input import ModelSessionInputResolver
-from tsm_agt.adapters.model_runtime_input import ModelRuntimeInputClassifier
 from tsm_agt.adapters.model_task_spec_planner import ModelTaskSpecPlanner
 from tsm_agt.adapters.local_process import LocalProcessExecutor
 from tsm_agt.adapters.local_flow_export import (
@@ -725,14 +724,6 @@ def compose_openai_compatible_readonly_application(
         )
     )
     registry.register(
-        SessionInputResolverPort,
-        ModelSessionInputResolver(registry.require(ModelProviderPort)),
-    )
-    registry.register(
-        RuntimeInputClassifierPort,
-        ModelRuntimeInputClassifier(registry.require(ModelProviderPort)),
-    )
-    registry.register(
         TaskSpecPlannerPort,
         ModelTaskSpecPlanner(registry.require(ModelProviderPort)),
     )
@@ -799,6 +790,7 @@ def compose_openai_compatible_readonly_application(
         / "memory.db"
     ))
     registry.register(ToolProviderPort, CoreReadOnlyToolProvider())
+    registry.register(ToolProviderPort, NetworkToolProvider())
     registry.register(ToolProviderPort, CoreMemoryToolProvider())
     registry.register(ToolProviderPort, CoreWorkingMemoryToolProvider())
     registry.register(ToolProviderPort, CoreTaskSpecToolProvider())
@@ -867,14 +859,6 @@ def compose_openai_compatible_engineering_application(
         )
     )
     registry.register(
-        SessionInputResolverPort,
-        ModelSessionInputResolver(registry.require(ModelProviderPort)),
-    )
-    registry.register(
-        RuntimeInputClassifierPort,
-        ModelRuntimeInputClassifier(registry.require(ModelProviderPort)),
-    )
-    registry.register(
         TaskSpecPlannerPort,
         ModelTaskSpecPlanner(registry.require(ModelProviderPort)),
     )
@@ -939,6 +923,7 @@ def compose_openai_compatible_engineering_application(
         / "memory.db"
     ))
     registry.register(ToolProviderPort, CoreReadOnlyToolProvider())
+    registry.register(ToolProviderPort, NetworkToolProvider())
     registry.register(ToolProviderPort, CoreProcessToolProvider())
     registry.register(ToolProviderPort, CoreWorkspaceMutationToolProvider())
     registry.register(ToolProviderPort, CoreMemoryToolProvider())

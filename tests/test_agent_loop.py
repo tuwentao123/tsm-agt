@@ -17,6 +17,7 @@ from tsm_agt.core import (
     ApprovalNotPending,
     ModelInvocationFailed,
     ProviderCapabilityMismatch,
+    RuntimeInputIntent,
     TaskState,
     ToolCommitState,
 )
@@ -383,7 +384,6 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
         provider = RiskyToolProvider()
         application = compose_fixture_application(
             model_adapter=model, tool_adapters=(provider,),
-            runtime_input_classifier_adapter=ApprovalSteeringClassifier(),
         )
         await application.registry.start_all()
         temp_dir = tempfile.TemporaryDirectory()
@@ -407,7 +407,8 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(provider.invocation_count, 0)
 
             route = await application.kernel.route_runtime_input(
-                task.task_id, "change the remaining direction", "new-direction"
+                task.task_id, "change the remaining direction", "new-direction",
+                explicit_intent=RuntimeInputIntent.REPLACE,
             )
             self.assertTrue(route.applied)
             current = await application.kernel.get_task(task.task_id)
@@ -764,6 +765,17 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsInstance(completed, AgentTurnResult)
             from tsm_agt.core import TaskOutcomeStatus
+            outcome = (
+                await second.kernel.get_task_spec(task.task_id)
+            ).outcomes[0]
+            self.assertEqual(outcome.status, TaskOutcomeStatus.IN_PROGRESS)
+            completion = await second.kernel.request_task_outcome_completion(
+                task.task_id, outcome.outcome_id,
+                completion_summary="Approved mutation action completed",
+                evidence_refs=outcome.fulfillment_refs, remaining_work=(),
+                writer="approval-restart-test",
+            )
+            self.assertTrue(completion["accepted"], completion)
             outcome = (
                 await second.kernel.get_task_spec(task.task_id)
             ).outcomes[0]

@@ -110,15 +110,18 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                         task.task_id, state, state.value
                     )
                 first = await client.route_input(
-                    task.task_id, "记得兼容 Windows",
-                    command_id="sdk-input-1", intent="steer",
+                    task.task_id, "arbitrary payload 42",
+                    command_id="sdk-input-1",
                 )
                 replay = await client.route_input(
-                    task.task_id, "记得兼容 Windows",
-                    command_id="sdk-input-1", intent="steer",
+                    task.task_id, "arbitrary payload 42",
+                    command_id="sdk-input-1",
                 )
                 self.assertEqual(first.result["intent"], "STEER")
                 self.assertTrue(first.result["applied"])
+                self.assertEqual(
+                    first.result["reason_code"], "follow_up_mode_default"
+                )
                 self.assertTrue(replay.replayed)
 
     async def test_background_failure_converges_task_instead_of_hanging(self) -> None:

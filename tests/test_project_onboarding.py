@@ -45,8 +45,8 @@ class ProjectOnboardingTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(("language", "JavaScript/TypeScript"), values)
                 self.assertIn(("build_system", "Node.js"), values)
                 self.assertIn(("entry_candidate", "src/index.ts"), values)
-                self.assertIn(("candidate_command", "npm run build"), values)
-                self.assertIn(("candidate_command", "npm run test"), values)
+                self.assertIn(("observed_command", "npm run build"), values)
+                self.assertIn(("observed_command", "npm run test"), values)
                 self.assertFalse(snapshot.trusted_rules_read)
                 self.assertNotIn(("trusted_rule_file", "AGENTS.md"), values)
                 self.assertNotIn("never-read", str(snapshot.to_data()))
@@ -57,6 +57,53 @@ class ProjectOnboardingTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIn("onboarding.completed", [event.event_type for event in events])
                 self.assertFalse(any(event.event_type.startswith("process.") for event in events))
+            finally:
+                await application.registry.stop_all()
+
+    async def test_local_runtime_is_observed_without_recommending_a_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text("VALUE = 1\n")
+            (root / "pyproject.toml").write_text(
+                "[project]\nname='fixture'\nversion='0.1.0'\n",
+                encoding="utf-8",
+            )
+            runtime = root / ".venv" / "bin"
+            runtime.mkdir(parents=True)
+            python = runtime / "python"
+            python.write_text("#!/bin/sh\nexit 0\n")
+            python.chmod(0o755)
+            (root / ".venv" / "pyvenv.cfg").write_text(
+                "version = 9.9.9\nhome = /fixture/runtime\n",
+                encoding="utf-8",
+            )
+            application = compose_fixture_application(tool_adapters=())
+            await application.registry.start_all()
+            try:
+                task = await application.kernel.create_task("inspect", root)
+                task = await application.kernel.transition_task(
+                    task.task_id, TaskState.INTAKE, "intake"
+                )
+                task = await application.kernel.transition_task(
+                    task.task_id, TaskState.RESOLVING_PROJECT, "resolve"
+                )
+                facts = task.onboarding_snapshots[-1].facts
+                executable = next(
+                    fact for fact in facts
+                    if fact.category == "observed_local_executable"
+                )
+                import json
+                self.assertEqual(json.loads(executable.value), {
+                    "executable": True, "path": ".venv/bin/python",
+                    "metadata": {
+                        "home": "/fixture/runtime",
+                        "version": "9.9.9",
+                    },
+                })
+                self.assertFalse(any(
+                    fact.category == "observed_command" for fact in facts
+                ))
             finally:
                 await application.registry.stop_all()
 

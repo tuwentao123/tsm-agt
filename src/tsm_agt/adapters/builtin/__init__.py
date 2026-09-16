@@ -8,6 +8,7 @@ from .code_intelligence_tools import CodeIntelligenceToolProvider
 from .interaction_tools import CoreInteractionToolProvider
 from .working_memory_tools import CoreWorkingMemoryToolProvider
 from .task_spec_tools import CoreTaskSpecToolProvider
+from .network_tools import NetworkToolProvider
 
 __all__ = [
     "CoreProcessToolProvider", "CoreReadOnlyToolProvider",
@@ -17,4 +18,5 @@ __all__ = [
     "CoreInteractionToolProvider",
     "CoreWorkingMemoryToolProvider",
     "CoreTaskSpecToolProvider",
+    "NetworkToolProvider",
 ]

@@ -92,7 +92,7 @@ class RuntimeInputRouterTest(unittest.TestCase):
 
 
 class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
-    async def test_optional_classifier_can_replace_ambiguous_semantics(self):
+    async def test_optional_classifier_cannot_change_ambiguous_input(self):
         with tempfile.TemporaryDirectory() as directory:
             app = compose_fixture_application(
                 model_adapter=EchoModelProvider(), tool_adapters=(),
@@ -102,11 +102,11 @@ class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
             try:
                 task = await executing_task(app, Path(directory))
                 route = await app.kernel.route_runtime_input(
-                    task.task_id, "这个方向不太对", "classified-input"
+                    task.task_id, "arbitrary payload 42", "classified-input"
                 )
-                self.assertEqual(route.intent, RuntimeInputIntent.REPLACE)
-                self.assertTrue(route.applied)
-                self.assertTrue(route.router_version.startswith("classifier:"))
+                self.assertEqual(route.intent, RuntimeInputIntent.AMBIGUOUS)
+                self.assertFalse(route.applied)
+                self.assertTrue(route.requires_confirmation)
             finally:
                 await app.registry.stop_all()
 
@@ -115,14 +115,15 @@ class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             app = compose_fixture_application(
                 model_adapter=EchoModelProvider(), tool_adapters=(),
-                runtime_input_classifier_adapter=FixtureClassifier("STEER"),
+                runtime_input_classifier_adapter=FixtureClassifier("REPLACE"),
             )
             await app.registry.start_all()
             try:
                 task = await executing_task(app, root)
                 secret_text = "另外不要修改公共 API secret-marker"
                 route = await app.kernel.route_runtime_input(
-                    task.task_id, secret_text, "input-1"
+                    task.task_id, secret_text, "input-1",
+                    fallback_intent=RuntimeInputIntent.STEER,
                 )
                 self.assertEqual(route.intent, RuntimeInputIntent.STEER)
                 self.assertTrue(route.applied)
@@ -138,7 +139,8 @@ class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
                 steering = await app.kernel.get_steering(task.task_id)
                 self.assertEqual(steering.pending[0].text, secret_text)
                 replay = await app.kernel.route_runtime_input(
-                    task.task_id, secret_text, "input-1"
+                    task.task_id, secret_text, "input-1",
+                    fallback_intent=RuntimeInputIntent.STEER,
                 )
                 self.assertEqual(replay, route)
                 self.assertEqual(len((await app.kernel.get_steering(
@@ -147,7 +149,7 @@ class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
-    async def test_classifier_receives_current_goal_and_state(self):
+    async def test_fallback_intent_bypasses_classifier(self):
         with tempfile.TemporaryDirectory() as directory:
             classifier = FixtureClassifier("STATUS_QUERY")
             app = compose_fixture_application(
@@ -158,11 +160,11 @@ class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
             try:
                 task = await executing_task(app, Path(directory))
                 route = await app.kernel.route_runtime_input(
-                    task.task_id, "how is it going", "status-input"
+                    task.task_id, "arbitrary payload 42", "status-input",
+                    fallback_intent=RuntimeInputIntent.STEER,
                 )
-                self.assertEqual(route.intent, RuntimeInputIntent.STATUS_QUERY)
-                self.assertEqual(classifier.contexts[0]["current_goal"], "original goal")
-                self.assertEqual(classifier.contexts[0]["task_state"], "EXECUTING")
+                self.assertEqual(route.intent, RuntimeInputIntent.STEER)
+                self.assertEqual(classifier.contexts, [])
             finally:
                 await app.registry.stop_all()
 

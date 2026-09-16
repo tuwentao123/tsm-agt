@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
-from tsm_agt.ports import RuntimeEvent, ToolEffect
+from tsm_agt.ports import OutcomeBindingMode, RuntimeEvent, ToolEffect
 
 from .configuration import canonical_hash
 
@@ -63,6 +63,7 @@ class TaskOutcomeStatus(StrEnum):
 
     PENDING = "PENDING"
     IN_PROGRESS = "IN_PROGRESS"
+    COMPLETION_REQUESTED = "COMPLETION_REQUESTED"
     DELIVERED = "DELIVERED"
     ALREADY_SATISFIED = "ALREADY_SATISFIED"
     WAITING_USER = "WAITING_USER"
@@ -87,6 +88,10 @@ class TaskOutcomeCompletionPolicy(StrEnum):
     """
 
     EXPLICIT_ACCEPTANCE = "EXPLICIT_ACCEPTANCE"
+    ATOMIC_ACTION = "ATOMIC_ACTION"
+    # Legacy value.  It is still readable for old event streams, but Runtime
+    # now treats it as explicit completion instead of closing an Outcome merely
+    # because every broad ToolEffect appeared once.
     REQUIRED_EFFECTS = "REQUIRED_EFFECTS"
 
 
@@ -101,6 +106,7 @@ class OutcomeBindingAction(StrEnum):
 
 class OutcomeBindingReason(StrEnum):
     NONE = "NONE"
+    UNIQUE_COMPATIBLE_OPEN_OUTCOME = "UNIQUE_COMPATIBLE_OPEN_OUTCOME"
     OUTCOME_NOT_FOUND = "OUTCOME_NOT_FOUND"
     OUTCOME_ALREADY_CLOSED = "OUTCOME_ALREADY_CLOSED"
     OUTCOME_NOT_SELECTED = "OUTCOME_NOT_SELECTED"
@@ -129,6 +135,7 @@ class TaskOutcomeProposal:
     completion_policy: TaskOutcomeCompletionPolicy = (
         TaskOutcomeCompletionPolicy.EXPLICIT_ACCEPTANCE
     )
+    atomic_action: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.outcome_id.strip() or not self.description.strip():
@@ -155,6 +162,21 @@ class TaskOutcomeProposal:
             raise ValueError("Task outcome dependencies must name other outcomes")
         if len(set(self.depends_on)) != len(self.depends_on):
             raise ValueError("Task outcome dependencies must be unique")
+        if self.completion_policy is TaskOutcomeCompletionPolicy.ATOMIC_ACTION:
+            if not isinstance(self.atomic_action, Mapping):
+                raise ValueError("atomic action completion requires a contract")
+            if set(self.atomic_action) != {"tool_name", "arguments"}:
+                raise ValueError(
+                    "atomic action contract requires only tool_name and arguments"
+                )
+            if not str(self.atomic_action.get("tool_name", "")).strip():
+                raise ValueError("atomic action tool_name is required")
+            if not isinstance(self.atomic_action.get("arguments"), Mapping):
+                raise ValueError("atomic action arguments must be an object")
+        elif self.atomic_action is not None:
+            raise ValueError(
+                "atomic_action is only valid with ATOMIC_ACTION completion"
+            )
 
     def to_data(self) -> dict[str, Any]:
         data = {
@@ -170,6 +192,11 @@ class TaskOutcomeProposal:
             data["depends_on"] = list(self.depends_on)
         if self.completion_policy is not TaskOutcomeCompletionPolicy.EXPLICIT_ACCEPTANCE:
             data["completion_policy"] = self.completion_policy.value
+        if self.atomic_action is not None:
+            data["atomic_action"] = {
+                "tool_name": str(self.atomic_action["tool_name"]),
+                "arguments": dict(self.atomic_action["arguments"]),
+            }
         return data
 
     @classmethod
@@ -177,6 +204,7 @@ class TaskOutcomeProposal:
         _reject_unknown_fields(data, {
             "outcome_id", "description", "kind", "required_effects", "required",
             "depends_on", "completion_policy",
+            "atomic_action",
         }, "Task outcome proposal")
         raw_effects = data.get("required_effects")
         if not isinstance(raw_effects, list):
@@ -196,6 +224,8 @@ class TaskOutcomeProposal:
             TaskOutcomeCompletionPolicy(str(
                 data.get("completion_policy", "EXPLICIT_ACCEPTANCE")
             )),
+            (dict(data["atomic_action"])
+             if isinstance(data.get("atomic_action"), Mapping) else None),
         )
 
 
@@ -279,12 +309,13 @@ class TaskOutcomeSnapshot:
     completion_policy: TaskOutcomeCompletionPolicy = (
         TaskOutcomeCompletionPolicy.EXPLICIT_ACCEPTANCE
     )
+    atomic_action: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         TaskOutcomeProposal(
             self.outcome_id, self.description, self.kind,
             self.required_effects, self.required,
-            self.depends_on, self.completion_policy,
+            self.depends_on, self.completion_policy, self.atomic_action,
         )
         if any(not value.strip() for value in self.fulfillment_refs):
             raise ValueError("Task outcome fulfillment references must not be empty")
@@ -297,6 +328,7 @@ class TaskOutcomeSnapshot:
             proposal.outcome_id, proposal.description, proposal.kind,
             proposal.required_effects, TaskOutcomeStatus.PENDING,
             proposal.required, (), proposal.depends_on, proposal.completion_policy,
+            proposal.atomic_action,
         )
 
     def to_data(self) -> dict[str, Any]:
@@ -304,7 +336,7 @@ class TaskOutcomeSnapshot:
             **TaskOutcomeProposal(
                 self.outcome_id, self.description, self.kind,
                 self.required_effects, self.required,
-                self.depends_on, self.completion_policy,
+                self.depends_on, self.completion_policy, self.atomic_action,
             ).to_data(),
             "status": self.status.value,
             "fulfillment_refs": list(self.fulfillment_refs),
@@ -315,11 +347,13 @@ class TaskOutcomeSnapshot:
         _reject_unknown_fields(data, {
             "outcome_id", "description", "kind", "required_effects", "required",
             "status", "fulfillment_refs", "depends_on", "completion_policy",
+            "atomic_action",
         }, "Task outcome snapshot")
         proposal = TaskOutcomeProposal.from_data({
             key: data[key] for key in (
                 "outcome_id", "description", "kind", "required_effects", "required",
                 "depends_on", "completion_policy",
+                "atomic_action",
             ) if key in data
         })
         raw_refs = data.get("fulfillment_refs", [])
@@ -330,7 +364,7 @@ class TaskOutcomeSnapshot:
             proposal.required_effects,
             TaskOutcomeStatus(str(data.get("status", "PENDING"))),
             proposal.required, tuple(str(item) for item in raw_refs),
-            proposal.depends_on, proposal.completion_policy,
+            proposal.depends_on, proposal.completion_policy, proposal.atomic_action,
         )
 
 
@@ -385,6 +419,7 @@ class OutcomeBindingDecision:
     selected_outcome_ids: tuple[str, ...] = ()
     eligible_outcome_ids: tuple[str, ...] = ()
     compatible_outcome_ids: tuple[str, ...] = ()
+    binding_mode: OutcomeBindingMode = OutcomeBindingMode.FULFILLMENT
 
     def to_data(self) -> dict[str, Any]:
         return {
@@ -394,6 +429,7 @@ class OutcomeBindingDecision:
             "selected_outcome_ids": list(self.selected_outcome_ids),
             "eligible_outcome_ids": list(self.eligible_outcome_ids),
             "compatible_outcome_ids": list(self.compatible_outcome_ids),
+            "binding_mode": self.binding_mode.value,
         }
 
 
@@ -402,16 +438,46 @@ class TaskOutcomeEligibilityCalculator:
 
     @staticmethod
     def eligible(spec: TaskSpecSnapshot) -> tuple[TaskOutcomeSnapshot, ...]:
-        statuses = {item.outcome_id: item.status for item in spec.outcomes}
+        outcomes = {item.outcome_id: item for item in spec.outcomes}
         return tuple(
             outcome for outcome in spec.outcomes
             if not outcome.status.is_closed
             and outcome.status is not TaskOutcomeStatus.BLOCKED
             and all(
-                dependency in statuses and statuses[dependency].is_closed
+                dependency in outcomes
+                and TaskOutcomeEligibilityCalculator.dependency_ready(
+                    outcomes[dependency]
+                )
                 for dependency in outcome.depends_on
             )
         )
+
+    @staticmethod
+    def dependency_ready(outcome: TaskOutcomeSnapshot) -> bool:
+        """Return whether downstream work may safely start.
+
+        Final acceptance and execution ordering are deliberately different. A
+        workspace delivery may remain IN_PROGRESS until post-mutation
+        verification succeeds, while that very verification is its downstream
+        Outcome. Once every declared effect has a committed fulfillment edge,
+        the dependency has produced the inputs needed by its consumer even
+        though Runtime has not yet accepted it as finally delivered. Outcomes
+        without declared effects still require an explicit closed state.
+        """
+        if outcome.status.is_closed:
+            return True
+        if outcome.status is TaskOutcomeStatus.BLOCKED:
+            return False
+        required = set(outcome.required_effects)
+        if not required:
+            return False
+        fulfilled = {
+            ToolEffect(suffix)
+            for reference in outcome.fulfillment_refs
+            if (suffix := reference.rsplit(":", 1)[-1])
+            in {effect.value for effect in ToolEffect}
+        }
+        return required.issubset(fulfilled)
 
 
 def _reject_unknown_fields(
@@ -453,7 +519,17 @@ TASK_SPEC_PROPOSAL_SCHEMA_V1: Mapping[str, Any] = {
                         "type": "string",
                         "enum": [
                             item.value for item in TaskOutcomeCompletionPolicy
+                            if item is not TaskOutcomeCompletionPolicy.REQUIRED_EFFECTS
                         ],
+                    },
+                    "atomic_action": {
+                        "type": "object",
+                        "properties": {
+                            "tool_name": {"type": "string", "minLength": 1},
+                            "arguments": {"type": "object"},
+                        },
+                        "required": ["tool_name", "arguments"],
+                        "additionalProperties": False,
                     },
                 },
                 "required": [

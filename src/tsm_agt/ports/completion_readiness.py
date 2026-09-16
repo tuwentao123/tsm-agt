@@ -75,11 +75,15 @@ class CompletionReadinessState:
 
     continue_attempts: int = 0
     disclosure_attempts: int = 0
+    automatic_resume_attempts: int = 0
     last_action: str = ""
     schema_version: int = 1
 
     def __post_init__(self) -> None:
-        if self.continue_attempts < 0 or self.disclosure_attempts < 0:
+        if min(
+            self.continue_attempts, self.disclosure_attempts,
+            self.automatic_resume_attempts,
+        ) < 0:
             raise ValueError("completion readiness counters must not be negative")
         if self.schema_version != 1:
             raise ValueError("unsupported completion readiness schema version")
@@ -93,6 +97,7 @@ class CompletionReadinessState:
         return cls(
             int(data.get("continue_attempts", 0)),
             int(data.get("disclosure_attempts", 0)),
+            int(data.get("automatic_resume_attempts", 0)),
             str(data.get("last_action", "")),
             int(data.get("schema_version", 1)),
         )
@@ -101,6 +106,7 @@ class CompletionReadinessState:
         return {
             "continue_attempts": self.continue_attempts,
             "disclosure_attempts": self.disclosure_attempts,
+            "automatic_resume_attempts": self.automatic_resume_attempts,
             "last_action": self.last_action,
             "schema_version": self.schema_version,
         }

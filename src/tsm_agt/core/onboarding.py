@@ -34,6 +34,11 @@ _SENSITIVE_NAMES = frozenset({
 })
 _MAX_FILES = 5000
 _MAX_SOURCE_BYTES = 2_000_000
+_LOCAL_EXECUTABLE_PROBES = (
+    ".venv/bin/python", "venv/bin/python",
+    ".venv/Scripts/python.exe", "venv/Scripts/python.exe",
+    "gradlew", "gradlew.bat", "mvnw", "mvnw.cmd",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,8 +295,26 @@ class ProjectOnboardingScanner:
             if truncated:
                 break
         ordered = tuple(sorted(files))
+        # Workspace-local runtime entry points are intentionally excluded from
+        # source traversal, but their identity must invalidate a cached factual
+        # snapshot. Never hash or enumerate the environment behind the entry.
+        runtime_entries = []
+        for relative in _LOCAL_EXECUTABLE_PROBES:
+            candidate = root / relative
+            if not candidate.exists():
+                continue
+            try:
+                stat = candidate.stat()
+            except OSError:
+                continue
+            runtime_entries.append({
+                "path": relative, "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "executable": os.access(candidate, os.X_OK),
+            })
         fingerprint = canonical_hash({
             "files": [sources[path].to_data() for path in ordered],
+            "local_runtime_entries": runtime_entries,
             "truncated": truncated,
         })
         return OnboardingInventory(ordered, sources, fingerprint, truncated)
@@ -305,7 +328,11 @@ class ProjectOnboardingScanner:
         if phase == "boundary_and_entry_discovery":
             return self._boundaries_and_entries(inventory), None
         if phase == "command_discovery":
-            return self._commands(workspace, inventory), None
+            return (
+                self._commands(workspace, inventory)
+                + self.local_executables(workspace),
+                None,
+            )
         if phase == "trusted_rule_discovery":
             trusted = trust is not ProjectTrustLevel.UNTRUSTED
             return self._rules(inventory, trusted), trusted
@@ -412,9 +439,56 @@ class ProjectOnboardingScanner:
             except (OSError, UnicodeError, json.JSONDecodeError, tomllib.TOMLDecodeError):
                 continue
         return tuple(
-            self._fact("candidate_command", command, (source,))
+            self._fact("observed_command", command, (source,))
             for command, source in sorted(commands.items())
         )
+
+    def local_executables(
+        self, workspace: Path,
+    ) -> tuple[OnboardingFact, ...]:
+        """Observe bounded local entry points; never execute or select one."""
+        root = self._paths.normalize_workspace(workspace)
+        facts: list[OnboardingFact] = []
+        for relative in _LOCAL_EXECUTABLE_PROBES:
+            candidate = root / relative
+            if not candidate.exists():
+                continue
+            try:
+                resolved = candidate.resolve(strict=True)
+                if not resolved.is_file():
+                    continue
+                stat = resolved.stat()
+            except OSError:
+                continue
+            source = OnboardingSource(relative, canonical_hash({
+                "path": relative, "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "executable": os.access(resolved, os.X_OK),
+            }))
+            metadata: dict[str, str] = {}
+            if relative.endswith(("bin/python", "Scripts/python.exe")):
+                config = candidate.parents[1] / "pyvenv.cfg"
+                if config.is_file() and not self._paths.is_link_like(config):
+                    try:
+                        for line in config.read_text(
+                            encoding="utf-8", errors="replace"
+                        ).splitlines():
+                            key, separator, raw = line.partition("=")
+                            if separator and key.strip() in {
+                                "version", "version_info", "home",
+                            }:
+                                metadata[key.strip()] = raw.strip()[:500]
+                    except OSError:
+                        pass
+            value = json.dumps({
+                "path": relative,
+                "executable": os.access(resolved, os.X_OK),
+                "metadata": metadata,
+            }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            facts.append(self._fact(
+                "observed_local_executable", value, (source,)
+            ))
+        return tuple(facts)
 
     def _rules(
         self, inventory: OnboardingInventory, trusted: bool,

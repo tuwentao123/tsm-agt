@@ -77,6 +77,7 @@ class RuleBasedCompletionReadinessPolicy:
         if can_continue:
             next_state = CompletionReadinessState(
                 state.continue_attempts + 1, state.disclosure_attempts,
+                state.automatic_resume_attempts,
                 CompletionReadinessAction.CONTINUE.value,
             )
             return CompletionReadinessDecision(
@@ -89,6 +90,7 @@ class RuleBasedCompletionReadinessPolicy:
         ):
             next_state = CompletionReadinessState(
                 state.continue_attempts, state.disclosure_attempts + 1,
+                state.automatic_resume_attempts,
                 CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE.value,
             )
             return CompletionReadinessDecision(
@@ -98,7 +100,7 @@ class RuleBasedCompletionReadinessPolicy:
             )
         if probe.remaining_model_calls > 0 and state.disclosure_attempts == 0:
             next_state = CompletionReadinessState(
-                state.continue_attempts, 1,
+                state.continue_attempts, 1, state.automatic_resume_attempts,
                 CompletionReadinessAction.REPORT_BLOCKED.value,
             )
             return CompletionReadinessDecision(
@@ -114,5 +116,6 @@ class RuleBasedCompletionReadinessPolicy:
     @staticmethod
     def _decision(action, reason, state, probe):
         return CompletionReadinessDecision(action, reason, CompletionReadinessState(
-            state.continue_attempts, state.disclosure_attempts, action.value
+            state.continue_attempts, state.disclosure_attempts,
+            state.automatic_resume_attempts, action.value
         ), tuple(gap for gap in probe.gaps if gap.required))
