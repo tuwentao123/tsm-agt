@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -15,11 +16,14 @@ from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     AcceptanceStatus, AgentContinuationSuspended, SessionContinuationMode,
-    AgentClarificationSuspended, AgentTurnSuspended, ApprovalDecision,
+    AgentClarificationSuspended, AgentTurnResult, AgentTurnSuspended,
+    ApprovalDecision,
     ApprovalRequired,
     InvalidToolArguments,
+    Kernel, ModelInvocationFailed,
     ProjectTrustLevel, TaskAcceptanceCriterion, TaskCriterionKind,
-    TaskOutcomeEligibilityCalculator, TaskOutcomeStatus, TaskSpecProposal,
+    TaskOutcomeEligibilityCalculator, TaskOutcomeKind, TaskOutcomeSnapshot,
+    TaskOutcomeStatus, TaskSpecProposal,
     TaskSpecSnapshot, TaskState, ToolBatchSnapshot, ToolBatchStatus,
 )
 from tsm_agt.ports import (
@@ -291,6 +295,130 @@ class ExplicitCompletionModel(EchoModelProvider):
         return ModelResponse(Message(
             "explicit-final", MessageRole.ASSISTANT,
             (TextBlock("Inspection completed and accepted."),),
+        ), FinishReason.STOP, ModelUsage(1, 1))
+
+
+class AdvertisedToolRecorder(EchoModelProvider):
+    """Record every request so a test can audit the advertised protocol."""
+
+    def __init__(self, inner: EchoModelProvider) -> None:
+        super().__init__()
+        self.capabilities = inner.capabilities
+        self._inner = inner
+        self.requests: list[ModelRequest] = []
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        self.requests.append(request)
+        return await self._inner.complete(request)
+
+    def advertised_tool_names(self, index: int) -> set[str]:
+        return {tool.name for tool in self.requests[index].tools}
+
+    def unadvertised_history(self) -> list[tuple[int, list[str]]]:
+        """Report every history tool call the same request failed to offer."""
+        reported: list[tuple[int, list[str]]] = []
+        for index, request in enumerate(self.requests, start=1):
+            referenced = {
+                block.call.name
+                for message in request.messages
+                for block in message.content
+                if isinstance(block, ToolCallBlock)
+            }
+            missing = sorted(
+                referenced - {tool.name for tool in request.tools}
+            )
+            if missing:
+                reported.append((index, missing))
+        return reported
+
+
+class FocusSelectionModel(EchoModelProvider):
+    """Take every eligible Outcome into focus, then answer."""
+
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        results = [
+            block.result for message in request.messages
+            for block in message.content if isinstance(block, ToolResultBlock)
+        ]
+        if not results:
+            return ModelResponse(Message(
+                "select-all", MessageRole.ASSISTANT,
+                (ToolCallBlock(ToolCall(
+                    "select-all", "core.task_outcome_select", {
+                        "outcome_ids": ["inspect-a", "inspect-b"],
+                        "reason": "The user requires both units",
+                    },
+                )),),
+            ), FinishReason.TOOL_CALL, ModelUsage(1, 1))
+        return ModelResponse(Message(
+            "select-final", MessageRole.ASSISTANT,
+            (TextBlock("Both units are now in focus."),),
+        ), FinishReason.STOP, ModelUsage(1, 1))
+
+
+class AmbiguousObservationModel(EchoModelProvider):
+    """Two ANSWER outcomes both want `observe`, so a bare read is ambiguous.
+
+    Reproduces the shape of the real turn where the first observation fulfils
+    ``route_issue_analysis``'s declared effect, which makes its dependent
+    ``route_fix_recommendation`` eligible too. Every later read is then
+    compatible with two already-selected outcomes.
+
+    ``outcome_ref_from_call`` is the model call from which the reply names one
+    of the two candidates instead of leaving ``outcome_ref`` empty; ``None``
+    means it never does. Counting calls lets a test express "ignores the first
+    correction, complies after the turn is interrupted and resumed".
+    """
+
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
+
+    def __init__(self, outcome_ref_from_call: int | None = None) -> None:
+        super().__init__()
+        self.outcome_ref_from_call = outcome_ref_from_call
+        self.calls = 0
+        self.corrections: list[str] = []
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        self.calls += 1
+        for message in request.messages:
+            if "Name exactly one of them" in message.text:
+                self.corrections.append(message.text)
+        results = [
+            block.result for message in request.messages
+            for block in message.content if isinstance(block, ToolResultBlock)
+        ]
+
+        def call(call_id, name, arguments, outcome_ref=None):
+            return ModelResponse(Message(
+                call_id, MessageRole.ASSISTANT,
+                (ToolCallBlock(ToolCall(
+                    call_id, name, arguments, outcome_ref=outcome_ref,
+                )),),
+            ), FinishReason.TOOL_CALL, ModelUsage(1, 1))
+
+        if not results:
+            return call(
+                "bound-read", "core.find_files",
+                {"path": ".", "pattern": "**/*route*.py"},
+                outcome_ref="route_issue_analysis",
+            )
+        if len(results) == 1:
+            names_one = (
+                self.outcome_ref_from_call is not None
+                and self.calls >= self.outcome_ref_from_call
+            )
+            return call(
+                f"read-{self.calls}", "core.search_text",
+                {"path": "src", "query": "route"},
+                outcome_ref=(
+                    "route_fix_recommendation" if names_one else None
+                ),
+            )
+        return ModelResponse(Message(
+            "ambiguous-final", MessageRole.ASSISTANT,
+            (TextBlock("Analysis and recommendation delivered."),),
         ), FinishReason.STOP, ModelUsage(1, 1))
 
 
@@ -1446,6 +1574,437 @@ class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
+    async def test_completed_outcome_does_not_withdraw_the_tool_it_used(self):
+        """A turn must never advertise less than its own history references.
+
+        Closing the last explicitly completable Outcome retires
+        ``core.task_outcome_complete`` from the advertised protocol, but the
+        transcript still carries the assistant call that closed it. Advertising
+        a function in history that the same request does not offer is a
+        transport-level protocol violation, so withdrawal cannot be retroactive.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            model = AdvertisedToolRecorder(ExplicitCompletionModel())
+            app = compose_fixture_application(
+                model_adapter=model,
+                tool_adapters=(
+                    CoreReadOnlyToolProvider(), CoreTaskSpecToolProvider(),
+                ),
+            )
+            await app.registry.start_all()
+            try:
+                task = await app.kernel.create_task(
+                    "inspect workspace", Path(directory)
+                )
+                current = await app.kernel.get_task_spec(task.task_id)
+                data = proposal(task.goal)
+                data["outcomes"][0].update({
+                    "outcome_id": "inspection",
+                    "kind": "COMMAND_RESULT",
+                    "description": "Complete workspace inspection",
+                })
+                spec = TaskSpecSnapshot.from_proposal(
+                    task.task_id, 2, TaskSpecProposal.from_data(data),
+                    current.acceptance_criteria,
+                )
+                await app.kernel._append_events(task.task_id, ((
+                    "task_spec.revised", {"snapshot": spec.to_data()},
+                ),))
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    task = await app.kernel.transition_task(
+                        task.task_id, state, state.value
+                    )
+                await app.kernel.run_agent_turn(task.task_id, task.goal)
+            finally:
+                await app.registry.stop_all()
+
+            self.assertEqual(len(model.requests), 3)
+            # The closing call is advertised while it is still reachable.
+            self.assertIn(
+                "core.task_outcome_complete",
+                model.advertised_tool_names(1),
+            )
+            outcome = (await app.kernel.get_task_spec(task.task_id)).outcomes[0]
+            self.assertEqual(outcome.status, TaskOutcomeStatus.DELIVERED)
+            self.assertEqual(model.unadvertised_history(), [])
+
+    async def test_completed_focus_selection_does_not_withdraw_its_tool(self):
+        """The symmetric narrowing of ``core.task_outcome_select`` is safe too."""
+        with tempfile.TemporaryDirectory() as directory:
+            model = AdvertisedToolRecorder(FocusSelectionModel())
+            app = compose_fixture_application(
+                model_adapter=model,
+                tool_adapters=(
+                    CoreReadOnlyToolProvider(), CoreTaskSpecToolProvider(),
+                ),
+            )
+            await app.registry.start_all()
+            try:
+                task = await app.kernel.create_task(
+                    "inspect workspace twice", Path(directory)
+                )
+                current = await app.kernel.get_task_spec(task.task_id)
+                data = proposal(task.goal, outcome_ids=("inspect-a", "inspect-b"))
+                # Initial focus already holds every required Outcome; only an
+                # optional one leaves a selection transition to advertise.
+                data["outcomes"][1]["required"] = False
+                spec = TaskSpecSnapshot.from_proposal(
+                    task.task_id, 2, TaskSpecProposal.from_data(data),
+                    current.acceptance_criteria,
+                )
+                await app.kernel._append_events(task.task_id, ((
+                    "task_spec.revised", {"snapshot": spec.to_data()},
+                ),))
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    task = await app.kernel.transition_task(
+                        task.task_id, state, state.value
+                    )
+                await app.kernel.run_agent_turn(task.task_id, task.goal)
+            finally:
+                await app.registry.stop_all()
+
+            self.assertGreaterEqual(len(model.requests), 2)
+            self.assertIn(
+                "core.task_outcome_select",
+                model.advertised_tool_names(0),
+            )
+            focus = await app.kernel.get_task_execution_focus(task.task_id)
+            self.assertEqual(
+                set(focus.selected_outcome_ids), {"inspect-a", "inspect-b"}
+            )
+            self.assertEqual(model.unadvertised_history(), [])
+
+    async def _run_ambiguous_observation_turn(self, model, directory=None):
+        """Drive the two-ANSWER-outcome shape that makes a bare read ambiguous.
+
+        New proposals are normalised to one conversational deliverable per user
+        question, so this shape reaches Runtime only from state that already
+        exists: an event stream written before that rule, or a non-planner
+        writer. The binding layer must still handle it.
+
+        Pass ``directory`` to keep the workspace alive after the turn, which a
+        caller needs in order to resume the interrupted turn.
+        """
+        if directory is None:
+            with tempfile.TemporaryDirectory() as owned:
+                return await self._run_ambiguous_observation_turn(model, owned)
+        app = compose_fixture_application(
+            model_adapter=model,
+            tool_adapters=(CoreReadOnlyToolProvider(),),
+        )
+        await app.registry.start_all()
+        try:
+            task = await app.kernel.create_task(
+                "analyse route issue", Path(directory)
+            )
+            current = await app.kernel.get_task_spec(task.task_id)
+            base = TaskSpecSnapshot.from_proposal(
+                task.task_id, 2,
+                TaskSpecProposal.from_data(proposal(task.goal)),
+                current.acceptance_criteria,
+            )
+            spec = replace(base, content_hash="", outcomes=(
+                TaskOutcomeSnapshot(
+                    "route_issue_analysis",
+                    "Give the route root-cause analysis",
+                    TaskOutcomeKind.ANSWER, (ToolEffect.OBSERVE,),
+                ),
+                TaskOutcomeSnapshot(
+                    "route_fix_recommendation",
+                    "Give the route fix recommendation",
+                    TaskOutcomeKind.ANSWER, (ToolEffect.OBSERVE,),
+                    depends_on=("route_issue_analysis",),
+                ),
+            ))
+            await app.kernel._append_events(task.task_id, ((
+                "task_spec.revised", {"snapshot": spec.to_data()},
+            ),))
+            for state in (
+                TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                TaskState.EXECUTING,
+            ):
+                task = await app.kernel.transition_task(
+                    task.task_id, state, state.value
+                )
+            error = None
+            result = None
+            try:
+                result = await app.kernel.run_agent_turn(
+                    task.task_id, task.goal
+                )
+            except ModelInvocationFailed as failure:
+                error = failure
+            return app, task, result, error
+        except BaseException:
+            await app.registry.stop_all()
+            raise
+
+    async def test_ambiguous_observation_correction_names_the_repair(self):
+        """The correction must state a repair the model can actually perform.
+
+        A bare read with two equally compatible, already-selected open outcomes
+        is rejected as ambiguous. Advising the model to "correct or omit the
+        outcome_ref" cannot be satisfied there — the reference is already
+        omitted — so the identical rejection would repeat until the recovery
+        budget is spent and the turn is interrupted.
+        """
+        model = AmbiguousObservationModel(outcome_ref_from_call=3)
+        app, task, result, error = await self._run_ambiguous_observation_turn(model)
+        try:
+            self.assertIsNone(error, error)
+            assert result is not None
+            self.assertEqual(result.tool_calls, 2)
+            self.assertTrue(model.corrections, "no correction reached the model")
+            correction = model.corrections[0]
+            # The repair is named concretely, with both candidates listed.
+            self.assertIn("route_issue_analysis", correction)
+            self.assertIn("route_fix_recommendation", correction)
+            self.assertIn("outcome_ref set to one of", correction)
+            self.assertIn("Omitting outcome_ref will be rejected again", correction)
+            # The unsatisfiable advice is not offered for this state.
+            self.assertNotIn("otherwise correct or omit", correction)
+            outcomes = (await app.kernel.get_task_spec(task.task_id)).outcomes
+            self.assertEqual(
+                [item.outcome_id for item in outcomes],
+                ["route_issue_analysis", "route_fix_recommendation"],
+            )
+            # The named read bound to the outcome the model chose, and the
+            # rejected bare read was never executed.
+            events = await app.kernel.dependencies.store.read_events(
+                task.task_id
+            )
+            bound = [
+                item.payload for item in events
+                if item.event_type == "task_outcome.binding_decided"
+                and item.payload.get("bound_outcome_id")
+                == "route_fix_recommendation"
+            ]
+            self.assertTrue(bound, "the corrected call never bound")
+            self.assertTrue(all(item["action"] == "ACCEPT" for item in bound))
+            executions = (await app.kernel.get_task(task.task_id)).tool_executions
+            self.assertEqual(
+                sorted(item.call.name for item in executions.values()),
+                ["core.find_files", "core.search_text"],
+            )
+        finally:
+            await app.registry.stop_all()
+
+    async def test_ambiguous_observation_still_interrupts_when_ignored(self):
+        """A model that repeats the rejected call unchanged still stops safely."""
+        model = AmbiguousObservationModel()
+        app, task, result, error = await self._run_ambiguous_observation_turn(model)
+        try:
+            self.assertIsNotNone(error)
+            self.assertIn("invalid_outcome_binding", str(error))
+            self.assertEqual(result, None)
+            # No tool ran from the rejected turns, and the prior work survived.
+            executions = (await app.kernel.get_task(task.task_id)).tool_executions
+            self.assertEqual(
+                sorted(item.call.name for item in executions.values()),
+                ["core.find_files"],
+            )
+            self.assertTrue(
+                (await app.kernel.get_task_spec(task.task_id)).outcomes[0]
+                .fulfillment_refs
+            )
+        finally:
+            await app.registry.stop_all()
+
+    async def test_interrupted_legacy_turn_completes_after_resume(self):
+        """An already-interrupted legacy session can still be continued.
+
+        P046 only normalises new proposals, so a Task whose stream was written
+        before that rule keeps its two ANSWER outcomes. Continuing it must not
+        be a dead end: the corrected instruction is followable, so resuming the
+        interrupted turn lets the model name one outcome and finish.
+        """
+        model = AmbiguousObservationModel(outcome_ref_from_call=4)
+        with tempfile.TemporaryDirectory() as directory:
+            (app, task, result, error) = (
+                await self._run_ambiguous_observation_turn(model, directory)
+            )
+            try:
+                # The first turn still fails, exactly as the real session did.
+                self.assertIsNotNone(error)
+                self.assertIn("invalid_outcome_binding", str(error))
+                self.assertEqual(result, None)
+                self.assertEqual(model.calls, 3)
+
+                resumed = await app.kernel.resume_checkpointed_agent_turn(
+                    task.task_id
+                )
+                self.assertIsInstance(resumed, AgentTurnResult)
+                assert isinstance(resumed, AgentTurnResult)
+                # The resumed turn named one candidate and completed the work.
+                self.assertEqual(
+                    sorted(
+                        item.call.name
+                        for item in (
+                            await app.kernel.get_task(task.task_id)
+                        ).tool_executions.values()
+                    ),
+                    ["core.find_files", "core.search_text"],
+                )
+                events = await app.kernel.dependencies.store.read_events(
+                    task.task_id
+                )
+                named = [
+                    item.payload for item in events
+                    if item.event_type == "task_outcome.binding_decided"
+                    and item.payload.get("requested_outcome_id")
+                    == "route_fix_recommendation"
+                ]
+                # The named candidate was accepted, never re-rejected.
+                self.assertTrue(named)
+                self.assertEqual(
+                    {item.get("reason") for item in named}, {"NONE"}
+                )
+                self.assertEqual(
+                    [
+                        item.event_type for item in events
+                        if item.event_type == "turn.interrupted"
+                    ].count("turn.interrupted"),
+                    1,
+                )
+            finally:
+                await app.registry.stop_all()
+
+    def test_binding_correction_covers_both_ambiguous_reasons(self):
+        """Each ambiguous reason gets its own actionable instruction."""
+        ambiguous = json.dumps({
+            "action": "REQUIRE_SELECTION",
+            "reason": "OUTCOME_SELECTION_AMBIGUOUS",
+            "compatible_outcome_ids": ["a", "b"],
+            "selected_outcome_ids": ["a", "b"],
+            "requested_outcome_id": None,
+        })
+        text = Kernel._outcome_binding_correction(ambiguous)
+        self.assertIn("outcome_ref set to one of a, b", text)
+        self.assertNotIn("otherwise correct or omit", text)
+
+        unselected = json.dumps({
+            "action": "REQUIRE_SELECTION",
+            "reason": "OUTCOME_NOT_SELECTED",
+            "compatible_outcome_ids": ["a", "b"],
+            "selected_outcome_ids": [],
+            "requested_outcome_id": None,
+        })
+        text = Kernel._outcome_binding_correction(unselected)
+        self.assertIn("core.task_outcome_select", text)
+        self.assertIn("a, b", text)
+
+        # Unparsable or unrelated detail keeps the generic guidance.
+        for detail in ("", "not json", json.dumps({
+            "reason": "OUTCOME_NOT_FOUND",
+            "compatible_outcome_ids": ["a"],
+        })):
+            self.assertIn(
+                "otherwise correct or omit",
+                Kernel._outcome_binding_correction(detail),
+            )
+
+    async def test_planner_keeps_one_answer_per_user_question(self):
+        """The reported failure shape cannot reach Runtime from a proposal.
+
+        The planner for the real turn split one user question into "analyse the
+        route issue" and "recommend a fix", the second depending on the first.
+        Every later read was then compatible with two open ANSWER outcomes at
+        once, so the turn was interrupted with invalid_outcome_binding.
+        """
+        real_proposal = {
+            "schema_version": 1,
+            "goal": "分析 route 相关问题的根因，并给出修复建议。",
+            "scope": ["."], "constraints": [],
+            "outcomes": [
+                {
+                    "outcome_id": "route_issue_analysis",
+                    "description": "Give the route root-cause analysis",
+                    "kind": "ANSWER", "required_effects": ["observe"],
+                    "required": True,
+                },
+                {
+                    "outcome_id": "route_fix_recommendation",
+                    "description": "Give the route fix recommendation",
+                    "kind": "ANSWER", "required_effects": ["observe"],
+                    "required": True,
+                    "depends_on": ["route_issue_analysis"],
+                },
+            ],
+            "continuation_policy": {"mode": "NONE"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            model = AmbiguousObservationModel()
+            app = compose_fixture_application(
+                model_adapter=model,
+                tool_adapters=(CoreReadOnlyToolProvider(),),
+                task_spec_planner_adapter=FixturePlanner(data=real_proposal),
+            )
+            await app.registry.start_all()
+            try:
+                task = await app.kernel.create_task(
+                    "analyse route issue", Path(directory)
+                )
+                spec = await app.kernel.plan_task_spec(task.task_id)
+                self.assertEqual(
+                    [
+                        (item.outcome_id, item.kind, item.status)
+                        for item in spec.outcomes
+                    ],
+                    [(
+                        "route_issue_analysis",
+                        TaskOutcomeKind.ANSWER,
+                        TaskOutcomeStatus.PENDING,
+                    )],
+                )
+                # Both requested deliverables survive inside the single ANSWER.
+                self.assertEqual(
+                    spec.outcomes[0].required_effects, (ToolEffect.OBSERVE,)
+                )
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    task = await app.kernel.transition_task(
+                        task.task_id, state, state.value
+                    )
+                result = await app.kernel.run_agent_turn(
+                    task.task_id, task.goal
+                )
+                # The bare read binds to the single compatible Outcome instead
+                # of being rejected as ambiguous, so the turn completes.
+                self.assertEqual(result.tool_calls, 2)
+                events = await app.kernel.dependencies.store.read_events(
+                    task.task_id
+                )
+                # No read is ever left needing a choice the model cannot make.
+                self.assertEqual(
+                    [
+                        item.payload for item in events
+                        if item.event_type == "task_outcome.binding_decided"
+                        and item.payload.get("action") == "REQUIRE_SELECTION"
+                    ],
+                    [],
+                )
+                self.assertEqual(
+                    [
+                        item.event_type for item in events
+                        if item.event_type in {"llm.failed", "turn.interrupted"}
+                    ],
+                    [],
+                )
+            finally:
+                await app.registry.stop_all()
+
     async def test_legacy_required_effects_stays_open_after_one_tool(self):
         """Old Task streams keep their facts but gain safe completion semantics."""
         with tempfile.TemporaryDirectory() as directory:
@@ -1851,6 +2410,86 @@ class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("old", [
                     item.outcome_id for item in planned.outcomes
                 ])
+            finally:
+                await app.registry.stop_all()
+
+    async def test_replace_replan_also_normalises_the_answer_outcomes(self):
+        """`/replace` gives an older session the merged contract too.
+
+        A Task whose stream already holds two chained ANSWER outcomes cannot be
+        re-planned in place, because planning refuses to touch a contract that
+        already has outcomes. Replace clears them and re-plans, and the fresh
+        proposal passes through the same normalisation as any new plan.
+        """
+        two_answers = {
+            "schema_version": 1, "goal": "replacement goal",
+            "scope": ["."], "constraints": [],
+            "outcomes": [
+                {
+                    "outcome_id": "route_issue_analysis",
+                    "description": "Give the route root-cause analysis",
+                    "kind": "ANSWER", "required_effects": ["observe"],
+                    "required": True,
+                },
+                {
+                    "outcome_id": "route_fix_recommendation",
+                    "description": "Give the route fix recommendation",
+                    "kind": "ANSWER", "required_effects": ["observe"],
+                    "required": True,
+                    "depends_on": ["route_issue_analysis"],
+                },
+            ],
+            "continuation_policy": {"mode": "NONE"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+                task_spec_planner_adapter=FixturePlanner(data=two_answers),
+            )
+            await app.registry.start_all()
+            try:
+                task = await app.kernel.create_task("old goal", Path(directory))
+                current = await app.kernel.get_task_spec(task.task_id)
+                old = TaskSpecSnapshot.from_proposal(
+                    task.task_id, 2,
+                    TaskSpecProposal.from_data(proposal("old goal", ("old",))),
+                    current.acceptance_criteria,
+                )
+                await app.kernel._append_events(task.task_id, ((
+                    "task_spec.revised", {"snapshot": old.to_data()},
+                ),))
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    task = await app.kernel.transition_task(
+                        task.task_id, state, state.value
+                    )
+                from tsm_agt.core import AgentTurnCheckpoint, SteeringKind
+                checkpoint = AgentTurnCheckpoint(
+                    task.task_id, "turn-replace-answers", 1,
+                    (Message("replace-user", MessageRole.USER,
+                             (TextBlock("old goal"),)),),
+                    (), (), 0, 0, 0, 0, 5, 5, 256, 10.0,
+                )
+                checkpoint = await app.kernel._bind_agent_checkpoint(
+                    task, checkpoint, await app.kernel.list_tools()
+                )
+                await app.kernel._save_agent_checkpoint(checkpoint, "test")
+                await app.kernel.queue_steering(
+                    task.task_id, SteeringKind.REPLACE,
+                    "replacement goal", "replace-answers",
+                )
+                await app.kernel._apply_pending_steering(checkpoint, "test")
+                planned = await app.kernel.plan_task_spec(task.task_id)
+                self.assertEqual(
+                    [item.outcome_id for item in planned.outcomes],
+                    ["route_issue_analysis"],
+                )
+                self.assertIn(
+                    "fix recommendation", planned.outcomes[0].description
+                )
             finally:
                 await app.registry.stop_all()
 

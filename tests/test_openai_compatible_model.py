@@ -797,6 +797,78 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider_messages[2]["tool_call_id"], "call-1")
         self.assertIn('\"ok\":true', provider_messages[2]["content"])
 
+    async def test_history_may_reference_a_withdrawn_tool(self) -> None:
+        """A retired tool call stays encodable without staying advertised.
+
+        The Runtime narrows the advertised protocol mid-turn — completing an
+        Outcome retires ``core.task_outcome_complete`` — while the transcript
+        still carries the assistant call that used it. That call is a history
+        fact, not a capability request, so it must serialize instead of
+        failing the turn with an unrepairable payload error.
+        """
+        provider, transport = await self._provider([{
+            "choices": [{
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        }])
+        retired = ToolCall("call-complete", "core.task_outcome_complete", {
+            "outcome_id": "inspection", "completion_summary": "done",
+            "evidence_refs": [], "remaining_work": [],
+        })
+        messages = (
+            Message("user-1", MessageRole.USER, (TextBlock("inspect"),)),
+            Message("assistant-1", MessageRole.ASSISTANT, (ToolCallBlock(retired),)),
+            Message("tool-1", MessageRole.TOOL, (
+                ToolResultBlock(ToolResult("call-complete", True, data={})),
+            )),
+        )
+
+        await provider.complete(ModelRequest(
+            "turn-withdrawn", messages, tools=(self._tool_spec(),),
+        ))
+
+        payload = transport.requests[0]["payload"]
+        self.assertEqual(
+            payload["messages"][1]["tool_calls"][0]["function"]["name"],
+            "core__task_outcome_complete",
+        )
+        self.assertEqual(
+            [tool["function"]["name"] for tool in payload["tools"]],
+            ["core__read_file"],
+        )
+
+    async def test_call_to_a_withdrawn_tool_is_still_rejected(self) -> None:
+        """Tolerating history does not widen what the model may call now."""
+        provider, _ = await self._provider([{
+            "choices": [{
+                "message": {"role": "assistant", "tool_calls": [{
+                    "id": "call-retired", "type": "function",
+                    "function": {
+                        "name": "core__task_outcome_complete",
+                        "arguments": json.dumps({
+                            "outcome_id": "inspection",
+                            "completion_summary": "done",
+                            "evidence_refs": [],
+                            "remaining_work": [],
+                        }),
+                    },
+                }]},
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {},
+        }])
+
+        with self.assertRaises(OpenAICompatibleProviderError) as caught:
+            await provider.complete(ModelRequest(
+                "turn-withdrawn-call",
+                (Message("user-1", MessageRole.USER, (TextBlock("inspect"),)),),
+                tools=(self._tool_spec(),),
+            ))
+
+        self.assertIn("unadvertised", str(caught.exception))
+
     async def test_recovers_exact_text_tool_blocks_from_compatible_gateway(self) -> None:
         body = (
             '<tool_use id="call-text-1" name="core__read_file">\n'

@@ -10392,18 +10392,34 @@ class Kernel:
             )
             # Expose the focus-selection protocol only when it can perform a
             # valid transition. This keeps ordinary single-focus turns small.
+            #
+            # Withdrawal is deliberately not retroactive. A tool this turn
+            # already invoked stays advertised for the remainder of the turn,
+            # because the outgoing payload still carries that assistant call in
+            # its history. Advertising a function in the transcript that the
+            # provider was not offered in the same request is a protocol
+            # violation no retry can repair, so a completed Outcome must not be
+            # able to shrink the protocol mid-turn.
+            invoked_tool_names = {
+                block.call.name
+                for message in messages
+                for block in message.content
+                if isinstance(block, ToolCallBlock)
+            }
             model_visible_tools = tuple(
                 tool for tool in visible_tools
-                if (
-                    tool.name != "core.task_outcome_select"
-                    or bool(unselected_outcomes)
-                ) and (
-                    tool.name != "core.task_outcome_complete"
-                    or any(
-                        outcome.kind is not TaskOutcomeKind.ANSWER
-                        and outcome.completion_policy
-                        is not TaskOutcomeCompletionPolicy.ATOMIC_ACTION
-                        for outcome in eligible_outcomes
+                if tool.name in invoked_tool_names or (
+                    (
+                        tool.name != "core.task_outcome_select"
+                        or bool(unselected_outcomes)
+                    ) and (
+                        tool.name != "core.task_outcome_complete"
+                        or any(
+                            outcome.kind is not TaskOutcomeKind.ANSWER
+                            and outcome.completion_policy
+                            is not TaskOutcomeCompletionPolicy.ATOMIC_ACTION
+                            for outcome in eligible_outcomes
+                        )
                     )
                 )
             )
@@ -10657,12 +10673,7 @@ class Kernel:
                             "remaining uncertainty."
                         )
                         if error.reason_code == "tool_call_emitted_while_disabled" else (
-                            "Your previous tool call could not bind to the current "
-                            "Task execution focus. Inspect Runtime detail below. If "
-                            "the intended eligible outcome is not selected, first call "
-                            "core.task_outcome_select; otherwise correct or omit the "
-                            "outcome_ref. Do not repeat the invalid call unchanged. "
-                            f"Runtime detail: {error.detail}"
+                            self._outcome_binding_correction(error.detail)
                         ) if error.reason_code == "invalid_outcome_binding" else
                         (
                             "Your previous response used an invalid tool-call envelope. "
@@ -12808,6 +12819,65 @@ class Kernel:
                 names.add(spec.name)
                 tools.append(spec)
         return tuple(tools)
+
+    @staticmethod
+    def _outcome_binding_correction(detail: str) -> str:
+        """State the one repair that can satisfy a rejected Outcome binding.
+
+        Advising the model to "correct or omit the outcome_ref" is unsatisfiable
+        for OUTCOME_SELECTION_AMBIGUOUS: every compatible Outcome is already
+        selected and the reference is already omitted, so repeating the call
+        reproduces the identical rejection until the recovery budget is spent
+        and the turn is interrupted. That state has exactly one repair, so it is
+        named here rather than left to be inferred from raw decision JSON.
+        """
+        try:
+            decision = json.loads(detail) if detail else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decision = {}
+        if not isinstance(decision, Mapping):
+            decision = {}
+        candidates = tuple(
+            str(item) for item in decision.get("compatible_outcome_ids", ())
+            if str(item).strip()
+        )
+        reason = str(decision.get("reason") or "")
+        listed = ", ".join(candidates)
+        if (
+            reason == OutcomeBindingReason.OUTCOME_SELECTION_AMBIGUOUS.value
+            and len(candidates) > 1
+        ):
+            return (
+                "Your previous tool call could bind to more than one open Task "
+                f"outcome ({listed}) and all of them are already in the execution "
+                "focus, so Runtime cannot tell which result the call advances. "
+                "Name exactly one of them: repeat the same tool call with "
+                f"outcome_ref set to one of {listed}. Omitting outcome_ref will be "
+                "rejected again. Alternatively call core.task_outcome_select with "
+                "just the single outcome this work advances, then repeat the call. "
+                "Do not repeat the invalid call unchanged. "
+                f"Runtime detail: {detail}"
+            )
+        if (
+            reason == OutcomeBindingReason.OUTCOME_NOT_SELECTED.value
+            and len(candidates) > 1
+        ):
+            return (
+                "Your previous tool call omitted outcome_ref and could bind to "
+                f"more than one open Task outcome ({listed}), none of which is in "
+                "the current execution focus. Call core.task_outcome_select with "
+                "the one outcome this work advances, or repeat the tool call with "
+                f"outcome_ref set to one of {listed}. Do not repeat the invalid "
+                f"call unchanged. Runtime detail: {detail}"
+            )
+        return (
+            "Your previous tool call could not bind to the current Task "
+            "execution focus. Inspect Runtime detail below. If the intended "
+            "eligible outcome is not selected, first call "
+            "core.task_outcome_select; otherwise correct or omit the "
+            "outcome_ref. Do not repeat the invalid call unchanged. "
+            f"Runtime detail: {detail}"
+        )
 
     async def _bind_tool_call_outcome(
         self, task_id: str, call: ToolCall, tool: ToolSpec, *,

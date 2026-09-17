@@ -660,12 +660,29 @@ class OpenAICompatibleModelProvider:
                 )
             provider_to_internal[provider_name] = tool.name
             internal_to_provider[tool.name] = provider_name
+        # History tool calls are transcript facts, not capability requests. An
+        # assistant message may reference a tool the Runtime has since withdrawn
+        # from the advertised set (for example a completed Outcome retires the
+        # explicit-completion protocol) or one a resumed checkpoint no longer
+        # registers. Encode those names so the outgoing payload stays
+        # well-formed; whether the model may call a tool *now* is decided by
+        # `tools` alone, and an inbound call naming a non-advertised function is
+        # still rejected in _normalize_response.
+        history_to_provider = dict(internal_to_provider)
+        for name in sorted({
+            block.call.name
+            for message in request.messages
+            if message.role is not MessageRole.TOOL
+            for block in message.content
+            if isinstance(block, ToolCallBlock)
+        } - set(internal_to_provider)):
+            history_to_provider[name] = self._encode_tool_name(name)
         tool_outcome_refs = dict(request.tool_outcome_refs)
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": [
                 self._message_to_provider(
-                    message, internal_to_provider,
+                    message, history_to_provider,
                     frozenset(
                         tool.name for tool in request.tools
                         if request.require_evidence_questions

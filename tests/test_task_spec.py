@@ -12,7 +12,8 @@ from tsm_agt.core import (
     TASK_SPEC_PROPOSAL_SCHEMA_V1,
     AcceptanceStatus, AgentTurnCheckpoint, ProjectTrustLevel, SteeringKind,
     TaskAcceptanceCriterion, TaskContinuationMode, TaskCriterionKind,
-    TaskOutcomeKind, TaskOutcomeStatus, TaskSpecProjector, TaskSpecProposal,
+    TaskOutcomeKind, TaskOutcomeCompletionPolicy, TaskOutcomeStatus,
+    TaskSpecProjector, TaskSpecProposal,
     TaskSpecSnapshot,
     TaskExecutionFocusProjector, TaskOutcomeEligibilityCalculator,
     TaskState, canonical_hash,
@@ -195,6 +196,182 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(restored, focus)
             finally:
                 await app.registry.stop_all()
+
+    def test_chained_answer_outcomes_merge_into_one_deliverable(self):
+        """One user question yields one conversational Outcome, not a chain.
+
+        The real planner split a single request into "analyse the route issue"
+        and "recommend a fix", the second depending on the first. Kept apart,
+        every read-only observation is compatible with two open ANSWER outcomes
+        at once, so Runtime must either guess or interrupt the turn.
+        """
+        proposal = TaskSpecProposal.from_data({
+            "schema_version": 1,
+            "goal": "analyse the route issue and recommend a fix",
+            "scope": ["src"], "constraints": [],
+            "outcomes": [
+                {
+                    "outcome_id": "route_issue_analysis",
+                    "description": "Give the route root-cause analysis",
+                    "kind": "ANSWER", "required_effects": ["observe"],
+                    "required": True,
+                },
+                {
+                    "outcome_id": "route_fix_recommendation",
+                    "description": "Give the route fix recommendation",
+                    "kind": "ANSWER", "required_effects": ["observe"],
+                    "required": True,
+                    "depends_on": ["route_issue_analysis"],
+                },
+            ],
+            "continuation_policy": {"mode": "NONE"},
+        })
+        self.assertEqual(len(proposal.outcomes), 1)
+        merged = proposal.outcomes[0]
+        self.assertEqual(merged.outcome_id, "route_issue_analysis")
+        self.assertIs(merged.kind, TaskOutcomeKind.ANSWER)
+        self.assertEqual(merged.required_effects, (ToolEffect.OBSERVE,))
+        self.assertTrue(merged.required)
+        # The internal ordering of the group is gone, not left as a self-loop.
+        self.assertEqual(merged.depends_on, ())
+        # Neither requested part is silently dropped from the deliverable.
+        self.assertIn("root-cause analysis", merged.description)
+        self.assertIn("fix recommendation", merged.description)
+        # The normalised form round-trips unchanged.
+        self.assertEqual(
+            TaskSpecProposal.from_data(proposal.to_data()), proposal
+        )
+
+    def test_merging_repoints_dependents_and_keeps_other_kinds_separate(self):
+        """Only conversational answers merge; other deliverables stay intact."""
+        proposal = TaskSpecProposal.from_data({
+            "schema_version": 1,
+            "goal": "analyse and then deliver a patch",
+            "scope": ["src"], "constraints": [],
+            "outcomes": [
+                {
+                    "outcome_id": "inspect",
+                    "description": "Collect the required evidence",
+                    "kind": "EVIDENCE", "required_effects": ["observe"],
+                    "required": True,
+                },
+                {
+                    "outcome_id": "answer-analysis",
+                    "description": "Answer the analysis part",
+                    "kind": "ANSWER", "required_effects": ["observe"],
+                    "required": True,
+                },
+                {
+                    "outcome_id": "answer-summary",
+                    "description": "Answer the summary part",
+                    "kind": "ANSWER", "required_effects": ["observe"],
+                    "required": False,
+                    "depends_on": ["answer-analysis"],
+                },
+                {
+                    "outcome_id": "deliver-patch",
+                    "description": "Write the requested patch",
+                    "kind": "WORKSPACE_DELIVERY",
+                    "required_effects": ["mutate"],
+                    "required": True,
+                    "depends_on": ["answer-summary", "inspect"],
+                },
+            ],
+            "continuation_policy": {"mode": "NONE"},
+        })
+        by_id = {item.outcome_id: item for item in proposal.outcomes}
+        self.assertEqual(
+            sorted(by_id), ["answer-analysis", "deliver-patch", "inspect"]
+        )
+        # A required EVIDENCE deliverable is never absorbed into the answer.
+        self.assertIs(by_id["inspect"].kind, TaskOutcomeKind.EVIDENCE)
+        # The optional answer contributed its obligation to the merged answer.
+        self.assertTrue(by_id["answer-analysis"].required)
+        # The dependent deliverable now waits on the merged answer and evidence.
+        self.assertEqual(
+            by_id["deliver-patch"].depends_on, ("answer-analysis", "inspect")
+        )
+
+    def test_atomic_action_answer_is_never_merged(self):
+        """A pinned action contract keeps its own acceptance semantics."""
+        proposal = TaskSpecProposal.from_data({
+            "schema_version": 1,
+            "goal": "explain the config and write the report file",
+            "scope": ["src"], "constraints": [],
+            "outcomes": [
+                {
+                    "outcome_id": "explain",
+                    "description": "Explain the configuration",
+                    "kind": "ANSWER", "required_effects": [],
+                    "required": True,
+                },
+                {
+                    "outcome_id": "write-report",
+                    "description": "Write the report with one exact call",
+                    "kind": "ANSWER",
+                    "required_effects": [], "required": True,
+                    "completion_policy": "ATOMIC_ACTION",
+                    "atomic_action": {
+                        "tool_name": "core.apply_patch",
+                        "arguments": {"path": "REPORT.md"},
+                    },
+                },
+            ],
+            "continuation_policy": {"mode": "NONE"},
+        })
+        self.assertEqual(
+            [item.outcome_id for item in proposal.outcomes],
+            ["explain", "write-report"],
+        )
+        self.assertIs(
+            proposal.outcomes[1].completion_policy,
+            TaskOutcomeCompletionPolicy.ATOMIC_ACTION,
+        )
+
+    def test_merged_answer_description_stays_within_bounds(self):
+        """Merging respects the bounded description the schema declares."""
+        proposal = TaskSpecProposal.from_data({
+            "schema_version": 1,
+            "goal": "many answers",
+            "scope": [], "constraints": [],
+            "outcomes": [
+                {
+                    "outcome_id": f"answer-{index}",
+                    "description": f"Deliverable part {index} " + "x" * 400,
+                    "kind": "ANSWER", "required_effects": [],
+                    "required": True,
+                }
+                for index in range(4)
+            ],
+            "continuation_policy": {"mode": "NONE"},
+        })
+        self.assertEqual(len(proposal.outcomes), 1)
+        self.assertLessEqual(len(proposal.outcomes[0].description), 1000)
+        self.assertTrue(proposal.outcomes[0].description.endswith("…"))
+
+    def test_duplicate_outcome_ids_are_still_rejected(self):
+        """Normalisation must not quietly repair a malformed proposal."""
+        with self.assertRaises(ValueError):
+            TaskSpecProposal.from_data({
+                "schema_version": 1,
+                "goal": "duplicate identities",
+                "scope": [], "constraints": [],
+                "outcomes": [
+                    {
+                        "outcome_id": "same",
+                        "description": "First answer",
+                        "kind": "ANSWER", "required_effects": [],
+                        "required": True,
+                    },
+                    {
+                        "outcome_id": "same",
+                        "description": "Second answer",
+                        "kind": "ANSWER", "required_effects": [],
+                        "required": True,
+                    },
+                ],
+                "continuation_policy": {"mode": "NONE"},
+            })
 
     def test_legacy_snapshot_replays_with_original_hash(self):
         legacy = {

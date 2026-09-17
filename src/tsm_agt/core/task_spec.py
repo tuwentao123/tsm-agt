@@ -229,6 +229,90 @@ class TaskOutcomeProposal:
         )
 
 
+_MERGED_ANSWER_DESCRIPTION_LIMIT = 1000
+
+
+def _merge_answer_outcomes(
+    outcomes: Sequence[TaskOutcomeProposal],
+) -> tuple[TaskOutcomeProposal, ...]:
+    """Collapse one question's conversational deliverables into one Outcome.
+
+    A planner may split a single user question into a chain of ANSWER outcomes
+    ("analyse X", then "recommend a fix for X"). They are not independently
+    deliverable results: they are one continuous piece of reasoning that reaches
+    the user as one reply, and nothing is accepted for the first one that is not
+    also needed by the second. Keeping them apart is not merely redundant. Every
+    read-only observation becomes compatible with two equally eligible open
+    Outcomes at once, so Runtime can no longer bind a bare read without guessing
+    semantics, and the model is forced to make a bookkeeping choice that changes
+    nothing about what is delivered.
+
+    ATOMIC_ACTION answers are deliberately left alone: they are pinned to one
+    exact tool call, so folding independent action contracts into a single
+    answer would change what acceptance means.
+    """
+    if len({item.outcome_id for item in outcomes}) != len(outcomes):
+        # Keep the existing strict rejection of duplicated identities.
+        return tuple(outcomes)
+    mergeable = tuple(
+        item for item in outcomes
+        if item.kind is TaskOutcomeKind.ANSWER
+        and item.completion_policy
+        is TaskOutcomeCompletionPolicy.EXPLICIT_ACCEPTANCE
+    )
+    if len(mergeable) < 2:
+        return tuple(outcomes)
+    survivor_id = mergeable[0].outcome_id
+    absorbed = {item.outcome_id for item in mergeable[1:]}
+    description = " ".join(dict.fromkeys(
+        item.description for item in mergeable
+    ))
+    if len(description) > _MERGED_ANSWER_DESCRIPTION_LIMIT:
+        description = (
+            description[:_MERGED_ANSWER_DESCRIPTION_LIMIT - 1].rstrip() + "…"
+        )
+    merged = TaskOutcomeProposal(
+        survivor_id,
+        description,
+        TaskOutcomeKind.ANSWER,
+        tuple(dict.fromkeys(
+            effect for item in mergeable for effect in item.required_effects
+        )),
+        any(item.required for item in mergeable),
+        # Ordering inside the merged group becomes internal to the single
+        # deliverable, so a dependency on the survivor is dropped rather than
+        # left as a self-reference.
+        tuple(dict.fromkeys(
+            dependency for item in mergeable for dependency in item.depends_on
+            if dependency not in absorbed and dependency != survivor_id
+        )),
+        TaskOutcomeCompletionPolicy.EXPLICIT_ACCEPTANCE,
+        None,
+    )
+    rewritten: list[TaskOutcomeProposal] = []
+    for item in outcomes:
+        if item.outcome_id == survivor_id:
+            rewritten.append(merged)
+            continue
+        if item.outcome_id in absorbed:
+            continue
+        # A downstream Outcome that consumed an absorbed answer now consumes the
+        # merged one, and a dependency cannot name its own Outcome.
+        dependencies = tuple(dict.fromkeys(
+            survivor_id if dependency in absorbed else dependency
+            for dependency in item.depends_on
+        ))
+        dependencies = tuple(
+            dependency for dependency in dependencies
+            if dependency != item.outcome_id
+        )
+        rewritten.append(
+            replace(item, depends_on=dependencies)
+            if dependencies != item.depends_on else item
+        )
+    return tuple(rewritten)
+
+
 @dataclass(frozen=True, slots=True)
 class TaskSpecProposal:
     """Versioned form submitted by a planner model for Runtime validation."""
@@ -285,11 +369,17 @@ class TaskSpecProposal:
         if not isinstance(raw_continuation, Mapping):
             raise ValueError("Task SPEC proposal continuation_policy must be an object")
         _reject_unknown_fields(raw_continuation, {"mode"}, "continuation policy")
+        # One user question receives one conversational deliverable. Normalising
+        # here covers every planner implementation at the single point where new
+        # Outcomes enter Runtime, and never rewrites outcomes already persisted
+        # in an event stream.
         return cls(
             int(data.get("schema_version", 0)), str(data.get("goal", "")).strip(),
             tuple(str(item).strip() for item in raw_scope),
             tuple(str(item).strip() for item in raw_constraints),
-            tuple(TaskOutcomeProposal.from_data(item) for item in raw_outcomes),
+            _merge_answer_outcomes(tuple(
+                TaskOutcomeProposal.from_data(item) for item in raw_outcomes
+            )),
             TaskContinuationMode(str(raw_continuation.get("mode", ""))),
         )
 
