@@ -350,14 +350,14 @@ class SessionPromptProjection:
 
 @dataclass(frozen=True, slots=True)
 class SessionContextProjector:
-    recent_execution_limit: int = 12
-    recent_execution_per_task_limit: int = 6
-    execution_result_item_limit: int = 10
-    small_read_content_characters: int = 2000
-    recent_visible_message_limit: int = 12
-    detailed_task_summary_limit: int = 8
-    historical_resource_limit: int = 40
-    historical_question_limit: int = 20
+    recent_execution_limit: int = 10
+    recent_execution_per_task_limit: int = 4
+    execution_result_item_limit: int = 8
+    small_read_content_characters: int = 1200
+    recent_visible_message_limit: int = 8
+    detailed_task_summary_limit: int = 4
+    historical_resource_limit: int = 24
+    historical_question_limit: int = 12
 
     def __post_init__(self) -> None:
         if min(
@@ -508,7 +508,7 @@ class SessionContextProjector:
         visible_messages = projection.messages[-self.recent_visible_message_limit:]
         recent_task_ids = list(dict.fromkeys(
             message.task_id for message in reversed(visible_messages)
-        ))
+        ))[:self.detailed_task_summary_limit]
         recent_task_id_set = set(recent_task_ids)
         summaries_by_id = {item.task_id: item for item in projection.task_summaries}
         visible_task_summaries = tuple(

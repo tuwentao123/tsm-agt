@@ -6,6 +6,7 @@ import asyncio
 import html
 import json
 import re
+import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from datetime import datetime
 from html.parser import HTMLParser
@@ -28,6 +29,8 @@ from tsm_agt.ports import (
     ToolRisk,
     ToolSpec,
 )
+from tsm_agt.retrieval.pipeline import RetrievalPipeline
+from tsm_agt.retrieval.schemas import RetrievalResult
 
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -131,6 +134,113 @@ class _DuckDuckGoResultsParser(HTMLParser):
         self._text_parts = []
 
 
+class _DuckDuckGoInstantProvider:
+    name = "duckduckgo-instant-answer"
+
+    def __init__(self, tools: NetworkToolProvider) -> None:
+        self._tools = tools
+
+    def search(self, query: str, top_k: int) -> list[RetrievalResult]:
+        try:
+            payload = self._tools._load_json(
+                "https://api.duckduckgo.com/?q="
+                f"{quote_plus(query)}&format=json&no_redirect=1&no_html=1"
+            )
+        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError):
+            return []
+
+        results: list[RetrievalResult] = []
+        for item in payload.get("RelatedTopics", []):
+            if len(results) >= top_k:
+                break
+            if not isinstance(item, Mapping):
+                continue
+            nested = item.get("Topics") if "Topics" in item else [item]
+            for candidate in nested:
+                if not isinstance(candidate, Mapping):
+                    continue
+                parsed = self._tools._parse_search_result(candidate)
+                if parsed is None:
+                    continue
+                results.append(
+                    RetrievalResult(
+                        title=parsed["title"],
+                        url=parsed["url"],
+                        snippet=parsed["snippet"],
+                        provider=self.name,
+                    )
+                )
+                if len(results) >= top_k:
+                    break
+        return results
+
+
+class _DuckDuckGoHtmlProvider:
+    name = "duckduckgo-html"
+
+    def __init__(self, tools: "NetworkToolProvider") -> None:
+        self._tools = tools
+
+    def search(self, query: str, top_k: int) -> list[RetrievalResult]:
+        return [
+            RetrievalResult(
+                title=item["title"],
+                url=item["url"],
+                snippet=item["snippet"],
+                provider=self.name,
+            )
+            for item in self._tools._fallback_html_search(query, top_k)
+        ]
+
+
+class _RssNewsProvider:
+    name = "rss-news"
+
+    def __init__(self, tools: "NetworkToolProvider") -> None:
+        self._tools = tools
+
+    def search(self, query: str, top_k: int) -> list[RetrievalResult]:
+        rss_query = quote_plus(query)
+        url = (
+            "https://news.google.com/rss/search?q="
+            f"{rss_query}&hl=en-US&gl=US&ceid=US:en"
+        )
+        request = Request(url, headers={"User-Agent": _USER_AGENT})
+
+        with urlopen(request, timeout=15) as response:
+            payload = response.read(_MAX_SEARCH_BYTES).decode(
+                "utf-8", errors="replace"
+            )
+
+        root = ET.fromstring(payload)
+        results: list[RetrievalResult] = []
+
+        for item in root.findall("./channel/item"):
+            if len(results) >= top_k:
+                break
+
+            title = item.findtext("title") or "RSS result"
+            link = item.findtext("link") or ""
+            description = item.findtext("description") or ""
+            description = re.sub(r"<[^>]+>", " ", description)
+
+            if not link.strip():
+                continue
+
+            results.append(
+                RetrievalResult(
+                    title=html.unescape(title.strip()),
+                    url=link.strip(),
+                    snippet=html.unescape(description.strip()),
+                    provider=self.name,
+                    source="news",
+                    content_type="rss",
+                )
+            )
+
+        return results
+
+
 class NetworkToolProvider:
     descriptor = AdapterDescriptor(
         adapter_id="builtin.network-tools",
@@ -213,6 +323,13 @@ class NetworkToolProvider:
         """
         self._enable_fetch = enable_fetch
         self._started = False
+        self._pipeline = RetrievalPipeline(
+            providers=[
+                _DuckDuckGoInstantProvider(self),
+                _DuckDuckGoHtmlProvider(self),
+                _RssNewsProvider(self),
+            ]
+        )
 
     async def start(self, context: AdapterContext) -> None:
         self._started = True
@@ -270,46 +387,16 @@ class NetworkToolProvider:
     def _web_search(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         query = self._required_string(arguments, "query")
         top_k = min(max(int(arguments.get("top_k", 5)), 1), 10)
-        try:
-            payload = self._load_json(
-                "https://api.duckduckgo.com/?q="
-                f"{quote_plus(query)}&format=json&no_redirect=1&no_html=1"
-            )
-        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError):
-            # Search Provider fallback is part of this Adapter's capability,
-            # not an Agent retry. No Tool call or side effect is repeated.
-            payload = {}
-        results: list[dict[str, str]] = []
-        for item in payload.get("RelatedTopics", []):
-            if len(results) >= top_k:
-                break
-            if not isinstance(item, Mapping):
-                continue
-            nested = item.get("Topics") if "Topics" in item else [item]
-            for candidate in nested:
-                if isinstance(candidate, Mapping):
-                    parsed = self._parse_search_result(candidate)
-                    if parsed is not None:
-                        results.append(parsed)
-                if len(results) >= top_k:
-                    break
 
-        provider = "duckduckgo-instant-answer"
-        if not results:
-            results = self._fallback_html_search(query, top_k)
-            provider = "duckduckgo-html"
-
-        if not results:
-            raise _NoSearchResults(
+        response = self._pipeline.search(query, top_k)
+        if not response.results:
+            degraded = response.to_dict()
+            degraded["message"] = (
                 "public search providers returned no usable results"
             )
+            return degraded
 
-        return {
-            "query": query,
-            "results": results,
-            "provider": provider,
-            "result_count": len(results),
-        }
+        return response.to_dict()
 
     def _fetch_markdown(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         url = self._required_string(arguments, "url")

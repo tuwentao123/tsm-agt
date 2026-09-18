@@ -504,6 +504,137 @@ def _task_spec_requires_command_verification(spec: TaskSpecSnapshot) -> bool:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _PostMutationVerification:
+    """One inspectable read of the post-mutation verification contract.
+
+    The contract asks for a recognized foreground test/build command that
+    finished with exit code 0 after the latest workspace mutation. Reporting
+    only "no successful command was recorded" hides the two facts a caller
+    needs in order to act: which command was tried last, and why it did not
+    count. Both are carried here so a gap can state them verbatim.
+    """
+
+    passed: bool = False
+    latest_argv: tuple[str, ...] = ()
+    latest_exit_code: int | None = None
+    latest_output: str = ""
+    latest_reference: str = ""
+
+
+def _post_mutation_verification(
+    task: TaskSnapshot,
+) -> _PostMutationVerification:
+    """Read the verification contract without discarding the failure reason."""
+    if not task.mutation_journal:
+        return _PostMutationVerification()
+    latest_mutation = max(
+        task.mutation_journal, key=lambda item: item.created_at
+    )
+    attempts: list[tuple[ToolExecutionRecord, Mapping[str, Any]]] = []
+    for execution in task.tool_executions.values():
+        data = execution.result.data if execution.result is not None else None
+        if (
+            execution.call.name != "core.run_command"
+            or not _is_verification_command(execution.call.arguments)
+            or execution.updated_at < latest_mutation.created_at
+            or execution.state is not ToolCommitState.COMMITTED
+            or execution.result is None or not execution.result.ok
+            or not isinstance(data, Mapping)
+            or data.get("mode") != "foreground"
+            or data.get("status") != "exited"
+        ):
+            continue
+        attempts.append((execution, data))
+    if not attempts:
+        return _PostMutationVerification()
+    if any(data.get("exit_code") == 0 for _execution, data in attempts):
+        return _PostMutationVerification(passed=True)
+    latest, data = max(attempts, key=lambda item: item[0].updated_at)
+    output = ""
+    for field in ("stderr", "stdout"):
+        raw = data.get(field)
+        text = raw.get("text") if isinstance(raw, Mapping) else raw
+        if isinstance(text, str) and text.strip():
+            output = text.strip()
+            break
+    exit_code = data.get("exit_code")
+    return _PostMutationVerification(
+        latest_argv=tuple(
+            str(item) for item in latest.call.arguments.get("argv", ())
+        ),
+        latest_exit_code=exit_code if isinstance(exit_code, int) else None,
+        latest_output=output[:600],
+        latest_reference=latest.invocation_id,
+    )
+
+
+def _post_mutation_verification_description(
+    verification: _PostMutationVerification,
+) -> str:
+    """State the requirement in the vocabulary Runtime actually accepts."""
+    return (
+        "The workspace changed but no successful foreground verification "
+        "command was recorded after the latest mutation. Only a recognized "
+        "test or build command counts, and it must run in foreground mode and "
+        "exit 0. Static syntax checks such as `python -m compileall` or "
+        "`python -m py_compile` are not verification and never satisfy this. "
+        "Run the project's own test or build target, for example "
+        "`python -m pytest`, `npm test`, `cargo test`, or the equivalent "
+        "build/lint task for this project."
+    )
+
+
+def _post_mutation_verification_observed(
+    verification: _PostMutationVerification, interpreter: str,
+) -> str:
+    """Explain why the last recognized attempt did not count."""
+    parts: list[str] = []
+    if verification.latest_argv:
+        attempted = " ".join(verification.latest_argv)
+        exit_code = (
+            verification.latest_exit_code
+            if verification.latest_exit_code is not None else "unknown"
+        )
+        parts.append(f"Last recognized attempt: `{attempted}` exited {exit_code}.")
+        if verification.latest_output:
+            parts.append(f"Its output was: {verification.latest_output}")
+    else:
+        parts.append("No recognized test or build command has been run yet.")
+    if interpreter:
+        parts.append(
+            "This workspace provides its own interpreter; run the tests with "
+            f"`{interpreter}` rather than a system Python, whose environment "
+            "usually lacks the project's test dependencies."
+        )
+    return " ".join(parts)
+
+
+def _continuation_made_no_progress(
+    previous: Mapping[str, Any], required_gap_ids: tuple[str, ...],
+    remaining_outcome_ids: tuple[str, ...],
+) -> bool:
+    """Return whether a resumed continuation left the contract exactly as it was.
+
+    The same required gaps and the same outstanding Outcomes mean the last
+    attempt achieved nothing that the Runtime can observe, so replenishing its
+    capacity would repeat an identical attempt.
+    """
+    if not previous:
+        return False
+    previous_gaps = tuple(sorted(
+        str(item) for item in previous.get("gap_ids", [])
+    ))
+    previous_outcomes = tuple(sorted(
+        str(item) for item in previous.get("remaining_outcome_ids", [])
+    ))
+    return bool(
+        required_gap_ids
+        and previous_gaps == required_gap_ids
+        and previous_outcomes == remaining_outcome_ids
+    )
+
+
 def _goal_matches_command_argv(
     goal: str, arguments: Mapping[str, Any],
 ) -> bool:
@@ -2199,28 +2330,16 @@ class Kernel:
             ToolEffect.EXECUTE in outcome.required_effects
             and task.mutation_journal
         ):
-            latest_mutation = max(
-                task.mutation_journal, key=lambda item: item.created_at
-            )
-            verified = any(
-                execution.call.name == "core.run_command"
-                and _is_verification_command(execution.call.arguments)
-                and execution.updated_at >= latest_mutation.created_at
-                and execution.state is ToolCommitState.COMMITTED
-                and execution.result is not None and execution.result.ok
-                and isinstance(execution.result.data, Mapping)
-                and execution.result.data.get("mode") == "foreground"
-                and execution.result.data.get("status") == "exited"
-                and execution.result.data.get("exit_code") == 0
-                for execution in task.tool_executions.values()
-            )
-            if not verified:
+            verification = _post_mutation_verification(task)
+            if not verification.passed:
                 gaps.append(CompletionGap(
                     f"outcome-verification:{outcome.outcome_id}",
                     "MISSING_VERIFICATION",
-                    "Workspace mutations have no successful build, test, lint, "
-                    "or equivalent foreground verification after the latest change.",
+                    _post_mutation_verification_description(verification),
                     "MISSING", required_effects=(ToolEffect.EXECUTE,),
+                    observed=_post_mutation_verification_observed(
+                        verification, self._local_interpreter(task)
+                    ),
                 ))
         return tuple(gaps)
 
@@ -5093,6 +5212,33 @@ class Kernel:
             MessageRole.USER, (TextBlock(body),),
         )
 
+    def _local_interpreter(self, task: TaskSnapshot) -> str:
+        """Return the workspace's own interpreter path when one is observed.
+
+        Runtime already publishes local entry points as onboarding facts. A
+        verification gap that omits them invites the model to reach for a system
+        interpreter, whose environment usually lacks the project's test
+        dependencies, which then reads as "the tests failed" instead of "the
+        wrong Python was used".
+        """
+        try:
+            facts = ProjectOnboardingScanner(
+                self._dependencies.workspace_path
+            ).local_executables(Path(task.workspace))
+        except OSError:
+            return ""
+        for fact in facts:
+            try:
+                data = json.loads(fact.value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, Mapping):
+                continue
+            path = str(data.get("path", ""))
+            if path.endswith(("bin/python", "Scripts/python.exe")):
+                return path
+        return ""
+
     async def _onboarding_context_message(self, task_id: str) -> Message | None:
         task = await self.get_task(task_id)
         scanner = ProjectOnboardingScanner(self._dependencies.workspace_path)
@@ -6237,32 +6383,20 @@ class Kernel:
             task.mutation_journal
             and _task_spec_requires_command_verification(spec)
         ):
-            latest_mutation = max(
-                task.mutation_journal, key=lambda item: item.created_at
-            )
-            verified = any(
-                execution.call.name == "core.run_command"
-                and _is_verification_command(execution.call.arguments)
-                and execution.updated_at >= latest_mutation.created_at
-                and execution.state is ToolCommitState.COMMITTED
-                and execution.result is not None and execution.result.ok
-                and isinstance(execution.result.data, Mapping)
-                and execution.result.data.get("mode") == "foreground"
-                and execution.result.data.get("status") == "exited"
-                and execution.result.data.get("exit_code") == 0
-                for execution in task.tool_executions.values()
-            )
-            if not verified:
+            verification = _post_mutation_verification(task)
+            if not verification.passed:
                 gaps.append(CompletionGap(
                     gap_id="post-mutation-verification",
                     kind="POST_MUTATION_VERIFICATION",
-                    description=(
-                        "The workspace changed but no successful foreground "
-                        "build or test was recorded after the latest mutation."
+                    description=_post_mutation_verification_description(
+                        verification
                     ),
                     status="MISSING", required=True, recoverable=False,
                     required_effects=(ToolEffect.EXECUTE,),
                     candidate_tools=execute_tools,
+                    observed=_post_mutation_verification_observed(
+                        verification, self._local_interpreter(task)
+                    ),
                 ))
         return tuple(gaps)
 
@@ -8543,7 +8677,16 @@ class Kernel:
                 {} if replenish_capacity else checkpoint.exploration_budget_state
             ),
             completion_readiness_state=(
-                {} if replenish_capacity else checkpoint.completion_readiness_state
+                # The three per-attempt counters restart so the new attempt gets
+                # its own bounded corrections, but a stalled zero-progress count
+                # must survive: it is what stops the same unsatisfiable
+                # requirement from being retried forever.
+                CompletionReadinessState(
+                    stalled_continuations=CompletionReadinessState.from_data(
+                        checkpoint.completion_readiness_state
+                    ).stalled_continuations,
+                ).to_data()
+                if replenish_capacity else checkpoint.completion_readiness_state
             ),
         )
         resumed_task = task.transition(TaskState.EXECUTING).with_agent_checkpoint(
@@ -11291,6 +11434,16 @@ class Kernel:
             tuple(outcome.outcome_id for outcome in remaining), message,
         )
 
+    async def _last_continuation_pending(
+        self, task_id: str,
+    ) -> Mapping[str, Any]:
+        """Return the most recently persisted continuation boundary, if any."""
+        events = await self._dependencies.store.read_events(task_id)
+        for event in reversed(events):
+            if event.event_type == "continuation.requested":
+                return event.payload
+        return {}
+
     async def _suspend_incomplete_recoverable(
         self, checkpoint: AgentTurnCheckpoint, message: Message,
         gaps: tuple[CompletionGap, ...],
@@ -11305,6 +11458,26 @@ class Kernel:
             outcome.outcome_id for outcome in spec.outcomes
             if outcome.required and not outcome.status.is_closed
         )
+        required_gap_ids = tuple(sorted(
+            gap.gap_id for gap in gaps if gap.required
+        ))
+        # A user continuation replenishes capacity. That must not turn one
+        # unsatisfiable requirement into an endless series of identical
+        # attempts, so count how many consecutive continuations ended with the
+        # same required gaps and the same outstanding Outcomes, and carry that
+        # count past the replenishment.
+        readiness_state = CompletionReadinessState.from_data(
+            checkpoint.completion_readiness_state
+        )
+        previous = await self._last_continuation_pending(checkpoint.task_id)
+        stalled = (
+            readiness_state.stalled_continuations + 1
+            if _continuation_made_no_progress(
+                previous, required_gap_ids,
+                tuple(sorted(remaining_outcome_ids)),
+            )
+            else 0
+        )
         pending = {
             "kind": "CONTINUATION",
             "reason": "incomplete_recoverable",
@@ -11312,12 +11485,16 @@ class Kernel:
             "turn_id": checkpoint.turn_id,
             "completed_outcome_ids": [],
             "remaining_outcome_ids": list(remaining_outcome_ids),
-            "gap_ids": [gap.gap_id for gap in gaps if gap.required],
+            "gap_ids": list(required_gap_ids),
+            "zero_progress_continuations": stalled,
         }
         suspended_checkpoint = replace(
             checkpoint, revision=checkpoint.revision + 1,
             pending_user_action=pending,
             task_spec_revision=spec.revision, task_spec_hash=spec.content_hash,
+            completion_readiness_state=replace(
+                readiness_state, stalled_continuations=stalled
+            ).to_data(),
             execution_focus=(await self.get_task_execution_focus(
                 checkpoint.task_id
             )).to_data(),
@@ -12913,7 +13090,9 @@ class Kernel:
                     call, outcome_ref=decision.bound_outcome_id,
                     outcome_binding_mode=decision.binding_mode,
                 )
-                if decision.bound_outcome_id is not None else call
+                if decision.bound_outcome_id is not None
+                else replace(call, outcome_ref=None)
+                if call.outcome_ref is not None else call
             )
         raise InvalidToolArguments(
             json.dumps(decision.to_data(), sort_keys=True, separators=(",", ":"))
@@ -13014,6 +13193,20 @@ class Kernel:
                     OutcomeBindingReason.OUTCOME_DEPENDENCY_UNSATISFIED,
                 )
             if not self._tool_effect_supports_outcome(tool.effect, target):
+                # A recognized test/build command after a workspace mutation is
+                # task-level checking, not fulfillment of the implementation
+                # Outcome. Models often copy the preceding mutation's reference;
+                # normalize that harmless bookkeeping error instead of rejecting
+                # the command before it can produce verification evidence.
+                if (
+                    call.name == "core.run_command"
+                    and task.mutation_journal
+                    and _is_verification_command(call.arguments)
+                ):
+                    return result(
+                        OutcomeBindingAction.ACCEPT,
+                        OutcomeBindingReason.NO_COMPATIBLE_OUTCOME,
+                    )
                 return result(
                     OutcomeBindingAction.CORRECT,
                     OutcomeBindingReason.OUTCOME_EFFECT_MISMATCH,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from tsm_agt.adapters.builtin import NetworkToolProvider
 from tsm_agt.bootstrap import compose_fixture_application
@@ -58,6 +58,7 @@ class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertTrue(result.ok, result.to_data())
         self.assertEqual(result.data["provider"], "duckduckgo-html")
+        self.assertIn("telemetry", result.data)
         self.assertEqual(
             result.data["results"][0]["url"], "https://example.com/nba"
         )
@@ -66,6 +67,83 @@ class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
             "Latest playoff and trade updates from around the league.",
         )
         self.assertTrue(result.meta["untrusted_data"])
+        self.assertEqual(
+            result.data["telemetry"][0]["provider"],
+            "duckduckgo-instant-answer",
+        )
+        self.assertEqual(
+            result.data["telemetry"][0]["status"],
+            "empty",
+        )
+        self.assertEqual(
+            result.data["telemetry"][1]["provider"],
+            "duckduckgo-html",
+        )
+        self.assertFalse(result.data["cache_hit"])
+        self.assertIn("fetched_at", result.data["results"][0])
+
+    async def test_cached_search_response_is_reused(self):
+        html = (
+            '<article class="result">'
+            '<a class="result__a" href="https://example.com/cache">'
+            'Cache result</a>'
+            '<div class="result__snippet">cached snippet</div>'
+            '</article>'
+        )
+        with patch.object(self.provider, "_load_json", return_value={}), \
+             patch(
+                 "tsm_agt.adapters.builtin.network_tools.urlopen",
+                 return_value=_Response(html.encode()),
+             ):
+            first = await self.provider.invoke(
+                ToolCall("search-cache-1", "web.search", {
+                    "query": "cache me", "top_k": 2,
+                }),
+                None,
+            )
+            second = await self.provider.invoke(
+                ToolCall("search-cache-2", "web.search", {
+                    "query": "cache me", "top_k": 2,
+                }),
+                None,
+            )
+
+        self.assertTrue(first.ok)
+        self.assertTrue(second.ok)
+        self.assertFalse(first.data["cache_hit"])
+        self.assertTrue(second.data["cache_hit"])
+        self.assertEqual(first.data["results"], second.data["results"])
+
+    async def test_provider_failures_return_degraded_response(self):
+        failing_response = Mock()
+        failing_response.read.side_effect = TimeoutError("provider timeout")
+        failing_response.__enter__ = Mock(return_value=failing_response)
+        failing_response.__exit__ = Mock(return_value=False)
+
+        with patch.object(self.provider, "_load_json", side_effect=TimeoutError("instant timeout")), \
+             patch(
+                 "tsm_agt.adapters.builtin.network_tools.urlopen",
+                 return_value=failing_response,
+             ):
+            result = await self.provider.invoke(
+                ToolCall("search-timeout", "web.search", {
+                    "query": "today NBA news", "top_k": 3,
+                }),
+                None,
+            )
+
+        self.assertTrue(result.ok, result.to_data())
+        self.assertEqual(result.data["provider"], "degraded-no-results")
+        self.assertEqual(result.data["results"], [])
+        self.assertEqual(len(result.data["telemetry"]), 3)
+        self.assertEqual(
+            result.data["telemetry"][0]["status"],
+            "empty",
+        )
+        self.assertEqual(
+            result.data["telemetry"][2]["status"],
+            "error",
+        )
 
     async def test_untrusted_workspace_can_use_dedicated_search(self):
         with tempfile.TemporaryDirectory() as directory:

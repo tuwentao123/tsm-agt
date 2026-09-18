@@ -38,6 +38,7 @@ class CompletionGap:
     expected_scope: str = ""
     required_effects: tuple[ToolEffect, ...] = ()
     candidate_tools: tuple[str, ...] = ()
+    observed: str = ""
 
     def __post_init__(self) -> None:
         if not all((self.gap_id.strip(), self.kind.strip(), self.description.strip())):
@@ -66,23 +67,32 @@ class CompletionGap:
             "expected_scope": self.expected_scope,
             "required_effects": [item.value for item in self.required_effects],
             "candidate_tools": list(self.candidate_tools),
+            "observed": self.observed,
         }
 
 
 @dataclass(frozen=True, slots=True)
 class CompletionReadinessState:
-    """Checkpointed bounded correction counts for one Agent Turn."""
+    """Checkpointed bounded correction counts for one Agent Turn.
+
+    ``stalled_continuations`` counts consecutive user continuations that ended
+    with exactly the same required gap set and no completed Outcome. It is the
+    one counter that deliberately survives a capacity replenishment: the other
+    three bound corrections inside a single attempt, while this one bounds how
+    many times the same unsatisfied requirement may be retried at all.
+    """
 
     continue_attempts: int = 0
     disclosure_attempts: int = 0
     automatic_resume_attempts: int = 0
     last_action: str = ""
     schema_version: int = 1
+    stalled_continuations: int = 0
 
     def __post_init__(self) -> None:
         if min(
             self.continue_attempts, self.disclosure_attempts,
-            self.automatic_resume_attempts,
+            self.automatic_resume_attempts, self.stalled_continuations,
         ) < 0:
             raise ValueError("completion readiness counters must not be negative")
         if self.schema_version != 1:
@@ -100,6 +110,7 @@ class CompletionReadinessState:
             int(data.get("automatic_resume_attempts", 0)),
             str(data.get("last_action", "")),
             int(data.get("schema_version", 1)),
+            int(data.get("stalled_continuations", 0)),
         )
 
     def to_data(self) -> dict[str, Any]:
@@ -109,6 +120,7 @@ class CompletionReadinessState:
             "automatic_resume_attempts": self.automatic_resume_attempts,
             "last_action": self.last_action,
             "schema_version": self.schema_version,
+            "stalled_continuations": self.stalled_continuations,
         }
 
 

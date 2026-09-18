@@ -34,6 +34,7 @@ from tsm_agt.core import (
     AgentClarificationSuspended,
     AgentContinuationSuspended,
     ApprovalDecision,
+    ChatDispatcher,
     FlowNode,
     FlowNodeDiagnostic,
     FlowNodeKind,
@@ -1382,10 +1383,15 @@ async def _chat(
                             "[续接] 已记录明确的审批决定，正在继续同一 Task。"
                         )
                     else:
-                        route = await application.kernel.route_runtime_input(
-                            task.task_id, prompt, f"input-{uuid4().hex}",
+                        dispatcher = ChatDispatcher(application.kernel)
+                        dispatch = await dispatcher.dispatch_runtime_input(
+                            task.task_id,
+                            prompt,
+                            f"input-{uuid4().hex}",
                             explicit_intent=explicit_runtime_intent,
                         )
+                        route = dispatch.route
+                        assert route is not None
                         if route.applied:
                             session = await application.kernel.select_session_task(
                                 session.session_id, task.task_id
@@ -1780,8 +1786,10 @@ async def _chat(
                                             read_input("control> ")
                                         )
                                         continue
-                                    route = await application.kernel.route_runtime_input(
-                                        task.task_id, routed_text,
+                                    dispatcher = ChatDispatcher(application.kernel)
+                                    dispatch = await dispatcher.dispatch_runtime_input(
+                                        task.task_id,
+                                        routed_text,
                                         f"input-{uuid4().hex}",
                                         explicit_intent=explicit,
                                         fallback_intent=(
@@ -1793,6 +1801,8 @@ async def _chat(
                                             else None
                                         ),
                                     )
+                                    route = dispatch.route
+                                    assert route is not None
                                     if route.intent is RuntimeInputIntent.STATUS_QUERY:
                                         await _print_chat_status(
                                             application, session, task.task_id, output_fn

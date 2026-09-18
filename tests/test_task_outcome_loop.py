@@ -1108,6 +1108,59 @@ class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
+    async def test_post_mutation_verification_drops_incompatible_outcome_ref(self):
+        """A copied implementation ref must not block the checking command."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, task = await self._prepared_app(root)
+            try:
+                current = await app.kernel.get_task_spec(task.task_id)
+                data = proposal("implement and verify")
+                data["outcomes"][0].update({
+                    "outcome_id": "implementation",
+                    "kind": "ANSWER",
+                    "required_effects": ["observe", "mutate"],
+                })
+                spec = TaskSpecSnapshot.from_proposal(
+                    task.task_id, 3, TaskSpecProposal.from_data(data),
+                    current.acceptance_criteria,
+                )
+                await app.kernel._append_events(task.task_id, ((
+                    "task_spec.revised", {"snapshot": spec.to_data()},
+                ),))
+                await app.kernel.write_workspace_text(
+                    task.task_id, "fixture-mutation", "changed.py",
+                    "value = 1\n", None,
+                )
+                command = ToolSpec(
+                    "core.run_command", "Run a command",
+                    {"type": "object", "properties": {}}, ToolRisk.R0,
+                    effect=ToolEffect.EXECUTE,
+                )
+
+                bound = await app.kernel._bind_tool_call_outcome(
+                    task.task_id, ToolCall(
+                        "verify", "core.run_command", {
+                            "argv": [".venv/bin/python", "-m", "pytest"],
+                            "mode": "foreground",
+                        }, outcome_ref="implementation",
+                    ), command,
+                )
+                self.assertIsNone(bound.outcome_ref)
+
+                with self.assertRaisesRegex(
+                    InvalidToolArguments, "OUTCOME_EFFECT_MISMATCH"
+                ):
+                    await app.kernel._bind_tool_call_outcome(
+                        task.task_id, ToolCall(
+                            "script", "core.run_command",
+                            {"argv": ["python", "generate.py"]},
+                            outcome_ref="implementation",
+                        ), command,
+                    )
+            finally:
+                await app.registry.stop_all()
+
     async def test_answer_outcome_stays_open_until_visible_answer_is_verified(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

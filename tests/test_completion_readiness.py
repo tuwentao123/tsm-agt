@@ -4,6 +4,7 @@ import hashlib
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from tsm_agt.adapters.builtin import CoreProcessToolProvider
@@ -17,15 +18,23 @@ from tsm_agt.adapters.rule_based_completion_readiness import (
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     AgentContinuationSuspended, AgentTurnCheckpoint, AgentTurnResult,
-    AgentTurnSuspended, ApprovalDecision, ProjectTrustLevel, TaskState,
-    TaskSpecProposal, TaskSpecSnapshot,
+    AgentTurnSuspended, ApprovalDecision, Kernel, ProjectTrustLevel,
+    TaskState, TaskSpecProposal, TaskSpecSnapshot, ToolCommitState,
+    ToolExecutionRecord,
+)
+from tsm_agt.core.kernel import (
+    _continuation_made_no_progress, _post_mutation_verification,
+    _post_mutation_verification_description,
+    _post_mutation_verification_observed,
 )
 from tsm_agt.ports import (
-    CompletionGap, CompletionReadinessAction, CompletionReadinessProbe,
+    CompletionGap, CompletionReadinessAction, CompletionReadinessDecision,
+    CompletionReadinessProbe,
     CompletionReadinessState, EvidenceQuestion, FinishReason, Message, MessageRole, ModelRequest,
     ModelResponse, ModelStreamCompleted, ModelTextDelta, ModelUsage,
     ProviderCapabilities, RuntimeStorePort, TextBlock, ToolCall, ToolCallBlock,
-    ToolEffect, ToolInvocationContext, ToolResult, ToolResultBlock,
+    ToolEffect, ToolIdempotency, ToolInvocationContext, ToolResult,
+    ToolResultBlock, ToolRisk,
 )
 
 
@@ -640,3 +649,208 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _VerificationFacts:
+    """Minimal duck-typed task for the post-mutation verification contract.
+
+    The contract only reads ``mutation_journal`` and ``tool_executions``, so a
+    stand-in keeps these cases about the predicate and its wording instead of
+    about building a whole TaskSnapshot.
+    """
+
+    def __init__(self, mutation_at, executions):
+        self.mutation_journal = (_Mutation(mutation_at),)
+        self.tool_executions = {
+            item.invocation_id: item for item in executions
+        }
+
+
+class _Mutation:
+    def __init__(self, created_at):
+        self.created_at = created_at
+
+
+def _execution(argv, exit_code, *, stderr="", at=None, name="core.run_command"):
+    moment = at or datetime(2026, 1, 2, tzinfo=timezone.utc)
+    return ToolExecutionRecord(
+        execution_id="turn-verify:" + argv[-1],
+        turn_id="turn-verify",
+        invocation_id="inv-" + argv[-1],
+        call=ToolCall("call-" + argv[-1], name, {"argv": list(argv)}),
+        payload_hash="payload",
+        policy_decision_id="policy",
+        effective_risk=ToolRisk.R0,
+        approval_request_id=None,
+        idempotency=ToolIdempotency.IDEMPOTENT,
+        idempotency_key=None,
+        state=ToolCommitState.COMMITTED,
+        result=ToolResult(
+            "call-" + argv[-1], True,
+            data={
+                "mode": "foreground", "status": "exited",
+                "exit_code": exit_code,
+                "stdout": {"text": "", "total_bytes": 0, "truncated": False},
+                "stderr": {
+                    "text": stderr, "total_bytes": len(stderr),
+                    "truncated": False,
+                },
+            },
+        ),
+        started_at=moment,
+        updated_at=moment,
+    )
+
+
+class PostMutationVerificationContractTest(unittest.TestCase):
+    """The requirement must say what counts, and why the last try did not."""
+
+    MUTATION_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def test_failed_recognized_attempt_is_reported_with_its_reason(self):
+        task = _VerificationFacts(self.MUTATION_AT, [_execution(
+            ["python3", "-m", "pytest", "tests"], 1,
+            stderr="/usr/bin/python3: No module named pytest\n",
+        )])
+        outcome = _post_mutation_verification(task)
+        self.assertFalse(outcome.passed)
+        self.assertEqual(
+            outcome.latest_argv, ("python3", "-m", "pytest", "tests")
+        )
+        self.assertEqual(outcome.latest_exit_code, 1)
+        observed = _post_mutation_verification_observed(
+            outcome, ".venv/bin/python"
+        )
+        self.assertIn("python3 -m pytest tests", observed)
+        self.assertIn("exited 1", observed)
+        self.assertIn("No module named pytest", observed)
+        self.assertIn(".venv/bin/python", observed)
+
+    def test_static_syntax_checks_never_satisfy_verification(self):
+        """P043 keeps compileall out of behavioral evidence; so does this."""
+        task = _VerificationFacts(self.MUTATION_AT, [_execution(
+            ["python3", "-m", "compileall", "-f", "src"], 0,
+        )])
+        self.assertFalse(_post_mutation_verification(task).passed)
+        description = _post_mutation_verification_description(
+            _post_mutation_verification(task)
+        )
+        self.assertIn("python -m pytest", description)
+        self.assertIn("compileall", description)
+
+    def test_successful_recognized_command_satisfies_verification(self):
+        task = _VerificationFacts(self.MUTATION_AT, [_execution(
+            [".venv/bin/python", "-m", "pytest", "tests"], 0,
+        )])
+        self.assertTrue(_post_mutation_verification(task).passed)
+
+    def test_attempt_before_the_latest_mutation_does_not_count(self):
+        task = _VerificationFacts(
+            datetime(2026, 2, 1, tzinfo=timezone.utc),
+            [_execution(
+                [".venv/bin/python", "-m", "pytest"], 0,
+                at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )],
+        )
+        self.assertFalse(_post_mutation_verification(task).passed)
+
+    def test_correction_message_carries_the_gap_and_its_observation(self):
+        gap = CompletionGap(
+            "post-mutation-verification", "POST_MUTATION_VERIFICATION",
+            "Only a recognized test or build command counts.",
+            "MISSING", required_effects=(ToolEffect.EXECUTE,),
+            candidate_tools=("core.run_command",),
+            observed="Last recognized attempt: `python3 -m pytest` exited 1.",
+        )
+        message = Kernel._completion_correction_message(
+            CompletionReadinessDecision(
+                CompletionReadinessAction.CONTINUE,
+                "required_capability_is_available",
+                CompletionReadinessState(), (gap,),
+            )
+        )
+        self.assertIn("Only a recognized test or build command counts.",
+                      message.text)
+        self.assertIn("exited 1", message.text)
+
+
+class ContinuationStallTest(unittest.IsolatedAsyncioTestCase):
+    """An unchanged requirement must not be retried forever."""
+
+    def test_no_progress_requires_identical_gaps_and_outcomes(self):
+        previous = {
+            "gap_ids": ["post-mutation-verification"],
+            "remaining_outcome_ids": ["implementation"],
+        }
+        self.assertTrue(_continuation_made_no_progress(
+            previous, ("post-mutation-verification",), ("implementation",),
+        ))
+        # Finishing anything resets the stall: real progress happened.
+        self.assertFalse(_continuation_made_no_progress(
+            previous, ("post-mutation-verification",), (),
+        ))
+        self.assertFalse(_continuation_made_no_progress(
+            previous, ("a-different-gap",), ("implementation",),
+        ))
+        self.assertFalse(_continuation_made_no_progress(
+            {}, ("post-mutation-verification",), ("implementation",),
+        ))
+        self.assertFalse(_continuation_made_no_progress(
+            previous, (), (),
+        ))
+
+    def test_stalled_counter_survives_state_serialization(self):
+        state = CompletionReadinessState(stalled_continuations=2)
+        restored = CompletionReadinessState.from_data(state.to_data())
+        self.assertEqual(restored.stalled_continuations, 2)
+
+    async def test_repeated_stall_reports_blocked_instead_of_continuing(self):
+        policy = RuleBasedCompletionReadinessPolicy()
+        await policy.start(None)  # type: ignore[arg-type]
+        gap = CompletionGap(
+            "post-mutation-verification", "POST_MUTATION_VERIFICATION",
+            "Run a recognized test.", "MISSING",
+            required_effects=(ToolEffect.EXECUTE,),
+        )
+        probe = CompletionReadinessProbe(
+            goal="verify the change", gaps=(gap,),
+            remaining_model_calls=6, remaining_tool_calls=6,
+            available_read_tools=("core.read_file",),
+            available_effects=frozenset({ToolEffect.EXECUTE}),
+        )
+
+        # First stall: still allowed to continue the work once.
+        first = await policy.evaluate(
+            probe, CompletionReadinessState(stalled_continuations=1)
+        )
+        self.assertIs(first.action, CompletionReadinessAction.CONTINUE)
+
+        # At the limit the same requirement is reported as a blocker, and the
+        # stall count keeps travelling with the state.
+        blocked = await policy.evaluate(
+            probe, CompletionReadinessState(stalled_continuations=2)
+        )
+        self.assertIs(blocked.action, CompletionReadinessAction.REPORT_BLOCKED)
+        self.assertEqual(
+            blocked.reason, "required_gaps_unchanged_across_continuations"
+        )
+        self.assertEqual(blocked.state.stalled_continuations, 2)
+
+    async def test_continue_keeps_the_stall_count(self):
+        policy = RuleBasedCompletionReadinessPolicy()
+        await policy.start(None)  # type: ignore[arg-type]
+        gap = CompletionGap(
+            "post-mutation-verification", "POST_MUTATION_VERIFICATION",
+            "Run a recognized test.", "MISSING",
+            required_effects=(ToolEffect.EXECUTE,),
+        )
+        decision = await policy.evaluate(
+            CompletionReadinessProbe(
+                goal="verify", gaps=(gap,), remaining_model_calls=6,
+                remaining_tool_calls=6, available_read_tools=(),
+                available_effects=frozenset({ToolEffect.EXECUTE}),
+            ),
+            CompletionReadinessState(stalled_continuations=1),
+        )
+        self.assertIs(decision.action, CompletionReadinessAction.CONTINUE)
+        self.assertEqual(decision.state.stalled_continuations, 1)

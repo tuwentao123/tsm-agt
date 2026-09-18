@@ -44,6 +44,7 @@ from .clarification import (
     ClarificationChoice, ClarificationKind, ClarificationNotPending, ClarificationRequest,
     ClarificationRequired, ClarificationTokenMismatch,
 )
+from .chat_dispatcher import ChatDispatcher, ChatDispatchResult
 from .kernel import Kernel, KernelDependencies
 from .replay import (
     FlowReplay, FlowReplayBoundary, FlowReplayFrame, FlowReplayIndex,
@@ -196,6 +197,8 @@ __all__ = [
     "ClarificationRequest",
     "ClarificationRequired",
     "ClarificationTokenMismatch",
+    "ChatDispatcher",
+    "ChatDispatchResult",
     "ProviderCapabilityMismatch",
     "InvalidModelResponse",
     "InvalidTaskTransition",
