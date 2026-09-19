@@ -267,8 +267,12 @@ class TaskSnapshot:
             state=target,
             created_at=self.created_at,
             updated_at=now or datetime.now(timezone.utc),
-            pending_approval=self.pending_approval,
-            pending_clarification=self.pending_clarification,
+            pending_approval=(
+                None if target.is_terminal else self.pending_approval
+            ),
+            pending_clarification=(
+                None if target.is_terminal else self.pending_clarification
+            ),
             tool_executions=self.tool_executions,
             background_processes=self.background_processes,
             project_trust=self.project_trust,

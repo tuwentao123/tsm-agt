@@ -139,25 +139,15 @@ class ChatSigintIntegrationTest(unittest.TestCase):
 
                 self.assertEqual(process.returncode, 130, (stdout, stderr))
                 self.assertLess(elapsed, 2.0)
-                # Planner/provider protocol fragments are internal state.  A
-                # user interrupt must preserve the resumable checkpoint without
-                # leaking an incomplete planning response into the transcript.
+                self.assertIn("session saved:", stdout)
                 self.assertNotIn("partial output", stdout)
-                self.assertIn("interrupted safely; resume with:", stdout)
                 self.assertNotIn("Traceback", stdout + stderr)
                 self.assertNotIn("CancelledError", stdout + stderr)
-                task_match = re.search(r"task: (task-[a-f0-9]+)", stdout)
-                self.assertIsNotNone(task_match, stdout)
-                task_id = task_match.group(1)
                 with sqlite3.connect(workspace / ".agent" / "runtime.db") as db:
                     row = db.execute(
-                        "SELECT data_json FROM runtime_tasks WHERE task_id = ?",
-                        (task_id,),
+                        "SELECT COUNT(*) FROM runtime_tasks"
                     ).fetchone()
-                self.assertIsNotNone(row)
-                task_data = json.loads(row[0])
-                self.assertEqual(task_data["state"], "INTERRUPTED")
-                self.assertIsNotNone(task_data["active_agent_checkpoint"])
+                self.assertEqual(row[0], 0)
         finally:
             _HangingSseHandler.release_response.set()
             server.shutdown()

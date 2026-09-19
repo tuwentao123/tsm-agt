@@ -67,6 +67,7 @@ from tsm_agt.ports import (
     HealthState,
     HealthStatus,
     Message,
+    MessageBlock,
     MessageRole,
     ModelProviderPort,
     ModelRequest,
@@ -235,11 +236,13 @@ from .working_memory import (
 )
 from .steering import SteeringKind, SteeringProjection, SteeringProjector
 from .runtime_input import (
-    QueuedFollowUp, RuntimeInputContext, RuntimeInputIntent, RuntimeInputRoute,
-    RuntimeInputRouter, SessionContinuationDecision, SessionContinuationMode,
-    SessionResumeCandidate, SessionResumeSafety,
-    SessionInputAction, SessionInputDecision, SessionInputGrounding,
-    SessionRouteDisposition, SessionTaskCatalogEntry, SessionTaskRelation,
+    ApprovalResolutionInput, CancelTaskInput, ClarificationReplyInput,
+    InterruptTaskInput, QueuedFollowUp, RuntimeInputContext,
+    RuntimeInputEvent, RuntimeInputIntent, RuntimeInputRoute, RuntimeInputRouter,
+    RuntimeTextInput, SessionContinuationDecision, SessionContinuationMode,
+    SessionResumeCandidate, SessionResumeSafety, SessionInputAction,
+    SessionInputDecision, SessionInputGrounding, SessionRouteDisposition,
+    SessionTaskCatalogEntry, SessionTaskRelation,
 )
 from .exploration_coordinator import (
     ExplorationCoordinator, ExplorationCoordinatorAction,
@@ -1465,7 +1468,7 @@ class Kernel:
             session_id, conversation, candidates
         )
         resolver = self._dependencies.session_input_resolver
-        if not catalog or (not candidates and resolver is None):
+        if resolver is None and not catalog:
             decision = SessionInputDecision(
                 SessionRouteDisposition.CREATE_TASK,
                 SessionTaskRelation.INDEPENDENT, None, normalized, 1.0,
@@ -1594,7 +1597,15 @@ class Kernel:
             resume_ids = {item.task_id for item in candidates}
             if source_task_id is not None and source_task_id not in catalog_by_id:
                 raise ValueError("resolver selected unknown Task")
-            if disposition is SessionRouteDisposition.RESUME_TASK:
+            if disposition is SessionRouteDisposition.ANSWER:
+                if (
+                    relation is not SessionTaskRelation.INDEPENDENT
+                    or source_task_id is not None
+                    or input_grounding is not SessionInputGrounding.SELF_CONTAINED
+                    or confidence < 0.85
+                ):
+                    raise ValueError("invalid direct Session answer")
+            elif disposition is SessionRouteDisposition.RESUME_TASK:
                 if (
                     relation is not SessionTaskRelation.CONTINUE
                     or source_task_id not in resume_ids
@@ -1735,10 +1746,18 @@ class Kernel:
         message_recency: dict[str, int] = {}
         for index, message in enumerate(reversed(conversation.messages)):
             message_recency.setdefault(message.task_id, index)
-        completed_ids = [
+        terminal_ids = [
             task_id for task_id in reversed(tuple(tasks))
             if task_id not in resume_by_id and tasks[task_id].state.is_terminal
-        ][:completed_limit]
+        ]
+        # The conversation anchor must stay visible even when many terminal
+        # Tasks exist.  A FAILED/SUCCEEDED Task is a valid follow-up referent,
+        # but it is only reachable if it survives the catalog truncation.
+        if anchor_id is not None and anchor_id in terminal_ids:
+            terminal_ids = [item for item in terminal_ids if item != anchor_id]
+            completed_ids = [anchor_id, *terminal_ids[: completed_limit - 1]]
+        else:
+            completed_ids = terminal_ids[:completed_limit]
         included_ids = set(resume_by_id) | set(completed_ids)
         ordered_ids = sorted(
             included_ids,
@@ -2028,6 +2047,98 @@ class Kernel:
             try:
                 await self._dependencies.store.commit_session(SessionUnitOfWork(
                     session_id, stored.version, session.to_data(), events
+                ))
+                return
+            except ValueError as error:
+                if "version conflict" not in str(error) or attempt == 2:
+                    raise
+
+    async def answer_session_message(
+        self,
+        session_id: str,
+        user_text: str,
+        on_text_delta: Callable[[str], None] | None = None,
+    ) -> str:
+        """Generate and persist a tool-free answer after route validation."""
+        normalized = user_text.strip()
+        if not normalized:
+            raise ValueError("session answer input must not be empty")
+        conversation = await self.get_session_conversation(session_id)
+        history = [
+            {"role": item.role.value, "text": item.text}
+            for item in conversation.messages[-12:]
+        ]
+        system = Message(
+            f"session-answer-system-{uuid4().hex}", MessageRole.SYSTEM,
+            (TextBlock(
+                "Answer the user's self-contained informational question. "
+                "Do not call tools, claim workspace or runtime facts, perform "
+                "actions, approve requests, or invent execution results. If the "
+                "question requires current files, runtime state, network data, or "
+                "an action, explain that it must be handled as an Agent Task."
+            ),),
+        )
+        user = Message(
+            f"session-answer-user-{uuid4().hex}", MessageRole.USER,
+            (TextBlock(json.dumps({
+                "boundary": "tool_free_session_answer",
+                "recent_messages": history,
+                "current_input": normalized,
+            }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))),),
+        )
+        response = await self._complete_agent_model_request(
+            ModelRequest(
+                turn_id=f"session-answer-{uuid4().hex}",
+                messages=(system, user), tools=(), max_output_tokens=1024,
+                allow_tool_calls=False, require_evidence_questions=False,
+            ),
+            on_text_delta,
+        )
+        if any(isinstance(block, ToolCallBlock) for block in response.message.content):
+            raise InvalidModelResponse("session answer attempted a tool call")
+        answer = response.message.text.strip()
+        if not answer:
+            raise InvalidModelResponse("session answer was empty")
+        await self.record_session_answer(session_id, normalized, answer)
+        return answer
+
+    async def record_session_answer(
+        self, session_id: str, user_text: str, answer_text: str,
+    ) -> None:
+        """Persist a direct, tool-free Session answer without creating a Task."""
+        normalized_user = user_text.strip()
+        normalized_answer = answer_text.strip()
+        if not normalized_user or not normalized_answer:
+            raise ValueError("session answer messages must not be empty")
+        for attempt in range(3):
+            stored = await self._dependencies.store.load_session(session_id)
+            if stored is None:
+                raise LookupError(f"session not found: {session_id}")
+            session = SessionSnapshot.from_data(stored.data)
+            self._authorize_session(session)
+            updated = session.bump_context()
+            user_message = Message(
+                f"msg-session-user-{uuid4().hex}", MessageRole.USER,
+                (TextBlock(normalized_user),),
+            )
+            assistant_message = Message(
+                f"msg-session-assistant-{uuid4().hex}", MessageRole.ASSISTANT,
+                (TextBlock(normalized_answer),),
+            )
+            event = SessionEvent(
+                f"sevt-{uuid4().hex}", session_id,
+                stored.last_event_sequence + 1, "session.chat_turn_recorded", {
+                    "user_message": user_message.to_data(),
+                    "assistant_message": assistant_message.to_data(),
+                    "content_hash": canonical_hash(
+                        assistant_message.to_data()
+                    ),
+                    "context_revision": updated.context_revision,
+                },
+            )
+            try:
+                await self._dependencies.store.commit_session(SessionUnitOfWork(
+                    session_id, stored.version, updated.to_data(), (event,)
                 ))
                 return
             except ValueError as error:
@@ -2468,6 +2579,53 @@ class Kernel:
         events = await self._dependencies.store.read_events(task_id)
         return SteeringProjector.project(task_id, events)
 
+    async def dispatch_input_event(
+        self,
+        event: RuntimeInputEvent,
+        *,
+        on_text_delta: Callable[[str], None] | None = None,
+        on_progress: Callable[[AgentProgress], None] | None = None,
+    ) -> (
+        RuntimeInputRoute | TaskSnapshot | AgentTurnResult | AgentTurnSuspended
+        | AgentClarificationSuspended
+    ):
+        """Route typed input before any semantic interpretation.
+
+        Protocol replies are resolved directly against their pending request;
+        only ``RuntimeTextInput`` may enter the ordinary-text route.
+        """
+        if isinstance(event, ApprovalResolutionInput):
+            return await self.resolve_agent_approval(
+                event.request_id, event.decision, event.reason,
+                on_text_delta=on_text_delta, on_progress=on_progress,
+            )
+        if isinstance(event, ClarificationReplyInput):
+            return await self.resolve_agent_clarification(
+                event.request_id, event.resume_token, event.answer,
+                selected_choice=event.selected_choice,
+                on_text_delta=on_text_delta, on_progress=on_progress,
+            )
+        if isinstance(event, InterruptTaskInput):
+            return await self.interrupt_agent_turn(event.task_id, event.reason)
+        if isinstance(event, CancelTaskInput):
+            task = await self.get_task(event.task_id)
+            if task.state is TaskState.CANCELLED:
+                return task
+            if task.state.is_terminal:
+                raise InvalidTurnState(
+                    f"terminal task {event.task_id} cannot be cancelled"
+                )
+            return await self.transition_task(
+                event.task_id, TaskState.CANCELLED, event.reason
+            )
+        if isinstance(event, RuntimeTextInput):
+            return await self.route_runtime_input(
+                event.task_id, event.text, event.input_id,
+                explicit_intent=event.explicit_intent,
+                fallback_intent=event.fallback_intent,
+            )
+        raise TypeError(f"unsupported runtime input event: {type(event)!r}")
+
     async def route_runtime_input(
         self, task_id: str, text: str, input_id: str, *,
         explicit_intent: RuntimeInputIntent | None = None,
@@ -2533,8 +2691,41 @@ class Kernel:
                 (task.pending_approval.risk.value
                  if task.pending_approval is not None else ""),
             )
+            classified_intent: RuntimeInputIntent | None = None
+            classified_confidence: float | None = None
+            classifier = self._dependencies.runtime_input_classifier
+            if (
+                explicit_intent is None
+                and not context.awaiting_approval
+                and not context.awaiting_clarification
+                and fallback_intent is None
+                and classifier is not None
+            ):
+                try:
+                    proposed = await classifier.classify_runtime_input(
+                        normalized, context.to_classifier_data()
+                    )
+                    candidate = RuntimeInputIntent(
+                        str(proposed.get("intent", "")).upper()
+                    )
+                    confidence = float(proposed.get("confidence", 0.0))
+                    if candidate in {
+                        RuntimeInputIntent.STEER, RuntimeInputIntent.REPLACE,
+                        RuntimeInputIntent.NEW_TASK_AFTER_CURRENT,
+                        RuntimeInputIntent.STATUS_QUERY,
+                    } and confidence >= 0.75:
+                        classified_intent = candidate
+                        classified_confidence = confidence
+                except (
+                    ValueError, TypeError, KeyError, TimeoutError,
+                    asyncio.TimeoutError,
+                ):
+                    # An unavailable semantic proposal must not change the Task.
+                    classified_intent = None
+                    classified_confidence = None
             route = RuntimeInputRouter().route(
-                normalized, context, explicit_intent, fallback_intent
+                normalized, context, explicit_intent, fallback_intent,
+                classified_intent, classified_confidence,
             )
             steering_kind = {
                 RuntimeInputIntent.STEER: SteeringKind.STEER,
@@ -8236,6 +8427,7 @@ class Kernel:
         self,
         task_id: str,
         user_text: str,
+        user_blocks: tuple[MessageBlock, ...] | None = None,
         max_model_calls: int | None = None,
         max_tool_calls: int | None = None,
         max_output_tokens: int | None = None,
@@ -8279,7 +8471,7 @@ class Kernel:
         user_message = Message(
             message_id=f"msg-{uuid4().hex}",
             role=MessageRole.USER,
-            content=(TextBlock(normalized_text),),
+            content=user_blocks or (TextBlock(normalized_text),),
         )
         visible_tools = await self.list_tools()
         capabilities = self._dependencies.model.capabilities
@@ -9145,7 +9337,10 @@ class Kernel:
         current = TaskSnapshot.from_data(stored.data)
         if current.state is TaskState.INTERRUPTED:
             return current
-        if current.state not in {TaskState.EXECUTING, TaskState.RUNNING_WORKFLOW}:
+        if current.state not in {
+            TaskState.EXECUTING, TaskState.RUNNING_WORKFLOW,
+            TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER,
+        }:
             raise InvalidTurnState(
                 f"task {task_id} cannot be interrupted from {current.state.value}"
             )

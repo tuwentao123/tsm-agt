@@ -568,8 +568,14 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(model.requests), 1)
         self.assertEqual(model.requests[0].max_provider_attempts, 1)
 
-    async def test_no_unfinished_task_bypasses_semantic_resolver(self):
-        resolver = FixtureResolver({})
+    async def test_no_history_uses_semantic_resolver(self):
+        resolver = FixtureResolver({
+            "disposition": "CREATE_TASK", "relation": "INDEPENDENT",
+            "source_task_id": None, "resolved_goal": "any ordinary input",
+            "input_grounding": "SELF_CONTAINED", "confidence": 0.96,
+            "reason_code": "self_contained_new_task", "clarification": None,
+            "candidate_task_ids": [],
+        })
         with tempfile.TemporaryDirectory() as directory:
             app = compose_fixture_application(
                 model_adapter=EchoModelProvider(), tool_adapters=(),
@@ -582,7 +588,7 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                     session.session_id, "any ordinary input", Path(directory)
                 )
                 self.assertEqual(decision.action, SessionInputAction.NEW_TASK)
-                self.assertEqual(resolver.inputs, [])
+                self.assertEqual(len(resolver.inputs), 1)
                 events = await app.kernel.dependencies.store.read_session_events(
                     session.session_id
                 )
@@ -648,5 +654,56 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     decision.reason_code, "semantic_router_protocol_degraded"
                 )
+            finally:
+                await app.registry.stop_all()
+
+
+class SessionAnswerTest(unittest.IsolatedAsyncioTestCase):
+    async def test_self_contained_answer_bypasses_task_creation(self):
+        resolver = FixtureResolver({
+            "disposition": "ANSWER",
+            "relation": "INDEPENDENT",
+            "source_task_id": None,
+            "resolved_goal": None,
+            "input_grounding": "SELF_CONTAINED",
+            "confidence": 0.96,
+            "reason_code": "self_contained_question",
+            "clarification": None,
+            "candidate_task_ids": [],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+                session_input_resolver_adapter=resolver,
+            )
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("answer only")
+                decision = await app.kernel.resolve_session_input(
+                    session.session_id, "What is a Session?", Path(directory)
+                )
+                self.assertEqual(
+                    decision.disposition, SessionRouteDisposition.ANSWER
+                )
+                self.assertEqual(
+                    await app.kernel.list_session_tasks(session.session_id), ()
+                )
+                await app.kernel.record_session_answer(
+                    session.session_id, "What is a Session?",
+                    "A Session is a durable conversation container.",
+                )
+                conversation = await app.kernel.get_session_conversation(
+                    session.session_id
+                )
+                self.assertEqual(
+                    [item.text for item in conversation.messages],
+                    [
+                        "What is a Session?",
+                        "A Session is a durable conversation container.",
+                    ],
+                )
+                self.assertTrue(all(
+                    item.task_id is None for item in conversation.messages
+                ))
             finally:
                 await app.registry.stop_all()

@@ -17,9 +17,9 @@ from tsm_agt.core import (
     AgentClarificationSuspended, AgentProgress, AgentTurnResult,
     AgentTurnSuspended,
     AgentContinuationSuspended,
-    ApprovalDecision, TaskSnapshot, TaskState, canonical_hash,
-    SteeringKind,
-    RuntimeInputIntent,
+    ApprovalDecision, ApprovalResolutionInput, ClarificationReplyInput,
+    InterruptTaskInput, RuntimeTextInput, TaskSnapshot, TaskState, canonical_hash,
+    SteeringKind, RuntimeInputIntent,
 )
 from tsm_agt.ports import RuntimeCommandRecord, RuntimeStorePort
 
@@ -398,7 +398,9 @@ class EngineeringAgentClient:
         self, task_id: str, *, command_id: str, reason: str,
     ) -> RuntimeCommandResult:
         async def execute():
-            task = await self.application.kernel.interrupt_agent_turn(task_id, reason)
+            task = await self.application.kernel.dispatch_input_event(
+                InterruptTaskInput(task_id, reason)
+            )
             runner = self._run_tasks.get(task_id)
             if runner is not None and not runner.done():
                 runner.cancel()
@@ -472,11 +474,11 @@ class EngineeringAgentClient:
                 ) from error
 
         async def execute():
-            return await self.application.kernel.route_runtime_input(
-                task_id, text, command_id, explicit_intent=explicit,
-                fallback_intent=(
-                    RuntimeInputIntent.STEER if explicit is None else None
-                ),
+            return await self.application.kernel.dispatch_input_event(
+                RuntimeTextInput(
+                    task_id, text, command_id, explicit,
+                    RuntimeInputIntent.STEER if explicit is None else None,
+                )
             )
 
         return await self._command(
@@ -518,8 +520,8 @@ class EngineeringAgentClient:
                 TaskSnapshot.from_data(stored.data).task_id if stored is not None
                 else ""
             )
-            result = await self.application.kernel.resolve_agent_approval(
-                request_id, decision, reason,
+            result = await self.application.kernel.dispatch_input_event(
+                ApprovalResolutionInput(request_id, decision, reason),
                 on_progress=(
                     (lambda item: self._record_progress(task_id, item))
                     if task_id else None
@@ -546,9 +548,10 @@ class EngineeringAgentClient:
                 TaskSnapshot.from_data(stored.data).task_id if stored is not None
                 else ""
             )
-            result = await self.application.kernel.resolve_agent_clarification(
-                request_id, resume_token, answer,
-                selected_choice=selected_choice,
+            result = await self.application.kernel.dispatch_input_event(
+                ClarificationReplyInput(
+                    request_id, resume_token, answer, selected_choice
+                ),
                 on_progress=(
                     (lambda item: self._record_progress(task_id, item))
                     if task_id else None

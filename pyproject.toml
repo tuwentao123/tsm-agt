@@ -5,6 +5,8 @@ description = "A pluggable engineering agent harness built with Ports and Adapte
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "prompt-toolkit==3.0.52",
+    "fastapi==0.115.0",
+    "uvicorn==0.30.6",
 ]
 
 [project.optional-dependencies]
@@ -14,6 +16,7 @@ dev = [
 
 [project.scripts]
 tsm-agt = "tsm_agt.cli:main"
+tsm-agt-web = "tsm_agt.web.app:main"
 
 [build-system]
 requires = ["hatchling==1.27.0"]

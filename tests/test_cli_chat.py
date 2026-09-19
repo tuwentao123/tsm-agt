@@ -177,7 +177,7 @@ class FixtureSessionInputResolver:
 
     async def resolve_session_input(self, text, context):
         self.contexts.append(dict(context))
-        if text in self.new_task_inputs:
+        if not context["unfinished_tasks"] or text in self.new_task_inputs:
             return {
                 "action": "NEW_TASK", "task_id": None,
                 "input_grounding": "SELF_CONTAINED",
@@ -541,7 +541,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             model = BlockingChatModel()
             application = compose_fixture_application(
                 model_adapter=model, tool_adapters=(),
-                runtime_input_classifier_adapter=FailingRuntimeInputClassifier(),
+                runtime_input_classifier_adapter=SteeringRuntimeInputClassifier(),
             )
             terminal = AsyncScriptedTerminal([
                 "initial request", "arbitrary payload 42", "/exit",
@@ -577,12 +577,12 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(routed.payload["intent"], "STEER")
                 self.assertEqual(
-                    routed.payload["reason_code"], "follow_up_mode_default"
+                    routed.payload["reason_code"], "semantic_runtime_routing"
                 )
             finally:
                 await application.registry.stop_all()
 
-    async def test_active_interrupted_task_resumes_without_semantic_router(self):
+    async def test_active_interrupted_task_resumes_after_initial_session_route(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = FailOnceChatModel()
@@ -622,7 +622,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(len(task_ids), 2)
             self.assertEqual(task_ids[0], task_ids[1])
-            self.assertEqual(resolver.contexts, [])
+            self.assertEqual(len(resolver.contexts), 1)
             await application.registry.start_all()
             try:
                 tasks = await application.kernel.list_session_tasks(session_id)
@@ -682,7 +682,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                     "正在继续上次意外中断的任务：inspect the interrupted target"
                     in line for line in output
                 ))
-                self.assertEqual(resolver.contexts, [])
+                self.assertEqual(len(resolver.contexts), 1)
             finally:
                 await application.registry.stop_all()
 
@@ -844,7 +844,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await application.registry.stop_all()
 
-    async def test_session_first_four_turn_journey_bypasses_semantic_router(self):
+    async def test_session_first_four_turn_journey_uses_semantic_router(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = RecordingChatModel()
@@ -865,7 +865,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                 output_fn=output.append, application_factory=lambda: application,
             )
             self.assertEqual(result, 0)
-            self.assertEqual(resolver.contexts, [])
+            self.assertEqual(len(resolver.contexts), 4)
             self.assertEqual(len(model.requests), 4)
             self.assertEqual(
                 [request.messages[-1].text for request in model.requests],
@@ -1126,3 +1126,96 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnsweringSessionInputResolver:
+    descriptor = AdapterDescriptor(
+        "fixture.answering-session-resolver", "1.0",
+        "SessionInputResolverPort", "1.0",
+    )
+
+    async def start(self, context):
+        pass
+
+    async def health(self):
+        return HealthStatus(HealthState.HEALTHY)
+
+    async def stop(self, deadline):
+        pass
+
+    async def resolve_session_input(self, text, context):
+        return {
+            "disposition": "ANSWER",
+            "relation": "INDEPENDENT",
+            "source_task_id": None,
+            "resolved_goal": None,
+            "input_grounding": "SELF_CONTAINED",
+            "confidence": 0.98,
+            "reason_code": "self_contained_question",
+            "clarification": None,
+            "candidate_task_ids": [],
+        }
+
+
+class SessionAnswerModel(EchoModelProvider):
+    async def complete(self, request):
+        return ModelResponse(
+            Message(
+                "session-answer", MessageRole.ASSISTANT,
+                (TextBlock("A Session is a durable conversation container."),),
+            ), FinishReason.STOP, ModelUsage(1, 1),
+        )
+
+
+class SessionAnswerCliTest(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_answer_does_not_create_or_plan_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = compose_fixture_application(
+                model_adapter=SessionAnswerModel(), tool_adapters=(),
+                session_input_resolver_adapter=AnsweringSessionInputResolver(),
+            )
+            output: list[str] = []
+            result = await _chat(
+                root, input_fn=ScriptedInput(["What is a Session?", "/exit"]),
+                output_fn=output.append, application_factory=lambda: application,
+            )
+            self.assertEqual(result, 0)
+            self.assertIn(
+                "agent> A Session is a durable conversation container.", output
+            )
+            self.assertFalse(any(line.startswith("task: ") for line in output))
+            session_id = next(
+                line.removeprefix("session: ") for line in output
+                if line.startswith("session: ")
+            )
+            await application.registry.start_all()
+            try:
+                self.assertEqual(
+                    await application.kernel.list_session_tasks(session_id), ()
+                )
+                conversation = await application.kernel.get_session_conversation(
+                    session_id
+                )
+                self.assertEqual(len(conversation.messages), 2)
+            finally:
+                await application.registry.stop_all()
+
+
+class SteeringRuntimeInputClassifier:
+    descriptor = AdapterDescriptor(
+        "fixture.steering-runtime-classifier", "1.0",
+        "RuntimeInputClassifierPort", "1.0",
+    )
+
+    async def start(self, context):
+        pass
+
+    async def health(self):
+        return HealthStatus(HealthState.HEALTHY)
+
+    async def stop(self, deadline):
+        pass
+
+    async def classify_runtime_input(self, text, context):
+        return {"intent": "STEER", "confidence": 0.95}

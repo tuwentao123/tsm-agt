@@ -13,8 +13,8 @@ from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.cli import _chat
 from tsm_agt.core import (
-    AgentClarificationSuspended, AgentTurnResult, ClarificationRequest,
-    AcceptanceStatus, ClarificationTokenMismatch, TaskState,
+    AgentClarificationSuspended, AgentTurnResult, ClarificationReplyInput,
+    ClarificationRequest, AcceptanceStatus, ClarificationTokenMismatch, TaskState,
 )
 from tsm_agt.ports import (
     AdapterDescriptor, EvidenceQuestion, FinishReason, Message, MessageRole, ModelRequest,
@@ -115,9 +115,10 @@ class ClarificationProtocolTest(unittest.IsolatedAsyncioTestCase):
                     )
                 still_waiting = await application.kernel.get_task(task.task_id)
                 self.assertEqual(still_waiting.state, TaskState.AWAITING_USER)
-
-                completed = await application.kernel.resolve_agent_clarification(
-                    suspended.request_id, suspended.resume_token, "dark"
+                completed = await application.kernel.dispatch_input_event(
+                    ClarificationReplyInput(
+                        suspended.request_id, suspended.resume_token, answer="dark"
+                    )
                 )
                 self.assertIsInstance(completed, AgentTurnResult)
                 assert isinstance(completed, AgentTurnResult)

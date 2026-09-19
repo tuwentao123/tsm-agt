@@ -29,14 +29,14 @@ class SessionConversationMessage:
     message_id: str
     role: MessageRole
     text: str
-    task_id: str
-    turn_id: str
+    task_id: str | None
+    turn_id: str | None
     source_event_sequence: int
 
     def __post_init__(self) -> None:
         if self.role not in (MessageRole.USER, MessageRole.ASSISTANT):
             raise ValueError("Session conversation only accepts user-visible roles")
-        if not all((self.message_id, self.text, self.task_id, self.turn_id)):
+        if not self.message_id or not self.text:
             raise ValueError("Session conversation message fields must not be empty")
         if self.source_event_sequence < 1:
             raise ValueError("source event sequence must be positive")
@@ -410,6 +410,17 @@ class SessionContextProjector:
                 if summary is not None:
                     task_summaries.pop(summary.task_id, None)
                     task_summaries[summary.task_id] = summary
+            elif event.event_type == "session.chat_turn_recorded":
+                for key, role in (("user_message", MessageRole.USER),
+                                  ("assistant_message", MessageRole.ASSISTANT)):
+                    projected = self._visible_message(
+                        event.payload.get(key), role, None, None, event.sequence
+                    )
+                    if projected is None or projected.message_id in seen_message_ids:
+                        continue
+                    seen_message_ids.add(projected.message_id)
+                    messages.append(projected)
+                    sources.add(event.sequence)
             elif event.event_type == "session.context_state_updated":
                 self._apply_explicit_state(explicit_state, event.payload)
                 sources.add(event.sequence)
@@ -508,6 +519,7 @@ class SessionContextProjector:
         visible_messages = projection.messages[-self.recent_visible_message_limit:]
         recent_task_ids = list(dict.fromkeys(
             message.task_id for message in reversed(visible_messages)
+            if message.task_id is not None
         ))[:self.detailed_task_summary_limit]
         recent_task_id_set = set(recent_task_ids)
         summaries_by_id = {item.task_id: item for item in projection.task_summaries}
@@ -945,10 +957,10 @@ class SessionContextProjector:
 
     @staticmethod
     def _visible_message(
-        raw: Any, expected_role: MessageRole, task_id: str, turn_id: str,
-        sequence: int,
+        raw: Any, expected_role: MessageRole, task_id: str | None,
+        turn_id: str | None, sequence: int,
     ) -> SessionConversationMessage | None:
-        if not isinstance(raw, Mapping) or not task_id or not turn_id:
+        if not isinstance(raw, Mapping):
             return None
         try:
             message = Message.from_data(raw)

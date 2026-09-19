@@ -34,6 +34,9 @@ from tsm_agt.core import (
     AgentClarificationSuspended,
     AgentContinuationSuspended,
     ApprovalDecision,
+    ApprovalResolutionInput,
+    ClarificationReplyInput,
+    InterruptTaskInput,
     ChatDispatcher,
     FlowNode,
     FlowNodeDiagnostic,
@@ -1180,6 +1183,7 @@ async def _chat(
             route_source_task_id = None
             route_relation = SessionTaskRelation.INDEPENDENT
             route_goal = prompt
+            session_answer_text: str | None = None
             session = await application.kernel.get_session(session.session_id)
             if explicit_resume_task is None and not explicit_new_task:
                 local_choice = (
@@ -1213,9 +1217,6 @@ async def _chat(
                             f"{route_source_task_id}"
                         )
                 else:
-                    # Ordinary language always reaches the main engineering
-                    # model. Harness chooses only the execution container from
-                    # durable state; it never classifies the message semantics.
                     if session.pending_interaction is not None:
                         await application.kernel.clear_pending_session_interaction(
                             session.session_id,
@@ -1224,15 +1225,61 @@ async def _chat(
                         session = await application.kernel.get_session(
                             session.session_id
                         )
-                    if session.active_task_id is not None:
-                        active = await application.kernel.get_task(
-                            session.active_task_id
-                        )
-                        if not active.state.is_terminal:
-                            explicit_resume_task = active.task_id
-                            state_selected_resume = True
+                    active = (
+                        await application.kernel.get_task(session.active_task_id)
+                        if session.active_task_id is not None else None
+                    )
+                    if active is not None and not active.state.is_terminal:
+                        explicit_resume_task = active.task_id
+                        state_selected_resume = True
+                    else:
+                        try:
+                            decision = await application.kernel.resolve_session_input(
+                                session.session_id, prompt, root
+                            )
+                        except (KeyboardInterrupt, asyncio.CancelledError):
+                            output_fn(
+                                f"session saved: {session.session_id} "
+                                f"(resume with: tsm-agt chat --session "
+                                f"{session.session_id})"
+                            )
+                            return 130
+                        if decision.disposition is SessionRouteDisposition.ANSWER:
+                            try:
+                                session_answer_text = (
+                                    await application.kernel.answer_session_message(
+                                        session.session_id, prompt
+                                    )
+                                )
+                            except (KeyboardInterrupt, asyncio.CancelledError):
+                                output_fn(
+                                    f"session saved: {session.session_id} "
+                                    f"(resume with: tsm-agt chat --session "
+                                    f"{session.session_id})"
+                                )
+                                return 130
+                        elif (
+                            decision.disposition
+                            is SessionRouteDisposition.RESUME_TASK
+                        ):
+                            explicit_resume_task = decision.source_task_id
+                        elif (
+                            decision.disposition
+                            is SessionRouteDisposition.CREATE_TASK
+                        ):
+                            route_source_task_id = decision.source_task_id
+                            route_relation = decision.relation
+                            route_goal = decision.resolved_goal or prompt
+                            prompt = route_goal
                         else:
-                            route_relation = SessionTaskRelation.CONTEXTUAL
+                            output_fn(
+                                decision.clarification
+                                or "无法确定这条输入要关联哪项任务，请补充说明。"
+                            )
+                            continue
+            if session_answer_text is not None:
+                output_fn(f"agent> {session_answer_text}")
+                continue
             selected_resume_task = explicit_resume_task
             if selected_resume_task is not None:
                 await application.kernel.clear_pending_session_interaction(
@@ -1616,8 +1663,8 @@ async def _chat(
                 async def run_current_agent():
                     if pending_approval_resolution is not None:
                         request_id, decision, reason = pending_approval_resolution
-                        return await application.kernel.resolve_agent_approval(
-                            request_id, decision, reason,
+                        return await application.kernel.dispatch_input_event(
+                            ApprovalResolutionInput(request_id, decision, reason),
                             on_text_delta=on_text_delta,
                             on_progress=on_progress,
                         )
@@ -1661,8 +1708,10 @@ async def _chat(
                                 live_text = ""
                             if live_text:
                                 if live_text in {"/exit", "/quit"}:
-                                    await application.kernel.interrupt_agent_turn(
-                                        task.task_id, "interactive chat exit"
+                                    await application.kernel.dispatch_input_event(
+                                        InterruptTaskInput(
+                                            task.task_id, "interactive chat exit"
+                                        )
                                     )
                                     agent_future.cancel()
                                     await asyncio.gather(
@@ -1739,8 +1788,10 @@ async def _chat(
                                 ):
                                     pass
                                 elif live_text == "/interrupt":
-                                    await application.kernel.interrupt_agent_turn(
-                                        task.task_id, "interactive user interrupt"
+                                    await application.kernel.dispatch_input_event(
+                                        InterruptTaskInput(
+                                            task.task_id, "interactive user interrupt"
+                                        )
                                     )
                                     agent_future.cancel()
                                     await asyncio.gather(
@@ -1794,10 +1845,7 @@ async def _chat(
                                         explicit_intent=explicit,
                                         fallback_intent=(
                                             RuntimeInputIntent.STEER
-                                            if follow_up_mode in {
-                                                FollowUpMode.AUTO,
-                                                FollowUpMode.STEER,
-                                            }
+                                            if follow_up_mode is FollowUpMode.STEER
                                             else None
                                         ),
                                     )
@@ -1838,7 +1886,9 @@ async def _chat(
                 except (KeyboardInterrupt, asyncio.CancelledError):
                     stop_heartbeat()
                     finish_stream()
-                    await application.kernel.interrupt_agent_turn(task.task_id)
+                    await application.kernel.dispatch_input_event(
+                        InterruptTaskInput(task.task_id)
+                    )
                     output_fn(
                         "interrupted safely; resume with: "
                         f"tsm-agt resume {task.task_id} --workspace {root}"
@@ -1918,9 +1968,11 @@ async def _chat(
                                 f"--workspace {root}"
                             )
                             return 0
-                        result = await application.kernel.resolve_agent_clarification(
-                            result.request_id, result.resume_token, answer,
-                            selected_choice=selected_choice,
+                        result = await application.kernel.dispatch_input_event(
+                            ClarificationReplyInput(
+                                result.request_id, result.resume_token, answer,
+                                selected_choice,
+                            ),
                             on_text_delta=on_text_delta, on_progress=on_progress,
                         )
                         if (
@@ -1962,15 +2014,18 @@ async def _chat(
                         "rejected interactively by the user"
                     )
                     try:
-                        result = await application.kernel.resolve_agent_approval(
-                            result.approval_request_id, decision, reason,
-                            on_text_delta=on_text_delta,
-                            on_progress=on_progress,
+                        result = await application.kernel.dispatch_input_event(
+                            ApprovalResolutionInput(
+                                result.approval_request_id, decision, reason
+                            ),
+                            on_text_delta=on_text_delta, on_progress=on_progress,
                         )
                     except (KeyboardInterrupt, asyncio.CancelledError):
                         stop_heartbeat()
                         finish_stream()
-                        await application.kernel.interrupt_agent_turn(task.task_id)
+                        await application.kernel.dispatch_input_event(
+                        InterruptTaskInput(task.task_id)
+                    )
                         output_fn(
                             "interrupted safely; resume with: "
                             f"tsm-agt resume {task.task_id} --workspace {root}"
@@ -2075,9 +2130,11 @@ async def _chat(
                     and current.active_agent_checkpoint is not None
                 ):
                     try:
-                        current = await application.kernel.interrupt_agent_turn(
-                            task.task_id,
-                            f"interactive execution stopped: {type(error).__name__}",
+                        current = await application.kernel.dispatch_input_event(
+                            InterruptTaskInput(
+                                task.task_id,
+                                f"interactive execution stopped: {type(error).__name__}",
+                            )
                         )
                     except (RuntimeError, ValueError):
                         pass
@@ -2143,8 +2200,8 @@ async def _resolve_agent_approval(
     )
     await application.registry.start_all()
     try:
-        result = await application.kernel.resolve_agent_approval(
-            request_id, decision, reason,
+        result = await application.kernel.dispatch_input_event(
+            ApprovalResolutionInput(request_id, decision, reason),
             on_progress=_print_standalone_agent_progress,
         )
         _print_agent_result(result)
@@ -2166,9 +2223,10 @@ async def _resolve_agent_clarification(
     )
     await application.registry.start_all()
     try:
-        result = await application.kernel.resolve_agent_clarification(
-            request_id, resume_token, answer,
-            selected_choice=selected_choice,
+        result = await application.kernel.dispatch_input_event(
+            ClarificationReplyInput(
+                request_id, resume_token, answer, selected_choice
+            ),
             on_progress=_print_standalone_agent_progress,
         )
         _print_agent_result(result)

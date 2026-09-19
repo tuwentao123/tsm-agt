@@ -75,6 +75,19 @@ class TextBlock:
 
 
 @dataclass(frozen=True, slots=True)
+class ImageBlock:
+    image_url: str
+    detail: str = "auto"
+
+    def to_data(self) -> dict[str, str]:
+        return {
+            "type": "input_image",
+            "image_url": self.image_url,
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ToolCallBlock:
     call: ToolCall
 
@@ -90,7 +103,9 @@ class ToolResultBlock:
         return {"type": "tool_result", **self.result.to_data()}
 
 
-MessageBlock = TextBlock | ToolCallBlock | ToolResultBlock
+MessageBlock = (
+    TextBlock | ImageBlock | ToolCallBlock | ToolResultBlock
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +139,11 @@ class Message:
             block_type = raw_block.get("type")
             if block_type == "text":
                 blocks.append(TextBlock(str(raw_block.get("text", ""))))
+            elif block_type == "input_image":
+                blocks.append(ImageBlock(
+                    image_url=str(raw_block.get("image_url", "")),
+                    detail=str(raw_block.get("detail", "auto")),
+                ))
             elif block_type == "tool_call":
                 blocks.append(ToolCallBlock(ToolCall.from_data(raw_block)))
             elif block_type == "tool_result":

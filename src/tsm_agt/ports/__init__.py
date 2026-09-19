@@ -9,7 +9,9 @@ from .adapter import (
 )
 from .model import (
     FinishReason,
+    ImageBlock,
     Message,
+    MessageBlock,
     MessageRole,
     ModelCallPurpose,
     ModelProviderPort,
@@ -176,6 +178,7 @@ __all__ = [
     "HealthState",
     "HealthStatus",
     "FinishReason",
+    "ImageBlock",
     "EvidenceQuestion",
     "ToolEffect",
     "ToolResultAuthority",
@@ -205,6 +208,7 @@ __all__ = [
     "ProjectMemoryPort",
     "StoredMemory",
     "Message",
+    "MessageBlock",
     "MessageRole",
     "ModelProviderPort",
     "ModelRequest",

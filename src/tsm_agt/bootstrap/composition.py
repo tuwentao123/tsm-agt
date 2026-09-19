@@ -63,6 +63,8 @@ from tsm_agt.adapters.resilient_model import ResilientModelProvider
 from tsm_agt.adapters.rule_based_model_recovery import (
     RuleBasedModelRecoveryPolicy,
 )
+from tsm_agt.adapters.model_runtime_input import ModelRuntimeInputClassifier
+from tsm_agt.adapters.model_session_input import ModelSessionInputResolver
 from tsm_agt.adapters.model_task_spec_planner import ModelTaskSpecPlanner
 from tsm_agt.adapters.local_process import LocalProcessExecutor
 from tsm_agt.adapters.local_flow_export import (
@@ -724,6 +726,14 @@ def compose_openai_compatible_readonly_application(
         )
     )
     registry.register(
+        RuntimeInputClassifierPort,
+        ModelRuntimeInputClassifier(registry.require(ModelProviderPort)),
+    )
+    registry.register(
+        SessionInputResolverPort,
+        ModelSessionInputResolver(registry.require(ModelProviderPort)),
+    )
+    registry.register(
         TaskSpecPlannerPort,
         ModelTaskSpecPlanner(registry.require(ModelProviderPort)),
     )
@@ -857,6 +867,14 @@ def compose_openai_compatible_engineering_application(
             physical_model, recovery_policy,
             max_provider_attempts=model_max_retries + 1,
         )
+    )
+    registry.register(
+        RuntimeInputClassifierPort,
+        ModelRuntimeInputClassifier(registry.require(ModelProviderPort)),
+    )
+    registry.register(
+        SessionInputResolverPort,
+        ModelSessionInputResolver(registry.require(ModelProviderPort)),
     )
     registry.register(
         TaskSpecPlannerPort,

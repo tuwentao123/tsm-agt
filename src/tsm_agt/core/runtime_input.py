@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
+from .approval import ApprovalDecision
 from .configuration import canonical_hash
 
 
@@ -78,6 +79,7 @@ class SessionContinuationDecision:
 class SessionInputAction(StrEnum):
     """Semantic action proposed for one ordinary Session input."""
 
+    ANSWER = "ANSWER"
     NEW_TASK = "NEW_TASK"
     RESUME_TASK = "RESUME_TASK"
     CLARIFY = "CLARIFY"
@@ -99,6 +101,7 @@ class SessionInputGrounding(StrEnum):
 class SessionRouteDisposition(StrEnum):
     """What Runtime should do after validating a semantic proposal."""
 
+    ANSWER = "ANSWER"
     CREATE_TASK = "CREATE_TASK"
     RESUME_TASK = "RESUME_TASK"
     CLARIFY = "CLARIFY"
@@ -175,6 +178,12 @@ class SessionInputDecision:
     def __post_init__(self) -> None:
         if not 0 <= self.confidence <= 1:
             raise ValueError("Session input confidence must be between 0 and 1")
+        if self.disposition is SessionRouteDisposition.ANSWER:
+            if (
+                self.relation is not SessionTaskRelation.INDEPENDENT
+                or self.source_task_id is not None
+            ):
+                raise ValueError("ANSWER requires an independent relation")
         if self.disposition is SessionRouteDisposition.RESUME_TASK:
             if not self.source_task_id:
                 raise ValueError("RESUME_TASK requires source_task_id")
@@ -193,6 +202,7 @@ class SessionInputDecision:
     def action(self) -> SessionInputAction:
         """Compatibility view for callers using the v1 action names."""
         return {
+            SessionRouteDisposition.ANSWER: SessionInputAction.ANSWER,
             SessionRouteDisposition.CREATE_TASK: SessionInputAction.NEW_TASK,
             SessionRouteDisposition.RESUME_TASK: SessionInputAction.RESUME_TASK,
             SessionRouteDisposition.CLARIFY: SessionInputAction.CLARIFY,
@@ -225,8 +235,89 @@ class RuntimeInputIntent(StrEnum):
     REVIEW_PENDING_ACTION = "REVIEW_PENDING_ACTION"
     STATUS_QUERY = "STATUS_QUERY"
     NEW_TASK_AFTER_CURRENT = "NEW_TASK_AFTER_CURRENT"
-    CLARIFICATION_ANSWER = "CLARIFICATION_ANSWER"
     AMBIGUOUS = "AMBIGUOUS"
+
+
+class InputChannel(StrEnum):
+    """Protocol-level source channels for inbound runtime input."""
+
+    TEXT = "TEXT"
+    APPROVAL = "APPROVAL"
+    CLARIFICATION = "CLARIFICATION"
+    INTERRUPT = "INTERRUPT"
+    CANCEL = "CANCEL"
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeTextInput:
+    """Ordinary text for a selected active Task; never a protocol reply."""
+
+    task_id: str
+    text: str
+    input_id: str
+    explicit_intent: RuntimeInputIntent | None = None
+    fallback_intent: RuntimeInputIntent | None = None
+
+    @property
+    def channel(self) -> InputChannel:
+        return InputChannel.TEXT
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalResolutionInput:
+    """Explicit user approval bound to one pending approval request."""
+
+    request_id: str
+    decision: ApprovalDecision
+    reason: str
+
+    @property
+    def channel(self) -> InputChannel:
+        return InputChannel.APPROVAL
+
+
+@dataclass(frozen=True, slots=True)
+class ClarificationReplyInput:
+    """Explicit user answer bound to one pending clarification request."""
+
+    request_id: str
+    resume_token: str
+    answer: str | None = None
+    selected_choice: str | None = None
+
+    @property
+    def channel(self) -> InputChannel:
+        return InputChannel.CLARIFICATION
+
+
+@dataclass(frozen=True, slots=True)
+class InterruptTaskInput:
+    """Explicit interruption command for one active Task."""
+
+    task_id: str
+    reason: str = "model invocation interrupted by user"
+
+    @property
+    def channel(self) -> InputChannel:
+        return InputChannel.INTERRUPT
+
+
+@dataclass(frozen=True, slots=True)
+class CancelTaskInput:
+    """Explicit cancellation command for one non-terminal Task."""
+
+    task_id: str
+    reason: str = "task cancelled by user"
+
+    @property
+    def channel(self) -> InputChannel:
+        return InputChannel.CANCEL
+
+
+RuntimeInputEvent = (
+    RuntimeTextInput | ApprovalResolutionInput | ClarificationReplyInput
+    | InterruptTaskInput | CancelTaskInput
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,6 +389,8 @@ class RuntimeInputRouter:
         self, text: str, context: RuntimeInputContext,
         explicit_intent: RuntimeInputIntent | None = None,
         fallback_intent: RuntimeInputIntent | None = None,
+        classified_intent: RuntimeInputIntent | None = None,
+        classified_confidence: float | None = None,
     ) -> RuntimeInputRoute:
         normalized = text.strip()
         if not normalized:
@@ -321,8 +414,23 @@ class RuntimeInputRouter:
             )
         if context.awaiting_clarification:
             return RuntimeInputRoute(
-                RuntimeInputIntent.CLARIFICATION_ANSWER, 0.98,
-                "pending_clarification", False,
+                RuntimeInputIntent.AMBIGUOUS, 1.0,
+                "clarification_requires_structured_reply", True,
+            )
+        if classified_intent is not None:
+            if classified_intent not in {
+                RuntimeInputIntent.STEER, RuntimeInputIntent.REPLACE,
+                RuntimeInputIntent.NEW_TASK_AFTER_CURRENT,
+                RuntimeInputIntent.STATUS_QUERY,
+                RuntimeInputIntent.REVIEW_PENDING_ACTION,
+            }:
+                raise ValueError("unsupported classified runtime input intent")
+            confidence = classified_confidence if classified_confidence is not None else 0.0
+            if not 0 <= confidence <= 1:
+                raise ValueError("classified runtime input confidence is invalid")
+            return RuntimeInputRoute(
+                classified_intent, confidence, "semantic_runtime_routing", False,
+                router_version="semantic-v1",
             )
         if fallback_intent is not None:
             if fallback_intent is not RuntimeInputIntent.STEER:

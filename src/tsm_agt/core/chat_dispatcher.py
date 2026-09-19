@@ -42,9 +42,6 @@ class ChatDispatcher:
         explicit_intent: RuntimeInputIntent | None = None,
         fallback_intent: RuntimeInputIntent | None = None,
     ) -> ChatDispatchResult:
-        if not self._allow_implicit_task_resume:
-            fallback_intent = None
-
         route = await self._kernel.route_runtime_input(
             task_id,
             text,

@@ -60,6 +60,13 @@ class ModelTaskSpecPlanner:
                 f"task-planner-system-{uuid4().hex}", MessageRole.SYSTEM,
                 (TextBlock(
                     "Translate the user request into a project-neutral Task SPEC. "
+                    "First classify the goal. If it asks to build, fix, implement, "
+                    "write, modify, refactor, deploy, run, or otherwise change the "
+                    "workspace, it is IMPLEMENTATION work and you MUST emit "
+                    "WORKSPACE_DELIVERY, COMMAND_RESULT, or ARTIFACT_DELIVERY "
+                    "outcomes carrying mutate or execute effects. An ANSWER outcome "
+                    "alone is forbidden for implementation work. ANSWER is only for "
+                    "a pure knowledge question that changes nothing. "
                     + (
                         "Call planner.submit_task_spec exactly once. "
                         if supports_tools else
@@ -74,10 +81,10 @@ class ModelTaskSpecPlanner:
                     "workspace, files, runtime state, or other tool-observable facts "
                     "must require observe (or use a separate EVIDENCE outcome). "
                     "Read-only observation may support an ANSWER without directly "
-                    "completing it. Submit exactly one ANSWER outcome per user "
-                    "question: a single reply is one deliverable, so never split it "
-                    "into chained conversational outcomes such as an analysis that "
-                    "another answer then depends on. Fold every requested part of "
+                    "completing it. For a pure knowledge question, submit exactly "
+                    "one ANSWER outcome: a single reply is one deliverable, so never "
+                    "split it into chained conversational outcomes such as an analysis "
+                    "that another answer then depends on. Fold every requested part of "
                     "the answer (analysis, judgement, recommendation) into that one "
                     "ANSWER description. Use separate outcomes only for work that is "
                     "genuinely delivered and accepted on its own, and write the "

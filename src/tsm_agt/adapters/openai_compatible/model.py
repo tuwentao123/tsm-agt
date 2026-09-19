@@ -35,7 +35,7 @@ from tsm_agt.ports import (
     RecoverableToolProtocolError,
     TextBlock,
     ToolCall,
-    EvidenceQuestion, ToolCallBlock,
+    EvidenceQuestion, ImageBlock, ToolCallBlock,
     ToolResultBlock,
 )
 
@@ -289,6 +289,7 @@ class OpenAICompatibleModelProvider:
         tools=True,
         parallel_tools=False,
         strict_json_schema=True,
+        vision=True,
         stream_cancel=True,
         context_window=128_000,
     )
@@ -350,7 +351,9 @@ class OpenAICompatibleModelProvider:
         )
         self.capabilities = ProviderCapabilities(
             tools=True, parallel_tools=False,
-            strict_json_schema=strict_tool_schema, stream_cancel=streaming,
+            strict_json_schema=strict_tool_schema,
+            vision=True,
+            stream_cancel=streaming,
             context_window=128_000,
         )
         self._transport = transport or UrllibHttpJsonTransport()
@@ -799,8 +802,23 @@ class OpenAICompatibleModelProvider:
             }
 
         data: dict[str, Any] = {"role": message.role.value}
-        text = message.text
-        data["content"] = text or None
+        provider_content: list[dict[str, Any]] = []
+        for block in message.content:
+            if isinstance(block, TextBlock):
+                provider_content.append({
+                    "type": "input_text",
+                    "text": block.text,
+                })
+            elif isinstance(block, ImageBlock):
+                provider_content.append({
+                    "type": "input_image",
+                    "image_url": {
+                        "url": block.image_url,
+                        "detail": block.detail,
+                    },
+                })
+
+        data["content"] = provider_content or (message.text or None)
         calls = [block.call for block in message.content if isinstance(block, ToolCallBlock)]
         if calls:
             unknown = [call.name for call in calls if call.name not in internal_to_provider]

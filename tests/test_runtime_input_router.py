@@ -81,7 +81,11 @@ class RuntimeInputRouterTest(unittest.TestCase):
                 "AWAITING_USER", awaiting_clarification=True
             )
         )
-        self.assertEqual(answer.intent, RuntimeInputIntent.CLARIFICATION_ANSWER)
+        self.assertEqual(answer.intent, RuntimeInputIntent.AMBIGUOUS)
+        self.assertEqual(
+            answer.reason_code, "clarification_requires_structured_reply"
+        )
+        self.assertTrue(answer.requires_confirmation)
         approval = self.router.route(
             "可以", RuntimeInputContext(
                 "AWAITING_APPROVAL", awaiting_approval=True
@@ -92,11 +96,12 @@ class RuntimeInputRouterTest(unittest.TestCase):
 
 
 class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
-    async def test_optional_classifier_cannot_change_ambiguous_input(self):
+    async def test_classifier_routes_high_confidence_live_input(self):
         with tempfile.TemporaryDirectory() as directory:
+            classifier = FixtureClassifier("REPLACE")
             app = compose_fixture_application(
                 model_adapter=EchoModelProvider(), tool_adapters=(),
-                runtime_input_classifier_adapter=FixtureClassifier(),
+                runtime_input_classifier_adapter=classifier,
             )
             await app.registry.start_all()
             try:
@@ -104,9 +109,9 @@ class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
                 route = await app.kernel.route_runtime_input(
                     task.task_id, "arbitrary payload 42", "classified-input"
                 )
-                self.assertEqual(route.intent, RuntimeInputIntent.AMBIGUOUS)
-                self.assertFalse(route.applied)
-                self.assertTrue(route.requires_confirmation)
+                self.assertEqual(route.intent, RuntimeInputIntent.REPLACE)
+                self.assertTrue(route.applied)
+                self.assertEqual(len(classifier.contexts), 1)
             finally:
                 await app.registry.stop_all()
 

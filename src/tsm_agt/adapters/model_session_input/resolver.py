@@ -11,7 +11,8 @@ from uuid import uuid4
 
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, FinishReason, HealthState, HealthStatus,
-    Message, MessageRole, ModelProviderPort, ModelRequest, TextBlock,
+    Message, MessageRole, ModelProviderPort, ModelRequest, ModelResponse,
+    ModelStreamCompleted, StreamingModelProviderPort, TextBlock,
     ModelCallPurpose, ToolCallBlock, ToolIdempotency, ToolRisk, ToolSpec,
     SessionRouteResolutionError,
 )
@@ -22,7 +23,7 @@ SESSION_ROUTE_PROPOSAL_SCHEMA = {
     "properties": {
         "disposition": {
             "type": "string",
-            "enum": ["CREATE_TASK", "RESUME_TASK", "CLARIFY"],
+            "enum": ["ANSWER", "CREATE_TASK", "RESUME_TASK", "CLARIFY"],
         },
         "relation": {
             "type": "string",
@@ -90,9 +91,13 @@ class ModelSessionInputResolver:
             f"session-input-system-{uuid4().hex}", MessageRole.SYSTEM,
             (TextBlock(
                 "Propose how to route one user message inside an engineering-"
-                "agent Session. Return disposition CREATE_TASK, RESUME_TASK, "
-                "or CLARIFY, separately from relation INDEPENDENT, CONTINUE, "
-                "FOLLOW_UP, BRANCH, or UNCERTAIN. CREATE_TASK+INDEPENDENT starts "
+                "agent Session. Return disposition ANSWER, CREATE_TASK, "
+                "RESUME_TASK, or CLARIFY, separately from relation INDEPENDENT, "
+                "CONTINUE, FOLLOW_UP, BRANCH, or UNCERTAIN. ANSWER is only for "
+                "a self-contained informational question that needs no workspace, "
+                "runtime state, network, tool, file, command, or Task mutation; "
+                "ANSWER must set relation INDEPENDENT and source_task_id null. "
+                "CREATE_TASK+INDEPENDENT starts "
                 "unrelated work. RESUME_TASK+CONTINUE resumes one unfinished "
                 "Task. CREATE_TASK+FOLLOW_UP or +BRANCH creates new work grounded "
                 "in a prior Task without reopening its checkpoint. CLARIFY is "
@@ -112,14 +117,21 @@ class ModelSessionInputResolver:
                 "decision; mere unfinished status is never sufficient. "
                 "When session.submit_route_proposal is supplied, call it exactly "
                 "once and return no prose. Otherwise return exactly one JSON "
-                "object with disposition, relation, "
-                "source_task_id, resolved_goal, input_grounding, confidence, "
-                "reason_code, clarification, candidate_task_ids. For derived "
+                "object with disposition, relation, source_task_id, resolved_goal, "
+                "input_grounding, confidence, reason_code, clarification, "
+                "candidate_task_ids. For derived "
                 "new work, resolved_goal must be a complete goal combining the "
                 "current request with the selected Task summary. source_task_id "
                 "must be null for INDEPENDENT and must exactly match task_catalog "
                 "for CONTINUE, FOLLOW_UP, or BRANCH. RESUME_TASK may select only "
-                "a non-terminal catalog entry. Selecting an entry only identifies which "
+                "a non-terminal catalog entry. A terminal Task (FAILED, SUCCEEDED, "
+                "CANCELLED) is never a RESUME_TASK target, but it IS a valid "
+                "CREATE_TASK+FOLLOW_UP or +BRANCH source: propose FOLLOW_UP with "
+                "that source when current_input explicitly refers back to it, by "
+                "continue/接着/那 phrasing or by naming its goal, topic, or artifact. "
+                "Never treat a terminal Task as the default referent; a "
+                "self-contained new goal stays CREATE_TASK+INDEPENDENT even when a "
+                "terminal Task exists. Selecting an entry only identifies which "
                 "Task the message refers to; it does not execute a checkpoint, "
                 "approve an action, answer a clarification, or grant authority. "
                 "Any supplied unfinished candidate may therefore be selected "
@@ -157,17 +169,17 @@ class ModelSessionInputResolver:
         messages = (system, user)
         last_error: SessionRouteResolutionError | None = None
         for attempt in (1, 2):
+            request = ModelRequest(
+                turn_id=f"session-input-{uuid4().hex}",
+                messages=messages, max_output_tokens=512,
+                tools=(submit_tool,) if supports_tools else (),
+                allow_tool_calls=supports_tools,
+                require_evidence_questions=False,
+                purpose=ModelCallPurpose.SESSION_ROUTING,
+                timeout_seconds=self._timeout_seconds, max_provider_attempts=1,
+            )
             response = await asyncio.wait_for(
-                self._model.complete(ModelRequest(
-                    turn_id=f"session-input-{uuid4().hex}",
-                    messages=messages, max_output_tokens=512,
-                    tools=(submit_tool,) if supports_tools else (),
-                    allow_tool_calls=supports_tools,
-                    require_evidence_questions=False,
-                    purpose=ModelCallPurpose.SESSION_ROUTING,
-                    timeout_seconds=self._timeout_seconds, max_provider_attempts=1,
-                )),
-                timeout=self._timeout_seconds + 1.0,
+                self._complete(request), timeout=self._timeout_seconds + 1.0,
             )
             try:
                 proposal = self._extract_proposal(
@@ -198,6 +210,18 @@ class ModelSessionInputResolver:
                 messages = messages + (response.message, correction)
         assert last_error is not None
         raise last_error
+
+    async def _complete(self, request: ModelRequest) -> ModelResponse:
+        """Consume streaming providers so session routing remains cancellable."""
+        if not isinstance(self._model, StreamingModelProviderPort):
+            return await self._model.complete(request)
+        completed: ModelResponse | None = None
+        async for event in self._model.stream_complete(request):
+            if isinstance(event, ModelStreamCompleted):
+                completed = event.response
+        if completed is None:
+            raise RuntimeError("session routing stream ended without a response")
+        return completed
 
     @staticmethod
     def _extract_proposal(
@@ -282,7 +306,7 @@ class ModelSessionInputResolver:
                 attempt=attempt, argument_keys=tuple(sorted(actual)),
             )
         if proposal["disposition"] not in {
-            "CREATE_TASK", "RESUME_TASK", "CLARIFY",
+            "ANSWER", "CREATE_TASK", "RESUME_TASK", "CLARIFY",
         } or proposal["relation"] not in {
             "INDEPENDENT", "CONTINUE", "FOLLOW_UP",
             "BRANCH", "UNCERTAIN",

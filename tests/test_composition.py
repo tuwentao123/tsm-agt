@@ -188,10 +188,10 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                 application.kernel.dependencies.default_max_output_tokens, 8192
             )
             self.assertEqual(
-                application.registry.all(SessionInputResolverPort), ()
+                len(application.registry.all(SessionInputResolverPort)), 1
             )
             self.assertEqual(
-                application.registry.all(RuntimeInputClassifierPort), ()
+                len(application.registry.all(RuntimeInputClassifierPort)), 1
             )
             model = application.registry.require(ModelProviderPort)
             self.assertTrue(model.capabilities.tools)
