@@ -718,6 +718,51 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
 
 
 class SessionAnswerTest(unittest.IsolatedAsyncioTestCase):
+    async def test_current_input_is_the_final_standalone_user_message(self):
+        model = JsonModel({"answer": "current request handled"})
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(
+                model_adapter=model, tool_adapters=(),
+            )
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("answer prompt")
+                for index in range(7):
+                    await app.kernel.record_session_answer(
+                        session.session_id,
+                        f"historical user request {index}",
+                        f"historical assistant answer {index}",
+                    )
+
+                current = (
+                    "为什么 Trace 节点显示 running，实际不是已经执行完了吗？"
+                )
+                await app.kernel.answer_session_message(
+                    session.session_id, current
+                )
+
+                request = model.requests[-1]
+                self.assertEqual(
+                    [message.role for message in request.messages],
+                    [MessageRole.SYSTEM, MessageRole.USER, MessageRole.USER],
+                )
+                self.assertEqual(request.messages[-1].text, current)
+                history = json.loads(request.messages[-2].text)
+                self.assertEqual(
+                    history["boundary"], "untrusted_session_history"
+                )
+                self.assertEqual(len(history["recent_messages"]), 12)
+                self.assertNotIn(
+                    current,
+                    [item["text"] for item in history["recent_messages"]],
+                )
+                self.assertNotIn("current_input", history)
+                self.assertIn("final User message", request.messages[0].text)
+                self.assertEqual(request.tools, ())
+                self.assertFalse(request.allow_tool_calls)
+            finally:
+                await app.registry.stop_all()
+
     async def test_self_contained_answer_bypasses_task_creation(self):
         resolver = FixtureResolver({
             "disposition": "ANSWER",

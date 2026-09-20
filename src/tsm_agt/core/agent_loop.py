@@ -301,6 +301,8 @@ class AgentTurnCheckpoint:
     active_outcome_ids: tuple[str, ...] = ()
     legacy_active_outcome_ids: bool = False
     pending_user_action: Mapping[str, Any] = field(default_factory=dict)
+    model_budget_renewal_count: int = 0
+    model_budget_total_granted: int = 0
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> AgentTurnCheckpoint:
@@ -326,6 +328,12 @@ class AgentTurnCheckpoint:
             max_tool_calls=int(data["max_tool_calls"]),
             max_output_tokens=int(data["max_output_tokens"]),
             tool_timeout_seconds=float(data["tool_timeout_seconds"]),
+            model_budget_renewal_count=int(
+                data.get("model_budget_renewal_count", 0)
+            ),
+            model_budget_total_granted=int(
+                data.get("model_budget_total_granted", 0)
+            ),
             workspace_fingerprint=str(data.get("workspace_fingerprint", "")),
             effective_config_hash=str(data.get("effective_config_hash", "")),
             toolset_hash=str(data.get("toolset_hash", "")),
@@ -405,6 +413,11 @@ class AgentTurnCheckpoint:
                 if isinstance(data.get("pending_user_action"), Mapping) else {}
             ),
         )
+        if (
+            checkpoint.model_budget_renewal_count < 0
+            or checkpoint.model_budget_total_granted < 0
+        ):
+            raise ValueError("agent checkpoint budget renewal values must not be negative")
         stored_hash = data.get("checkpoint_hash")
         if stored_hash is not None and str(stored_hash) != checkpoint.checkpoint_hash:
             legacy_content = checkpoint._content_data()
@@ -412,6 +425,7 @@ class AgentTurnCheckpoint:
                 "evidence_relation_state", "rejection_loop_state",
                 "exploration_outcome_state", "evidence_question_state",
                 "completion_readiness_state",
+                "model_budget_renewal_count", "model_budget_total_granted",
                 "task_spec_revision", "task_spec_hash",
                 "execution_focus", "active_outcome_ids",
                 "pending_user_action", "tool_batch",
@@ -444,6 +458,8 @@ class AgentTurnCheckpoint:
             "max_tool_calls": self.max_tool_calls,
             "max_output_tokens": self.max_output_tokens,
             "tool_timeout_seconds": self.tool_timeout_seconds,
+            "model_budget_renewal_count": self.model_budget_renewal_count,
+            "model_budget_total_granted": self.model_budget_total_granted,
             "workspace_fingerprint": self.workspace_fingerprint,
             "effective_config_hash": self.effective_config_hash,
             "toolset_hash": self.toolset_hash,

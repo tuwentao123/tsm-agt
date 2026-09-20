@@ -18,7 +18,7 @@ from tsm_agt.local_api import LocalEventApiServer
 from tsm_agt.ports import ImageBlock
 
 app = FastAPI(title="tsm-agt-web")
-WEBUI_VERSION = "deepseek-cn-v20260920-restore"
+WEBUI_VERSION = "deepseek-cn-v20260921-session-timeline-order"
 
 INDEX_HTML = """
 <!doctype html>
@@ -61,7 +61,25 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .topbar{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 20px;border-bottom:1px solid var(--border)}
 #conversation-name{font-weight:500}
 .topbar .icon-btn{font-size:12px}
+.chat-shell{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.view-switcher{display:flex;align-items:center;justify-content:space-between;padding:12px 20px 0;gap:12px}
+.view-tabs{display:flex;gap:8px}
+.view-tab{padding:8px 14px;border:1px solid var(--border);color:var(--muted);background:#16181b}
+.view-tab.active{background:#273246;border-color:#3d5d92;color:#fff}
+.view-summary{font-size:12px;color:var(--muted)}
 .chat-area{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:20px;display:flex;flex-direction:column;gap:10px}
+.trace-board{display:grid;grid-template-columns:minmax(0,1.2fr) 320px;gap:18px;align-items:start}
+.trace-main{display:flex;flex-direction:column;gap:14px}
+.trace-sidebar{position:sticky;top:0;display:flex;flex-direction:column;gap:12px}
+.trace-summary-card,.trace-legend{background:#16181b;border:1px solid var(--border);border-radius:12px;padding:14px}
+.trace-summary-title{font-size:13px;font-weight:600;margin-bottom:10px}
+.trace-metric-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.trace-metric{background:#1d2025;border-radius:10px;padding:10px}
+.trace-metric-label{font-size:11px;color:var(--muted)}
+.trace-metric-value{font-size:18px;font-weight:600;margin-top:4px}
+.trace-legend-item{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px}
+.trace-dot{width:10px;height:10px;border-radius:50%}
+.trace-dot.running{background:#8ab4f8}.trace-dot.waiting{background:#f0c674}.trace-dot.done{background:#81c995}.trace-dot.failed{background:#f4837a}
 .message{max-width:70%;word-break:break-word}
 .message-body{white-space:pre-wrap}
 .message-images{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
@@ -69,6 +87,40 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .message.user{align-self:flex-end;background:#2f3a4f;padding:8px 12px;border-radius:12px 12px 2px 12px}
 .message.assistant{align-self:flex-start;background:var(--panel);padding:8px 12px;border-radius:12px 12px 12px 2px}
 .message.system{align-self:flex-start;max-width:100%;color:var(--muted);font-size:12px;padding:0 2px}
+.message.task{align-self:stretch;max-width:100%;padding:0}
+.task-card{border:1px solid var(--border);border-radius:14px;background:#151719;padding:14px;display:flex;flex-direction:column;gap:12px;box-shadow:0 10px 30px rgba(0,0,0,.18)}
+.task-card-header{display:flex;justify-content:space-between;gap:12px;align-items:center}
+.task-card-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.task-phase-badge{padding:3px 8px;border-radius:999px;font-size:11px;background:#22262c;color:var(--muted);border:1px solid #31353c}
+.task-card-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.task-summary-item{background:#1c1f24;border-radius:10px;padding:10px}
+.task-summary-label{font-size:11px;color:var(--muted)}
+.task-summary-value{margin-top:4px;font-size:13px;font-weight:600}
+.task-view-tabs{display:flex;gap:8px;padding-bottom:4px;border-bottom:1px solid var(--border)}
+.task-view-tab{padding:6px 12px;border:1px solid var(--border);border-radius:999px;color:var(--muted)}
+.task-view-tab.active{background:#253246;border-color:#40639f;color:#fff}
+.task-panel{display:none}
+.task-panel.active{display:flex;flex-direction:column}
+.task-progress{display:flex;flex-direction:column;gap:8px}
+.task-progress-line{font-size:12px;color:var(--muted);white-space:pre-wrap;word-break:break-word;background:#1a1d21;border:1px solid #252932;border-radius:10px;padding:10px 12px}
+.task-progress-empty{font-size:12px;color:#686d75}
+.trace-timeline{position:relative;display:flex;flex-direction:column;gap:12px;padding-left:18px}
+.trace-timeline::before{content:'';position:absolute;left:5px;top:4px;bottom:4px;width:1px;background:#31353c}
+.trace-step{position:relative;padding:12px 14px;border-radius:12px;background:#1a1d21;border:1px solid #2b3038}
+.trace-step::before{content:'';position:absolute;left:-18px;top:18px;width:10px;height:10px;border-radius:50%;background:#5b8cff;border:2px solid #111213}
+.trace-step.done::before{background:#81c995}.trace-step.waiting::before{background:#f0c674}.trace-step.failed::before{background:#f4837a}
+.trace-step-header{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.trace-step-title{font-size:13px;font-weight:600}
+.trace-step-meta{font-size:11px;color:var(--muted)}
+.trace-step-body{margin-top:8px;font-size:12px;color:#c7cbd1;white-space:pre-wrap;word-break:break-word}
+.task-card-header{display:flex;justify-content:space-between;gap:12px;align-items:center}
+.task-card-title{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task-card-state{font-size:12px;color:var(--muted);flex:none}
+.task-card-state.running{color:#8ab4f8}.task-card-state.waiting{color:#f0c674}.task-card-state.failed{color:#f4837a}.task-card-state.done{color:#81c995}
+.task-progress{display:flex;flex-direction:column;gap:3px;border-top:1px solid var(--border);padding-top:7px}
+.task-progress-line{font-size:12px;color:var(--muted);white-space:pre-wrap;word-break:break-word}
+.task-progress-empty{font-size:12px;color:#686d75}
+.task-card .message.approval{max-width:100%;align-self:stretch;margin-top:2px}
 .message.approval{align-self:flex-start;max-width:85%;background:var(--panel);border:1px solid #6b4f1d;border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:6px}
 .approval-title{font-weight:600;color:#f0c674}
 .approval-row{font-size:12px;color:var(--muted);word-break:break-all}
@@ -95,7 +147,7 @@ textarea{width:100%;min-height:48px;max-height:180px;background:none;border:none
 .loading,.error-banner{display:none;font-size:13px;color:var(--muted);padding:0 20px}
 .loading.visible,.error-banner.visible{display:block}
 .error-banner{color:#f4837a}
-@media(max-width:900px){.layout{grid-template-columns:1fr;height:auto}.sidebar{border-right:none;border-bottom:1px solid var(--border)}}
+@media(max-width:900px){.layout{grid-template-columns:1fr;height:auto}.sidebar{border-right:none;border-bottom:1px solid var(--border)}.trace-board{grid-template-columns:1fr}.trace-sidebar{position:static}.task-card-summary{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -125,7 +177,16 @@ textarea{width:100%;min-height:48px;max-height:180px;background:none;border:none
 
     <div id=\"error-banner\" class=\"error-banner\"></div>
     <div id=\"loading\" class=\"loading\">正在等待运行结果…</div>
-    <section id=\"chat-area\" class=\"chat-area\"></section>
+    <div class=\"chat-shell\">
+      <div class=\"view-switcher\">
+        <div class=\"view-tabs\">
+          <button id=\"conversation-tab\" class=\"view-tab active\" onclick=\"switchPrimaryView('conversation')\">Conversation</button>
+          <button id=\"trace-tab\" class=\"view-tab\" onclick=\"switchPrimaryView('trace')\">Trace</button>
+        </div>
+        <div id=\"view-summary\" class=\"view-summary\">聚焦当前对话与执行过程</div>
+      </div>
+      <section id=\"chat-area\" class=\"chat-area\"></section>
+    </div>
 
     <div class=\"composer\">
       <div id=\"preview-list\" class=\"preview-list\"></div>
@@ -148,6 +209,7 @@ const conversations = [];
 const ACTIVE_WORKSPACE_STORAGE_KEY = 'tsm-agt.active-workspace';
 let activeConversationId = null;
 let activeWorkspaceId = localStorage.getItem(ACTIVE_WORKSPACE_STORAGE_KEY);
+let activePrimaryView = 'conversation';
 
 function getConversationById(conversationId) {
   return conversations.find((item) => item.id === conversationId);
@@ -326,6 +388,16 @@ function renderConversations() {
   document.getElementById('conversation-name').textContent = active?.title || '新建会话';
 }
 
+function switchPrimaryView(view) {
+  activePrimaryView = view;
+  document.getElementById('conversation-tab').classList.toggle('active', view === 'conversation');
+  document.getElementById('trace-tab').classList.toggle('active', view === 'trace');
+  document.getElementById('view-summary').textContent = view === 'trace'
+    ? '按阶段查看 Agent 执行链路、状态与关键事件'
+    : '聚焦用户对话、结果输出与上下文交流';
+  renderMessages();
+}
+
 function renderMessages() {
   const active = getActiveConversation();
   const chatArea = document.getElementById('chat-area');
@@ -362,11 +434,19 @@ function renderMessages() {
     return;
   }
 
+  if (activePrimaryView === 'trace') {
+    renderTraceView(chatArea, active);
+    chatArea.scrollTop = 0;
+    return;
+  }
+
   active.messages.forEach((message) => {
     const element = document.createElement('div');
     element.className = `message ${message.role}`;
     const text = String(message.content ?? '').trim();
-    if (message.role === 'approval') {
+    if (message.role === 'task') {
+      renderTaskCard(element, message, active.id);
+    } else if (message.role === 'approval') {
       renderApprovalCard(element, message);
     } else if (message.role === 'system') {
       element.textContent = text;
@@ -398,6 +478,327 @@ function renderMessages() {
 }
 
 const 风险文案 = { R0: '无副作用', R1: '低风险', R2: '需授权', R3: '高风险' };
+
+function taskStateClass(phase1State) {
+  if (phase1State === 'DONE') return 'done';
+  if (phase1State === 'FAILED' || phase1State === 'CANCELLED') return 'failed';
+  if (phase1State === 'WAITING' || phase1State === 'INTERRUPTED') return 'waiting';
+  return 'running';
+}
+
+function traceStateForProgress(progress) {
+  const kind = progress?.kind || '';
+  if (kind === 'tool_completed') {
+    return progress.ok === false || progress.error_code ? 'failed' : 'done';
+  }
+  if (kind === 'model_completed') return 'done';
+  if (kind === 'waiting') return 'waiting';
+  if (kind === 'tool_started' || kind === 'model_started') return 'running';
+  return progress?.ok === false ? 'failed' : 'running';
+}
+
+function buildTraceSteps(task) {
+  const steps = [];
+  const pendingTools = [];
+  let pendingModel = null;
+  (task.progress || []).forEach((item) => {
+    const progress = item.progressData || {};
+    const kind = progress.kind || '';
+    const toolName = progress.tool_name || progress.operation || '';
+    const sequence = Number(item.sequence || 0);
+    const text = item.text || '执行中';
+    if (kind === 'tool_started') {
+      steps.push({
+        title: toolName ? `调用工具：${toolName}` : '调用工具',
+        body: text, state: 'running',
+        meta: `#${sequence || steps.length + 1}`,
+        startSequence: sequence, toolName,
+      });
+      pendingTools.push(steps.length - 1);
+      return;
+    }
+    if (kind === 'tool_completed') {
+      const index = pendingTools.findLastIndex((candidate) => {
+        const step = steps[candidate];
+        return step.state === 'running'
+          && (!toolName || !step.toolName || step.toolName === toolName);
+      });
+      const state = traceStateForProgress(progress);
+      if (index >= 0) {
+        const stepIndex = pendingTools.splice(index, 1)[0];
+        const step = steps[stepIndex];
+        step.state = state;
+        step.body = `${step.body}\n${text}`;
+        step.meta = `#${step.startSequence || sequence}–#${sequence}`;
+      } else {
+        steps.push({
+          title: toolName ? `工具结果：${toolName}` : '工具结果',
+          body: text, state,
+          meta: `#${sequence || steps.length + 1}`,
+          startSequence: sequence, toolName,
+        });
+      }
+      return;
+    }
+    if (kind === 'model_started') {
+      steps.push({
+        title: '模型调用', body: text, state: 'running',
+        meta: `#${sequence || steps.length + 1}`,
+        startSequence: sequence,
+      });
+      pendingModel = steps.length - 1;
+      return;
+    }
+    if (kind === 'model_completed' && pendingModel !== null) {
+      const step = steps[pendingModel];
+      step.state = 'done';
+      step.body = `${step.body}\n${text}`;
+      step.meta = `#${step.startSequence || sequence}–#${sequence}`;
+      pendingModel = null;
+      return;
+    }
+    steps.push({
+      title: kind === 'waiting' ? '等待用户操作' : '运行事件',
+      body: text,
+      state: traceStateForProgress(progress),
+      meta: `#${sequence || steps.length + 1}`,
+      startSequence: sequence,
+    });
+  });
+  if (task.waiting) {
+    const approval = task.waiting.approval;
+    steps.push({
+      title: task.waiting.kind === 'APPROVAL'
+        ? '等待用户授权' : '等待用户输入',
+      body: approval?.action || task.waiting.question || '任务已暂停，等待用户操作。',
+      state: 'waiting',
+      meta: approval?.request_id || 'pending',
+      startSequence: 0,
+    });
+  }
+  return steps.slice(-12);
+}
+
+function renderTraceView(chatArea, conversation) {
+  const tasks = conversation.messages.filter((item) => item.role === 'task');
+  const board = document.createElement('div');
+  board.className = 'trace-board';
+
+  const main = document.createElement('div');
+  main.className = 'trace-main';
+
+  if (tasks.length === 0) {
+    main.innerHTML = `<div class='empty-state'><h2>暂无执行链路</h2><div>发送任务后会生成 Agent Trace Timeline</div></div>`;
+  } else {
+    tasks.forEach((message) => {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'message task';
+      renderTaskCard(wrapper, message, conversation.id, 'trace');
+      main.appendChild(wrapper);
+    });
+  }
+
+  const sidebar = document.createElement('div');
+  sidebar.className = 'trace-sidebar';
+  const summary = document.createElement('div');
+  summary.className = 'trace-summary-card';
+  const taskCount = tasks.length;
+  const runningCount = tasks.filter((item) => item.task?.phase1State === 'RUNNING').length;
+  const waitingCount = tasks.filter((item) => item.task?.phase1State === 'WAITING').length;
+  summary.innerHTML = `
+    <div class='trace-summary-title'>执行流程总览</div>
+    <div class='trace-metric-grid'>
+      <div class='trace-metric'><div class='trace-metric-label'>任务节点</div><div class='trace-metric-value'>${taskCount}</div></div>
+      <div class='trace-metric'><div class='trace-metric-label'>运行中</div><div class='trace-metric-value'>${runningCount}</div></div>
+      <div class='trace-metric'><div class='trace-metric-label'>等待确认</div><div class='trace-metric-value'>${waitingCount}</div></div>
+      <div class='trace-metric'><div class='trace-metric-label'>会话消息</div><div class='trace-metric-value'>${conversation.messages.length}</div></div>
+    </div>
+  `;
+  const legend = document.createElement('div');
+  legend.className = 'trace-legend';
+  legend.innerHTML = `
+    <div class='trace-summary-title'>状态图例</div>
+    <div class='trace-legend-item'><span class='trace-dot running'></span>执行中</div>
+    <div class='trace-legend-item'><span class='trace-dot waiting'></span>等待用户操作</div>
+    <div class='trace-legend-item'><span class='trace-dot done'></span>已完成阶段</div>
+    <div class='trace-legend-item'><span class='trace-dot failed'></span>失败或中断</div>
+  `;
+  sidebar.append(summary, legend);
+  board.append(main, sidebar);
+  chatArea.appendChild(board);
+}
+
+function renderTaskCard(element, message, conversationId, mode = 'conversation') {
+  const task = message.task || {};
+  const card = document.createElement('div');
+  card.className = 'task-card';
+  const header = document.createElement('div');
+  header.className = 'task-card-header';
+  const title = document.createElement('div');
+  title.className = 'task-card-title';
+  title.textContent = task.goal || `任务 ${String(task.taskId || '').slice(0, 8)}`;
+  const state = document.createElement('div');
+  state.className = `task-card-state ${taskStateClass(task.phase1State)}`;
+  state.textContent = 状态文案[task.phase1State] || task.phase1State || '准备中';
+  header.append(title, state);
+  card.appendChild(header);
+
+  const meta = document.createElement('div');
+  meta.className = 'task-card-meta';
+  meta.innerHTML = `
+    <span class='task-phase-badge'>${task.status || 'running'}</span>
+    <span class='task-phase-badge'>${task.taskId || 'task'}</span>
+  `;
+  card.appendChild(meta);
+
+  const summary = document.createElement('div');
+  summary.className = 'task-card-summary';
+  const progressCount = (task.progress || []).length;
+  summary.innerHTML = `
+    <div class='task-summary-item'><div class='task-summary-label'>当前阶段</div><div class='task-summary-value'>${状态文案[task.phase1State] || task.phase1State || '准备中'}</div></div>
+    <div class='task-summary-item'><div class='task-summary-label'>流程事件</div><div class='task-summary-value'>${progressCount}</div></div>
+    <div class='task-summary-item'><div class='task-summary-label'>执行状态</div><div class='task-summary-value'>${task.waiting ? '等待输入' : '持续执行'}</div></div>
+  `;
+  card.appendChild(summary);
+
+  const tabBar = document.createElement('div');
+  tabBar.className = 'task-view-tabs';
+  tabBar.innerHTML = `
+    <button class='task-view-tab ${mode === 'conversation' ? 'active' : ''}'>Conversation</button>
+    <button class='task-view-tab ${mode === 'trace' ? 'active' : ''}'>Trace Timeline</button>
+  `;
+  card.appendChild(tabBar);
+
+  const progress = document.createElement('div');
+  progress.className = `task-progress task-panel ${mode === 'conversation' ? 'active' : ''}`;
+  const lines = task.progress || [];
+  if (lines.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'task-progress-empty';
+    empty.textContent = task.phase1State === 'WAITING'
+      ? '该任务正在等待处理，不会自动重放历史执行日志。'
+      : '暂无新的执行进度';
+    progress.appendChild(empty);
+  } else {
+    lines.slice(-30).forEach((item) => {
+      const line = document.createElement('div');
+      line.className = 'task-progress-line';
+      line.textContent = item.text;
+      progress.appendChild(line);
+    });
+  }
+  card.appendChild(progress);
+
+  const tracePanel = document.createElement('div');
+  tracePanel.className = `task-panel ${mode === 'trace' ? 'active' : ''}`;
+  const timeline = document.createElement('div');
+  timeline.className = 'trace-timeline';
+  const steps = buildTraceSteps(task);
+  if (steps.length === 0) {
+    const emptyTrace = document.createElement('div');
+    emptyTrace.className = 'task-progress-empty';
+    emptyTrace.textContent = '等待 Agent 产生执行事件后，这里会展示完整 Timeline。';
+    tracePanel.appendChild(emptyTrace);
+  } else {
+    steps.forEach((step) => {
+      const item = document.createElement('div');
+      item.className = `trace-step ${step.state}`;
+      item.innerHTML = `
+        <div class='trace-step-header'>
+          <div>
+            <div class='trace-step-title'>${step.title}</div>
+            <div class='trace-step-meta'>${step.meta}</div>
+          </div>
+          <div class='task-phase-badge'>${step.state}</div>
+        </div>
+        <div class='trace-step-body'>${step.body}</div>
+      `;
+      timeline.appendChild(item);
+    });
+    tracePanel.appendChild(timeline);
+  }
+  card.appendChild(tracePanel);
+
+  if (task.waiting?.kind === 'APPROVAL' && task.waiting.approval) {
+    const approval = document.createElement('div');
+    approval.className = 'message approval';
+    const approvalRequest = task.waiting.approval;
+    const resolution = task.approvalResolution;
+    renderApprovalCard(approval, {
+      approval: approvalRequest,
+      taskId: task.taskId,
+      resolved: (
+        resolution?.requestId === approvalRequest.request_id
+          ? resolution.decision : null
+      ),
+      conversationId,
+    });
+    card.appendChild(approval);
+  } else if (task.waiting) {
+    const waiting = document.createElement('div');
+    waiting.className = 'task-progress-line';
+    waiting.textContent = task.waiting.question || '该任务正在等待你的输入。';
+    card.appendChild(waiting);
+  }
+  element.appendChild(card);
+}
+
+function taskMessage(conversationId, taskId) {
+  const conversation = getConversationById(conversationId);
+  return conversation?.messages.find(
+    (item) => item.role === 'task' && item.task?.taskId === taskId,
+  );
+}
+
+function upsertTaskCard(conversationId, rawTask) {
+  const conversation = getConversationById(conversationId);
+  if (!conversation || !rawTask?.task_id) return null;
+  let message = taskMessage(conversationId, rawTask.task_id);
+  if (!message) {
+    message = {
+      role: 'task', content: '',
+      task: {
+        taskId: rawTask.task_id,
+        goal: rawTask.goal || '',
+        phase1State: rawTask.phase1_state || 'PREPARING',
+        status: rawTask.status || 'running',
+        cursor: Number(rawTask.progress_cursor || 0),
+        progress: [], waiting: rawTask.waiting || null,
+      },
+    };
+    conversation.messages.push(message);
+  } else {
+    message.task.goal = rawTask.goal || message.task.goal;
+    message.task.phase1State = rawTask.phase1_state || message.task.phase1State;
+    message.task.status = rawTask.status || message.task.status;
+    message.task.cursor = Math.max(
+      Number(message.task.cursor || 0), Number(rawTask.progress_cursor || 0),
+    );
+    message.task.waiting = rawTask.waiting ?? message.task.waiting;
+  }
+  if (conversationId === activeConversationId) renderMessages();
+  return message;
+}
+
+function appendTaskProgress(taskId, progress, conversationId) {
+  const message = taskMessage(conversationId, taskId)
+    || upsertTaskCard(conversationId, { task_id: taskId, phase1_state: 'RUNNING' });
+  if (!message) return;
+  const sequence = Number(progress?.sequence || 0);
+  message.task.cursor = Math.max(Number(message.task.cursor || 0), sequence);
+  const progressData = { ...(progress?.progress || {}) };
+  const text = describeProgress(progressData);
+  if (!text) return;
+  const lines = message.task.progress;
+  if (lines.some((item) => item.sequence === sequence && sequence > 0)) return;
+  if (
+    lines[lines.length - 1]?.text === text
+    && lines[lines.length - 1]?.progressData?.kind === progressData.kind
+  ) return;
+  lines.push({ sequence, text, progressData });
+  if (lines.length > 30) lines.splice(0, lines.length - 30);
+  if (conversationId === activeConversationId) renderMessages();
+}
 
 function renderApprovalCard(element, message) {
   const approval = message.approval || {};
@@ -473,37 +874,48 @@ async function decideApproval(message, decision) {
     showError(error.message || '提交授权决定失败。');
     return;
   }
-  message.resolved = decision;
+  const card = taskMessage(message.conversationId || activeConversationId, message.taskId);
+  if (card) {
+    card.task.approvalResolution = {
+      requestId: approval.request_id, decision,
+    };
+    card.task.waiting = decision === 'APPROVE' ? null : card.task.waiting;
+  }
   renderMessages();
-  appendMessage('system', decision === 'APPROVE' ? '已允许，继续执行…' : '已拒绝该操作。');
-  if (decision === 'APPROVE') setLoading(true);
-}
-
-function appendApproval(taskId, approval, conversationId = activeConversationId) {
-  const active = getConversationById(conversationId);
-  if (!active) return;
-  const existing = active.messages.find(
-    (item) => item.role === 'approval' && item.approval?.request_id === approval.request_id,
-  );
-  if (existing) return;
-  active.messages.push({
-    role: 'approval', content: '', approval, taskId, resolved: null,
-  });
-  renderConversations();
-  if (conversationId === activeConversationId) {
-    renderMessages();
+  if (decision === 'APPROVE') {
+    setLoading(true);
+    followTask(message.taskId, message.conversationId || activeConversationId);
   }
 }
 
-function appendMessage(role, content, images = [], conversationId = activeConversationId) {
+function appendApproval(taskId, approval, conversationId = activeConversationId) {
+  const card = taskMessage(conversationId, taskId)
+    || upsertTaskCard(conversationId, {
+      task_id: taskId, phase1_state: 'WAITING', status: 'awaiting_approval',
+    });
+  if (!card) return;
+  card.task.phase1State = 'WAITING';
+  card.task.status = 'awaiting_approval';
+  card.task.waiting = { kind: 'APPROVAL', approval };
+  if (card.task.approvalResolution?.requestId !== approval.request_id) {
+    card.task.approvalResolution = null;
+  }
+  if (conversationId === activeConversationId) renderMessages();
+}
+
+function appendMessage(
+  role, content, images = [], conversationId = activeConversationId, taskId = null,
+) {
   const active = getConversationById(conversationId);
   if (!active) return;
   const text = String(content ?? '').trim();
   if (!text && images.length === 0) return;
   const last = active.messages[active.messages.length - 1];
-  // Progress notices repeat often; collapse identical consecutive lines.
-  if (role === 'system' && last?.role === 'system' && last.content === text) return;
-  active.messages.push({ role, content: text, images });
+  if (
+    role === 'system' && last?.role === 'system'
+    && last.content === text && last.taskId === taskId
+  ) return;
+  active.messages.push({ role, content: text, images, taskId });
   renderConversations();
   if (conversationId === activeConversationId) {
     renderMessages();
@@ -718,8 +1130,32 @@ async function runTask() {
     if (!task?.task_id) {
       throw new Error('会话响应中没有返回任务。');
     }
-    appendMessage('system', '已创建任务，正在执行…', [], conversationId);
-    followTask(task.task_id, conversationId);
+    const card = upsertTaskCard(conversationId, {
+      task_id: task.task_id,
+      goal: prompt,
+      phase1_state: task.phase1_state || 'PREPARING',
+      status: task.status || 'running',
+      progress_cursor: 0,
+      waiting: task.approval
+        ? { kind: 'APPROVAL', approval: task.approval }
+        : task.status === 'awaiting_user'
+          ? { kind: task.clarification?.kind || 'INPUT', ...task.clarification }
+          : null,
+    });
+    if (TERMINAL_STATES.includes(task.phase1_state)) {
+      renderFinalResult(task.task_id, task, conversationId);
+      setLoading(false);
+    } else if (
+      task.phase1_state === 'WAITING'
+      || task.status === 'awaiting_user'
+      || task.status === 'awaiting_approval'
+    ) {
+      if (card) card.task.waiting = card.task.waiting || { kind: 'INPUT' };
+      setLoading(false);
+      renderMessages();
+    } else {
+      followTask(task.task_id, conversationId);
+    }
   } catch (error) {
     console.error(error);
     showError(error.message || '发送消息时发生未知错误。');
@@ -736,31 +1172,62 @@ const TERMINAL_STATES = ['DONE', 'FAILED', 'CANCELLED'];
 const MAX_STREAM_RETRIES = 6;
 const followers = new Map();
 
-function renderFinalResult(state, conversationId) {
-  if (state.assistant_text) {
-    appendMessage('assistant', state.assistant_text, [], conversationId);
-  } else if (state.clarification?.question) {
-    appendMessage('assistant', state.clarification.question, [], conversationId);
-  } else if (state.failure_reason) {
-    showError(describeFailure(state.failure_reason));
-    appendMessage('system', `任务失败：${describeFailure(state.failure_reason)}`, [], conversationId);
-  } else {
-    appendMessage('system', '本次任务没有返回文本结果。', [], conversationId);
-  }
+function stopConversationFollowers(conversationId, exceptTaskId = null) {
+  followers.forEach((follower, taskId) => {
+    if (follower.conversationId === conversationId && taskId !== exceptTaskId) {
+      follower.stop();
+    }
+  });
 }
 
-// The progress stream is ephemeral and dies with its connection: a server
-// restart, a sleeping laptop, or a proxy timeout all end it. Closing the
-// EventSource there left the page silent even when the Task went on to finish,
-// so reconnect and reconcile against the durable Task result instead.
+function renderFinalResult(taskId, state, conversationId) {
+  const card = taskMessage(conversationId, taskId)
+    || upsertTaskCard(conversationId, { task_id: taskId });
+  if (card) {
+    card.task.phase1State = state.phase1_state || card.task.phase1State;
+    card.task.status = state.status || card.task.status;
+    card.task.waiting = null;
+  }
+  if (state.assistant_text) {
+    const conversation = getConversationById(conversationId);
+    const duplicate = conversation?.messages.some(
+      (item) => item.role === 'assistant'
+        && item.taskId === taskId
+        && item.content === state.assistant_text,
+    );
+    if (!duplicate) {
+      appendMessage('assistant', state.assistant_text, [], conversationId, taskId);
+    }
+  } else if (state.clarification?.question) {
+    appendMessage(
+      'assistant', state.clarification.question, [], conversationId, taskId,
+    );
+  } else if (state.failure_reason) {
+    if (conversationId === activeConversationId) {
+      showError(describeFailure(state.failure_reason));
+    }
+    appendTaskProgress(taskId, {
+      sequence: 0,
+      progress: {
+        activity: `任务失败：${describeFailure(state.failure_reason)}`,
+      },
+    }, conversationId);
+  }
+  if (conversationId === activeConversationId) renderMessages();
+}
+
+// Each follower owns exactly one Task card. Its cursor is part of that card,
+// therefore reconnecting cannot replay another Task's history into the current
+// conversation timeline.
 function followTask(taskId, conversationId) {
   const existing = followers.get(taskId);
-  if (existing) {
-    existing.stop();
-  }
+  if (existing) existing.stop();
+  stopConversationFollowers(conversationId, taskId);
+  const card = taskMessage(conversationId, taskId)
+    || upsertTaskCard(conversationId, { task_id: taskId, phase1_state: 'RUNNING' });
   const follower = {
-    attempts: 0, lastState: null, stopped: false,
-    source: null, timer: null,
+    conversationId,
+    attempts: 0, stopped: false, source: null, timer: null,
     stop() {
       this.stopped = true;
       if (this.source) this.source.close();
@@ -771,53 +1238,87 @@ function followTask(taskId, conversationId) {
   followers.set(taskId, follower);
 
   const finish = (state) => {
-    renderFinalResult(state, conversationId);
+    renderFinalResult(taskId, state, conversationId);
     follower.stop();
     setLoading(false);
   };
 
   const reconcile = async () => {
-    // Called on every (re)connect: anything missed while disconnected is still
-    // readable from the Task itself.
     const response = await fetch(`/tasks/${taskId}`);
     if (!response.ok) return false;
     const state = await response.json();
-    if (state.phase1_state !== follower.lastState) {
-      follower.lastState = state.phase1_state;
-      appendMessage('system', `任务状态：${状态文案[state.phase1_state] || '未知'}`, [], conversationId);
+    const current = taskMessage(conversationId, taskId) || card;
+    if (current) {
+      current.task.phase1State = state.phase1_state;
+      current.task.status = state.status;
+      current.task.waiting = state.approval
+        ? { kind: 'APPROVAL', approval: state.approval }
+        : state.status === 'awaiting_user'
+          ? { kind: state.clarification?.kind || 'INPUT', ...state.clarification }
+          : null;
     }
     if (TERMINAL_STATES.includes(state.phase1_state)) {
       finish(state);
       return true;
     }
-    if (state.approval) {
+    const submittedApprovalIsSettling = Boolean(
+      state.approval
+      && current?.task?.approvalResolution?.decision === 'APPROVE'
+      && current.task.approvalResolution.requestId === state.approval.request_id
+    );
+    if (
+      (state.phase1_state === 'WAITING' || state.status === 'awaiting_user')
+      && !submittedApprovalIsSettling
+    ) {
+      if (conversationId === activeConversationId) renderMessages();
+      follower.stop();
       setLoading(false);
-      appendApproval(taskId, state.approval, conversationId);
+      return true;
     }
+    if (conversationId === activeConversationId) renderMessages();
     return false;
   };
 
   const connect = () => {
     if (follower.stopped) return;
-    const source = new EventSource(`/stream/${taskId}`);
+    const current = taskMessage(conversationId, taskId) || card;
+    const after = Number(current?.task?.cursor || 0);
+    const source = new EventSource(`/stream/${taskId}?after=${after}`);
     follower.source = source;
-    source.onopen = () => {
-      follower.attempts = 0;
-    };
+    source.onopen = () => { follower.attempts = 0; };
     source.onmessage = (event) => {
       let payload;
       try {
         payload = JSON.parse(event.data);
       } catch (error) {
-        appendMessage('system', event.data, [], conversationId);
+        console.error(error);
         return;
       }
+      const sequence = Number(event.lastEventId || payload.sequence || 0);
+      if (sequence > 0) {
+        const currentCard = taskMessage(conversationId, taskId);
+        if (currentCard) {
+          currentCard.task.cursor = Math.max(
+            Number(currentCard.task.cursor || 0), sequence,
+          );
+        }
+      }
       if (payload.waiting) {
-        setLoading(false);
-        if (payload.waiting.kind === 'APPROVAL' && payload.waiting.approval) {
-          appendApproval(payload.task_id || taskId, payload.waiting.approval, conversationId);
-        } else if (payload.waiting.question) {
-          appendMessage('assistant', payload.waiting.question, [], conversationId);
+        const currentCard = taskMessage(conversationId, taskId);
+        if (currentCard) {
+          currentCard.task.phase1State = 'WAITING';
+          currentCard.task.waiting = payload.waiting;
+        }
+        if (conversationId === activeConversationId) renderMessages();
+        const submittedApprovalIsSettling = Boolean(
+          payload.waiting.kind === 'APPROVAL'
+          && currentCard?.task?.approvalResolution?.decision === 'APPROVE'
+          && currentCard.task.approvalResolution.requestId
+            === payload.waiting.approval?.request_id
+        );
+        if (!submittedApprovalIsSettling) {
+          follower.stop();
+          setLoading(false);
         }
         return;
       }
@@ -825,8 +1326,7 @@ function followTask(taskId, conversationId) {
         finish(payload);
         return;
       }
-      const text = describeProgress(payload.progress);
-      if (text) appendMessage('system', text, [], conversationId);
+      appendTaskProgress(taskId, payload, conversationId);
     };
     source.onerror = async () => {
       source.close();
@@ -834,7 +1334,12 @@ function followTask(taskId, conversationId) {
       if (await reconcile()) return;
       follower.attempts += 1;
       if (follower.attempts > MAX_STREAM_RETRIES) {
-        appendMessage('system', '实时输出连接已断开；任务仍在后台运行，可刷新页面查看结果。', [], conversationId);
+        appendTaskProgress(taskId, {
+          sequence: 0,
+          progress: {
+            activity: '实时输出连接已断开；任务仍在后台运行，可刷新页面查看结果。',
+          },
+        }, conversationId);
         follower.stop();
         setLoading(false);
         return;
@@ -886,34 +1391,67 @@ async function ensureConversationLoaded(conversationId) {
     const response = await fetch(`/sessions/${conversationId}`);
     if (!response.ok) return;
     const data = await response.json();
-    conversation.messages = (data.messages || []).map((message) => ({
-      role: message.role, content: message.content, images: [],
-    }));
-    // An unanswered approval has to come back as a live control, not as text:
-    // the Task stays suspended until someone decides.
-    if (data.waiting?.kind === 'APPROVAL' && data.waiting.approval) {
-      conversation.messages.push({
-        role: 'approval', content: '', approval: data.waiting.approval,
-        taskId: data.latest_task_id, resolved: null,
+    const tasksById = new Map(
+      (data.tasks || []).map((task) => [task.task_id, task]),
+    );
+    const timeline = [];
+    let insertionOrder = 0;
+    (data.messages || []).forEach((message) => {
+      const task = tasksById.get(message.task_id);
+      // Task user text is persisted when a result is recorded, but belongs at
+      // task attachment time. Direct Session chat keeps its own event sequence.
+      const sequence = Number(
+        message.role === 'user' && task
+          ? task.attached_sequence
+          : message.source_event_sequence,
+      );
+      timeline.push({
+        sequence, order: message.role === 'user' ? 0 : 2,
+        insertionOrder: insertionOrder++,
+        message: {
+          role: message.role, content: message.content, images: [],
+          taskId: message.task_id || null,
+        },
       });
-    } else if (data.waiting) {
-      conversation.messages.push({
-        role: 'system', content: '该会话正在等待你的输入。', images: [],
+    });
+    (data.tasks || []).forEach((task) => {
+      timeline.push({
+        sequence: Number(task.attached_sequence || 0),
+        order: 1,
+        insertionOrder: insertionOrder++,
+        message: {
+          role: 'task', content: '', task: {
+            taskId: task.task_id, goal: task.goal,
+            phase1State: task.phase1_state, status: task.status,
+            cursor: Number(task.progress_cursor || 0), progress: [],
+            waiting: task.waiting || null,
+          },
+        },
       });
-    }
+    });
+    timeline.sort((left, right) => (
+      left.sequence - right.sequence
+      || left.order - right.order
+      || left.insertionOrder - right.insertionOrder
+    ));
+    conversation.messages = timeline.map((item) => item.message);
     renderConversations();
     renderMessages();
-    // Still executing: re-attach the stream so output continues here instead of
-    // finishing invisibly in the background.
+
+    // Only the Session's authoritative active Task may auto-follow. Older
+    // WAITING Tasks remain visible as pending cards but do not reopen an SSE
+    // stream and cannot replay their historical progress into a newer Task.
+    const activeTask = tasksById.get(data.active_task_id);
     if (
-      data.latest_task_id
-      && !data.waiting
-      && !TERMINAL_STATES.includes(data.latest_task_state)
+      activeTask
+      && !activeTask.waiting
+      && ['PREPARING', 'RUNNING'].includes(activeTask.phase1_state)
     ) {
       setLoading(true);
-      followTask(data.latest_task_id, conversationId);
+      followTask(activeTask.task_id, conversationId);
     }
   } catch (error) {
+    conversation.loaded = false;
     console.error(error);
   }
 }
@@ -1017,6 +1555,45 @@ def save_workspace_registry() -> None:
         return
 
 
+def recover_workspace_registry_from_runtime() -> None:
+    """Rebuild missing workspace entries from durable Task ownership.
+
+    The JSON file is only a UI index; Runtime Task records are authoritative.
+    If the file is deleted, stale, or corrupted, hiding every Session would make
+    durable history appear lost even though SQLite still has it.
+    """
+    if runtime_server is None:
+        return
+    known = {item["path"] for item in workspace_registry}
+    kernel = runtime_server._client.application.kernel
+    try:
+        sessions = runtime_server._call(kernel.list_sessions())
+    except Exception:
+        return
+    changed = False
+    for session in sessions:
+        for task_id in reversed(session.task_ids):
+            try:
+                task = runtime_server._call(kernel.get_task(task_id))
+            except (LookupError, PermissionError):
+                continue
+            path = str(task.workspace)
+            if path in known:
+                break
+            if not Path(path).is_dir():
+                continue
+            workspace_registry.append({
+                "id": workspace_identifier(path),
+                "name": Path(path).name or path,
+                "path": path,
+            })
+            known.add(path)
+            changed = True
+            break
+    if changed:
+        save_workspace_registry()
+
+
 @app.on_event("startup")
 async def startup() -> None:
     global runtime_server, runtime_error
@@ -1024,6 +1601,7 @@ async def startup() -> None:
     runtime_server = LocalEventApiServer(Path.cwd())
     try:
         runtime_server.start()
+        recover_workspace_registry_from_runtime()
         runtime_error = None
     except Exception as error:
         runtime_server = None
@@ -1314,39 +1892,56 @@ async def get_session(session_id: str) -> dict:
         projection = runtime_server._call(
             kernel.get_session_conversation(session_id)
         )
+        session_events = runtime_server._call(
+            kernel.dependencies.store.read_session_events(session_id)
+        )
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except PermissionError as error:
         raise HTTPException(status_code=403, detail=str(error)) from error
-    latest_task_id = snapshot.active_task_id or (
-        snapshot.task_ids[-1] if snapshot.task_ids else None
-    )
-    waiting = None
-    latest_task_state = None
-    if latest_task_id:
+    task_attach_sequences = {
+        str(event.payload.get("task_id")): event.sequence
+        for event in session_events
+        if event.event_type == "session.task_attached"
+        and event.payload.get("task_id")
+    }
+    task_items: list[dict] = []
+    for task_id in snapshot.task_ids:
         try:
+            task = runtime_server._call(kernel.get_task(task_id))
             result = runtime_server._call(
-                runtime_server._client.get_task_result(latest_task_id)
+                runtime_server._client.get_task_result(task_id)
             )
-            waiting = _waiting_payload(result)
-            latest_task_state = result.phase1_state
         except (LookupError, PermissionError):
-            waiting = None
+            continue
+        task_items.append({
+            "task_id": task_id,
+            "goal": task.goal,
+            "attached_sequence": task_attach_sequences.get(task_id, 0),
+            "phase1_state": result.phase1_state,
+            "status": result.status,
+            "progress_cursor": (
+                runtime_server._client.latest_progress_sequence(task_id)
+            ),
+            "waiting": _waiting_payload(result),
+            "assistant_text": result.assistant_text,
+            "is_active": task_id == snapshot.active_task_id,
+        })
+    latest = task_items[-1] if task_items else None
     return {
         "session_id": snapshot.session_id,
         "title": snapshot.title,
-        "latest_task_id": latest_task_id,
-        # A Task that is still executing needs its stream re-attached, so the
-        # page has to know the difference between running and already finished.
-        "latest_task_state": latest_task_state,
-        # An unanswered approval is part of the Session's live state: after a
-        # reload the button has to come back, or the Task waits forever.
-        "waiting": waiting,
+        "active_task_id": snapshot.active_task_id,
+        "latest_task_id": latest["task_id"] if latest else None,
+        "latest_task_state": latest["phase1_state"] if latest else None,
+        "waiting": latest["waiting"] if latest else None,
+        "tasks": task_items,
         "messages": [
             {
                 "role": message.role.value,
                 "content": message.text,
                 "task_id": message.task_id,
+                "source_event_sequence": message.source_event_sequence,
             }
             for message in projection.messages
         ],
@@ -1421,7 +2016,10 @@ async def get_task(task_id: str) -> dict:
             detail=runtime_error or "runtime unavailable",
         )
     result = runtime_server._call(runtime_server._client.get_task_result(task_id))
-    return result.to_data()
+    data = result.to_data()
+    if result.phase1_state == "FAILED":
+        data["failure_reason"] = _task_failure_reason(task_id)
+    return data
 
 
 def _describe_loop_limit(error: AgentLoopLimitExceeded) -> str:
@@ -1465,7 +2063,7 @@ def _task_failure_reason(task_id: str) -> str | None:
     except Exception:
         return None
     for event in reversed(events):
-        if event.event_type in {"turn.failed", "llm.failed"}:
+        if event.event_type.endswith(".failed"):
             message = str(event.payload.get("message", "")).strip()
             if message:
                 return message
@@ -1473,21 +2071,26 @@ def _task_failure_reason(task_id: str) -> str | None:
 
 
 @app.get("/stream/{task_id}")
-async def stream(task_id: str):
+async def stream(task_id: str, after: int = 0):
     if runtime_server is None:
         raise HTTPException(
             status_code=503,
             detail=runtime_error or "runtime unavailable",
         )
+    if after < 0:
+        raise HTTPException(status_code=400, detail="after must not be negative")
 
     async def event_generator():
-        cursor = 0
+        cursor = after
         announced_wait: str | None = None
         while True:
             items = runtime_server._client.read_progress(task_id, after=cursor)
             for item in items:
                 cursor = max(cursor, item.sequence)
-                yield f"data: {json.dumps(item.to_data(), ensure_ascii=False)}\n\n"
+                yield (
+                    f"id: {item.sequence}\n"
+                    f"data: {json.dumps(item.to_data(), ensure_ascii=False)}\n\n"
+                )
 
             result = runtime_server._call(
                 runtime_server._client.get_task_result(task_id)

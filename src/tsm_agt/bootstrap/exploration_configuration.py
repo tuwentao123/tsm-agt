@@ -15,6 +15,10 @@ EXPLORATION_ENV_NAMES = (
     "TSM_AGT_AGENT_EXECUTION_RESERVE_MODEL_CALLS",
     "TSM_AGT_AGENT_RECOVERY_RESERVE_MODEL_CALLS",
     "TSM_AGT_AGENT_VERIFICATION_RESERVE_MODEL_CALLS",
+    "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_INCREMENTS",
+    "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_MAX_COUNT",
+    "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_ABSOLUTE_LIMIT",
+    "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_THRESHOLD",
     "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS",
     "TSM_AGT_EXPLORATION_MAX_ACTIONS",
     "TSM_AGT_EXPLORATION_MAX_TOOL_SECONDS",
@@ -40,6 +44,10 @@ class ExplorationBudgetConfiguration:
     execution_reserve_model_calls: int = 1
     recovery_reserve_model_calls: int = 1
     verification_reserve_model_calls: int = 1
+    model_call_renewal_increments: tuple[int, ...] = (10, 5, 3)
+    model_call_renewal_max_count: int = 3
+    model_call_renewal_absolute_limit: int = 60
+    model_call_renewal_threshold: int = 4
     max_tool_calls: int = 60
     max_actions: int = 60
     max_tool_seconds: int = 300
@@ -56,16 +64,14 @@ class ExplorationBudgetConfiguration:
             self.execution_reserve_model_calls,
             self.recovery_reserve_model_calls,
             self.verification_reserve_model_calls,
+            self.model_call_renewal_max_count,
+            self.model_call_renewal_absolute_limit,
+            self.model_call_renewal_threshold,
             self.max_tool_calls, self.max_actions, self.max_tool_seconds,
             self.low_value_streak, self.reserve_tool_calls, self.minimum_actions,
         )
         if min(values) < 1:
             raise ValueError("exploration budget values must be positive integers")
-        if self.max_tool_calls > self.agent_max_tool_calls:
-            raise ValueError(
-                "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS must not exceed "
-                "TSM_AGT_AGENT_MAX_TOOL_CALLS"
-            )
         if self.finalization_model_calls >= self.agent_max_model_calls:
             raise ValueError(
                 "TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS must be smaller than "
@@ -81,6 +87,44 @@ class ExplorationBudgetConfiguration:
             raise ValueError(
                 "Agent execution, recovery, verification and finalization reserves "
                 "must leave at least one normal model call"
+            )
+        if not self.model_call_renewal_increments or any(
+            value < 1 for value in self.model_call_renewal_increments
+        ):
+            raise ValueError(
+                "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_INCREMENTS must contain "
+                "positive integers"
+            )
+        if any(
+            later > earlier for earlier, later in zip(
+                self.model_call_renewal_increments,
+                self.model_call_renewal_increments[1:],
+            )
+        ):
+            raise ValueError(
+                "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_INCREMENTS must not increase"
+            )
+        if self.model_call_renewal_max_count > len(
+            self.model_call_renewal_increments
+        ):
+            raise ValueError(
+                "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_MAX_COUNT exceeds the "
+                "configured renewal increments"
+            )
+        if self.model_call_renewal_absolute_limit < self.agent_max_model_calls:
+            raise ValueError(
+                "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_ABSOLUTE_LIMIT must not be "
+                "smaller than TSM_AGT_AGENT_MAX_MODEL_CALLS"
+            )
+        if self.model_call_renewal_threshold >= self.agent_max_model_calls:
+            raise ValueError(
+                "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_THRESHOLD must be smaller "
+                "than TSM_AGT_AGENT_MAX_MODEL_CALLS"
+            )
+        if self.max_tool_calls > self.agent_max_tool_calls:
+            raise ValueError(
+                "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS must not exceed "
+                "TSM_AGT_AGENT_MAX_TOOL_CALLS"
             )
         if self.reserve_tool_calls >= self.max_tool_calls:
             raise ValueError(
@@ -107,7 +151,7 @@ class ExplorationBudgetConfiguration:
             "minimum_scored_actions": self.minimum_actions,
         }
 
-    def snapshot_data(self) -> dict[str, int | str]:
+    def snapshot_data(self) -> dict[str, int | str | list[int]]:
         return {
             "policy_id": "builtin.rule-based-exploration-budget",
             "agent_max_model_calls": self.agent_max_model_calls,
@@ -116,6 +160,14 @@ class ExplorationBudgetConfiguration:
             "execution_reserve_model_calls": self.execution_reserve_model_calls,
             "recovery_reserve_model_calls": self.recovery_reserve_model_calls,
             "verification_reserve_model_calls": self.verification_reserve_model_calls,
+            "model_call_renewal_increments": list(
+                self.model_call_renewal_increments
+            ),
+            "model_call_renewal_max_count": self.model_call_renewal_max_count,
+            "model_call_renewal_absolute_limit": (
+                self.model_call_renewal_absolute_limit
+            ),
+            "model_call_renewal_threshold": self.model_call_renewal_threshold,
             "max_tool_calls": self.max_tool_calls,
             "max_actions": self.max_actions,
             "max_tool_seconds": self.max_tool_seconds,
@@ -133,6 +185,9 @@ _FIELD_BY_ENV = {
     "TSM_AGT_AGENT_EXECUTION_RESERVE_MODEL_CALLS": "execution_reserve_model_calls",
     "TSM_AGT_AGENT_RECOVERY_RESERVE_MODEL_CALLS": "recovery_reserve_model_calls",
     "TSM_AGT_AGENT_VERIFICATION_RESERVE_MODEL_CALLS": "verification_reserve_model_calls",
+    "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_MAX_COUNT": "model_call_renewal_max_count",
+    "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_ABSOLUTE_LIMIT": "model_call_renewal_absolute_limit",
+    "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_THRESHOLD": "model_call_renewal_threshold",
     "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS": "max_tool_calls",
     "TSM_AGT_EXPLORATION_MAX_ACTIONS": "max_actions",
     "TSM_AGT_EXPLORATION_MAX_TOOL_SECONDS": "max_tool_seconds",
@@ -170,6 +225,30 @@ def load_exploration_budget_configuration(
         sources[f"exploration_budget.{field_name}"] = (
             "environment" if exported else "env_file"
         )
+    increments_name = "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_INCREMENTS"
+    exported_increments = environment.get(increments_name, "").strip()
+    file_increments = file_values.get(increments_name, "").strip()
+    raw_increments = exported_increments or file_increments
+    if raw_increments:
+        try:
+            renewal_increments = tuple(
+                int(item.strip()) for item in raw_increments.split(",")
+                if item.strip()
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"{increments_name} must be comma-separated positive integers"
+            ) from error
+        if not renewal_increments or any(value < 1 for value in renewal_increments):
+            raise ValueError(
+                f"{increments_name} must be comma-separated positive integers"
+            )
+        sources["exploration_budget.model_call_renewal_increments"] = (
+            "environment" if exported_increments else "env_file"
+        )
+    else:
+        renewal_increments = defaults.model_call_renewal_increments
+        sources["exploration_budget.model_call_renewal_increments"] = "default"
     exported_profile = environment.get("TSM_AGT_EXPLORATION_PROFILE", "").strip()
     file_profile = file_values.get("TSM_AGT_EXPLORATION_PROFILE", "").strip()
     profile = (exported_profile or file_profile or defaults.profile).casefold()
@@ -178,7 +257,8 @@ def load_exploration_budget_configuration(
         "env_file" if file_profile else "default"
     )
     return ExplorationBudgetConfiguration(
-        **values, profile=profile, sources=sources
+        **values, model_call_renewal_increments=renewal_increments,
+        profile=profile, sources=sources
     )
 
 

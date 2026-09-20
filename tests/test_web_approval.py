@@ -246,6 +246,18 @@ class ApprovalUiContractTest(unittest.TestCase):
         for field in ("approval.action", "approval.target", "approval.preview"):
             self.assertIn(field, web_app.INDEX_HTML)
 
+    def test_approval_resolution_is_bound_to_the_exact_request(self) -> None:
+        html = web_app.INDEX_HTML
+        self.assertIn("requestId: approval.request_id, decision", html)
+        self.assertIn(
+            "resolution?.requestId === approvalRequest.request_id", html
+        )
+        self.assertIn(
+            "approvalResolution.requestId === state.approval.request_id", html
+        )
+        # A later approval must not inherit the previous request's "已允许".
+        self.assertNotIn("task.approvalResolved", html)
+
     def test_ordinary_text_ingress_is_not_reused_for_approval(self) -> None:
         # Approval must travel on its own route; chat text never grants consent.
         self.assertNotIn("'/session-input', { decision", web_app.INDEX_HTML)

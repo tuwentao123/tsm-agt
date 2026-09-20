@@ -381,6 +381,20 @@ def _kernel_dependencies(
         verification_reserve_model_calls=int(
             budget.get("verification_reserve_model_calls", 1)
         ),
+        model_call_renewal_increments=tuple(
+            int(value) for value in budget.get(
+                "model_call_renewal_increments", [10, 5, 3]
+            )
+        ),
+        model_call_renewal_max_count=int(
+            budget.get("model_call_renewal_max_count", 3)
+        ),
+        model_call_renewal_absolute_limit=int(
+            budget.get("model_call_renewal_absolute_limit", 60)
+        ),
+        model_call_renewal_threshold=int(
+            budget.get("model_call_renewal_threshold", 4)
+        ),
         context_manager=context_manager or ContextWindowManager(),
         require_evidence_questions=require_evidence_questions,
     )

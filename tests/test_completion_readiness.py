@@ -453,6 +453,95 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
+    async def test_completion_gap_renews_model_budget_before_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "changed.py"
+            target.write_text("value = 1\n", encoding="utf-8")
+            (root / "test_changed.py").write_text(
+                "import unittest\nimport changed\n\n"
+                "class ChangedTest(unittest.TestCase):\n"
+                "    def test_value(self):\n"
+                "        self.assertEqual(changed.value, 2)\n",
+                encoding="utf-8",
+            )
+            workspace_path = PosixWorkspacePath()
+            app = compose_fixture_application(
+                model_adapter=PostMutationVerificationModel(),
+                tool_adapters=(CoreProcessToolProvider(),),
+                process_adapter=LocalProcessExecutor(),
+                sandbox_adapter=LocalWorkspaceSandbox(workspace_path),
+                workspace_path_adapter=workspace_path,
+                completion_readiness_policy_adapter=(
+                    RuleBasedCompletionReadinessPolicy()
+                ),
+            )
+            # Tight deterministic limits prove renewal happens at the existing
+            # CompletionReadiness boundary rather than at a generic progress hook.
+            dependencies = app.kernel.dependencies
+            object.__setattr__(
+                dependencies, "model_call_renewal_increments", (2,)
+            )
+            object.__setattr__(
+                dependencies, "model_call_renewal_max_count", 1
+            )
+            object.__setattr__(
+                dependencies, "model_call_renewal_absolute_limit", 3
+            )
+            object.__setattr__(
+                dependencies, "model_call_renewal_threshold", 0
+            )
+            await app.registry.start_all()
+            try:
+                await app.kernel.set_project_trust(
+                    root, ProjectTrustLevel.TRUSTED_BUILD
+                )
+                task = await executing_task(app, root, "ready-renew-budget")
+                await self._require_command_verification(app, task)
+                await app.kernel.write_workspace_text(
+                    task.task_id, "change-file", target.name, "value = 2\n",
+                    hashlib.sha256(b"value = 1\n").hexdigest(),
+                )
+                suspended = await app.kernel.run_agent_turn(
+                    task.task_id, "finish and verify the change",
+                    max_model_calls=1, max_tool_calls=2,
+                )
+                self.assertIsInstance(suspended, AgentTurnSuspended)
+                saved = await app.kernel.get_task(task.task_id)
+                checkpoint = AgentTurnCheckpoint.from_data(
+                    saved.active_agent_checkpoint or {}
+                )
+                self.assertEqual(checkpoint.max_model_calls, 3)
+                self.assertEqual(checkpoint.model_budget_renewal_count, 1)
+                self.assertEqual(checkpoint.model_budget_total_granted, 2)
+                events = await app.registry.require(RuntimeStorePort).read_events(
+                    task.task_id
+                )
+                renewal = next(
+                    event for event in events
+                    if event.event_type == "budget.renewed"
+                )
+                self.assertEqual(renewal.payload["increment"], 2)
+                self.assertEqual(renewal.payload["previous_max_model_calls"], 1)
+                self.assertEqual(renewal.payload["max_model_calls"], 3)
+                self.assertFalse(any(
+                    event.event_type == "completion.automatic_resume_started"
+                    for event in events
+                ))
+                # The renewal event and renewed checkpoint are one commit unit:
+                # the following checkpoint receipt carries the same count.
+                renewal_index = events.index(renewal)
+                self.assertEqual(events[renewal_index - 1].event_type, "llm.completed")
+                self.assertEqual(events[renewal_index + 1].event_type, "checkpoint.saved")
+                self.assertEqual(
+                    events[renewal_index + 1].payload[
+                        "model_budget_renewal_count"
+                    ],
+                    1,
+                )
+            finally:
+                await app.registry.stop_all()
+
     async def test_execute_gap_continues_when_execute_capability_is_visible(self) -> None:
         policy = RuleBasedCompletionReadinessPolicy()
         await policy.start(None)  # type: ignore[arg-type]

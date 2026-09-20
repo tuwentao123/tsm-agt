@@ -441,6 +441,10 @@ class EngineeringAgentClient:
                 return
             await asyncio.sleep(self._poll_interval)
 
+    def latest_progress_sequence(self, task_id: str) -> int:
+        """Return the cursor for the ephemeral progress stream namespace."""
+        return self._progress_sequences.get(task_id, 0)
+
     def read_progress(
         self, task_id: str, *, after: int = 0, limit: int = 200,
     ) -> tuple[RuntimeProgressEnvelope, ...]:

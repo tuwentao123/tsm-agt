@@ -870,12 +870,16 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
                 "last_action": "REPORT_BLOCKED",
                 "schema_version": 1,
             },
+            model_budget_renewal_count=2,
+            model_budget_total_granted=15,
         )
         self.assertNotIn("execution_focus", checkpoint.to_data())
         self.assertNotIn("active_outcome_ids", checkpoint.to_data())
         self.assertEqual(
             AgentTurnCheckpoint.from_data(checkpoint.to_data()), checkpoint
         )
+        self.assertEqual(checkpoint.to_data()["model_budget_renewal_count"], 2)
+        self.assertEqual(checkpoint.to_data()["model_budget_total_granted"], 15)
         data = checkpoint.to_data()
         data["max_tool_calls"] = 999
         with self.assertRaisesRegex(ValueError, "integrity hash"):
@@ -912,6 +916,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
             "evidence_relation_state", "rejection_loop_state",
             "exploration_outcome_state", "evidence_question_state",
             "completion_readiness_state",
+            "model_budget_renewal_count", "model_budget_total_granted",
             "task_spec_revision", "task_spec_hash",
             "active_outcome_ids", "pending_user_action",
         ):
@@ -923,6 +928,8 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.exploration_outcome_state, {})
         self.assertEqual(restored.evidence_question_state, {})
         self.assertEqual(restored.completion_readiness_state, {})
+        self.assertEqual(restored.model_budget_renewal_count, 0)
+        self.assertEqual(restored.model_budget_total_granted, 0)
         self.assertEqual(restored.task_spec_revision, 0)
         self.assertEqual(restored.task_spec_hash, "")
         self.assertEqual(restored.active_outcome_ids, ())

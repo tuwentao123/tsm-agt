@@ -24,6 +24,7 @@ class _Message:
     role: MessageRole
     text: str
     task_id: str | None
+    source_event_sequence: int = 1
 
 
 @dataclass
@@ -43,6 +44,22 @@ class _Session:
 @dataclass
 class _Task:
     workspace: str
+    goal: str
+
+
+@dataclass
+class _SessionEvent:
+    sequence: int
+    event_type: str
+    payload: dict
+
+
+class _FakeStore:
+    def __init__(self, events) -> None:
+        self._events = tuple(events)
+
+    async def read_session_events(self, _session_id: str):
+        return self._events
 
 
 class _FakeKernel:
@@ -50,6 +67,21 @@ class _FakeKernel:
         self._sessions = sessions
         self._tasks = tasks
         self._projection = projection
+        events = []
+        sequence = 1
+        seen = set()
+        for session in sessions:
+            for task_id in session.task_ids:
+                if task_id in seen:
+                    continue
+                seen.add(task_id)
+                events.append(_SessionEvent(
+                    sequence, "session.task_attached", {"task_id": task_id}
+                ))
+                sequence += 3
+        self.dependencies = type(
+            "_Dependencies", (), {"store": _FakeStore(events)}
+        )()
 
     async def list_sessions(self):
         return tuple(self._sessions)
@@ -70,12 +102,17 @@ class _FakeKernel:
 
 
 class _FakeClient:
-    def __init__(self, kernel: _FakeKernel, result: RuntimeTaskResult) -> None:
+    def __init__(self, kernel: _FakeKernel, result) -> None:
         self.application = type("_App", (), {"kernel": kernel})()
         self._result = result
 
-    async def get_task_result(self, _task_id: str) -> RuntimeTaskResult:
+    async def get_task_result(self, task_id: str) -> RuntimeTaskResult:
+        if isinstance(self._result, dict):
+            return self._result[task_id]
         return self._result
+
+    def latest_progress_sequence(self, _task_id: str) -> int:
+        return 7
 
 
 class _FakeRuntimeServer:
@@ -116,11 +153,12 @@ class WorkspaceRegistryPersistenceTest(unittest.TestCase):
             root = Path(directory)
             workspace = root / "project"
             workspace.mkdir()
-            with mock.patch.object(web_app.Path, "cwd", return_value=root):
+            registry_path = root / ".agent" / "web-workspaces.json"
+            with mock.patch.object(
+                web_app, "workspace_registry_path", return_value=registry_path
+            ):
                 registered = web_app.register_workspace(str(workspace))
-                self.assertTrue(
-                    (root / ".agent" / "web-workspaces.json").exists()
-                )
+                self.assertTrue(registry_path.exists())
                 # Simulate a fresh process: memory empty, file on disk.
                 web_app.workspace_registry.clear()
                 web_app.load_workspace_registry()
@@ -129,6 +167,45 @@ class WorkspaceRegistryPersistenceTest(unittest.TestCase):
         self.assertEqual(web_app.workspace_registry[0]["id"], registered["id"])
         self.assertEqual(
             web_app.workspace_registry[0]["path"], str(workspace.resolve())
+        )
+
+    def test_runtime_history_rebuilds_a_missing_workspace_index(self) -> None:
+        previous_server = web_app.runtime_server
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "recovered-project"
+            workspace.mkdir()
+            session = _Session(
+                "session-recover", "recover", ("task-recover",),
+                "task-recover", datetime.now(timezone.utc),
+            )
+            kernel = _FakeKernel(
+                (session,),
+                {"task-recover": _Task(str(workspace), "recover goal")},
+                _Projection(()),
+            )
+            result = RuntimeTaskResult(
+                task_id="task-recover", state="SUCCEEDED",
+                phase1_state="DONE", status="completed", cursor=1,
+            )
+            web_app.runtime_server = _FakeRuntimeServer(kernel, result)
+            registry_path = root / ".agent" / "web-workspaces.json"
+            try:
+                with mock.patch.object(
+                    web_app, "workspace_registry_path",
+                    return_value=registry_path,
+                ):
+                    web_app.recover_workspace_registry_from_runtime()
+            finally:
+                web_app.runtime_server = previous_server
+
+        self.assertEqual(
+            [item["path"] for item in web_app.workspace_registry],
+            [str(workspace)],
+        )
+        self.assertEqual(
+            web_app.workspace_registry[0]["id"],
+            web_app.workspace_identifier(str(workspace)),
         )
 
     def test_a_directory_that_disappeared_is_not_restored(self) -> None:
@@ -141,7 +218,10 @@ class WorkspaceRegistryPersistenceTest(unittest.TestCase):
                 ]),
                 encoding="utf-8",
             )
-            with mock.patch.object(web_app.Path, "cwd", return_value=root):
+            registry_path = root / ".agent" / "web-workspaces.json"
+            with mock.patch.object(
+                web_app, "workspace_registry_path", return_value=registry_path
+            ):
                 web_app.load_workspace_registry()
 
         self.assertEqual(web_app.workspace_registry, [])
@@ -162,13 +242,14 @@ class SessionRestoreEndpointTest(unittest.IsolatedAsyncioTestCase):
                 datetime(2026, 9, 20, 10, 0, tzinfo=timezone.utc),
             ),
             _Session(
-                "session-new", "最近的会话", ("task-new",), "task-new",
+                "session-new", "最近的会话", ("task-old", "task-new"),
+                "task-new",
                 datetime(2026, 9, 20, 12, 0, tzinfo=timezone.utc),
             ),
         ]
         tasks = {
-            "task-old": _Task("/workspace/alpha"),
-            "task-new": _Task("/workspace/beta"),
+            "task-old": _Task("/workspace/alpha", "old goal"),
+            "task-new": _Task("/workspace/beta", "new goal"),
         }
         projection = _Projection((
             _Message(MessageRole.USER, "帮我看下这个文档", "task-new"),
@@ -218,6 +299,20 @@ class SessionRestoreEndpointTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(payload["latest_task_state"], "RUNNING")
         self.assertIsNone(payload["waiting"])
+        self.assertEqual(payload["active_task_id"], "task-new")
+        self.assertEqual(
+            [item["task_id"] for item in payload["tasks"]],
+            ["task-old", "task-new"],
+        )
+        self.assertEqual(payload["tasks"][1]["progress_cursor"], 7)
+        self.assertEqual(
+            [item["attached_sequence"] for item in payload["tasks"]],
+            [1, 4],
+        )
+        self.assertEqual(
+            [item["source_event_sequence"] for item in payload["messages"]],
+            [1, 1],
+        )
 
     async def test_unanswered_approval_comes_back_with_the_session(self) -> None:
         web_app.runtime_server = self._server(
@@ -231,6 +326,35 @@ class SessionRestoreEndpointTest(unittest.IsolatedAsyncioTestCase):
             payload["waiting"]["approval"]["request_id"], "approval-1"
         )
 
+    async def test_old_waiting_task_and_active_running_task_remain_separate(
+        self,
+    ) -> None:
+        server = self._server()
+        server._client._result = {
+            "task-old": RuntimeTaskResult(
+                task_id="task-old", state="AWAITING_APPROVAL",
+                phase1_state="WAITING", status="awaiting_approval", cursor=20,
+                approval={
+                    "request_id": "approval-old",
+                    "action": "git push origin branch",
+                },
+            ),
+            "task-new": RuntimeTaskResult(
+                task_id="task-new", state="EXECUTING",
+                phase1_state="RUNNING", status="running", cursor=4,
+            ),
+        }
+        web_app.runtime_server = server
+
+        payload = await web_app.get_session("session-new")
+
+        by_id = {item["task_id"]: item for item in payload["tasks"]}
+        self.assertEqual(by_id["task-old"]["phase1_state"], "WAITING")
+        self.assertEqual(by_id["task-old"]["waiting"]["kind"], "APPROVAL")
+        self.assertEqual(by_id["task-new"]["phase1_state"], "RUNNING")
+        self.assertIsNone(by_id["task-new"]["waiting"])
+        self.assertEqual(payload["active_task_id"], "task-new")
+
     async def test_unknown_session_is_reported_as_missing(self) -> None:
         web_app.runtime_server = self._server()
 
@@ -241,6 +365,17 @@ class SessionRestoreEndpointTest(unittest.IsolatedAsyncioTestCase):
 
 
 class StreamResilienceUiTest(unittest.TestCase):
+    def test_failed_task_without_result_is_sorted_by_attach_sequence(self) -> None:
+        html = web_app.INDEX_HTML
+        self.assertIn("task.attached_sequence", html)
+        self.assertIn("message.source_event_sequence", html)
+        self.assertIn("timeline.sort((left, right)", html)
+        self.assertIn("left.sequence - right.sequence", html)
+        self.assertNotIn("restored.push({", html)
+        # A failed Task without a result message is still inserted at its
+        # session.task_attached position, never appended after current chat.
+        self.assertIn("order: 1", html)
+
     def test_stream_reconnects_and_reconciles_against_the_task(self) -> None:
         html = web_app.INDEX_HTML
         # Closing the stream on error left the page silent while the Task kept
@@ -257,7 +392,119 @@ class StreamResilienceUiTest(unittest.TestCase):
         self.assertIn("async function loadSessions()", html)
         self.assertIn("await loadSessions();", html)
         self.assertIn("ensureConversationLoaded(", html)
-        self.assertIn("followTask(data.latest_task_id, conversationId)", html)
+        self.assertIn("const activeTask = tasksById.get(data.active_task_id)", html)
+        self.assertIn("followTask(activeTask.task_id, conversationId)", html)
+        self.assertIn("['PREPARING', 'RUNNING'].includes", html)
+        self.assertNotIn("followTask(data.latest_task_id, conversationId)", html)
+
+
+class _ProgressEnvelope:
+    sequence = 9
+
+    def to_data(self):
+        return {
+            "task_id": "task-stream", "sequence": self.sequence,
+            "progress": {"kind": "tool", "tool_name": "core.read_file"},
+        }
+
+
+class _StreamClient:
+    def __init__(self) -> None:
+        self.afters: list[int] = []
+
+    def read_progress(self, _task_id: str, *, after: int = 0):
+        self.afters.append(after)
+        return (_ProgressEnvelope(),) if after < 9 else ()
+
+    async def get_task_result(self, task_id: str):
+        return RuntimeTaskResult(
+            task_id=task_id, state="SUCCEEDED", phase1_state="DONE",
+            status="completed", cursor=12,
+        )
+
+
+class _StreamServer:
+    def __init__(self) -> None:
+        self._client = _StreamClient()
+
+    def _call(self, awaitable, *, timeout: float = 70):
+        try:
+            awaitable.send(None)
+        except StopIteration as stop:
+            return stop.value
+        raise AssertionError("fake coroutines must not await")
+
+
+class StreamCursorProtocolTest(unittest.IsolatedAsyncioTestCase):
+    async def test_stream_starts_after_the_requested_progress_cursor(self) -> None:
+        previous = web_app.runtime_server
+        server = _StreamServer()
+        web_app.runtime_server = server
+        try:
+            response = await web_app.stream("task-stream", after=8)
+            chunk = await anext(response.body_iterator)
+            if isinstance(chunk, bytes):
+                chunk = chunk.decode("utf-8")
+            self.assertIn("id: 9\n", chunk)
+            self.assertIn('"sequence": 9', chunk)
+            self.assertEqual(server._client.afters[0], 8)
+            await response.body_iterator.aclose()
+        finally:
+            web_app.runtime_server = previous
+
+    async def test_negative_cursor_is_rejected(self) -> None:
+        previous = web_app.runtime_server
+        web_app.runtime_server = _StreamServer()
+        try:
+            with self.assertRaises(HTTPException) as caught:
+                await web_app.stream("task-stream", after=-1)
+            self.assertEqual(caught.exception.status_code, 400)
+        finally:
+            web_app.runtime_server = previous
+
+
+class TaskCardIsolationUiTest(unittest.TestCase):
+    def test_progress_is_written_to_a_task_card_not_session_system_text(self):
+        html = web_app.INDEX_HTML
+        self.assertIn("function appendTaskProgress(taskId, progress, conversationId)", html)
+        self.assertIn("appendTaskProgress(taskId, payload, conversationId)", html)
+        self.assertNotIn("if (text) appendMessage('system', text", html)
+        self.assertIn("message.role === 'task'", html)
+
+    def test_each_reconnect_uses_its_own_task_cursor(self) -> None:
+        html = web_app.INDEX_HTML
+        self.assertIn("`/stream/${taskId}?after=${after}`", html)
+        self.assertIn("event.lastEventId", html)
+        self.assertIn("item.task?.taskId === taskId", html)
+
+    def test_trace_state_uses_structured_progress_not_display_text(self) -> None:
+        html = web_app.INDEX_HTML
+        self.assertIn("function traceStateForProgress(progress)", html)
+        self.assertIn("kind === 'tool_started'", html)
+        self.assertIn("kind === 'tool_completed'", html)
+        self.assertIn("progress.ok === false || progress.error_code", html)
+        self.assertIn("const progress = item.progressData || {}", html)
+        # Patch contents and filenames are untrusted display text. In particular,
+        # `approval-request-bound` must never turn a completed patch into waiting.
+        self.assertNotIn("lower.includes('approval')", html)
+        self.assertNotIn("lower.includes('fail')", html)
+        self.assertNotIn("lower.includes('错误')", html)
+
+    def test_tool_and_model_start_completion_events_are_paired(self) -> None:
+        html = web_app.INDEX_HTML
+        self.assertIn("const pendingTools = []", html)
+        self.assertIn("pendingTools.splice(index, 1)", html)
+        self.assertIn("step.state = state", html)
+        self.assertIn("let pendingModel = null", html)
+        self.assertIn("kind === 'model_completed' && pendingModel !== null", html)
+        self.assertIn("lines.push({ sequence, text, progressData })", html)
+
+    def test_new_active_task_stops_older_followers_in_the_same_session(self):
+        html = web_app.INDEX_HTML
+        self.assertIn("stopConversationFollowers(conversationId, taskId)", html)
+        self.assertIn("follower.conversationId === conversationId", html)
+        self.assertIn("task.phase1State === 'WAITING'", html)
+        self.assertIn("不会自动重放历史执行日志", html)
 
 
 if __name__ == "__main__":
