@@ -281,10 +281,8 @@ class SessionActiveCheckpoint:
             "task_spec": {
                 "revision": self.task_spec_revision,
                 "content_hash": self.task_spec_hash,
-                "execution_focus": (
-                    dict(self.execution_focus)
-                    if self.execution_focus is not None else None
-                ),
+                **({"historical_execution_focus": dict(self.execution_focus)}
+                   if self.execution_focus is not None else {}),
             },
             "pending_user_action": (
                 dict(self.pending_user_action)
@@ -373,6 +371,7 @@ class SessionContextProjector:
     ) -> SessionConversationProjection:
         messages: list[SessionConversationMessage] = []
         seen_message_ids: set[str] = set()
+        latest_assistant_by_turn: dict[tuple[str, str], int] = {}
         sources: set[int] = set()
         explicit_state: dict[str, Any] = {}
         resources: dict[str, SessionResourceReference] = {}
@@ -513,10 +512,27 @@ class SessionContextProjector:
                 }), (), (),
             )
 
-        # Every Task remains represented in task_index. Verbose user-visible
-        # text and detailed handoffs are bounded deterministically before they
-        # become protected Session context; this is retention, not routing.
-        visible_messages = projection.messages[-self.recent_visible_message_limit:]
+        # Every Task remains represented in task_index. A terminal failure is
+        # still available there, but its generated assistant conclusion must
+        # not be replayed into a later Task's model context: doing so makes a
+        # historical verification blocker look like the answer to a new turn.
+        # Keep the originating user message so an explicit follow-up remains
+        # intelligible, and retain successful/active Task results as before.
+        terminal_failure_task_ids = {
+            summary.task_id for summary in projection.task_summaries
+            if summary.recorded_task_state in {"FAILED", "CANCELLED"}
+        }
+        prompt_messages = tuple(
+            message for message in projection.messages
+            if not (
+                message.role is MessageRole.ASSISTANT
+                and message.task_id in terminal_failure_task_ids
+            )
+        )
+        # Verbose user-visible text and detailed handoffs are bounded
+        # deterministically before they become protected Session context; this
+        # is retention, not routing.
+        visible_messages = prompt_messages[-self.recent_visible_message_limit:]
         recent_task_ids = list(dict.fromkeys(
             message.task_id for message in reversed(visible_messages)
             if message.task_id is not None
@@ -528,7 +544,14 @@ class SessionContextProjector:
             if item.task_id in recent_task_id_set
         )[-self.detailed_task_summary_limit:]
         visible_task_ids = {item.task_id for item in visible_task_summaries}
-        task_index = self._task_index(projection)
+        # Only current conversational work belongs in the model prompt. Durable
+        # Session storage keeps every Task for UI/history lookup, but injecting
+        # every old conclusion makes stale diagnoses dominate unrelated turns.
+        prompt_task_ids = set(recent_task_id_set)
+        if active_checkpoint is not None:
+            prompt_task_ids.add(active_checkpoint.task_id)
+        prompt_task_ids.update(item.task_id for item in suspended_tasks)
+        task_index = self._task_index(projection, prompt_task_ids)
         if active_checkpoint is not None:
             # The checkpoint is fresher than a visible-result summary for the
             # same Task. Keep recent user-visible messages, but do not repeat
@@ -552,7 +575,9 @@ class SessionContextProjector:
                 item for item in task_index
                 if item["task_id"] not in recent_task_ids
             ],
-            "omitted_task_count": 0,
+            "omitted_task_count": (
+                len(projection.task_summaries) - len(task_index)
+            ),
         }
         summary_hash = canonical_hash(summary_source)
         body_data = {
@@ -611,7 +636,7 @@ class SessionContextProjector:
                 ],
                 "message_count": len(projection.messages) - len(visible_messages),
                 "tasks": summary_source["tasks"],
-                "omitted_task_count": 0,
+                "omitted_task_count": summary_source["omitted_task_count"],
             },
             "recent_messages": [
                 message.source_data() for message in visible_messages
@@ -749,13 +774,13 @@ class SessionContextProjector:
 
     def _task_index(
         self, projection: SessionConversationProjection,
+        included_task_ids: set[str],
     ) -> list[dict[str, Any]]:
-        """Build one minimal, traceable directory entry for every Task.
+        """Build prompt entries only for currently relevant Tasks.
 
-        The index is intentionally smaller than a Task summary, but it keeps the
-        facts most likely to be referenced later: identity, goal, state, concrete
-        artifacts, completed work, remaining work, and source Event sequences.
-        It is retained when the unified context manager compacts old detail.
+        The durable projection retains every Task. Prompt callers pass the
+        bounded recent/active/suspended subset so stale conclusions cannot
+        become implicit instructions for a new turn.
         """
         messages_by_task: dict[str, list[SessionConversationMessage]] = {}
         for message in projection.messages:
@@ -769,6 +794,8 @@ class SessionContextProjector:
             )
         entries: list[dict[str, Any]] = []
         for summary in projection.task_summaries:
+            if summary.task_id not in included_task_ids:
+                continue
             artifacts = list(dict.fromkeys(
                 resources_by_task.get(summary.task_id, ())
             ))

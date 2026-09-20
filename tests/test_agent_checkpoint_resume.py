@@ -871,6 +871,8 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
                 "schema_version": 1,
             },
         )
+        self.assertNotIn("execution_focus", checkpoint.to_data())
+        self.assertNotIn("active_outcome_ids", checkpoint.to_data())
         self.assertEqual(
             AgentTurnCheckpoint.from_data(checkpoint.to_data()), checkpoint
         )
@@ -878,6 +880,27 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         data["max_tool_calls"] = 999
         with self.assertRaisesRegex(ValueError, "integrity hash"):
             AgentTurnCheckpoint.from_data(data)
+
+    def test_legacy_execution_focus_checkpoint_remains_integrity_checked(self) -> None:
+        checkpoint = AgentTurnCheckpoint(
+            "task-legacy-focus", "turn-legacy-focus", 1, (), (), (),
+            0, 0, 0, 0, 2, 2, 100, 1.0,
+        )
+        legacy = checkpoint._content_data()
+        legacy["execution_focus"] = {
+            "selected_outcome_ids": ["deliver"],
+            "selection_revision": 3,
+            "selection_reason": "legacy",
+            "source_input_id": "input-1",
+        }
+        legacy["active_outcome_ids"] = ["deliver"]
+        legacy["checkpoint_hash"] = canonical_hash(legacy)
+
+        restored = AgentTurnCheckpoint.from_data(legacy)
+
+        self.assertTrue(restored.legacy_execution_focus)
+        self.assertTrue(restored.legacy_active_outcome_ids)
+        self.assertEqual(restored.to_data(), legacy)
 
     def test_checkpoint_from_before_evidence_guided_state_still_loads(self) -> None:
         checkpoint = AgentTurnCheckpoint(
@@ -892,7 +915,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
             "task_spec_revision", "task_spec_hash",
             "active_outcome_ids", "pending_user_action",
         ):
-            legacy.pop(field)
+            legacy.pop(field, None)
         legacy["checkpoint_hash"] = canonical_hash(legacy)
         restored = AgentTurnCheckpoint.from_data(legacy)
         self.assertEqual(restored.evidence_relation_state, {})

@@ -11,7 +11,7 @@ import secrets
 import shlex
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -194,6 +194,7 @@ from .configuration import (
     EffectiveConfigurationSnapshot, canonical_hash, effective_toolset_hash,
 )
 from .context import ContextWindowExceeded, ContextWindowManager
+from .document_references import extract_document_references
 from .prompt import PromptAssemblyReceipt, PromptTemplate
 from .memory import MemoryRecord, MemoryScope, MemorySourceKind, MemoryView
 from .onboarding import (
@@ -239,7 +240,8 @@ from .runtime_input import (
     ApprovalResolutionInput, CancelTaskInput, ClarificationReplyInput,
     InterruptTaskInput, QueuedFollowUp, RuntimeInputContext,
     RuntimeInputEvent, RuntimeInputIntent, RuntimeInputRoute, RuntimeInputRouter,
-    RuntimeTextInput, SessionContinuationDecision, SessionContinuationMode,
+    RuntimeTextInput, SessionTextInput, SessionContinuationDecision,
+    SessionContinuationMode,
     SessionResumeCandidate, SessionResumeSafety, SessionInputAction,
     SessionInputDecision, SessionInputGrounding, SessionRouteDisposition,
     SessionTaskCatalogEntry, SessionTaskRelation,
@@ -328,8 +330,8 @@ class KernelDependencies:
     tools: tuple[ToolProviderPort, ...] = ()
     runtime_adapters: tuple[RuntimeAdapter, ...] = ()
     configuration_metadata: Mapping[str, Any] = field(default_factory=dict)
-    default_max_model_calls: int = 15
-    default_max_tool_calls: int = 40
+    default_max_model_calls: int = 40
+    default_max_tool_calls: int = 120
     default_max_output_tokens: int = 1024
     finalization_model_calls: int = 2
     execution_reserve_model_calls: int = 1
@@ -499,9 +501,6 @@ def _is_verification_command(arguments: Mapping[str, Any]) -> bool:
 def _task_spec_requires_command_verification(spec: TaskSpecSnapshot) -> bool:
     """Derive command verification solely from the declared Task contract."""
     return any(
-        outcome.required and ToolEffect.EXECUTE in outcome.required_effects
-        for outcome in spec.outcomes
-    ) or any(
         criterion.verification_kind is TaskCriterionKind.POST_MUTATION_COMMAND
         for criterion in spec.acceptance_criteria
     )
@@ -551,9 +550,9 @@ def _post_mutation_verification(
         attempts.append((execution, data))
     if not attempts:
         return _PostMutationVerification()
-    if any(data.get("exit_code") == 0 for _execution, data in attempts):
-        return _PostMutationVerification(passed=True)
     latest, data = max(attempts, key=lambda item: item[0].updated_at)
+    if data.get("exit_code") == 0:
+        return _PostMutationVerification(passed=True)
     output = ""
     for field in ("stderr", "stdout"):
         raw = data.get(field)
@@ -968,14 +967,6 @@ class _TaskSpecControl(ToolTaskSpecControl):
             operation_id=scoped_operation, writer=self.invocation_id,
         )).to_data()
 
-    async def select_outcomes(
-        self, outcome_ids: tuple[str, ...], reason: str, source_input_id: str,
-    ) -> Mapping[str, Any]:
-        return (await self.kernel.select_task_outcomes(
-            self.task_id, outcome_ids, reason=reason,
-            source_input_id=source_input_id, writer=self.invocation_id,
-        )).to_data()
-
     async def complete_outcome(
         self, outcome_id: str, completion_summary: str,
         evidence_refs: tuple[str, ...], remaining_work: tuple[str, ...],
@@ -1151,6 +1142,187 @@ class Kernel:
                 int(event.payload["inbound_sequence"]),
             ))
         return tuple(sorted(queued, key=lambda item: item.inbound_sequence))
+
+    async def consume_queued_session_follow_up(
+        self, session_id: str, workspace: Path, *, input_id: str | None = None,
+    ) -> TaskSnapshot | None:
+        """Atomically create and dispatch one ready queued follow-up.
+
+        A named queue item is replayable: after it has been dispatched this
+        returns its durable Task instead of creating another one.  Without an
+        ``input_id``, the earliest ready undispatched item is selected.
+        """
+        if input_id is not None and not input_id.strip():
+            raise ValueError("follow-up input_id must not be empty")
+        resolved_workspace = self._dependencies.workspace_path.normalize_workspace(
+            workspace
+        )
+        for attempt in range(5):
+            stored = await self._dependencies.store.load_session(session_id)
+            if stored is None:
+                raise LookupError(f"session not found: {session_id}")
+            session = SessionSnapshot.from_data(stored.data)
+            self._authorize_session(session)
+            events = await self._dependencies.store.read_session_events(session_id)
+
+            if input_id is not None:
+                dispatched = next((
+                    event for event in events
+                    if event.event_type == "session.follow_up_dispatched"
+                    and event.payload.get("input_id") == input_id
+                ), None)
+                if dispatched is not None:
+                    task = await self.get_task(str(dispatched.payload["task_id"]))
+                    if task.session_id != session_id:
+                        raise ValueError("dispatched Task does not belong to follow-up Session")
+                    return task
+
+            terminal_ids = {
+                str(event.payload.get("input_id"))
+                for event in events
+                if event.event_type in {
+                    "session.follow_up_dispatched", "session.follow_up_cancelled",
+                }
+            }
+            candidates: list[QueuedFollowUp] = []
+            for event in events:
+                if event.event_type != "session.follow_up_queued":
+                    continue
+                queued_input_id = str(event.payload["input_id"])
+                if queued_input_id in terminal_ids:
+                    continue
+                if input_id is not None and queued_input_id != input_id:
+                    continue
+                candidates.append(QueuedFollowUp(
+                    queued_input_id, session_id,
+                    str(event.payload["after_task_id"]),
+                    str(event.payload["text"]),
+                    int(event.payload["inbound_sequence"]),
+                ))
+            candidates.sort(key=lambda item: item.inbound_sequence)
+            follow_up = None
+            for candidate in candidates:
+                if (await self.get_task(candidate.after_task_id)).state.is_terminal:
+                    follow_up = candidate
+                    break
+            if follow_up is None:
+                return None
+
+            command_id = f"follow-up:{follow_up.input_id}"
+            prior = await self._dependencies.store.load_session_task_command(command_id)
+            if prior is not None:
+                prior_session_id, prior_task_id = prior
+                if prior_session_id != session_id:
+                    raise ValueError("follow-up command belongs to another Session")
+                task = await self.get_task(prior_task_id)
+                if task.session_id != session_id:
+                    raise ValueError("follow-up command Task belongs to another Session")
+                dispatch = SessionEvent(
+                    f"sevt-{uuid4().hex}", session_id,
+                    stored.last_event_sequence + 1,
+                    "session.follow_up_dispatched", {
+                        "input_id": follow_up.input_id, "task_id": task.task_id,
+                        "inbound_sequence": follow_up.inbound_sequence,
+                    },
+                )
+                try:
+                    await self._dependencies.store.commit_session(SessionUnitOfWork(
+                        session_id, stored.version, session.to_data(), (dispatch,)
+                    ))
+                    return task
+                except ValueError as error:
+                    if "version conflict" not in str(error) or attempt == 4:
+                        raise
+                    continue
+
+            identity = f"task-{uuid4().hex}"
+            session = session.attach_task(identity)
+            attach_sequence = stored.last_event_sequence + 1
+            session_events = (
+                SessionEvent(
+                    f"sevt-{uuid4().hex}", session_id, attach_sequence,
+                    "session.task_attached", {
+                        "task_id": identity, "active_task_id": identity,
+                        "source_task_id": follow_up.after_task_id,
+                        "task_relation": SessionTaskRelation.FOLLOW_UP.value,
+                    },
+                ),
+                SessionEvent(
+                    f"sevt-{uuid4().hex}", session_id, attach_sequence + 1,
+                    "session.task_derived", {
+                        "task_id": identity, "source_task_id": follow_up.after_task_id,
+                        "task_relation": SessionTaskRelation.FOLLOW_UP.value,
+                        "inherited": ["authority_free_session_summary"],
+                        "not_inherited": [
+                            "approval", "workspace_access_grant", "sandbox_grant",
+                            "checkpoint", "tool_batch", "background_process",
+                            "unknown_outcome",
+                        ],
+                    },
+                ),
+                SessionEvent(
+                    f"sevt-{uuid4().hex}", session_id, attach_sequence + 2,
+                    "session.follow_up_dispatched", {
+                        "input_id": follow_up.input_id, "task_id": identity,
+                        "inbound_sequence": follow_up.inbound_sequence,
+                    },
+                ),
+            )
+            trust = await self.get_project_trust(resolved_workspace)
+            baseline = capture_workspace_baseline(
+                resolved_workspace, self._dependencies.workspace_path
+            )
+            snapshot = TaskSnapshot.create(
+                task_id=identity, goal=follow_up.text,
+                workspace=str(resolved_workspace), session_id=session_id,
+            ).with_project_trust(
+                trust.level, trust.fingerprint, trust.subject
+            ).with_workspace_baseline(baseline)
+            task_spec = TaskSpecSnapshot.initial(snapshot.task_id, snapshot.goal)
+            event = RuntimeEvent(
+                event_id=f"evt-{uuid4().hex}", task_id=identity, sequence=1,
+                event_type="task.created", payload={
+                    "goal": snapshot.goal, "workspace": snapshot.workspace,
+                    "session_id": session_id,
+                    "source_task_id": follow_up.after_task_id,
+                    "task_relation": SessionTaskRelation.FOLLOW_UP.value,
+                    "project_trust": snapshot.project_trust.value,
+                    "project_fingerprint": snapshot.project_fingerprint,
+                    "trust_subject": snapshot.trust_subject,
+                    "task_spec": task_spec.to_data(),
+                    "baseline": {
+                        "captured_at": baseline.captured_at.isoformat(),
+                        "file_count": len(baseline.files),
+                        "git_head": baseline.git_head,
+                        "skipped_files": baseline.skipped_files,
+                        "truncated": baseline.truncated,
+                    },
+                },
+            )
+            try:
+                await self._dependencies.store.commit_session_and_task(
+                    SessionTaskUnitOfWork(
+                        SessionUnitOfWork(
+                            session_id, stored.version, session.to_data(), session_events
+                        ),
+                        RuntimeUnitOfWork(identity, 0, snapshot.to_data(), (event,)),
+                        command_id,
+                    )
+                )
+                return snapshot
+            except ValueError as error:
+                # Concurrent consumers may both select the same ready item.
+                # The winning transaction owns the stable command id; retry so
+                # the loser observes its durable dispatched event and replays
+                # the winning Task instead of surfacing an idempotency error.
+                retryable = (
+                    "version conflict" in str(error)
+                    or "session command_id was reused with different targets"
+                    in str(error)
+                )
+                if not retryable or attempt == 4:
+                    raise
+        raise RuntimeError("unreachable follow-up consume retry state")
 
     async def cancel_session_follow_up(
         self, session_id: str, input_id: str,
@@ -1468,7 +1640,7 @@ class Kernel:
             session_id, conversation, candidates
         )
         resolver = self._dependencies.session_input_resolver
-        if resolver is None and not catalog:
+        if not catalog:
             decision = SessionInputDecision(
                 SessionRouteDisposition.CREATE_TASK,
                 SessionTaskRelation.INDEPENDENT, None, normalized, 1.0,
@@ -1682,44 +1854,30 @@ class Kernel:
                 session_id, normalized, decision
             )
             return decision
-        except (TimeoutError, asyncio.TimeoutError):
-            decision = SessionInputDecision(
-                disposition=SessionRouteDisposition.CLARIFY,
-                relation=SessionTaskRelation.UNCERTAIN,
-                source_task_id=None, resolved_goal=normalized, confidence=0.0,
-                reason_code="semantic_router_timeout_degraded",
-                input_grounding=SessionInputGrounding.AMBIGUOUS,
-                clarification=(
-                    "会话路由超时，未创建新 Task。请选择要继续的历史 Task，"
-                    "或完整描述一个独立新目标。"
-                ),
-                resolver_version=(
-                    "resolver:" f"{resolver.descriptor.adapter_id}@"
-                    f"{resolver.descriptor.adapter_version}"
-                ),
-                candidates=candidates, task_catalog=catalog,
-            )
-            await self._record_session_input_decision(
-                session_id, normalized, decision
-            )
-            return decision
         except Exception as error:
+            # Every router failure is the same situation: the classifier produced
+            # no usable answer about input Runtime already accepted. A timeout is
+            # not evidence that the user was unclear, so it must not be answered
+            # by asking the user to restate the request; that discards a valid
+            # message and loses the conversation thread.
             failure = (
-                "protocol"
+                "timeout"
+                if isinstance(error, (TimeoutError, asyncio.TimeoutError))
+                else "protocol"
                 if isinstance(
                     error, (ValueError, KeyError, TypeError, json.JSONDecodeError)
                 ) else "unavailable"
             )
+            # Harness never guesses a semantic source after router failure. It
+            # instead creates a contextual Task so the normal Agent receives the
+            # durable Session history and can resolve the user's intent itself.
             decision = SessionInputDecision(
-                disposition=SessionRouteDisposition.CLARIFY,
-                relation=SessionTaskRelation.UNCERTAIN,
+                disposition=SessionRouteDisposition.CREATE_TASK,
+                relation=SessionTaskRelation.CONTEXTUAL,
                 source_task_id=None, resolved_goal=normalized, confidence=0.0,
-                reason_code=f"semantic_router_{failure}_degraded",
-                input_grounding=SessionInputGrounding.AMBIGUOUS,
-                clarification=(
-                    "会话路由结果无效，未创建新 Task。请选择要继续的历史 "
-                    "Task，或完整描述一个独立新目标。"
-                ),
+                reason_code=f"semantic_router_{failure}_contextual_fallback",
+                input_grounding=SessionInputGrounding.CONTEXT_DEPENDENT,
+                clarification=None,
                 resolver_version=(
                     "resolver:" f"{resolver.descriptor.adapter_id}@"
                     f"{resolver.descriptor.adapter_version}"
@@ -1786,6 +1944,10 @@ class Kernel:
                 )[:8],
                 candidate.safety if candidate else None, recency,
                 task_id == anchor_id,
+                phase1_state=(
+                    task.state if task is not None
+                    else TaskState(candidate.task_state)
+                ).phase1_state.value,
             ))
         return tuple(entries)
 
@@ -2195,46 +2357,6 @@ class Kernel:
             legacy_active_outcome_ids=legacy_active_outcome_ids,
         )
 
-    async def select_task_outcomes(
-        self, task_id: str, outcome_ids: tuple[str, ...], *, reason: str,
-        source_input_id: str = "", writer: str = "runtime",
-    ) -> TaskExecutionFocus:
-        """Validate and persist a model-proposed execution focus change."""
-        if not outcome_ids or len(set(outcome_ids)) != len(outcome_ids):
-            raise ValueError("outcome selection must contain unique IDs")
-        if not reason.strip() or not writer.strip():
-            raise ValueError("outcome selection reason and writer are required")
-        stored = await self._require_stored_task(task_id)
-        task = TaskSnapshot.from_data(stored.data)
-        events = await self._dependencies.store.read_events(task_id)
-        spec = TaskSpecProjector.project(task_id, task.goal, events)
-        eligible_ids = tuple(
-            item.outcome_id
-            for item in TaskOutcomeEligibilityCalculator.eligible(spec)
-        )
-        invalid = tuple(item for item in outcome_ids if item not in eligible_ids)
-        if invalid:
-            raise ValueError(
-                "outcome selection contains ineligible IDs: "
-                + ", ".join(invalid)
-            )
-        current = TaskExecutionFocusProjector.project(spec, events)
-        focus = TaskExecutionFocus(
-            outcome_ids, current.selection_revision + 1, reason.strip(),
-            source_input_id.strip(),
-        )
-        event = RuntimeEvent(
-            f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
-            "task_execution_focus.changed", {
-                "writer": writer, "focus": focus.to_data(),
-                "eligible_outcome_ids": list(eligible_ids),
-            },
-        )
-        await self._dependencies.store.commit(RuntimeUnitOfWork(
-            task_id, stored.version, task.to_data(), (event,)
-        ))
-        return focus
-
     async def request_task_outcome_completion(
         self, task_id: str, outcome_id: str, *, completion_summary: str,
         evidence_refs: tuple[str, ...], remaining_work: tuple[str, ...],
@@ -2469,10 +2591,11 @@ class Kernel:
                     if not tool.is_internal_state
                 }),
             })
-            proposal = TaskSpecProposal.from_data(raw)
+            proposal = TaskSpecProposal.from_data(
+                raw, require_acceptance_criteria=True
+            )
             candidate = TaskSpecSnapshot.from_proposal(
-                task_id, current.revision + 1, proposal,
-                current.acceptance_criteria,
+                task_id, current.revision + 1, proposal
             )
             await self._append_events(task_id, (("task_spec.revised", {
                 "writer": "task-spec-planner",
@@ -2586,8 +2709,8 @@ class Kernel:
         on_text_delta: Callable[[str], None] | None = None,
         on_progress: Callable[[AgentProgress], None] | None = None,
     ) -> (
-        RuntimeInputRoute | TaskSnapshot | AgentTurnResult | AgentTurnSuspended
-        | AgentClarificationSuspended
+        RuntimeInputRoute | SessionInputDecision | TaskSnapshot
+        | AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended
     ):
         """Route typed input before any semantic interpretation.
 
@@ -2617,6 +2740,11 @@ class Kernel:
                 )
             return await self.transition_task(
                 event.task_id, TaskState.CANCELLED, event.reason
+            )
+        if isinstance(event, SessionTextInput):
+            return await self.resolve_session_input(
+                event.session_id, event.text,
+                Path(event.workspace) if event.workspace else None,
             )
         if isinstance(event, RuntimeTextInput):
             return await self.route_runtime_input(
@@ -3184,11 +3312,15 @@ class Kernel:
         tasks = []
         for task_id in session.task_ids:
             task_stored = await self._dependencies.store.load_task(task_id)
+            task = (
+                TaskSnapshot.from_data(task_stored.data)
+                if task_stored is not None else None
+            )
             tasks.append({
                 "task_id": task_id,
-                "state": (
-                    TaskSnapshot.from_data(task_stored.data).state.value
-                    if task_stored is not None else "MISSING"
+                "state": task.state.value if task is not None else "MISSING",
+                "phase1_state": (
+                    task.state.phase1_state.value if task is not None else "MISSING"
                 ),
                 "active": task_id == session.active_task_id,
             })
@@ -3812,6 +3944,28 @@ class Kernel:
             trust.level, trust.fingerprint, trust.subject
         ).with_workspace_baseline(baseline)
         task_spec = TaskSpecSnapshot.initial(snapshot.task_id, snapshot.goal)
+        document_references = extract_document_references(normalized_goal)
+        visible_tool_names = {tool.name for tool in await self.list_tools()}
+        document_fetch_failure = (
+            ToolResult(
+                call_id=f"document-fetch-{canonical_hash(normalized_goal)[:16]}",
+                ok=False,
+                error_code="DOCUMENT_FETCH_UNAVAILABLE",
+                message=(
+                    "An explicit document URL was supplied, but this runtime does "
+                    "not advertise web.fetch_markdown. The document was not read."
+                ),
+                hint=(
+                    "Configure and advertise web.fetch_markdown before reading the "
+                    "URL. Do not use workspace search as a substitute."
+                ),
+                retryable=False,
+                data={"document_references": list(document_references)},
+                meta={"runtime_guard": "EXPLICIT_DOCUMENT_REFERENCE"},
+            )
+            if document_references and "web.fetch_markdown" not in visible_tool_names
+            else None
+        )
         event = RuntimeEvent(
             event_id=f"evt-{uuid4().hex}",
             task_id=snapshot.task_id,
@@ -3826,6 +3980,11 @@ class Kernel:
                 "project_fingerprint": snapshot.project_fingerprint,
                 "trust_subject": snapshot.trust_subject,
                 "task_spec": task_spec.to_data(),
+                "document_references": list(document_references),
+                "document_fetch_failure": (
+                    document_fetch_failure.to_data()
+                    if document_fetch_failure is not None else None
+                ),
                 "baseline": {
                     "captured_at": baseline.captured_at.isoformat(),
                     "file_count": len(baseline.files),
@@ -5243,17 +5402,30 @@ class Kernel:
 
     async def _session_context_message(self, task_id: str) -> Message | None:
         task = await self.get_task(task_id)
-        return (await self.get_session_prompt_projection(task.session_id)).message
+        return (await self.get_session_prompt_projection(
+            task.session_id, exclude_task_id=task_id
+        )).message
 
     async def get_session_prompt_projection(
-        self, session_id: str,
+        self, session_id: str, *, exclude_task_id: str | None = None,
     ) -> SessionPromptProjection:
-        """Build the unified bounded Session view used by model and UI."""
+        """Build the unified bounded Session view used by model and UI.
+
+        ``exclude_task_id`` removes the Task that owns the current prompt. Its
+        live messages and authoritative checkpoint are already in the turn, so
+        projecting the Task into its own Session context only duplicates state
+        and describes the current turn as if it were prior work.
+        """
         projection = await self.get_session_conversation(session_id)
         projector = self._dependencies.session_context_projector
         active_checkpoint = await self.get_session_active_checkpoint(
             session_id
         )
+        if (
+            active_checkpoint is not None
+            and active_checkpoint.task_id == exclude_task_id
+        ):
+            active_checkpoint = None
         executions_by_task: dict[str, tuple[Any, ...]] = {}
         excluded = (
             (active_checkpoint.task_id,)
@@ -5272,8 +5444,11 @@ class Kernel:
         recent_executions = projector.project_recent_executions(
             executions_by_task
         )
-        suspended_tasks = await self.list_session_resume_candidates(
-            session_id, validate_compatibility=False
+        suspended_tasks = tuple(
+            candidate for candidate in await self.list_session_resume_candidates(
+                session_id, validate_compatibility=False
+            )
+            if candidate.task_id != exclude_task_id
         )
         return projector.for_prompt(
             projection, recent_executions=recent_executions,
@@ -5330,6 +5505,18 @@ class Kernel:
         pending_tools = tuple(dict.fromkeys(
             call.name for call in checkpoint.pending_tool_calls
         ))[:20]
+        historical_focus: Mapping[str, Any] | None = None
+        if checkpoint.legacy_execution_focus or checkpoint.legacy_active_outcome_ids:
+            events = await self._dependencies.store.read_events(task.task_id)
+            if any(
+                event.event_type == "task_execution_focus.changed" for event in events
+            ) or checkpoint.active_outcome_ids:
+                historical_focus = (await self.get_task_execution_focus(
+                    task.task_id,
+                    legacy_active_outcome_ids=checkpoint.active_outcome_ids,
+                )).to_data()
+            elif checkpoint.legacy_execution_focus:
+                historical_focus = dict(checkpoint.execution_focus)
         return SessionActiveCheckpoint(
             task_id=task.task_id, turn_id=checkpoint.turn_id,
             task_state=task.state.value, goal=memory.goal or task.goal,
@@ -5349,7 +5536,7 @@ class Kernel:
             consecutive_zero_delta=inventory.consecutive_zero_delta,
             task_spec_revision=checkpoint.task_spec_revision,
             task_spec_hash=checkpoint.task_spec_hash,
-            execution_focus=dict(checkpoint.execution_focus),
+            execution_focus=historical_focus,
             pending_user_action=(
                 dict(checkpoint.pending_user_action)
                 if checkpoint.pending_user_action else None
@@ -5473,21 +5660,78 @@ class Kernel:
         )
 
     async def _project_context_messages(self, task_id: str) -> tuple[Message, ...]:
-        instructions, task_spec, onboarding, memory, session, working_memory = (
+        instructions, task_spec, onboarding, memory, session, document_references, working_memory = (
             await asyncio.gather(
             self._project_instructions_context_message(task_id),
             self._task_spec_context_message(task_id),
             self._onboarding_context_message(task_id),
             self._memory_context_message(task_id),
             self._session_context_message(task_id),
+            self._document_reference_context_message(task_id),
             self._working_memory_context_message(task_id),
         ))
         return tuple(
             message for message in (
-                instructions, task_spec, onboarding, memory, session, working_memory
+                instructions, task_spec, onboarding, memory, session,
+                document_references, working_memory
             )
             if message is not None
         )
+
+    async def _document_reference_context_message(self, task_id: str) -> Message | None:
+        """Expose durable URL targets and unavailable-fetch facts without authority."""
+        task = await self.get_task(task_id)
+        session = await self.get_session(task.session_id)
+        references: list[dict[str, Any]] = []
+        failures: list[dict[str, Any]] = []
+        for related_task_id in session.task_ids:
+            try:
+                events = await self._dependencies.store.read_events(related_task_id)
+            except Exception:
+                continue
+            created = next((
+                event for event in events if event.event_type == "task.created"
+            ), None)
+            if created is None:
+                continue
+            raw_references = created.payload.get("document_references")
+            if isinstance(raw_references, list):
+                references.extend(
+                    {"task_id": related_task_id, **dict(item)}
+                    for item in raw_references if isinstance(item, Mapping)
+                )
+            raw_failure = created.payload.get("document_fetch_failure")
+            if isinstance(raw_failure, Mapping):
+                failures.append({
+                    "task_id": related_task_id,
+                    "result": dict(raw_failure),
+                })
+        if not references and not failures:
+            return None
+        body = json.dumps({
+            "boundary": "explicit_document_references",
+            "warning": (
+                "These are user-declared remote-document targets and Runtime "
+                "fetch facts. They grant no network authority. Local workspace "
+                "search cannot read these URLs."
+            ),
+            "references": references[:20],
+            "failures": failures[:20],
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return Message(
+            f"document-references-context-{canonical_hash(body)[:16]}",
+            MessageRole.USER, (TextBlock(body),),
+        )
+
+    async def _document_fetch_failure(self, task_id: str) -> ToolResult | None:
+        events = await self._dependencies.store.read_events(task_id)
+        created = next((
+            event for event in events if event.event_type == "task.created"
+        ), None)
+        if created is None:
+            return None
+        raw = created.payload.get("document_fetch_failure")
+        return ToolResult.from_data(raw) if isinstance(raw, Mapping) else None
 
     async def _project_instructions_context_message(
         self, task_id: str,
@@ -5529,13 +5773,10 @@ class Kernel:
 
     async def _task_spec_context_message(self, task_id: str) -> Message:
         snapshot = await self.get_task_spec(task_id)
-        focus = await self.get_task_execution_focus(task_id)
-        eligible = TaskOutcomeEligibilityCalculator.eligible(snapshot)
         task = await self.get_task(task_id)
         workspace = self._dependencies.workspace_path.normalize_workspace(
             Path(task.workspace)
         )
-        eligible_ids = tuple(item.outcome_id for item in eligible)
         context_data = {
             "boundary": "inspectable_task_spec",
             "runtime_environment": {
@@ -5550,18 +5791,7 @@ class Kernel:
                 ),
             },
             "task_spec": snapshot.to_data(),
-            "execution_focus": focus.to_data(),
         }
-        if snapshot.outcomes:
-            context_data["instruction"] = (
-                "Bind actions to eligible compatible outcomes; select only when "
-                "ambiguous. Selection grants no authority. Tool success is progress, "
-                "not completion. After all work and verification, complete a "
-                "non-answer outcome with core.task_outcome_complete, its bound "
-                "evidence refs, and empty remaining_work."
-            )
-        if eligible_ids != focus.selected_outcome_ids:
-            context_data["eligible_outcome_ids"] = list(eligible_ids)
         body = json.dumps(
             context_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
@@ -5601,6 +5831,7 @@ class Kernel:
                 {
                     "task_id": task_id, "turn_id": turn_id,
                     "task_state": task.state.value,
+                    "phase1_state": task.state.phase1_state.value,
                     "user_message": user_message.to_data(),
                     "assistant_message": message_data,
                     "content_hash": canonical_hash(message_data),
@@ -5689,6 +5920,7 @@ class Kernel:
             "turn_id": turn_id,
             "goal": working_memory.goal or task.goal,
             "recorded_task_state": task.state.value,
+            "phase1_state": task.state.phase1_state.value,
             "tool_counts": dict(sorted(counts.items())),
             "important_actions": actions[-20:],
             "confirmed": list(confirmed),
@@ -6008,10 +6240,6 @@ class Kernel:
         session = await self.get_session(task.session_id)
         working_memory = await self.get_working_memory(task.task_id)
         task_spec = await self.get_task_spec(task.task_id)
-        focus = await self.get_task_execution_focus(
-            task.task_id,
-            legacy_active_outcome_ids=checkpoint.active_outcome_ids,
-        )
         return replace(
             checkpoint, workspace_fingerprint=task.project_fingerprint,
             effective_config_hash=configuration.effective_config_hash,
@@ -6022,21 +6250,19 @@ class Kernel:
             working_memory_hash=working_memory.content_hash,
             task_spec_revision=task_spec.revision,
             task_spec_hash=task_spec.content_hash,
-            execution_focus=focus.to_data(),
+            execution_focus={}, legacy_execution_focus=False,
+            active_outcome_ids=(), legacy_active_outcome_ids=False,
         )
 
     async def _save_agent_checkpoint(
         self, checkpoint: AgentTurnCheckpoint, reason: str,
     ) -> None:
         task_spec = await self.get_task_spec(checkpoint.task_id)
-        focus = await self.get_task_execution_focus(
-            checkpoint.task_id,
-            legacy_active_outcome_ids=checkpoint.active_outcome_ids,
-        )
         checkpoint = replace(
             checkpoint, task_spec_revision=task_spec.revision,
             task_spec_hash=task_spec.content_hash,
-            execution_focus=focus.to_data(),
+            execution_focus={}, legacy_execution_focus=False,
+            active_outcome_ids=(), legacy_active_outcome_ids=False,
         )
         stored = await self._require_stored_task(checkpoint.task_id)
         task = TaskSnapshot.from_data(stored.data)
@@ -6058,7 +6284,6 @@ class Kernel:
                 ),
                 "task_spec_revision": checkpoint.task_spec_revision,
                 "task_spec_hash": checkpoint.task_spec_hash,
-                "execution_focus": dict(checkpoint.execution_focus),
                 "pending_user_action": dict(checkpoint.pending_user_action),
             },
         )
@@ -6451,6 +6676,10 @@ class Kernel:
             tool.name for tool in visible_tools
             if not tool.is_internal_state and tool.effect is ToolEffect.EXECUTE
         ))
+        mutate_tools = tuple(sorted(
+            tool.name for tool in visible_tools
+            if not tool.is_internal_state and tool.effect is ToolEffect.MUTATE
+        ))
         # Observation is Task-scoped evidence. A model can conservatively bind a
         # read to a broader delivery Outcome even though the same committed fact
         # also supports separate Evidence Outcomes. Reuse only successful
@@ -6465,7 +6694,9 @@ class Kernel:
         ))
         gaps: list[CompletionGap] = []
 
-        for outcome in spec.outcomes:
+        # Outcomes remain in old snapshots for replay only; task completion is
+        # evaluated exclusively through Task-level acceptance criteria.
+        for outcome in ():
             if not outcome.required or outcome.status.is_closed:
                 continue
             # A candidate assistant response itself can satisfy ANSWER; its text
@@ -6520,20 +6751,78 @@ class Kernel:
             ))
 
         for criterion in spec.acceptance_criteria:
-            if criterion.verification_kind is not TaskCriterionKind.EVIDENCE_REFERENCE:
-                continue
-            reference = criterion.evidence_reference or ""
-            evidence = self._verify_task_spec_reference(
-                task, events, reference, criterion.description
-            )
-            if not evidence.passed:
-                gaps.append(CompletionGap(
-                    gap_id=f"task-spec:{criterion.criterion_id}",
-                    kind="TASK_SPEC_EVIDENCE",
-                    description=criterion.description,
-                    status="MISSING", required=True, recoverable=False,
-                    evidence_reference=reference,
-                ))
+            gap_id = f"task-spec:{criterion.criterion_id}"
+            if criterion.verification_kind is TaskCriterionKind.WORKSPACE_INTEGRITY:
+                reverted = {
+                    mutation.reverts_mutation_id for mutation in task.mutation_journal
+                    if mutation.reverts_mutation_id is not None
+                }
+                active_mutations = {
+                    mutation.path: mutation for mutation in task.mutation_journal
+                    if mutation.mutation_id not in reverted
+                }
+                mismatched_paths: list[str] = []
+                for path, mutation in sorted(active_mutations.items()):
+                    try:
+                        resolved = self._dependencies.workspace_path.resolve_mutation_path(
+                            Path(task.workspace), path
+                        ).path
+                        actual_hash = (
+                            file_sha256(resolved) if resolved.exists() else None
+                        )
+                    except (OSError, ValueError):
+                        actual_hash = None
+                    if actual_hash != mutation.after_hash:
+                        mismatched_paths.append(path)
+                if mismatched_paths:
+                    gaps.append(CompletionGap(
+                        gap_id=gap_id, kind="TASK_SPEC_WORKSPACE_INTEGRITY",
+                        description=(criterion.description + ": "
+                                     + "workspace differs from the mutation journal for "
+                                     + ", ".join(mismatched_paths[:10])),
+                        status="FAILED", required=True,
+                        recoverable=bool(mutate_tools),
+                        required_effects=(ToolEffect.MUTATE,),
+                        candidate_tools=mutate_tools,
+                    ))
+            elif criterion.verification_kind is TaskCriterionKind.POST_MUTATION_COMMAND:
+                if not task.mutation_journal:
+                    gaps.append(CompletionGap(
+                        gap_id=gap_id, kind="TASK_SPEC_POST_MUTATION_COMMAND",
+                        description=(criterion.description + ": no workspace mutation "
+                                     + "exists for a post-mutation check"),
+                        status="BLOCKED", required=True, recoverable=False,
+                    ))
+                    continue
+                verification = _post_mutation_verification(task)
+                if not verification.passed:
+                    gaps.append(CompletionGap(
+                        gap_id=gap_id, kind="TASK_SPEC_POST_MUTATION_COMMAND",
+                        description=(criterion.description + ": "
+                                     + _post_mutation_verification_description(
+                                         verification
+                                     )),
+                        status="MISSING", required=True,
+                        recoverable=bool(execute_tools),
+                        required_effects=(ToolEffect.EXECUTE,),
+                        candidate_tools=execute_tools,
+                        observed=_post_mutation_verification_observed(
+                            verification, self._local_interpreter(task)
+                        ),
+                    ))
+            else:
+                reference = criterion.evidence_reference or ""
+                evidence = self._verify_task_spec_reference(
+                    task, events, reference, criterion.description
+                )
+                if not evidence.passed:
+                    gaps.append(CompletionGap(
+                        gap_id=gap_id,
+                        kind="TASK_SPEC_EVIDENCE",
+                        description=criterion.description,
+                        status="MISSING", required=True, recoverable=False,
+                        evidence_reference=reference,
+                    ))
 
         for record in questions.records:
             if record.status not in {
@@ -6573,6 +6862,11 @@ class Kernel:
         if (
             task.mutation_journal
             and _task_spec_requires_command_verification(spec)
+            and not any(
+                criterion.verification_kind
+                is TaskCriterionKind.POST_MUTATION_COMMAND
+                for criterion in spec.acceptance_criteria
+            )
         ):
             verification = _post_mutation_verification(task)
             if not verification.passed:
@@ -6880,7 +7174,10 @@ class Kernel:
         This does not invoke a provider. Exact terminal results are represented
         to the model once, removed from pending work, and audited as reused.
         """
-        if decision.action is not CheckpointCompatibilityAction.RECONCILE_REQUIRED:
+        if decision.action not in {
+            CheckpointCompatibilityAction.RECONCILE_REQUIRED,
+            CheckpointCompatibilityAction.EXACT_RESUME,
+        }:
             raise AgentCheckpointConflict(
                 "checkpoint compatibility policy did not allow reconciliation"
             )
@@ -6914,9 +7211,9 @@ class Kernel:
                     MessageRole.TOOL, (ToolResultBlock(execution.result),),
                 ))
                 represented_call_ids.add(call.call_id)
-        if not reconciled:
+        if remaining:
             raise AgentCheckpointConflict(
-                "checkpoint reconciliation found no exact committed pending call"
+                "checkpoint reconciliation found unresolved pending tool calls"
             )
         safe_runtime_differences = {
             "session_context_hash", "effective_config_hash",
@@ -6952,7 +7249,7 @@ class Kernel:
             generated_prefixes = (
                 "project-instructions-context-", "task-spec-context-",
                 "project-onboarding-context-", "project-memory-context-",
-                "session-context-", "working-memory-context-",
+                "session-context-", "document-references-context-", "working-memory-context-",
             )
             messages = [
                 message for message in messages
@@ -7412,6 +7709,7 @@ class Kernel:
                 {
                     "task_id": task.task_id,
                     "task_state": task.state.value,
+                    "phase1_state": task.state.phase1_state.value,
                     "verification_status": verification_status,
                     "context_revision": updated.context_revision,
                 },
@@ -7459,7 +7757,8 @@ class Kernel:
             for reference in candidate.fulfillment_refs
             if reference.rsplit(":", 1)[-1] == ToolEffect.OBSERVE.value
         ))
-        for outcome in task_spec.outcomes:
+        # Legacy Outcome events are never synthesized during new verification.
+        for outcome in ():
             local_fulfilled_effects = {
                 ToolEffect(ref.rsplit(":", 1)[-1])
                 for ref in outcome.fulfillment_refs
@@ -7520,7 +7819,7 @@ class Kernel:
                         ),
                     },
                 ),))
-        if task_spec.outcomes:
+        if task_spec.schema_version == 0:
             events = await self._dependencies.store.read_events(task_id)
             task_spec = TaskSpecProjector.project(task_id, task.goal, events)
         answer_evidence_result = (
@@ -7568,7 +7867,7 @@ class Kernel:
         if mandatory_answer_completeness:
             assert answer_result is not None
             criteria.append(answer_result)
-        if task_spec.outcomes:
+        if task_spec.schema_version == 0:
             open_required = tuple(
                 outcome for outcome in task_spec.outcomes
                 if outcome.required and not outcome.status.is_closed
@@ -8707,7 +9006,15 @@ class Kernel:
         decision = await self._evaluate_checkpoint_compatibility(
             task, checkpoint, visible_tools
         )
-        if decision.action is CheckpointCompatibilityAction.RECONCILE_REQUIRED:
+        if (
+            task.state is TaskState.INTERRUPTED
+            and decision.action is CheckpointCompatibilityAction.EXACT_RESUME
+        ):
+            checkpoint = await self._reconcile_agent_checkpoint(
+                task, checkpoint, visible_tools, decision
+            )
+            task = await self.get_task(task_id)
+        elif decision.action is CheckpointCompatibilityAction.RECONCILE_REQUIRED:
             checkpoint = await self._reconcile_agent_checkpoint(
                 task, checkpoint, visible_tools, decision
             )
@@ -8768,6 +9075,112 @@ class Kernel:
             on_progress=on_progress,
         )
 
+    @staticmethod
+    def _latest_recoverable_tool_batch(
+        messages: Sequence[Message],
+    ) -> tuple[ToolResult, ...]:
+        """Return retryable failures from the newest completed tool batch.
+
+        This derives a generic recovery barrier from durable ToolResult data;
+        it deliberately does not inspect a particular tool name or error code.
+        """
+        generated_prefixes = (
+            "project-instructions-context-", "task-spec-context-",
+            "project-onboarding-context-", "project-memory-context-",
+            "session-context-", "working-memory-context-",
+            "completion-readiness-", "continuation-input-", "steering-",
+        )
+        results: list[ToolResult] = []
+        saw_result = False
+        for message in reversed(messages):
+            if message.message_id.startswith(generated_prefixes):
+                continue
+            tool_results = [
+                block.result for block in message.content
+                if isinstance(block, ToolResultBlock)
+            ]
+            if tool_results:
+                results.extend(tool_results)
+                saw_result = True
+                continue
+            if (
+                saw_result
+                and message.role is MessageRole.ASSISTANT
+                and any(isinstance(block, ToolCallBlock) for block in message.content)
+            ):
+                break
+        recoverable = {
+            ToolRecoveryKind.RETRY_SAME,
+            ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+        }
+        return tuple(
+            result for result in reversed(results)
+            if not result.ok and result.effective_recovery_kind in recoverable
+        )
+
+    @staticmethod
+    def _recovery_batch_blocker_message(
+        recovery_batch: Sequence[ToolResult],
+    ) -> Message:
+        """Render authoritative failed ToolResults without model paraphrasing."""
+        failures = [
+            {
+                "call_id": result.call_id,
+                "error_code": result.error_code,
+                "message": result.message,
+                "recovery_kind": result.effective_recovery_kind.value,
+                "recovery_action": dict(result.recovery_action),
+            }
+            for result in recovery_batch
+        ]
+        return Message(
+            f"tool-recovery-blocker-{uuid4().hex}", MessageRole.ASSISTANT,
+            (TextBlock(json.dumps({
+                "boundary": "unresolved_tool_batch",
+                "instruction": (
+                    "Tool execution did not complete. The Task is paused until "
+                    "the next user continuation; prior assistant prose is not "
+                    "evidence of completion."
+                ),
+                "failures": failures,
+            }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))),),
+        )
+
+    @staticmethod
+    def _compact_continuation_messages(
+        messages: tuple[Message, ...], user_text: str, input_id: str,
+    ) -> tuple[Message, ...]:
+        """Keep execution evidence but discard stale assistant conclusions.
+
+        A continuation resumes one Task safely; it must not make earlier blocker
+        prose look like durable evidence. Tool-call messages and ToolResult
+        messages remain paired and intact for protocol recovery.
+        """
+        retained = [
+            message for message in messages
+            if not message.message_id.startswith("completion-readiness-")
+            and not (
+                message.role is MessageRole.ASSISTANT
+                and not any(
+                    isinstance(block, ToolCallBlock)
+                    for block in message.content
+                )
+            )
+        ]
+        retained.append(Message(
+            f"continuation-input-{input_id}", MessageRole.USER,
+            (TextBlock(json.dumps({
+                "boundary": "user_continuation",
+                "instruction": (
+                    "Continue the current Task from durable ToolResults and "
+                    "workspace facts. Prior assistant prose is not evidence and "
+                    "must not be repeated as a conclusion."
+                ),
+                "text": user_text,
+            }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))),),
+        ))
+        return tuple(retained)
+
     async def resume_agent_continuation(
         self, task_id: str, user_text: str, *, input_id: str,
         on_text_delta: Callable[[str], None] | None = None,
@@ -8796,7 +9209,20 @@ class Kernel:
         pending = checkpoint.pending_user_action
         if pending.get("kind") != "CONTINUATION":
             raise ClarificationNotPending("task has no pending continuation")
-        replenish_capacity = pending.get("reason") == "incomplete_recoverable"
+        # An explicit user continuation is a new authorization to spend, so the
+        # resumed Turn must be able to act. Without this, a continuation that
+        # was suspended at an exhausted budget resumes with zero capacity, dies
+        # on the next model call, and leaves the Task terminally FAILED - after
+        # which the same request can only be retried as a brand-new Task that
+        # repeats work already done. Capacity is judged by what is left, not by
+        # which reason string produced the suspension.
+        exhausted_capacity = (
+            checkpoint.model_calls >= checkpoint.max_model_calls
+            or checkpoint.tool_calls >= checkpoint.max_tool_calls
+        )
+        replenish_capacity = exhausted_capacity or pending.get("reason") in {
+            "incomplete_recoverable", "unresolved_tool_batch",
+        }
         visible_tools = await self.list_tools()
         compatibility = await self._evaluate_checkpoint_compatibility(
             task, checkpoint, visible_tools
@@ -8856,6 +9282,9 @@ class Kernel:
             )
         resumed_checkpoint = replace(
             checkpoint, revision=checkpoint.revision + 1,
+            messages=self._compact_continuation_messages(
+                checkpoint.messages, normalized, input_id
+            ),
             pending_user_action={},
             max_model_calls=(
                 checkpoint.model_calls + self._dependencies.default_max_model_calls
@@ -9392,9 +9821,6 @@ class Kernel:
         turn_id = checkpoint.turn_id
         await self.plan_task_spec(task_id)
         live_spec = await self.get_task_spec(task_id)
-        live_focus = await self.get_task_execution_focus(
-            task_id, legacy_active_outcome_ids=checkpoint.active_outcome_ids
-        )
         closed_outcomes_at_entry = frozenset(
             outcome.outcome_id for outcome in live_spec.outcomes
             if outcome.required and outcome.status.is_closed
@@ -9402,7 +9828,6 @@ class Kernel:
         checkpoint = replace(
             checkpoint, task_spec_revision=live_spec.revision,
             task_spec_hash=live_spec.content_hash,
-            execution_focus=live_focus.to_data(),
         )
         messages = list(checkpoint.messages)
         if initial_tool_message is not None:
@@ -9455,11 +9880,9 @@ class Kernel:
                 pending_tool_calls.clear()
                 await self.plan_task_spec(task_id)
                 refreshed_spec = await self.get_task_spec(task_id)
-                refreshed_focus = await self.get_task_execution_focus(task_id)
                 checkpoint = replace(
                     checkpoint, task_spec_revision=refreshed_spec.revision,
                     task_spec_hash=refreshed_spec.content_hash,
-                    execution_focus=refreshed_focus.to_data(),
                 )
             while pending_tool_calls:
                 checkpoint, replaced = await self._apply_pending_steering(
@@ -10558,19 +10981,9 @@ class Kernel:
                 )
                 for gap in required_gaps
             )
-            last_tool_result = next((
-                block.result
-                for message in reversed(messages)
-                for block in reversed(message.content)
-                if isinstance(block, ToolResultBlock)
-            ), None)
-            structured_recovery = (
-                last_tool_result is not None and not last_tool_result.ok
-                and last_tool_result.effective_recovery_kind in {
-                    ToolRecoveryKind.RETRY_SAME,
-                    ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
-                }
-            )
+            recovery_batch = self._latest_recoverable_tool_batch(messages)
+            recovery_result = recovery_batch[-1] if recovery_batch else None
+            structured_recovery = recovery_result is not None
             # A soft exploration stop must not consume capacity reserved for a
             # known recovery or a required executable outcome. Keep one final
             # model call, while allowing the preceding call to use tools.
@@ -10678,11 +11091,11 @@ class Kernel:
                     goal=(await self.get_task(task_id)).goal,
                     reason="execution_budget_nearly_exhausted",
                 ))
-            elif structured_recovery and last_tool_result is not None:
-                action = dict(last_tool_result.recovery_action)
+            elif structured_recovery and recovery_result is not None:
+                action = dict(recovery_result.recovery_action)
                 runtime_instruction = (
                     "The previous tool failure has structured recovery kind "
-                    f"{last_tool_result.effective_recovery_kind.value}. "
+                    f"{recovery_result.effective_recovery_kind.value}. "
                     f"Recovery requirements: {json.dumps(action, ensure_ascii=False)}. "
                     "The required Task outcome remains open. Choose a legal recovery "
                     "action or an alternative tool; do not merely restate the error. "
@@ -10699,6 +11112,13 @@ class Kernel:
                     "exploration. Use the available tool effect needed to implement, "
                     "recover, or verify the remaining required work, while preserving "
                     "one final model response."
+                )
+            elif last_tool_error is not None:
+                runtime_instruction = (
+                    "The latest durable ToolResult is authoritative. Do not repeat "
+                    "or rely on prior assistant prose as evidence. Address the "
+                    f"current tool failure ({last_tool_error}) using its result "
+                    "details; inspect or retry with corrected facts when safe."
                 )
             elif focus_state.focus_mode:
                 runtime_instruction = (
@@ -10717,63 +11137,26 @@ class Kernel:
                     runtime_instruction, protocol_correction,
                 )))
             live_spec = await self.get_task_spec(task_id)
-            live_focus = await self.get_task_execution_focus(task_id)
-            eligible_outcomes = TaskOutcomeEligibilityCalculator.eligible(live_spec)
-            selected_ids = set(live_focus.selected_outcome_ids)
-            selected_outcomes = tuple(
-                outcome for outcome in eligible_outcomes
-                if outcome.outcome_id in selected_ids
-            )
-            unselected_outcomes = tuple(
-                outcome for outcome in eligible_outcomes
-                if outcome.outcome_id not in selected_ids
-            )
-            # Expose the focus-selection protocol only when it can perform a
-            # valid transition. This keeps ordinary single-focus turns small.
-            #
-            # Withdrawal is deliberately not retroactive. A tool this turn
-            # already invoked stays advertised for the remainder of the turn,
-            # because the outgoing payload still carries that assistant call in
-            # its history. Advertising a function in the transcript that the
-            # provider was not offered in the same request is a protocol
-            # violation no retry can repair, so a completed Outcome must not be
-            # able to shrink the protocol mid-turn.
-            invoked_tool_names = {
-                block.call.name
-                for message in messages
-                for block in message.content
-                if isinstance(block, ToolCallBlock)
-            }
+            # Tool availability is stable within a turn. Outcome completion is
+            # legacy-only and is never advertised for new runtime calls.
             model_visible_tools = tuple(
                 tool for tool in visible_tools
-                if tool.name in invoked_tool_names or (
-                    (
-                        tool.name != "core.task_outcome_select"
-                        or bool(unselected_outcomes)
-                    ) and (
-                        tool.name != "core.task_outcome_complete"
-                        or any(
-                            outcome.kind is not TaskOutcomeKind.ANSWER
-                            and outcome.completion_policy
-                            is not TaskOutcomeCompletionPolicy.ATOMIC_ACTION
-                            for outcome in eligible_outcomes
-                        )
-                    )
-                )
+                if tool.name != "core.task_outcome_complete"
             )
-            # Outcome state is event-sourced and may have changed after the
-            # previous tool result. Keep exactly one fresh protected Task SPEC
-            # message so compaction and restart never reintroduce stale state.
+            # Dynamic context is persisted in checkpoints for crash recovery, but
+            # must be rebuilt before every model call. Keeping an old
+            # session-context message lets stale Task summaries outlive later
+            # user input and dominate resumed turns.
+            generated_prefixes = (
+                "project-instructions-context-", "task-spec-context-",
+                "project-onboarding-context-", "project-memory-context-",
+                "session-context-", "document-references-context-", "working-memory-context-",
+            )
             messages = [
                 message for message in messages
-                if not message.message_id.startswith((
-                    "task-spec-context-", "project-onboarding-context-",
-                ))
+                if not message.message_id.startswith(generated_prefixes)
             ]
-            onboarding_message = await self._onboarding_context_message(task_id)
-            if onboarding_message is not None:
-                messages.append(onboarding_message)
-            messages.append(await self._task_spec_context_message(task_id))
+            messages.extend(await self._project_context_messages(task_id))
             try:
                 prepared = self._dependencies.context_manager.prepare(
                     conversation=tuple(messages), tools=model_visible_tools,
@@ -10855,18 +11238,6 @@ class Kernel:
                 require_evidence_questions=(
                     self._dependencies.require_evidence_questions
                 ),
-                outcome_refs=tuple(
-                    outcome.outcome_id for outcome in selected_outcomes
-                ),
-                tool_outcome_refs=tuple(
-                    (tool.name, tuple(
-                        outcome.outcome_id for outcome in selected_outcomes
-                        if self._tool_effect_supports_outcome(
-                            tool.effect, outcome
-                        )
-                    ))
-                    for tool in model_visible_tools
-                ),
                 on_transport_progress=record_transport,
             )
             model_started_at = time.monotonic()
@@ -10911,6 +11282,7 @@ class Kernel:
                     ),
                     allow_tool_calls=request.allow_tool_calls,
                 )
+                recovery_batch = self._latest_recoverable_tool_batch(messages)
                 duplicate_call_ids = [
                     call.call_id for call in tool_calls if call.call_id in seen_call_ids
                 ]
@@ -10919,25 +11291,13 @@ class Kernel:
                         "tool call_id must be unique within a turn: "
                         + ", ".join(duplicate_call_ids)
                     )
-                # Resolve every Action→Outcome edge against one consistent
-                # pre-batch snapshot. Later calls in the same accepted batch
-                # remain valid even if an earlier result changes Outcome state;
-                # a new model response still cannot target a closed Outcome.
-                bound_calls: list[ToolCall] = []
-                try:
-                    for call in tool_calls:
-                        call_spec = visible_tool_by_name.get(call.name)
-                        bound_calls.append(
-                            await self._bind_tool_call_outcome(
-                                task_id, call, call_spec
-                            )
-                            if call_spec is not None else call
-                        )
-                except InvalidToolArguments as error:
-                    raise RecoverableToolProtocolError(
-                        "invalid_outcome_binding", str(error)
-                    ) from error
-                tool_calls = tuple(bound_calls)
+                tool_calls = tuple(
+                    replace(
+                        call, outcome_ref=None,
+                        outcome_binding_mode=OutcomeBindingMode.FULFILLMENT,
+                    )
+                    for call in tool_calls
+                )
                 self._validate_tool_batch_proposal(
                     tool_calls, visible_tool_by_name, seen_call_ids
                 )
@@ -11151,16 +11511,59 @@ class Kernel:
                 > response_checkpoint.last_steering_inbound_sequence
                 for item in steering_after_model.pending
             )
+            if (
+                recovery_batch
+                and not tool_calls
+                and not has_late_steering
+            ):
+                recovery_gaps = tuple(CompletionGap(
+                    gap_id=f"tool-recovery:{tool_result.call_id}",
+                    kind="TOOL_RECOVERY_REQUIRED",
+                    description=(
+                        tool_result.message
+                        or f"{tool_result.error_code or 'TOOL_FAILURE'} requires recovery"
+                    ),
+                    status=tool_result.effective_recovery_kind.value.upper(),
+                    required=True, recoverable=True,
+                    observed=json.dumps(
+                        tool_result.recovery_action,
+                        ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ) for tool_result in recovery_batch)
+                recovery_checkpoint = replace(
+                    response_checkpoint,
+                    messages=tuple(messages[:-1]),
+                    pending_tool_calls=(), tool_batch=None,
+                )
+                blocker = self._recovery_batch_blocker_message(recovery_batch)
+                suspension = await self._suspend_incomplete_recoverable(
+                    recovery_checkpoint, blocker, recovery_gaps,
+                    reason="unresolved_tool_batch",
+                )
+                source_user_message = next((
+                    message for message in messages
+                    if message.role is MessageRole.USER
+                    and not message.message_id.startswith((
+                        "project-onboarding-context-",
+                        "project-memory-context-", "session-context-",
+                        "working-memory-context-", "task-spec-context-",
+                        "project-instructions-context-", "completion-readiness-",
+                    ))
+                ), None)
+                if source_user_message is not None:
+                    await self._record_session_task_result(
+                        task_id, turn_id, source_user_message, blocker
+                    )
+                    await self._refresh_continuation_session_identity(task_id)
+                return suspension
             readiness = CompletionReadinessDecision(
                 CompletionReadinessAction.COMPLETE, "not_a_final_candidate",
                 CompletionReadinessState.from_data(
                     response_checkpoint.completion_readiness_state
                 ),
             )
-            if (
-                not tool_calls and not has_late_steering
-                and self._dependencies.completion_readiness_policy is not None
-            ):
+            if not tool_calls and not has_late_steering:
                 readiness = await self._evaluate_completion_readiness(
                     task_id, turn_id, response_checkpoint, visible_tools,
                     forced_wrap_up=wrap_up or disclosure_only,
@@ -11213,14 +11616,42 @@ class Kernel:
                             "attempt": 1,
                         },
                     ),))
+            unmet_acceptance_criteria = any(
+                gap.gap_id.startswith("task-spec:") and gap.required
+                for gap in readiness.gaps
+            )
+            if (
+                unmet_acceptance_criteria
+                and readiness.action is CompletionReadinessAction.COMPLETE
+                and not disclosure_only
+            ):
+                blocked_state = replace(
+                    readiness.state,
+                    last_action=CompletionReadinessAction.REPORT_BLOCKED.value,
+                )
+                readiness = CompletionReadinessDecision(
+                    CompletionReadinessAction.REPORT_BLOCKED,
+                    "acceptance_criteria_unmet", blocked_state, readiness.gaps,
+                )
+                response_checkpoint = replace(
+                    response_checkpoint,
+                    completion_readiness_state=blocked_state.to_data(),
+                )
             final_response = bool(
                 not tool_calls and not has_late_steering
                 and readiness.action is CompletionReadinessAction.COMPLETE
+                and not unmet_acceptance_criteria
+            )
+            acceptance_incomplete_boundary = bool(
+                not tool_calls
+                and unmet_acceptance_criteria
+                and readiness.action is CompletionReadinessAction.REPORT_BLOCKED
             )
             incomplete_recovery_boundary = bool(
-                final_response and disclosure_only
-                and completion_state.last_action
-                == CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE.value
+                (final_response and disclosure_only
+                 and completion_state.last_action
+                 == CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE.value)
+                or acceptance_incomplete_boundary
             )
             await self._commit_model_response_checkpoint(
                 response_checkpoint, response, prompt.receipt, prepared.budget,
@@ -11243,7 +11674,12 @@ class Kernel:
             if not tool_calls:
                 if incomplete_recovery_boundary:
                     suspension = await self._suspend_incomplete_recoverable(
-                        response_checkpoint, response.message, required_gaps
+                        response_checkpoint, response.message, readiness.gaps,
+                        reason=(
+                            "unmet_acceptance_criteria"
+                            if acceptance_incomplete_boundary
+                            else "incomplete_recoverable"
+                        ),
                     )
                     source_user_message = next((
                         message for message in messages
@@ -11573,9 +12009,6 @@ class Kernel:
             checkpoint, revision=checkpoint.revision + 1,
             pending_user_action=pending,
             task_spec_revision=spec.revision, task_spec_hash=spec.content_hash,
-            execution_focus=(await self.get_task_execution_focus(
-                checkpoint.task_id
-            )).to_data(),
         )
         stored = await self._require_stored_task(checkpoint.task_id)
         task = TaskSnapshot.from_data(stored.data)
@@ -11641,12 +12074,13 @@ class Kernel:
 
     async def _suspend_incomplete_recoverable(
         self, checkpoint: AgentTurnCheckpoint, message: Message,
-        gaps: tuple[CompletionGap, ...],
+        gaps: tuple[CompletionGap, ...], *, reason: str = "incomplete_recoverable",
     ) -> AgentContinuationSuspended:
-        """Persist exhausted-but-recoverable work as a resumable boundary.
+        """Persist unmet required work as a resumable boundary.
 
-        This differs from BLOCKED: no new authority is needed. A later Session
-        input resumes the same checkpoint after the normal compatibility gate.
+        The default is exhausted recoverable work. Acceptance criteria that
+        remain unmet after a required blocker disclosure use the same durable
+        continuation boundary, but retain their distinct reason for callers.
         """
         spec = await self.get_task_spec(checkpoint.task_id)
         remaining_outcome_ids = tuple(
@@ -11675,7 +12109,7 @@ class Kernel:
         )
         pending = {
             "kind": "CONTINUATION",
-            "reason": "incomplete_recoverable",
+            "reason": reason,
             "task_id": checkpoint.task_id,
             "turn_id": checkpoint.turn_id,
             "completed_outcome_ids": [],
@@ -11690,9 +12124,6 @@ class Kernel:
             completion_readiness_state=replace(
                 readiness_state, stalled_continuations=stalled
             ).to_data(),
-            execution_focus=(await self.get_task_execution_focus(
-                checkpoint.task_id
-            )).to_data(),
         )
         stored = await self._require_stored_task(checkpoint.task_id)
         task = TaskSnapshot.from_data(stored.data)
@@ -12808,9 +13239,8 @@ class Kernel:
         self, task_id: str, source_message: Message,
         calls: tuple[ToolCall, ...],
     ) -> ToolBatchSnapshot:
-        """Freeze accepted calls and their Task/Focus revisions."""
+        """Freeze accepted calls and their Task SPEC revision."""
         spec = await self.get_task_spec(task_id)
-        focus = await self.get_task_execution_focus(task_id)
         return ToolBatchSnapshot(
             batch_id=f"batch-{uuid4().hex}",
             source_message_id=source_message.message_id,
@@ -12818,7 +13248,6 @@ class Kernel:
             pending_call_ids=tuple(call.call_id for call in calls),
             status=ToolBatchStatus.ACCEPTED,
             task_spec_revision=spec.revision,
-            execution_focus_revision=focus.selection_revision,
         )
 
     @staticmethod
@@ -12850,9 +13279,6 @@ class Kernel:
                 ),
                 status=ToolBatchStatus.RECONCILING,
                 task_spec_revision=checkpoint.task_spec_revision,
-                execution_focus_revision=int(
-                    checkpoint.execution_focus.get("selection_revision", 0)
-                ),
             )
         elif batch is not None:
             batch = batch.with_pending(pending)
@@ -13221,32 +13647,14 @@ class Kernel:
         ):
             return (
                 "Your previous tool call could bind to more than one open Task "
-                f"outcome ({listed}) and all of them are already in the execution "
-                "focus, so Runtime cannot tell which result the call advances. "
-                "Name exactly one of them: repeat the same tool call with "
-                f"outcome_ref set to one of {listed}. Omitting outcome_ref will be "
-                "rejected again. Alternatively call core.task_outcome_select with "
-                "just the single outcome this work advances, then repeat the call. "
-                "Do not repeat the invalid call unchanged. "
-                f"Runtime detail: {detail}"
-            )
-        if (
-            reason == OutcomeBindingReason.OUTCOME_NOT_SELECTED.value
-            and len(candidates) > 1
-        ):
-            return (
-                "Your previous tool call omitted outcome_ref and could bind to "
-                f"more than one open Task outcome ({listed}), none of which is in "
-                "the current execution focus. Call core.task_outcome_select with "
-                "the one outcome this work advances, or repeat the tool call with "
-                f"outcome_ref set to one of {listed}. Do not repeat the invalid "
+                f"outcome ({listed}). Name exactly one of them: repeat the same "
+                f"tool call with outcome_ref set to one of {listed}. Omitting "
+                "outcome_ref will be rejected again. Do not repeat the invalid "
                 f"call unchanged. Runtime detail: {detail}"
             )
         return (
-            "Your previous tool call could not bind to the current Task "
-            "execution focus. Inspect Runtime detail below. If the intended "
-            "eligible outcome is not selected, first call "
-            "core.task_outcome_select; otherwise correct or omit the "
+            "Your previous tool call could not bind to an eligible compatible "
+            "Task outcome. Inspect Runtime detail below and correct or omit the "
             "outcome_ref. Do not repeat the invalid call unchanged. "
             f"Runtime detail: {detail}"
         )
@@ -13255,8 +13663,17 @@ class Kernel:
         self, task_id: str, call: ToolCall, tool: ToolSpec, *,
         allow_closed_ref: bool = False,
     ) -> ToolCall:
-        """Resolve one Action→Outcome edge in Kernel, never in Provider."""
-        decision = await self._decide_tool_call_outcome(
+        """Discard legacy Outcome binding data for new runtime tool calls."""
+        del task_id, tool, allow_closed_ref
+        return replace(call, outcome_ref=None,
+                       outcome_binding_mode=OutcomeBindingMode.FULFILLMENT)
+
+    async def _decide_tool_call_outcome(
+        self, task_id: str, call: ToolCall, tool: ToolSpec, *,
+        allow_closed_ref: bool = False,
+    ) -> OutcomeBindingDecision:
+        """Legacy-only binding reader retained for historical diagnostics."""
+        decision = await self._decide_legacy_tool_call_outcome(
             task_id, call, tool, allow_closed_ref=allow_closed_ref
         )
         if (
@@ -13293,11 +13710,11 @@ class Kernel:
             json.dumps(decision.to_data(), sort_keys=True, separators=(",", ":"))
         )
 
-    async def _decide_tool_call_outcome(
+    async def _decide_legacy_tool_call_outcome(
         self, task_id: str, call: ToolCall, tool: ToolSpec, *,
         allow_closed_ref: bool = False,
     ) -> OutcomeBindingDecision:
-        """Return a deterministic, fully inspectable binding decision."""
+        """Return a deterministic, fully inspectable legacy binding decision."""
         spec = await self.get_task_spec(task_id)
         if not spec.outcomes or tool.effect is ToolEffect.INTERNAL:
             if call.outcome_ref is not None and not spec.outcomes:
@@ -13311,25 +13728,13 @@ class Kernel:
                 requested_outcome_id=call.outcome_ref,
                 bound_outcome_id=call.outcome_ref,
             )
-        task = await self.get_task(task_id)
-        legacy_ids: tuple[str, ...] = ()
-        if task.active_agent_checkpoint is not None:
-            legacy_ids = tuple(
-                str(item) for item in
-                task.active_agent_checkpoint.get("active_outcome_ids", [])
-            )
-        focus = await self.get_task_execution_focus(
-            task_id, legacy_active_outcome_ids=legacy_ids
-        )
         eligible = TaskOutcomeEligibilityCalculator.eligible(spec)
         eligible_ids = tuple(item.outcome_id for item in eligible)
-        selected_ids = tuple(
-            item for item in focus.selected_outcome_ids if item in eligible_ids
-        )
         compatible_ids = tuple(
             item.outcome_id for item in eligible
             if self._tool_effect_supports_outcome(tool.effect, item)
         )
+        task = await self.get_task(task_id)
 
         def result(
             action: OutcomeBindingAction, reason: OutcomeBindingReason,
@@ -13340,7 +13745,6 @@ class Kernel:
                 action=action, reason=reason,
                 requested_outcome_id=call.outcome_ref,
                 bound_outcome_id=bound,
-                selected_outcome_ids=selected_ids,
                 eligible_outcome_ids=eligible_ids,
                 compatible_outcome_ids=compatible_ids,
                 binding_mode=mode,
@@ -13374,8 +13778,8 @@ class Kernel:
                 if (
                     tool.effect is ToolEffect.OBSERVE
                     and target.status is not TaskOutcomeStatus.BLOCKED
-                    and self._supporting_observation_is_in_focus(
-                        target, selected_ids
+                    and self._supporting_observation_is_available(
+                        target, eligible_ids
                     )
                 ):
                     return result(
@@ -13406,31 +13810,14 @@ class Kernel:
                     OutcomeBindingAction.CORRECT,
                     OutcomeBindingReason.OUTCOME_EFFECT_MISMATCH,
                 )
-            if target.outcome_id not in selected_ids:
-                # A valid explicit outcome_ref carries the model's semantic
-                # choice. Focus is a planning hint and cannot veto it.
-                return result(
-                    OutcomeBindingAction.ACCEPT, OutcomeBindingReason.NONE,
-                    target.outcome_id,
-                )
+            # A valid explicit outcome_ref carries the model's semantic
+            # choice. Historical execution focus must not participate in
+            # new-runtime Outcome binding.
             return result(
                 OutcomeBindingAction.ACCEPT, OutcomeBindingReason.NONE,
                 target.outcome_id,
             )
 
-        selected_compatible = tuple(
-            item for item in compatible_ids if item in selected_ids
-        )
-        if len(selected_compatible) == 1:
-            return result(
-                OutcomeBindingAction.CORRECT, OutcomeBindingReason.NONE,
-                selected_compatible[0],
-            )
-        if len(selected_compatible) > 1:
-            return result(
-                OutcomeBindingAction.REQUIRE_SELECTION,
-                OutcomeBindingReason.OUTCOME_SELECTION_AMBIGUOUS,
-            )
         if compatible_ids:
             if len(compatible_ids) == 1:
                 return result(
@@ -13440,7 +13827,7 @@ class Kernel:
                 )
             return result(
                 OutcomeBindingAction.REQUIRE_SELECTION,
-                OutcomeBindingReason.OUTCOME_NOT_SELECTED,
+                OutcomeBindingReason.OUTCOME_SELECTION_AMBIGUOUS,
             )
         return result(
             OutcomeBindingAction.ACCEPT,
@@ -13448,14 +13835,14 @@ class Kernel:
         )
 
     @staticmethod
-    def _supporting_observation_is_in_focus(
-        target: TaskOutcomeSnapshot, selected_ids: tuple[str, ...],
+    def _supporting_observation_is_available(
+        target: TaskOutcomeSnapshot, eligible_outcome_ids: tuple[str, ...],
     ) -> bool:
-        """Allow preparation only for a direct descendant of active work."""
-        if not target.depends_on or not selected_ids:
+        """Allow preparation only for a direct descendant of eligible work."""
+        if not target.depends_on:
             return False
-        selected = set(selected_ids)
-        return any(dependency in selected for dependency in target.depends_on)
+        return any(dependency in set(eligible_outcome_ids)
+                   for dependency in target.depends_on)
 
     @staticmethod
     def _tool_effect_supports_outcome(
@@ -13540,6 +13927,40 @@ class Kernel:
         # false version conflict.
         stored = await self._require_stored_task(task_id)
         task = TaskSnapshot.from_data(stored.data)
+        invocation_id = f"inv-{uuid4().hex}"
+        document_failure = await self._document_fetch_failure(task_id)
+        if (
+            document_failure is not None
+            and call.name in {"core.find_files", "core.search_text"}
+        ):
+            blocked = ToolResult(
+                call_id=call.call_id,
+                ok=False,
+                error_code="DOCUMENT_FETCH_UNAVAILABLE",
+                message=(
+                    "The Task has an unresolved explicit document URL and "
+                    "web.fetch_markdown is unavailable; local workspace search "
+                    "was not executed as a substitute for reading that document."
+                ),
+                hint=document_failure.hint,
+                retryable=False,
+                data=document_failure.data,
+                meta={
+                    **dict(document_failure.meta),
+                    "runtime_guard": "EXPLICIT_DOCUMENT_URL_LOCAL_SEARCH_BLOCKED",
+                },
+            )
+            await self._dependencies.store.commit(RuntimeUnitOfWork(
+                task_id, stored.version, task.to_data(), (RuntimeEvent(
+                    f"evt-{uuid4().hex}", task_id,
+                    stored.last_event_sequence + 1, "tool.failed", {
+                        "turn_id": turn_id, "invocation_id": invocation_id,
+                        "outcome_ref": call.outcome_ref,
+                        "result": blocked.to_data(),
+                    },
+                ),)
+            ))
+            return blocked
         if existing is not None:
             expected_hash = self._tool_policy.payload_hash(
                 selected_spec, call, task.project_trust

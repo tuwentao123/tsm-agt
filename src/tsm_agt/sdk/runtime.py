@@ -18,10 +18,13 @@ from tsm_agt.core import (
     AgentTurnSuspended,
     AgentContinuationSuspended,
     ApprovalDecision, ApprovalResolutionInput, ClarificationReplyInput,
-    InterruptTaskInput, RuntimeTextInput, TaskSnapshot, TaskState, canonical_hash,
-    SteeringKind, RuntimeInputIntent,
+    InterruptTaskInput, RuntimeTextInput, SessionTextInput,
+    SessionInputDecision, SessionRouteDisposition, SessionTaskRelation,
+    TaskSnapshot, TaskState, canonical_hash, SteeringKind, RuntimeInputIntent,
 )
-from tsm_agt.ports import RuntimeCommandRecord, RuntimeStorePort
+from tsm_agt.ports import (
+    ImageBlock, RuntimeCommandRecord, RuntimeStorePort, TextBlock,
+)
 
 
 class CommandInProgress(RuntimeError):
@@ -73,6 +76,7 @@ class RuntimeProgressEnvelope:
 class RuntimeTaskResult:
     task_id: str
     state: str
+    phase1_state: str
     status: str
     cursor: int
     assistant_text: str | None = None
@@ -84,6 +88,7 @@ class RuntimeTaskResult:
     def to_data(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id, "state": self.state,
+            "phase1_state": self.phase1_state,
             "status": self.status, "cursor": self.cursor,
             "assistant_text": self.assistant_text,
             "approval": dict(self.approval) if self.approval else None,
@@ -107,6 +112,28 @@ class RuntimeCommandResult:
         return {
             "command_id": self.command_id, "replayed": self.replayed,
             "result": dict(self.result),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SessionTextResult:
+    """Result of a normal Session message routed by the Runtime."""
+
+    command_id: str
+    kind: str
+    decision: Mapping[str, Any]
+    task: RuntimeTaskResult | None = None
+    answer: str | None = None
+    clarification: str | None = None
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "command_id": self.command_id,
+            "kind": self.kind,
+            "decision": dict(self.decision),
+            "task": self.task.to_data() if self.task else None,
+            "answer": self.answer,
+            "clarification": self.clarification,
         }
 
 
@@ -178,17 +205,24 @@ class EngineeringAgentClient:
 
     async def create_task(
         self, goal: str, *, command_id: str, session_id: str | None = None,
+        source_task_id: str | None = None,
+        task_relation: SessionTaskRelation = SessionTaskRelation.INDEPENDENT,
     ) -> TaskSnapshot:
         return await self.application.kernel.create_task(
             goal, self.workspace, session_id=session_id, command_id=command_id,
+            source_task_id=source_task_id, task_relation=task_relation,
         )
 
     async def submit_task(
         self, goal: str, *, command_id: str, session_id: str | None = None,
+        source_task_id: str | None = None,
+        task_relation: SessionTaskRelation = SessionTaskRelation.INDEPENDENT,
+        images: tuple[ImageBlock, ...] = (),
     ) -> RuntimeTaskResult:
         async with self._submit_lock:
             task = await self.create_task(
-                goal, command_id=command_id, session_id=session_id
+                goal, command_id=command_id, session_id=session_id,
+                source_task_id=source_task_id, task_relation=task_relation,
             )
             current = await self.application.kernel.get_task(task.task_id)
             if (
@@ -196,7 +230,7 @@ class EngineeringAgentClient:
                 and task.task_id not in self._run_tasks
             ):
                 runner = asyncio.create_task(
-                    self._run_submitted_task(task.task_id, goal),
+                    self._run_submitted_task(task.task_id, goal, images=images),
                     name=f"tsm-agt-sdk-{task.task_id}",
                 )
                 self._run_tasks[task.task_id] = runner
@@ -207,11 +241,78 @@ class EngineeringAgentClient:
                 )
         return await self.get_task_result(task.task_id)
 
+    async def submit_session_text(
+        self, session_id: str, text: str, *, command_id: str,
+        images: tuple[Mapping[str, str], ...] = (),
+    ) -> RuntimeCommandResult:
+        """Route one ordinary message and execute its validated Session action.
+
+        ``command_id`` is the caller's stable per-message request id. It is
+        also passed to ``create_task`` when a Task is created, preserving the
+        Kernel's stricter Task command receipt rather than bypassing it.
+
+        ``images`` carries inline data-URL attachments. They travel as
+        structured ``ImageBlock`` content, never inside the Task goal: a goal is
+        bounded text and base64 payloads would exceed the Task SPEC limits.
+        """
+        normalized = text.strip()
+        if not normalized:
+            raise ValueError("session text must not be empty")
+        image_blocks = tuple(
+            ImageBlock(image_url=str(image["image_url"]))
+            for image in images
+            if str(image.get("image_url", "")).startswith("data:image/")
+        )
+
+        async def execute() -> SessionTextResult:
+            decision = await self.application.kernel.dispatch_input_event(
+                SessionTextInput(session_id, normalized, command_id, str(self.workspace))
+            )
+            if not isinstance(decision, SessionInputDecision):
+                raise RuntimeError("session text dispatch returned an invalid result")
+            decision_data = _session_decision_data(decision)
+            if decision.disposition is SessionRouteDisposition.ANSWER:
+                answer = await self.application.kernel.answer_session_message(
+                    session_id, normalized
+                )
+                return SessionTextResult(
+                    command_id, "answer", decision_data, answer=answer
+                )
+            if decision.disposition is SessionRouteDisposition.CLARIFY:
+                return SessionTextResult(
+                    command_id, "clarify", decision_data,
+                    clarification=decision.clarification,
+                )
+            if decision.disposition is SessionRouteDisposition.RESUME_TASK:
+                assert decision.source_task_id is not None
+                task = await self.run_task(
+                    decision.source_task_id, normalized, images=image_blocks
+                )
+                return SessionTextResult(command_id, "task", decision_data, task=task)
+            assert decision.disposition is SessionRouteDisposition.CREATE_TASK
+            task = await self.submit_task(
+                decision.resolved_goal or normalized,
+                command_id=command_id, session_id=session_id,
+                source_task_id=decision.source_task_id,
+                task_relation=decision.relation,
+                images=image_blocks,
+            )
+            return SessionTextResult(command_id, "task", decision_data, task=task)
+
+        return await self._command(
+            command_id, "session_text", {
+                "session_id": session_id,
+                "text_hash": canonical_hash(normalized),
+                "workspace": str(self.workspace),
+                "image_count": len(image_blocks),
+            }, execute, lambda result: result.to_data(),
+        )
+
     async def _run_submitted_task(
-        self, task_id: str, goal: str,
+        self, task_id: str, goal: str, *, images: tuple[ImageBlock, ...] = (),
     ) -> RuntimeTaskResult:
         try:
-            return await self.run_task(task_id, goal)
+            return await self.run_task(task_id, goal, images=images)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -239,7 +340,8 @@ class EngineeringAgentClient:
         return await self.get_task_result(task_id)
 
     async def run_task(
-        self, task_id: str, user_text: str,
+        self, task_id: str, user_text: str, *,
+        images: tuple[ImageBlock, ...] = (),
     ) -> RuntimeTaskResult:
         kernel = self.application.kernel
         task = await kernel.get_task(task_id)
@@ -254,6 +356,9 @@ class EngineeringAgentClient:
                 )
             result = await kernel.run_agent_turn(
                 task_id, user_text,
+                user_blocks=(
+                    (TextBlock(user_text), *images) if images else None
+                ),
                 on_progress=lambda item: self._record_progress(task_id, item),
             )
         elif task.state in {TaskState.INTERRUPTED, TaskState.CONFLICT}:
@@ -287,8 +392,8 @@ class EngineeringAgentClient:
         assert stored is not None
         cached = self._latest_results.get(task_id)
         return RuntimeTaskResult(
-            task_id, task.state.value, _status_for_state(task.state),
-            stored.last_event_sequence,
+            task_id, task.state.value, task.state.phase1_state.value,
+            _status_for_state(task.state), stored.last_event_sequence,
             assistant_text=cached.assistant_text if cached else None,
             approval=_approval_data(task),
             clarification=(cached.clarification if cached else _clarification_data(task)),
@@ -576,7 +681,8 @@ class EngineeringAgentClient:
         elif isinstance(result, AgentClarificationSuspended):
             base = await self.get_task_result(result.task_id)
             task_result = RuntimeTaskResult(
-                base.task_id, base.state, "awaiting_user", base.cursor,
+                base.task_id, base.state, base.phase1_state, "awaiting_user",
+                base.cursor,
                 clarification={
                     "request_id": result.request_id,
                     "question": result.question, "reason": result.reason,
@@ -593,7 +699,8 @@ class EngineeringAgentClient:
         elif isinstance(result, AgentContinuationSuspended):
             base = await self.get_task_result(result.task_id)
             task_result = RuntimeTaskResult(
-                base.task_id, base.state, "awaiting_user", base.cursor,
+                base.task_id, base.state, base.phase1_state, "awaiting_user",
+                base.cursor,
                 assistant_text=result.assistant_message.text,
                 clarification={
                     "kind": "CONTINUATION",
@@ -625,7 +732,8 @@ class EngineeringAgentClient:
                 )
             base = await self.get_task_result(result.task_id)
             task_result = RuntimeTaskResult(
-                base.task_id, base.state, _status_for_state(TaskState(base.state)),
+                base.task_id, base.state, base.phase1_state,
+                _status_for_state(TaskState(base.state)),
                 base.cursor, assistant_text=result.assistant_message.text,
                 verification={
                     "status": verification.status.value,
@@ -684,6 +792,19 @@ class EngineeringAgentClient:
 
     def _store(self) -> RuntimeStorePort:
         return self.application.registry.require(RuntimeStorePort)
+
+
+def _session_decision_data(decision: SessionInputDecision) -> dict[str, Any]:
+    return {
+        "disposition": decision.disposition.value,
+        "relation": decision.relation.value,
+        "source_task_id": decision.source_task_id,
+        "resolved_goal": decision.resolved_goal,
+        "confidence": decision.confidence,
+        "reason_code": decision.reason_code,
+        "clarification": decision.clarification,
+        "candidate_task_ids": list(decision.candidate_task_ids),
+    }
 
 
 def _status_for_state(state: TaskState) -> str:

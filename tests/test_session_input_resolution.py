@@ -173,6 +173,10 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                     routed_context["task_catalog"][0]["task_id"],
                     completed.task_id,
                 )
+                self.assertEqual(
+                    routed_context["task_catalog"][0]["phase1_state"],
+                    "DONE",
+                )
                 self.assertTrue(
                     routed_context["task_catalog"][0]
                     ["is_conversation_anchor"]
@@ -534,6 +538,61 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
+    async def test_router_timeout_keeps_the_message_instead_of_asking_again(self):
+        """A slow classifier is not evidence that the user was unclear.
+
+        Answering a timeout with CLARIFY throws away input Runtime already
+        accepted and makes the user restate a request the Agent could have
+        resolved from durable Session history.
+        """
+        class TimingOutResolver(FixtureResolver):
+            async def resolve_session_input(self, text, context):
+                self.inputs.append((text, context))
+                raise TimeoutError("semantic router deadline exceeded")
+
+        resolver = TimingOutResolver({})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+                session_input_resolver_adapter=resolver,
+            )
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("router timeout")
+                candidate = SessionResumeCandidate(
+                    "task-existing", "unfinished goal", "INTERRUPTED",
+                    str(root), SessionResumeSafety.EXACT_RESUME, "checkpoint",
+                )
+                with patch.object(
+                    app.kernel, "list_session_resume_candidates",
+                    AsyncMock(return_value=(candidate,)),
+                ):
+                    decision = await app.kernel.resolve_session_input(
+                        session.session_id,
+                        "但是我们现在没有后端介入，但是要预留这个功能", root,
+                    )
+
+                self.assertEqual(decision.action, SessionInputAction.NEW_TASK)
+                self.assertEqual(
+                    decision.relation, SessionTaskRelation.CONTEXTUAL
+                )
+                self.assertEqual(
+                    decision.reason_code,
+                    "semantic_router_timeout_contextual_fallback",
+                )
+                self.assertIsNone(decision.clarification)
+                # The Agent still receives the original text plus Session
+                # history, so the thread is not lost.
+                self.assertEqual(
+                    decision.resolved_goal,
+                    "但是我们现在没有后端介入，但是要预留这个功能",
+                )
+                # A timeout must never be answered by resuming a guessed Task.
+                self.assertIsNone(decision.source_task_id)
+            finally:
+                await app.registry.stop_all()
+
     async def test_missing_grounding_degrades_to_contextual_task(self):
         _app, _session, _resolver, decision = (
             await self._resolve_with_unfinished_candidate({
@@ -542,10 +601,11 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                 "clarification": None,
             })
         )
-        self.assertEqual(decision.action, SessionInputAction.CLARIFY)
-        self.assertEqual(decision.relation, SessionTaskRelation.UNCERTAIN)
+        self.assertEqual(decision.action, SessionInputAction.NEW_TASK)
+        self.assertEqual(decision.relation, SessionTaskRelation.CONTEXTUAL)
         self.assertEqual(
-            decision.reason_code, "semantic_router_protocol_degraded"
+            decision.reason_code,
+            "semantic_router_protocol_contextual_fallback",
         )
         self.assertEqual(decision.candidate_task_ids, ())
 
@@ -568,14 +628,8 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(model.requests), 1)
         self.assertEqual(model.requests[0].max_provider_attempts, 1)
 
-    async def test_no_history_uses_semantic_resolver(self):
-        resolver = FixtureResolver({
-            "disposition": "CREATE_TASK", "relation": "INDEPENDENT",
-            "source_task_id": None, "resolved_goal": "any ordinary input",
-            "input_grounding": "SELF_CONTAINED", "confidence": 0.96,
-            "reason_code": "self_contained_new_task", "clarification": None,
-            "candidate_task_ids": [],
-        })
+    async def test_no_history_bypasses_semantic_resolver(self):
+        resolver = FixtureResolver({})
         with tempfile.TemporaryDirectory() as directory:
             app = compose_fixture_application(
                 model_adapter=EchoModelProvider(), tool_adapters=(),
@@ -588,7 +642,7 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                     session.session_id, "any ordinary input", Path(directory)
                 )
                 self.assertEqual(decision.action, SessionInputAction.NEW_TASK)
-                self.assertEqual(len(resolver.inputs), 1)
+                self.assertEqual(resolver.inputs, [])
                 events = await app.kernel.dependencies.store.read_session_events(
                     session.session_id
                 )
@@ -648,11 +702,16 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                 decision = await app.kernel.resolve_session_input(
                     session.session_id, "refer to some earlier work", root
                 )
-                self.assertEqual(decision.action, SessionInputAction.CLARIFY)
-                self.assertEqual(decision.relation, SessionTaskRelation.UNCERTAIN)
+                self.assertEqual(
+                    decision.action, SessionInputAction.NEW_TASK
+                )
+                self.assertEqual(
+                    decision.relation, SessionTaskRelation.CONTEXTUAL
+                )
                 self.assertIsNone(decision.source_task_id)
                 self.assertEqual(
-                    decision.reason_code, "semantic_router_protocol_degraded"
+                    decision.reason_code,
+                    "semantic_router_protocol_contextual_fallback",
                 )
             finally:
                 await app.registry.stop_all()
@@ -679,6 +738,19 @@ class SessionAnswerTest(unittest.IsolatedAsyncioTestCase):
             await app.registry.start_all()
             try:
                 session = await app.kernel.create_session("answer only")
+                history_task = await app.kernel.create_task(
+                    "completed context", Path(directory),
+                    session_id=session.session_id,
+                )
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING, TaskState.VERIFYING,
+                    TaskState.FINALIZING, TaskState.SUCCEEDED,
+                ):
+                    history_task = await app.kernel.transition_task(
+                        history_task.task_id, state, state.value
+                    )
                 decision = await app.kernel.resolve_session_input(
                     session.session_id, "What is a Session?", Path(directory)
                 )
@@ -686,7 +758,7 @@ class SessionAnswerTest(unittest.IsolatedAsyncioTestCase):
                     decision.disposition, SessionRouteDisposition.ANSWER
                 )
                 self.assertEqual(
-                    await app.kernel.list_session_tasks(session.session_id), ()
+                    len(await app.kernel.list_session_tasks(session.session_id)), 1
                 )
                 await app.kernel.record_session_answer(
                     session.session_id, "What is a Session?",

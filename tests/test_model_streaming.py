@@ -24,8 +24,12 @@ class StreamingEchoModel(EchoModelProvider):
 
     async def stream_complete(self, request: ModelRequest):
         text = next(
-            message.text for message in request.messages
+            message.text for message in reversed(request.messages)
             if message.role is MessageRole.USER
+            and not message.message_id.startswith((
+                "project-onboarding-context-", "project-memory-context-",
+                "session-context-", "working-memory-context-",
+            ))
         )
         midpoint = max(1, len(text) // 2)
         yield ModelTextDelta(text[:midpoint])

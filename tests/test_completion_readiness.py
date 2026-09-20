@@ -4,6 +4,7 @@ import hashlib
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,8 +20,8 @@ from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     AgentContinuationSuspended, AgentTurnCheckpoint, AgentTurnResult,
     AgentTurnSuspended, ApprovalDecision, Kernel, ProjectTrustLevel,
-    TaskState, TaskSpecProposal, TaskSpecSnapshot, ToolCommitState,
-    ToolExecutionRecord,
+    TaskAcceptanceCriterion, TaskCriterionKind, TaskState, TaskSpecProposal,
+    TaskSpecSnapshot, ToolCommitState, ToolExecutionRecord,
 )
 from tsm_agt.core.kernel import (
     _continuation_made_no_progress, _post_mutation_verification,
@@ -33,7 +34,8 @@ from tsm_agt.ports import (
     CompletionReadinessState, EvidenceQuestion, FinishReason, Message, MessageRole, ModelRequest,
     ModelResponse, ModelStreamCompleted, ModelTextDelta, ModelUsage,
     ProviderCapabilities, RuntimeStorePort, TextBlock, ToolCall, ToolCallBlock,
-    ToolEffect, ToolIdempotency, ToolInvocationContext, ToolResult,
+    ToolEffect, ToolIdempotency, ToolInvocationContext, ToolRecoveryKind,
+    ToolResult,
     ToolResultBlock, ToolRisk,
 )
 
@@ -57,6 +59,90 @@ class RecoverableReadTool(EchoToolProvider):
                 meta={"recoverable_input": True},
             )
         return await super().invoke(call, context)
+
+
+class BatchRecoveryTool(EchoToolProvider):
+    """Fails one call recoverably while another call in the same batch succeeds."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_ids: list[str] = []
+
+    async def invoke(
+        self, call: ToolCall, context: ToolInvocationContext,
+    ) -> ToolResult:
+        self.call_ids.append(call.call_id)
+        if call.call_id == "recover-first":
+            return ToolResult(
+                call.call_id, False, error_code="STATE_REFRESH_REQUIRED",
+                message="Refresh the resource state before retrying.",
+                recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+                recovery_action={
+                    "required_change": "refresh_resource_state",
+                    "same_call_safe": False,
+                },
+            )
+        return await super().invoke(call, context)
+
+
+class BatchRecoveryModel(EchoModelProvider):
+    """Emits a mixed batch, then a rejected final before user continuation."""
+
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests: list[ModelRequest] = []
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        self.requests.append(request)
+        results = [
+            block.result
+            for message in request.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock)
+        ]
+        if not results:
+            calls = (
+                ToolCall("recover-first", "fixture.echo", {"text": "stale"}),
+                ToolCall("batch-success", "fixture.echo", {"text": "fresh"}),
+            )
+            return ModelResponse(
+                Message(
+                    "mixed-batch", MessageRole.ASSISTANT,
+                    tuple(ToolCallBlock(call) for call in calls),
+                ),
+                FinishReason.TOOL_CALL, ModelUsage(1, 1),
+            )
+        if any(result.call_id == "recover-retry" and result.ok for result in results):
+            return ModelResponse(
+                Message(
+                    "batch-recovered", MessageRole.ASSISTANT,
+                    (TextBlock("Recovered after refreshing state."),),
+                ),
+                FinishReason.STOP, ModelUsage(1, 1),
+            )
+        if any(
+            message.role is MessageRole.USER
+            and message.message_id.startswith("continuation-input-")
+            for message in request.messages
+        ):
+            return ModelResponse(
+                Message(
+                    "batch-retry", MessageRole.ASSISTANT,
+                    (ToolCallBlock(ToolCall(
+                        "recover-retry", "fixture.echo", {"text": "refreshed"},
+                    )),),
+                ),
+                FinishReason.TOOL_CALL, ModelUsage(1, 1),
+            )
+        return ModelResponse(
+            Message(
+                "batch-premature", MessageRole.ASSISTANT,
+                (TextBlock("The batch completed successfully."),),
+            ),
+            FinishReason.STOP, ModelUsage(1, 1),
+        )
 
 
 class BlockedReadTool(EchoToolProvider):
@@ -115,6 +201,23 @@ class ReadinessSequenceModel(EchoModelProvider):
                     (TextBlock("Required evidence collected."),),
                 ),
                 FinishReason.STOP, ModelUsage(1, 1),
+            )
+        if results and not results[-1].ok and self.tool_calls < 2:
+            self.tool_calls += 1
+            call = ToolCall(
+                f"read-{self.tool_calls}", "fixture.echo",
+                {"text": "evidence"},
+                EvidenceQuestion(
+                    "Q-required", "What fact is required for the answer?",
+                    expected_scope=".",
+                ),
+            )
+            return ModelResponse(
+                Message(
+                    f"tool-{self.tool_calls}", MessageRole.ASSISTANT,
+                    (ToolCallBlock(call),),
+                ),
+                FinishReason.TOOL_CALL, ModelUsage(1, 1),
             )
         if not results or (
             '"action":"CONTINUE"' in correction
@@ -210,6 +313,28 @@ class PostMutationVerificationModel(EchoModelProvider):
         )
 
 
+class CriterionBlockedModel(EchoModelProvider):
+    """Stops twice so readiness must produce a durable incomplete boundary."""
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        correction = next((
+            message.text for message in reversed(request.messages)
+            if message.role is MessageRole.USER
+            and '"boundary":"completion_readiness"' in message.text
+        ), "")
+        text = (
+            "Blocked: required acceptance criterion remains unmet."
+            if correction else "The task is complete."
+        )
+        return ModelResponse(
+            Message(
+                "criterion-blocked-final", MessageRole.ASSISTANT,
+                (TextBlock(text),),
+            ),
+            FinishReason.STOP, ModelUsage(1, 1),
+        )
+
+
 async def executing_task(application, root: Path, task_id: str):
     task = await application.kernel.create_task(
         "collect the required fact", root, task_id=task_id
@@ -240,7 +365,21 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
         })
         spec = TaskSpecSnapshot.from_proposal(
             task.task_id, current.revision + 1, proposal,
-            current.acceptance_criteria,
+            (TaskAcceptanceCriterion(
+                "post-mutation-command",
+                "Run required behavioral verification after workspace changes",
+                TaskCriterionKind.POST_MUTATION_COMMAND,
+            ),),
+        )
+        await app.kernel._append_events(task.task_id, ((
+            "task_spec.revised", {"snapshot": spec.to_data()},
+        ),))
+
+    async def _set_acceptance_criteria(self, app, task, *criteria) -> None:
+        current = await app.kernel.get_task_spec(task.task_id)
+        spec = replace(
+            current, revision=current.revision + 1,
+            acceptance_criteria=tuple(criteria), content_hash="",
         )
         await app.kernel._append_events(task.task_id, ((
             "task_spec.revised", {"snapshot": spec.to_data()},
@@ -388,7 +527,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 )
                 gap = next(
                     item for item in gaps
-                    if item.kind == "POST_MUTATION_VERIFICATION"
+                    if item.kind == "TASK_SPEC_POST_MUTATION_COMMAND"
                 )
                 self.assertEqual(gap.required_effects, (ToolEffect.EXECUTE,))
                 self.assertEqual(gap.candidate_tools, ("core.run_command",))
@@ -455,6 +594,209 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(any(
                     gap.kind == "POST_MUTATION_VERIFICATION" for gap in gaps
                 ))
+            finally:
+                await app.registry.stop_all()
+
+    async def test_all_criterion_kinds_create_readiness_gaps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "changed.txt"
+            target.write_text("before\n", encoding="utf-8")
+            app = compose_fixture_application(
+                tool_adapters=(CoreProcessToolProvider(),),
+                completion_readiness_policy_adapter=(
+                    RuleBasedCompletionReadinessPolicy()
+                ),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, root, "criterion-gaps")
+                await self._set_acceptance_criteria(
+                    app, task,
+                    TaskAcceptanceCriterion(
+                        "workspace", "Workspace remains durable",
+                        TaskCriterionKind.WORKSPACE_INTEGRITY,
+                    ),
+                    TaskAcceptanceCriterion(
+                        "command", "Run verification after mutation",
+                        TaskCriterionKind.POST_MUTATION_COMMAND,
+                    ),
+                    TaskAcceptanceCriterion(
+                        "evidence", "Record a trusted event",
+                        TaskCriterionKind.EVIDENCE_REFERENCE, "event:999999",
+                    ),
+                )
+                await app.kernel.write_workspace_text(
+                    task.task_id, "change", target.name, "after\n",
+                    hashlib.sha256(b"before\n").hexdigest(),
+                )
+                target.write_text("drifted\n", encoding="utf-8")
+                gaps = await app.kernel._completion_readiness_gaps(
+                    task.task_id, await app.kernel.list_tools()
+                )
+                by_id = {gap.gap_id: gap for gap in gaps}
+                self.assertEqual(
+                    by_id["task-spec:workspace"].kind,
+                    "TASK_SPEC_WORKSPACE_INTEGRITY",
+                )
+                self.assertEqual(
+                    by_id["task-spec:command"].kind,
+                    "TASK_SPEC_POST_MUTATION_COMMAND",
+                )
+                self.assertEqual(
+                    by_id["task-spec:evidence"].kind,
+                    "TASK_SPEC_EVIDENCE",
+                )
+            finally:
+                await app.registry.stop_all()
+
+    async def test_outcome_and_acceptance_gates_remain_parallel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(
+                tool_adapters=(CoreProcessToolProvider(),),
+                completion_readiness_policy_adapter=(
+                    RuleBasedCompletionReadinessPolicy()
+                ),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, Path(directory), "parallel-gates")
+                current = await app.kernel.get_task_spec(task.task_id)
+                proposal = TaskSpecProposal.from_data({
+                    "schema_version": 1, "goal": task.goal,
+                    "scope": ["."], "constraints": [],
+                    "outcomes": [{
+                        "outcome_id": "verification",
+                        "description": "Run required verification",
+                        "kind": "COMMAND_RESULT",
+                        "required_effects": ["execute"], "required": True,
+                    }],
+                    "continuation_policy": {"mode": "NONE"},
+                })
+                spec = TaskSpecSnapshot.from_proposal(
+                    task.task_id, current.revision + 1, proposal,
+                    (TaskAcceptanceCriterion(
+                        "command", "Run verification after mutation",
+                        TaskCriterionKind.POST_MUTATION_COMMAND,
+                    ),),
+                )
+                await app.kernel._append_events(task.task_id, ((
+                    "task_spec.revised", {"snapshot": spec.to_data()},
+                ),))
+                gaps = await app.kernel._completion_readiness_gaps(
+                    task.task_id, await app.kernel.list_tools()
+                )
+                self.assertFalse(any(
+                    gap.kind == "REQUIRED_OUTCOME_UNSATISFIED" for gap in gaps
+                ))
+                self.assertTrue(any(
+                    gap.gap_id == "task-spec:command" for gap in gaps
+                ))
+            finally:
+                await app.registry.stop_all()
+
+    async def test_unmet_acceptance_criterion_never_completes_agent_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(
+                model_adapter=CriterionBlockedModel(), tool_adapters=(),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, Path(directory), "criterion-stop")
+                await self._set_acceptance_criteria(
+                    app, task,
+                    TaskAcceptanceCriterion(
+                        "command", "Run verification after mutation",
+                        TaskCriterionKind.POST_MUTATION_COMMAND,
+                    ),
+                )
+                result = await app.kernel.run_agent_turn(
+                    task.task_id, "complete the task", max_model_calls=4,
+                    max_tool_calls=1,
+                )
+                self.assertIsInstance(result, AgentContinuationSuspended)
+                current = await app.kernel.get_task(task.task_id)
+                self.assertEqual(current.state, TaskState.AWAITING_USER)
+                events = await app.registry.require(RuntimeStorePort).read_events(
+                    task.task_id
+                )
+                self.assertFalse(any(
+                    event.event_type == "turn.completed" for event in events
+                ))
+                continuation = next(
+                    event for event in events
+                    if event.event_type == "continuation.requested"
+                )
+                self.assertEqual(
+                    continuation.payload["reason"], "unmet_acceptance_criteria"
+                )
+            finally:
+                await app.registry.stop_all()
+
+    async def test_continuation_at_a_spent_budget_regains_capacity(self) -> None:
+        """A continuation the user is invited to give must be able to act.
+
+        Suspending at an exhausted budget and then resuming with zero capacity
+        fails on the first model call, marks the Task terminally FAILED, and
+        forces the same request to restart as a new Task that repeats work.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(
+                model_adapter=CriterionBlockedModel(), tool_adapters=(),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, Path(directory), "spent-budget")
+                await self._set_acceptance_criteria(
+                    app, task,
+                    TaskAcceptanceCriterion(
+                        "command", "Run verification after mutation",
+                        TaskCriterionKind.POST_MUTATION_COMMAND,
+                    ),
+                )
+                suspended = await app.kernel.run_agent_turn(
+                    task.task_id, "complete the task", max_model_calls=1,
+                    max_tool_calls=1,
+                )
+                self.assertIsInstance(suspended, AgentContinuationSuspended)
+                checkpoint = AgentTurnCheckpoint.from_data(
+                    (await app.kernel.get_task(task.task_id))
+                    .active_agent_checkpoint or {}
+                )
+                self.assertEqual(
+                    checkpoint.pending_user_action["reason"],
+                    "unmet_acceptance_criteria",
+                )
+                self.assertGreaterEqual(
+                    checkpoint.model_calls, checkpoint.max_model_calls
+                )
+
+                await app.kernel.resume_agent_continuation(
+                    task.task_id, "继续", input_id="input-spent-budget",
+                )
+
+                resumed = await app.kernel.get_task(task.task_id)
+                self.assertNotEqual(resumed.state, TaskState.FAILED)
+                resumed_checkpoint = AgentTurnCheckpoint.from_data(
+                    resumed.active_agent_checkpoint or {}
+                )
+                self.assertGreater(
+                    resumed_checkpoint.max_model_calls, checkpoint.max_model_calls
+                )
+                events = await app.registry.require(RuntimeStorePort).read_events(
+                    task.task_id
+                )
+                self.assertTrue(any(
+                    event.event_type == "continuation.resolved"
+                    and event.payload.get("capacity_replenished") is True
+                    for event in events
+                ))
+                # The anti-loop guard is what bounds repetition, not a starved
+                # budget, so the stalled count has to survive replenishment.
+                self.assertIn(
+                    "stalled_continuations",
+                    resumed_checkpoint.completion_readiness_state,
+                )
             finally:
                 await app.registry.stop_all()
 
@@ -529,7 +871,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(sum(
                     event.event_type == "completion.continuation_requested"
                     for event in events
-                ), 1)
+                ), 0)
             finally:
                 await app.registry.stop_all()
 
@@ -578,7 +920,10 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 result = await app.kernel.run_agent_turn(
                     task.task_id, "inspect", max_model_calls=10, max_tool_calls=5
                 )
-                self.assertIn("remains unverified", result.assistant_message.text)
+                self.assertIn(
+                    '"boundary":"unresolved_tool_batch"',
+                    result.assistant_message.text,
+                )
                 self.assertIsInstance(result, AgentContinuationSuspended)
                 self.assertEqual(tool.attempts, 2)
                 suspended = await app.kernel.get_task(task.task_id)
@@ -594,11 +939,11 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(sum(
                     event.event_type == "completion.automatic_resume_started"
                     for event in events
-                ), 1)
-                self.assertGreaterEqual(sum(
+                ), 0)
+                self.assertEqual(sum(
                     event.event_type == "completion.incomplete_recoverable_requested"
                     for event in events
-                ), 1)
+                ), 0)
                 resumed_result = await app.kernel.resume_agent_continuation(
                     task.task_id, "continue the remaining work",
                     input_id="input-recoverable-resume",
@@ -618,6 +963,92 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                     event.event_type == "continuation.resolved"
                     and event.payload.get("capacity_replenished") is True
                     for event in resumed_events
+                ))
+            finally:
+                await app.registry.stop_all()
+
+    async def test_mixed_recoverable_batch_blocks_text_and_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            model = BatchRecoveryModel()
+            tool = BatchRecoveryTool()
+            app = compose_fixture_application(
+                model_adapter=model, tool_adapters=(tool,),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, Path(directory), "mixed-recovery")
+                suspended = await app.kernel.run_agent_turn(
+                    task.task_id, "inspect", max_model_calls=2, max_tool_calls=4,
+                )
+                self.assertIsInstance(suspended, AgentContinuationSuspended)
+                self.assertIn(
+                    '"boundary":"unresolved_tool_batch"',
+                    suspended.assistant_message.text,
+                )
+                self.assertIn("STATE_REFRESH_REQUIRED", suspended.assistant_message.text)
+                self.assertIn(
+                    '"recovery_kind":"retry_after_state_change"',
+                    suspended.assistant_message.text,
+                )
+                self.assertFalse(model.requests[-1].allow_tool_calls)
+                self.assertEqual(tool.call_ids, ["recover-first", "batch-success"])
+                events = await app.registry.require(RuntimeStorePort).read_events(
+                    task.task_id
+                )
+                self.assertFalse(any(
+                    event.event_type == "turn.completed" for event in events
+                ))
+                paused = await app.kernel.get_task(task.task_id)
+                self.assertEqual(paused.state, TaskState.AWAITING_USER)
+                checkpoint = AgentTurnCheckpoint.from_data(
+                    paused.active_agent_checkpoint or {}
+                )
+                retained_results = [
+                    block.result
+                    for message in checkpoint.messages
+                    for block in message.content
+                    if isinstance(block, ToolResultBlock)
+                ]
+                self.assertTrue(any(
+                    result.call_id == "recover-first"
+                    and result.error_code == "STATE_REFRESH_REQUIRED"
+                    for result in retained_results
+                ))
+                self.assertFalse(any(
+                    message.message_id == "batch-premature"
+                    for message in checkpoint.messages
+                ))
+
+                completed = await app.kernel.resume_agent_continuation(
+                    task.task_id, "refresh and continue",
+                    input_id="mixed-recovery-resume",
+                )
+                self.assertIsInstance(completed, AgentTurnResult)
+                self.assertEqual(
+                    completed.assistant_message.text,
+                    "Recovered after refreshing state.",
+                )
+                self.assertEqual(
+                    tool.call_ids,
+                    ["recover-first", "batch-success", "recover-retry"],
+                )
+                continuation_request = next(
+                    request for request in model.requests
+                    if any(
+                        message.message_id == "continuation-input-mixed-recovery-resume"
+                        for message in request.messages
+                    )
+                )
+                self.assertTrue(any(
+                    block.result.call_id == "recover-first"
+                    and not block.result.ok
+                    for message in continuation_request.messages
+                    for block in message.content
+                    if isinstance(block, ToolResultBlock)
+                ))
+                self.assertFalse(any(
+                    message.message_id == "batch-premature"
+                    for message in continuation_request.messages
                 ))
             finally:
                 await app.registry.stop_all()

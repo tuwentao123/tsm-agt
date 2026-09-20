@@ -20,6 +20,18 @@ from .session import standalone_session_id
 from .workspace_access import WorkspaceAccessGrant
 
 
+class Phase1TaskState(StrEnum):
+    """Phase 1 converged task lifecycle exposed to routing/runtime logic."""
+
+    PREPARING = "PREPARING"
+    RUNNING = "RUNNING"
+    WAITING = "WAITING"
+    INTERRUPTED = "INTERRUPTED"
+    DONE = "DONE"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
 class TaskState(StrEnum):
     CREATED = "CREATED"
     INTAKE = "INTAKE"
@@ -44,6 +56,36 @@ class TaskState(StrEnum):
     @property
     def is_terminal(self) -> bool:
         return self in {self.SUCCEEDED, self.CANCELLED, self.FAILED}
+
+    @property
+    def phase1_state(self) -> Phase1TaskState:
+        if self in {
+            self.CREATED,
+            self.INTAKE,
+            self.RESOLVING_PROJECT,
+            self.SELECTING_EXTENSIONS,
+            self.ROUTING,
+        }:
+            return Phase1TaskState.PREPARING
+        if self in {
+            self.PLANNING,
+            self.RUNNING_WORKFLOW,
+            self.EXECUTING,
+            self.VERIFYING,
+            self.FINALIZING,
+            self.RESUMING,
+            self.CONFLICT,
+        }:
+            return Phase1TaskState.RUNNING
+        if self in {self.AWAITING_APPROVAL, self.AWAITING_USER}:
+            return Phase1TaskState.WAITING
+        if self in {self.INTERRUPTING, self.INTERRUPTED}:
+            return Phase1TaskState.INTERRUPTED
+        if self is self.SUCCEEDED:
+            return Phase1TaskState.DONE
+        if self is self.CANCELLED:
+            return Phase1TaskState.CANCELLED
+        return Phase1TaskState.FAILED
 
 
 LEGAL_TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = {
@@ -621,6 +663,7 @@ class TaskSnapshot:
             "goal": self.goal,
             "workspace": self.workspace,
             "state": self.state.value,
+            "phase1_state": self.state.phase1_state.value,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "pending_approval": (

@@ -147,6 +147,7 @@ from .investigation_flow import (
 from .tool import (
     EvidenceQuestion,
     OutcomeBindingMode,
+    WebEgressMode,
     ToolCall,
     ToolEffect,
     ToolIdempotency,
@@ -180,6 +181,7 @@ __all__ = [
     "FinishReason",
     "ImageBlock",
     "EvidenceQuestion",
+    "WebEgressMode",
     "ToolEffect",
     "ToolResultAuthority",
     "ToolProtocol",

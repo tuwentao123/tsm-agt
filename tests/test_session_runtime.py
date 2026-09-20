@@ -80,6 +80,158 @@ class SessionRuntimeTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await second.registry.stop_all()
 
+    async def test_follow_up_consume_requires_terminal_source_and_records_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = compose_fixture_application(tool_adapters=())
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("follow-up")
+                source = await app.kernel.create_task(
+                    "source", root, session_id=session.session_id
+                )
+                queued = await app.kernel.queue_session_follow_up(
+                    session.session_id, source.task_id, "after failure", "follow-terminal"
+                )
+                self.assertIsNone(await app.kernel.consume_queued_session_follow_up(
+                    session.session_id, root, input_id=queued.input_id
+                ))
+                await app.kernel.transition_task(
+                    source.task_id, TaskState.FAILED, "source failed"
+                )
+                dispatched = await app.kernel.consume_queued_session_follow_up(
+                    session.session_id, root, input_id=queued.input_id
+                )
+                assert dispatched is not None
+                self.assertEqual(dispatched.goal, "after failure")
+                self.assertEqual(dispatched.session_id, session.session_id)
+                events = await app.registry.require(RuntimeStorePort).read_session_events(
+                    session.session_id
+                )
+                self.assertEqual(
+                    [event.event_type for event in events[-3:]],
+                    [
+                        "session.task_attached", "session.task_derived",
+                        "session.follow_up_dispatched",
+                    ],
+                )
+                created = await app.registry.require(RuntimeStorePort).read_events(
+                    dispatched.task_id
+                )
+                self.assertEqual(created[0].payload["source_task_id"], source.task_id)
+                self.assertEqual(created[0].payload["task_relation"], "FOLLOW_UP")
+            finally:
+                await app.registry.stop_all()
+
+    async def test_follow_up_consume_uses_first_ready_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = compose_fixture_application(tool_adapters=())
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("follow-up ordering")
+                waiting = await app.kernel.create_task(
+                    "waiting", root, session_id=session.session_id
+                )
+                ready = await app.kernel.create_task(
+                    "ready", root, session_id=session.session_id
+                )
+                first = await app.kernel.queue_session_follow_up(
+                    session.session_id, waiting.task_id, "wait for this", "follow-waiting"
+                )
+                second = await app.kernel.queue_session_follow_up(
+                    session.session_id, ready.task_id, "consume this", "follow-ready"
+                )
+                await app.kernel.transition_task(
+                    ready.task_id, TaskState.CANCELLED, "source cancelled"
+                )
+                dispatched = await app.kernel.consume_queued_session_follow_up(
+                    session.session_id, root
+                )
+                assert dispatched is not None
+                self.assertEqual(dispatched.goal, second.text)
+                replay = await app.kernel.consume_queued_session_follow_up(
+                    session.session_id, root, input_id=second.input_id
+                )
+                self.assertEqual(replay, dispatched)
+                self.assertEqual(
+                    await app.kernel.list_queued_session_follow_ups(session.session_id),
+                    (first,),
+                )
+                events = await app.registry.require(RuntimeStorePort).read_session_events(
+                    session.session_id
+                )
+                self.assertEqual(
+                    sum(
+                        event.event_type == "session.follow_up_dispatched"
+                        and event.payload.get("input_id") == second.input_id
+                        for event in events
+                    ),
+                    1,
+                )
+            finally:
+                await app.registry.stop_all()
+
+    async def test_follow_up_consume_concurrent_replays_one_atomically_dispatched_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = compose_fixture_application(tool_adapters=())
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("concurrent follow-up")
+                source = await app.kernel.create_task(
+                    "source", root, session_id=session.session_id
+                )
+                queued = await app.kernel.queue_session_follow_up(
+                    session.session_id, source.task_id, "after source", "follow-concurrent"
+                )
+                await app.kernel.transition_task(
+                    source.task_id, TaskState.CANCELLED, "source cancelled"
+                )
+                original_get_project_trust = app.kernel.get_project_trust
+                entered_create = 0
+                both_creates_ready = asyncio.Event()
+
+                async def synchronize_create(workspace: Path):
+                    nonlocal entered_create
+                    entered_create += 1
+                    if entered_create == 2:
+                        both_creates_ready.set()
+                    await both_creates_ready.wait()
+                    return await original_get_project_trust(workspace)
+
+                app.kernel.get_project_trust = synchronize_create
+                first, second = await asyncio.gather(
+                    app.kernel.consume_queued_session_follow_up(
+                        session.session_id, root, input_id=queued.input_id
+                    ),
+                    app.kernel.consume_queued_session_follow_up(
+                        session.session_id, root, input_id=queued.input_id
+                    ),
+                )
+                assert first is not None and second is not None
+                self.assertEqual(first, second)
+                self.assertEqual(first.goal, queued.text)
+                self.assertEqual(
+                    (await app.kernel.get_session(session.session_id)).task_ids.count(
+                        first.task_id
+                    ),
+                    1,
+                )
+                events = await app.registry.require(RuntimeStorePort).read_session_events(
+                    session.session_id
+                )
+                self.assertEqual(
+                    sum(
+                        event.event_type == "session.follow_up_dispatched"
+                        and event.payload.get("input_id") == queued.input_id
+                        for event in events
+                    ),
+                    1,
+                )
+            finally:
+                await app.registry.stop_all()
+
     async def _executing_task(
         self, application, root: Path, task_id: str, session_id: str | None = None,
     ) -> TaskSnapshot:
@@ -128,6 +280,26 @@ class SessionRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     await app.kernel.select_session_task(
                         session.session_id, second.task_id, expected_version=1
                     )
+            finally:
+                await app.registry.stop_all()
+
+    async def test_session_flow_exposes_phase1_state_alongside_legacy_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = compose_fixture_application(tool_adapters=())
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("phase1 flow")
+                task = await app.kernel.create_task(
+                    "phase one state", root, session_id=session.session_id
+                )
+                flow = await app.kernel.get_session_flow(session.session_id)
+                self.assertEqual(flow["tasks"], [{
+                    "task_id": task.task_id,
+                    "state": TaskState.CREATED.value,
+                    "phase1_state": "PREPARING",
+                    "active": True,
+                }])
             finally:
                 await app.registry.stop_all()
 

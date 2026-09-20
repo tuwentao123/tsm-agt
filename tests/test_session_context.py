@@ -144,13 +144,17 @@ class SessionContextProjectorTest(unittest.TestCase):
 
         self.assertEqual(
             [item["task_id"] for item in body["recent_task_summaries"]],
-            [f"task-{index}" for index in range(2, 8)],
+            [f"task-{index}" for index in range(4, 8)],
         )
         self.assertEqual(
             [item["task_id"] for item in body["task_index"]],
-            [f"task-{index}" for index in range(1, 8)],
+            [f"task-{index}" for index in range(4, 8)],
         )
-        self.assertEqual(body["earlier_summary"]["message_count"], 2)
+        self.assertEqual(body["earlier_summary"]["omitted_task_count"], 3)
+        # Old terminal conclusions stay durable for UI/history lookup but must
+        # not be implicitly injected into a new model turn.
+        self.assertNotIn("question 1", json.dumps(body))
+        self.assertNotIn("answer 1", json.dumps(body))
 
     def test_task_index_keeps_artifact_and_handoff_facts(self) -> None:
         snapshot = SessionSnapshot.create(
@@ -214,9 +218,9 @@ class SessionContextProjectorTest(unittest.TestCase):
         ).message.text)
         self.assertEqual(
             [item["task_id"] for item in body["task_index"]],
-            [f"task-{index}" for index in range(1, 6)],
+            [f"task-{index}" for index in range(2, 6)],
         )
-        self.assertEqual(body["earlier_summary"]["omitted_task_count"], 0)
+        self.assertEqual(body["earlier_summary"]["omitted_task_count"], 1)
 
     @staticmethod
     def _execution(
@@ -379,6 +383,34 @@ class SessionContextProjectorTest(unittest.TestCase):
             "SUCCEEDED",
         )
 
+    def test_failed_task_result_is_not_replayed_as_a_later_prompt_answer(self) -> None:
+        snapshot = SessionSnapshot.create(
+            "session-1", "uid:1", "failed task result"
+        ).bump_context().bump_context()
+        result = self._event(
+            1, "investigate the old failure", "historical blocker conclusion"
+        )
+        failed = SessionEvent(
+            "event-2", "session-1", 2, "session.task_state_updated",
+            {"task_id": "task-1", "task_state": "FAILED"},
+        )
+
+        projection = SessionContextProjector().project(snapshot, (result, failed))
+        body = json.loads(SessionContextProjector().for_prompt(projection).message.text)
+
+        self.assertEqual(
+            body["recent_messages"], [{
+                "message_id": "user-1",
+                "role": "user",
+                "text": "investigate the old failure",
+                "task_id": "task-1",
+                "turn_id": "turn-1",
+                "source_event_sequence": 1,
+            }],
+        )
+        self.assertEqual(body["task_index"][0]["status"], "FAILED")
+        self.assertNotIn("historical blocker conclusion", json.dumps(body))
+
     def test_reference_catalogs_are_bounded_and_same_question_ids_do_not_collide(
         self,
     ) -> None:
@@ -457,8 +489,8 @@ class SessionContextProjectorTest(unittest.TestCase):
         assert prompt.message is not None
         body = json.loads(prompt.message.text)
         historical = body["historical_investigation"]
-        self.assertEqual(len(historical["resources"]), 40)
-        self.assertEqual(len(historical["questions"]), 20)
+        self.assertEqual(len(historical["resources"]), 24)
+        self.assertEqual(len(historical["questions"]), 12)
         self.assertNotIn("evidence_references", json.dumps(historical))
         self.assertLess(len(prompt.message.text), 100_000)
 

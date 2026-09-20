@@ -806,12 +806,12 @@ class OpenAICompatibleModelProvider:
         for block in message.content:
             if isinstance(block, TextBlock):
                 provider_content.append({
-                    "type": "input_text",
+                    "type": "text",
                     "text": block.text,
                 })
             elif isinstance(block, ImageBlock):
                 provider_content.append({
-                    "type": "input_image",
+                    "type": "image_url",
                     "image_url": {
                         "url": block.image_url,
                         "detail": block.detail,

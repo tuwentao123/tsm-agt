@@ -38,7 +38,35 @@ class ToolRecoveryContractTest(unittest.TestCase):
         self.assertNotIn("recovery_kind", data)
         self.assertNotIn("recovery_action", data)
 
-    def test_unknown_outcome_is_never_plain_retryable(self) -> None:
+    def test_multiple_recoverable_tool_results_form_one_batch(self) -> None:
+        from tsm_agt.core.kernel import Kernel
+        from tsm_agt.ports import (
+            Message, MessageRole, TextBlock, ToolCall, ToolCallBlock,
+            ToolResultBlock,
+        )
+
+        messages = (
+            Message("call-batch", MessageRole.ASSISTANT, (ToolCallBlock(
+                ToolCall("read", "core.read_file", {"path": "app.py"}),
+            ), ToolCallBlock(
+                ToolCall("patch", "core.apply_patch", {"path": "app.py"}),
+            ))),
+            Message("result-read", MessageRole.TOOL, (ToolResultBlock(
+                ToolResult("read", False, error_code="TIMEOUT", retryable=True),
+            ),)),
+            Message("result-patch", MessageRole.TOOL, (ToolResultBlock(
+                ToolResult(
+                    "patch", False, error_code="CONFLICT",
+                    recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+                ),
+            ),)),
+        )
+
+        self.assertEqual(
+            [item.call_id for item in Kernel._latest_recoverable_tool_batch(messages)],
+            ["read", "patch"],
+        )
+
         result = ToolResult(
             "unknown", False, error_code="UNKNOWN_OUTCOME",
             recovery_kind=ToolRecoveryKind.UNKNOWN_OUTCOME,

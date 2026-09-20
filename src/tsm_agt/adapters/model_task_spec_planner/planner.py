@@ -49,7 +49,8 @@ class ModelTaskSpecPlanner:
         supports_tools = self._model.capabilities.tools
         tool = ToolSpec(
             "planner.submit_task_spec",
-            "Submit the outcomes required to satisfy the current user task.",
+            "Submit the verifiable acceptance criteria and outcomes required "
+            "to satisfy the current user task.",
             TASK_SPEC_PROPOSAL_SCHEMA_V1, ToolRisk.R0, is_read_only=True,
             is_concurrency_safe=True, idempotency=ToolIdempotency.IDEMPOTENT,
             is_internal_state=True,
@@ -60,6 +61,11 @@ class ModelTaskSpecPlanner:
                 f"task-planner-system-{uuid4().hex}", MessageRole.SYSTEM,
                 (TextBlock(
                     "Translate the user request into a project-neutral Task SPEC. "
+                    "First define 1-30 acceptance criteria that Runtime can verify: "
+                    "use workspace_integrity for durable workspace changes, "
+                    "post_mutation_command when a mutation must be command-verified, "
+                    "and evidence_reference only with a durable Runtime reference. "
+                    "Then define the coarse outcomes that satisfy those criteria. "
                     "First classify the goal. If it asks to build, fix, implement, "
                     "write, modify, refactor, deploy, run, or otherwise change the "
                     "workspace, it is IMPLEMENTATION work and you MUST emit "
@@ -73,8 +79,15 @@ class ModelTaskSpecPlanner:
                         "Return exactly one JSON object matching the supplied "
                         "Task SPEC schema, with no prose or Markdown. "
                     ) +
+                    "Acceptance criteria are the primary completion contract: "
+                    "include them in every proposal and keep outcomes coarse. "
                     "Outcomes describe "
-                    "observable results, not steps or promises. ANSWER and "
+                    "observable results, not steps or promises. Prefer Task-level "
+                    "acceptance criteria over fine-grained outcome choreography: "
+                    "outcomes should stay coarse and describe durable deliveries, "
+                    "while completion is validated through acceptance criteria and "
+                    "verification evidence. Do not rely on execution_focus, "
+                    "binding-style coordination, or hidden runtime state. ANSWER and "
                     "USER_DECISION may have no required effects; other outcomes "
                     "must name the effects needed. A pure knowledge answer may use "
                     "ANSWER with no effects. An answer that depends on the current "
@@ -127,7 +140,9 @@ class ModelTaskSpecPlanner:
                     parsed = json.loads(response.message.text)
                     if not isinstance(parsed, Mapping):
                         raise ValueError("Task SPEC text must be a JSON object")
-                    return TaskSpecProposal.from_data(parsed).to_data()
+                    return TaskSpecProposal.from_data(
+                        parsed, require_acceptance_criteria=True
+                    ).to_data()
                 except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                     pass
             elif (
@@ -139,7 +154,9 @@ class ModelTaskSpecPlanner:
                     # Validate here so malformed arguments get the one bounded
                     # protocol correction instead of escaping to Kernel first.
                     from tsm_agt.core import TaskSpecProposal
-                    proposal = TaskSpecProposal.from_data(calls[0].arguments)
+                    proposal = TaskSpecProposal.from_data(
+                        calls[0].arguments, require_acceptance_criteria=True
+                    )
                     return proposal.to_data()
                 except (KeyError, TypeError, ValueError):
                     pass

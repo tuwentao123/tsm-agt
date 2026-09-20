@@ -64,7 +64,9 @@ from .process import (
     ProcessSandboxDenied,
     SupervisedProcessResult,
 )
-from .task import InvalidTaskTransition, TaskNotFound, TaskSnapshot, TaskState
+from .task import (
+    InvalidTaskTransition, Phase1TaskState, TaskNotFound, TaskSnapshot, TaskState,
+)
 from .task_spec import (
     TASK_SPEC_PROPOSAL_SCHEMA_V1,
     TaskAcceptanceCriterion, TaskContinuationMode, TaskCriterionKind,
@@ -102,9 +104,10 @@ from .steering import (
 )
 from .runtime_input import (
     ApprovalResolutionInput, CancelTaskInput, ClarificationReplyInput,
-    FollowUpMode, InterruptTaskInput, QueuedFollowUp, RuntimeInputContext,
-    RuntimeInputEvent, RuntimeInputIntent, RuntimeInputRoute, RuntimeInputRouter,
-    RuntimeTextInput, SessionContinuationDecision, SessionContinuationMode,
+    FollowUpMode, InputChannel, InterruptTaskInput, QueuedFollowUp,
+    RuntimeInputContext, RuntimeInputEvent, RuntimeInputIntent, RuntimeInputRoute,
+    RuntimeInputRouter, RuntimeTextInput, SessionTextInput,
+    SessionContinuationDecision, SessionContinuationMode,
     SessionResumeCandidate, SessionResumeSafety,
     SessionInputAction, SessionInputDecision, SessionInputGrounding,
     SessionRouteDisposition, SessionTaskCatalogEntry, SessionTaskRelation,
@@ -207,8 +210,10 @@ __all__ = [
     "Kernel",
     "KernelDependencies",
     "RuntimeInputContext",
+    "InputChannel",
     "RuntimeInputEvent",
     "RuntimeTextInput",
+    "SessionTextInput",
     "ApprovalResolutionInput",
     "ClarificationReplyInput",
     "InterruptTaskInput",
@@ -241,6 +246,7 @@ __all__ = [
     "SupervisedProcessResult",
     "ModelInvocationFailed",
     "TaskNotFound",
+    "Phase1TaskState",
     "TaskSnapshot",
     "TaskState",
     "TaskAcceptanceCriterion",

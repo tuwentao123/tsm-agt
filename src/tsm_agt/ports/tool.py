@@ -91,6 +91,25 @@ class OutcomeBindingMode(StrEnum):
     SUPPORTING = "SUPPORTING"
 
 
+class WebEgressMode(StrEnum):
+    """Which component decides where an outbound document fetch may go.
+
+    ``DIRECT`` means the fetching process opens the socket itself, so it owns
+    the decision: resolve the host once, refuse any non-public answer, then
+    connect to that exact address so a second resolution cannot substitute an
+    internal host (DNS rebinding).
+
+    ``DELEGATED`` means the destination is reached through infrastructure the
+    process does not control - a forward proxy, VPN, or TUN device. Locally
+    resolved addresses then describe the tunnel rather than the destination, so
+    classifying them in-process would assert a guarantee that does not exist.
+    Deployments choosing this mode must enforce egress in that infrastructure.
+    """
+
+    DIRECT = "DIRECT"
+    DELEGATED = "DELEGATED"
+
+
 @dataclass(frozen=True, slots=True)
 class EvidenceQuestion:
     """The concrete unknown that one model-requested tool call should resolve."""

@@ -102,7 +102,7 @@ class PromptTemplate:
     def default(cls) -> PromptTemplate:
         return cls(
             manifest_id="builtin.engineering-agent",
-            revision=7,
+            revision=8,
             static_segments=(
                 PromptTemplateSegment(
                     "system-safety", "core", "1.0",
@@ -124,8 +124,12 @@ class PromptTemplate:
                     "questions must also declare expected_scope as the directory or file "
                     "that the question is about. Otherwise do not "
                     "call the tool. Start with the most specific identifier already "
-                    "present in the request. When an exact or wildcard file name is "
-                    "already known, use core.find_files instead of listing directories "
+                    "present in the request. Read an explicit http(s) document URL with "
+                    "web.fetch_markdown when that tool is advertised; otherwise report "
+                    "that the document cannot be fetched, and never substitute "
+                    "core.find_files or core.search_text for it. When an exact or "
+                    "wildcard file name is already known, use "
+                    "core.find_files instead of listing directories "
                     "one level at a time. After a search finds a likely module or "
                     "file, inspect those hits and keep later searches inside that scope; "
                     "do not return to workspace-wide searches merely by changing the "
@@ -213,6 +217,10 @@ class PromptTemplate:
             message for message in conversation
             if message.message_id.startswith("session-context-")
         )
+        document_reference_messages = tuple(
+            message for message in conversation
+            if message.message_id.startswith("document-references-context-")
+        )
         working_memory_messages = tuple(
             message for message in conversation
             if message.message_id.startswith("working-memory-context-")
@@ -221,9 +229,8 @@ class PromptTemplate:
             message for message in conversation
             if not message.message_id.startswith((
                 "project-onboarding-context-", "project-memory-context-",
-                "session-context-",
-                "working-memory-context-",
-                "project-instructions-context-", "task-spec-context-",
+                "session-context-", "document-references-context-",
+                "working-memory-context-", "project-instructions-context-", "task-spec-context-",
             ))
         )
         if any(
@@ -240,13 +247,18 @@ class PromptTemplate:
         if any(message.role is not MessageRole.USER for message in session_messages):
             raise ValueError("Session context must use the untrusted user role")
         if any(
+            message.role is not MessageRole.USER
+            for message in document_reference_messages
+        ):
+            raise ValueError("document references must use the untrusted user role")
+        if any(
             message.role is not MessageRole.USER for message in working_memory_messages
         ):
             raise ValueError("working memory context must use the untrusted user role")
         messages = (
             system_messages + runtime_messages + project_instruction_messages
             + task_spec_messages + onboarding_messages
-            + memory_messages + session_messages
+            + memory_messages + session_messages + document_reference_messages
             + working_memory_messages
             + ordinary_conversation
         )

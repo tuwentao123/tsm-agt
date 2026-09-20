@@ -7,7 +7,8 @@ from pathlib import Path
 from tsm_agt.adapters.fixture import EchoModelProvider
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
-    RuntimeInputContext, RuntimeInputIntent, RuntimeInputRouter, TaskState,
+    RuntimeInputContext, RuntimeInputIntent, RuntimeInputRouter,
+    SessionInputAction, SessionTextInput, TaskState,
 )
 from tsm_agt.ports import AdapterDescriptor, HealthState, HealthStatus
 
@@ -96,6 +97,25 @@ class RuntimeInputRouterTest(unittest.TestCase):
 
 
 class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
+    async def test_dispatch_session_text_uses_task_text_channel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=()
+            )
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("input dispatcher")
+                event = SessionTextInput(
+                    session.session_id, "inspect the current workspace",
+                    "session-input-1", directory,
+                )
+                self.assertEqual(event.channel.value, "TASK_TEXT")
+                decision = await app.kernel.dispatch_input_event(event)
+                self.assertEqual(decision.action, SessionInputAction.NEW_TASK)
+                self.assertEqual(decision.relation.value, "INDEPENDENT")
+            finally:
+                await app.registry.stop_all()
+
     async def test_classifier_routes_high_confidence_live_input(self):
         with tempfile.TemporaryDirectory() as directory:
             classifier = FixtureClassifier("REPLACE")

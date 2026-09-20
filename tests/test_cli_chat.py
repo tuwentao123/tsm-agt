@@ -622,7 +622,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(len(task_ids), 2)
             self.assertEqual(task_ids[0], task_ids[1])
-            self.assertEqual(len(resolver.contexts), 1)
+            self.assertEqual(resolver.contexts, [])
             await application.registry.start_all()
             try:
                 tasks = await application.kernel.list_session_tasks(session_id)
@@ -682,7 +682,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                     "正在继续上次意外中断的任务：inspect the interrupted target"
                     in line for line in output
                 ))
-                self.assertEqual(len(resolver.contexts), 1)
+                self.assertEqual(resolver.contexts, [])
             finally:
                 await application.registry.stop_all()
 
@@ -865,7 +865,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                 output_fn=output.append, application_factory=lambda: application,
             )
             self.assertEqual(result, 0)
-            self.assertEqual(len(resolver.contexts), 4)
+            self.assertEqual(len(resolver.contexts), 3)
             self.assertEqual(len(model.requests), 4)
             self.assertEqual(
                 [request.messages[-1].text for request in model.requests],
@@ -1175,9 +1175,27 @@ class SessionAnswerCliTest(unittest.IsolatedAsyncioTestCase):
                 model_adapter=SessionAnswerModel(), tool_adapters=(),
                 session_input_resolver_adapter=AnsweringSessionInputResolver(),
             )
+            await application.registry.start_all()
+            try:
+                session = await application.kernel.create_session("answer context")
+                history_task = await application.kernel.create_task(
+                    "completed context", root, session_id=session.session_id
+                )
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING, TaskState.VERIFYING,
+                    TaskState.FINALIZING, TaskState.SUCCEEDED,
+                ):
+                    history_task = await application.kernel.transition_task(
+                        history_task.task_id, state, state.value
+                    )
+            finally:
+                await application.registry.stop_all()
             output: list[str] = []
             result = await _chat(
-                root, input_fn=ScriptedInput(["What is a Session?", "/exit"]),
+                root, session_id=session.session_id,
+                input_fn=ScriptedInput(["What is a Session?", "/exit"]),
                 output_fn=output.append, application_factory=lambda: application,
             )
             self.assertEqual(result, 0)
@@ -1192,7 +1210,7 @@ class SessionAnswerCliTest(unittest.IsolatedAsyncioTestCase):
             await application.registry.start_all()
             try:
                 self.assertEqual(
-                    await application.kernel.list_session_tasks(session_id), ()
+                    len(await application.kernel.list_session_tasks(session_id)), 1
                 )
                 conversation = await application.kernel.get_session_conversation(
                     session_id

@@ -315,7 +315,12 @@ def _merge_answer_outcomes(
 
 @dataclass(frozen=True, slots=True)
 class TaskSpecProposal:
-    """Versioned form submitted by a planner model for Runtime validation."""
+    """Versioned planner contract before Runtime creates a Task SPEC snapshot.
+
+    New planner submissions carry their own verifiable acceptance contract.
+    Empty criteria remain readable only for pre-acceptance-first callers that
+    explicitly supply an existing criterion set to ``from_proposal``.
+    """
 
     schema_version: int
     goal: str
@@ -323,6 +328,7 @@ class TaskSpecProposal:
     constraints: tuple[str, ...]
     outcomes: tuple[TaskOutcomeProposal, ...]
     continuation_mode: TaskContinuationMode = TaskContinuationMode.NONE
+    acceptance_criteria: tuple["TaskAcceptanceCriterion", ...] = ()
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
@@ -334,6 +340,12 @@ class TaskSpecProposal:
         if len({item.outcome_id for item in self.outcomes}) != len(self.outcomes):
             raise ValueError("Task SPEC proposal outcome IDs must be unique")
         _validate_outcome_dependencies(self.outcomes)
+        if len(self.acceptance_criteria) > 30:
+            raise ValueError("Task SPEC proposal supports at most 30 acceptance criteria")
+        if len({item.criterion_id for item in self.acceptance_criteria}) != len(
+            self.acceptance_criteria
+        ):
+            raise ValueError("Task SPEC proposal criterion IDs must be unique")
         if len(self.scope) > 50 or len(self.constraints) > 50:
             raise ValueError("Task SPEC proposal scope or constraints exceed limits")
         for value in self.scope + self.constraints:
@@ -346,22 +358,34 @@ class TaskSpecProposal:
             "goal": self.goal.strip(),
             "scope": list(self.scope),
             "constraints": list(self.constraints),
+            "acceptance_criteria": [
+                item.to_data() for item in self.acceptance_criteria
+            ],
             "outcomes": [item.to_data() for item in self.outcomes],
             "continuation_policy": {"mode": self.continuation_mode.value},
         }
 
     @classmethod
-    def from_data(cls, data: Mapping[str, Any]) -> TaskSpecProposal:
+    def from_data(
+        cls, data: Mapping[str, Any], *, require_acceptance_criteria: bool = False,
+    ) -> TaskSpecProposal:
         _reject_unknown_fields(data, {
-            "schema_version", "goal", "scope", "constraints", "outcomes",
-            "continuation_policy",
+            "schema_version", "goal", "scope", "constraints",
+            "acceptance_criteria", "outcomes", "continuation_policy",
         }, "Task SPEC proposal")
         raw_scope = data.get("scope")
         raw_constraints = data.get("constraints")
+        raw_criteria = data.get("acceptance_criteria", [])
         raw_outcomes = data.get("outcomes")
         raw_continuation = data.get("continuation_policy")
         if not isinstance(raw_scope, list) or not isinstance(raw_constraints, list):
             raise ValueError("Task SPEC proposal scope and constraints must be lists")
+        if not isinstance(raw_criteria, list) or not all(
+            isinstance(item, Mapping) for item in raw_criteria
+        ):
+            raise ValueError("Task SPEC proposal acceptance_criteria must be an object list")
+        if require_acceptance_criteria and not raw_criteria:
+            raise ValueError("Task SPEC planner proposal requires acceptance_criteria")
         if not isinstance(raw_outcomes, list) or not all(
             isinstance(item, Mapping) for item in raw_outcomes
         ):
@@ -381,6 +405,7 @@ class TaskSpecProposal:
                 TaskOutcomeProposal.from_data(item) for item in raw_outcomes
             )),
             TaskContinuationMode(str(raw_continuation.get("mode", ""))),
+            tuple(TaskAcceptanceCriterion.from_data(item) for item in raw_criteria),
         )
 
 
@@ -585,6 +610,23 @@ TASK_SPEC_PROPOSAL_SCHEMA_V1: Mapping[str, Any] = {
         "goal": {"type": "string", "minLength": 1, "maxLength": 2000},
         "scope": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
         "constraints": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
+        "acceptance_criteria": {
+            "type": "array", "minItems": 1, "maxItems": 30,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "criterion_id": {"type": "string", "minLength": 1, "maxLength": 120},
+                    "description": {"type": "string", "minLength": 1, "maxLength": 1000},
+                    "verification_kind": {
+                        "type": "string",
+                        "enum": [item.value for item in TaskCriterionKind],
+                    },
+                    "evidence_reference": {"type": ["string", "null"]},
+                },
+                "required": ["criterion_id", "description", "verification_kind"],
+                "additionalProperties": False,
+            },
+        },
         "outcomes": {
             "type": "array", "minItems": 1, "maxItems": 30,
             "items": {
@@ -637,8 +679,8 @@ TASK_SPEC_PROPOSAL_SCHEMA_V1: Mapping[str, Any] = {
         },
     },
     "required": [
-        "schema_version", "goal", "scope", "constraints", "outcomes",
-        "continuation_policy",
+        "schema_version", "goal", "scope", "constraints",
+        "acceptance_criteria", "outcomes", "continuation_policy",
     ],
     "additionalProperties": False,
 }
@@ -677,6 +719,10 @@ class TaskAcceptanceCriterion:
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> TaskAcceptanceCriterion:
+        _reject_unknown_fields(data, {
+            "criterion_id", "description", "verification_kind",
+            "evidence_reference",
+        }, "Task SPEC acceptance criterion")
         return cls(
             str(data["criterion_id"]).strip(),
             str(data["description"]).strip(),
@@ -745,13 +791,21 @@ class TaskSpecSnapshot:
     @classmethod
     def from_proposal(
         cls, task_id: str, revision: int, proposal: TaskSpecProposal,
-        acceptance_criteria: tuple[TaskAcceptanceCriterion, ...],
+        acceptance_criteria: tuple[TaskAcceptanceCriterion, ...] | None = None,
     ) -> TaskSpecSnapshot:
-        """Create Runtime-owned state; all outcomes start pending."""
+        """Create Runtime-owned state; all outcomes start pending.
+
+        Planner proposals own the criteria for new planning. The optional
+        fallback only keeps pre-acceptance-first callers and historical fixtures
+        readable while they supply their existing contract explicitly.
+        """
+        criteria = proposal.acceptance_criteria or acceptance_criteria
+        if not criteria:
+            raise ValueError("Task SPEC proposal requires acceptance criteria")
         return cls(
             task_id=task_id, revision=revision, goal=proposal.goal,
             scope=proposal.scope, constraints=proposal.constraints,
-            acceptance_criteria=acceptance_criteria,
+            acceptance_criteria=criteria,
             outcomes=tuple(
                 TaskOutcomeSnapshot.from_proposal(item)
                 for item in proposal.outcomes
@@ -864,8 +918,9 @@ class TaskSpecProjector:
 class TaskExecutionFocusProjector:
     """Rebuild current Outcome selection from durable Task events.
 
-    Old checkpoints used ``active_outcome_ids``.  Migration is intentionally
-    isolated here: new runtime code consumes TaskExecutionFocus only.
+    Old checkpoints used ``active_outcome_ids``. Migration is intentionally
+    isolated here: this is a read-only historical replay/UI projection; new
+    runtime code must not consume or update execution focus.
     """
 
     @staticmethod

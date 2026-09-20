@@ -9,6 +9,7 @@ from pathlib import Path
 from tsm_agt.adapters.builtin import CoreWorkspaceMutationToolProvider
 from tsm_agt.bootstrap import compose_fixture_application, compose_readonly_application
 from tsm_agt.core import ApprovalDecision, ApprovalRequired, TaskState
+from tsm_agt.ports import ToolRecoveryKind
 from tsm_agt.ports import ToolCall
 
 
@@ -116,6 +117,15 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(result.ok)
         self.assertEqual(result.error_code, "CONFLICT")
+        self.assertIs(
+            result.effective_recovery_kind,
+            ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+        )
+        self.assertEqual(
+            result.recovery_action["required_change"],
+            "refresh_resource_then_retry",
+        )
+        self.assertFalse(result.recovery_action["same_call_safe"])
         self.assertEqual(target.read_text(encoding="utf-8"), "user-write\n")
         self.assertEqual(
             (await self.application.kernel.get_task(self.task.task_id)).mutation_journal, ()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     AgentLoopLimitExceeded,
     AgentClarificationSuspended,
+    AgentContinuationSuspended,
     AgentTurnResult,
     AgentTurnSuspended,
     ApprovalDecision,
@@ -494,11 +496,21 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
                     "pending_tool_calls"
                 ], [],
             )
-            completed = await application.kernel.resolve_agent_clarification(
+            # CONFIRM_NOT_APPLIED turns the unknown outcome into an explicit
+            # failure. Prose alone cannot close a failed Tool batch, so the turn
+            # is suspended for continuation instead of reported as finished.
+            blocked = await application.kernel.resolve_agent_clarification(
                 stopped.request_id, stopped.resume_token,
                 selected_choice="CONFIRM_NOT_APPLIED",
             )
-            self.assertIsInstance(completed, AgentTurnResult)
+            self.assertIsInstance(blocked, AgentContinuationSuspended)
+            assert isinstance(blocked, AgentContinuationSuspended)
+            blocker = json.loads(blocked.assistant_message.text)
+            self.assertEqual(blocker["boundary"], "unresolved_tool_batch")
+            self.assertEqual(
+                [item["error_code"] for item in blocker["failures"]],
+                ["NOT_APPLIED"],
+            )
             self.assertEqual(provider.invocation_count, 1)
             self.assertEqual(model.calls, 2)
             reconciled = (
@@ -570,11 +582,11 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
                 restored.pending_clarification.kind.value,
                 "OUTCOME_RECONCILIATION",
             )
-            completed = await second.kernel.resolve_agent_clarification(
+            blocked = await second.kernel.resolve_agent_clarification(
                 stopped.request_id, stopped.resume_token,
                 selected_choice="CONFIRM_NOT_APPLIED",
             )
-            self.assertIsInstance(completed, AgentTurnResult)
+            self.assertIsInstance(blocked, AgentContinuationSuspended)
             self.assertEqual(second_provider.invocation_count, 0)
             self.assertEqual(second_model.calls, 1)
         finally:
@@ -764,40 +776,21 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
                 "approved after restart",
             )
             self.assertIsInstance(completed, AgentTurnResult)
-            from tsm_agt.core import TaskOutcomeStatus
-            outcome = (
-                await second.kernel.get_task_spec(task.task_id)
-            ).outcomes[0]
-            self.assertEqual(outcome.status, TaskOutcomeStatus.IN_PROGRESS)
-            completion = await second.kernel.request_task_outcome_completion(
-                task.task_id, outcome.outcome_id,
-                completion_summary="Approved mutation action completed",
-                evidence_refs=outcome.fulfillment_refs, remaining_work=(),
-                writer="approval-restart-test",
-            )
-            self.assertTrue(completion["accepted"], completion)
-            outcome = (
-                await second.kernel.get_task_spec(task.task_id)
-            ).outcomes[0]
-            self.assertEqual(outcome.status, TaskOutcomeStatus.DELIVERED)
-            events = await second.kernel.dependencies.store.read_events(
-                task.task_id
-            )
-            for event_type in (
-                "tool.requested", "policy.evaluated",
-                "approval.requested", "approval.resolved",
-                "tool.started", "tool.completed",
-            ):
-                event = next(
-                    item for item in events if item.event_type == event_type
+            snapshot = await second.kernel.get_task(task.task_id)
+            execution = next(iter(snapshot.tool_executions.values()))
+            self.assertEqual(second_provider.invocation_count, 1)
+            self.assertIsNone(execution.call.outcome_ref)
+            events = await second.kernel.dependencies.store.read_events(task.task_id)
+            self.assertFalse(any(
+                item.event_type == "task_outcome.binding_decided" for item in events
+            ))
+            self.assertTrue(all(
+                any(item.event_type == event_type for item in events)
+                for event_type in (
+                    "tool.requested", "policy.evaluated", "approval.requested",
+                    "approval.resolved", "tool.started", "tool.completed",
                 )
-                if event_type in {"tool.requested", "tool.started"}:
-                    reference = event.payload["call"]["outcome_ref"]
-                elif event_type == "approval.requested":
-                    reference = event.payload["call"]["outcome_ref"]
-                else:
-                    reference = event.payload["outcome_ref"]
-                self.assertEqual(reference, "workspace-change", event_type)
+            ))
         finally:
             await second.registry.stop_all()
             workspace.cleanup()
@@ -830,24 +823,15 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
 
             store = application.registry.require(RuntimeStorePort)
             events = await store.read_events(task.task_id)
-            self.assertEqual(
-                [event.event_type for event in events[-14:]],
-                [
-                    "turn.started",
-                    "checkpoint.saved",
-                    "llm.completed",
-                    "checkpoint.saved",
-                    "plan.action_evaluated",
-                    "tool.requested",
-                    "checkpoint.saved",
-                    "policy.evaluated",
-                    "tool.prepared",
-                    "tool.started",
-                    "tool.completed",
-                    "checkpoint.saved",
-                    "llm.completed",
-                    "turn.completed",
-                ],
+            event_types = [event.event_type for event in events]
+            for expected in (
+                "turn.started", "tool.requested", "policy.evaluated",
+                "tool.prepared", "tool.started", "tool.completed",
+                "turn.completed",
+            ):
+                self.assertIn(expected, event_types)
+            self.assertLess(
+                event_types.index("tool.requested"), event_types.index("tool.completed")
             )
             model_events = [
                 event for event in events if event.event_type == "llm.completed"

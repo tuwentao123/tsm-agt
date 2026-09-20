@@ -206,7 +206,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                 [
                     "core.list_files", "core.find_files",
                     "core.read_file", "core.search_text",
-                    "web.search", "content.summarize",
+                    "web.search", "web.fetch_markdown", "content.summarize",
                     "core.run_command",
                     "core.process_status", "core.process_logs",
                     "core.process_stop", "core.apply_patch",
@@ -220,8 +220,6 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                     "core.working_memory_read",
                     "core.working_memory_update",
                     "core.task_spec_read",
-                    "core.task_outcome_select",
-                    "core.task_outcome_complete",
                     "core.task_spec_update",
                     "code.symbol_overview", "code.definition",
                     "code.references", "code.implementations",

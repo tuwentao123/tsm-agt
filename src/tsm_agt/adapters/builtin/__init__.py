@@ -8,7 +8,10 @@ from .code_intelligence_tools import CodeIntelligenceToolProvider
 from .interaction_tools import CoreInteractionToolProvider
 from .working_memory_tools import CoreWorkingMemoryToolProvider
 from .task_spec_tools import CoreTaskSpecToolProvider
-from .network_tools import NetworkToolProvider
+from .network_tools import (
+    NetworkToolProvider, PinnedAddressWebFetchTransport, UrllibWebFetchTransport,
+    WebEgressMode,
+)
 
 __all__ = [
     "CoreProcessToolProvider", "CoreReadOnlyToolProvider",
@@ -19,4 +22,7 @@ __all__ = [
     "CoreWorkingMemoryToolProvider",
     "CoreTaskSpecToolProvider",
     "NetworkToolProvider",
+    "PinnedAddressWebFetchTransport",
+    "UrllibWebFetchTransport",
+    "WebEgressMode",
 ]

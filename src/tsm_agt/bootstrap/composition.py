@@ -138,6 +138,9 @@ from .exploration_configuration import (
 from .context_configuration import (
     ContextConfiguration, load_context_configuration,
 )
+from .egress_configuration import (
+    WebEgressConfiguration, load_web_egress_configuration,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,8 +368,8 @@ def _kernel_dependencies(
         tools=registry.all(ToolProviderPort),
         runtime_adapters=registry.runtime_adapters(),
         configuration_metadata=configuration_metadata,
-        default_max_model_calls=int(budget.get("agent_max_model_calls", 15)),
-        default_max_tool_calls=int(budget.get("agent_max_tool_calls", 40)),
+        default_max_model_calls=int(budget.get("agent_max_model_calls", 40)),
+        default_max_tool_calls=int(budget.get("agent_max_tool_calls", 120)),
         default_max_output_tokens=default_max_output_tokens,
         finalization_model_calls=int(budget.get("finalization_model_calls", 2)),
         execution_reserve_model_calls=int(
@@ -703,12 +706,14 @@ def compose_openai_compatible_readonly_application(
     model_strict_tool_schema: bool = True,
     model_streaming: bool = True,
     context_configuration: ContextConfiguration | None = None,
+    web_egress_configuration: WebEgressConfiguration | None = None,
 ) -> Application:
     """Compose a real OpenAI-compatible model with built-in read-only tools."""
 
     registry = AdapterRegistry()
     budget = exploration_budget_configuration or ExplorationBudgetConfiguration()
     context = context_configuration or ContextConfiguration()
+    egress = web_egress_configuration or WebEgressConfiguration()
     physical_model = OpenAICompatibleModelProvider(
         base_url, model, api_key, timeout_seconds=model_timeout_seconds,
         max_retries=0, retry_backoff_seconds=0,
@@ -800,7 +805,9 @@ def compose_openai_compatible_readonly_application(
         / "memory.db"
     ))
     registry.register(ToolProviderPort, CoreReadOnlyToolProvider())
-    registry.register(ToolProviderPort, NetworkToolProvider())
+    registry.register(ToolProviderPort, NetworkToolProvider(
+        enable_fetch=True, egress_mode=egress.mode,
+    ))
     registry.register(ToolProviderPort, CoreMemoryToolProvider())
     registry.register(ToolProviderPort, CoreWorkingMemoryToolProvider())
     registry.register(ToolProviderPort, CoreTaskSpecToolProvider())
@@ -845,12 +852,14 @@ def compose_openai_compatible_engineering_application(
     model_strict_tool_schema: bool = True,
     model_streaming: bool = True,
     context_configuration: ContextConfiguration | None = None,
+    web_egress_configuration: WebEgressConfiguration | None = None,
 ) -> Application:
     """Compose the engineering Agent with workspace and process tools."""
 
     registry = AdapterRegistry()
     budget = exploration_budget_configuration or ExplorationBudgetConfiguration()
     context = context_configuration or ContextConfiguration()
+    egress = web_egress_configuration or WebEgressConfiguration()
     workspace_path = _platform_workspace_path()
     physical_model = OpenAICompatibleModelProvider(
         base_url, model, api_key, timeout_seconds=model_timeout_seconds,
@@ -941,7 +950,9 @@ def compose_openai_compatible_engineering_application(
         / "memory.db"
     ))
     registry.register(ToolProviderPort, CoreReadOnlyToolProvider())
-    registry.register(ToolProviderPort, NetworkToolProvider())
+    registry.register(ToolProviderPort, NetworkToolProvider(
+        enable_fetch=True, egress_mode=egress.mode,
+    ))
     registry.register(ToolProviderPort, CoreProcessToolProvider())
     registry.register(ToolProviderPort, CoreWorkspaceMutationToolProvider())
     registry.register(ToolProviderPort, CoreMemoryToolProvider())
@@ -998,6 +1009,9 @@ def compose_openai_compatible_readonly_application_from_env(
     context = load_context_configuration(
         env_file or Path.cwd() / ".env", os.environ
     )
+    egress = load_web_egress_configuration(
+        env_file or Path.cwd() / ".env", os.environ
+    )
     return compose_openai_compatible_readonly_application(
         base_url=configuration.base_url,
         model=configuration.model,
@@ -1012,6 +1026,7 @@ def compose_openai_compatible_readonly_application_from_env(
         model_strict_tool_schema=configuration.strict_tool_schema,
         model_streaming=configuration.streaming,
         context_configuration=context,
+        web_egress_configuration=egress,
     )
 
 
@@ -1036,6 +1051,9 @@ def compose_openai_compatible_engineering_application_from_env(
     context = load_context_configuration(
         env_file or Path.cwd() / ".env", os.environ
     )
+    egress = load_web_egress_configuration(
+        env_file or Path.cwd() / ".env", os.environ
+    )
     return compose_openai_compatible_engineering_application(
         base_url=configuration.base_url,
         model=configuration.model,
@@ -1050,4 +1068,5 @@ def compose_openai_compatible_engineering_application_from_env(
         model_strict_tool_schema=configuration.strict_tool_schema,
         model_streaming=configuration.streaming,
         context_configuration=context,
+        web_egress_configuration=egress,
     )

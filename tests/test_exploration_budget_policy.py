@@ -502,13 +502,18 @@ class ExplorationBudgetCompositionTest(unittest.TestCase):
 
     def test_default_budget_is_not_the_old_twelve_call_experiment(self):
         configuration = ExplorationBudgetConfiguration()
-        self.assertEqual(configuration.agent_max_model_calls, 15)
+        # The ceiling has to cover a real engineering Turn: read, edit, then run
+        # a build or test suite, with one model call spent interpreting each
+        # Tool result. Fifteen calls ended ordinary work as a budget failure.
+        self.assertEqual(configuration.agent_max_model_calls, 40)
+        self.assertEqual(configuration.agent_max_tool_calls, 120)
         self.assertEqual(configuration.finalization_model_calls, 2)
         self.assertEqual(configuration.execution_reserve_model_calls, 1)
         self.assertEqual(configuration.recovery_reserve_model_calls, 1)
         self.assertEqual(configuration.verification_reserve_model_calls, 1)
-        self.assertEqual(configuration.max_tool_calls, 24)
-        self.assertEqual(configuration.max_actions, 24)
+        self.assertEqual(configuration.max_tool_calls, 60)
+        self.assertEqual(configuration.max_actions, 60)
+        self.assertEqual(configuration.max_tool_seconds, 300)
 
     def test_workspace_budget_is_configurable_and_environment_wins(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -546,7 +551,7 @@ class ExplorationBudgetCompositionTest(unittest.TestCase):
                 ],
                 "env_file",
             )
-            self.assertEqual(configuration.agent_max_tool_calls, 40)
+            self.assertEqual(configuration.agent_max_tool_calls, 120)
 
     def test_invalid_budget_fails_at_startup(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -333,14 +333,17 @@ class ContextWindowManagerTest(unittest.TestCase):
 
     def test_repeated_compaction_flattens_prior_summary(self) -> None:
         manager = ContextWindowManager(trigger_ratio=0.70, recent_message_floor=1)
+        # The window only needs to stay above the static system prompt plus one
+        # recent group; it is calibrated for repeated compaction, not for the
+        # exact size of the prompt template.
         first = manager.prepare(
             conversation=self.conversation(), tools=(), prompt_template=self.template,
-            context_window=1100, max_output_tokens=128,
+            context_window=1200, max_output_tokens=128,
         )
         extended = first.messages + tool_pair("call-3", "new data " * 40)
         second = manager.prepare(
             conversation=extended, tools=(), prompt_template=self.template,
-            context_window=1100, max_output_tokens=128,
+            context_window=1200, max_output_tokens=128,
         )
 
         summaries = [

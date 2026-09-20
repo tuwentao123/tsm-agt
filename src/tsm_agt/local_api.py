@@ -7,7 +7,10 @@ import hmac
 import json
 import secrets
 import socket
+import sys
 import threading
+from collections.abc import Callable
+from concurrent.futures import Future
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -87,7 +90,24 @@ class LocalEventApiServer:
             class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
                 address_family = socket.AF_INET6
             server_type = IPv6ThreadingHTTPServer
-        self._http = server_type((self.host, self.port), handler)
+        bind_error: OSError | None = None
+        candidate_ports = [self.port]
+        if self.port != 0:
+            candidate_ports.append(0)
+
+        for candidate_port in candidate_ports:
+            try:
+                self._http = server_type((self.host, candidate_port), handler)
+                self.port = int(self._http.server_address[1])
+                break
+            except OSError as error:
+                bind_error = error
+                continue
+
+        if self._http is None:
+            raise RuntimeError(
+                f"failed to bind local Event API on {self.host}:{self.port}"
+            ) from bind_error
 
     def serve_forever(self) -> None:
         self.start()
@@ -111,6 +131,35 @@ class LocalEventApiServer:
             raise RuntimeError("local Event API is not running")
         future = asyncio.run_coroutine_threadsafe(awaitable, self._loop)
         return future.result(timeout=timeout)
+
+    def submit_background(
+        self, awaitable, *, on_error: Callable[[BaseException], None] | None = None,
+    ) -> Future[Any]:
+        """Run Runtime work that outlives one HTTP request.
+
+        Resuming a suspended Agent Turn continues the whole Task, which can take
+        far longer than a request may wait. The caller validates preconditions
+        first and then observes progress through the Task's own event stream, so
+        the request does not have to hold the connection open for the work.
+        """
+        if self._loop is None:
+            raise RuntimeError("local Event API is not running")
+        future = asyncio.run_coroutine_threadsafe(awaitable, self._loop)
+
+        def report(completed: Future[Any]) -> None:
+            error = completed.exception()
+            if error is None:
+                return
+            if on_error is not None:
+                on_error(error)
+                return
+            print(
+                f"tsm-agt local API background work failed: {error!r}",
+                file=sys.stderr,
+            )
+
+        future.add_done_callback(report)
+        return future
 
     def _handler_type(self):
         owner = self

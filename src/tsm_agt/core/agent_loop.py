@@ -188,7 +188,9 @@ class ToolBatchSnapshot:
     pending_call_ids: tuple[str, ...]
     status: ToolBatchStatus
     task_spec_revision: int
-    execution_focus_revision: int
+    execution_focus_revision: int = 0
+    # Retained only when decoding a historical batch. New batches never emit it.
+    legacy_execution_focus_revision: bool = False
 
     def __post_init__(self) -> None:
         call_ids = tuple(call.call_id for call in self.calls)
@@ -219,19 +221,21 @@ class ToolBatchSnapshot:
         return ToolBatchSnapshot(
             self.batch_id, self.source_message_id, self.calls, pending_ids,
             resolved_status, self.task_spec_revision,
-            self.execution_focus_revision,
+            self.execution_focus_revision, self.legacy_execution_focus_revision,
         )
 
     def to_data(self) -> dict[str, Any]:
-        return {
+        data = {
             "batch_id": self.batch_id,
             "source_message_id": self.source_message_id,
             "calls": [call.to_data() for call in self.calls],
             "pending_call_ids": list(self.pending_call_ids),
             "status": self.status.value,
             "task_spec_revision": self.task_spec_revision,
-            "execution_focus_revision": self.execution_focus_revision,
         }
+        if self.legacy_execution_focus_revision:
+            data["execution_focus_revision"] = self.execution_focus_revision
+        return data
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> ToolBatchSnapshot:
@@ -246,6 +250,7 @@ class ToolBatchSnapshot:
             ToolBatchStatus(str(data["status"])),
             int(data.get("task_spec_revision", 0)),
             int(data.get("execution_focus_revision", 0)),
+            "execution_focus_revision" in data,
         )
 
 
@@ -288,10 +293,13 @@ class AgentTurnCheckpoint:
     completion_readiness_state: Mapping[str, Any] = field(default_factory=dict)
     task_spec_revision: int = 0
     task_spec_hash: str = ""
+    # Historical checkpoint payload retained solely for integrity-checked replay.
     execution_focus: Mapping[str, Any] = field(default_factory=dict)
+    legacy_execution_focus: bool = False
     tool_batch: ToolBatchSnapshot | None = None
-    # Deprecated migration input. New code reads execution_focus exclusively.
+    # Deprecated migration input retained solely for historical replay.
     active_outcome_ids: tuple[str, ...] = ()
+    legacy_active_outcome_ids: bool = False
     pending_user_action: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -383,6 +391,7 @@ class AgentTurnCheckpoint:
                 dict(data["execution_focus"])
                 if isinstance(data.get("execution_focus"), Mapping) else {}
             ),
+            legacy_execution_focus="execution_focus" in data,
             tool_batch=(
                 ToolBatchSnapshot.from_data(data["tool_batch"])
                 if isinstance(data.get("tool_batch"), Mapping) else None
@@ -390,6 +399,7 @@ class AgentTurnCheckpoint:
             active_outcome_ids=tuple(
                 str(item) for item in data.get("active_outcome_ids", [])
             ),
+            legacy_active_outcome_ids="active_outcome_ids" in data,
             pending_user_action=(
                 dict(data["pending_user_action"])
                 if isinstance(data.get("pending_user_action"), Mapping) else {}
@@ -467,11 +477,17 @@ class AgentTurnCheckpoint:
             ),
             "task_spec_revision": self.task_spec_revision,
             "task_spec_hash": self.task_spec_hash,
-            "execution_focus": dict(self.execution_focus or {}),
+            **(
+                {"execution_focus": dict(self.execution_focus or {})}
+                if self.legacy_execution_focus else {}
+            ),
             "tool_batch": (
                 self.tool_batch.to_data() if self.tool_batch is not None else None
             ),
-            "active_outcome_ids": list(self.active_outcome_ids),
+            **(
+                {"active_outcome_ids": list(self.active_outcome_ids)}
+                if self.legacy_active_outcome_ids else {}
+            ),
             "pending_user_action": dict(self.pending_user_action or {}),
         }
 

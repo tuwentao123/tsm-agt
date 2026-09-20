@@ -23,7 +23,7 @@ from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.cli import _chat_error_guidance
 from tsm_agt.core import (
-    AcceptanceStatus, ModelInvocationFailed, TaskOutcomeStatus, TaskState,
+    AcceptanceStatus, ModelInvocationFailed, TaskState,
 )
 from tsm_agt.ports import (
     AdapterDescriptor, FinishReason, HealthState, HealthStatus, Message,
@@ -38,6 +38,11 @@ def answer_spec(goal: str) -> dict:
     return {
         "schema_version": 1, "goal": goal, "scope": ["."],
         "constraints": ["Base the answer on inspected project files"],
+        "acceptance_criteria": [{
+            "criterion_id": "workspace-integrity",
+            "description": "Workspace mutations remain consistent",
+            "verification_kind": "workspace_integrity",
+        }],
         "outcomes": [{
             "outcome_id": "assessment",
             "description": "Deliver a project architecture assessment",
@@ -291,12 +296,12 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.tool_calls, 2)
             verification = await self._verify_and_finish(first, task.task_id)
             self.assertEqual(verification.status, AcceptanceStatus.PASSED)
-            outcome = (await first.kernel.get_task_spec(task.task_id)).outcomes[0]
-            self.assertEqual(outcome.status, TaskOutcomeStatus.DELIVERED)
-            self.assertEqual(
-                len(outcome.fulfillment_refs), 3,
-                msg=repr(outcome.fulfillment_refs),
-            )
+            execution = await first.kernel.get_task(task.task_id)
+            self.assertEqual(len(execution.tool_executions), 2)
+            self.assertTrue(all(
+                record.call.outcome_ref is None
+                for record in execution.tool_executions.values()
+            ))
             await first.registry.stop_all()
 
             restarted = compose_fixture_application(
@@ -311,12 +316,10 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
                 restored = await restarted.kernel.get_task(task.task_id)
                 self.assertEqual(restored.state, TaskState.SUCCEEDED)
                 self.assertEqual(restored.session_id, session.session_id)
-                restored_outcome = (
-                    await restarted.kernel.get_task_spec(task.task_id)
-                ).outcomes[0]
-                self.assertEqual(
-                    restored_outcome.status, TaskOutcomeStatus.DELIVERED
-                )
+                self.assertTrue(all(
+                    record.call.outcome_ref is None
+                    for record in restored.tool_executions.values()
+                ))
             finally:
                 await restarted.registry.stop_all()
 
@@ -345,21 +348,13 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     marker.read_text(encoding="utf-8"), "unchanged\n"
                 )
-                advertised = dict(model.requests[0].tool_outcome_refs)
-                self.assertEqual(advertised["core.apply_patch"], ())
-                self.assertEqual(
-                    advertised["core.list_files"], ("assessment",)
-                )
                 events = await app.registry.require(
                     RuntimeStorePort
                 ).read_events(task.task_id)
-                retry = next(
-                    event for event in events
-                    if event.event_type == "llm.protocol_retry_requested"
-                )
-                self.assertEqual(
-                    retry.payload["reason_code"], "invalid_outcome_binding"
-                )
+                self.assertFalse(any(
+                    event.event_type == "task_outcome.binding_decided"
+                    for event in events
+                ))
                 started = [
                     event.payload["call"]["name"] for event in events
                     if event.event_type == "tool.started"

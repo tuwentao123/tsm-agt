@@ -36,6 +36,11 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
             "goal": goal,
             "scope": ["src"],
             "constraints": ["preserve compatibility"],
+            "acceptance_criteria": [{
+                "criterion_id": "workspace-integrity",
+                "description": "Committed workspace effects still match the mutation journal",
+                "verification_kind": "workspace_integrity",
+            }],
             "outcomes": [{
                 "outcome_id": "deliver-fix",
                 "description": "Implement the requested fix",
@@ -63,6 +68,11 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
             "goal": "fix and verify",
             "scope": ["src"],
             "constraints": ["preserve compatibility"],
+            "acceptance_criteria": [{
+                "criterion_id": "workspace-integrity",
+                "description": "Committed workspace effects still match the mutation journal",
+                "verification_kind": "workspace_integrity",
+            }],
             "outcomes": [{
                 "outcome_id": "deliver-fix",
                 "description": "Implement the requested fix",
@@ -76,10 +86,23 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "unknown fields: status"):
             TaskSpecProposal.from_data(data)
         self.assertNotIn("task_id", TASK_SPEC_PROPOSAL_SCHEMA_V1["properties"])
+        self.assertIn(
+            "acceptance_criteria", TASK_SPEC_PROPOSAL_SCHEMA_V1["required"]
+        )
         self.assertNotIn("status", (
             TASK_SPEC_PROPOSAL_SCHEMA_V1["properties"]["outcomes"]
             ["items"]["properties"]
         ))
+
+    def test_planner_requires_acceptance_criteria(self):
+        data = self._delivery_proposal().to_data()
+        data.pop("acceptance_criteria")
+        with self.assertRaisesRegex(
+            ValueError, "planner proposal requires acceptance_criteria"
+        ):
+            TaskSpecProposal.from_data(
+                data, require_acceptance_criteria=True
+            )
 
     def test_proposal_becomes_pending_runtime_snapshot_and_round_trips(self):
         proposal = TaskSpecProposal.from_data({
@@ -87,6 +110,11 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
             "goal": "fix and verify",
             "scope": ["src"],
             "constraints": ["preserve compatibility"],
+            "acceptance_criteria": [{
+                "criterion_id": "workspace-integrity",
+                "description": "Committed workspace effects still match the mutation journal",
+                "verification_kind": "workspace_integrity",
+            }],
             "outcomes": [{
                 "outcome_id": "deliver-fix",
                 "description": "Implement the requested fix",
@@ -97,11 +125,11 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
             "continuation_policy": {"mode": "AFTER_COMPLETED_UNIT"},
         })
         spec = TaskSpecSnapshot.from_proposal(
-            "task-proposal", 1, proposal,
-            (TaskAcceptanceCriterion(
-                "workspace-integrity", "workspace remains consistent",
-                TaskCriterionKind.WORKSPACE_INTEGRITY,
-            ),),
+            "task-proposal", 1, proposal
+        )
+        self.assertEqual(
+            [item.criterion_id for item in spec.acceptance_criteria],
+            ["workspace-integrity"],
         )
         self.assertEqual(spec.outcomes[0].status, TaskOutcomeStatus.PENDING)
         self.assertEqual(
@@ -162,7 +190,7 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "contain a cycle"):
             TaskSpecProposal.from_data(data)
 
-    async def test_optional_outcome_can_be_selected_structurally(self):
+    async def test_historical_execution_focus_event_remains_readable(self):
         with tempfile.TemporaryDirectory() as directory:
             app = compose_fixture_application(tool_adapters=())
             await app.registry.start_all()
@@ -183,17 +211,23 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
                 )
                 await app.kernel._append_events(task.task_id, ((
                     "task_spec.revised", {"snapshot": spec.to_data()},
-                ),))
-                focus = await app.kernel.select_task_outcomes(
-                    task.task_id, ("optional-validation",),
-                    reason="model selected user's requested next unit",
-                    source_input_id="input-1",
-                )
-                self.assertEqual(
-                    focus.selected_outcome_ids, ("optional-validation",)
-                )
+                ), (
+                    "task_execution_focus.changed", {
+                        "writer": "legacy-runtime",
+                        "focus": {
+                            "selected_outcome_ids": ["optional-validation"],
+                            "selection_revision": 2,
+                            "selection_reason": "legacy selection",
+                            "source_input_id": "input-1",
+                        },
+                        "eligible_outcome_ids": ["deliver-fix", "optional-validation"],
+                    },
+                )))
                 restored = await app.kernel.get_task_execution_focus(task.task_id)
-                self.assertEqual(restored, focus)
+                self.assertEqual(
+                    restored.selected_outcome_ids, ("optional-validation",)
+                )
+                self.assertEqual(restored.selection_revision, 2)
             finally:
                 await app.registry.stop_all()
 

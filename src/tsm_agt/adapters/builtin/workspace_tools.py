@@ -8,7 +8,8 @@ from typing import Any
 
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ToolCall,
-    ToolEffect, ToolIdempotency, ToolInvocationContext, ToolResult,
+    ToolEffect, ToolIdempotency, ToolInvocationContext, ToolRecoveryKind,
+    ToolResult,
     ToolResultAuthority, ToolRisk, ToolSpec,
 )
 
@@ -454,8 +455,20 @@ class CoreWorkspaceMutationToolProvider:
         except (TypeError, ValueError) as error:
             return self._error(call, "INVALID_PARAM", str(error))
         except RuntimeError as error:
-            code = "CONFLICT" if error.__class__.__name__ == "WorkspaceMutationConflict" else "TOOL_FAILED"
-            return self._error(call, code, str(error))
+            if error.__class__.__name__ == "WorkspaceMutationConflict":
+                return ToolResult(
+                    call.call_id, False, error_code="CONFLICT",
+                    message=str(error),
+                    recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+                    recovery_action={
+                        "required_change": "refresh_resource_then_retry",
+                        "resource": getattr(error, "path", None),
+                        "expected_hash": getattr(error, "expected_hash", None),
+                        "actual_hash": getattr(error, "actual_hash", None),
+                        "same_call_safe": False,
+                    },
+                )
+            return self._error(call, "TOOL_FAILED", str(error))
 
     @staticmethod
     def _error(call: ToolCall, code: str, message: str) -> ToolResult:

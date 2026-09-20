@@ -28,15 +28,21 @@ EXPLORATION_ENV_NAMES = (
 class ExplorationBudgetConfiguration:
     """User-facing values used to construct the replaceable budget policy."""
 
-    agent_max_model_calls: int = 15
-    agent_max_tool_calls: int = 40
+    # Sized from observed engineering Turns rather than from exploration alone:
+    # reading a few files, editing them, and then running a build or test suite
+    # already costs well over fifteen model calls once each Tool result comes
+    # back for interpretation. A ceiling below that turns ordinary work into a
+    # budget failure, which the user can only answer by continuing - and each
+    # continuation re-reads context instead of finishing the job.
+    agent_max_model_calls: int = 40
+    agent_max_tool_calls: int = 120
     finalization_model_calls: int = 2
     execution_reserve_model_calls: int = 1
     recovery_reserve_model_calls: int = 1
     verification_reserve_model_calls: int = 1
-    max_tool_calls: int = 24
-    max_actions: int = 24
-    max_tool_seconds: int = 120
+    max_tool_calls: int = 60
+    max_actions: int = 60
+    max_tool_seconds: int = 300
     low_value_streak: int = 2
     reserve_tool_calls: int = 2
     minimum_actions: int = 2

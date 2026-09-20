@@ -13,6 +13,7 @@ from tsm_agt.ports import (
     AdapterContext,
     EvidenceQuestion,
     FinishReason,
+    ImageBlock,
     Message,
     MessageRole,
     ModelRequest,
@@ -549,8 +550,52 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         request = transport.requests[0]
         self.assertEqual(request["url"], "https://models.example.test/v1/chat/completions")
         self.assertEqual(request["payload"]["model"], "test-model")
-        self.assertEqual(request["payload"]["messages"][0], {"role": "user", "content": "hi"})
+        self.assertEqual(
+            request["payload"]["messages"][0],
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        )
         self.assertEqual(request["headers"]["Authorization"], "Bearer test-secret")
+
+    async def test_serializes_image_blocks_as_chat_content_parts(self) -> None:
+        provider, transport = await self._provider([
+            {
+                "id": "chatcmpl-image",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "received"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {},
+            }
+        ])
+
+        await provider.complete(ModelRequest(
+            "turn-image",
+            (Message(
+                "user-image", MessageRole.USER,
+                (
+                    TextBlock("describe this image"),
+                    ImageBlock("data:image/png;base64,AAAA", "high"),
+                ),
+            ),),
+            512,
+        ))
+
+        self.assertEqual(
+            transport.requests[0]["payload"]["messages"][0],
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this image"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,AAAA",
+                            "detail": "high",
+                        },
+                    },
+                ],
+            },
+        )
 
     async def test_normalizes_tool_call_and_advertises_strict_schema(self) -> None:
         provider, transport = await self._provider(

@@ -53,6 +53,8 @@ from tsm_agt.core import (
     ProjectTrustLevel,
     ProjectOnboardingSnapshot,
     RuntimeInputIntent,
+    SessionInputDecision,
+    SessionTextInput,
     SessionContinuationMode,
     SessionResumeSafety,
     SessionRouteDisposition, SessionTaskRelation,
@@ -1234,9 +1236,16 @@ async def _chat(
                         state_selected_resume = True
                     else:
                         try:
-                            decision = await application.kernel.resolve_session_input(
-                                session.session_id, prompt, root
+                            decision = await application.kernel.dispatch_input_event(
+                                SessionTextInput(
+                                    session.session_id, prompt,
+                                    f"input-{uuid4().hex}", str(root),
+                                )
                             )
+                            if not isinstance(decision, SessionInputDecision):
+                                raise RuntimeError(
+                                    "session text dispatch returned an invalid result"
+                                )
                         except (KeyboardInterrupt, asyncio.CancelledError):
                             output_fn(
                                 f"session saved: {session.session_id} "

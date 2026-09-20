@@ -18,8 +18,7 @@ from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     AcceptanceStatus, AgentTurnResult, AgentTurnSuspended, ApprovalDecision,
-    ProjectTrustLevel, TaskOutcomeStatus, TaskSpecProposal, TaskSpecSnapshot,
-    TaskState,
+    ProjectTrustLevel, TaskSpecProposal, TaskSpecSnapshot, TaskState,
 )
 from tsm_agt.ports import (
     AdapterDescriptor, FinishReason, Message, MessageRole, ModelRequest,
@@ -141,6 +140,11 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
         proposal = TaskSpecProposal.from_data({
             "schema_version": 1, "goal": task.goal,
             "scope": ["."], "constraints": [],
+            "acceptance_criteria": [{
+                "criterion_id": "post-mutation-command",
+                "description": "Run a successful foreground test or build after changes",
+                "verification_kind": "post_mutation_command",
+            }],
             "outcomes": [{
                 "outcome_id": "verification_required",
                 "description": "Run the verification required by this coding task",
@@ -261,38 +265,30 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
                 assert isinstance(completed, AgentTurnResult)
                 self.assertIn("verified", completed.assistant_message.text)
 
-                progress = await second.kernel.get_task_spec(task.task_id)
-                by_id = {item.outcome_id: item for item in progress.outcomes}
-                for outcome_id in ("change", "verify"):
-                    completion = await second.kernel.request_task_outcome_completion(
-                        task.task_id, outcome_id,
-                        completion_summary=(
-                            "Workspace fix and its verification are complete"
-                        ),
-                        evidence_refs=by_id[outcome_id].fulfillment_refs,
-                        remaining_work=(), writer=f"e2e-{outcome_id}",
-                    )
-                    self.assertTrue(completion["accepted"], completion)
+                executions = await second.kernel.get_task(task.task_id)
+                self.assertEqual(
+                    {record.call.call_id for record in executions.tool_executions.values()},
+                    {
+                        f"call-read-{completed.turn_id}",
+                        f"call-patch-{completed.turn_id}",
+                        f"call-test-{completed.turn_id}",
+                    },
+                )
+                self.assertTrue(all(
+                    record.call.outcome_ref is None
+                    for record in executions.tool_executions.values()
+                ))
 
                 await second.kernel.transition_task(
                     task.task_id, TaskState.VERIFYING, "run trusted verifier"
                 )
                 verification = await second.kernel.verify_task_acceptance(task.task_id)
                 self.assertEqual(verification.status, AcceptanceStatus.PASSED)
-                outcomes = await second.kernel.get_task_spec(task.task_id)
-                self.assertEqual(
-                    {item.outcome_id: item.status for item in outcomes.outcomes},
-                    {
-                        "inspect": TaskOutcomeStatus.DELIVERED,
-                        "change": TaskOutcomeStatus.DELIVERED,
-                        "verify": TaskOutcomeStatus.DELIVERED,
-                    },
-                )
-                outcome_criterion = next(
+                post_mutation = next(
                     item for item in verification.criteria
-                    if item.criterion_id == "task-outcome-fulfillment"
+                    if item.criterion_id == "post-mutation-command"
                 )
-                self.assertEqual(outcome_criterion.status, AcceptanceStatus.PASSED)
+                self.assertEqual(post_mutation.status, AcceptanceStatus.PASSED)
                 await second.kernel.transition_task(
                     task.task_id, TaskState.FINALIZING, "verified"
                 )
@@ -350,13 +346,13 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
                 )
                 assert prompt.message is not None
                 prompt_body = json.loads(prompt.message.text)
-                historical = next(
-                    item for item in prompt_body["task_index"]
-                    if item["task_id"] == task.task_id
+                self.assertFalse(any(
+                    item["task_id"] == task.task_id
+                    for item in prompt_body["task_index"]
+                ))
+                self.assertGreater(
+                    prompt_body["earlier_summary"]["omitted_task_count"], 0
                 )
-                self.assertEqual(historical["status"], "SUCCEEDED")
-                self.assertEqual(historical["verification_status"], "passed")
-                self.assertIn("calc.py", historical["artifacts"])
 
                 events = await second.registry.require(
                     RuntimeStorePort
@@ -543,21 +539,9 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
                     task.task_id, initial.revision + 1, proposal,
                     initial.acceptance_criteria,
                 )
-                await app.kernel._append_events(task.task_id, (
-                    ("task_spec.revised", {"snapshot": spec.to_data()}),
-                    ("task_outcome.state_changed", {
-                        "outcome_id": "workspace_search_fix",
-                        "status": TaskOutcomeStatus.IN_PROGRESS.value,
-                        "fulfillment_ref": "tool:read-source:observe",
-                        "reason": "source_inspected",
-                    }),
-                    ("task_outcome.state_changed", {
-                        "outcome_id": "workspace_search_fix",
-                        "status": TaskOutcomeStatus.IN_PROGRESS.value,
-                        "fulfillment_ref": "tool:apply-change:mutate",
-                        "reason": "change_applied",
-                    }),
-                ))
+                await app.kernel._append_events(task.task_id, ((
+                    "task_spec.revised", {"snapshot": spec.to_data()},
+                ),))
 
                 from tsm_agt.core import ApprovalRequired
                 with self.assertRaises(ApprovalRequired) as caught:
@@ -574,28 +558,14 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
                         ),
                     )
 
-                self.assertEqual(
-                    caught.exception.request.call.outcome_ref,
-                    "verification_results",
-                )
+                self.assertIsNone(caught.exception.request.call.outcome_ref)
                 events = await app.kernel.dependencies.store.read_events(
                     task.task_id
                 )
-                binding = next(
-                    event for event in reversed(events)
-                    if event.event_type == "task_outcome.binding_decided"
-                )
-                self.assertEqual(binding.payload["action"], "ACCEPT")
-                self.assertEqual(
-                    binding.payload["bound_outcome_id"],
-                    "verification_results",
-                )
-                self.assertIn(
-                    "verification_results",
-                    binding.payload["eligible_outcome_ids"],
-                )
-                workspace = (await app.kernel.get_task_spec(task.task_id)).outcomes[0]
-                self.assertEqual(workspace.status, TaskOutcomeStatus.IN_PROGRESS)
+                self.assertFalse(any(
+                    event.event_type == "task_outcome.binding_decided"
+                    for event in events
+                ))
             finally:
                 await app.registry.stop_all()
 

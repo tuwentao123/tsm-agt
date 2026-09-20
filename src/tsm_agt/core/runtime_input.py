@@ -139,6 +139,7 @@ class SessionTaskCatalogEntry:
     resume_safety: SessionResumeSafety | None = None
     recency_index: int = 0
     is_conversation_anchor: bool = False
+    phase1_state: str = ""
 
     @property
     def is_terminal(self) -> bool:
@@ -147,7 +148,9 @@ class SessionTaskCatalogEntry:
     def to_data(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id, "goal": self.goal,
-            "task_state": self.task_state, "workspace": self.workspace,
+            "task_state": self.task_state,
+            "phase1_state": self.phase1_state,
+            "workspace": self.workspace,
             "completed_work": list(self.completed_work),
             "remaining_work": list(self.remaining_work),
             "verification_status": self.verification_status,
@@ -239,13 +242,11 @@ class RuntimeInputIntent(StrEnum):
 
 
 class InputChannel(StrEnum):
-    """Protocol-level source channels for inbound runtime input."""
+    """The three ingress channels defined by the Phase 1 redesign."""
 
-    TEXT = "TEXT"
-    APPROVAL = "APPROVAL"
-    CLARIFICATION = "CLARIFICATION"
-    INTERRUPT = "INTERRUPT"
-    CANCEL = "CANCEL"
+    STRUCTURED_EVENT = "STRUCTURED_EVENT"
+    RUNTIME_TEXT = "RUNTIME_TEXT"
+    TASK_TEXT = "TASK_TEXT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,7 +261,7 @@ class RuntimeTextInput:
 
     @property
     def channel(self) -> InputChannel:
-        return InputChannel.TEXT
+        return InputChannel.RUNTIME_TEXT
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,7 +274,7 @@ class ApprovalResolutionInput:
 
     @property
     def channel(self) -> InputChannel:
-        return InputChannel.APPROVAL
+        return InputChannel.STRUCTURED_EVENT
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,7 +288,7 @@ class ClarificationReplyInput:
 
     @property
     def channel(self) -> InputChannel:
-        return InputChannel.CLARIFICATION
+        return InputChannel.STRUCTURED_EVENT
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,7 +300,7 @@ class InterruptTaskInput:
 
     @property
     def channel(self) -> InputChannel:
-        return InputChannel.INTERRUPT
+        return InputChannel.STRUCTURED_EVENT
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,12 +312,26 @@ class CancelTaskInput:
 
     @property
     def channel(self) -> InputChannel:
-        return InputChannel.CANCEL
+        return InputChannel.STRUCTURED_EVENT
+
+
+@dataclass(frozen=True, slots=True)
+class SessionTextInput:
+    """Ordinary session text without a preselected active Task."""
+
+    session_id: str
+    text: str
+    input_id: str
+    workspace: str | None = None
+
+    @property
+    def channel(self) -> InputChannel:
+        return InputChannel.TASK_TEXT
 
 
 RuntimeInputEvent = (
-    RuntimeTextInput | ApprovalResolutionInput | ClarificationReplyInput
-    | InterruptTaskInput | CancelTaskInput
+    RuntimeTextInput | SessionTextInput | ApprovalResolutionInput
+    | ClarificationReplyInput | InterruptTaskInput | CancelTaskInput
 )
 
 
