@@ -772,6 +772,12 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 await app.kernel._append_events(task.task_id, ((
                     "task_spec.revised", {"snapshot": spec.to_data()},
                 ),))
+                # A post-mutation criterion only applies once the Task has
+                # actually changed something. Produce that change so the
+                # criterion is unmet rather than inapplicable.
+                await app.kernel.write_workspace_text(
+                    task.task_id, "change", "changed.txt", "after\n", None,
+                )
                 gaps = await app.kernel._completion_readiness_gaps(
                     task.task_id, await app.kernel.list_tools()
                 )
@@ -798,6 +804,11 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                         "command", "Run verification after mutation",
                         TaskCriterionKind.POST_MUTATION_COMMAND,
                     ),
+                )
+                # The criterion has to be genuinely unmet, not inapplicable:
+                # change the workspace without running any verification.
+                await app.kernel.write_workspace_text(
+                    task.task_id, "change", "changed.txt", "after\n", None,
                 )
                 result = await app.kernel.run_agent_turn(
                     task.task_id, "complete the task", max_model_calls=4,
@@ -842,6 +853,11 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                         "command", "Run verification after mutation",
                         TaskCriterionKind.POST_MUTATION_COMMAND,
                     ),
+                )
+                # The criterion has to be genuinely unmet, not inapplicable:
+                # change the workspace without running any verification.
+                await app.kernel.write_workspace_text(
+                    task.task_id, "change", "changed.txt", "after\n", None,
                 )
                 suspended = await app.kernel.run_agent_turn(
                     task.task_id, "complete the task", max_model_calls=1,

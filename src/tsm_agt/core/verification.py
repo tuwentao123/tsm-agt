@@ -13,6 +13,10 @@ class AcceptanceStatus(StrEnum):
     PASSED = "passed"
     FAILED = "failed"
     BLOCKED = "blocked"
+    # A criterion whose precondition does not hold in this Task. Unlike BLOCKED
+    # it is not an outstanding debt: nobody has to act on it, so it must never
+    # become a required completion gap.
+    NOT_APPLICABLE = "not_applicable"
 
 
 @dataclass(frozen=True, slots=True)

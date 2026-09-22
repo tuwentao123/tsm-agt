@@ -74,10 +74,45 @@ class TextBlock:
         return {"type": "text", "text": self.text}
 
 
+IMAGE_DETAIL_LEVELS = ("auto", "low", "high")
+
+
 @dataclass(frozen=True, slots=True)
 class ImageBlock:
+    """An image handed to the model provider verbatim.
+
+    ``image_url`` reaches the provider unchanged, so what counts as an acceptable
+    source is this type's own invariant, not a check each caller repeats. Only
+    inline base64 data URLs are accepted today: the bytes originate in this
+    deployment, so no outbound fetch is delegated to the provider.
+
+    Supporting remote links (a CDN, say) is a single change here plus an explicit
+    decision about who owns that egress and what happens when a link expires
+    while it still sits in a persisted Agent checkpoint. Re-adding a per-caller
+    prefix test would put the same rule in several places again, which is how
+    attachments came to be dropped silently in the first place.
+    """
+
     image_url: str
     detail: str = "auto"
+
+    def __post_init__(self) -> None:
+        if self.detail not in IMAGE_DETAIL_LEVELS:
+            raise ValueError(
+                "image detail must be one of "
+                f"{', '.join(IMAGE_DETAIL_LEVELS)}, got {self.detail!r}"
+            )
+        prefix, separator, payload = self.image_url.partition(";base64,")
+        if not separator or not prefix.startswith("data:image/"):
+            raise ValueError(
+                "image_url must be an inline base64 data URL of the form "
+                "'data:image/<subtype>;base64,<payload>'; remote links are not "
+                "an accepted image source yet"
+            )
+        if not prefix[len("data:image/"):]:
+            raise ValueError("image data URL is missing its image subtype")
+        if not payload:
+            raise ValueError("image data URL carries no base64 payload")
 
     def to_data(self) -> dict[str, str]:
         return {

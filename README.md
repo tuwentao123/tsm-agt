@@ -63,6 +63,48 @@ uv run tsm-agt replay <task_id> --workspace . --play --speed max --resume-cursor
 uv run python -m unittest discover -s tests -v
 ```
 
+## 统一 Python / pytest / Web 启动策略
+
+当前 Runtime 对命令执行有两个关键限制：
+
+- `argv[0]` 使用 `./.venv/bin/python` 或 `.venv/bin/python` 时，Runtime 可能因为相对 executable 校验而拒绝执行。
+- `cwd` 必须保持 workspace-relative；直接传入开发者本地绝对路径会触发 Runtime sandbox 拒绝。
+
+因此项目不再把 `.venv/bin/python` 作为默认推荐入口，也不依赖固定 workspace 名称或开发者机器绝对路径。
+
+统一策略如下：
+
+- 使用 `python -m ...` module invocation，而不是硬编码 `.venv/bin/python`。
+- 使用当前激活解释器的 `sys.executable`，让本地开发、CI、容器、systemd、Kubernetes、GitHub Actions 与 PaaS 环境都能复用同一入口。
+- 所有项目命令都从 workspace root 启动，并由 `scripts/run_in_project_env.py` 自动补齐 `PYTHONPATH=src`。
+- Web app 与 pytest 共用同一解释器来源，避免 reload、subprocess 或测试环境出现解释器漂移。
+- Runtime 中推荐使用 workspace-relative `cwd=.`；不要绑定 `/Users/...` 之类的本地绝对路径。
+
+推荐入口：
+
+```bash
+python scripts/run_in_project_env.py pytest tests -q
+python scripts/run_in_project_env.py web
+python scripts/run_in_project_env.py module unittest discover -s tests
+```
+
+适用边界与部署说明：
+
+- 本地开发：兼容 `uv run`、激活 venv、direnv 或系统 Python shim。
+- CI：只要求 PATH 中存在目标 Python，不依赖 `.venv` 目录名称。
+- 容器：ENTRYPOINT 可以直接执行 `python scripts/run_in_project_env.py web`。
+- systemd / supervisor / PaaS：可直接调用 `python -m tsm_agt.web.app` 或统一 launcher。
+- pytest：统一走 module invocation，避免 Runtime 对相对 executable 的拒绝。
+- reload：当前 `uvicorn.run(... reload=False)` 保持生产安全默认值；开发环境如需热重载，应在外部进程管理器或显式 dev 配置中开启，而不是依赖固定本地路径。
+
+不推荐的方式：
+
+```bash
+./.venv/bin/python -m pytest
+```
+
+该方式在普通 shell 中通常可运行，但在 Runtime sandbox、远程执行器或容器编排环境中可能因为 executable/cwd 校验失败而不可移植。
+
 ## 安装与首次启动
 
 开发项目时使用 `uv sync` + `uv run tsm-agt`；日常使用可以把 CLI 安装成独立工具，不依赖当前源码目录：

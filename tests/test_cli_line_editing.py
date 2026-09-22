@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pty
+import re
 import select
 import sys
 import time
@@ -79,17 +80,23 @@ class CliLineEditingPtyTest(unittest.TestCase):
     def _read_until(
         descriptor: int, output: bytearray, expected: bytes, timeout: float
     ) -> None:
+        ansi_escape = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+        def normalized(buffer: bytearray) -> bytes:
+            cleaned = ansi_escape.sub(b"", bytes(buffer))
+            return cleaned.replace(b"\r", b"")
+
         deadline = time.monotonic() + timeout
-        while expected not in output and time.monotonic() < deadline:
+        while expected not in normalized(output) and time.monotonic() < deadline:
             readable, _, _ = select.select([descriptor], [], [], 0.1)
             if readable:
                 chunk = os.read(descriptor, 4096)
                 if not chunk:
                     break
                 output.extend(chunk)
-        if expected not in output:
+        if expected not in normalized(output):
             raise AssertionError(
-                f"prompt {expected!r} not observed: {bytes(output)!r}"
+                f"prompt {expected!r} not observed: {normalized(output)!r}"
             )
 
     def test_left_arrow_backspace_and_chinese_inline_editing(self) -> None:
@@ -97,7 +104,7 @@ class CliLineEditingPtyTest(unittest.TestCase):
             "from tsm_agt.cli_input import platform_line_input; "
             "print('RESULT=' + platform_line_input()('you> '))",
             [
-                (b"you> ", "你好worXd".encode(), 0.15),
+                (b"you>", "你好worXd".encode(), 0.15),
                 ("你好worXd".encode(), b"\x1b[D", 0.15),
                 (b"", b"\x7f", 0.15),
                 (b"", b"l\n", 0.15),
@@ -117,7 +124,7 @@ class CliLineEditingPtyTest(unittest.TestCase):
             "from tsm_agt.cli_input import platform_line_input; "
             "print('LENGTH=' + str(len(platform_line_input()('you> '))))",
             [
-                (b"you> ", initial, 0.15),
+                (b"you>", initial, 0.15),
                 (initial[-20:], b"\x7f" * 150 + b"\n", 0.15),
             ],
         )
@@ -128,8 +135,8 @@ class CliLineEditingPtyTest(unittest.TestCase):
             "from tsm_agt.cli_input import platform_line_input; r=platform_line_input(); "
             "a=r('one> '); b=r('two> '); print('RESULT=' + a + '|' + b)",
             [
-                (b"one> ", b"history-entry\n", 0.15),
-                (b"two> ", b"\x1b[A", 0.15),
+                (b"one>", b"history-entry\n", 0.15),
+                (b"two>", b"\x1b[A", 0.15),
                 (b"history-entry", b"\n", 0.10),
             ],
         )
@@ -150,11 +157,11 @@ class CliLineEditingPtyTest(unittest.TestCase):
         rendered, raw_output = self._run_pty(
             source,
             [
-                (b"you> ", "你好worXd".encode(), 0.15),
+                (b"you>", "你好worXd".encode(), 0.15),
                 ("你好worXd".encode(), b"\x1b[D", 0.15),
                 (b"", b"\x7f", 0.15),
                 (b"", b"l\n", 0.15),
-                (b"agent> ", b"/exit\n", 0.15),
+                (b"agent>", b"/exit\n", 0.15),
             ],
             timeout=8.0,
         )
@@ -187,8 +194,8 @@ class CliLineEditingPtyTest(unittest.TestCase):
         rendered, raw_output = self._run_pty(
             source,
             [
-                (b"you> ", b"test\n", 0.05),
-                (b"control> ", b"", 0.05),
+                (b"you>", b"test\n", 0.05),
+                (b"control>", b"", 0.05),
                 ("完成验证。".encode(), b"/exit\n", 0.05),
             ],
             timeout=8.0,

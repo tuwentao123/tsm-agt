@@ -26,6 +26,7 @@ class RuntimeTaskResultTest(unittest.TestCase):
             "clarification": None,
             "verification": None,
             "evidence_level": None,
+            "projection": None,
         })
 
 

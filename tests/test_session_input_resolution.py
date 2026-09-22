@@ -398,8 +398,16 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                     decision = await app.kernel.resolve_session_input(
                         session.session_id, "continue pending work", root
                     )
-                self.assertEqual(decision.action, SessionInputAction.RESUME_TASK)
-                self.assertEqual(decision.task_id, "task-awaiting")
+                self.assertEqual(decision.action, SessionInputAction.NEW_TASK)
+                self.assertEqual(
+                    decision.disposition, SessionRouteDisposition.CREATE_TASK
+                )
+                self.assertEqual(
+                    decision.relation, SessionTaskRelation.FOLLOW_UP
+                )
+                self.assertEqual(decision.source_task_id, "task-awaiting")
+                self.assertIn("[session-follow-up]", decision.resolved_goal)
+                self.assertIn("continue pending work", decision.resolved_goal)
                 self.assertEqual(
                     decision.candidates[0].safety,
                     SessionResumeSafety.AWAIT_USER_ACTION,
@@ -441,7 +449,11 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                     decision = await app.kernel.resolve_session_input(
                         session.session_id, "continue with a narrower scope", root
                     )
-                self.assertEqual(decision.action, SessionInputAction.RESUME_TASK)
+                self.assertEqual(decision.action, SessionInputAction.NEW_TASK)
+                self.assertEqual(
+                    decision.relation, SessionTaskRelation.FOLLOW_UP
+                )
+                self.assertEqual(decision.source_task_id, "task-awaiting")
                 routed_context = resolver.inputs[-1][1]
                 pending = routed_context["pending_interaction"]
                 self.assertNotIn("prompt", pending)
@@ -758,8 +770,15 @@ class SessionAnswerTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertNotIn("current_input", history)
                 self.assertIn("final User message", request.messages[0].text)
-                self.assertEqual(request.tools, ())
-                self.assertFalse(request.allow_tool_calls)
+                # The only Tool offered grants no capability: it exists so the
+                # model can report that this route cannot serve the message.
+                self.assertEqual(
+                    [tool.name for tool in request.tools],
+                    ["session.requires_agent_task"],
+                )
+                self.assertTrue(request.tools[0].is_read_only)
+                self.assertTrue(request.tools[0].is_internal_state)
+                self.assertTrue(request.allow_tool_calls)
             finally:
                 await app.registry.stop_all()
 

@@ -3,10 +3,12 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from tsm_agt.adapters.fixture import EchoModelProvider
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
+    SessionResumeCandidate, SessionResumeSafety,
     SessionRouteDisposition, SessionTaskRelation, TaskState,
 )
 from tsm_agt.ports import AdapterDescriptor, HealthState, HealthStatus
@@ -119,6 +121,81 @@ class SessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 created.payload["task_relation"], SessionTaskRelation.FOLLOW_UP.value
             )
+
+    async def test_ordinary_resume_proposal_derives_a_fresh_follow_up_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_id = {"value": ""}
+
+            def resume(_context):
+                return route(
+                    "RESUME_TASK", "CONTINUE",
+                    source_task_id=source_id["value"],
+                )
+
+            client = await self.make_client(root, FixtureResolver(resume))
+            kernel = client.application.kernel
+            session = await kernel.create_session("derived resume")
+            source = await kernel.create_task(
+                "push the verified commit", root,
+                session_id=session.session_id,
+            )
+            source_id["value"] = source.task_id
+            for state in (
+                TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                TaskState.EXECUTING, TaskState.VERIFYING,
+                TaskState.FINALIZING, TaskState.SUCCEEDED,
+            ):
+                source = await kernel.transition_task(
+                    source.task_id, state, state.value
+                )
+            candidate = SessionResumeCandidate(
+                source.task_id, source.goal, "AWAITING_USER", str(root),
+                SessionResumeSafety.EXACT_RESUME, "fixture_resume",
+            )
+            with patch.object(
+                kernel, "list_session_resume_candidates",
+                AsyncMock(return_value=(candidate,)),
+            ):
+                result = await client.submit_session_text(
+                    session.session_id, "continue and push now",
+                    command_id="request-derived-resume",
+                )
+
+            new_task_id = result.result["task"]["task_id"]
+            self.assertNotEqual(new_task_id, source.task_id)
+            self.assertEqual(
+                result.result["decision"]["disposition"], "CREATE_TASK"
+            )
+            self.assertEqual(
+                result.result["decision"]["relation"], "FOLLOW_UP"
+            )
+            created_events = await kernel.dependencies.store.read_events(
+                new_task_id
+            )
+            created = next(
+                event for event in created_events
+                if event.event_type == "task.created"
+            )
+            self.assertEqual(created.payload["source_task_id"], source.task_id)
+            self.assertEqual(created.payload["task_relation"], "FOLLOW_UP")
+            self.assertIn("continue and push now", created.payload["goal"])
+            self.assertIn(source.task_id, created.payload["goal"])
+            original = await kernel.get_task(source.task_id)
+            self.assertEqual(original.state, TaskState.SUCCEEDED)
+            self.assertIsNone(original.active_agent_checkpoint)
+            session_events = await kernel.dependencies.store.read_session_events(
+                session.session_id
+            )
+            derived = next(
+                event for event in session_events
+                if event.event_type == "session.task_derived"
+                and event.payload["task_id"] == new_task_id
+            )
+            self.assertIn("authority_free_session_summary", derived.payload["inherited"])
+            self.assertIn("checkpoint", derived.payload["not_inherited"])
+            self.assertIn("approval", derived.payload["not_inherited"])
 
     async def test_answer_and_clarify_do_not_create_tasks(self):
         with tempfile.TemporaryDirectory() as directory:

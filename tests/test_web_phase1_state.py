@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest import mock
 
 from fastapi import HTTPException
 
+from tsm_agt.ports import ImageBlock
 from tsm_agt.sdk.runtime import RuntimeTaskResult
 
 
@@ -111,27 +113,34 @@ class PastedImageIngressTest(unittest.TestCase):
         # Images must reach the session ingress, not just the local preview.
         self.assertIn("images,", web_app.INDEX_HTML)
 
-    def test_only_inline_data_url_images_are_forwarded(self) -> None:
+    def test_inline_data_url_images_become_image_blocks(self) -> None:
         blocks = web_app._normalize_image_blocks([
             {"image_url": "data:image/png;base64,AAAA", "media_type": "image/png"},
             {"image_url": "data:image/webp;base64,BBBB"},
-            {"image_url": "https://example.com/remote.png"},
-            "not-a-mapping",
         ])
 
         self.assertEqual(blocks, [
-            {
-                "type": "input_image",
-                "image_url": "data:image/png;base64,AAAA",
-                "media_type": "image/png",
-            },
-            {
-                "type": "input_image",
-                "image_url": "data:image/webp;base64,BBBB",
-                "media_type": "image/png",
-            },
+            ImageBlock(image_url="data:image/png;base64,AAAA"),
+            ImageBlock(image_url="data:image/webp;base64,BBBB"),
         ])
         self.assertEqual(web_app._normalize_image_blocks(None), [])
+
+    def test_unsupported_image_source_is_reported_not_dropped(self) -> None:
+        """A silently dropped attachment makes the model answer without it.
+
+        That is what produced replies asking for a screenshot the user had
+        already attached, so an unusable source has to surface as an error.
+        """
+        for payload in (
+            [{"image_url": "https://example.com/remote.png"}],
+            ["not-a-mapping"],
+            [{"image_url": "data:image/png;base64,"}],
+            [{"image_url": "data:image/png,AAAA"}],
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(HTTPException) as caught:
+                    web_app._normalize_image_blocks(payload)
+                self.assertEqual(caught.exception.status_code, 400)
 
     def test_base64_payloads_never_enter_the_bounded_goal_text(self) -> None:
         source = Path(web_app.__file__).read_text(encoding="utf-8")
@@ -149,12 +158,32 @@ class PastedImageIngressTest(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 413)
         self.assertIn("图片过大", caught.exception.detail)
 
-    def test_ui_downscales_images_and_explains_context_failures(self) -> None:
-        self.assertIn("downscaleImage", web_app.INDEX_HTML)
-        self.assertIn("MAX_IMAGE_EDGE", web_app.INDEX_HTML)
+    def test_ui_recompresses_images_and_explains_context_failures(self) -> None:
+        html = web_app.INDEX_HTML
+        self.assertIn("prepareImage", html)
+        self.assertIn("MAX_IMAGE_EDGE", html)
+        # Every attachment is re-encoded, not only the oversized ones: a raw PNG
+        # screenshot under the edge limit is the single most wasteful payload.
+        self.assertIn("encodeImageToJpeg(image, MAX_IMAGE_EDGE", html)
+        self.assertNotIn("if (longest <= MAX_IMAGE_EDGE) return dataUrl", html)
+        # JPEG has no alpha; an opaque base keeps transparent regions readable.
+        self.assertIn("fillRect(0, 0, canvas.width, canvas.height)", html)
+        # The client degrades a too-large screenshot instead of hitting the 413.
+        self.assertIn("IMAGE_FALLBACK_STEPS", html)
+        self.assertLess(
+            web_app.INDEX_HTML.count("MAX_IMAGE_DATA_URL_CHARS = 380000"), 2
+        )
         # A failed task must explain itself instead of showing an empty result.
-        self.assertIn("failure_reason", web_app.INDEX_HTML)
-        self.assertIn("describeFailure", web_app.INDEX_HTML)
+        self.assertIn("failure_reason", html)
+        self.assertIn("describeFailure", html)
+
+    def test_client_image_budget_stays_below_the_server_cap(self) -> None:
+        """A client budget above the server cap would re-introduce the 413."""
+        source = Path(web_app.__file__).read_text(encoding="utf-8")
+        client_budget = int(
+            re.search(r"MAX_IMAGE_DATA_URL_CHARS = (\d+);", source).group(1)
+        )
+        self.assertLess(client_budget, web_app.MAX_IMAGE_DATA_URL_CHARS)
 
 
 class ComposerLayoutTest(unittest.TestCase):

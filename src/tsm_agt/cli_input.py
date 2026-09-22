@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
+
+os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory

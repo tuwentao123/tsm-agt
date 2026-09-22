@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from tsm_agt.adapters.builtin import CoreProcessToolProvider
@@ -62,7 +63,7 @@ class CommandRiskPolicyTest(unittest.TestCase):
                 self.assertEqual(decision.requires_network, network)
                 self.assertTrue(decision.risk_factors)
 
-    def test_shell_inline_code_delete_publish_and_production_are_r4_denied(self) -> None:
+    def test_previously_r4_commands_now_require_r3_approval(self) -> None:
         cases = (
             ["bash", "-c", "echo unsafe"],
             ["python3", "-c", "print('unclassified')"],
@@ -75,9 +76,20 @@ class CommandRiskPolicyTest(unittest.TestCase):
         for argv in cases:
             with self.subTest(argv=argv):
                 decision = self.decision(argv)
-                self.assertEqual(decision.effective_risk, ToolRisk.R4)
-                self.assertEqual(decision.action, PolicyAction.DENY)
-                self.assertIn("R4", decision.reason)
+                self.assertEqual(decision.effective_risk, ToolRisk.R3)
+                self.assertEqual(
+                    decision.action, PolicyAction.REQUIRE_APPROVAL
+                )
+                self.assertIn("explicit approval", decision.reason)
+
+    def test_legacy_declared_r4_is_mapped_to_r3_approval(self) -> None:
+        spec = replace(self.spec, name="fixture.legacy-r4", risk=ToolRisk.R4)
+        decision = self.policy.evaluate(
+            spec, ToolCall("call-legacy", spec.name, {})
+        )
+        self.assertEqual(decision.effective_risk, ToolRisk.R3)
+        self.assertEqual(decision.action, PolicyAction.REQUIRE_APPROVAL)
+        self.assertIn("legacy R4", decision.reason)
 
     def test_effective_risk_never_drops_below_declared_r2(self) -> None:
         decision = self.decision(["true"] )
@@ -121,6 +133,19 @@ class CommandRiskKernelTest(unittest.IsolatedAsyncioTestCase):
         await self.application.registry.stop_all()
         self.temporary.cleanup()
 
+    async def test_git_push_reaches_exact_r3_approval_boundary(self) -> None:
+        with self.assertRaises(ApprovalRequired) as caught:
+            await self.application.kernel.invoke_tool(
+                self.task.task_id, "turn-push",
+                ToolCall("call-push", "core.run_command", {
+                    "argv": ["git", "push", "origin", "main"]
+                }),
+            )
+        request = caught.exception.request
+        self.assertEqual(request.risk, ToolRisk.R3)
+        self.assertEqual(request.network_access, "required")
+        self.assertIn('"argv":["git","push","origin","main"]', request.preview)
+
     async def test_r3_approval_explains_dynamic_network_risk(self) -> None:
         with self.assertRaises(ApprovalRequired) as caught:
             await self.application.kernel.invoke_tool(
@@ -141,23 +166,32 @@ class CommandRiskKernelTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(decision["requires_network"])
         self.assertTrue(decision["risk_factors"])
 
-    async def test_r4_is_denied_before_approval_or_process_execution(self) -> None:
-        result = await self.application.kernel.invoke_tool(
-            self.task.task_id, "turn-delete",
-            ToolCall("call-delete", "core.run_command", {
-                "argv": ["rm", "-rf", "build"]
-            }),
+    async def test_destructive_command_reaches_r3_approval_boundary(self) -> None:
+        with self.assertRaises(ApprovalRequired) as caught:
+            await self.application.kernel.invoke_tool(
+                self.task.task_id, "turn-delete",
+                ToolCall("call-delete", "core.run_command", {
+                    "argv": ["rm", "-rf", "build"]
+                }),
+            )
+        self.assertEqual(caught.exception.request.risk, ToolRisk.R3)
+        self.assertEqual(
+            (await self.application.kernel.get_task(self.task.task_id)).state,
+            TaskState.AWAITING_APPROVAL,
         )
-        self.assertFalse(result.ok)
-        self.assertEqual(result.error_code, "PERMISSION_DENIED")
-        self.assertEqual((await self.application.kernel.get_task(self.task.task_id)).state, TaskState.EXECUTING)
-        events = await self.application.registry.require(RuntimeStorePort).read_events(
-            self.task.task_id
+        events = await self.application.registry.require(
+            RuntimeStorePort
+        ).read_events(self.task.task_id)
+        policy = next(
+            event for event in events if event.event_type == "policy.evaluated"
         )
-        self.assertEqual(events[-2].payload["decision"]["effective_risk"], "R4")
-        self.assertEqual(events[-2].payload["decision"]["action"], "deny")
-        self.assertEqual(events[-1].event_type, "tool.failed")
-        self.assertNotIn("approval.requested", [event.event_type for event in events[-2:]])
+        self.assertEqual(policy.payload["decision"]["effective_risk"], "R3")
+        self.assertEqual(
+            policy.payload["decision"]["action"], "require_approval"
+        )
+        self.assertIn(
+            "approval.requested", [event.event_type for event in events]
+        )
 
 
 if __name__ == "__main__":

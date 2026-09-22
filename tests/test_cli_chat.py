@@ -272,16 +272,42 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result, 0)
             self.assertEqual(tool.invocations, 1)
             self.assertIn("approval required", output)
-            self.assertTrue(any(
+            self.assertFalse(any(
                 "已记录明确的审批决定" in line for line in output
-            ), output)
+            ))
+            await application.registry.start_all()
+            try:
+                tasks = await application.kernel.list_session_tasks(
+                    session.session_id
+                )
+                self.assertEqual(len(tasks), 2)
+                original = await application.kernel.get_task(task.task_id)
+                self.assertEqual(original.state, TaskState.AWAITING_APPROVAL)
+                self.assertIsNotNone(original.pending_approval)
+                derived = next(item for item in tasks if item.task_id != task.task_id)
+                self.assertEqual(derived.state, TaskState.SUCCEEDED)
+                session_events = await application.kernel.dependencies.store.read_session_events(
+                    session.session_id
+                )
+                relation = next(
+                    event for event in session_events
+                    if event.event_type == "session.task_derived"
+                    and event.payload["task_id"] == derived.task_id
+                )
+                self.assertEqual(
+                    relation.payload["source_task_id"], task.task_id
+                )
+            finally:
+                await application.registry.stop_all()
             self.assertFalse(any(
                 "已取消尚未执行的旧审批动作" in line for line in output
             ), output)
             await application.registry.start_all()
             try:
                 restored = await application.kernel.get_task(task.task_id)
-                self.assertEqual(restored.state, TaskState.SUCCEEDED)
+                self.assertEqual(
+                    restored.state, TaskState.AWAITING_APPROVAL
+                )
                 events = await application.kernel.dependencies.store.read_events(
                     task.task_id
                 )
@@ -582,7 +608,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await application.registry.stop_all()
 
-    async def test_active_interrupted_task_resumes_after_initial_session_route(self):
+    async def test_active_interrupted_task_derives_follow_up_from_session_text(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = FailOnceChatModel()
@@ -602,13 +628,10 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(result, 0)
             self.assertTrue(any(
-                '"text":"Use the preserved checkpoint with this exact input"'
-                in line
-                or '"text": "Use the preserved checkpoint with this exact input"'
-                in line
-                for line in output if line.startswith("agent> " )
+                "[session-follow-up]" in line
+                for line in output if line.startswith("agent> ")
             ))
-            self.assertTrue(any(
+            self.assertFalse(any(
                 line.startswith("[恢复] 正在继续上次意外中断的任务")
                 for line in output
             ))
@@ -621,20 +644,36 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                 if line.startswith("task: ")
             ]
             self.assertEqual(len(task_ids), 2)
-            self.assertEqual(task_ids[0], task_ids[1])
-            self.assertEqual(resolver.contexts, [])
+            self.assertNotEqual(task_ids[0], task_ids[1])
+            self.assertEqual(len(resolver.contexts), 1)
             await application.registry.start_all()
             try:
                 tasks = await application.kernel.list_session_tasks(session_id)
-                self.assertEqual(len(tasks), 1)
+                self.assertEqual(len(tasks), 2)
                 self.assertEqual(tasks[0].goal, "inspect the original target")
-                self.assertEqual(tasks[0].state, TaskState.SUCCEEDED)
+                self.assertEqual(tasks[0].state, TaskState.INTERRUPTED)
+                self.assertEqual(tasks[1].state, TaskState.SUCCEEDED)
+                self.assertIn(
+                    "Use the preserved checkpoint with this exact input",
+                    tasks[1].goal,
+                )
+                session_events = await application.kernel.dependencies.store.read_session_events(
+                    session_id
+                )
+                derived = next(
+                    event for event in session_events
+                    if event.event_type == "session.task_derived"
+                    and event.payload["task_id"] == tasks[1].task_id
+                )
+                self.assertEqual(
+                    derived.payload["source_task_id"], tasks[0].task_id
+                )
                 events = await application.registry.require(
                     RuntimeStorePort
                 ).read_events(tasks[0].task_id)
                 event_types = [event.event_type for event in events]
                 self.assertIn("turn.interrupted", event_types)
-                self.assertIn("turn.resumed", event_types)
+                self.assertNotIn("turn.resumed", event_types)
             finally:
                 await application.registry.stop_all()
 
@@ -686,7 +725,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await application.registry.stop_all()
 
-    async def test_active_interrupted_task_routes_by_state_not_input_phrase(self):
+    async def test_active_interrupted_task_does_not_implicitly_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = FailOnceChatModel()
@@ -704,8 +743,9 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                 ]), output_fn=output.append,
                 application_factory=lambda: application,
             )
-            self.assertTrue(any(
-                "已将本轮用户原文加入任务上下文" in line for line in output
+            self.assertFalse(any(
+                "已将本轮用户原文加入任务上下文" in line
+                for line in output
             ))
             session_id = next(
                 line.removeprefix("session: ") for line in output
@@ -714,8 +754,14 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             await application.registry.start_all()
             try:
                 tasks = await application.kernel.list_session_tasks(session_id)
-                self.assertEqual(len(tasks), 1)
+                self.assertEqual(len(tasks), 2)
                 self.assertEqual(tasks[0].goal, "original target")
+                self.assertEqual(tasks[0].state, TaskState.INTERRUPTED)
+                self.assertEqual(tasks[1].state, TaskState.SUCCEEDED)
+                self.assertIn(
+                    "A semantically unrelated sentence must still follow state",
+                    tasks[1].goal,
+                )
                 events = await application.kernel.dependencies.store.read_events(
                     tasks[0].task_id
                 )
@@ -723,10 +769,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                     event for event in events
                     if event.event_type == "steering.queued"
                 ]
-                self.assertEqual(
-                    queued[-1].payload["text"],
-                    "A semantically unrelated sentence must still follow state",
-                )
+                self.assertEqual(queued, [])
             finally:
                 await application.registry.stop_all()
 

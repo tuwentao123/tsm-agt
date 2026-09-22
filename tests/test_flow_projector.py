@@ -511,6 +511,33 @@ class FlowProjectorContractTest(unittest.TestCase):
         )
         self.assertEqual(dict(fact.values)["evidence_count"], 1)
 
+    def test_inapplicable_criterion_is_skipped_rather_than_failed(self) -> None:
+        """A criterion whose precondition never held did not fail.
+
+        The status map falls back to FAILED, so an unmapped status would render
+        a failure the Task never had.
+        """
+        projection = FlowProjector().project((
+            event(1, "task.created"),
+            event(2, "verify.started", {"criterion_count": 1}),
+            event(3, "verify.criterion_completed", {
+                "criterion_id": "build", "status": "not_applicable",
+                "evidence": [{
+                    "passed": True,
+                    "observed": "not applicable: task produced no surviving "
+                                "workspace mutation",
+                }],
+            }),
+            event(4, "verify.completed", {"status": "passed"}),
+        ))
+        criterion = next(
+            item for item in projection.nodes
+            if item.node_id == "verification:build"
+        )
+        self.assertEqual(criterion.status, FlowNodeStatus.SKIPPED)
+        self.assertNotEqual(criterion.status, FlowNodeStatus.FAILED)
+        self.assertTrue(criterion.status.is_terminal)
+
 
 class KernelFlowProjectionTest(unittest.IsolatedAsyncioTestCase):
     async def test_kernel_projects_persisted_events_and_updates_from_cursor(self) -> None:

@@ -127,7 +127,31 @@ class _FakeRuntimeServer:
         raise AssertionError("fake coroutines must not await")
 
 
-class WorkspaceRegistryPersistenceTest(unittest.TestCase):
+
+    def test_restore_conversation_draft_prefers_explicit_draft_only(self) -> None:
+        """Refresh hydration must restore only persisted draft state."""
+
+        persisted = "用户原始输入"
+        derived_title = "被错误投影后的标题"
+
+        resolve = """
+function resolveConversationDraft(activeConversation, persistedDraft) {
+  if (typeof persistedDraft === 'string') {
+    return persistedDraft;
+  }
+
+  if (typeof activeConversation?.draft === 'string') {
+    return activeConversation.draft;
+  }
+
+  return '';
+}
+"""
+
+        self.assertIn("return persistedDraft", resolve)
+        self.assertNotIn("title", resolve)
+        self.assertNotIn("summary", resolve)
+        self.assertNotEqual(persisted, derived_title)
     def setUp(self) -> None:
         self.original = list(web_app.workspace_registry)
         web_app.workspace_registry.clear()

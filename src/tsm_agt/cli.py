@@ -57,8 +57,10 @@ from tsm_agt.core import (
     SessionTextInput,
     SessionContinuationMode,
     SessionResumeSafety,
+    SessionAnswerRequiresTask,
     SessionRouteDisposition, SessionTaskRelation,
     SessionChoiceAction,
+    build_session_follow_up_goal,
     ModelInvocationFailed,
     SteeringKind,
     TaskState,
@@ -1181,7 +1183,6 @@ async def _chat(
             resume_mode = False
             continuation_resume = False
             pending_approval_resolution = None
-            state_selected_resume = False
             route_source_task_id = None
             route_relation = SessionTaskRelation.INDEPENDENT
             route_goal = prompt
@@ -1227,25 +1228,45 @@ async def _chat(
                         session = await application.kernel.get_session(
                             session.session_id
                         )
-                    active = (
-                        await application.kernel.get_task(session.active_task_id)
-                        if session.active_task_id is not None else None
-                    )
-                    if active is not None and not active.state.is_terminal:
-                        explicit_resume_task = active.task_id
-                        state_selected_resume = True
-                    else:
+                    try:
+                        decision = await application.kernel.dispatch_input_event(
+                            SessionTextInput(
+                                session.session_id, prompt,
+                                f"input-{uuid4().hex}", str(root),
+                            )
+                        )
+                        if not isinstance(decision, SessionInputDecision):
+                            raise RuntimeError(
+                                "session text dispatch returned an invalid result"
+                            )
+                    except (KeyboardInterrupt, asyncio.CancelledError):
+                        output_fn(
+                            f"session saved: {session.session_id} "
+                            f"(resume with: tsm-agt chat --session "
+                            f"{session.session_id})"
+                        )
+                        return 130
+                    if decision.disposition is SessionRouteDisposition.ANSWER:
                         try:
-                            decision = await application.kernel.dispatch_input_event(
-                                SessionTextInput(
-                                    session.session_id, prompt,
-                                    f"input-{uuid4().hex}", str(root),
+                            session_answer_text = (
+                                await application.kernel.answer_session_message(
+                                    session.session_id, prompt
                                 )
                             )
-                            if not isinstance(decision, SessionInputDecision):
-                                raise RuntimeError(
-                                    "session text dispatch returned an invalid result"
-                                )
+                        except SessionAnswerRequiresTask as error:
+                            # The answering model held no tools and reported the
+                            # route cannot serve this message. Re-route it as
+                            # contextual work instead of printing an apology.
+                            await application.kernel.record_session_route_self_correction(
+                                session.session_id, prompt, error.reason
+                            )
+                            route_source_task_id = None
+                            route_relation = SessionTaskRelation.CONTEXTUAL
+                            route_goal = prompt
+                            output_fn(
+                                "[会话] 该输入无法在无工具的直接回答中完成，"
+                                "已改为创建 Task 执行。"
+                            )
                         except (KeyboardInterrupt, asyncio.CancelledError):
                             output_fn(
                                 f"session saved: {session.session_id} "
@@ -1253,39 +1274,35 @@ async def _chat(
                                 f"{session.session_id})"
                             )
                             return 130
-                        if decision.disposition is SessionRouteDisposition.ANSWER:
-                            try:
-                                session_answer_text = (
-                                    await application.kernel.answer_session_message(
-                                        session.session_id, prompt
-                                    )
-                                )
-                            except (KeyboardInterrupt, asyncio.CancelledError):
-                                output_fn(
-                                    f"session saved: {session.session_id} "
-                                    f"(resume with: tsm-agt chat --session "
-                                    f"{session.session_id})"
-                                )
-                                return 130
-                        elif (
-                            decision.disposition
-                            is SessionRouteDisposition.RESUME_TASK
-                        ):
-                            explicit_resume_task = decision.source_task_id
-                        elif (
-                            decision.disposition
-                            is SessionRouteDisposition.CREATE_TASK
-                        ):
-                            route_source_task_id = decision.source_task_id
-                            route_relation = decision.relation
-                            route_goal = decision.resolved_goal or prompt
-                            prompt = route_goal
-                        else:
-                            output_fn(
-                                decision.clarification
-                                or "无法确定这条输入要关联哪项任务，请补充说明。"
-                            )
-                            continue
+                    elif (
+                        decision.disposition
+                        is SessionRouteDisposition.RESUME_TASK
+                    ):
+                        assert decision.source_task_id is not None
+                        source = next(
+                            item for item in decision.task_catalog
+                            if item.task_id == decision.source_task_id
+                        )
+                        route_source_task_id = decision.source_task_id
+                        route_relation = SessionTaskRelation.FOLLOW_UP
+                        route_goal = build_session_follow_up_goal(
+                            prompt, source
+                        )
+                        prompt = route_goal
+                    elif (
+                        decision.disposition
+                        is SessionRouteDisposition.CREATE_TASK
+                    ):
+                        route_source_task_id = decision.source_task_id
+                        route_relation = decision.relation
+                        route_goal = decision.resolved_goal or prompt
+                        prompt = route_goal
+                    else:
+                        output_fn(
+                            decision.clarification
+                            or "无法确定这条输入要关联哪项任务，请补充说明。"
+                        )
+                        continue
             if session_answer_text is not None:
                 output_fn(f"agent> {session_answer_text}")
                 continue
@@ -1340,14 +1357,6 @@ async def _chat(
                     output_fn(
                         "[恢复] 检测到事件日志已领先于旧断点；将复用已经"
                         "提交的工具结果并刷新执行现场，不会重复运行工具。"
-                    )
-                if state_selected_resume:
-                    await application.kernel.queue_steering(
-                        task.task_id, SteeringKind.STEER,
-                        prompt, f"input-{uuid4().hex}",
-                    )
-                    output_fn(
-                        "[恢复] 已将本轮用户原文加入任务上下文。"
                     )
             elif (
                 continuation is not None

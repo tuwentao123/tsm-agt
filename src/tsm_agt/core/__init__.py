@@ -23,6 +23,11 @@ from .prompt import (
     PromptAssembly, PromptAssemblyReceipt, PromptManifest, PromptTemplate,
     PromptTemplateSegment,
 )
+from .task_runtime_projection import (
+    TaskDisplayStatus, TaskExecutionStatus, TaskRuntimeFailure,
+    TaskRuntimePhase, TaskRuntimeProjection, TaskRuntimeProjector,
+    TaskRuntimeTraceItem, TaskVerificationStatus,
+)
 from .flow import (
     FlowDiagnosticCategory, FlowDiagnosticFact, FlowEdge, FlowEdgeRelation,
     FlowFailureAttribution, FlowLane, FlowNode, FlowNodeDiagnostic,
@@ -112,6 +117,7 @@ from .runtime_input import (
     SessionInputAction, SessionInputDecision, SessionInputGrounding,
     SessionRouteDisposition, SessionTaskCatalogEntry, SessionTaskRelation,
 )
+from .session_handoff import build_session_follow_up_goal
 from .plan_guard import (
     ActionProgressState, GoalSlice, PlanGuard, PlanGuardDecision,
 )
@@ -137,7 +143,10 @@ from .evidence_question import (
     EvidenceQuestionProjection, EvidenceQuestionRecord, EvidenceQuestionStatus,
     ToolActionDisposition,
 )
-from .turn import InvalidModelResponse, InvalidTurnState, ModelInvocationFailed, TurnResult
+from .turn import (
+    InvalidModelResponse, InvalidTurnState, ModelInvocationFailed,
+    SessionAnswerRequiresTask, TurnResult,
+)
 from .tool import (
     DuplicateToolName,
     InvalidToolArguments,
@@ -205,6 +214,7 @@ __all__ = [
     "ChatDispatchResult",
     "ProviderCapabilityMismatch",
     "InvalidModelResponse",
+    "SessionAnswerRequiresTask",
     "InvalidTaskTransition",
     "InvalidTurnState",
     "Kernel",
@@ -233,6 +243,7 @@ __all__ = [
     "SessionRouteDisposition",
     "SessionTaskCatalogEntry",
     "SessionTaskRelation",
+    "build_session_follow_up_goal",
     "IdempotencyConflict",
     "ToolCommitState",
     "ToolExecutionInProgress",
@@ -246,6 +257,14 @@ __all__ = [
     "SupervisedProcessResult",
     "ModelInvocationFailed",
     "TaskNotFound",
+    "TaskDisplayStatus",
+    "TaskExecutionStatus",
+    "TaskRuntimeFailure",
+    "TaskRuntimePhase",
+    "TaskRuntimeProjection",
+    "TaskRuntimeProjector",
+    "TaskRuntimeTraceItem",
+    "TaskVerificationStatus",
     "Phase1TaskState",
     "TaskSnapshot",
     "TaskState",

@@ -19,8 +19,11 @@ from tsm_agt.core import (
     AgentContinuationSuspended,
     ApprovalDecision, ApprovalResolutionInput, ClarificationReplyInput,
     InterruptTaskInput, RuntimeTextInput, SessionTextInput,
+    SessionAnswerRequiresTask,
     SessionInputDecision, SessionRouteDisposition, SessionTaskRelation,
-    TaskSnapshot, TaskState, canonical_hash, SteeringKind, RuntimeInputIntent,
+    TaskRuntimeProjection, TaskRuntimeProjector,
+    TaskSnapshot, TaskState, build_session_follow_up_goal,
+    canonical_hash, SteeringKind, RuntimeInputIntent,
 )
 from tsm_agt.ports import (
     ImageBlock, RuntimeCommandRecord, RuntimeStorePort, TextBlock,
@@ -84,6 +87,7 @@ class RuntimeTaskResult:
     clarification: Mapping[str, Any] | None = None
     verification: Mapping[str, Any] | None = None
     evidence_level: Mapping[str, Any] | None = None
+    projection: Mapping[str, Any] | None = None
 
     def to_data(self) -> dict[str, Any]:
         return {
@@ -99,6 +103,7 @@ class RuntimeTaskResult:
             "evidence_level": (
                 dict(self.evidence_level) if self.evidence_level else None
             ),
+            "projection": dict(self.projection) if self.projection else None,
         }
 
 
@@ -207,10 +212,18 @@ class EngineeringAgentClient:
         self, goal: str, *, command_id: str, session_id: str | None = None,
         source_task_id: str | None = None,
         task_relation: SessionTaskRelation = SessionTaskRelation.INDEPENDENT,
+        workspace: Path | None = None,
     ) -> TaskSnapshot:
+        """Create one Task, optionally in a workspace other than the client's.
+
+        One client process may serve several workspaces, so the caller must be
+        able to name the workspace a Task actually runs in. Omitting it keeps
+        the client's own workspace, which is the single-workspace default.
+        """
         return await self.application.kernel.create_task(
-            goal, self.workspace, session_id=session_id, command_id=command_id,
-            source_task_id=source_task_id, task_relation=task_relation,
+            goal, workspace or self.workspace, session_id=session_id,
+            command_id=command_id, source_task_id=source_task_id,
+            task_relation=task_relation,
         )
 
     async def submit_task(
@@ -218,11 +231,13 @@ class EngineeringAgentClient:
         source_task_id: str | None = None,
         task_relation: SessionTaskRelation = SessionTaskRelation.INDEPENDENT,
         images: tuple[ImageBlock, ...] = (),
+        workspace: Path | None = None,
     ) -> RuntimeTaskResult:
         async with self._submit_lock:
             task = await self.create_task(
                 goal, command_id=command_id, session_id=session_id,
                 source_task_id=source_task_id, task_relation=task_relation,
+                workspace=workspace,
             )
             current = await self.application.kernel.get_task(task.task_id)
             if (
@@ -243,7 +258,8 @@ class EngineeringAgentClient:
 
     async def submit_session_text(
         self, session_id: str, text: str, *, command_id: str,
-        images: tuple[Mapping[str, str], ...] = (),
+        images: tuple[ImageBlock, ...] = (),
+        workspace: Path | None = None,
     ) -> RuntimeCommandResult:
         """Route one ordinary message and execute its validated Session action.
 
@@ -251,30 +267,66 @@ class EngineeringAgentClient:
         also passed to ``create_task`` when a Task is created, preserving the
         Kernel's stricter Task command receipt rather than bypassing it.
 
-        ``images`` carries inline data-URL attachments. They travel as
-        structured ``ImageBlock`` content, never inside the Task goal: a goal is
-        bounded text and base64 payloads would exceed the Task SPEC limits.
+        ``images`` matches ``submit_task``: already-validated ``ImageBlock``
+        values, whose accepted sources are that type's invariant. Attachments
+        travel as structured content, never inside the Task goal, because a goal
+        is bounded text and base64 payloads would exceed the Task SPEC limits.
+
+        Ordinary semantic continuation never resumes a source checkpoint in
+        place. A validated RESUME proposal is canonicalized into a fresh
+        FOLLOW_UP Task with a bounded authority-free handoff. Typed approval,
+        clarification and explicit recovery APIs retain their original-Task
+        semantics.
         """
         normalized = text.strip()
         if not normalized:
             raise ValueError("session text must not be empty")
-        image_blocks = tuple(
-            ImageBlock(image_url=str(image["image_url"]))
-            for image in images
-            if str(image.get("image_url", "")).startswith("data:image/")
-        )
+        image_blocks = tuple(images)
+        # The router reasons about the workspace the message belongs to, so a
+        # multi-workspace caller must be able to name it here too.
+        resolved_workspace = workspace or self.workspace
 
         async def execute() -> SessionTextResult:
             decision = await self.application.kernel.dispatch_input_event(
-                SessionTextInput(session_id, normalized, command_id, str(self.workspace))
+                SessionTextInput(
+                    session_id, normalized, command_id, str(resolved_workspace)
+                )
             )
             if not isinstance(decision, SessionInputDecision):
                 raise RuntimeError("session text dispatch returned an invalid result")
             decision_data = _session_decision_data(decision)
             if decision.disposition is SessionRouteDisposition.ANSWER:
-                answer = await self.application.kernel.answer_session_message(
-                    session_id, normalized
-                )
+                try:
+                    answer = await self.application.kernel.answer_session_message(
+                        session_id, normalized, attachments=image_blocks,
+                    )
+                except SessionAnswerRequiresTask as error:
+                    # Routing read one message; the answering model saw the whole
+                    # request with no tools in hand and reported the route cannot
+                    # serve it. Re-route the same message rather than returning an
+                    # apology. CONTEXTUAL carries Session history without
+                    # inheriting any prior Task's authority.
+                    await self.application.kernel.record_session_route_self_correction(
+                        session_id, normalized, error.reason
+                    )
+                    task = await self.submit_task(
+                        normalized, command_id=command_id, session_id=session_id,
+                        task_relation=SessionTaskRelation.CONTEXTUAL,
+                        images=image_blocks, workspace=resolved_workspace,
+                    )
+                    corrected = SessionInputDecision(
+                        SessionRouteDisposition.CREATE_TASK,
+                        SessionTaskRelation.CONTEXTUAL, None, normalized,
+                        decision.confidence,
+                        "answer_route_self_corrected_to_task",
+                        decision.input_grounding, None,
+                        decision.resolver_version, decision.candidates,
+                        decision.task_catalog, decision.candidate_task_ids,
+                    )
+                    return SessionTextResult(
+                        command_id, "task", _session_decision_data(corrected),
+                        task=task,
+                    )
                 return SessionTextResult(
                     command_id, "answer", decision_data, answer=answer
                 )
@@ -284,18 +336,44 @@ class EngineeringAgentClient:
                     clarification=decision.clarification,
                 )
             if decision.disposition is SessionRouteDisposition.RESUME_TASK:
+                # Kernel normally canonicalizes ordinary RESUME proposals into
+                # CREATE_TASK+FOLLOW_UP. Keep this defensive branch for custom
+                # Kernel implementations without ever replaying a source
+                # checkpoint from ordinary Session text.
                 assert decision.source_task_id is not None
-                task = await self.run_task(
-                    decision.source_task_id, normalized, images=image_blocks
+                source = next(
+                    item for item in decision.task_catalog
+                    if item.task_id == decision.source_task_id
                 )
-                return SessionTextResult(command_id, "task", decision_data, task=task)
+                goal = decision.resolved_goal or build_session_follow_up_goal(
+                    normalized, source
+                )
+                task = await self.submit_task(
+                    goal, command_id=command_id, session_id=session_id,
+                    source_task_id=decision.source_task_id,
+                    task_relation=SessionTaskRelation.FOLLOW_UP,
+                    images=image_blocks, workspace=resolved_workspace,
+                )
+                derived = SessionInputDecision(
+                    SessionRouteDisposition.CREATE_TASK,
+                    SessionTaskRelation.FOLLOW_UP,
+                    decision.source_task_id, goal, decision.confidence,
+                    "ordinary_resume_derived_follow_up",
+                    decision.input_grounding, decision.clarification,
+                    decision.resolver_version, decision.candidates,
+                    decision.task_catalog, decision.candidate_task_ids,
+                )
+                return SessionTextResult(
+                    command_id, "task", _session_decision_data(derived),
+                    task=task,
+                )
             assert decision.disposition is SessionRouteDisposition.CREATE_TASK
             task = await self.submit_task(
                 decision.resolved_goal or normalized,
                 command_id=command_id, session_id=session_id,
                 source_task_id=decision.source_task_id,
                 task_relation=decision.relation,
-                images=image_blocks,
+                images=image_blocks, workspace=resolved_workspace,
             )
             return SessionTextResult(command_id, "task", decision_data, task=task)
 
@@ -386,19 +464,60 @@ class EngineeringAgentClient:
             return await self.get_task_result(task_id)
         return await self._finish_agent_result(result)
 
+    async def _persisted_assistant_text(
+        self, task: TaskSnapshot,
+    ) -> str | None:
+        """Read only a durable *user-facing* Task result after a restart.
+
+        Every ``llm.completed`` event is not a response for the user: an Agent
+        can emit a provisional summary, fail readiness, then continue with more
+        tools. The Session result event is the durable boundary that says a
+        message was actually handed to the user, so it is the only safe fallback
+        once the live ``_latest_results`` cache is gone.
+        """
+        session_events = await self._store().read_session_events(task.session_id)
+        for event in reversed(session_events):
+            if (
+                event.event_type != "session.task_result_recorded"
+                or str(event.payload.get("task_id") or "") != task.task_id
+            ):
+                continue
+            raw_message = event.payload.get("assistant_message")
+            if not isinstance(raw_message, Mapping):
+                continue
+            raw_content = raw_message.get("content")
+            if not isinstance(raw_content, list):
+                continue
+            text = "\n".join(
+                str(block.get("text", ""))
+                for block in raw_content
+                if isinstance(block, Mapping) and block.get("type") == "text"
+            ).strip()
+            if text:
+                return text
+        return None
+
     async def get_task_result(self, task_id: str) -> RuntimeTaskResult:
         task = await self.application.kernel.get_task(task_id)
         stored = await self._store().load_task(task_id)
         assert stored is not None
+        events = await self._store().read_events(task_id)
+        projection = TaskRuntimeProjector.project(task, events).to_data()
         cached = self._latest_results.get(task_id)
+        assistant_text = (
+            cached.assistant_text
+            if cached is not None and cached.assistant_text is not None
+            else await self._persisted_assistant_text(task)
+        )
         return RuntimeTaskResult(
             task_id, task.state.value, task.state.phase1_state.value,
             _status_for_state(task.state), stored.last_event_sequence,
-            assistant_text=cached.assistant_text if cached else None,
+            assistant_text=assistant_text,
             approval=_approval_data(task),
             clarification=(cached.clarification if cached else _clarification_data(task)),
             verification=cached.verification if cached else None,
             evidence_level=cached.evidence_level if cached else None,
+            projection=projection,
         )
 
     async def read_events(

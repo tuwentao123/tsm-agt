@@ -53,7 +53,7 @@ class PolicyDecision:
 class CoreToolPolicy:
     """Fail closed; risky calls pause until the kernel resolves approval."""
 
-    _POLICY_VERSION = 1
+    _POLICY_VERSION = 2
     _INTERNAL_STATE_TOOLS = frozenset({
         "core.working_memory_update", "core.task_spec_update",
     })
@@ -68,7 +68,7 @@ class CoreToolPolicy:
             "r0_mutating": "deny",
             "r0_runtime_internal_state": "allow-listed",
             "r1_r3": "require_approval",
-            "r4": "deny",
+            "r4": "reserved-no-active-classification",
             "project_trust_enforced": True,
             "payload_hash_bound": True,
         }
@@ -110,8 +110,12 @@ class CoreToolPolicy:
             if detail:
                 reason += f": {detail}"
         else:
-            action = PolicyAction.DENY
-            reason = "R4 tools are denied by the default core policy"
+            # R4 remains a serialized compatibility value, but the current
+            # policy has no active R4 operations. External adapters that still
+            # declare R4 are conservatively mapped to R3 exact approval.
+            action = PolicyAction.REQUIRE_APPROVAL
+            effective_risk = ToolRisk.R3
+            reason = "legacy R4 declaration requires explicit R3 approval"
             if detail:
                 reason += f": {detail}"
         return PolicyDecision(
@@ -129,11 +133,17 @@ class CoreToolPolicy:
         cls, spec: ToolSpec, call: ToolCall
     ) -> tuple[ToolRisk, bool, tuple[str, ...]]:
         if call.name != "core.run_command":
-            return spec.risk, spec.requires_network, ()
+            return (
+                ToolRisk.R3 if spec.risk is ToolRisk.R4 else spec.risk,
+                spec.requires_network,
+                (("legacy R4 declaration mapped to R3 approval",)
+                 if spec.risk is ToolRisk.R4 else ()),
+            )
         classified, network, factors = cls._classify_command(call)
         ranks = {risk: index for index, risk in enumerate(ToolRisk)}
+        declared = ToolRisk.R3 if spec.risk is ToolRisk.R4 else spec.risk
         return (
-            classified if ranks[classified] > ranks[spec.risk] else spec.risk,
+            classified if ranks[classified] > ranks[declared] else declared,
             spec.requires_network or network,
             factors,
         )
@@ -144,7 +154,7 @@ class CoreToolPolicy:
     ) -> tuple[ToolRisk, bool, tuple[str, ...]]:
         raw_argv = call.arguments.get("argv")
         if not isinstance(raw_argv, (list, tuple)) or not raw_argv:
-            return ToolRisk.R4, False, ("command argv is missing or invalid",)
+            return ToolRisk.R3, False, ("command argv is missing or invalid",)
         argv = tuple(str(item) for item in raw_argv)
         executable = Path(argv[0]).name.lower()
         for suffix in (".exe", ".cmd", ".bat"):
@@ -198,7 +208,26 @@ class CoreToolPolicy:
         ):
             factors.append("production-targeting argument")
         if factors:
-            return ToolRisk.R4, any("publish" in factor.lower() for factor in factors), tuple(factors)
+            network = bool(
+                (executable == "git" and "push" in tokens)
+                or (
+                    executable in {"npm", "pnpm", "yarn", "cargo"}
+                    and "publish" in tokens
+                )
+                or (
+                    executable in {"gradle", "gradlew", "mvn"}
+                    and any(
+                        "publish" in item or item == "uploadarchives"
+                        for item in lowered
+                    )
+                )
+                or any(
+                    marker in item
+                    for item in lowered
+                    for marker in ("production", "--prod", "prod-deploy")
+                )
+            )
+            return ToolRisk.R3, network, tuple(factors)
 
         network = False
         install_programs = {"pip", "pip3", "gem", "bundle"}

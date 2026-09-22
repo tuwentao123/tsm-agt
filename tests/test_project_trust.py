@@ -140,7 +140,7 @@ class ProjectTrustTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await application.registry.stop_all()
 
-    async def test_trusted_full_does_not_allow_r4_command(self) -> None:
+    async def test_trusted_full_routes_legacy_r4_command_to_approval(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             application = compose_fixture_application(
@@ -151,16 +151,21 @@ class ProjectTrustTest(unittest.IsolatedAsyncioTestCase):
                 await application.kernel.set_project_trust(
                     workspace, ProjectTrustLevel.TRUSTED_FULL
                 )
-                task = await self._executing_task(application, workspace, "task-full-r4")
-                result = await application.kernel.invoke_tool(
-                    task.task_id, "turn-r4",
-                    ToolCall("call-r4", "core.run_command", {
-                        "argv": ["git", "push", "origin", "main"]
-                    }),
+                task = await self._executing_task(
+                    application, workspace, "task-full-r3-push"
                 )
-                self.assertFalse(result.ok)
-                self.assertEqual(result.error_code, "PERMISSION_DENIED")
-                self.assertIn("R4", result.message)
+                with self.assertRaises(ApprovalRequired) as caught:
+                    await application.kernel.invoke_tool(
+                        task.task_id, "turn-r3-push",
+                        ToolCall("call-r3-push", "core.run_command", {
+                            "argv": ["git", "push", "origin", "main"]
+                        }),
+                    )
+                self.assertEqual(caught.exception.request.risk.value, "R3")
+                self.assertEqual(
+                    (await application.kernel.get_task(task.task_id)).state,
+                    TaskState.AWAITING_APPROVAL,
+                )
             finally:
                 await application.registry.stop_all()
 

@@ -28,13 +28,14 @@ INDEX_HTML = """
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
 <title>任务协同助手</title>
 <style>
-:root{color-scheme:dark;--bg:#111213;--panel:#191a1c;--border:#2a2c30;--text:#e8eaed;--muted:#9aa0a6;--accent:#5b8cff}
+:root{color-scheme:light;--bg:#f8fafc;--bg-soft:#ffffff;--panel:#ffffff;--panel-elevated:#ffffff;--panel-muted:#f9fbfd;--border:#edf2f7;--border-strong:#e2e8f0;--text:#1f2937;--text-soft:#475569;--muted:#7b8794;--accent:#1677ff;--accent-soft:#eef6ff;--shadow-sm:0 10px 30px rgba(15,23,42,.035);--shadow-md:0 24px 60px rgba(15,23,42,.05);--radius-lg:20px;--radius-md:14px}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
-button{font:inherit;color:inherit;background:none;border:none;cursor:pointer;border-radius:6px}
+body{margin:0;background:linear-gradient(180deg,#fbfdff 0%,#f6f9fc 100%);color:var(--text);font:14px/1.7 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+body::before{content:"";position:fixed;inset:0;background:radial-gradient(circle at top,rgba(22,119,255,.08),transparent 30%);pointer-events:none}
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer;border-radius:10px}
 button:disabled{opacity:.4;cursor:not-allowed}
-.layout{display:grid;grid-template-columns:260px 1fr;height:100vh;overflow:hidden}
-.sidebar{border-right:1px solid var(--border);padding:16px 12px;display:flex;flex-direction:column;gap:16px;min-height:0;height:100vh;overflow-y:auto;overscroll-behavior:contain}
+.layout{display:grid;grid-template-columns:260px minmax(0,1fr);height:100vh;overflow:hidden}
+.sidebar{border-right:1px solid var(--border);padding:20px 14px;display:flex;flex-direction:column;gap:14px;min-height:0;height:100vh;overflow-y:auto;overscroll-behavior:contain;background:rgba(255,255,255,.96);box-shadow:inset -1px 0 0 rgba(217,225,236,.7)}
 .brand{font-size:15px;font-weight:600;padding:0 6px}
 .new-session-btn{border:1px solid var(--border);padding:8px 10px;text-align:left;color:var(--muted)}
 .new-session-btn:hover:not(:disabled){color:var(--text);border-color:#3c4046}
@@ -52,67 +53,117 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .session-item .item-title{font-size:13px}
 .session-empty{padding:4px 8px;font-size:12px}
 .list-item{text-align:left;padding:7px 8px;border-radius:6px;color:var(--text);overflow:hidden}
-.list-item:hover{background:#202225}
-.list-item.active{background:#26282c}
-.item-title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.list-item:hover{background:var(--panel-muted)}
+.list-item.active{background:#e8f3ff;color:#1677ff}
+.item-title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:500}
 .item-meta{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:rtl;text-align:left}
 .hint{font-size:12px;color:var(--muted);padding:6px}
-.main{display:flex;flex-direction:column;min-width:0;min-height:0;height:100vh;overflow:hidden}
-.topbar{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 20px;border-bottom:1px solid var(--border)}
+.main{display:flex;flex-direction:column;min-width:0;min-height:0;height:100vh;overflow:hidden;background:transparent}
+.topbar{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:18px 32px;border-bottom:1px solid var(--border);background:rgba(255,255,255,.9);backdrop-filter:blur(12px)}
 #conversation-name{font-weight:500}
 .topbar .icon-btn{font-size:12px}
-.chat-shell{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
-.view-switcher{display:flex;align-items:center;justify-content:space-between;padding:12px 20px 0;gap:12px}
-.view-tabs{display:flex;gap:8px}
-.view-tab{padding:8px 14px;border:1px solid var(--border);color:var(--muted);background:#16181b}
-.view-tab.active{background:#273246;border-color:#3d5d92;color:#fff}
-.view-summary{font-size:12px;color:var(--muted)}
-.chat-area{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:20px;display:flex;flex-direction:column;gap:10px}
-.trace-board{display:grid;grid-template-columns:minmax(0,1.2fr) 320px;gap:18px;align-items:start}
-.trace-main{display:flex;flex-direction:column;gap:14px}
-.trace-sidebar{position:sticky;top:0;display:flex;flex-direction:column;gap:12px}
-.trace-summary-card,.trace-legend{background:#16181b;border:1px solid var(--border);border-radius:12px;padding:14px}
-.trace-summary-title{font-size:13px;font-weight:600;margin-bottom:10px}
-.trace-metric-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
-.trace-metric{background:#1d2025;border-radius:10px;padding:10px}
-.trace-metric-label{font-size:11px;color:var(--muted)}
-.trace-metric-value{font-size:18px;font-weight:600;margin-top:4px}
-.trace-legend-item{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px}
-.trace-dot{width:10px;height:10px;border-radius:50%}
-.trace-dot.running{background:#8ab4f8}.trace-dot.waiting{background:#f0c674}.trace-dot.done{background:#81c995}.trace-dot.failed{background:#f4837a}
-.message{max-width:70%;word-break:break-word}
-.message-body{white-space:pre-wrap}
-.message-images{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
-.message-images img{width:56px;height:56px;object-fit:cover;border-radius:6px;display:block;cursor:zoom-in;border:1px solid rgba(255,255,255,.12)}
-.message.user{align-self:flex-end;background:#2f3a4f;padding:8px 12px;border-radius:12px 12px 2px 12px}
-.message.assistant{align-self:flex-start;background:var(--panel);padding:8px 12px;border-radius:12px 12px 12px 2px}
+.chat-shell{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden;padding:18px 22px 14px}
+.workspace-stage{flex:1;min-height:0;width:100%;display:grid;grid-template-columns:minmax(0,1.18fr) minmax(320px,.82fr);gap:14px;align-items:stretch}
+.pane-shell{min-height:0;display:flex;flex-direction:column;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.72);border-radius:24px;overflow:hidden;backdrop-filter:blur(10px);box-shadow:none}
+.pane-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:14px 18px 10px;border-bottom:1px solid rgba(237,242,247,.75);background:rgba(255,255,255,.78)}
+.pane-title{font-size:15px;font-weight:700;color:#111827}
+.pane-subtitle{margin-top:4px;font-size:12px;color:#64748b}
+.pane-badge{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:#eff6ff;color:#2563eb;font-size:12px;font-weight:600}
+.chat-area,.trace-pane{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:10px;display:flex;flex-direction:column;gap:8px;background:transparent}
+.trace-pane{gap:8px;background:rgba(255,255,255,.2)}
+.trace-live-board{display:flex;flex-direction:column;gap:6px}
+.trace-future-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
+.trace-future-card{border:1px dashed #dde6f0;border-radius:10px;padding:7px 9px;background:rgba(255,255,255,.72)}
+.trace-future-title{font-size:12px;font-weight:700;color:#334155;margin-bottom:4px}
+.trace-future-copy{font-size:11px;color:#64748b;line-height:1.5}
+.trace-board{display:grid;grid-template-columns:minmax(0,1fr) 208px;gap:8px;align-items:start}
+.trace-main{display:flex;flex-direction:column;gap:6px}
+.trace-sidebar{position:sticky;top:8px;display:flex;flex-direction:column;gap:6px;opacity:.94}
+.trace-overview-panel{background:linear-gradient(180deg,rgba(255,255,255,.78),rgba(248,251,255,.88));border:1px solid rgba(226,232,240,.72);border-radius:14px;padding:9px;display:flex;flex-direction:column;gap:6px}
+.trace-panel-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.trace-panel-title{font-size:12px;font-weight:700;color:#0f172a}
+.trace-panel-caption{font-size:11px;color:#64748b}
+.trace-summary-strip{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
+.trace-metric{background:rgba(255,255,255,.88);border:1px solid #e2e8f0;border-radius:9px;padding:7px 8px;min-height:44px}
+.trace-metric-label{font-size:9px;color:#6b7280;text-transform:uppercase;letter-spacing:.04em}
+.trace-metric-value{font-size:14px;font-weight:700;margin-top:2px;color:#111827}
+.trace-legend-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px}
+.trace-legend-item{display:flex;align-items:center;gap:5px;color:var(--text-soft);font-size:10px;padding:4px 6px;border-radius:8px;background:rgba(251,253,255,.82);border:1px solid #e7edf5}
+.trace-dot{width:10px;height:10px;border-radius:50%;box-shadow:0 0 0 4px rgba(255,255,255,.06)}
+.trace-dot.running{background:#1677ff}.trace-dot.waiting{background:#faad14}.trace-dot.done{background:#52c41a}.trace-dot.failed{background:#ff4d4f}
+.message{width:100%;max-width:none;word-break:break-word}
+.message.assistant{padding-inline:0;background:rgba(255,255,255,.82);border:1px solid #e6edf5;border-radius:20px;padding:16px 18px;box-shadow:none}
+.message.user{align-self:flex-end;max-width:860px;background:#f8fafc;color:#334155;border:1px solid #dbe4ee;border-radius:16px;padding:12px 14px;box-shadow:none}
+.message-body{width:min(96ch,100%);white-space:normal;font-size:15px;line-height:1.72;letter-spacing:0;color:var(--text);font-family:Inter,"SF Pro Display","Segoe UI",sans-serif}
+.message-body > *:first-child{margin-top:0}
+.message-body > *:last-child{margin-bottom:0}
+.message-body p{margin:.45em 0;color:var(--text-soft);max-width:96ch}
+.message-body h1,.message-body h2,.message-body h3{line-height:1.3;font-weight:600;letter-spacing:-.01em;color:var(--text)}
+.message-body h1{margin:1.2em 0 .55em;font-size:28px}
+.message-body h2{margin:1em 0 .45em;font-size:22px}
+.message-body h3{margin:.9em 0 .35em;font-size:18px}
+.message-body ul,.message-body ol{margin:.45em 0 .9em;padding-left:1.3em;color:var(--text-soft);max-width:96ch}
+.message-body li{margin:.2em 0}
+.message-body strong{color:var(--text);font-weight:600}
+.message-body a{color:var(--accent);text-decoration:none}
+.message-body a:hover{text-decoration:underline}
+.message-body code{font-family:"SFMono-Regular","JetBrains Mono","Fira Code",monospace;background:#eef4fb;border:1px solid #d7e3f1;padding:.14rem .42rem;border-radius:6px;font-size:.9em;color:#1e293b}
+.message-body pre{max-width:none;width:100%;margin:1rem 0;padding:16px 18px;background:linear-gradient(180deg,#f8fbff,#f1f5f9);border:1px solid #d9e2ec;border-radius:16px;overflow:auto;box-shadow:inset 0 1px 0 rgba(255,255,255,.65)}
+.message-body pre code{display:block;padding:0;background:none;border:none;border-radius:0;color:#0f172a;line-height:1.7;min-width:max-content;font-size:13px;font-weight:500}
+.message-body pre code .token.comment,.message-body pre code .token.prolog,.message-body pre code .token.doctype,.message-body pre code .token.cdata{color:#64748b}
+.message-body pre code .token.keyword,.message-body pre code .token.selector,.message-body pre code .token.important{color:#7c3aed}
+.message-body pre code .token.string,.message-body pre code .token.attr-value,.message-body pre code .token.char,.message-body pre code .token.builtin,.message-body pre code .token.inserted{color:#047857}
+.message-body pre code .token.function,.message-body pre code .token.class-name{color:#0f766e}
+.message-body pre code .token.number,.message-body pre code .token.boolean,.message-body pre code .token.constant{color:#b45309}
+.message-body blockquote{margin:1rem 0;padding:12px 16px;border-left:3px solid #7b8798;background:#343d49;border-radius:0 12px 12px 0;color:#eef2f7;max-width:86ch}
+.message-body hr{border:none;height:1px;background:#e5edf5;margin:1.5rem 0}
+.message-section{display:flex;flex-direction:column;gap:10px;padding:0;background:transparent;border:none;box-shadow:none}
+.message-section + .message-section{margin-top:12px}
+.message-section-label{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#6b7280}
+.code-block-shell{position:relative}
+.code-block-header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #3a4350;background:#20252d;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#aeb7c3}
+.terminal-block{margin:1rem 0;border-radius:16px;background:#353e49;border:1px solid #596577;overflow:hidden;box-shadow:none}
+.terminal-header{display:flex;align-items:center;gap:8px;padding:10px 14px;background:#414b58;border-bottom:1px solid #596577;font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#edf2f7}
+.terminal-dot{width:8px;height:8px;border-radius:50%;background:#ff7875;box-shadow:14px 0 0 #ffc53d,28px 0 0 #73d13d;margin-right:22px}
+.terminal-body{padding:16px 18px;font-family:"SFMono-Regular","JetBrains Mono","Fira Code",monospace;font-size:13px;line-height:1.7;color:#f3f4f6;white-space:pre-wrap;overflow:auto;background:#313943}
+.message-images{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+.message-images img{width:56px;height:56px;object-fit:cover;border-radius:10px;display:block;cursor:zoom-in;border:1px solid #dbe5f0}
+.message.user,.message.assistant{position:relative;display:flex;flex-direction:column;gap:8px;max-width:min(920px,100%);padding:12px 14px;border-radius:14px;border:1px solid var(--border);box-shadow:none;backdrop-filter:none}
+.message.user{align-self:flex-end;background:#f8fafc;border-color:#dbe4ee;border-bottom-right-radius:8px;color:#334155}
+.message.assistant{align-self:flex-start;background:#ffffff;border-bottom-left-radius:8px;color:#1f2937}
+.message-role{display:flex;align-items:center;gap:8px;font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#64748b}
+.message-role::before{content:'';width:8px;height:8px;border-radius:999px;background:currentColor;opacity:.85}
+.message.assistant .message-role{color:#4b5563}
+.message.user .message-role{color:#d1d5db}
+.message-body{font-size:15px;line-height:1.72;color:inherit}
+.message-body p:first-child,.message-body h1:first-child,.message-body h2:first-child,.message-body h3:first-child{margin-top:0}
+.message-body p:last-child{margin-bottom:0}
 .message.system{align-self:flex-start;max-width:100%;color:var(--muted);font-size:12px;padding:0 2px}
 .message.task{align-self:stretch;max-width:100%;padding:0}
-.task-card{border:1px solid var(--border);border-radius:14px;background:#151719;padding:14px;display:flex;flex-direction:column;gap:12px;box-shadow:0 10px 30px rgba(0,0,0,.18)}
-.task-card-header{display:flex;justify-content:space-between;gap:12px;align-items:center}
-.task-card-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.task-phase-badge{padding:3px 8px;border-radius:999px;font-size:11px;background:#22262c;color:var(--muted);border:1px solid #31353c}
-.task-card-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
-.task-summary-item{background:#1c1f24;border-radius:10px;padding:10px}
-.task-summary-label{font-size:11px;color:var(--muted)}
-.task-summary-value{margin-top:4px;font-size:13px;font-weight:600}
-.task-view-tabs{display:flex;gap:8px;padding-bottom:4px;border-bottom:1px solid var(--border)}
-.task-view-tab{padding:6px 12px;border:1px solid var(--border);border-radius:999px;color:var(--muted)}
-.task-view-tab.active{background:#253246;border-color:#40639f;color:#fff}
+.task-card{border:1px solid #d9e1ec;border-radius:18px;background:linear-gradient(180deg,#ffffff,#f8fafc);padding:14px 16px;display:flex;flex-direction:column;gap:10px;box-shadow:0 2px 6px rgba(15,23,42,.04)}
+.task-card-header{display:flex;justify-content:space-between;gap:10px;align-items:center}
+.task-card-meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.task-phase-badge{padding:3px 8px;border-radius:999px;font-size:10px;background:#f3f4f6;color:#374151;border:1px solid #d1d5db;font-weight:600}
+.task-card-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;align-items:stretch}
+.task-summary-item{background:#f8fafc;border:1px solid #d9e1ec;border-radius:10px;padding:8px 10px;min-height:0}
+.task-summary-label{font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:.06em}
+.task-summary-value{margin-top:3px;font-size:13px;font-weight:700;color:#111827;line-height:1.2}
 .task-panel{display:none}
-.task-panel.active{display:flex;flex-direction:column}
-.task-progress{display:flex;flex-direction:column;gap:8px}
-.task-progress-line{font-size:12px;color:var(--muted);white-space:pre-wrap;word-break:break-word;background:#1a1d21;border:1px solid #252932;border-radius:10px;padding:10px 12px}
-.task-progress-empty{font-size:12px;color:#686d75}
-.trace-timeline{position:relative;display:flex;flex-direction:column;gap:12px;padding-left:18px}
-.trace-timeline::before{content:'';position:absolute;left:5px;top:4px;bottom:4px;width:1px;background:#31353c}
-.trace-step{position:relative;padding:12px 14px;border-radius:12px;background:#1a1d21;border:1px solid #2b3038}
-.trace-step::before{content:'';position:absolute;left:-18px;top:18px;width:10px;height:10px;border-radius:50%;background:#5b8cff;border:2px solid #111213}
-.trace-step.done::before{background:#81c995}.trace-step.waiting::before{background:#f0c674}.trace-step.failed::before{background:#f4837a}
-.trace-step-header{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
-.trace-step-title{font-size:13px;font-weight:600}
-.trace-step-meta{font-size:11px;color:var(--muted)}
-.trace-step-body{margin-top:8px;font-size:12px;color:#c7cbd1;white-space:pre-wrap;word-break:break-word}
+.task-panel.active{display:flex;flex-direction:column;gap:8px}
+.task-progress{display:flex;flex-direction:column;gap:6px}
+.task-progress-line{font-size:12px;color:#334155;white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid #d9e1ec;border-left:2px solid #91caff;border-radius:10px;padding:8px 10px}
+.task-progress-empty{font-size:12px;color:#94a3b8}
+.trace-timeline-scroll{min-height:0;max-height:min(72vh,1400px);overflow-y:auto;overscroll-behavior:contain;padding-right:4px}
+.trace-timeline{position:relative;display:flex;flex-direction:column;gap:8px;padding-left:18px;padding-bottom:6px}
+.trace-timeline::before{content:'';position:absolute;left:6px;top:6px;bottom:6px;width:2px;background:linear-gradient(180deg,#cbd5e1,#dbe5f0)}
+.trace-step{position:relative;padding:7px 10px;border-radius:10px;background:#ffffff;border:1px solid #d9e1ec;box-shadow:0 1px 1px rgba(15,23,42,.03)}
+.trace-step::before{content:'';position:absolute;left:-12px;top:10px;width:8px;height:8px;border-radius:50%;background:#8b95a7;border:2px solid #f8fafc;box-shadow:none}
+.trace-step.done::before{background:#52c41a}.trace-step.waiting::before{background:#faad14}.trace-step.failed::before{background:#ff4d4f}
+.trace-step-header{display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:nowrap}
+.trace-step-header > div:first-child{display:flex;align-items:center;gap:8px;min-width:0;flex:1}
+.trace-step-title{font-size:12px;font-weight:700;color:#111827;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.trace-step-meta{font-size:10px;color:#64748b;background:#f8fafc;border-radius:999px;padding:1px 6px;border:1px solid #dbe4ee;white-space:nowrap;flex-shrink:0}
+.trace-step-body{margin-top:2px;font-size:11px;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.35}
 .task-card-header{display:flex;justify-content:space-between;gap:12px;align-items:center}
 .task-card-title{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .task-card-state{font-size:12px;color:var(--muted);flex:none}
@@ -120,24 +171,97 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .task-progress{display:flex;flex-direction:column;gap:3px;border-top:1px solid var(--border);padding-top:7px}
 .task-progress-line{font-size:12px;color:var(--muted);white-space:pre-wrap;word-break:break-word}
 .task-progress-empty{font-size:12px;color:#686d75}
-.task-card .message.approval{max-width:100%;align-self:stretch;margin-top:2px}
-.message.approval{align-self:flex-start;max-width:85%;background:var(--panel);border:1px solid #6b4f1d;border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:6px}
-.approval-title{font-weight:600;color:#f0c674}
-.approval-row{font-size:12px;color:var(--muted);word-break:break-all}
-.approval-preview{margin:4px 0 0;padding:8px;background:#101113;border:1px solid var(--border);border-radius:6px;font-size:12px;max-height:220px;overflow:auto;white-space:pre-wrap}
-.approval-actions{display:flex;gap:8px;margin-top:4px;align-items:center}
-.approval-btn{padding:6px 14px;border:1px solid var(--border)}
-.approval-btn.approve{background:#2f5d3a;border-color:#3c7a4b}
-.approval-btn.deny{background:#5d2f2f;border-color:#7a3c3c}
+.task-card .message.approval{max-width:100%;align-self:stretch;margin-top:4px}
+.message.approval{align-self:flex-start;max-width:min(920px,100%);background:linear-gradient(180deg,#ffffff,#f8fafc);border:1px solid #d9e1ec;border-radius:18px;padding:10px 12px;display:flex;flex-direction:column;gap:8px;box-shadow:0 6px 14px rgba(15,23,42,.05);position:relative;overflow:hidden}
+.message.approval::before{content:'';position:absolute;inset:0;background:radial-gradient(circle at top right,rgba(255,240,201,.08),transparent 32%);pointer-events:none}
+.approval-hero{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}
+.approval-title{font-size:15px;font-weight:700;color:#1f2937;letter-spacing:-.02em;line-height:1.1}
+.approval-subtitle{margin-top:1px;font-size:11px;color:#64748b;line-height:1.35}
+.approval-risk{padding:5px 10px;border-radius:999px;background:#f5efe3;border:1px solid #e6d9bd;font-size:11px;color:#7c5b2a;white-space:nowrap}
+.approval-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:8px}
+.approval-item{padding:7px 9px;border-radius:10px;background:#f8fafc;border:1px solid #d9e1ec}
+.approval-label{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#94a3b8;margin-bottom:5px}
+.approval-value{font-size:13px;color:#334155;line-height:1.5;word-break:break-word}
+.approval-preview{margin:0;padding:8px 10px;background:#f8fafc;border:1px solid #d9e1ec;border-radius:10px;font-size:11px;max-height:180px;overflow:auto;white-space:pre-wrap;color:#334155;line-height:1.45;box-shadow:none}
+.approval-actions{display:flex;gap:10px;margin-top:0;align-items:center}
+.approval-btn{padding:11px 18px;border-radius:14px;border:1px solid transparent;font-weight:700;letter-spacing:.01em;transition:transform .18s ease,box-shadow .18s ease,filter .18s ease,background .18s ease,border-color .18s ease;position:relative;overflow:hidden}
+.approval-btn:hover{transform:translateY(-1px);filter:brightness(1.04)}
+.approval-btn:active{transform:translateY(1px) scale(.98)}
+.approval-btn:focus-visible{outline:none;box-shadow:0 0 0 4px rgba(255,248,220,.18)}
+.approval-btn::after{content:'';position:absolute;inset:0;background:linear-gradient(120deg,transparent,rgba(255,255,255,.18),transparent);opacity:0;transition:opacity .18s ease}
+.approval-btn:hover::after{opacity:1}
+.approval-btn.approve{background:linear-gradient(135deg,#809671,#5f7752);border-color:#a9be9b;color:#f6fff2;box-shadow:0 10px 20px rgba(96,119,82,.28)}
+.approval-btn.deny{background:linear-gradient(135deg,#8f5c5c,#704545);border-color:#b78d8d;color:#fff4f4;box-shadow:0 10px 20px rgba(112,69,69,.24)}
+.markdown-list{margin:14px 0;padding-left:18px;color:#475569;display:flex;flex-direction:column;gap:10px;line-height:1.7}
+.markdown-list li::marker{color:#94a3b8}
+.markdown-table{width:100%;border-collapse:separate;border-spacing:0;margin:18px 0;background:#ffffff;border:1px solid #d9e1ec;border-radius:18px;overflow:hidden;box-shadow:0 10px 30px rgba(15,23,42,.06)}
+.markdown-table th,.markdown-table td{padding:12px 14px;border-bottom:1px solid #e8edf5;text-align:left;font-size:13px;color:#475569;vertical-align:top}
+.markdown-table tr:last-child td{border-bottom:none}
+.markdown-table th{background:#f8fafc;color:#0f172a;font-weight:700}
+.tool-call-card{margin:16px 0;padding:18px 20px;border-radius:20px;background:#fff;border:1px solid #dbe3ee;box-shadow:0 10px 28px rgba(15,23,42,.06);display:flex;flex-direction:column;gap:14px}
+.tool-call-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-bottom:12px;border-bottom:1px solid #edf2f7}
+.tool-call-title-wrap{display:flex;align-items:center;gap:10px;min-width:0}
+.tool-call-title{font-size:15px;font-weight:700;color:#0f172a;white-space:nowrap}
+.tool-call-subtitle{font-size:13px;color:#64748b;line-height:1.5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tool-call-badge{padding:5px 10px;border-radius:999px;background:#f1f5f9;color:#475569;font-size:11px;font-weight:600;white-space:nowrap}
+.tool-call-grid{display:flex;flex-direction:column;gap:10px}
+.tool-call-item{display:grid;grid-template-columns:120px minmax(0,1fr);gap:14px;padding:10px 0;border-bottom:1px dashed #e2e8f0;align-items:start}
+.tool-call-item:last-child{border-bottom:none;padding-bottom:0}
+.tool-call-label{font-size:12px;font-weight:600;color:#64748b}
+.tool-call-value{font-size:14px;color:#1e293b;line-height:1.7;word-break:break-word}
+.tool-call-primary{font-weight:700;color:#0f172a}
+.tool-call-markdown{background:linear-gradient(180deg,#fbfdff 0%,#f8fafc 100%);border:1px solid #dbe3ee;border-radius:18px;padding:18px;display:flex;flex-direction:column;gap:14px;overflow:hidden}
+.tool-call-markdown p{margin:0 0 12px;color:#475569;line-height:1.75}
+.tool-call-markdown p:last-child{margin-bottom:0}
+.tool-call-markdown h1,.tool-call-markdown h2,.tool-call-markdown h3{margin:0 0 10px;color:#0f172a;letter-spacing:-.01em}
+.tool-call-markdown code{background:#eef2ff;color:#4338ca;padding:2px 6px;border-radius:6px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.tool-call-markdown hr{border:none;border-top:1px solid #dbe3ee;margin:16px 0}
+.diff-viewer{display:flex;flex-direction:column;gap:14px;border:1px solid #d9e2ec;border-radius:16px;background:#ffffff;overflow:hidden;box-shadow:0 8px 24px rgba(15,23,42,.05)}
+.diff-viewer-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;background:#f8fafc;border-bottom:1px solid #e5edf5}
+.diff-viewer-title{font-size:13px;font-weight:700;color:#0f172a}
+.diff-viewer-actions{display:flex;align-items:center;gap:10px}
+.diff-viewer-toggle{border:1px solid #cbd5e1;background:#ffffff;color:#334155;border-radius:999px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer;transition:all .18s ease}
+.diff-viewer-toggle:hover{background:#eff6ff;border-color:#93c5fd;color:#1d4ed8}
+.diff-viewer-meta{font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em}
+.diff-viewer-body{display:flex;flex-direction:column;gap:14px;padding-bottom:14px}
+.diff-viewer-body.collapsed{max-height:240px;overflow:hidden;position:relative}
+.diff-viewer-body.collapsed::after{content:'';position:absolute;left:0;right:0;bottom:0;height:72px;background:linear-gradient(180deg,rgba(255,255,255,0) 0%,#ffffff 100%);pointer-events:none}
+.diff-section{display:flex;flex-direction:column;gap:8px;padding:0 14px}
+.diff-section-label{display:flex;align-items:center;justify-content:space-between;font-size:12px;font-weight:700;color:#475569}
+.diff-code-block{position:relative;border-radius:14px;border:1px solid #e2e8f0;background:#fcfcfd;overflow:auto}
+.diff-code-block.added{background:#f3fbf5;border-color:#cfe8d5}
+.diff-code-block.removed{background:#fff6f5;border-color:#efd4d1}
+.diff-code-block pre{margin:0;padding:16px 18px;font-size:12px;line-height:1.75;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#334155;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
+.diff-code-block.added pre{color:#1f5130}
+.diff-code-block.removed pre{color:#7f1d1d}
+.diff-inline-tag{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:700}
+.diff-inline-tag.added{background:#dcfce7;color:#166534}
+.diff-inline-tag.removed{background:#fee2e2;color:#991b1b}
+.diff-muted{font-size:12px;color:#94a3b8;line-height:1.6}
+.change-list{display:flex;flex-direction:column;gap:12px;margin-top:8px}
+.change-list{display:flex;flex-direction:column;gap:4px;margin:2px 0}
+.change-item{padding:8px 10px;background:#fff;border:1px solid #e2e8f0;border-radius:10px}
+.change-item-title{font-size:11px;font-weight:700;color:#334155;margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em}
+.change-item-body{font-size:12px;color:#475569;line-height:1.45}
+.change-bullet{display:flex;gap:8px;margin-top:6px}
+.change-bullet::before{content:'•';color:#94a3b8;font-weight:700}
+@media(max-width:720px){.tool-call-header{align-items:flex-start;flex-direction:column}.tool-call-item{grid-template-columns:1fr;gap:6px}}
 .empty-state{margin:auto;text-align:center;color:var(--muted);display:flex;flex-direction:column;gap:12px;align-items:center}
 .empty-state h2{margin:0;font-size:15px;font-weight:500;color:var(--text)}
 .link-btn{color:var(--accent)}
-.composer{padding:12px 20px 20px;display:flex;flex-direction:column;gap:8px}
-.composer-box{border:1px solid var(--border);border-radius:10px;padding:10px 12px;background:var(--panel)}
-.composer-box:focus-within{border-color:#3c4046}
-textarea{width:100%;min-height:48px;max-height:180px;background:none;border:none;color:var(--text);font:inherit;resize:none;outline:none}
-.composer-actions{display:flex;align-items:center;justify-content:space-between;margin-top:6px}
-.send-btn{background:var(--accent);color:#fff;padding:6px 16px}
+.composer{padding:8px 20px 10px;display:flex;flex-direction:column;gap:6px;background:#f7f9fc;border-top:1px solid #e2e8f0}
+.composer-box{border:1px solid #dbe3ee;border-radius:16px;padding:10px 12px;background:#ffffff;box-shadow:none}
+.composer-box:focus-within{border-color:#91caff;box-shadow:0 0 0 2px rgba(22,119,255,.08)}
+.composer-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
+.composer-title{font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#94a3b8}
+.composer-hint{font-size:11px;color:var(--muted);white-space:nowrap;display:flex;align-items:center;min-height:36px}
+.composer-input-row{display:flex;align-items:center;gap:10px;min-width:0}
+.textarea-wrap{flex:1;min-width:0;display:flex;align-items:center}
+textarea{width:100%;min-height:48px;max-height:140px;background:#ffffff;border:1px solid #e2e8f0;color:#0f172a;font:inherit;font-size:14px;line-height:1.45;resize:none;outline:none;padding:10px 12px;border-radius:12px;transition:border-color .2s ease,background .2s ease,box-shadow .2s ease}
+textarea:focus{border-color:#91caff;background:#ffffff;box-shadow:0 0 0 3px rgba(22,119,255,.08)}
+textarea::placeholder{color:#94a3b8}
+.composer-actions{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-shrink:0;min-height:48px}
+.send-btn{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:linear-gradient(135deg,#4096ff,#1677ff);color:#fff;padding:9px 16px;border-radius:999px;font-weight:600;letter-spacing:.01em;box-shadow:0 6px 14px rgba(22,119,255,.16)}
 .send-btn:disabled{background:#3a4560}
 .preview-list{display:flex;gap:8px;overflow:auto}
 .preview-item{position:relative;flex:none}
@@ -147,7 +271,10 @@ textarea{width:100%;min-height:48px;max-height:180px;background:none;border:none
 .loading,.error-banner{display:none;font-size:13px;color:var(--muted);padding:0 20px}
 .loading.visible,.error-banner.visible{display:block}
 .error-banner{color:#f4837a}
-@media(max-width:900px){.layout{grid-template-columns:1fr;height:auto}.sidebar{border-right:none;border-bottom:1px solid var(--border)}.trace-board{grid-template-columns:1fr}.trace-sidebar{position:static}.task-card-summary{grid-template-columns:1fr}}
+@media(max-width:1500px){.workspace-stage{grid-template-columns:minmax(0,1fr) 380px}.trace-board{grid-template-columns:minmax(0,1fr) 220px}}
+@media(max-width:1280px){.workspace-stage{grid-template-columns:1fr}.trace-board{grid-template-columns:1fr}.trace-sidebar{position:static;order:-1;opacity:.72}.task-card-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.trace-future-grid{grid-template-columns:1fr}}
+@media(max-width:1024px){.layout{grid-template-columns:1fr;height:auto}.sidebar{display:none}.topbar{padding-inline:16px}.chat-shell{padding:16px 16px 14px}.chat-area,.trace-pane{padding:14px}.message.user{max-width:100%}.composer{padding:8px 14px 10px}.composer-box{padding:9px 10px}.textarea{min-height:44px}}
+@media(max-width:720px){.trace-board{gap:8px}.task-card-summary{grid-template-columns:1fr}.chat-area,.trace-pane{padding:10px 12px 18px}.task-card{padding:9px 10px}.trace-step{padding-block:6px}.composer{padding:8px 10px}.composer-meta{align-items:flex-start;flex-direction:column;gap:3px}.composer-input-row{align-items:stretch;flex-wrap:wrap}.composer-actions{width:100%;justify-content:space-between}.send-btn{padding:8px 14px}.composer-hint{white-space:normal}}
 </style>
 </head>
 <body>
@@ -178,24 +305,49 @@ textarea{width:100%;min-height:48px;max-height:180px;background:none;border:none
     <div id=\"error-banner\" class=\"error-banner\"></div>
     <div id=\"loading\" class=\"loading\">正在等待运行结果…</div>
     <div class=\"chat-shell\">
-      <div class=\"view-switcher\">
-        <div class=\"view-tabs\">
-          <button id=\"conversation-tab\" class=\"view-tab active\" onclick=\"switchPrimaryView('conversation')\">Conversation</button>
-          <button id=\"trace-tab\" class=\"view-tab\" onclick=\"switchPrimaryView('trace')\">Trace</button>
-        </div>
-        <div id=\"view-summary\" class=\"view-summary\">聚焦当前对话与执行过程</div>
+      <div class=\"workspace-stage\">
+        <section class=\"pane-shell\">
+          <div class=\"pane-header\">
+            <div>
+              <div class=\"pane-title\">实时对话</div>
+              <div class=\"pane-subtitle\">持续展示会话上下文、tool call 与 patch diff 输出</div>
+            </div>
+            <div class=\"pane-badge\">Conversation Live</div>
+          </div>
+          <section id=\"chat-area\" class=\"chat-area\"></section>
+        </section>
+        <aside class=\"pane-shell\">
+          <div class=\"pane-header\">
+            <div>
+              <div class=\"pane-title\">执行轨迹</div>
+              <div class=\"pane-subtitle\">实时 Trace Timeline，并为未来节点图与链路分析预留结构</div>
+            </div>
+            <div class=\"pane-badge\">Trace Graph Ready</div>
+          </div>
+          <section id=\"trace-pane\" class=\"trace-pane\"></section>
+        </aside>
       </div>
-      <section id=\"chat-area\" class=\"chat-area\"></section>
     </div>
 
     <div class=\"composer\">
       <div id=\"preview-list\" class=\"preview-list\"></div>
       <div class=\"composer-box\">
-        <textarea id=\"prompt\" placeholder=\"请输入希望助手完成的任务，可直接粘贴图片…\" onpaste=\"handlePaste(event)\"></textarea>
-        <div class=\"composer-actions\">
-          <button class=\"icon-btn\" onclick=\"document.getElementById('image-input').click()\" title=\"上传图片\">＋ 图片</button>
-          <input id=\"image-input\" type=\"file\" accept=\"image/*\" multiple onchange=\"handleImages(event)\" style=\"display:none\" />
-          <button class=\"send-btn\" onclick=\"runTask()\">发送</button>
+        <div class=\"composer-meta\">
+          <div>
+            <div class=\"composer-title\">当前任务</div>
+            <div class=\"composer-hint\">Enter 发送消息，Shift + Enter 换行</div>
+          </div>
+          <div class=\"composer-hint\">支持粘贴截图与 markdown</div>
+        </div>
+        <div class=\"composer-input-row\">
+          <div class=\"textarea-wrap\">
+            <textarea id=\"prompt\" placeholder=\"描述你希望完成的任务、修复的问题或需要分析的内容…\" onpaste=\"handlePaste(event)\"></textarea>
+          </div>
+          <div class=\"composer-actions\">
+            <button class=\"icon-btn\" onclick=\"document.getElementById('image-input').click()\" title=\"上传图片\">＋ 图片</button>
+            <input id=\"image-input\" type=\"file\" accept=\"image/*\" multiple onchange=\"handleImages(event)\" style=\"display:none\" />
+            <button class=\"send-btn\" onclick=\"runTask()\">发送</button>
+          </div>
         </div>
       </div>
     </div>
@@ -207,23 +359,65 @@ const selectedImages = [];
 const workspaces = [];
 const conversations = [];
 const ACTIVE_WORKSPACE_STORAGE_KEY = 'tsm-agt.active-workspace';
+const DRAFT_STORAGE_PREFIX = 'tsm-agt.draft.';
 let activeConversationId = null;
 let activeWorkspaceId = localStorage.getItem(ACTIVE_WORKSPACE_STORAGE_KEY);
-let activePrimaryView = 'conversation';
+const traceVisualizationState = {
+  mode: 'timeline',
+  graph: {
+    nodes: [],
+    edges: [],
+    lanes: [],
+  },
+  timeline: {
+    groups: [],
+    liveCursor: 0,
+  },
+};
 
 function getConversationById(conversationId) {
   return conversations.find((item) => item.id === conversationId);
 }
 
+function draftStorageKey(conversationId) {
+  return `${DRAFT_STORAGE_PREFIX}${conversationId}`;
+}
+
 function persistActiveDraft() {
   const active = getActiveConversation();
   if (!active) return;
-  active.draft = document.getElementById('prompt').value;
+  const value = document.getElementById('prompt').value;
+  active.draft = value;
+  sessionStorage.setItem(draftStorageKey(active.id), value);
+}
+
+function resolveConversationDraft(activeConversation, persistedDraft) {
+  // Composer restore is intentionally isolated from task projections,
+  // summaries, titles, runtime trace text, and message-derived metadata.
+  // Only explicit draft state may hydrate the input field after refresh.
+  if (typeof persistedDraft === 'string') {
+    return persistedDraft;
+  }
+
+  if (typeof activeConversation?.draft === 'string') {
+    return activeConversation.draft;
+  }
+
+  return '';
 }
 
 function restoreConversationDraft() {
   const active = getActiveConversation();
-  document.getElementById('prompt').value = active?.draft || '';
+  if (!active) {
+    document.getElementById('prompt').value = '';
+    return;
+  }
+
+  const persistedDraft = sessionStorage.getItem(draftStorageKey(active.id));
+  const draft = resolveConversationDraft(active, persistedDraft);
+
+  active.draft = draft;
+  document.getElementById('prompt').value = draft;
 }
 
 function getActiveWorkspace() {
@@ -388,19 +582,272 @@ function renderConversations() {
   document.getElementById('conversation-name').textContent = active?.title || '新建会话';
 }
 
-function switchPrimaryView(view) {
-  activePrimaryView = view;
-  document.getElementById('conversation-tab').classList.toggle('active', view === 'conversation');
-  document.getElementById('trace-tab').classList.toggle('active', view === 'trace');
-  document.getElementById('view-summary').textContent = view === 'trace'
-    ? '按阶段查看 Agent 执行链路、状态与关键事件'
-    : '聚焦用户对话、结果输出与上下文交流';
-  renderMessages();
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
 }
 
-function renderMessages() {
+function renderInlineMarkdown(text) {
+  return text
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+}
+
+function renderStructuredToolCall(content) {
+  const rows = content.split('\\n').filter((line) => line.includes('：'));
+  if (rows.length < 2) return null;
+
+  const priorityLabels = ['工具', '操作', '命令', '文件', '状态'];
+  const summary = [];
+  const details = [];
+
+  rows.forEach((line) => {
+    const [label, ...rest] = line.split('：');
+    const cleanLabel = label.trim();
+    const value = rest.join('：').trim();
+    if (!value) return;
+
+    const isPrimary = priorityLabels.some((item) => cleanLabel.includes(item));
+    const rowHtml = `
+      <div class="tool-call-item">
+        <div class="tool-call-label">${renderInlineMarkdown(cleanLabel)}</div>
+        <div class="tool-call-value ${isPrimary ? 'tool-call-primary' : ''}">${renderInlineMarkdown(value)}</div>
+      </div>
+    `;
+
+    if (isPrimary) {
+      summary.push(rowHtml);
+    } else if (!cleanLabel.includes('metadata') && !cleanLabel.includes('trace')) {
+      details.push(rowHtml);
+    }
+  });
+
+  const contentHtml = [...summary, ...details].join('');
+
+  return `
+    <section class="tool-call-card">
+      <div class="tool-call-header">
+        <div class="tool-call-title-wrap">
+          <div class="tool-call-title">工具调用</div>
+          <div class="tool-call-subtitle">聚焦关键操作与执行结果</div>
+        </div>
+        <div class="tool-call-badge">Live</div>
+      </div>
+      <div class="tool-call-grid">${contentHtml}</div>
+    </section>
+  `;
+}
+
+function renderDiffBlocks(text) {
+  const lines = text.split('\\n');
+  const sections = [];
+  let current = null;
+
+  lines.forEach((line) => {
+    const normalized = line.trim();
+    if (/^(原内容|Old|Before)/i.test(normalized)) {
+      current = { type: 'removed', title: '修改前', lines: [] };
+      sections.push(current);
+      return;
+    }
+    if (/^(新内容|New|After)/i.test(normalized)) {
+      current = { type: 'added', title: '修改后', lines: [] };
+      sections.push(current);
+      return;
+    }
+    if (/^(---|\+\+\+|@@)/.test(normalized) || normalized.includes('metadata') || normalized.includes('mutation')) {
+      return;
+    }
+    if (!current) {
+      current = { type: 'neutral', title: '变更内容', lines: [] };
+      sections.push(current);
+    }
+    current.lines.push(line);
+  });
+
+  const meaningfulSections = sections.filter((section) => section.lines.join('').trim());
+  if (!meaningfulSections.length || text.length < 120) {
+    return null;
+  }
+
+  const body = meaningfulSections.map((section) => {
+    const typeClass = section.type === 'added' ? 'added' : section.type === 'removed' ? 'removed' : '';
+    const badge = section.type === 'added'
+      ? '<span class="diff-inline-tag added">新增</span>'
+      : section.type === 'removed'
+        ? '<span class="diff-inline-tag removed">旧版</span>'
+        : '<span class="diff-muted">结构化展示已启用</span>';
+
+    return `
+      <div class="diff-section">
+        <div class="diff-section-label">
+          <span>${section.title}</span>
+          ${badge}
+        </div>
+        <div class="diff-code-block ${typeClass}">
+          <pre>${escapeHtml(section.lines.join('\\n').trim())}</pre>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  const collapseId = `diff-${Math.random().toString(36).slice(2, 10)}`;
+
+  return `
+    <div class="diff-viewer">
+      <div class="diff-viewer-header">
+        <div>
+          <div class="diff-viewer-title">Patch Diff</div>
+          <div class="diff-muted">聚焦真实改动内容，弱化 metadata 与原始 dump 输出</div>
+        </div>
+        <div class="diff-viewer-actions">
+          <button class="diff-viewer-toggle" type="button" data-diff-toggle="${collapseId}" aria-expanded="false">展开完整内容</button>
+          <div class="diff-viewer-meta">Modern Viewer</div>
+        </div>
+      </div>
+      <div class="diff-viewer-body collapsed" data-diff-body="${collapseId}">
+        ${body}
+      </div>
+    </div>
+  `;
+}
+
+function renderMarkdown(text) {
+  const escaped = escapeHtml(text || '');
+  const lines = escaped.split('\\n');
+  const blocks = [];
+  let paragraph = [];
+  let codeFence = null;
+
+  function flushParagraph() {
+    if (!paragraph.length) return;
+    const content = paragraph.join('<br />');
+    blocks.push(`<p>${renderInlineMarkdown(content)}</p>`);
+    paragraph = [];
+  }
+
+  function flushCodeFence() {
+    if (!codeFence) return;
+    const language = codeFence.language || 'code';
+    const code = codeFence.lines.join('\\n');
+    const isTerminal = ['bash', 'shell', 'sh', 'zsh', 'terminal'].includes(language);
+    blocks.push(isTerminal
+      ? `<div class="terminal-block"><div class="terminal-header"><span class="terminal-dot"></span><span>${language}</span></div><div class="terminal-body">${code}</div></div>`
+      : `<div class="code-block-shell"><div class="code-block-header"><span>${language}</span></div><pre><code>${code}</code></pre></div>`);
+    codeFence = null;
+  }
+
+  lines.forEach((line) => {
+    const fence = line.match(/^```(.*)$/);
+    if (fence) {
+      if (codeFence) {
+        flushCodeFence();
+      } else {
+        flushParagraph();
+        codeFence = { language: (fence[1] || '').trim().toLowerCase(), lines: [] };
+      }
+      return;
+    }
+
+    if (codeFence) {
+      codeFence.lines.push(line);
+      return;
+    }
+
+    if (!line.trim()) {
+      flushParagraph();
+      return;
+    }
+
+    const heading = line.match(/^(#{1,3})\s+(.*)$/);
+    if (heading) {
+      flushParagraph();
+      const level = heading[1].length;
+      blocks.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+      return;
+    }
+
+    if (line.startsWith('- ') || line.startsWith('* ')) {
+      flushParagraph();
+      const items = [line];
+      blocks.push(`<ul class="markdown-list"><li>${renderInlineMarkdown(line.slice(2))}</li></ul>`);
+      return;
+    }
+
+    if (line === '---') {
+      flushParagraph();
+      blocks.push('<hr />');
+      return;
+    }
+
+    paragraph.push(renderInlineMarkdown(line));
+  });
+
+  const structured = renderStructuredToolCall(escaped);
+  flushCodeFence();
+  flushParagraph();
+
+  const markdownHtml = blocks.join('')
+    .replace(/<ul class="markdown-list">([\s\S]*?)<\/ul>/g, '<div class="change-list"><div class="change-item"><div class="change-item-title">改动清单</div><div class="change-item-body">$1</div></div></div>')
+    .replace(/<li>/g, '<div class="change-bullet"><div>')
+    .replace(/<\/li>/g, '</div></div>');
+
+  const diffHtml = renderDiffBlocks(text || '');
+
+  return `<div class="message-section"><div class="message-body">${structured || ''}<div class="tool-call-markdown">${diffHtml || ''}${markdownHtml}</div></div></div>`;
+}
+
+let shouldAutoFollowChat = true;
+let lastConversationScrollTop = 0;
+const CHAT_FOLLOW_THRESHOLD = 96;
+
+function isNearChatBottom(chatArea) {
+  if (!chatArea) return true;
+  const remaining = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight;
+  return remaining <= CHAT_FOLLOW_THRESHOLD;
+}
+
+function syncChatFollowState(chatArea) {
+  if (!chatArea) return;
+  shouldAutoFollowChat = isNearChatBottom(chatArea);
+  lastConversationScrollTop = chatArea.scrollTop;
+}
+
+function ensureChatScrollTracking(chatArea) {
+  if (!chatArea || chatArea.dataset.scrollTrackingBound === 'true') return;
+  chatArea.dataset.scrollTrackingBound = 'true';
+  chatArea.addEventListener('scroll', () => {
+    syncChatFollowState(chatArea);
+  }, { passive: true });
+}
+
+document.addEventListener('click', (event) => {
+  const toggle = event.target.closest('[data-diff-toggle]');
+  if (!toggle) {
+    return;
+  }
+
+  const diffId = toggle.dataset.diffToggle;
+  const body = document.querySelector(`[data-diff-body="${diffId}"]`);
+  if (!body) {
+    return;
+  }
+
+  const collapsed = body.classList.toggle('collapsed');
+  toggle.textContent = collapsed ? '展开完整内容' : '收起内容';
+  toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+});
+
+function renderMessages(forceScrollToBottom = false) {
   const active = getActiveConversation();
   const chatArea = document.getElementById('chat-area');
+  const previousScrollTop = chatArea.scrollTop;
+  const shouldStickToBottom = forceScrollToBottom || shouldAutoFollowChat || isNearChatBottom(chatArea);
+  ensureChatScrollTracking(chatArea);
   chatArea.innerHTML = '';
 
   if (!activeWorkspaceId) {
@@ -411,6 +858,7 @@ function renderMessages() {
         <button class='link-btn' onclick='pickWorkspace()'>添加目录</button>
       </div>
     `;
+    renderTracePane(null);
     return;
   }
 
@@ -421,6 +869,7 @@ function renderMessages() {
         <button class='link-btn' onclick='createConversation()'>新建会话</button>
       </div>
     `;
+    renderTracePane(null);
     return;
   }
 
@@ -431,12 +880,7 @@ function renderMessages() {
         <div>描述一个任务，或上传图片继续</div>
       </div>
     `;
-    return;
-  }
-
-  if (activePrimaryView === 'trace') {
-    renderTraceView(chatArea, active);
-    chatArea.scrollTop = 0;
+    renderTracePane(active);
     return;
   }
 
@@ -453,7 +897,7 @@ function renderMessages() {
     } else {
       const body = document.createElement('div');
       body.className = 'message-body';
-      body.textContent = text;
+      body.innerHTML = renderMarkdown(text);
       element.appendChild(body);
 
       // Attachments render under the text so the prompt stays readable.
@@ -474,16 +918,109 @@ function renderMessages() {
     chatArea.appendChild(element);
   });
 
-  chatArea.scrollTop = chatArea.scrollHeight;
+  // The trace pane is a sibling view, not a tail step of chat scrolling. It must
+  // render on every pass; keeping it after the scroll branches meant the whole
+  // panel stayed blank in the common "stick to bottom" case.
+  renderTracePane(active);
+
+  if (shouldStickToBottom) {
+    chatArea.scrollTop = chatArea.scrollHeight;
+    shouldAutoFollowChat = true;
+    lastConversationScrollTop = chatArea.scrollTop;
+    return;
+  }
+
+  const maxScrollTop = Math.max(0, chatArea.scrollHeight - chatArea.clientHeight);
+  chatArea.scrollTop = Math.min(lastConversationScrollTop || previousScrollTop || 0, maxScrollTop);
+}
+
+function renderTracePane(conversation) {
+  const tracePane = document.getElementById('trace-pane');
+  if (!tracePane) return;
+  if (!conversation) {
+    tracePane.innerHTML = '';
+    return;
+  }
+  renderTraceView(tracePane, conversation);
 }
 
 const 风险文案 = { R0: '无副作用', R1: '低风险', R2: '需授权', R3: '高风险' };
 
-function taskStateClass(phase1State) {
-  if (phase1State === 'DONE') return 'done';
-  if (phase1State === 'FAILED' || phase1State === 'CANCELLED') return 'failed';
-  if (phase1State === 'WAITING' || phase1State === 'INTERRUPTED') return 'waiting';
+function taskStateClass(task) {
+  const state = task?.projection?.display_status || task?.phase1State;
+  if (state === 'completed' || state === 'DONE') return 'done';
+  if (state === 'failed' || state === 'cancelled' || state === 'FAILED' || state === 'CANCELLED') return 'failed';
+  if (state === 'waiting' || state === 'interrupted' || state === 'WAITING' || state === 'INTERRUPTED') return 'waiting';
   return 'running';
+}
+
+function applyTaskProjection(task, projection) {
+  if (!task || !projection) return;
+  task.projection = projection;
+  task.traceCursor = Number(projection.trace_cursor || 0);
+  const display = projection.display_status;
+  task.phase1State = {
+    pending: 'PREPARING', running: 'RUNNING', waiting: 'WAITING',
+    interrupted: 'INTERRUPTED', failed: 'FAILED',
+    cancelled: 'CANCELLED', completed: 'DONE',
+  }[display] || task.phase1State;
+  task.status = {
+    waiting_approval: 'awaiting_approval',
+    waiting_input: 'awaiting_user',
+    interrupted: 'interrupted',
+    stopped: display === 'completed' ? 'completed' : 'failed',
+    running: 'running',
+  }[projection.execution_status] || task.status;
+  // A terminal snapshot is authoritative. Never let an old waiting/progress
+  // record keep an already failed/completed card looking active.
+  if (['failed', 'cancelled', 'completed'].includes(display)) {
+    task.waiting = null;
+  }
+}
+
+function taskProjection(task) {
+  return task?.projection || null;
+}
+
+function taskDisplayLabel(task) {
+  const projection = taskProjection(task);
+  if (projection) {
+    return {
+      pending: '准备中', running: '执行中', waiting: (
+        projection.execution_status === 'waiting_approval' ? '等待授权' : '等待输入'
+      ), interrupted: '已中断', failed: '已失败',
+      cancelled: '已取消', completed: '已完成',
+    }[projection.display_status] || projection.display_status;
+  }
+  if (task?.phase1State === 'WAITING') return taskWaitingLabel(task);
+  return 状态文案[task?.phase1State] || task?.phase1State || '准备中';
+}
+
+function taskWaitingLabel(task) {
+  const projection = taskProjection(task);
+  if (projection?.execution_status === 'waiting_approval') return '等待授权';
+  if (projection?.execution_status === 'waiting_input') return '等待输入';
+  if (task?.waiting?.kind === 'APPROVAL' || task?.status === 'awaiting_approval') return '等待授权';
+  if (task?.waiting || task?.status === 'awaiting_user') return '等待输入';
+  return '持续执行';
+}
+
+function taskPhaseLabel(task) {
+  const phase = taskProjection(task)?.phase;
+  if (!phase) return taskDisplayLabel(task);
+  return {
+    preparing: '准备阶段', executing: '执行阶段',
+    verifying: '验证阶段', finalizing: '收尾阶段',
+  }[phase] || phase;
+}
+
+function taskExecutionLabel(task) {
+  const projection = taskProjection(task);
+  if (!projection) return taskWaitingLabel(task);
+  return {
+    running: '持续执行', waiting_approval: '等待授权',
+    waiting_input: '等待输入', interrupted: '已中断', stopped: '已停止',
+  }[projection.execution_status] || projection.execution_status;
 }
 
 function traceStateForProgress(progress) {
@@ -498,6 +1035,29 @@ function traceStateForProgress(progress) {
 }
 
 function buildTraceSteps(task) {
+  const sortTraceSteps = (items) => items.sort((left, right) => {
+    const leftSequence = Number(left.startSequence || 0);
+    const rightSequence = Number(right.startSequence || 0);
+    return leftSequence - rightSequence;
+  });
+
+  const projectedTrace = taskProjection(task)?.trace;
+  if (Array.isArray(projectedTrace) && projectedTrace.length) {
+    const state = {
+      pending: 'running', running: 'running', completed: 'done',
+      failed: 'failed', cancelled: 'failed', unknown: 'failed',
+      waiting_approval: 'waiting', waiting_input: 'waiting', skipped: 'done',
+    };
+    return sortTraceSteps(projectedTrace.map((item) => ({
+      title: item.title,
+      body: item.wait_reason || item.kind,
+      state: state[item.status] || 'running',
+      meta: item.sequence_end
+        ? `#${item.sequence_start}–#${item.sequence_end}`
+        : `#${item.sequence_start}`,
+      startSequence: Number(item.sequence_start || 0),
+    })));
+  }
   const steps = [];
   const pendingTools = [];
   let pendingModel = null;
@@ -528,7 +1088,7 @@ function buildTraceSteps(task) {
         const stepIndex = pendingTools.splice(index, 1)[0];
         const step = steps[stepIndex];
         step.state = state;
-        step.body = `${step.body}\n${text}`;
+        step.body = `${step.body}\\n${text}`;
         step.meta = `#${step.startSequence || sequence}–#${sequence}`;
       } else {
         steps.push({
@@ -552,13 +1112,19 @@ function buildTraceSteps(task) {
     if (kind === 'model_completed' && pendingModel !== null) {
       const step = steps[pendingModel];
       step.state = 'done';
-      step.body = `${step.body}\n${text}`;
+      step.body = `${step.body}\\n${text}`;
       step.meta = `#${step.startSequence || sequence}–#${sequence}`;
       pendingModel = null;
       return;
     }
+    if (kind === 'waiting') {
+      // The authoritative current waiting payload below has richer structure
+      // (approval versus text input). Do not preserve an old generic progress
+      // line that would otherwise claim every wait is "等待输入".
+      return;
+    }
     steps.push({
-      title: kind === 'waiting' ? '等待用户操作' : '运行事件',
+      title: '运行事件',
       body: text,
       state: traceStateForProgress(progress),
       meta: `#${sequence || steps.length + 1}`,
@@ -576,13 +1142,41 @@ function buildTraceSteps(task) {
       startSequence: 0,
     });
   }
-  return steps.slice(-12);
+  return sortTraceSteps(steps);
 }
 
-function renderTraceView(chatArea, conversation) {
+function renderTraceView(tracePane, conversation) {
+  tracePane.innerHTML = '';
   const tasks = conversation.messages.filter((item) => item.role === 'task');
+
+  const futureBoard = document.createElement('div');
+  futureBoard.className = 'trace-future-grid';
+  futureBoard.innerHTML = `
+    <div class='trace-future-card'>
+      <div class='trace-future-title'>流程节点图容器</div>
+      <div class='trace-future-copy'>兼容 node / edge / lane 数据结构，可升级为真实 Agent Graph 与工具调用链路。</div>
+    </div>
+    <div class='trace-future-card'>
+      <div class='trace-future-title'>实时 Timeline 容器</div>
+      <div class='trace-future-copy'>兼容 sequence、cursor 与阶段聚合，可扩展为时间轴回放与事件过滤。</div>
+    </div>
+  `;
+  tracePane.appendChild(futureBoard);
+
   const board = document.createElement('div');
-  board.className = 'trace-board';
+  board.className = 'trace-live-board';
+
+  const traceGraphMeta = {
+    nodeCount: tasks.length,
+    edgeCount: Math.max(tasks.length - 1, 0),
+    liveCursor: tasks.reduce((max, item) => Math.max(max, Number(item.task?.traceCursor || 0)), 0),
+  };
+  traceVisualizationState.graph.nodes = tasks.map((item) => ({
+    id: item.task?.taskId,
+    type: 'task',
+    status: item.task?.status,
+  }));
+  traceVisualizationState.timeline.liveCursor = traceGraphMeta.liveCursor;
 
   const main = document.createElement('div');
   main.className = 'trace-main';
@@ -600,32 +1194,41 @@ function renderTraceView(chatArea, conversation) {
 
   const sidebar = document.createElement('div');
   sidebar.className = 'trace-sidebar';
-  const summary = document.createElement('div');
-  summary.className = 'trace-summary-card';
+  const overview = document.createElement('div');
+  overview.className = 'trace-overview-panel';
   const taskCount = tasks.length;
-  const runningCount = tasks.filter((item) => item.task?.phase1State === 'RUNNING').length;
-  const waitingCount = tasks.filter((item) => item.task?.phase1State === 'WAITING').length;
-  summary.innerHTML = `
-    <div class='trace-summary-title'>执行流程总览</div>
-    <div class='trace-metric-grid'>
+  const runningCount = tasks.filter((item) => (
+    item.task?.projection?.execution_status === 'running'
+    || (!item.task?.projection && item.task?.phase1State === 'RUNNING')
+  )).length;
+  const waitingCount = tasks.filter((item) => (
+    item.task?.projection?.display_status === 'waiting'
+    || (!item.task?.projection && item.task?.phase1State === 'WAITING')
+  )).length;
+  overview.innerHTML = `
+    <div class='trace-panel-heading'>
+      <div>
+        <div class='trace-panel-title'>Trace Overview</div>
+        <div class='trace-panel-caption'>聚合关键状态、统计与执行阶段摘要</div>
+      </div>
+      <div class='pane-badge'>Live Trace</div>
+    </div>
+    <div class='trace-summary-strip'>
       <div class='trace-metric'><div class='trace-metric-label'>任务节点</div><div class='trace-metric-value'>${taskCount}</div></div>
       <div class='trace-metric'><div class='trace-metric-label'>运行中</div><div class='trace-metric-value'>${runningCount}</div></div>
       <div class='trace-metric'><div class='trace-metric-label'>等待确认</div><div class='trace-metric-value'>${waitingCount}</div></div>
       <div class='trace-metric'><div class='trace-metric-label'>会话消息</div><div class='trace-metric-value'>${conversation.messages.length}</div></div>
     </div>
+    <div class='trace-legend-grid'>
+      <div class='trace-legend-item'><span class='trace-dot running'></span>执行中</div>
+      <div class='trace-legend-item'><span class='trace-dot waiting'></span>等待操作</div>
+      <div class='trace-legend-item'><span class='trace-dot done'></span>已完成</div>
+      <div class='trace-legend-item'><span class='trace-dot failed'></span>失败/中断</div>
+    </div>
   `;
-  const legend = document.createElement('div');
-  legend.className = 'trace-legend';
-  legend.innerHTML = `
-    <div class='trace-summary-title'>状态图例</div>
-    <div class='trace-legend-item'><span class='trace-dot running'></span>执行中</div>
-    <div class='trace-legend-item'><span class='trace-dot waiting'></span>等待用户操作</div>
-    <div class='trace-legend-item'><span class='trace-dot done'></span>已完成阶段</div>
-    <div class='trace-legend-item'><span class='trace-dot failed'></span>失败或中断</div>
-  `;
-  sidebar.append(summary, legend);
+  sidebar.append(overview);
   board.append(main, sidebar);
-  chatArea.appendChild(board);
+  tracePane.appendChild(board);
 }
 
 function renderTaskCard(element, message, conversationId, mode = 'conversation') {
@@ -638,15 +1241,17 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
   title.className = 'task-card-title';
   title.textContent = task.goal || `任务 ${String(task.taskId || '').slice(0, 8)}`;
   const state = document.createElement('div');
-  state.className = `task-card-state ${taskStateClass(task.phase1State)}`;
-  state.textContent = 状态文案[task.phase1State] || task.phase1State || '准备中';
+  state.className = `task-card-state ${taskStateClass(task)}`;
+  state.textContent = taskDisplayLabel(task);
   header.append(title, state);
   card.appendChild(header);
 
   const meta = document.createElement('div');
   meta.className = 'task-card-meta';
+  const projection = taskProjection(task);
+  const displayStatus = projection?.display_status || task.status || 'running';
   meta.innerHTML = `
-    <span class='task-phase-badge'>${task.status || 'running'}</span>
+    <span class='task-phase-badge'>${displayStatus}</span>
     <span class='task-phase-badge'>${task.taskId || 'task'}</span>
   `;
   card.appendChild(meta);
@@ -654,20 +1259,15 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
   const summary = document.createElement('div');
   summary.className = 'task-card-summary';
   const progressCount = (task.progress || []).length;
+  const traceCursor = Number(projection?.trace_cursor || task.traceCursor || 0);
+  const displayLabel = taskPhaseLabel(task);
+  const executionLabel = taskExecutionLabel(task);
   summary.innerHTML = `
-    <div class='task-summary-item'><div class='task-summary-label'>当前阶段</div><div class='task-summary-value'>${状态文案[task.phase1State] || task.phase1State || '准备中'}</div></div>
-    <div class='task-summary-item'><div class='task-summary-label'>流程事件</div><div class='task-summary-value'>${progressCount}</div></div>
-    <div class='task-summary-item'><div class='task-summary-label'>执行状态</div><div class='task-summary-value'>${task.waiting ? '等待输入' : '持续执行'}</div></div>
+    <div class='task-summary-item'><div class='task-summary-label'>当前阶段</div><div class='task-summary-value'>${displayLabel}</div></div>
+    <div class='task-summary-item'><div class='task-summary-label'>持久流程事件</div><div class='task-summary-value'>${traceCursor || progressCount}</div></div>
+    <div class='task-summary-item'><div class='task-summary-label'>执行状态</div><div class='task-summary-value'>${executionLabel}</div></div>
   `;
   card.appendChild(summary);
-
-  const tabBar = document.createElement('div');
-  tabBar.className = 'task-view-tabs';
-  tabBar.innerHTML = `
-    <button class='task-view-tab ${mode === 'conversation' ? 'active' : ''}'>Conversation</button>
-    <button class='task-view-tab ${mode === 'trace' ? 'active' : ''}'>Trace Timeline</button>
-  `;
-  card.appendChild(tabBar);
 
   const progress = document.createElement('div');
   progress.className = `task-progress task-panel ${mode === 'conversation' ? 'active' : ''}`;
@@ -691,6 +1291,8 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
 
   const tracePanel = document.createElement('div');
   tracePanel.className = `task-panel ${mode === 'trace' ? 'active' : ''}`;
+  const timelineScroll = document.createElement('div');
+  timelineScroll.className = 'trace-timeline-scroll';
   const timeline = document.createElement('div');
   timeline.className = 'trace-timeline';
   const steps = buildTraceSteps(task);
@@ -715,7 +1317,11 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
       `;
       timeline.appendChild(item);
     });
-    tracePanel.appendChild(timeline);
+    timelineScroll.appendChild(timeline);
+    tracePanel.appendChild(timelineScroll);
+    requestAnimationFrame(() => {
+      timelineScroll.scrollTop = timelineScroll.scrollHeight;
+    });
   }
   card.appendChild(tracePanel);
 
@@ -762,10 +1368,13 @@ function upsertTaskCard(conversationId, rawTask) {
         goal: rawTask.goal || '',
         phase1State: rawTask.phase1_state || 'PREPARING',
         status: rawTask.status || 'running',
+        projection: rawTask.projection || null,
+        traceCursor: Number(rawTask.projection?.trace_cursor || rawTask.progress_cursor || 0),
         cursor: Number(rawTask.progress_cursor || 0),
         progress: [], waiting: rawTask.waiting || null,
       },
     };
+    applyTaskProjection(message.task, rawTask.projection);
     conversation.messages.push(message);
   } else {
     message.task.goal = rawTask.goal || message.task.goal;
@@ -775,6 +1384,7 @@ function upsertTaskCard(conversationId, rawTask) {
       Number(message.task.cursor || 0), Number(rawTask.progress_cursor || 0),
     );
     message.task.waiting = rawTask.waiting ?? message.task.waiting;
+    applyTaskProjection(message.task, rawTask.projection);
   }
   if (conversationId === activeConversationId) renderMessages();
   return message;
@@ -802,25 +1412,47 @@ function appendTaskProgress(taskId, progress, conversationId) {
 
 function renderApprovalCard(element, message) {
   const approval = message.approval || {};
-  const title = document.createElement('div');
-  title.className = 'approval-title';
-  title.textContent = `需要你授权后才会执行（${风险文案[approval.risk] || approval.risk || '未知风险'}）`;
-  element.appendChild(title);
+
+  const hero = document.createElement('div');
+  hero.className = 'approval-hero';
+
+  const heading = document.createElement('div');
+  heading.innerHTML = `
+    <div class="approval-title">授权确认</div>
+    <div class="approval-subtitle">请确认以下操作内容与影响范围。新版授权面板会展示风险等级、目标与变更预览，避免误操作。</div>
+  `;
+
+  const risk = document.createElement('div');
+  risk.className = 'approval-risk';
+  risk.textContent = 风险文案[approval.risk] || approval.risk || '未知风险';
+
+  hero.appendChild(heading);
+  hero.appendChild(risk);
+  element.appendChild(hero);
+
+  const grid = document.createElement('div');
+  grid.className = 'approval-grid';
 
   const rows = [
     ['动作', approval.action],
     ['目标', approval.target],
-    ['网络访问', approval.network_access ? '是' : '否'],
-    ['数据外发', approval.data_transmission],
-    ['可回滚', approval.rollback],
+    ['网络访问', approval.network_access ? '允许外网访问' : '仅本地操作'],
+    ['数据外发', approval.data_transmission || 'none'],
+    ['可回滚', approval.rollback || '未知'],
   ];
+
   rows.forEach(([label, value]) => {
     if (!value && value !== false) return;
-    const row = document.createElement('div');
-    row.className = 'approval-row';
-    row.textContent = `${label}：${value}`;
-    element.appendChild(row);
+    const item = document.createElement('div');
+    item.className = 'approval-item';
+    item.innerHTML = `
+      <div class="approval-label">${label}</div>
+      <div class="approval-value">${renderInlineMarkdown(String(value))}</div>
+    `;
+    grid.appendChild(item);
   });
+
+  element.appendChild(grid);
 
   if (approval.preview) {
     const preview = document.createElement('pre');
@@ -977,10 +1609,38 @@ function renderPreviews() {
 }
 
 const MAX_IMAGE_EDGE = 1024;
+const IMAGE_JPEG_QUALITY = 0.65;
+// Mirrors MAX_IMAGE_DATA_URL_CHARS on the server, with headroom for the JSON
+// envelope, so an oversized screenshot degrades here instead of failing as 413.
+const MAX_IMAGE_DATA_URL_CHARS = 380000;
+// Shrinking the longest edge saves area, so it beats lowering quality: each
+// step halves cost far faster than a quality drop while keeping glyphs legible.
+const IMAGE_FALLBACK_STEPS = [
+  { edge: 1024, quality: 0.5 },
+  { edge: 896, quality: 0.5 },
+  { edge: 768, quality: 0.45 },
+  { edge: 640, quality: 0.4 },
+];
 
-async function downscaleImage(dataUrl) {
-  // A full-resolution screenshot is counted as input tokens and can exceed the
-  // model's context window on its own, so bound the longest edge first.
+function encodeImageToJpeg(image, edge, quality) {
+  const longest = Math.max(image.width, image.height);
+  const scale = longest > edge ? edge / longest : 1;
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(image.width * scale));
+  canvas.height = Math.max(1, Math.round(image.height * scale));
+  const context = canvas.getContext('2d');
+  // JPEG carries no alpha channel: without an opaque base, transparent regions
+  // of a PNG screenshot are composited onto black and become unreadable.
+  context.fillStyle = '#ffffff';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL('image/jpeg', quality);
+}
+
+async function prepareImage(dataUrl) {
+  // Every attachment is re-encoded, not just oversized ones. A raw PNG
+  // screenshot below the edge limit used to be sent untouched, which is the
+  // worst case: base64 PNG is several times larger than the same view as JPEG.
   const image = await new Promise((resolve, reject) => {
     const element = new Image();
     element.onload = () => resolve(element);
@@ -988,15 +1648,17 @@ async function downscaleImage(dataUrl) {
     element.src = dataUrl;
   });
 
-  const longest = Math.max(image.width, image.height);
-  if (longest <= MAX_IMAGE_EDGE) return dataUrl;
+  let prepared = encodeImageToJpeg(image, MAX_IMAGE_EDGE, IMAGE_JPEG_QUALITY);
+  for (const step of IMAGE_FALLBACK_STEPS) {
+    if (prepared.length <= MAX_IMAGE_DATA_URL_CHARS) break;
+    prepared = encodeImageToJpeg(image, step.edge, step.quality);
+  }
 
-  const scale = MAX_IMAGE_EDGE / longest;
-  const canvas = document.createElement('canvas');
-  canvas.width = Math.round(image.width * scale);
-  canvas.height = Math.round(image.height * scale);
-  canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL('image/jpeg', 0.82);
+  // A small flat icon can still encode smaller as its original PNG. Prefer it
+  // only when its pixel size is already within the edge budget, since pixel
+  // area — not byte size — is what the provider bills for a vision input.
+  const withinEdge = Math.max(image.width, image.height) <= MAX_IMAGE_EDGE;
+  return withinEdge && dataUrl.length < prepared.length ? dataUrl : prepared;
 }
 
 async function addImageFiles(files) {
@@ -1009,7 +1671,7 @@ async function addImageFiles(files) {
     const original = await fileToDataUrl(file);
     let prepared = original;
     try {
-      prepared = await downscaleImage(original);
+      prepared = await prepareImage(original);
     } catch (error) {
       console.error(error);
     }
@@ -1094,6 +1756,13 @@ async function runTask() {
   const workspaceId = activeWorkspaceId;
   appendMessage('user', prompt, images, conversationId);
   promptElement.value = '';
+  if (conversationId) {
+    const activeConversation = getConversationById(conversationId);
+    if (activeConversation) {
+      activeConversation.draft = '';
+    }
+    sessionStorage.removeItem(draftStorageKey(conversationId));
+  }
   selectedImages.length = 0;
   renderPreviews();
   setLoading(true);
@@ -1136,6 +1805,7 @@ async function runTask() {
       phase1_state: task.phase1_state || 'PREPARING',
       status: task.status || 'running',
       progress_cursor: 0,
+      projection: task.projection || null,
       waiting: task.approval
         ? { kind: 'APPROVAL', approval: task.approval }
         : task.status === 'awaiting_user'
@@ -1150,6 +1820,7 @@ async function runTask() {
       || task.status === 'awaiting_user'
       || task.status === 'awaiting_approval'
     ) {
+      appendTaskAssistantText(task.task_id, task.assistant_text, conversationId);
       if (card) card.task.waiting = card.task.waiting || { kind: 'INPUT' };
       setLoading(false);
       renderMessages();
@@ -1164,7 +1835,7 @@ async function runTask() {
 }
 
 const 状态文案 = {
-  PREPARING: '准备中', RUNNING: '执行中', WAITING: '等待输入',
+  PREPARING: '准备中', RUNNING: '执行中', WAITING: '等待操作',
   INTERRUPTED: '已中断', DONE: '已完成', FAILED: '已失败',
   CANCELLED: '已取消',
 };
@@ -1180,24 +1851,31 @@ function stopConversationFollowers(conversationId, exceptTaskId = null) {
   });
 }
 
+function appendTaskAssistantText(taskId, text, conversationId) {
+  const assistantText = String(text || '').trim();
+  if (!assistantText) return false;
+  const conversation = getConversationById(conversationId);
+  const duplicate = conversation?.messages.some(
+    (item) => item.role === 'assistant'
+      && item.taskId === taskId
+      && item.content === assistantText,
+  );
+  if (duplicate) return false;
+  appendMessage('assistant', assistantText, [], conversationId, taskId);
+  return true;
+}
+
 function renderFinalResult(taskId, state, conversationId) {
   const card = taskMessage(conversationId, taskId)
     || upsertTaskCard(conversationId, { task_id: taskId });
   if (card) {
+    applyTaskProjection(card.task, state.projection);
     card.task.phase1State = state.phase1_state || card.task.phase1State;
     card.task.status = state.status || card.task.status;
     card.task.waiting = null;
   }
   if (state.assistant_text) {
-    const conversation = getConversationById(conversationId);
-    const duplicate = conversation?.messages.some(
-      (item) => item.role === 'assistant'
-        && item.taskId === taskId
-        && item.content === state.assistant_text,
-    );
-    if (!duplicate) {
-      appendMessage('assistant', state.assistant_text, [], conversationId, taskId);
-    }
+    appendTaskAssistantText(taskId, state.assistant_text, conversationId);
   } else if (state.clarification?.question) {
     appendMessage(
       'assistant', state.clarification.question, [], conversationId, taskId,
@@ -1248,9 +1926,13 @@ function followTask(taskId, conversationId) {
     if (!response.ok) return false;
     const state = await response.json();
     const current = taskMessage(conversationId, taskId) || card;
+    appendTaskAssistantText(taskId, state.assistant_text, conversationId);
     if (current) {
-      current.task.phase1State = state.phase1_state;
-      current.task.status = state.status;
+      applyTaskProjection(current.task, state.projection);
+      if (!state.projection) {
+        current.task.phase1State = state.phase1_state;
+        current.task.status = state.status;
+      }
       current.task.waiting = state.approval
         ? { kind: 'APPROVAL', approval: state.approval }
         : state.status === 'awaiting_user'
@@ -1304,9 +1986,11 @@ function followTask(taskId, conversationId) {
         }
       }
       if (payload.waiting) {
+        appendTaskAssistantText(taskId, payload.assistant_text, conversationId);
         const currentCard = taskMessage(conversationId, taskId);
         if (currentCard) {
-          currentCard.task.phase1State = 'WAITING';
+          applyTaskProjection(currentCard.task, payload.projection);
+          if (!payload.projection) currentCard.task.phase1State = 'WAITING';
           currentCard.task.waiting = payload.waiting;
         }
         if (conversationId === activeConversationId) renderMessages();
@@ -1396,8 +2080,12 @@ async function ensureConversationLoaded(conversationId) {
     );
     const timeline = [];
     let insertionOrder = 0;
+    const visibleAssistantTaskIds = new Set();
     (data.messages || []).forEach((message) => {
       const task = tasksById.get(message.task_id);
+      if (message.role === 'assistant' && message.task_id) {
+        visibleAssistantTaskIds.add(message.task_id);
+      }
       // Task user text is persisted when a result is recorded, but belongs at
       // task attachment time. Direct Session chat keeps its own event sequence.
       const sequence = Number(
@@ -1422,12 +2110,28 @@ async function ensureConversationLoaded(conversationId) {
         message: {
           role: 'task', content: '', task: {
             taskId: task.task_id, goal: task.goal,
+            projection: task.projection || null,
             phase1State: task.phase1_state, status: task.status,
             cursor: Number(task.progress_cursor || 0), progress: [],
             waiting: task.waiting || null,
           },
         },
       });
+      // A Session result may be unavailable in older data or after a process
+      // restart, while the Task's durable llm.completed text is still present.
+      // Use it as a recovery-only assistant message; normal Session messages
+      // win whenever they already exist.
+      if (task.assistant_text && !visibleAssistantTaskIds.has(task.task_id)) {
+        timeline.push({
+          sequence: Number(task.attached_sequence || 0),
+          order: 2,
+          insertionOrder: insertionOrder++,
+          message: {
+            role: 'assistant', content: task.assistant_text, images: [],
+            taskId: task.task_id,
+          },
+        });
+      }
     });
     timeline.sort((left, right) => (
       left.sequence - right.sequence
@@ -1488,8 +2192,36 @@ async function loadWorkspaces() {
   renderMessages();
 }
 
-document.getElementById('prompt').addEventListener('input', () => {
+const promptComposer = document.getElementById('prompt');
+let imeComposing = false;
+
+promptComposer.addEventListener('input', () => {
   persistActiveDraft();
+});
+
+promptComposer.addEventListener('compositionstart', () => {
+  imeComposing = true;
+});
+
+promptComposer.addEventListener('compositionend', () => {
+  imeComposing = false;
+  persistActiveDraft();
+});
+
+promptComposer.addEventListener('keydown', (event) => {
+  const composing = imeComposing || event.isComposing || event.keyCode === 229;
+
+  if (event.key !== 'Enter' || composing) {
+    return;
+  }
+
+  if (event.shiftKey) {
+    return;
+  }
+
+  event.preventDefault();
+  persistActiveDraft();
+  runTask();
 });
 
 loadWorkspaces();
@@ -1501,6 +2233,7 @@ loadWorkspaces();
 runtime_server: LocalEventApiServer | None = None
 runtime_error: str | None = None
 workspace_registry: list[dict[str, str]] = []
+session_workspace_bindings: dict[str, str] = {}
 
 
 def workspace_registry_path() -> Path:
@@ -1555,6 +2288,51 @@ def save_workspace_registry() -> None:
         return
 
 
+def session_workspace_bindings_path() -> Path:
+    return Path.cwd() / ".agent" / "web-session-workspaces.json"
+
+
+def load_session_workspace_bindings() -> None:
+    session_workspace_bindings.clear()
+    try:
+        raw = json.loads(
+            session_workspace_bindings_path().read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return
+    if not isinstance(raw, dict):
+        return
+    for session_id, workspace_id in raw.items():
+        if isinstance(session_id, str) and isinstance(workspace_id, str):
+            session_workspace_bindings[session_id] = workspace_id
+
+
+def save_session_workspace_bindings() -> None:
+    target = session_workspace_bindings_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(session_workspace_bindings, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        return
+
+
+def bind_session_to_workspace(session_id: str, workspace_id: str) -> None:
+    existing = session_workspace_bindings.get(session_id)
+    if existing is not None and existing != workspace_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "当前会话已绑定其他工作区，禁止跨工作区复用 session。"
+            ),
+        )
+    if existing is None:
+        session_workspace_bindings[session_id] = workspace_id
+        save_session_workspace_bindings()
+
+
 def recover_workspace_registry_from_runtime() -> None:
     """Rebuild missing workspace entries from durable Task ownership.
 
@@ -1598,6 +2376,7 @@ def recover_workspace_registry_from_runtime() -> None:
 async def startup() -> None:
     global runtime_server, runtime_error
     load_workspace_registry()
+    load_session_workspace_bindings()
     runtime_server = LocalEventApiServer(Path.cwd())
     try:
         runtime_server.start()
@@ -1664,17 +2443,23 @@ def register_workspace(raw_path: str) -> dict[str, str]:
 MAX_IMAGE_DATA_URL_CHARS = 400_000
 
 
-def _normalize_image_blocks(images: object) -> list[dict[str, str]]:
-    """Keep only inline data-URL images the Kernel can consume."""
+def _normalize_image_blocks(images: object) -> list[ImageBlock]:
+    """Turn the request payload into ImageBlocks, rejecting what cannot be sent.
+
+    Whether a source is acceptable is ``ImageBlock``'s invariant, so this only
+    translates its ValueError into an HTTP status. An attachment is never dropped
+    quietly: a silently discarded image leaves the model answering a request it
+    cannot see, which reads to the user as the assistant ignoring the screenshot.
+    """
     if not isinstance(images, list):
         return []
-    blocks: list[dict[str, str]] = []
+    blocks: list[ImageBlock] = []
     for image in images:
         if not isinstance(image, dict):
-            continue
+            raise HTTPException(
+                status_code=400, detail="图片附件格式不正确"
+            )
         image_url = str(image.get("image_url", ""))
-        if not image_url.startswith("data:image/"):
-            continue
         if len(image_url) > MAX_IMAGE_DATA_URL_CHARS:
             # An oversized attachment makes the whole model call unanswerable
             # with "context cannot fit", so reject it with an actionable error.
@@ -1682,11 +2467,10 @@ def _normalize_image_blocks(images: object) -> list[dict[str, str]]:
                 status_code=413,
                 detail="图片过大，请压缩后重试（单张建议不超过 300KB）",
             )
-        blocks.append({
-            "type": "input_image",
-            "image_url": image_url,
-            "media_type": str(image.get("media_type", "image/png")),
-        })
+        try:
+            blocks.append(ImageBlock(image_url=image_url))
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
     return blocks
 
 
@@ -1768,6 +2552,8 @@ async def submit_session_input(payload: dict) -> dict:
             detail="session_id, request_id, and text are required",
         )
 
+    bind_session_to_workspace(session_id, workspace_id)
+
     async def ensure_session() -> None:
         try:
             await runtime_server._client.application.kernel.get_session(session_id)
@@ -1784,6 +2570,7 @@ async def submit_session_input(payload: dict) -> dict:
         result = runtime_server._call(runtime_server._client.submit_session_text(
             session_id, text, command_id=request_id,
             images=tuple(image_blocks),
+            workspace=Path(workspace["path"]),
         ))
     except AgentLoopLimitExceeded as error:
         # A spent call budget is a bounded Runtime outcome with a known cause,
@@ -1792,6 +2579,10 @@ async def submit_session_input(payload: dict) -> dict:
         raise HTTPException(
             status_code=409, detail=_describe_loop_limit(error),
         ) from error
+    except ValueError as error:
+        # A rejected workspace is a caller-visible conflict, most often a
+        # Session whose earlier Tasks ran in a different directory.
+        raise HTTPException(status_code=409, detail=str(error)) from error
     data = dict(result.result)
     status = 202 if data.get("kind") == "task" else 200
     return JSONResponse(content=data, status_code=status)
@@ -1815,6 +2606,9 @@ async def create_task(payload: dict) -> dict:
             detail="workspace selection is required",
         )
 
+    if session_id is not None:
+        bind_session_to_workspace(session_id, workspace_id)
+
     goal = str(payload.get("goal", ""))
     image_blocks = _normalize_image_blocks(payload.get("images"))
 
@@ -1822,21 +2616,18 @@ async def create_task(payload: dict) -> dict:
         # Record only the count; base64 payloads must never enter the goal.
         goal = f"{goal}\n\n[web-ui-attached-images: {len(image_blocks)}]"
 
-    goal = (
-        f"[workspace-context]\n"
-        f"workspace_id={workspace_id}\n"
-        f"workspace_path={workspace_path}\n\n"
-        f"{goal}"
-    )
-
-    result = runtime_server._call(runtime_server._client.submit_task(
-        goal,
-        command_id=f"web-ui:{workspace_id}",
-        session_id=session_id,
-        images=tuple(
-            ImageBlock(image_url=block["image_url"]) for block in image_blocks
-        ),
-    ))
+    # The workspace is a Task parameter, not a hint inside the goal text. Naming
+    # it here is what makes the Task actually run in the selected directory.
+    try:
+        result = runtime_server._call(runtime_server._client.submit_task(
+            goal,
+            command_id=f"web-ui:{workspace_id}",
+            session_id=session_id,
+            images=tuple(image_blocks),
+            workspace=Path(workspace_path),
+        ))
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     return result.to_data()
 
 
@@ -1925,6 +2716,7 @@ async def get_session(session_id: str) -> dict:
             ),
             "waiting": _waiting_payload(result),
             "assistant_text": result.assistant_text,
+            "projection": dict(result.projection) if result.projection else None,
             "is_active": task_id == snapshot.active_task_id,
         })
     latest = task_items[-1] if task_items else None
@@ -2099,13 +2891,24 @@ async def stream(task_id: str, after: int = 0):
             # so the wait itself has to reach the page; otherwise the UI shows a
             # spinner over a Task that is asking for a decision.
             waiting = _waiting_payload(result)
-            signature = json.dumps(waiting, ensure_ascii=False, sort_keys=True)
+            signature = json.dumps(
+                {"waiting": waiting, "assistant_text": result.assistant_text},
+                ensure_ascii=False, sort_keys=True,
+            )
             if waiting is not None and signature != announced_wait:
                 announced_wait = signature
                 yield (
                     "data: "
                     + json.dumps(
-                        {"task_id": task_id, "waiting": waiting},
+                        {
+                            "task_id": task_id,
+                            "waiting": waiting,
+                            "projection": result.projection,
+                            # A Task may generate a useful response and then
+                            # suspend for clarification or continuation. Waiting
+                            # must not hide that already durable response.
+                            "assistant_text": result.assistant_text,
+                        },
                         ensure_ascii=False,
                     )
                     + "\n\n"
@@ -2123,6 +2926,7 @@ async def stream(task_id: str, after: int = 0):
                         {
                             "task_id": task_id,
                             "final": True,
+                            "projection": result.projection,
                             "phase1_state": result.phase1_state,
                             "assistant_text": result.assistant_text,
                             "clarification": result.clarification,

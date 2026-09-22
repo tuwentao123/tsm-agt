@@ -39,7 +39,7 @@ _MAX_FIND_LIMIT = 500
 _MAX_FIND_ENTRIES = 50_000
 
 _GENERATED_DIRECTORY_NAMES = frozenset({
-    ".agent", ".gradle", ".idea", ".venv", ".cxx",
+    ".idea", ".venv", ".cxx",
     "build", "dist", "node_modules", "out", "target", "vendor",
     "__pycache__",
 })

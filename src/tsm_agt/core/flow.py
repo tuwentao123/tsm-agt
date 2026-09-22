@@ -1157,6 +1157,10 @@ class FlowProjector:
                         "passed": FlowNodeStatus.SUCCEEDED,
                         "failed": FlowNodeStatus.FAILED,
                         "blocked": FlowNodeStatus.WAITING_USER,
+                        # A criterion whose precondition did not hold was never
+                        # evaluated. Falling through to the FAILED default would
+                        # render it as a failure that never happened.
+                        "not_applicable": FlowNodeStatus.SKIPPED,
                     }.get(status_text, FlowNodeStatus.FAILED)
                     node_id = f"verification:{criterion_id}"
                     add_node(FlowNode(
