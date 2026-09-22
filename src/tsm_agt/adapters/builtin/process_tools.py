@@ -9,8 +9,10 @@ from typing import Any
 from tsm_agt.ports import (
     AdapterContext,
     AdapterDescriptor,
+    BackgroundProcessStartResult,
     HealthState,
     HealthStatus,
+    ProcessCommandResult,
     ToolCall,
     ToolEffect,
     ToolIdempotency,
@@ -50,6 +52,10 @@ class CoreProcessToolProvider:
                 "web retrieval when dedicated web.search or web.fetch_markdown "
                 "tools are available. "
                 "The environment starts minimal and rejects credential-like variable names. "
+                "A successful ToolResult means the process outcome was captured; for a "
+                "foreground command, inspect data.succeeded and data.failure_code to "
+                "determine command success. A background data.started value proves only "
+                "supervised start, not service readiness or terminal success. "
                 "This action requires approval."
             ),
             parameters={
@@ -180,7 +186,8 @@ class CoreProcessToolProvider:
             )
         try:
             if call.name == "core.run_command":
-                data = await self._run_command(call.arguments, control)
+                command = await self._run_command(call.arguments, control)
+                data = command.to_data()
             elif call.name == "core.process_status":
                 process_id = self._non_empty_string(call.arguments, "process_id")
                 data = await control.status(process_id)
@@ -211,7 +218,9 @@ class CoreProcessToolProvider:
         except RuntimeError as error:
             return self._error(call, "TOOL_FAILED", str(error), retryable=True)
 
-    async def _run_command(self, arguments: Mapping[str, Any], control) -> Mapping[str, Any]:
+    async def _run_command(
+        self, arguments: Mapping[str, Any], control,
+    ) -> ProcessCommandResult | BackgroundProcessStartResult:
         raw_argv = arguments.get("argv")
         if (
             not isinstance(raw_argv, (list, tuple))

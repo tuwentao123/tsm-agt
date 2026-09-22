@@ -46,6 +46,8 @@ from .runtime_store import (
     RuntimeCommandRecord,
 )
 from .process import (
+    BackgroundProcessStartResult,
+    ProcessCommandResult,
     ProcessExecutorPort,
     ProcessExitStatus,
     ProcessHandle,
@@ -54,6 +56,7 @@ from .process import (
     ProcessOutput,
     ProcessResult,
     ProcessStartRequest,
+    process_result_succeeded,
 )
 from .sandbox import SandboxDecision, SandboxPort, SandboxRequest
 from .cross_process_lock import CrossProcessLockPort
@@ -230,6 +233,8 @@ __all__ = [
     "ModelRetrySafety",
     "ProviderCapabilities",
     "RecoverableToolProtocolError",
+    "BackgroundProcessStartResult",
+    "ProcessCommandResult",
     "ProcessExecutorPort",
     "ProcessExitStatus",
     "ProcessHandle",
@@ -238,6 +243,7 @@ __all__ = [
     "ProcessOutput",
     "ProcessResult",
     "ProcessStartRequest",
+    "process_result_succeeded",
     "RuntimeAdapter",
     "RuntimeInputClassifierPort",
     "SessionInputResolverPort",

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .adapter import RuntimeAdapter
+from .process import BackgroundProcessStartResult, ProcessCommandResult
 from .workspace_path import WorkspacePathPort
 
 
@@ -397,7 +398,7 @@ class ToolProcessControl(Protocol):
         max_output_bytes: int,
         max_lifetime_seconds: float,
         stop_on_task_end: bool,
-    ) -> Mapping[str, Any]: ...
+    ) -> ProcessCommandResult | BackgroundProcessStartResult: ...
 
     async def status(self, process_id: str) -> Mapping[str, Any]: ...
 

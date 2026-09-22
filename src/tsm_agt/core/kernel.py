@@ -81,11 +81,14 @@ from tsm_agt.ports import (
     ModelRetrySafety,
     StreamingModelProviderPort,
     ModelUsage,
+    BackgroundProcessStartResult,
+    ProcessCommandResult,
     ProcessExecutorPort,
     ProcessExitStatus,
     ProcessLogs,
     ProcessResult,
     ProcessStartRequest,
+    process_result_succeeded,
     RuntimeEvent,
     RuntimeAdapter,
     RuntimeStorePort,
@@ -210,7 +213,6 @@ from .process import (
     BackgroundProcessRecord,
     BackgroundProcessState,
     ProcessSandboxDenied,
-    SupervisedProcessResult,
 )
 from .task import LEGAL_TRANSITIONS, TaskNotFound, TaskSnapshot, TaskState
 from .task_spec import (
@@ -543,14 +545,7 @@ def _has_active_workspace_mutation(task: TaskSnapshot) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class _PostMutationVerification:
-    """One inspectable read of the post-mutation verification contract.
-
-    The contract asks for a recognized foreground test/build command that
-    finished with exit code 0 after the latest workspace mutation. Reporting
-    only "no successful command was recorded" hides the two facts a caller
-    needs in order to act: which command was tried last, and why it did not
-    count. Both are carried here so a gap can state them verbatim.
-    """
+    """One inspectable read of the post-mutation verification contract."""
 
     passed: bool = False
     latest_argv: tuple[str, ...] = ()
@@ -579,14 +574,13 @@ def _post_mutation_verification(
             or execution.result is None or not execution.result.ok
             or not isinstance(data, Mapping)
             or data.get("mode") != "foreground"
-            or data.get("status") != "exited"
         ):
             continue
         attempts.append((execution, data))
     if not attempts:
         return _PostMutationVerification()
     latest, data = max(attempts, key=lambda item: item[0].updated_at)
-    if data.get("exit_code") == 0:
+    if process_result_succeeded(data):
         return _PostMutationVerification(passed=True)
     output = ""
     for field in ("stderr", "stdout"):
@@ -715,7 +709,7 @@ class _TaskProcessControl(ToolProcessControl):
         timeout_seconds: float, termination_grace_seconds: float,
         max_output_bytes: int, max_lifetime_seconds: float,
         stop_on_task_end: bool,
-    ) -> Mapping[str, Any]:
+    ) -> ProcessCommandResult | BackgroundProcessStartResult:
         if background:
             record = await self.kernel.start_background_process(
                 self.task_id, self.turn_id, argv, cwd=cwd,
@@ -725,37 +719,21 @@ class _TaskProcessControl(ToolProcessControl):
                 stop_on_task_end=stop_on_task_end,
                 invocation_id=self.invocation_id,
             )
-            return {
-                "mode": "background",
-                **self.kernel._background_record_data(record),
-            }
-        supervised = await self.kernel.run_foreground_process(
+            return BackgroundProcessStartResult(
+                process_id=record.process_id,
+                state=record.state.value,
+                started_at=record.handle.started_at,
+                deadline_at=record.deadline_at,
+                max_lifetime_seconds=record.max_lifetime_seconds,
+                stop_on_task_end=record.stop_on_task_end,
+            )
+        return await self.kernel.run_foreground_process(
             self.task_id, self.turn_id, argv, cwd=cwd,
             environment=environment, timeout_seconds=timeout_seconds,
             termination_grace_seconds=termination_grace_seconds,
             max_output_bytes=max_output_bytes,
             invocation_id=self.invocation_id,
         )
-        result = supervised.result
-        return {
-            "mode": "foreground",
-            "process_id": result.process_id,
-            "status": result.status.value,
-            "exit_code": result.exit_code,
-            "termination_signal": result.termination_signal,
-            "stdout": {
-                "text": result.stdout.text,
-                "total_bytes": result.stdout.total_bytes,
-                "truncated": result.stdout.truncated,
-            },
-            "stderr": {
-                "text": result.stderr.text,
-                "total_bytes": result.stderr.total_bytes,
-                "truncated": result.stderr.truncated,
-            },
-            "started_at": result.started_at.isoformat(),
-            "finished_at": result.finished_at.isoformat(),
-        }
 
     async def status(self, process_id: str) -> Mapping[str, Any]:
         record = await self.kernel.get_background_process_status(
@@ -3639,7 +3617,7 @@ class Kernel:
         termination_grace_seconds: float = 2.0,
         max_output_bytes: int = 1_000_000,
         invocation_id: str | None = None,
-    ) -> SupervisedProcessResult:
+    ) -> ProcessCommandResult:
         if not turn_id.strip():
             raise ValueError("turn_id must not be empty")
         if not argv or any(not item or "\x00" in item for item in argv):
@@ -3735,7 +3713,7 @@ class Kernel:
             )
             raise
         await self._record_process_result(task_id, turn_id, result, invocation_id)
-        return SupervisedProcessResult(handle, result)
+        return ProcessCommandResult(handle, result)
 
     async def start_background_process(
         self,
@@ -3886,6 +3864,8 @@ class Kernel:
         await self._commit_background_process(task_id, completed, event_type, {
             "turn_id": record.turn_id, "process_id": record.process_id,
             "status": result.status.value, "exit_code": result.exit_code,
+            "succeeded": result.succeeded,
+            "failure_code": result.failure_code,
             "termination_signal": result.termination_signal,
             "started_at": result.started_at.isoformat(),
             "finished_at": result.finished_at.isoformat(),
@@ -3988,6 +3968,8 @@ class Kernel:
                 {
                     "turn_id": turn_id, "process_id": result.process_id,
                     "status": result.status.value, "exit_code": result.exit_code,
+                    "succeeded": result.succeeded,
+                    "failure_code": result.failure_code,
                     "termination_signal": result.termination_signal,
                     "stdout": {
                         "text": result.stdout.text,
@@ -8260,8 +8242,7 @@ class Kernel:
             command_passed = bool(
                 latest_run is not None and latest_run.result is not None
                 and isinstance(latest_run.result.data, Mapping)
-                and latest_run.result.data.get("status") == "exited"
-                and latest_run.result.data.get("exit_code") == 0
+                and process_result_succeeded(latest_run.result.data)
             )
             command_result = AcceptanceResult(
                 "post-mutation-command",
@@ -8592,7 +8573,11 @@ class Kernel:
             data = result.data if isinstance(result.data, Mapping) else {}
             mode = str(data.get("mode", "foreground"))
             if mode == "background":
-                passed = result.ok and bool(data.get("process_id"))
+                started = data.get("started")
+                passed = bool(
+                    result.ok and bool(data.get("process_id"))
+                    and (started if isinstance(started, bool) else True)
+                )
                 status = (
                     AcceptanceStatus.PASSED
                     if passed else AcceptanceStatus.FAILED
@@ -8602,11 +8587,7 @@ class Kernel:
                     if passed else "direct background command did not start"
                 )
             else:
-                passed = bool(
-                    result.ok
-                    and data.get("status") == "exited"
-                    and data.get("exit_code") == 0
-                )
+                passed = bool(result.ok and process_result_succeeded(data))
                 status = (
                     AcceptanceStatus.PASSED
                     if passed else AcceptanceStatus.FAILED

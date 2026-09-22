@@ -19,6 +19,16 @@ class ProcessExitStatus(StrEnum):
     FAILED_TO_START = "failed_to_start"
 
 
+def process_result_succeeded(data: Mapping[str, object]) -> bool:
+    """Read command success from current or legacy serialized process data."""
+    explicit = data.get("succeeded")
+    if isinstance(explicit, bool):
+        return explicit
+    return data.get("status") == ProcessExitStatus.EXITED.value and data.get(
+        "exit_code"
+    ) == 0
+
+
 @dataclass(frozen=True, slots=True)
 class ProcessStartRequest:
     process_id: str
@@ -69,6 +79,88 @@ class ProcessResult:
     started_at: datetime
     finished_at: datetime
     termination_signal: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        """Whether the completed operating-system process exited successfully."""
+        return self.status is ProcessExitStatus.EXITED and self.exit_code == 0
+
+    @property
+    def failure_code(self) -> str | None:
+        if self.succeeded:
+            return None
+        if self.status is ProcessExitStatus.TIMED_OUT:
+            return "PROCESS_TIMED_OUT"
+        if self.status is ProcessExitStatus.CANCELLED:
+            return "PROCESS_CANCELLED"
+        if self.status is ProcessExitStatus.FAILED_TO_START:
+            return "PROCESS_FAILED_TO_START"
+        return "PROCESS_EXIT_NON_ZERO"
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "process_id": self.process_id,
+            "succeeded": self.succeeded,
+            "failure_code": self.failure_code,
+            "status": self.status.value,
+            "exit_code": self.exit_code,
+            "termination_signal": self.termination_signal,
+            "stdout": {
+                "text": self.stdout.text,
+                "total_bytes": self.stdout.total_bytes,
+                "truncated": self.stdout.truncated,
+            },
+            "stderr": {
+                "text": self.stderr.text,
+                "total_bytes": self.stderr.total_bytes,
+                "truncated": self.stderr.truncated,
+            },
+            "started_at": self.started_at.isoformat(),
+            "finished_at": self.finished_at.isoformat(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessCommandResult:
+    """A definitive foreground command outcome returned to a process tool."""
+
+    handle: ProcessHandle
+    result: ProcessResult
+
+    @property
+    def succeeded(self) -> bool:
+        return self.result.succeeded
+
+    def to_data(self) -> dict[str, object]:
+        return {"mode": "foreground", **self.result.to_data()}
+
+
+@dataclass(frozen=True, slots=True)
+class BackgroundProcessStartResult:
+    """Proof that a background process entered supervised RUNNING state."""
+
+    process_id: str
+    state: str
+    started_at: datetime
+    deadline_at: datetime
+    max_lifetime_seconds: float
+    stop_on_task_end: bool
+
+    @property
+    def started(self) -> bool:
+        return self.state == "RUNNING"
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "mode": "background",
+            "started": self.started,
+            "process_id": self.process_id,
+            "state": self.state,
+            "started_at": self.started_at.isoformat(),
+            "deadline_at": self.deadline_at.isoformat(),
+            "max_lifetime_seconds": self.max_lifetime_seconds,
+            "stop_on_task_end": self.stop_on_task_end,
+        }
 
 
 @dataclass(frozen=True, slots=True)

@@ -8,7 +8,9 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, TypeAlias
 
-from tsm_agt.ports import InvestigationFlowProjectorPort, RuntimeEvent
+from tsm_agt.ports import (
+    InvestigationFlowProjectorPort, RuntimeEvent, process_result_succeeded,
+)
 
 
 class FlowProjectionError(ValueError):
@@ -1212,10 +1214,11 @@ class FlowProjector:
                         FlowNodeKind.PROCESS, "Process", FlowNodeStatus.RUNNING,
                         event.occurred_at, None, None, None, event.sequence, None,
                     ))
+                process_succeeded = process_result_succeeded(payload)
                 process_status = {
                     "process.started": FlowNodeStatus.RUNNING,
                     "process.exited": (
-                        FlowNodeStatus.SUCCEEDED if payload.get("exit_code") == 0
+                        FlowNodeStatus.SUCCEEDED if process_succeeded
                         else FlowNodeStatus.FAILED
                     ),
                     "process.cancelled": FlowNodeStatus.CANCELLED,
@@ -1239,6 +1242,11 @@ class FlowProjector:
                         str(payload["status"])
                         if payload.get("status") is not None else None
                     ),
+                    "succeeded": process_succeeded,
+                    "failure_code": (
+                        str(payload["failure_code"])
+                        if payload.get("failure_code") is not None else None
+                    ),
                     "stdout_bytes": (
                         int(stdout["total_bytes"])
                         if isinstance(stdout.get("total_bytes"), int) else None
@@ -1257,7 +1265,7 @@ class FlowProjector:
                 process_failed = process_status[event_type] in {
                     FlowNodeStatus.FAILED, FlowNodeStatus.UNKNOWN_OUTCOME,
                 }
-                if event_type == "process.exited" and payload.get("exit_code") != 0:
+                if event_type == "process.exited" and not process_succeeded:
                     process_values["event_type"] = "process.nonzero_exit"
                 add_fact(
                     FlowDiagnosticCategory.FAILURE if process_failed

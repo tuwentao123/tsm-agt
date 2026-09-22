@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Mapping
 
-from tsm_agt.ports import ProcessHandle, ProcessResult
+from tsm_agt.ports import ProcessCommandResult, ProcessHandle, ProcessResult
 
 
 class ProcessSandboxDenied(PermissionError):
@@ -100,7 +100,5 @@ class BackgroundProcessRecord:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class SupervisedProcessResult:
-    handle: ProcessHandle
-    result: ProcessResult
+# Backward-compatible public name; new code uses the provider-neutral port type.
+SupervisedProcessResult = ProcessCommandResult
