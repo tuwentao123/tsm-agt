@@ -383,6 +383,78 @@ class SessionContextProjectorTest(unittest.TestCase):
             "SUCCEEDED",
         )
 
+    def test_recorded_input_wins_over_the_derived_goal(self) -> None:
+        snapshot = SessionSnapshot.create(
+            "session-1", "uid:1", "recorded input"
+        ).bump_context().bump_context()
+        attached = SessionEvent(
+            "event-1", "session-1", 1, "session.task_attached", {
+                "task_id": "task-2", "active_task_id": "task-2",
+                "task_relation": "FOLLOW_UP",
+                "user_text": "那继续验证啊",
+            },
+        )
+        # The result event still carries the rewritten handoff goal.
+        result = self._event(
+            2,
+            "[session-follow-up]\nCurrent request:\n那继续验证啊\n\n"
+            "Authority-free source Task:\n- task_id: task-1",
+            "已验证通过",
+        )
+
+        projection = SessionContextProjector().project(snapshot, (attached, result))
+
+        user_messages = [
+            item.text for item in projection.messages
+            if item.role is MessageRole.USER
+        ]
+        self.assertEqual(user_messages, ["那继续验证啊"])
+        self.assertEqual(projection.messages[0].source_event_sequence, 1)
+
+    def test_legacy_handoff_goal_recovers_the_user_sentence(self) -> None:
+        snapshot = SessionSnapshot.create(
+            "session-1", "uid:1", "legacy handoff"
+        ).bump_context()
+        # No task_attached user_text: this is how older records look.
+        result = self._event(
+            1,
+            "[session-follow-up]\nCurrent request:\n帮我把按钮改成蓝色\n\n"
+            "Authority-free source Task:\n- task_id: task-0\n- state: SUCCEEDED",
+            "已改好",
+        )
+
+        projection = SessionContextProjector().project(snapshot, (result,))
+
+        user_messages = [
+            item.text for item in projection.messages
+            if item.role is MessageRole.USER
+        ]
+        self.assertEqual(user_messages, ["帮我把按钮改成蓝色"])
+
+    def test_plain_goal_is_left_untouched(self) -> None:
+        snapshot = SessionSnapshot.create(
+            "session-1", "uid:1", "plain goal"
+        ).bump_context()
+        result = self._event(1, "查下今天的新闻", "好的")
+
+        projection = SessionContextProjector().project(snapshot, (result,))
+
+        self.assertEqual(projection.messages[0].text, "查下今天的新闻")
+
+    def test_attached_event_without_input_adds_no_message(self) -> None:
+        snapshot = SessionSnapshot.create(
+            "session-1", "uid:1", "no input"
+        ).bump_context()
+        attached = SessionEvent(
+            "event-1", "session-1", 1, "session.task_attached",
+            {"task_id": "task-1", "active_task_id": "task-1",
+             "task_relation": "INDEPENDENT"},
+        )
+
+        projection = SessionContextProjector().project(snapshot, (attached,))
+
+        self.assertEqual(projection.messages, ())
+
     def test_failed_task_result_is_not_replayed_as_a_later_prompt_answer(self) -> None:
         snapshot = SessionSnapshot.create(
             "session-1", "uid:1", "failed task result"

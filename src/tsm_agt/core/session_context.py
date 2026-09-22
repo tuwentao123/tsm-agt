@@ -377,20 +377,45 @@ class SessionContextProjector:
         resources: dict[str, SessionResourceReference] = {}
         questions: dict[str, SessionQuestionReference] = {}
         task_summaries: dict[str, SessionTaskSummary] = {}
+        # A Task that recorded its own input owns its user message. The goal
+        # carried by a later result event is a rewritten handoff, so it must not
+        # replace words the user actually typed.
+        tasks_with_recorded_input: set[str] = set()
 
         for event in sorted(events, key=lambda item: item.sequence):
             if event.session_id != snapshot.session_id:
                 raise ValueError("Session event belongs to a different Session")
-            if event.event_type == "session.task_result_recorded":
+            if event.event_type == "session.task_attached":
+                task_id = str(event.payload.get("task_id") or "")
+                user_text = str(event.payload.get("user_text") or "").strip()
+                if task_id and user_text:
+                    tasks_with_recorded_input.add(task_id)
+                    messages.append(SessionConversationMessage(
+                        f"msg-session-input-{task_id}", MessageRole.USER,
+                        user_text, task_id, None, event.sequence,
+                    ))
+                    sources.add(event.sequence)
+            elif event.event_type == "session.task_result_recorded":
                 task_id = str(event.payload.get("task_id") or "")
                 turn_id = str(event.payload.get("turn_id") or "")
                 for key, role in (("user_message", MessageRole.USER),
                                   ("assistant_message", MessageRole.ASSISTANT)):
+                    if (
+                        role is MessageRole.USER
+                        and task_id in tasks_with_recorded_input
+                    ):
+                        # The attachment already carried the real input.
+                        continue
                     projected = self._visible_message(
                         event.payload.get(key), role, task_id, turn_id, event.sequence
                     )
                     if projected is None or projected.message_id in seen_message_ids:
                         continue
+                    if role is MessageRole.USER:
+                        # Older records predate input recording and only kept the
+                        # goal. Recover the user's own sentence from the derived
+                        # handoff so restored history stays readable.
+                        projected = self._recovered_user_message(projected)
                     seen_message_ids.add(projected.message_id)
                     messages.append(projected)
                     sources.add(event.sequence)
@@ -419,6 +444,24 @@ class SessionContextProjector:
                         continue
                     seen_message_ids.add(projected.message_id)
                     messages.append(projected)
+                    sources.add(event.sequence)
+            elif event.event_type == "session.clarification_requested":
+                user_text = str(event.payload.get("user_text") or "").strip()
+                clarification = str(
+                    event.payload.get("clarification") or ""
+                ).strip()
+                if user_text:
+                    messages.append(SessionConversationMessage(
+                        f"msg-session-clarify-user-{event.sequence}",
+                        MessageRole.USER, user_text, None, None, event.sequence,
+                    ))
+                    sources.add(event.sequence)
+                if clarification:
+                    messages.append(SessionConversationMessage(
+                        f"msg-session-clarify-reply-{event.sequence}",
+                        MessageRole.ASSISTANT, clarification, None, None,
+                        event.sequence,
+                    ))
                     sources.add(event.sequence)
             elif event.event_type == "session.context_state_updated":
                 self._apply_explicit_state(explicit_state, event.payload)
@@ -981,6 +1024,34 @@ class SessionContextProjector:
             elif isinstance(item, (int, float, bool)) or item is None:
                 safe[str(key)] = item
         return safe
+
+    @staticmethod
+    def _recovered_user_message(
+        message: SessionConversationMessage,
+    ) -> SessionConversationMessage:
+        """Unwrap a derived handoff goal stored as a user message.
+
+        Records written before Tasks recorded their own input kept only the
+        goal. For derived Tasks that goal is a structured handoff whose first
+        section quotes the user verbatim, so the sentence is recoverable even
+        though the surrounding template is not what the user wrote.
+        """
+        text = message.text
+        if not text.startswith("[session-follow-up]"):
+            return message
+        marker = "Current request:"
+        start = text.find(marker)
+        if start < 0:
+            return message
+        body = text[start + len(marker):]
+        # Sections are separated by a blank line; the request is the first one.
+        request = body.split("\n\n", 1)[0].strip()
+        if not request:
+            return message
+        return SessionConversationMessage(
+            message.message_id, message.role, request,
+            message.task_id, message.turn_id, message.source_event_sequence,
+        )
 
     @staticmethod
     def _visible_message(

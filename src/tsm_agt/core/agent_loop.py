@@ -49,6 +49,7 @@ class AgentProgressKind(StrEnum):
     WRAP_UP = "wrap_up"
     EXPLORATION = "exploration"
     MODEL_RETRY = "model_retry"
+    MODEL_TRANSPORT = "model_transport"
     FOCUS = "focus"
 
 
@@ -98,6 +99,11 @@ class AgentProgress:
     transport_attempt: int = 0
     max_transport_attempts: int = 0
     retry_delay_seconds: float = 0.0
+    transport_mode: str = ""
+    transport_event: str = ""
+    diagnostic_code: str = ""
+    diagnostic_detail: str = ""
+    recovery_action: str = ""
 
     def to_data(self) -> dict[str, Any]:
         """Return the live UI payload.
@@ -151,6 +157,11 @@ class AgentProgress:
             "transport_attempt": self.transport_attempt,
             "max_transport_attempts": self.max_transport_attempts,
             "retry_delay_seconds": self.retry_delay_seconds,
+            "transport_mode": self.transport_mode,
+            "transport_event": self.transport_event,
+            "diagnostic_code": self.diagnostic_code,
+            "diagnostic_detail": self.diagnostic_detail,
+            "recovery_action": self.recovery_action,
         }
 
 

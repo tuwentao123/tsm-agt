@@ -1790,10 +1790,11 @@ class Kernel:
                     if raw.get("task_id") is not None else None
                 )
             confidence = float(raw["confidence"])
-            resolved_goal = (
-                str(raw["resolved_goal"]).strip()
-                if raw.get("resolved_goal") else None
-            )
+            # The resolver classifies; it does not author the goal. Every field
+            # it supplies above is checkable against an enum or the catalog,
+            # whereas a free-text goal is not, so Runtime used to accept one
+            # unexamined and the user's own words were replaced by it.
+            resolved_goal: str | None = None
             reason = str(raw.get("reason_code") or "semantic_resolution")
             clarification = (
                 str(raw["clarification"])
@@ -1833,21 +1834,30 @@ class Kernel:
                 )
                 reason = "ordinary_resume_derived_follow_up"
             elif disposition is SessionRouteDisposition.CREATE_TASK:
-                if confidence < 0.75:
+                if confidence < 0.85:
                     raise ValueError("low-confidence new Task decision")
+                # One rule decides the goal: does it have to name context the
+                # user did not state? With a source Task it does, so the same
+                # deterministic handoff used by the RESUME route builds it. With
+                # no source there is nothing to name, so the goal is the request
+                # itself. Session history reaches the Agent through
+                # _project_context_messages either way, never through the goal.
                 if relation is SessionTaskRelation.INDEPENDENT:
                     if source_task_id is not None:
                         raise ValueError("independent Task supplied a source")
-                    resolved_goal = resolved_goal or normalized
+                    resolved_goal = normalized
                 elif relation in {
                     SessionTaskRelation.FOLLOW_UP, SessionTaskRelation.BRANCH
                 }:
-                    if source_task_id is None or not resolved_goal:
-                        raise ValueError("derived Task requires source and goal")
+                    if source_task_id is None:
+                        raise ValueError("derived Task requires a source Task")
+                    resolved_goal = build_session_follow_up_goal(
+                        normalized, catalog_by_id[source_task_id]
+                    )
                 elif relation is SessionTaskRelation.CONTEXTUAL:
                     if source_task_id is not None:
                         raise ValueError("contextual Task supplied a source")
-                    resolved_goal = resolved_goal or normalized
+                    resolved_goal = normalized
                 else:
                     raise ValueError("invalid CREATE_TASK relation")
             elif relation is not SessionTaskRelation.UNCERTAIN:
@@ -2241,7 +2251,13 @@ class Kernel:
     async def _record_session_input_decision(
         self, session_id: str, text: str, decision: SessionInputDecision,
     ) -> None:
-        """Audit Session routing without persisting the user's plaintext."""
+        """Audit Session routing, keeping the audit events plaintext-free.
+
+        The three routing events below stay hash-only: they answer how an input
+        was routed, which needs no message body. A CLARIFY outcome additionally
+        writes one conversation record, because that route creates no Task and
+        would otherwise leave the exchange unrecoverable after a reload.
+        """
         for attempt in range(3):
             stored = await self._dependencies.store.load_session(session_id)
             if stored is None:
@@ -2286,6 +2302,20 @@ class Kernel:
                     "session.input_resolved", shared,
                 ),
             )
+            if decision.disposition is SessionRouteDisposition.CLARIFY:
+                # A clarification creates no Task, so nothing else would ever
+                # record this exchange and a reload would lose both the question
+                # and the message that triggered it. This is a conversation
+                # record, kept separate from the hash-only audit events above.
+                events += (SessionEvent(
+                    f"sevt-{uuid4().hex}", session_id, base_sequence + 4,
+                    "session.clarification_requested", {
+                        "user_text": text.strip(),
+                        "clarification": decision.clarification or "",
+                        "candidate_task_ids": list(decision.candidate_task_ids),
+                        "reason_code": decision.reason_code,
+                    },
+                ),)
             try:
                 await self._dependencies.store.commit_session(SessionUnitOfWork(
                     session_id, stored.version, session.to_data(), events
@@ -4040,7 +4070,16 @@ class Kernel:
         session_id: str | None = None, command_id: str | None = None,
         source_task_id: str | None = None,
         task_relation: SessionTaskRelation = SessionTaskRelation.INDEPENDENT,
+        original_user_text: str | None = None,
     ) -> TaskSnapshot:
+        """Create one Task and attach it to its Session.
+
+        ``original_user_text`` is the message the user actually typed. A goal is
+        not that message: a derived Task rewrites it into a bounded handoff, so
+        replaying the goal as conversation history would show the user words
+        they never wrote. Recording it here keeps it in the same commit as the
+        attachment, so history can never contain a Task without its input.
+        """
         normalized_goal = goal.strip()
         if not normalized_goal:
             raise ValueError("task goal must not be empty")
@@ -4113,13 +4152,17 @@ class Kernel:
         elif source_task_id is not None:
             raise ValueError("non-derived Task cannot have a source Task")
         session = session.attach_task(identity)
+        attached_payload: dict[str, Any] = {
+            "task_id": identity, "active_task_id": identity,
+            "source_task_id": source_task_id,
+            "task_relation": task_relation.value,
+        }
+        recorded_input = (original_user_text or "").strip()
+        if recorded_input:
+            attached_payload["user_text"] = recorded_input
         session_events += (SessionEvent(
             f"sevt-{uuid4().hex}", session_identity, attach_sequence,
-            "session.task_attached", {
-                "task_id": identity, "active_task_id": identity,
-                "source_task_id": source_task_id,
-                "task_relation": task_relation.value,
-            },
+            "session.task_attached", attached_payload,
         ),)
         if source_task_id is not None:
             session_events += (SessionEvent(
@@ -11441,25 +11484,23 @@ class Kernel:
             prompt = self._dependencies.prompt_template.assemble(
                 prepared.messages, model_visible_tools, runtime_instruction
             )
-            transport_updates: list[ModelTransportProgress] = []
-
-            def record_transport(update: ModelTransportProgress) -> None:
-                transport_updates.append(update)
-                # attempt_started/attempt_completed describe every normal
-                # physical request and remain in the audit log below.  They
-                # are not retries.  A user-visible retry exists only after the
-                # recovery policy decides to issue another physical request.
+            async def record_transport(update: ModelTransportProgress) -> None:
+                # Persist every physical-attempt transition before the provider
+                # continues. A buffered batch made a five-minute timeout look
+                # like one instantaneous event after recovery completed.
+                await self._record_model_attempt_events(
+                    task_id, turn_id, model_call_number, [update]
+                )
                 retry_actions = {
                     ModelRecoveryAction.RETRY_SAME_REQUEST.value,
                     ModelRecoveryAction.RESAMPLE.value,
                     ModelRecoveryAction.RESAMPLE_WITH_CORRECTION.value,
                     ModelRecoveryAction.FALLBACK_TRANSPORT.value,
                 }
-                if (
-                    update.kind != "recovery_decided"
-                    or update.recovery_action not in retry_actions
-                ):
-                    return
+                is_retry = (
+                    update.kind == "recovery_decided"
+                    and update.recovery_action in retry_actions
+                )
                 reason = update.reason
                 if (
                     update.recovery_action
@@ -11467,15 +11508,22 @@ class Kernel:
                 ):
                     reason = "stream_fallback:" + reason
                 self._notify_agent_progress(on_progress, AgentProgress(
-                    AgentProgressKind.MODEL_RETRY,
+                    AgentProgressKind.MODEL_RETRY if is_retry
+                    else AgentProgressKind.MODEL_TRANSPORT,
                     model_call=model_call_number,
                     max_model_calls=checkpoint.max_model_calls,
                     tool_call=tool_call_count,
                     max_tool_calls=checkpoint.max_tool_calls,
-                    goal=live_goal, reason=reason,
+                    goal=live_goal,
+                    reason=reason,
                     transport_attempt=update.attempt,
                     max_transport_attempts=update.max_attempts,
                     retry_delay_seconds=update.delay_seconds,
+                    transport_mode=update.transport_mode,
+                    transport_event=update.kind,
+                    diagnostic_code=update.diagnostic_code,
+                    diagnostic_detail=update.diagnostic_detail,
+                    recovery_action=update.recovery_action,
                 ))
 
             request = ModelRequest(
@@ -11509,9 +11557,6 @@ class Kernel:
                 response = await self._complete_agent_model_request(
                     request,
                     buffered_text.append if should_buffer_text else on_text_delta,
-                )
-                await self._record_model_attempt_events(
-                    task_id, turn_id, model_call_number, transport_updates
                 )
                 self._notify_agent_progress(on_progress, AgentProgress(
                     AgentProgressKind.MODEL_COMPLETED,
@@ -11692,9 +11737,6 @@ class Kernel:
                     diagnostic_detail=error.detail,
                 ) from error
             except Exception as error:
-                await self._record_model_attempt_events(
-                    task_id, turn_id, model_call_number, transport_updates
-                )
                 recovery = (
                     error if isinstance(error, ModelRecoveryExhausted) else None
                 )
@@ -13894,6 +13936,7 @@ class Kernel:
                 "category": update.category,
                 "retry_safety": update.retry_safety,
                 "diagnostic_code": update.diagnostic_code,
+                "diagnostic_detail": update.diagnostic_detail,
                 "recovery_action": update.recovery_action,
                 "reason_code": update.reason,
                 "delay_seconds": update.delay_seconds,
@@ -13901,8 +13944,16 @@ class Kernel:
                 "response_committed": update.response_committed,
                 "transport_mode": update.transport_mode,
             }))
-        if event_data:
-            await self._append_events(task_id, tuple(event_data))
+        if not event_data:
+            return
+        for attempt in range(5):
+            try:
+                await self._append_events(task_id, tuple(event_data))
+                return
+            except ValueError as error:
+                if "version conflict" not in str(error) or attempt == 4:
+                    raise
+                await asyncio.sleep(0)
 
     async def list_tools(self) -> tuple[ToolSpec, ...]:
         tools: list[ToolSpec] = []

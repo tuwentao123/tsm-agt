@@ -198,7 +198,7 @@ class ClarifyingSessionInputResolver(FixtureSessionInputResolver):
         self.contexts.append(dict(context))
         return {
             "disposition": "CLARIFY", "relation": "UNCERTAIN",
-            "source_task_id": None, "resolved_goal": None,
+            "source_task_id": None,
             "input_grounding": "AMBIGUOUS",
             "confidence": 0.99, "reason_code": "multiple_candidates",
             "clarification": "请选择要继续的未完成 Task。",
@@ -1191,7 +1191,6 @@ class AnsweringSessionInputResolver:
             "disposition": "ANSWER",
             "relation": "INDEPENDENT",
             "source_task_id": None,
-            "resolved_goal": None,
             "input_grounding": "SELF_CONTAINED",
             "confidence": 0.98,
             "reason_code": "self_contained_question",

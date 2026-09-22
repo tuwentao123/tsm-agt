@@ -177,6 +177,15 @@ class PastedImageIngressTest(unittest.TestCase):
         self.assertIn("failure_reason", html)
         self.assertIn("describeFailure", html)
 
+    def test_model_retry_status_includes_attempt_mode_and_diagnostics(self) -> None:
+        html = web_app.INDEX_HTML
+        self.assertIn("transport_attempt", html)
+        self.assertIn("max_transport_attempts", html)
+        self.assertIn("transport_mode", html)
+        self.assertIn("diagnostic_code", html)
+        self.assertIn("diagnostic_detail", html)
+        self.assertIn("recovery_action", html)
+
     def test_client_image_budget_stays_below_the_server_cap(self) -> None:
         """A client budget above the server cap would re-introduce the 413."""
         source = Path(web_app.__file__).read_text(encoding="utf-8")

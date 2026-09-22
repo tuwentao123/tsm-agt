@@ -91,9 +91,9 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .trace-legend-item{display:flex;align-items:center;gap:5px;color:var(--text-soft);font-size:10px;padding:4px 6px;border-radius:8px;background:rgba(251,253,255,.82);border:1px solid #e7edf5}
 .trace-dot{width:10px;height:10px;border-radius:50%;box-shadow:0 0 0 4px rgba(255,255,255,.06)}
 .trace-dot.running{background:#1677ff}.trace-dot.waiting{background:#faad14}.trace-dot.done{background:#52c41a}.trace-dot.failed{background:#ff4d4f}
-.message{width:100%;max-width:none;word-break:break-word}
-.message.assistant{padding-inline:0;background:rgba(255,255,255,.82);border:1px solid #e6edf5;border-radius:20px;padding:16px 18px;box-shadow:none}
-.message.user{align-self:flex-end;max-width:860px;background:#f8fafc;color:#334155;border:1px solid #dbe4ee;border-radius:16px;padding:12px 14px;box-shadow:none}
+.message{display:flex;flex-direction:column;position:relative;max-width:min(920px,100%);word-break:break-word;gap:8px}
+.message.assistant{align-self:flex-start;width:100%;padding-inline:0;background:rgba(255,255,255,.82);border:1px solid #e6edf5;border-radius:20px;padding:16px 18px;box-shadow:none}
+.message.user{display:inline-flex;align-self:flex-end !important;margin-left:auto !important;margin-right:0 !important;width:fit-content;max-width:min(720px,calc(100% - 24px));background:transparent;color:#334155;border:none !important;outline:none !important;box-shadow:none !important;border-radius:16px;padding:12px 14px;text-align:left}
 .message-body{width:min(96ch,100%);white-space:normal;font-size:15px;line-height:1.72;letter-spacing:0;color:var(--text);font-family:Inter,"SF Pro Display","Segoe UI",sans-serif}
 .message-body > *:first-child{margin-top:0}
 .message-body > *:last-child{margin-bottom:0}
@@ -128,9 +128,9 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .terminal-body{padding:16px 18px;font-family:"SFMono-Regular","JetBrains Mono","Fira Code",monospace;font-size:13px;line-height:1.7;color:#f3f4f6;white-space:pre-wrap;overflow:auto;background:#313943}
 .message-images{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
 .message-images img{width:56px;height:56px;object-fit:cover;border-radius:10px;display:block;cursor:zoom-in;border:1px solid #dbe5f0}
-.message.user,.message.assistant{position:relative;display:flex;flex-direction:column;gap:8px;max-width:min(920px,100%);padding:12px 14px;border-radius:14px;border:1px solid var(--border);box-shadow:none;backdrop-filter:none}
-.message.user{align-self:flex-end;background:#f8fafc;border-color:#dbe4ee;border-bottom-right-radius:8px;color:#334155}
-.message.assistant{align-self:flex-start;background:#ffffff;border-bottom-left-radius:8px;color:#1f2937}
+.message.user,.message.assistant{position:relative;display:flex;flex-direction:column;gap:8px;padding:12px 14px;border-radius:14px;box-shadow:none;backdrop-filter:none}
+.message.user{justify-content:flex-end;align-self:flex-end !important;margin-left:auto !important;margin-right:0 !important;background:transparent;border:none !important;outline:none !important;box-shadow:none !important;border-bottom-right-radius:8px;color:#334155;text-align:left}
+.message.assistant{align-self:flex-start;background:#ffffff;border:1px solid var(--border);border-bottom-left-radius:8px;color:#1f2937;width:100%}
 .message-role{display:flex;align-items:center;gap:8px;font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#64748b}
 .message-role::before{content:'';width:8px;height:8px;border-radius:999px;background:currentColor;opacity:.85}
 .message.assistant .message-role{color:#4b5563}
@@ -143,7 +143,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .task-card{border:1px solid #d9e1ec;border-radius:18px;background:linear-gradient(180deg,#ffffff,#f8fafc);padding:14px 16px;display:flex;flex-direction:column;gap:10px;box-shadow:0 2px 6px rgba(15,23,42,.04)}
 .task-card-header{display:flex;justify-content:space-between;gap:10px;align-items:center}
 .task-card-meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-.task-phase-badge{padding:3px 8px;border-radius:999px;font-size:10px;background:#f3f4f6;color:#374151;border:1px solid #d1d5db;font-weight:600}
+.task-phase-badge{padding:3px 8px;border-radius:999px;font-size:10px;background:#dbeafe;color:#2563eb;border:1px solid #93c5fd;font-weight:600}
 .task-card-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;align-items:stretch}
 .task-summary-item{background:#f8fafc;border:1px solid #d9e1ec;border-radius:10px;padding:8px 10px;min-height:0}
 .task-summary-label{font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:.06em}
@@ -199,12 +199,16 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .markdown-table tr:last-child td{border-bottom:none}
 .markdown-table th{background:#f8fafc;color:#0f172a;font-weight:700}
 .tool-call-card{margin:16px 0;padding:18px 20px;border-radius:20px;background:#fff;border:1px solid #dbe3ee;box-shadow:0 10px 28px rgba(15,23,42,.06);display:flex;flex-direction:column;gap:14px}
+.tool-call-card.collapsed .tool-call-toggle-icon{transform:rotate(-90deg)}
 .tool-call-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-bottom:12px;border-bottom:1px solid #edf2f7}
+.tool-call-toggle{display:flex;align-items:center;gap:10px;border:none;background:transparent;padding:0;cursor:pointer;text-align:left}
+.tool-call-toggle-icon{font-size:11px;color:#64748b;transition:transform .18s ease}
 .tool-call-title-wrap{display:flex;align-items:center;gap:10px;min-width:0}
 .tool-call-title{font-size:15px;font-weight:700;color:#0f172a;white-space:nowrap}
 .tool-call-subtitle{font-size:13px;color:#64748b;line-height:1.5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tool-call-badge{padding:5px 10px;border-radius:999px;background:#f1f5f9;color:#475569;font-size:11px;font-weight:600;white-space:nowrap}
 .tool-call-grid{display:flex;flex-direction:column;gap:10px}
+.tool-call-card.collapsed .tool-call-grid{display:none}
 .tool-call-item{display:grid;grid-template-columns:120px minmax(0,1fr);gap:14px;padding:10px 0;border-bottom:1px dashed #e2e8f0;align-items:start}
 .tool-call-item:last-child{border-bottom:none;padding-bottom:0}
 .tool-call-label{font-size:12px;font-weight:600;color:#64748b}
@@ -241,8 +245,14 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .change-list{display:flex;flex-direction:column;gap:12px;margin-top:8px}
 .change-list{display:flex;flex-direction:column;gap:4px;margin:2px 0}
 .change-item{padding:8px 10px;background:#fff;border:1px solid #e2e8f0;border-radius:10px}
-.change-item-title{font-size:11px;font-weight:700;color:#334155;margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em}
-.change-item-body{font-size:12px;color:#475569;line-height:1.45}
+.change-item-header{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.change-item-toggle{display:inline-flex;align-items:center;gap:8px;border:none;background:transparent;padding:0;cursor:pointer;width:100%;text-align:left}
+.change-item-toggle-icon{font-size:11px;color:#64748b;transition:transform .18s ease}
+.change-item.collapsed .change-item-toggle-icon{transform:rotate(-90deg)}
+.change-item-title{font-size:11px;font-weight:700;color:#334155;text-transform:uppercase;letter-spacing:.04em}
+.change-item-meta{font-size:11px;color:#94a3b8}
+.change-item-body{font-size:12px;color:#475569;line-height:1.45;margin-top:6px}
+.change-item.collapsed .change-item-body{display:none}
 .change-bullet{display:flex;gap:8px;margin-top:6px}
 .change-bullet::before{content:'•';color:#94a3b8;font-weight:700}
 @media(max-width:720px){.tool-call-header{align-items:flex-start;flex-direction:column}.tool-call-item{grid-template-columns:1fr;gap:6px}}
@@ -628,16 +638,21 @@ function renderStructuredToolCall(content) {
 
   const contentHtml = [...summary, ...details].join('');
 
+  const collapseId = `tool-call-${Math.random().toString(36).slice(2, 10)}`;
+
   return `
-    <section class="tool-call-card">
+    <section class="tool-call-card collapsed" data-tool-call-container>
       <div class="tool-call-header">
-        <div class="tool-call-title-wrap">
-          <div class="tool-call-title">工具调用</div>
-          <div class="tool-call-subtitle">聚焦关键操作与执行结果</div>
-        </div>
+        <button class="tool-call-toggle" type="button" data-tool-call-toggle="${collapseId}" aria-expanded="false">
+          <span class="tool-call-toggle-icon">▼</span>
+          <div class="tool-call-title-wrap">
+            <div class="tool-call-title">工具调用</div>
+            <div class="tool-call-subtitle">聚焦关键操作与执行结果</div>
+          </div>
+        </button>
         <div class="tool-call-badge">Live</div>
       </div>
-      <div class="tool-call-grid">${contentHtml}</div>
+      <div class="tool-call-grid" data-tool-call-body="${collapseId}">${contentHtml}</div>
     </section>
   `;
 }
@@ -730,6 +745,8 @@ function renderMarkdown(text) {
     paragraph = [];
   }
 
+  let listItems = [];
+
   function flushCodeFence() {
     if (!codeFence) return;
     const language = codeFence.language || 'code';
@@ -741,6 +758,24 @@ function renderMarkdown(text) {
     codeFence = null;
   }
 
+  function flushList() {
+    if (!listItems.length) return;
+    const collapseId = `change-list-${Math.random().toString(36).slice(2, 8)}`;
+    blocks.push(`
+      <div class="change-list">
+        <div class="change-item">
+          <div class="change-item-header">
+            <span class="change-item-title">改动清单</span>
+            <span class="change-item-meta">${listItems.length} 项</span>
+          </div>
+          <div class="change-item-body">
+            <ul class="markdown-list grouped-list">${listItems.join('')}</ul>
+          </div>
+        </div>
+      </div>`);
+    listItems = [];
+  }
+
   lines.forEach((line) => {
     const fence = line.match(/^```(.*)$/);
     if (fence) {
@@ -748,6 +783,7 @@ function renderMarkdown(text) {
         flushCodeFence();
       } else {
         flushParagraph();
+        flushList();
         codeFence = { language: (fence[1] || '').trim().toLowerCase(), lines: [] };
       }
       return;
@@ -760,12 +796,14 @@ function renderMarkdown(text) {
 
     if (!line.trim()) {
       flushParagraph();
+      flushList();
       return;
     }
 
     const heading = line.match(/^(#{1,3})\s+(.*)$/);
     if (heading) {
       flushParagraph();
+      flushList();
       const level = heading[1].length;
       blocks.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
       return;
@@ -773,26 +811,27 @@ function renderMarkdown(text) {
 
     if (line.startsWith('- ') || line.startsWith('* ')) {
       flushParagraph();
-      const items = [line];
-      blocks.push(`<ul class="markdown-list"><li>${renderInlineMarkdown(line.slice(2))}</li></ul>`);
+      listItems.push(`<li>${renderInlineMarkdown(line.slice(2))}</li>`);
       return;
     }
 
     if (line === '---') {
       flushParagraph();
+      flushList();
       blocks.push('<hr />');
       return;
     }
 
+    flushList();
     paragraph.push(renderInlineMarkdown(line));
   });
 
   const structured = renderStructuredToolCall(escaped);
   flushCodeFence();
   flushParagraph();
+  flushList();
 
   const markdownHtml = blocks.join('')
-    .replace(/<ul class="markdown-list">([\s\S]*?)<\/ul>/g, '<div class="change-list"><div class="change-item"><div class="change-item-title">改动清单</div><div class="change-item-body">$1</div></div></div>')
     .replace(/<li>/g, '<div class="change-bullet"><div>')
     .replace(/<\/li>/g, '</div></div>');
 
@@ -826,20 +865,31 @@ function ensureChatScrollTracking(chatArea) {
 }
 
 document.addEventListener('click', (event) => {
-  const toggle = event.target.closest('[data-diff-toggle]');
-  if (!toggle) {
+  const toolCallToggle = event.target.closest('[data-tool-call-toggle]');
+  if (toolCallToggle) {
+    const container = toolCallToggle.closest('[data-tool-call-container]');
+    if (!container) {
+      return;
+    }
+
+    const collapsed = container.classList.toggle('collapsed');
+    toolCallToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
     return;
   }
 
-  const diffId = toggle.dataset.diffToggle;
-  const body = document.querySelector(`[data-diff-body="${diffId}"]`);
-  if (!body) {
+  const diffToggle = event.target.closest('[data-diff-toggle]');
+  if (diffToggle) {
+    const diffId = diffToggle.dataset.diffToggle;
+    const body = document.querySelector(`[data-diff-body="${diffId}"]`);
+    if (!body) {
+      return;
+    }
+
+    const collapsed = body.classList.toggle('collapsed');
+    diffToggle.textContent = collapsed ? '展开完整内容' : '收起内容';
+    diffToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
     return;
   }
-
-  const collapsed = body.classList.toggle('collapsed');
-  toggle.textContent = collapsed ? '展开完整内容' : '收起内容';
-  toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
 });
 
 function renderMessages(forceScrollToBottom = false) {
@@ -1727,7 +1777,42 @@ function describeProgress(progress) {
       : '完成';
     return `工具 ${progress.tool_name} ${status}`;
   }
-  if (kind === 'model_retry') return '模型调用重试中…';
+  if (kind === 'model_retry' || kind === 'model_transport') {
+    const attempt = progress.transport_attempt || 1;
+    const maximum = progress.max_transport_attempts || 1;
+    const prefix = `模型请求 ${attempt}/${maximum}`;
+    const mode = {
+      streaming: '流式', non_streaming: '非流式',
+    }[progress.transport_mode] || '';
+    const event = progress.transport_event;
+    if (event === 'attempt_started') {
+      return `${prefix} 开始${mode ? `（${mode}）` : ''}`;
+    }
+    if (event === 'attempt_completed') {
+      return `${prefix} 成功${mode ? `（${mode}）` : ''}`;
+    }
+    if (event === 'attempt_failed') {
+      const code = progress.diagnostic_code
+        ? ` · ${progress.diagnostic_code}` : '';
+      const detail = progress.diagnostic_detail
+        ? `：${progress.diagnostic_detail}` : '';
+      return `${prefix} 失败${code}${detail}`;
+    }
+    if (event === 'recovery_decided') {
+      const action = {
+        FALLBACK_TRANSPORT: '切换为非流式请求',
+        RETRY_SAME_REQUEST: '重试同一请求',
+        RESAMPLE: '重新采样',
+        RESAMPLE_WITH_CORRECTION: '修正后重试',
+        PRESERVE_AND_INTERRUPT: '保留进度并中断',
+        FAIL_TERMINAL: '停止重试',
+      }[progress.recovery_action] || '执行恢复策略';
+      const delay = progress.retry_delay_seconds > 0
+        ? `，${progress.retry_delay_seconds} 秒后执行` : '';
+      return `${prefix}：${action}${delay}`;
+    }
+    return `${prefix} 状态更新`;
+  }
   if (kind === 'focus') return progress.activity || '调整执行重点';
   if (kind === 'exploration') return progress.activity || '正在检索工作区';
   if (kind === 'wrap_up') return '正在整理结果…';
@@ -2086,13 +2171,15 @@ async function ensureConversationLoaded(conversationId) {
       if (message.role === 'assistant' && message.task_id) {
         visibleAssistantTaskIds.add(message.task_id);
       }
-      // Task user text is persisted when a result is recorded, but belongs at
-      // task attachment time. Direct Session chat keeps its own event sequence.
-      const sequence = Number(
-        message.role === 'user' && task
-          ? task.attached_sequence
-          : message.source_event_sequence,
-      );
+      // A Task records its input at attachment time, so a user message already
+      // sorts correctly. Older records only kept it on the result event, which
+      // lands after the Task card, so fall back to the attachment position.
+      const sequence = message.role === 'user' && task
+        ? Math.min(
+            Number(message.source_event_sequence),
+            Number(task.attached_sequence),
+          )
+        : Number(message.source_event_sequence);
       timeline.push({
         sequence, order: message.role === 'user' ? 0 : 2,
         insertionOrder: insertionOrder++,

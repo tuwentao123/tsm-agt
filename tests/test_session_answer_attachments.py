@@ -45,7 +45,6 @@ class AnswerRouteResolver:
             "disposition": "ANSWER",
             "relation": "INDEPENDENT",
             "source_task_id": None,
-            "resolved_goal": None,
             "input_grounding": "SELF_CONTAINED",
             "confidence": 0.97,
             "reason_code": "self_contained_image_question",

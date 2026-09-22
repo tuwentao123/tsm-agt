@@ -213,17 +213,22 @@ class EngineeringAgentClient:
         source_task_id: str | None = None,
         task_relation: SessionTaskRelation = SessionTaskRelation.INDEPENDENT,
         workspace: Path | None = None,
+        original_user_text: str | None = None,
     ) -> TaskSnapshot:
         """Create one Task, optionally in a workspace other than the client's.
 
         One client process may serve several workspaces, so the caller must be
         able to name the workspace a Task actually runs in. Omitting it keeps
         the client's own workspace, which is the single-workspace default.
+
+        ``original_user_text`` preserves the message the user typed, which a
+        derived goal deliberately rewrites.
         """
         return await self.application.kernel.create_task(
             goal, workspace or self.workspace, session_id=session_id,
             command_id=command_id, source_task_id=source_task_id,
             task_relation=task_relation,
+            original_user_text=original_user_text,
         )
 
     async def submit_task(
@@ -232,12 +237,13 @@ class EngineeringAgentClient:
         task_relation: SessionTaskRelation = SessionTaskRelation.INDEPENDENT,
         images: tuple[ImageBlock, ...] = (),
         workspace: Path | None = None,
+        original_user_text: str | None = None,
     ) -> RuntimeTaskResult:
         async with self._submit_lock:
             task = await self.create_task(
                 goal, command_id=command_id, session_id=session_id,
                 source_task_id=source_task_id, task_relation=task_relation,
-                workspace=workspace,
+                workspace=workspace, original_user_text=original_user_text,
             )
             current = await self.application.kernel.get_task(task.task_id)
             if (
@@ -313,6 +319,7 @@ class EngineeringAgentClient:
                         normalized, command_id=command_id, session_id=session_id,
                         task_relation=SessionTaskRelation.CONTEXTUAL,
                         images=image_blocks, workspace=resolved_workspace,
+                        original_user_text=normalized,
                     )
                     corrected = SessionInputDecision(
                         SessionRouteDisposition.CREATE_TASK,
@@ -345,14 +352,17 @@ class EngineeringAgentClient:
                     item for item in decision.task_catalog
                     if item.task_id == decision.source_task_id
                 )
-                goal = decision.resolved_goal or build_session_follow_up_goal(
-                    normalized, source
-                )
+                # The goal is built here rather than taken from the decision. A
+                # derived goal must state the user's own request and reference
+                # the source Task only as bounded context, and that is a
+                # deterministic construction, not something a router may author.
+                goal = build_session_follow_up_goal(normalized, source)
                 task = await self.submit_task(
                     goal, command_id=command_id, session_id=session_id,
                     source_task_id=decision.source_task_id,
                     task_relation=SessionTaskRelation.FOLLOW_UP,
                     images=image_blocks, workspace=resolved_workspace,
+                    original_user_text=normalized,
                 )
                 derived = SessionInputDecision(
                     SessionRouteDisposition.CREATE_TASK,
@@ -368,12 +378,14 @@ class EngineeringAgentClient:
                     task=task,
                 )
             assert decision.disposition is SessionRouteDisposition.CREATE_TASK
+            assert decision.resolved_goal is not None
             task = await self.submit_task(
-                decision.resolved_goal or normalized,
+                decision.resolved_goal,
                 command_id=command_id, session_id=session_id,
                 source_task_id=decision.source_task_id,
                 task_relation=decision.relation,
                 images=image_blocks, workspace=resolved_workspace,
+                original_user_text=normalized,
             )
             return SessionTextResult(command_id, "task", decision_data, task=task)
 

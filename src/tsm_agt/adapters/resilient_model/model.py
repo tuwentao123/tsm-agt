@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import re
 from datetime import datetime
 
 from tsm_agt.ports import (
@@ -58,9 +60,32 @@ class ResilientModelProvider:
         await self._provider.stop(deadline)
 
     @staticmethod
-    def _notify(request: ModelRequest, update: ModelTransportProgress) -> None:
-        if request.on_transport_progress is not None:
-            request.on_transport_progress(update)
+    async def _notify(
+        request: ModelRequest, update: ModelTransportProgress,
+    ) -> None:
+        if request.on_transport_progress is None:
+            return
+        result = request.on_transport_progress(update)
+        if inspect.isawaitable(result):
+            await result
+
+    @staticmethod
+    def _safe_diagnostic_detail(message: str) -> str:
+        """Return a bounded diagnostic safe for local logs and Web UI."""
+        detail = message.strip()
+        substitutions = (
+            (r"(?i)Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer ***"),
+            (r"\bsk-[A-Za-z0-9_-]{8,}\b", "sk-***"),
+            (
+                r"(?i)([\"']?(?:api[_-]?key|token|secret|authorization)"
+                r"[\"']?\s*[:=]\s*)"
+                r"(?:\"[^\"]*\"|'[^']*'|[^,}\s]+)",
+                r'\1"***"',
+            ),
+        )
+        for pattern, replacement in substitutions:
+            detail = re.sub(pattern, replacement, detail)
+        return detail[:1000]
 
     @staticmethod
     def _normalize_failure(error: Exception) -> ModelAttemptFailure:
@@ -83,12 +108,12 @@ class ResilientModelProvider:
         attempt = 1
         max_attempts = request.max_provider_attempts or self._max_provider_attempts
         while True:
-            self._notify(request, ModelTransportProgress(
+            await self._notify(request, ModelTransportProgress(
                 "attempt_started", attempt, max_attempts,
             ))
             try:
                 response = await self._provider.complete(request)
-                self._notify(request, ModelTransportProgress(
+                await self._notify(request, ModelTransportProgress(
                     "attempt_completed", attempt, max_attempts,
                 ))
                 return response
@@ -100,7 +125,7 @@ class ResilientModelProvider:
                 decision = await self._decision(
                     failure, attempt, fallback=False, max_attempts=max_attempts
                 )
-                self._report_failure(
+                await self._report_failure(
                     request, failure, decision, attempt, max_attempts
                 )
                 if decision.action not in {
@@ -119,7 +144,7 @@ class ResilientModelProvider:
         max_attempts = request.max_provider_attempts or self._max_provider_attempts
         use_fallback = False
         while True:
-            self._notify(request, ModelTransportProgress(
+            await self._notify(request, ModelTransportProgress(
                 "attempt_started", attempt, max_attempts,
                 transport_mode=("non_streaming" if use_fallback else "streaming"),
             ))
@@ -135,7 +160,7 @@ class ResilientModelProvider:
                         if isinstance(event, ModelTextDelta):
                             visible = True
                         yield event
-                self._notify(request, ModelTransportProgress(
+                await self._notify(request, ModelTransportProgress(
                     "attempt_completed", attempt, max_attempts,
                     transport_mode=("non_streaming" if use_fallback else "streaming"),
                 ))
@@ -150,7 +175,7 @@ class ResilientModelProvider:
                     failure, attempt, fallback=(not use_fallback),
                     max_attempts=max_attempts,
                 )
-                self._report_failure(
+                await self._report_failure(
                     request, failure, decision, attempt, max_attempts
                 )
                 if decision.action not in {
@@ -167,21 +192,22 @@ class ResilientModelProvider:
                     await asyncio.sleep(decision.delay_seconds)
                 attempt += 1
 
-    def _report_failure(
+    async def _report_failure(
         self, request, failure, decision, attempt, max_attempts: int,
     ) -> None:
         common = dict(
             category=failure.category.value,
             retry_safety=failure.retry_safety.value,
             diagnostic_code=failure.diagnostic_code,
+            diagnostic_detail=self._safe_diagnostic_detail(failure.message),
             visible_output_emitted=failure.visible_output_emitted,
             response_committed=failure.response_committed,
         )
-        self._notify(request, ModelTransportProgress(
+        await self._notify(request, ModelTransportProgress(
             "attempt_failed", attempt, max_attempts,
             reason=decision.reason_code, **common,
         ))
-        self._notify(request, ModelTransportProgress(
+        await self._notify(request, ModelTransportProgress(
             "recovery_decided", attempt, max_attempts,
             reason=decision.reason_code, delay_seconds=decision.delay_seconds,
             recovery_action=decision.action.value, **common,

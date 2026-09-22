@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from collections.abc import AsyncIterator
 
@@ -92,6 +93,44 @@ class ModelRecoveryTest(unittest.IsolatedAsyncioTestCase):
                         "attempt_completed",
                     ],
                 )
+
+    async def test_transport_progress_awaits_async_sink_and_redacts_diagnostics(self):
+        physical = AttemptModel([
+            ModelAttemptFailed(ModelAttemptFailure(
+                ModelFailureCategory.TRANSIENT_PROVIDER,
+                ModelRetrySafety.SAFE_SAME_REQUEST,
+                "http_503",
+                'provider returned HTTP 503: {"api_key":"secret-value",'
+                '"authorization":"Bearer token-value","error":"busy"}',
+            )),
+            response("recovered"),
+        ])
+        model = await self._coordinator(physical)
+        updates = []
+
+        async def sink(update):
+            # If the coordinator does not await this callback, the order below
+            # becomes nondeterministic and durable attempt events lag recovery.
+            await asyncio.sleep(0)
+            updates.append(update)
+
+        result = await model.complete(ModelRequest(
+            "turn", (), on_transport_progress=sink,
+        ))
+
+        self.assertEqual(result.message.text, "recovered")
+        self.assertEqual(
+            [item.kind for item in updates],
+            [
+                "attempt_started", "attempt_failed", "recovery_decided",
+                "attempt_started", "attempt_completed",
+            ],
+        )
+        failed = updates[1]
+        self.assertEqual(failed.diagnostic_code, "http_503")
+        self.assertIn('"error":"busy"', failed.diagnostic_detail)
+        self.assertNotIn("secret-value", failed.diagnostic_detail)
+        self.assertNotIn("token-value", failed.diagnostic_detail)
 
     async def test_failure_limit_preserves_structured_terminal_decision(self):
         physical = AttemptModel([

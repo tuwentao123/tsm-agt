@@ -1295,7 +1295,8 @@ async def _chat(
                     ):
                         route_source_task_id = decision.source_task_id
                         route_relation = decision.relation
-                        route_goal = decision.resolved_goal or prompt
+                        assert decision.resolved_goal is not None
+                        route_goal = decision.resolved_goal
                         prompt = route_goal
                     else:
                         output_fn(

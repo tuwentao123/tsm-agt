@@ -36,12 +36,13 @@ class FixtureResolver:
         return self.factory(context)
 
 
-def route(disposition, relation, *, source_task_id=None, goal=None, clarification=None):
+def route(disposition, relation, *, source_task_id=None, clarification=None):
+    # A route proposal carries no goal: Runtime builds it from the user's request
+    # plus the selected Task's bounded summary.
     return {
         "disposition": disposition,
         "relation": relation,
         "source_task_id": source_task_id,
-        "resolved_goal": goal,
         "input_grounding": "SELF_CONTAINED",
         "confidence": 0.96,
         "reason_code": "fixture",
@@ -93,7 +94,6 @@ class SessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
                 source = context["task_catalog"][0]["task_id"]
                 return route(
                     "CREATE_TASK", "FOLLOW_UP", source_task_id=source,
-                    goal="write regression tests",
                 )
 
             client = await self.make_client(root, FixtureResolver(follow_up))
@@ -120,6 +120,106 @@ class SessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(created.payload["source_task_id"], source.task_id)
             self.assertEqual(
                 created.payload["task_relation"], SessionTaskRelation.FOLLOW_UP.value
+            )
+
+    async def test_follow_up_history_shows_the_user_text_not_the_derived_goal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def follow_up(context):
+                source = context["task_catalog"][0]["task_id"]
+                return route("CREATE_TASK", "FOLLOW_UP", source_task_id=source)
+
+            client = await self.make_client(root, FixtureResolver(follow_up))
+            kernel = client.application.kernel
+            session = await kernel.create_session("history")
+            source = await kernel.create_task(
+                "implement endpoint", root, session_id=session.session_id
+            )
+            for state in (
+                TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                TaskState.EXECUTING, TaskState.VERIFYING,
+                TaskState.FINALIZING, TaskState.SUCCEEDED,
+            ):
+                await kernel.transition_task(source.task_id, state, state.value)
+
+            result = await client.submit_session_text(
+                session.session_id, "那继续验证啊", command_id="request-history",
+            )
+            task_id = result.result["task"]["task_id"]
+            task = await kernel.get_task(task_id)
+            # The goal still carries the bounded handoff the Agent needs.
+            self.assertTrue(task.goal.startswith("[session-follow-up]"))
+
+            projection = await kernel.get_session_conversation(session.session_id)
+            derived = [
+                item.text for item in projection.messages
+                if item.task_id == task_id and item.role.value == "user"
+            ]
+            self.assertEqual(derived, ["那继续验证啊"])
+
+    async def test_clarification_exchange_survives_a_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def clarify(context):
+                ids = [item["task_id"] for item in context["task_catalog"]][:2]
+                return {
+                    **route("CLARIFY", "UNCERTAIN", clarification="指的是哪一项？"),
+                    "candidate_task_ids": ids,
+                }
+
+            client = await self.make_client(root, FixtureResolver(clarify))
+            kernel = client.application.kernel
+            session = await kernel.create_session("clarify")
+            # Two finished Tasks give the router a real choice; a single
+            # candidate is deliberately degraded to a contextual Task instead.
+            for index in range(2):
+                task = await kernel.create_task(
+                    f"task {index}", root, session_id=session.session_id,
+                    original_user_text=f"第 {index} 个请求",
+                )
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING, TaskState.VERIFYING,
+                    TaskState.FINALIZING, TaskState.SUCCEEDED,
+                ):
+                    await kernel.transition_task(task.task_id, state, state.value)
+
+            result = await client.submit_session_text(
+                session.session_id, "那个再改一下", command_id="request-clarify",
+            )
+            self.assertEqual(result.result["kind"], "clarify")
+
+            # A clarification creates no Task, so only a conversation record can
+            # keep the exchange visible once the browser state is gone.
+            projection = await kernel.get_session_conversation(session.session_id)
+            texts = [item.text for item in projection.messages]
+            self.assertIn("那个再改一下", texts)
+            self.assertIn("指的是哪一项？", texts)
+
+    async def test_input_survives_a_task_that_never_records_a_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = await self.make_client(Path(directory))
+            kernel = client.application.kernel
+            session = await kernel.create_session("failing task")
+
+            task = await kernel.create_task(
+                "goal text", root, session_id=session.session_id,
+                original_user_text="帮我查下今天的NBA新闻",
+            )
+            for state in (TaskState.INTAKE, TaskState.FAILED):
+                await kernel.transition_task(task.task_id, state, state.value)
+
+            # No session.task_result_recorded exists for a Task that failed
+            # before finishing a Turn, yet the input must remain visible.
+            projection = await kernel.get_session_conversation(session.session_id)
+            self.assertEqual(
+                [item.text for item in projection.messages],
+                ["帮我查下今天的NBA新闻"],
             )
 
     async def test_ordinary_resume_proposal_derives_a_fresh_follow_up_task(self):

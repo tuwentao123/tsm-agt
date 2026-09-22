@@ -216,6 +216,7 @@ class ModelTransportProgress:
     category: str = ""
     retry_safety: str = ""
     diagnostic_code: str = ""
+    diagnostic_detail: str = ""
     recovery_action: str = ""
     visible_output_emitted: bool = False
     response_committed: bool = False
@@ -228,6 +229,7 @@ class ModelTransportProgress:
             "delay_seconds": self.delay_seconds, "category": self.category,
             "retry_safety": self.retry_safety,
             "diagnostic_code": self.diagnostic_code,
+            "diagnostic_detail": self.diagnostic_detail,
             "recovery_action": self.recovery_action,
             "visible_output_emitted": self.visible_output_emitted,
             "response_committed": self.response_committed,
@@ -246,7 +248,7 @@ class ModelRequest:
     outcome_refs: tuple[str, ...] = ()
     # This callback is process-local and is never serialized into a Checkpoint.
     # Adapters can expose retries without leaking HTTP/SSE details into Kernel.
-    on_transport_progress: Callable[[ModelTransportProgress], None] | None = None
+    on_transport_progress: Callable[[ModelTransportProgress], Any] | None = None
     # Optional per-tool narrowing. Runtime computes this from the authoritative
     # TaskSpec so Provider schemas do not advertise impossible Tool→Outcome pairs.
     # Kept after the older callback field to preserve positional compatibility.

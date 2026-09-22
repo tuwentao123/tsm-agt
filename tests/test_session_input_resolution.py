@@ -138,9 +138,9 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                     "disposition": "CREATE_TASK",
                     "relation": "FOLLOW_UP",
                     "source_task_id": completed.task_id,
-                    "resolved_goal": (
-                        "基于 Codex 和 Hermes 的比较，说明还需补充哪些能力"
-                    ),
+                    # No goal: a resolver classifies the message, and Runtime
+                    # builds the derived goal from the request plus the source
+                    # summary. See tests/test_derived_task_goal_authorship.py.
                     "input_grounding": "CONTEXT_DEPENDENT",
                     "confidence": 0.96,
                     "reason_code": "references_completed_result",
@@ -186,8 +186,10 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                     for item in routed_context["task_catalog"]
                     if item["task_id"] == unrelated.task_id
                 ))
+                assert decision.resolved_goal is not None
+                self.assertIn("那现在还需要补充哪些", decision.resolved_goal)
                 derived = await app.kernel.create_task(
-                    decision.resolved_goal or "missing", root,
+                    decision.resolved_goal, root,
                     session_id=session.session_id,
                     source_task_id=decision.source_task_id,
                     task_relation=decision.relation,
@@ -347,6 +349,9 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
             "disposition": "CREATE_TASK",
             "relation": "INDEPENDENT",
             "source_task_id": None,
+            # A goal is no longer part of the contract. A model that still sends
+            # one must be tolerated and the key dropped, because failing strict
+            # validation here would degrade an otherwise usable classification.
             "resolved_goal": "explain the current implementation",
             "input_grounding": "SELF_CONTAINED",
             "confidence": 0.98,
@@ -362,6 +367,7 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
             "explain the current implementation", {"task_catalog": []}
         )
         self.assertEqual(result["disposition"], "CREATE_TASK")
+        self.assertNotIn("resolved_goal", result)
         request = model.requests[-1]
         self.assertTrue(request.allow_tool_calls)
         self.assertEqual(
@@ -500,7 +506,6 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
             "disposition": "CLARIFY",
             "relation": "UNCERTAIN",
             "source_task_id": None,
-            "resolved_goal": None,
             "input_grounding": "AMBIGUOUS",
             "confidence": 0.55,
             "reason_code": "two_plausible_referents",
@@ -787,7 +792,6 @@ class SessionAnswerTest(unittest.IsolatedAsyncioTestCase):
             "disposition": "ANSWER",
             "relation": "INDEPENDENT",
             "source_task_id": None,
-            "resolved_goal": None,
             "input_grounding": "SELF_CONTAINED",
             "confidence": 0.96,
             "reason_code": "self_contained_question",

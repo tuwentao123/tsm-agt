@@ -31,7 +31,6 @@ SESSION_ROUTE_PROPOSAL_SCHEMA = {
                      "BRANCH", "UNCERTAIN"],
         },
         "source_task_id": {"type": ["string", "null"]},
-        "resolved_goal": {"type": ["string", "null"]},
         "input_grounding": {
             "type": "string",
             "enum": ["SELF_CONTAINED", "CONTEXT_DEPENDENT", "AMBIGUOUS"],
@@ -43,8 +42,12 @@ SESSION_ROUTE_PROPOSAL_SCHEMA = {
             "type": "array", "items": {"type": "string"},
         },
     },
+    # Every field here is checkable against an enum or the supplied catalog.
+    # A goal is deliberately absent: Runtime builds it from the user's own words
+    # plus the selected Task's bounded summary, so this resolver classifies the
+    # message and never restates it.
     "required": [
-        "disposition", "relation", "source_task_id", "resolved_goal",
+        "disposition", "relation", "source_task_id",
         "input_grounding", "confidence", "reason_code",
         "clarification", "candidate_task_ids",
     ],
@@ -117,11 +120,11 @@ class ModelSessionInputResolver:
                 "decision; mere unfinished status is never sufficient. "
                 "When session.submit_route_proposal is supplied, call it exactly "
                 "once and return no prose. Otherwise return exactly one JSON "
-                "object with disposition, relation, source_task_id, resolved_goal, "
+                "object with disposition, relation, source_task_id, "
                 "input_grounding, confidence, reason_code, clarification, "
-                "candidate_task_ids. For derived "
-                "new work, resolved_goal must be a complete goal combining the "
-                "current request with the selected Task summary. source_task_id "
+                "candidate_task_ids. Do not write a goal for the new work and do "
+                "not restate the request: Runtime builds the goal from the user's "
+                "own words plus the selected Task summary. source_task_id "
                 "must be null for INDEPENDENT and must exactly match task_catalog "
                 "for CONTINUE, FOLLOW_UP, or BRANCH. RESUME_TASK may select only "
                 "a non-terminal catalog entry. A terminal Task (FAILED, SUCCEEDED, "
@@ -185,7 +188,7 @@ class ModelSessionInputResolver:
                 proposal = self._extract_proposal(
                     response, submit_tool.name, attempt
                 )
-                proposal = self._normalize_legacy_proposal(proposal, text)
+                proposal = self._normalize_legacy_proposal(proposal)
                 self._validate_proposal(proposal, attempt)
                 return proposal
             except SessionRouteResolutionError as error:
@@ -263,11 +266,18 @@ class ModelSessionInputResolver:
 
     @staticmethod
     def _normalize_legacy_proposal(
-        proposal: Mapping[str, Any], current_input: str,
+        proposal: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Map the documented v1 envelope to v2 before strict validation."""
         if "disposition" in proposal:
-            return dict(proposal)
+            normalized = dict(proposal)
+            # A goal is no longer part of the contract, but a model that still
+            # volunteers one must not fail the whole proposal: strict validation
+            # would degrade the route and discard a classification that is
+            # otherwise usable. Dropping it is safe because Runtime builds the
+            # goal itself and never reads this key.
+            normalized.pop("resolved_goal", None)
+            return normalized
         action = proposal.get("action")
         if action not in {"NEW_TASK", "RESUME_TASK", "CLARIFY"}:
             return dict(proposal)
@@ -286,7 +296,6 @@ class ModelSessionInputResolver:
             "disposition": disposition,
             "relation": relation,
             "source_task_id": task_id if action == "RESUME_TASK" else None,
-            "resolved_goal": current_input if action == "NEW_TASK" else None,
             "input_grounding": proposal.get(
                 "input_grounding", "AMBIGUOUS"
             ),
@@ -317,9 +326,7 @@ class ModelSessionInputResolver:
                 "schema_validation", "ROUTE_SCHEMA_ENUM_INVALID",
                 attempt=attempt, argument_keys=tuple(sorted(actual)),
             )
-        nullable_strings = (
-            "source_task_id", "resolved_goal", "clarification",
-        )
+        nullable_strings = ("source_task_id", "clarification")
         if any(
             proposal[key] is not None and not isinstance(proposal[key], str)
             for key in nullable_strings
