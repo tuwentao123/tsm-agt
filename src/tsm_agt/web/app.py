@@ -150,6 +150,11 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .task-summary-value{margin-top:3px;font-size:13px;font-weight:700;color:#111827;line-height:1.2}
 .task-panel{display:none}
 .task-panel.active{display:flex;flex-direction:column;gap:8px}
+.task-collapse-toggle{display:flex;align-items:center;justify-content:center;gap:6px;padding:8px 12px;border-radius:10px;border:1px solid #d9e1ec;background:#f8fafc;color:#475569;font-size:12px;font-weight:600;cursor:pointer;transition:all .15s ease}
+.task-collapse-toggle:hover{background:#eef4ff;border-color:#93c5fd;color:#2563eb}
+.task-collapsible{position:relative;overflow:hidden;transition:max-height .2s ease}
+.task-collapsible.collapsed{max-height:220px}
+.task-collapsible.collapsed::after{content:'';position:absolute;left:0;right:0;bottom:0;height:64px;background:linear-gradient(180deg,rgba(248,250,252,0),rgba(248,250,252,.96))}
 .task-progress{display:flex;flex-direction:column;gap:6px}
 .task-progress-line{font-size:12px;color:#334155;white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid #d9e1ec;border-left:2px solid #91caff;border-radius:10px;padding:8px 10px}
 .task-progress-empty{font-size:12px;color:#94a3b8}
@@ -214,8 +219,8 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .tool-call-label{font-size:12px;font-weight:600;color:#64748b}
 .tool-call-value{font-size:14px;color:#1e293b;line-height:1.7;word-break:break-word}
 .tool-call-primary{font-weight:700;color:#0f172a}
-.tool-call-markdown{background:linear-gradient(180deg,#fbfdff 0%,#f8fafc 100%);border:1px solid #dbe3ee;border-radius:18px;padding:18px;display:flex;flex-direction:column;gap:14px;overflow:hidden}
-.tool-call-markdown p{margin:0 0 12px;color:#475569;line-height:1.75}
+.tool-call-markdown{background:linear-gradient(180deg,#fbfdff 0%,#f8fafc 100%);border:1px solid #dbe3ee;border-radius:18px;padding:18px;display:flex;flex-direction:column;gap:10px;overflow:hidden}
+.tool-call-markdown p{margin:0;color:#475569;line-height:1.7}
 .tool-call-markdown p:last-child{margin-bottom:0}
 .tool-call-markdown h1,.tool-call-markdown h2,.tool-call-markdown h3{margin:0 0 10px;color:#0f172a;letter-spacing:-.01em}
 .tool-call-markdown code{background:#eef2ff;color:#4338ca;padding:2px 6px;border-radius:6px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
@@ -242,9 +247,8 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .diff-inline-tag.added{background:#dcfce7;color:#166534}
 .diff-inline-tag.removed{background:#fee2e2;color:#991b1b}
 .diff-muted{font-size:12px;color:#94a3b8;line-height:1.6}
-.change-list{display:flex;flex-direction:column;gap:12px;margin-top:8px}
-.change-list{display:flex;flex-direction:column;gap:4px;margin:2px 0}
-.change-item{padding:8px 10px;background:#fff;border:1px solid #e2e8f0;border-radius:10px}
+.change-list{display:flex;flex-direction:column;gap:8px;margin:6px 0 2px}
+.change-item{padding:10px 12px;background:#fff;border:1px solid #e2e8f0;border-radius:10px;box-shadow:0 1px 2px rgba(15,23,42,.03)}
 .change-item-header{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .change-item-toggle{display:inline-flex;align-items:center;gap:8px;border:none;background:transparent;padding:0;cursor:pointer;width:100%;text-align:left}
 .change-item-toggle-icon{font-size:11px;color:#64748b;transition:transform .18s ease}
@@ -365,6 +369,7 @@ textarea::placeholder{color:#94a3b8}
 </div>
 
 <script>
+""" + r"""
 const selectedImages = [];
 const workspaces = [];
 const conversations = [];
@@ -607,7 +612,54 @@ function renderInlineMarkdown(text) {
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
 }
 
+function extractVisibleFollowUpRequest(content) {
+  if (!content.includes('[session-follow-up]')) {
+    return null;
+  }
+
+  const match = content.match(/Current request:\s*([\s\S]*?)(?:\n\n(?:Authority-free source Task|Historical outcomes|Safety boundary|Remaining work|Completed work):|$)/);
+  if (!match) {
+    return null;
+  }
+
+  const request = match[1].trim();
+  return request || null;
+}
+
+const toolCallCollapseState = new Map();
+const diffCollapseState = new Map();
+
+function buildStableCollapseKey(prefix, content) {
+  const normalized = String(content || '').slice(0, 600);
+  let hash = 0;
+  for (let index = 0; index < normalized.length; index += 1) {
+    hash = ((hash << 5) - hash) + normalized.charCodeAt(index);
+    hash |= 0;
+  }
+  return `${prefix}-${Math.abs(hash)}`;
+}
+
 function renderStructuredToolCall(content) {
+  const visibleFollowUpRequest = extractVisibleFollowUpRequest(content);
+  if (visibleFollowUpRequest) {
+    return `
+      <section class="tool-call-card follow-up-card" data-tool-call-container>
+        <div class="tool-call-header">
+          <div class="tool-call-title-wrap">
+            <div class="tool-call-title">Follow-up Request</div>
+            <div class="tool-call-subtitle">仅展示当前用户请求，隐藏 Runtime 包装上下文</div>
+          </div>
+        </div>
+        <div class="tool-call-grid">
+          <div class="tool-call-item">
+            <div class="tool-call-label">当前请求</div>
+            <div class="tool-call-value tool-call-primary">${renderInlineMarkdown(visibleFollowUpRequest)}</div>
+          </div>
+        </div>
+      </section>
+    `;
+  }
+
   const rows = content.split('\\n').filter((line) => line.includes('：'));
   if (rows.length < 2) return null;
 
@@ -638,12 +690,15 @@ function renderStructuredToolCall(content) {
 
   const contentHtml = [...summary, ...details].join('');
 
-  const collapseId = `tool-call-${Math.random().toString(36).slice(2, 10)}`;
+  const collapseId = buildStableCollapseKey('tool-call', contentHtml);
+  const isCollapsed = toolCallCollapseState.has(collapseId)
+    ? toolCallCollapseState.get(collapseId)
+    : true;
 
   return `
-    <section class="tool-call-card collapsed" data-tool-call-container>
+    <section class="tool-call-card ${isCollapsed ? 'collapsed' : ''}" data-tool-call-container data-tool-call-id="${collapseId}">
       <div class="tool-call-header">
-        <button class="tool-call-toggle" type="button" data-tool-call-toggle="${collapseId}" aria-expanded="false">
+        <button class="tool-call-toggle" type="button" data-tool-call-toggle="${collapseId}" aria-expanded="${isCollapsed ? 'false' : 'true'}">
           <span class="tool-call-toggle-icon">▼</span>
           <div class="tool-call-title-wrap">
             <div class="tool-call-title">工具调用</div>
@@ -710,7 +765,10 @@ function renderDiffBlocks(text) {
     `;
   }).join('');
 
-  const collapseId = `diff-${Math.random().toString(36).slice(2, 10)}`;
+  const collapseId = buildStableCollapseKey('diff', text);
+  const isCollapsed = diffCollapseState.has(collapseId)
+    ? diffCollapseState.get(collapseId)
+    : true;
 
   return `
     <div class="diff-viewer">
@@ -720,11 +778,11 @@ function renderDiffBlocks(text) {
           <div class="diff-muted">聚焦真实改动内容，弱化 metadata 与原始 dump 输出</div>
         </div>
         <div class="diff-viewer-actions">
-          <button class="diff-viewer-toggle" type="button" data-diff-toggle="${collapseId}" aria-expanded="false">展开完整内容</button>
+          <button class="diff-viewer-toggle" type="button" data-diff-toggle="${collapseId}" aria-expanded="${isCollapsed ? 'false' : 'true'}">${isCollapsed ? '展开完整内容' : '收起内容'}</button>
           <div class="diff-viewer-meta">Modern Viewer</div>
         </div>
       </div>
-      <div class="diff-viewer-body collapsed" data-diff-body="${collapseId}">
+      <div class="diff-viewer-body ${isCollapsed ? 'collapsed' : ''}" data-diff-body="${collapseId}">
         ${body}
       </div>
     </div>
@@ -873,6 +931,10 @@ document.addEventListener('click', (event) => {
     }
 
     const collapsed = container.classList.toggle('collapsed');
+    const collapseId = container.dataset.toolCallId;
+    if (collapseId) {
+      toolCallCollapseState.set(collapseId, collapsed);
+    }
     toolCallToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
     return;
   }
@@ -886,6 +948,7 @@ document.addEventListener('click', (event) => {
     }
 
     const collapsed = body.classList.toggle('collapsed');
+    diffCollapseState.set(diffId, collapsed);
     diffToggle.textContent = collapsed ? '展开完整内容' : '收起内容';
     diffToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
     return;
@@ -1321,6 +1384,7 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
 
   const progress = document.createElement('div');
   progress.className = `task-progress task-panel ${mode === 'conversation' ? 'active' : ''}`;
+  progress.classList.add('task-collapsible');
   const lines = task.progress || [];
   if (lines.length === 0) {
     const empty = document.createElement('div');
@@ -1341,6 +1405,7 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
 
   const tracePanel = document.createElement('div');
   tracePanel.className = `task-panel ${mode === 'trace' ? 'active' : ''}`;
+  tracePanel.classList.add('task-collapsible');
   const timelineScroll = document.createElement('div');
   timelineScroll.className = 'trace-timeline-scroll';
   const timeline = document.createElement('div');
@@ -1374,6 +1439,24 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
     });
   }
   card.appendChild(tracePanel);
+
+  const collapsibleSections = [progress, tracePanel].filter((panel) => {
+    if (!panel.classList.contains('active')) return false;
+    return panel.scrollHeight > 260 || panel.childElementCount > 8;
+  });
+
+  collapsibleSections.forEach((panel) => {
+    panel.classList.add('collapsed');
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'task-collapse-toggle';
+    toggle.textContent = '展开详情';
+    toggle.addEventListener('click', () => {
+      const collapsed = panel.classList.toggle('collapsed');
+      toggle.textContent = collapsed ? '展开详情' : '收起详情';
+    });
+    card.appendChild(toggle);
+  });
 
   if (task.waiting?.kind === 'APPROVAL' && task.waiting.approval) {
     const approval = document.createElement('div');
@@ -2312,6 +2395,7 @@ promptComposer.addEventListener('keydown', (event) => {
 });
 
 loadWorkspaces();
+""" + """
 </script>
 </body>
 </html>
