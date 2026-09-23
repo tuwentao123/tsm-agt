@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Literal
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -30,11 +31,20 @@ def process_result_succeeded(data: Mapping[str, object]) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class ProcessEnvironmentPolicy:
+    inherit_host_environment: bool = False
+    allowed_host_variables: tuple[str, ...] = ()
+    blocked_host_variables: tuple[str, ...] = ()
+    runtime_trust_mode: Literal["isolated", "governed"] = "isolated"
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessStartRequest:
     process_id: str
     argv: tuple[str, ...]
     cwd: Path
     environment: Mapping[str, str] = field(default_factory=dict)
+    environment_policy: ProcessEnvironmentPolicy = field(default_factory=ProcessEnvironmentPolicy)
     max_output_bytes: int = 1_000_000
 
     def __post_init__(self) -> None:
@@ -180,7 +190,9 @@ class ProcessLogs:
 
 class ProcessExecutorPort(RuntimeAdapter, Protocol):
     def prepare_environment(
-        self, environment: Mapping[str, str]
+        self,
+        environment: Mapping[str, str],
+        policy: ProcessEnvironmentPolicy | None = None,
     ) -> Mapping[str, str]: ...
 
     async def start_process(self, request: ProcessStartRequest) -> ProcessHandle: ...

@@ -9,6 +9,9 @@ import os
 import signal
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from tsm_agt.bootstrap.process_environment_configuration import (
+    ProcessEnvironmentConfiguration,
+)
 
 from tsm_agt.ports import (
     AdapterContext,
@@ -81,7 +84,11 @@ class LocalProcessExecutor:
     def __init__(self) -> None:
         self._started = False
         self._live: dict[str, _LiveProcess] = {}
-        self._completed: dict[str, tuple[ProcessHandle, ProcessResult, _LogBuffer, _LogBuffer]] = {}
+        self._completed: dict[
+            str,
+            tuple[ProcessHandle, ProcessResult, _LogBuffer, _LogBuffer],
+        ] = {}
+        self._environment_configuration = ProcessEnvironmentConfiguration()
 
     async def start(self, context: AdapterContext) -> None:
         if os.name == "nt":
@@ -103,13 +110,11 @@ class LocalProcessExecutor:
             )
         self._started = False
 
-    def prepare_environment(self, environment) -> dict[str, str]:
-        safe = {
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-            "LANG": "C.UTF-8",
-        }
-        safe.update(environment)
-        return safe
+    def prepare_environment(self, environment, policy=None) -> dict[str, str]:
+        return self._environment_configuration.build_environment(
+            environment,
+            policy,
+        )
 
     async def start_process(self, request: ProcessStartRequest) -> ProcessHandle:
         if not self._started:

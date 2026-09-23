@@ -105,7 +105,54 @@ python scripts/run_in_project_env.py module unittest discover -s tests
 
 该方式在普通 shell 中通常可运行，但在 Runtime sandbox、远程执行器或容器编排环境中可能因为 executable/cwd 校验失败而不可移植。
 
-## 安装与首次启动
+## Runtime TOFU Trust Cache（Phase 2）
+
+当前 Local Sandbox 已实现第二阶段基础 Runtime Trust Layer：
+
+- trusted runtime origins
+- TOFU（Trust On First Use）runtime enrollment
+- runtime fingerprint persistence
+- fingerprint drift detection
+- workspace-scoped trust cache
+- structured trust cache schema (`version=2`)
+- trust diagnostics metadata
+- automatic revoke on fingerprint drift
+
+Runtime trust cache 存储于：
+
+```text
+.tsm/runtime_trust.json
+```
+
+当前 schema：
+
+```json
+{
+  "version": 2,
+  "runtimes": {
+    "/path/to/python3": {
+      "fingerprint": "sha256...",
+      "trust_source": "tofu",
+      "enrolled_at": "...",
+      "updated_at": "..."
+    }
+  }
+}
+```
+
+行为说明：
+
+- 首次外部 runtime 执行：
+  - 自动 TOFU enrollment
+  - 写入 workspace trust cache
+- 后续 fingerprint 一致：
+  - `persisted-tofu`
+- fingerprint 漂移：
+  - Runtime deny
+  - 自动 revoke cache entry
+  - diagnostics 输出 drift metadata
+- trusted origins（例如 `/usr/bin`、`~/.pyenv`）仍优先通过 origin trust。
+
 
 开发项目时使用 `uv sync` + `uv run tsm-agt`；日常使用可以把 CLI 安装成独立工具，不依赖当前源码目录：
 

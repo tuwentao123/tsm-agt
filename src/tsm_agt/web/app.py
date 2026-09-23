@@ -219,12 +219,17 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .tool-call-label{font-size:12px;font-weight:600;color:#64748b}
 .tool-call-value{font-size:14px;color:#1e293b;line-height:1.7;word-break:break-word}
 .tool-call-primary{font-weight:700;color:#0f172a}
-.tool-call-markdown{background:linear-gradient(180deg,#fbfdff 0%,#f8fafc 100%);border:1px solid #dbe3ee;border-radius:18px;padding:18px;display:flex;flex-direction:column;gap:10px;overflow:hidden}
-.tool-call-markdown p{margin:0;color:#475569;line-height:1.7}
-.tool-call-markdown p:last-child{margin-bottom:0}
-.tool-call-markdown h1,.tool-call-markdown h2,.tool-call-markdown h3{margin:0 0 10px;color:#0f172a;letter-spacing:-.01em}
-.tool-call-markdown code{background:#eef2ff;color:#4338ca;padding:2px 6px;border-radius:6px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-.tool-call-markdown hr{border:none;border-top:1px solid #dbe3ee;margin:16px 0}
+.tool-call-markdown{background:linear-gradient(180deg,#fbfdff 0%,#f8fafc 100%);border:1px solid #dbe3ee;border-radius:16px;padding:14px 16px;display:flex;flex-direction:column;gap:8px;overflow:hidden}
+.tool-call-markdown>*:first-child{margin-top:0!important}
+.tool-call-markdown>*:last-child{margin-bottom:0!important}
+.tool-call-markdown p{margin:.3em 0;color:#475569;line-height:1.68;white-space:pre-wrap;word-break:break-word}
+.tool-call-markdown h1,.tool-call-markdown h2,.tool-call-markdown h3{margin:.2em 0 .45em;color:#0f172a;letter-spacing:-.01em;line-height:1.3}
+.tool-call-markdown h1{font-size:1.1rem}
+.tool-call-markdown h2{font-size:1rem}
+.tool-call-markdown h3{font-size:.94rem}
+.tool-call-markdown code{background:#eef2ff;color:#4338ca;padding:1px 5px;border-radius:5px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.tool-call-markdown pre{margin:.45em 0}
+.tool-call-markdown hr{border:none;border-top:1px solid #dbe3ee;margin:10px 0}
 .diff-viewer{display:flex;flex-direction:column;gap:14px;border:1px solid #d9e2ec;border-radius:16px;background:#ffffff;overflow:hidden;box-shadow:0 8px 24px rgba(15,23,42,.05)}
 .diff-viewer-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;background:#f8fafc;border-bottom:1px solid #e5edf5}
 .diff-viewer-title{font-size:13px;font-weight:700;color:#0f172a}
@@ -375,8 +380,36 @@ const workspaces = [];
 const conversations = [];
 const ACTIVE_WORKSPACE_STORAGE_KEY = 'tsm-agt.active-workspace';
 const DRAFT_STORAGE_PREFIX = 'tsm-agt.draft.';
+
+function readBrowserStorage(storageName, key) {
+  try {
+    return window[storageName]?.getItem(key) ?? null;
+  } catch (error) {
+    console.warn(`无法读取 ${storageName}：`, error);
+    return null;
+  }
+}
+
+function writeBrowserStorage(storageName, key, value) {
+  try {
+    window[storageName]?.setItem(key, value);
+  } catch (error) {
+    console.warn(`无法写入 ${storageName}：`, error);
+  }
+}
+
+function removeBrowserStorage(storageName, key) {
+  try {
+    window[storageName]?.removeItem(key);
+  } catch (error) {
+    console.warn(`无法删除 ${storageName}：`, error);
+  }
+}
+
 let activeConversationId = null;
-let activeWorkspaceId = localStorage.getItem(ACTIVE_WORKSPACE_STORAGE_KEY);
+let activeWorkspaceId = readBrowserStorage(
+  'localStorage', ACTIVE_WORKSPACE_STORAGE_KEY,
+);
 const traceVisualizationState = {
   mode: 'timeline',
   graph: {
@@ -403,7 +436,7 @@ function persistActiveDraft() {
   if (!active) return;
   const value = document.getElementById('prompt').value;
   active.draft = value;
-  sessionStorage.setItem(draftStorageKey(active.id), value);
+  writeBrowserStorage('sessionStorage', draftStorageKey(active.id), value);
 }
 
 function resolveConversationDraft(activeConversation, persistedDraft) {
@@ -428,7 +461,9 @@ function restoreConversationDraft() {
     return;
   }
 
-  const persistedDraft = sessionStorage.getItem(draftStorageKey(active.id));
+  const persistedDraft = readBrowserStorage(
+    'sessionStorage', draftStorageKey(active.id),
+  );
   const draft = resolveConversationDraft(active, persistedDraft);
 
   active.draft = draft;
@@ -509,7 +544,9 @@ function renderWorkspaceList() {
         item.onclick = () => {
           persistActiveDraft();
           activeWorkspaceId = workspace.id;
-          localStorage.setItem(ACTIVE_WORKSPACE_STORAGE_KEY, workspace.id);
+          writeBrowserStorage(
+            'localStorage', ACTIVE_WORKSPACE_STORAGE_KEY, workspace.id,
+          );
           activeConversationId = conversation.id;
           updateWorkspaceState();
           renderMessages();
@@ -531,7 +568,9 @@ function renderWorkspaceList() {
 function activateWorkspace(workspaceId) {
   persistActiveDraft();
   activeWorkspaceId = workspaceId;
-  localStorage.setItem(ACTIVE_WORKSPACE_STORAGE_KEY, workspaceId);
+  writeBrowserStorage(
+    'localStorage', ACTIVE_WORKSPACE_STORAGE_KEY, workspaceId,
+  );
 
   const workspaceConversations = conversations.filter(
     (item) => item.workspaceId === activeWorkspaceId,
@@ -798,7 +837,11 @@ function renderMarkdown(text) {
 
   function flushParagraph() {
     if (!paragraph.length) return;
-    const content = paragraph.join('<br />');
+    const content = paragraph.join('<br />').trim();
+    if (!content || content === '<br />') {
+      paragraph = [];
+      return;
+    }
     blocks.push(`<p>${renderInlineMarkdown(content)}</p>`);
     paragraph = [];
   }
@@ -807,12 +850,13 @@ function renderMarkdown(text) {
 
   function flushCodeFence() {
     if (!codeFence) return;
-    const language = codeFence.language || 'code';
+    const language = (codeFence.language || '').trim();
     const code = codeFence.lines.join('\\n');
     const isTerminal = ['bash', 'shell', 'sh', 'zsh', 'terminal'].includes(language);
+    const languageBadge = language ? `<div class="code-block-header"><span>${language}</span></div>` : '';
     blocks.push(isTerminal
-      ? `<div class="terminal-block"><div class="terminal-header"><span class="terminal-dot"></span><span>${language}</span></div><div class="terminal-body">${code}</div></div>`
-      : `<div class="code-block-shell"><div class="code-block-header"><span>${language}</span></div><pre><code>${code}</code></pre></div>`);
+      ? `<div class="terminal-block"><div class="terminal-header"><span class="terminal-dot"></span><span>${language || 'terminal'}</span></div><div class="terminal-body">${code}</div></div>`
+      : `<div class="code-block-shell">${languageBadge}<pre><code>${code}</code></pre></div>`);
     codeFence = null;
   }
 
@@ -893,9 +937,7 @@ function renderMarkdown(text) {
     .replace(/<li>/g, '<div class="change-bullet"><div>')
     .replace(/<\/li>/g, '</div></div>');
 
-  const diffHtml = renderDiffBlocks(text || '');
-
-  return `<div class="message-section"><div class="message-body">${structured || ''}<div class="tool-call-markdown">${diffHtml || ''}${markdownHtml}</div></div></div>`;
+  return `<div class="message-section"><div class="message-body">${structured || ''}<div class="tool-call-markdown">${markdownHtml}</div></div></div>`;
 }
 
 let shouldAutoFollowChat = true;
@@ -1929,7 +1971,7 @@ async function runTask() {
     if (activeConversation) {
       activeConversation.draft = '';
     }
-    sessionStorage.removeItem(draftStorageKey(conversationId));
+    removeBrowserStorage('sessionStorage', draftStorageKey(conversationId));
   }
   selectedImages.length = 0;
   renderPreviews();
@@ -2365,34 +2407,38 @@ async function loadWorkspaces() {
 const promptComposer = document.getElementById('prompt');
 let imeComposing = false;
 
-promptComposer.addEventListener('input', () => {
-  persistActiveDraft();
-});
+if (promptComposer) {
+  promptComposer.addEventListener('input', () => {
+    persistActiveDraft();
+  });
 
-promptComposer.addEventListener('compositionstart', () => {
-  imeComposing = true;
-});
+  promptComposer.addEventListener('compositionstart', () => {
+    imeComposing = true;
+  });
 
-promptComposer.addEventListener('compositionend', () => {
-  imeComposing = false;
-  persistActiveDraft();
-});
+  promptComposer.addEventListener('compositionend', () => {
+    imeComposing = false;
+    persistActiveDraft();
+  });
 
-promptComposer.addEventListener('keydown', (event) => {
-  const composing = imeComposing || event.isComposing || event.keyCode === 229;
+  promptComposer.addEventListener('keydown', (event) => {
+    const composing = imeComposing || event.isComposing || event.keyCode === 229;
 
-  if (event.key !== 'Enter' || composing) {
-    return;
-  }
+    if (event.key !== 'Enter' || composing) {
+      return;
+    }
 
-  if (event.shiftKey) {
-    return;
-  }
+    if (event.shiftKey) {
+      return;
+    }
 
-  event.preventDefault();
-  persistActiveDraft();
-  runTask();
-});
+    event.preventDefault();
+    persistActiveDraft();
+    runTask();
+  });
+} else {
+  console.error('未找到消息输入框，仍继续加载工作区与会话。');
+}
 
 loadWorkspaces();
 """ + """

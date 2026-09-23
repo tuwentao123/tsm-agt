@@ -48,6 +48,7 @@ from .runtime_store import (
 from .process import (
     BackgroundProcessStartResult,
     ProcessCommandResult,
+    ProcessEnvironmentPolicy,
     ProcessExecutorPort,
     ProcessExitStatus,
     ProcessHandle,
@@ -235,6 +236,7 @@ __all__ = [
     "RecoverableToolProtocolError",
     "BackgroundProcessStartResult",
     "ProcessCommandResult",
+    "ProcessEnvironmentPolicy",
     "ProcessExecutorPort",
     "ProcessExitStatus",
     "ProcessHandle",

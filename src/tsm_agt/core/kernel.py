@@ -19,6 +19,7 @@ from typing import Any
 from uuid import uuid4
 
 from tsm_agt.ports import (
+    ProcessEnvironmentPolicy,
     CrossProcessLockPort,
     EvidenceDeltaEvaluatorPort,
     EvidenceDelta,
@@ -3639,8 +3640,24 @@ class Kernel:
             )
         resolved_cwd = self._resolve_process_cwd(Path(task.workspace), cwd)
         validated_environment = self._validate_process_environment(environment or {})
-        safe_environment = dict(executor.prepare_environment(validated_environment))
-        sandbox_request = SandboxRequest(argv, resolved_cwd, safe_environment)
+        environment_policy = ProcessEnvironmentPolicy(
+            inherit_host_environment=True,
+            allowed_host_variables=("SSH_AUTH_SOCK", "HOME", "USER"),
+            blocked_host_variables=("AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"),
+            runtime_trust_mode="governed",
+        )
+        safe_environment = dict(
+            executor.prepare_environment(
+                validated_environment,
+                environment_policy,
+            )
+        )
+        sandbox_request = SandboxRequest(
+            argv,
+            resolved_cwd,
+            safe_environment,
+            environment_policy=environment_policy,
+        )
         decision = await self._dependencies.sandbox.authorize(sandbox_request)
         if not decision.allowed:
             await self._append_events(
@@ -3743,6 +3760,12 @@ class Kernel:
             )
         resolved_cwd = self._resolve_process_cwd(Path(task.workspace), cwd)
         safe_environment = self._validate_process_environment(environment or {})
+        environment_policy = ProcessEnvironmentPolicy(
+            inherit_host_environment=True,
+            allowed_host_variables=("SSH_AUTH_SOCK", "HOME", "USER"),
+            blocked_host_variables=("AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"),
+            runtime_trust_mode="governed",
+        )
         decision = await self._dependencies.sandbox.authorize(
             SandboxRequest(argv, resolved_cwd, safe_environment)
         )

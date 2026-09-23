@@ -241,7 +241,17 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(secret.ok)
         self.assertEqual(secret.error_code, "INVALID_PARAM")
 
-    async def test_user_approval_does_not_bypass_deny_all_sandbox(self) -> None:
+
+    async def test_run_command_applies_governed_environment_policy(self) -> None:
+        result = await self._approve_call(ToolCall(
+            "call-command-governed", "core.run_command", {
+                "argv": [sys.executable, "-V"],
+                "environment": {"CUSTOM_FLAG": "enabled"},
+            },
+        ))
+        self.assertTrue(result.ok)
+        self.assertTrue(result.data["succeeded"])
+
         denied_application = compose_fixture_application(
             tool_adapters=(CoreProcessToolProvider(),)
         )

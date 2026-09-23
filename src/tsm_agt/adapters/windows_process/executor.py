@@ -9,7 +9,9 @@ import os
 import signal
 import subprocess
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from tsm_agt.bootstrap.process_environment_configuration import (
+    ProcessEnvironmentConfiguration,
+)
 
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus,
@@ -72,9 +74,7 @@ class WindowsProcessExecutor:
     def __init__(self) -> None:
         self._started = False
         self._live: dict[str, _LiveProcess] = {}
-        self._completed: dict[
-            str, tuple[ProcessHandle, ProcessResult, _LogBuffer, _LogBuffer]
-        ] = {}
+        self._environment_configuration = ProcessEnvironmentConfiguration()
 
     async def start(self, context: AdapterContext) -> None:
         if os.name != "nt":
@@ -94,18 +94,12 @@ class WindowsProcessExecutor:
             )
         self._started = False
 
-    def prepare_environment(self, environment) -> dict[str, str]:
-        required = (
-            "SystemRoot", "ComSpec", "PATHEXT", "TEMP", "TMP", "PATH"
+    def prepare_environment(self, environment, policy=None) -> dict[str, str]:
+        return self._environment_configuration.build_environment(
+            environment,
+            policy,
+            host_environment=os.environ,
         )
-        merged: dict[str, tuple[str, str]] = {}
-        for name in required:
-            value = os.environ.get(name)
-            if value is not None:
-                merged[name.casefold()] = (name, value)
-        for name, value in environment.items():
-            merged[name.casefold()] = (name, value)
-        return {name: value for name, value in merged.values()}
 
     async def start_process(self, request: ProcessStartRequest) -> ProcessHandle:
         if not self._started:
