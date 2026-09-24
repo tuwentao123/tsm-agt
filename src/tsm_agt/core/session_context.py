@@ -344,6 +344,7 @@ class SessionPromptProjection:
     summary_hash: str
     summary_source_event_sequences: tuple[int, ...]
     summary_source_event_ranges: tuple[tuple[int, int], ...]
+    prompt_data: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -534,6 +535,7 @@ class SessionContextProjector:
         recent_executions: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
         active_checkpoint: SessionActiveCheckpoint | None = None,
         suspended_tasks: Sequence[SessionResumeCandidate] = (),
+        pinned_task_ids: Sequence[str] = (),
     ) -> SessionPromptProjection:
         if not projection.messages and not any((
             projection.working_state.goal, projection.working_state.constraints,
@@ -545,6 +547,16 @@ class SessionContextProjector:
             active_checkpoint,
             suspended_tasks,
         )):
+            empty_prompt_data = {
+                "boundary": "session_conversation_projection",
+                "session_id": projection.session_id,
+                "revision": projection.revision,
+                "content_hash": projection.content_hash,
+                "recent_messages": [],
+                "recent_task_summaries": [],
+                "task_index": [],
+                "work_state": projection.working_state.to_data(),
+            }
             return SessionPromptProjection(
                 None, projection.revision, projection.content_hash,
                 projection.source_event_sequences, 0, 0, projection.revision,
@@ -552,7 +564,7 @@ class SessionContextProjector:
                     "algorithm": "deterministic-task-handoff-v1",
                     "revision": projection.revision, "tasks": [],
                     "source_event_sequences": [],
-                }), (), (),
+                }), (), (), empty_prompt_data,
             )
 
         # Every Task remains represented in task_index. A terminal failure is
@@ -580,12 +592,21 @@ class SessionContextProjector:
             message.task_id for message in reversed(visible_messages)
             if message.task_id is not None
         ))[:self.detailed_task_summary_limit]
-        recent_task_id_set = set(recent_task_ids)
         summaries_by_id = {item.task_id: item for item in projection.task_summaries}
+        pinned_ids = [
+            task_id for task_id in dict.fromkeys(pinned_task_ids)
+            if task_id in summaries_by_id
+        ]
+        combined_task_ids = list(dict.fromkeys([
+            *recent_task_ids,
+            *pinned_ids,
+        ]))
+        recent_task_id_set = set(combined_task_ids)
         visible_task_summaries = tuple(
-            item for item in projection.task_summaries
-            if item.task_id in recent_task_id_set
-        )[-self.detailed_task_summary_limit:]
+            summaries_by_id[task_id]
+            for task_id in combined_task_ids
+            if task_id in summaries_by_id
+        )
         visible_task_ids = {item.task_id for item in visible_task_summaries}
         # Only current conversational work belongs in the model prompt. Durable
         # Session storage keeps every Task for UI/history lookup, but injecting
@@ -701,7 +722,7 @@ class SessionContextProjector:
             projection.source_event_sequences, len(visible_messages),
             len(projection.messages) - len(visible_messages),
             projection.revision, summary_hash, summary_sources,
-            summary_source_ranges,
+            summary_source_ranges, body_data,
         )
 
     def _prompt_resource_catalog(

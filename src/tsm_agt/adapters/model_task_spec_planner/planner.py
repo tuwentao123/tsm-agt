@@ -109,7 +109,16 @@ class ModelTaskSpecPlanner:
                     "result; then include atomic_action.tool_name and the exact "
                     "atomic_action.arguments. Never use REQUIRED_EFFECTS for new "
                     "work. Never claim completion, status, "
-                    "IDs owned by Runtime, approval, or permission." + correction
+                    "IDs owned by Runtime, approval, or permission. "
+                    "Treat goal as the user's latest direct request. "
+                    "Use runtime_context.session to resolve conversational "
+                    "references such as 'continue', 'that', or 'phase3'. "
+                    "Treat related_task.historical_remaining_work as historical "
+                    "planning context rather than mandatory acceptance criteria. "
+                    "Prefer newer session decisions over older failed-task plans, "
+                    "and do not copy historical_remaining_work directly into scope "
+                    "or acceptance criteria without validating it against the "
+                    "latest session context." + correction
                 ),),
             )
             user = Message(

@@ -2761,6 +2761,84 @@ class Kernel:
                 ))
         return tuple(gaps)
 
+    async def _task_spec_planning_context(
+        self, task: TaskSnapshot,
+    ) -> tuple[str, Mapping[str, Any], int, str]:
+        session = await self.get_session(task.session_id)
+        events = await self._dependencies.store.read_session_events(
+            session.session_id
+        )
+        projection = self._dependencies.session_context_projector.project(
+            session, events
+        )
+        source_task_id: str | None = None
+        for summary in reversed(projection.task_summaries):
+            if summary.task_id == task.task_id:
+                for outcome in reversed(summary.outcomes):
+                    candidate = outcome.get("source_task_id")
+                    if isinstance(candidate, str) and candidate:
+                        source_task_id = candidate
+                        break
+                if source_task_id is not None:
+                    break
+        prompt_projection = self._dependencies.session_context_projector.for_prompt(
+            projection,
+            pinned_task_ids=((source_task_id,) if source_task_id else ()),
+        )
+        prompt_data = dict(prompt_projection.prompt_data or {})
+        related_task: Mapping[str, Any] | None = None
+        current_request = task.goal
+        for message in reversed(projection.messages):
+            if message.task_id == task.task_id and message.role is MessageRole.USER:
+                current_request = message.text.strip() or current_request
+                break
+        for item in reversed(prompt_data.get("task_index", [])):
+            if item.get("task_id") == task.task_id and source_task_id is None:
+                source_task_id = item.get("source_task_id")
+                break
+        for summary in prompt_data.get("recent_task_summaries", []):
+            if summary.get("task_id") == source_task_id:
+                related_task = {
+                    "task_id": summary.get("task_id"),
+                    "state": summary.get("recorded_task_state"),
+                    "verification_status": summary.get("verification_status"),
+                    "goal": summary.get("goal"),
+                    "historical_remaining_work": summary.get("remaining_work", []),
+                    "completed_work": summary.get("completed_work", []),
+                    "mutations": summary.get("mutations", []),
+                }
+                break
+        planning_context = {
+            "workspace": task.workspace,
+            "available_tool_effects": sorted({
+                tool.effect.value for tool in await self.list_tools()
+                if not tool.is_internal_state
+            }),
+            "session": {
+                "revision": prompt_projection.revision,
+                "working_state": prompt_data.get("work_state", {}),
+                "recent_messages": prompt_data.get("recent_messages", []),
+                "recent_artifacts": [
+                    {
+                        "canonical_path": item.get("canonical_path"),
+                        "resource_kind": item.get("resource_kind"),
+                        "source_task_id": item.get("source_task_id"),
+                        "question_ref": item.get("question_ref"),
+                    }
+                    for item in prompt_data.get("historical_investigation", {}).get("resources", [])
+                    if item.get("canonical_path")
+                ][:24],
+            },
+            "related_task": related_task,
+        }
+        context_hash = canonical_hash(planning_context)
+        return (
+            current_request,
+            planning_context,
+            prompt_projection.revision,
+            context_hash,
+        )
+
     async def plan_task_spec(self, task_id: str) -> TaskSpecSnapshot:
         """Ask the semantic Planner for a proposal; Runtime owns persistence."""
         planner = self._dependencies.task_spec_planner
@@ -2769,13 +2847,16 @@ class Kernel:
             return current
         task = await self.get_task(task_id)
         try:
-            raw = await planner.propose_task_spec(current.goal, {
-                "workspace": task.workspace,
-                "available_tool_effects": sorted({
-                    tool.effect.value for tool in await self.list_tools()
-                    if not tool.is_internal_state
-                }),
-            })
+            (
+                current_request,
+                planning_context,
+                planning_session_revision,
+                planning_context_hash,
+            ) = await self._task_spec_planning_context(task)
+            raw = await planner.propose_task_spec(
+                current_request,
+                planning_context,
+            )
             proposal = TaskSpecProposal.from_data(
                 raw, require_acceptance_criteria=True
             )
@@ -2787,6 +2868,9 @@ class Kernel:
                 "revision": candidate.revision,
                 "content_hash": candidate.content_hash,
                 "snapshot": candidate.to_data(),
+                "planning_session_revision": planning_session_revision,
+                "planning_context_hash": planning_context_hash,
+                "current_request_hash": canonical_hash(current_request),
             }),))
             return candidate
         except Exception as error:

@@ -18,6 +18,25 @@ ProcessResult.succeeded = false        ← 事实正确记录
 
 复现任务：`task-b907f9c866f64f9f912676b448b77bff`，`git push` 退出码 128，Task 仍标记成功。
 
+### 1.2 反向缺陷：成功被误判未完成
+
+同一职责错位还有对称的另一面：Runtime 以模型的临时笔记覆盖了自己记录的真实事实。
+
+```text
+mutation 已提交
+pytest exit=0 succeeded=true
+  → WorkingMemory plan 未回写，步骤仍 PENDING
+  → PLAN_STEP gap required=True 且 recoverable=False
+  → REPORT_BLOCKED 且指令禁止调用工具
+  → 唯一出路（core.working_memory_update）被封
+  → 纠正配额耗尽 → 强制 COMPLETE
+  → FinalAcceptance INCOMPLETE_REQUIRED_PLAN → BLOCK
+```
+
+复现任务：`task-a1ca6115134a42759ad2428eeee3e6dd`，代码与测试均已完成，Task 仍判定 blocked。详见 5.5。
+
+两个缺陷方向相反、根因相同：完成判定没有以 Runtime 自身记录的执行事实为准。因此同批修复。
+
 ## 2. 设计原则
 
 1. **不新增持久化实体**。事实由现有不可变记录派生，避免双账本。
@@ -218,6 +237,136 @@ and execution.result is not None and execution.result.ok
 
 非 OBSERVE 工具的结果摘要必须保留 `data.succeeded` 与 `data.failure_code`。当前只保留 `ok` / `error_code`，模型下一轮看不到真实业务结果。
 
+### 5.5 降级 scratchpad 硬门（原 6.3，已提升为首批）
+
+**文件**：`core/kernel.py` `_completion_readiness_gaps()`、`_evaluate_final_acceptance()`
+
+**提升原因**：该缺陷会让任何忘记回写 scratchpad 的 Task 无法正常收尾，与业务无关，且已在真实任务中造成死锁。它不是「为后续迭代准备」，而是与 5.2/5.3 同级的通用阻断缺陷。
+
+#### 5.5.1 实测死锁证据
+
+复现任务：`task-a1ca6115134a42759ad2428eeee3e6dd`，共 679 条事件。
+
+真实执行事实完整：
+
+```text
+[327] working_memory.updated   revision 1 → 2   仅此一次，写下 S1–S4
+[384] MUTATION src/tsm_agt/core/session_context.py
+[385] MUTATION src/tsm_agt/core/kernel.py
+[386] MUTATION tests/test_kernel_tasks.py
+[452] PROCESS exit=1 succeeded=False
+[531] MUTATION tests/test_kernel_tasks.py
+[562] PROCESS exit=1 succeeded=False
+[618] MUTATION tests/test_kernel_tasks.py
+[649] PROCESS exit=0 succeeded=True           ← 验证命令真实通过
+```
+
+23 次工具调用中仅 `#1 core.working_memory_read` 与 `#12 core.working_memory_update` 触及 scratchpad，其后再无更新。因此 S1 始终 `IN_PROGRESS`、S2–S4 始终 `PENDING`，`completed_work` 始终为空。
+
+首次完成判定的实际 probe：
+
+```text
+action:  REPORT_BLOCKED
+reason:  required_work_is_blocked_or_correction_limit_reached
+forced_wrap_up: False
+remaining_model_calls: 15
+remaining_tool_calls:  97
+gaps: plan-step:S1..S4
+      kind=PLAN_STEP  required=True  recoverable=False
+      required_effects=[]  candidate_tools=[]
+```
+
+最终结果：
+
+```text
+[658] READINESS REPORT_BLOCKED
+[661] completion.blocker_disclosure_requested
+[665] READINESS COMPLETE  reason=bounded_completion_corrections_exhausted
+[669] verify.final_evidence_evaluated BLOCK
+      INCOMPLETE_REQUIRED_PLAN × 4
+[677] verify.completed status=blocked
+```
+
+预算充足（15 次模型调用、97 次工具调用）却判定阻塞，唯一原因是 scratchpad 未回写。
+
+#### 5.5.2 三重缺陷叠加形成死锁
+
+1. **scratchpad 被当作硬 Gate。** `_completion_readiness_gaps()` 把 `PENDING/IN_PROGRESS` 计划步骤产出为 `required=True` 的 gap；`_evaluate_final_acceptance()` 再将其作为 `INCOMPLETE_REQUIRED_PLAN` 违规。Runtime 因此以模型的临时笔记覆盖了自己掌握的真实事实（mutation + 成功验证命令）。
+
+2. **`PLAN_STEP` gap 结构上不可恢复。** 该 gap 的 `required_effects=[]`，而 `rule_based_completion_readiness/policy.py` 的 `recoverable` 判定要求 `gap.effective_required_effects` 非空且被 `available_effects` 覆盖。空集合永远不进入 `recoverable`，因此 `can_continue` 恒为 `False`，直接落入 `REPORT_BLOCKED`，无法获得 `CONTINUE`。
+
+3. **`REPORT_BLOCKED` 的 runtime instruction 明确禁止工具调用。** 该分支下发 `Do not call tools. State the exact blocker`，而唯一能解开 gap 的动作恰恰是调用 `core.working_memory_update`。
+
+叠加后形成闭环：
+
+```text
+唯一出路 = 调用 core.working_memory_update
+Runtime 指令 = 不许调用任何工具
+模型只能用散文解释「已完成但无法标记」
+纠正配额耗尽 → 强制 COMPLETE
+FinalAcceptance → INCOMPLETE_REQUIRED_PLAN → BLOCK
+```
+
+#### 5.5.3 职责边界
+
+`core/working_memory_tools.py` 的 `core.working_memory_update` 为 `effect=INTERNAL`、`is_internal_state=True`，且工具自述为：
+
+```text
+This is inspectable temporary state, not durable user/project memory.
+```
+
+据此确认职责：
+
+| 角色 | 职责 |
+|---|---|
+| 模型 | 决定 scratchpad 内容与步骤状态，显式调用 `core.working_memory_update` |
+| Runtime | 校验 `expected_revision` / `operation_id`，持久化并投影 |
+| Runtime | **不得**从 `pytest exit=0` 之类事实反推 `S4` 是否完成 |
+| Runtime | **不得**以模型笔记覆盖自身记录的执行事实 |
+
+Runtime 没有语义能力把 `pytest validation` 这类自然语言步骤映射到具体命令，因此既不能代替模型回写，也不应把回写结果当作验收条件。
+
+#### 5.5.4 改动内容
+
+`_completion_readiness_gaps()` 不再产出 `PLAN_STEP` 类型的 `required=True` gap。计划中未完成的步骤改为 runtime instruction 提示，例如：
+
+```text
+Working-memory plan still lists unfinished steps. If the underlying work is
+already done, update the scratchpad with core.working_memory_update before
+finishing; the plan itself is not a delivery contract.
+```
+
+`_evaluate_final_acceptance()` 的 `required_plan_steps` 不再作为 `INCOMPLETE_REQUIRED_PLAN` 违规来源。
+
+完成判定改为依据 5.1–5.3 已有的真实事实：
+
+```text
+mutation fact
+effect_status（含 PROCESS_FACT succeeded）
+unresolved failure
+evidence question 完整性
+```
+
+#### 5.5.5 为何不采用「让 PLAN_STEP 可恢复」的替代方案
+
+替代方案是保留该 gap，但声明：
+
+```python
+required_effects=(ToolEffect.INTERNAL,)
+candidate_tools=("core.working_memory_update",)
+```
+
+这样会走 `CONTINUE` 而非 `REPORT_BLOCKED`，模型可补一次回写。
+
+否决理由：
+
+1. 每个任务都会多出一轮纯记账用途的模型调用；
+2. scratchpad 不是交付物，用它当验收条件属于职责错位；
+3. 仍未解决「Runtime 以笔记覆盖事实」这一根本问题；
+4. 模型仍可能再次忘记回写，缺陷只是概率降低。
+
+若后续确实需要强约束计划完整性，应通过显式 Spec/Task Runner 的正式任务清单表达，而不是通过模型的临时笔记。
+
 ## 6. 第二批改动（为后续迭代准备）
 
 ### 6.1 冻结执行语义
@@ -252,9 +401,9 @@ async def _protocol_gate(task_id) -> ProtocolBlock | None:
 
 第 4 项的一次性配额复用 `CompletionReadinessState` 现有有界纠正计数，防止反复失败导致任务永不结束。
 
-### 6.3 降级 scratchpad 硬门
+### 6.3 降级 scratchpad 硬门（已移至首批 5.5）
 
-WorkingMemory plan 的 `PENDING` / `IN_PROGRESS` 从硬 gap 降为 runtime instruction 提示。模型的思考笔记不应决定 Task 能否结束。
+原第二批条目已提升为首批 5.5，理由与实测死锁证据见该节。本节保留编号以便对照历史版本。
 
 ### 6.4 Outcome 死代码清理
 
@@ -296,11 +445,37 @@ WHERE event_type LIKE 'task_outcome.%' GROUP BY event_type;
 | 用户取消任务 | CANCELLED |
 | 同一失败重复出现 | 一次强制继续后 REPORT_INCOMPLETE_RECOVERABLE |
 
-### 7.3 回归测试（锁定已知故障）
+### 7.3 scratchpad 降级专项（5.5）
 
-重放 `task-b907f9c866f64f9f912676b448b77bff` 事件序列，断言 `gap_count > 0` 且 `action != COMPLETE`。此用例允许包含具体的 git 命令，因为它的作用是锁定历史缺陷，不参与通用规则验证。
+| 场景 | 期望 |
+|---|---|
+| plan 存在 `PENDING`/`IN_PROGRESS`，但 mutation 与成功验证命令齐备 | `COMPLETE`，且 FinalAcceptance 不产生 `INCOMPLETE_REQUIRED_PLAN` |
+| plan 全部 `COMPLETED`，但存在 unresolved effect failure | 不允许 `COMPLETE`（5.2/5.3 仍生效） |
+| plan 为空 | 行为与现状一致 |
+| plan 未完成且无任何 mutation/验证事实 | 仍因 5.1–5.3 的事实缺失而不能 `COMPLETE` |
+| plan 未完成 | runtime instruction 包含回写提示，但不产生 required gap |
 
-### 7.4 回归范围
+关键反向断言：**降级后不能出现「无任何执行事实却判定 COMPLETE」**。计划不再是 gate，但事实依然是。
+
+### 7.4 回归测试（锁定已知故障）
+
+两个历史故障各锁一条：
+
+```text
+task-b907f9c866f64f9f912676b448b77bff
+  git push exit 128
+  断言 gap_count > 0 且 action != COMPLETE
+
+task-a1ca6115134a42759ad2428eeee3e6dd
+  plan 未回写但 mutation + pytest exit=0 齐备
+  断言 action == COMPLETE
+  断言 verify.completed.status != blocked
+  断言无 INCOMPLETE_REQUIRED_PLAN 违规
+```
+
+两个用例允许包含具体命令，因为它们锁定的是历史缺陷形状，不参与通用规则验证。
+
+### 7.5 回归范围
 
 全量套件基线 `956 passed, 8 skipped`。重点检查断言 `completion.readiness_evaluated` payload、快照结构、`successful_tool_calls` 的既有测试。
 
@@ -311,9 +486,19 @@ WHERE event_type LIKE 'task_outcome.%' GROUP BY event_type;
 | 新增文件 | `core/execution_facts.py` | — |
 | 新增字段 | `CompletionReadinessProbe` 1 个 | `ToolExecutionRecord` 3 个 |
 | 新增枚举 | `EffectStatus`、`FactResolution`、1 个 gap kind | — |
-| 修改方法 | `last_tool_error` 判定、`structured_recovery`、`_completion_readiness_gaps`、`successful_tool_calls`、结果摘要 | Protocol Gate 收敛、plan 降级 |
+| 移除 gap | `PLAN_STEP` 不再作为 required gap（5.5） | — |
+| 修改方法 | `last_tool_error` 判定、`structured_recovery`、`_completion_readiness_gaps`、`successful_tool_calls`、结果摘要、`_evaluate_final_acceptance` | Protocol Gate 收敛 |
 | 不新增 | 持久化实体、事件类型、Port、Task 状态、Action 枚举 | 同 |
-| 回退方式 | 投影恒返回 `None` 即回到现状 | 同 |
+| 回退方式 | 投影恒返回 `None`；plan gap 可重新启用 | 同 |
+
+首批两类缺陷互补：
+
+```text
+5.1–5.4  修「失败被谎报成功」
+5.5      修「成功被误判未完成」
+```
+
+两者都源于同一职责错位——完成判定没有以 Runtime 自身记录的执行事实为准。
 
 ## 9. 对后续迭代的适配
 
@@ -325,6 +510,7 @@ WHERE event_type LIKE 'task_outcome.%' GROUP BY event_type;
 
 ## 10. 未核实事项
 
+0. 5.5 降级后，`REPORT_BLOCKED` 分支的 `Do not call tools` 指令是否仍有其他必需 gap 会落入同一死角，尚未逐一排查。需确认所有 `required=True` 且 `required_effects=()` 的 gap 来源，避免换一种 gap 再次形成闭环。
 1. `_continue_agent_turn` final-response 分支的完整结构尚未通读，Protocol Gate 的精确插入点需在实施前确认。
 2. 并行 MUTATE 的路径级串行化现状未核实。与本 SPEC 无关，但并行执行落地前需单独评估。
 3. `.agent/runtime.db` 中 legacy outcome 事件的真实分布未统计，6.4 的清理不得先于统计执行。
