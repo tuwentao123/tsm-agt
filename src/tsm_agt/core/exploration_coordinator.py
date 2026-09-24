@@ -160,6 +160,7 @@ class ExplorationCoordinator:
         arguments = dict(call.arguments)
         bounds = {
             "core.search_text": ("max_matches", 50),
+            "core.grep_search": ("max_matches", 50),
             "core.find_files": ("limit", 50),
             "core.list_files": ("limit", 100),
             "core.read_file": ("max_lines", 200),

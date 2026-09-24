@@ -64,6 +64,7 @@ class CoreReadOnlyToolProvider:
             {
                 "core.list_files", "core.find_files",
                 "core.read_file", "core.search_text",
+                "core.grep_search",
             }
         ),
     )
@@ -171,11 +172,10 @@ class CoreReadOnlyToolProvider:
                 "an absolute outside path requires explicit Task-scoped directory read "
                 "approval and never permits inspecting secrets. Binary, "
                 "oversized, .git, environment, credential, and key files are skipped. "
+                "Supports grep-style include/exclude globs plus before/after context lines. "
                 "query is required; path defaults to '.', regex and case_sensitive default "
                 "to false, and max_matches is 1..500. Success returns ordered path, line, "
-                "and text matches plus authoritative resolved path/root and "
-                "scan/truncation metadata. Example: "
-                "{\"query\": \"class Kernel\", \"path\": \"src\"}."
+                "text, optional context snippets, and scan metadata."
             ),
             parameters={
                 "type": "object",
@@ -185,6 +185,40 @@ class CoreReadOnlyToolProvider:
                     "regex": {"type": "boolean"},
                     "case_sensitive": {"type": "boolean"},
                     "max_matches": {"type": "integer"},
+                    "include": {"type": "string"},
+                    "exclude": {"type": "string"},
+                    "before_context": {"type": "integer"},
+                    "after_context": {"type": "integer"}
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            risk=ToolRisk.R0,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            idempotency=ToolIdempotency.IDEMPOTENT,
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.WORKSPACE_FACT,
+        ),
+        ToolSpec(
+            name="core.grep_search",
+            description=(
+                "Grep-style repository search with glob filtering and context lines. "
+                "This tool mirrors core.search_text while exposing a coding-agent friendly "
+                "name and parameters for code discovery workflows."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "path": {"type": "string"},
+                    "regex": {"type": "boolean"},
+                    "case_sensitive": {"type": "boolean"},
+                    "max_matches": {"type": "integer"},
+                    "include": {"type": "string"},
+                    "exclude": {"type": "string"},
+                    "before_context": {"type": "integer"},
+                    "after_context": {"type": "integer"}
                 },
                 "required": ["query"],
                 "additionalProperties": False,
@@ -225,6 +259,7 @@ class CoreReadOnlyToolProvider:
             "core.find_files": self._find_files,
             "core.read_file": self._read_file,
             "core.search_text": self._search_text,
+            "core.grep_search": self._search_text,
         }
         handler = handlers.get(call.name)
         if handler is None:
@@ -461,6 +496,22 @@ class CoreReadOnlyToolProvider:
             minimum=1,
             maximum=_MAX_SEARCH_MATCHES,
         )
+        include_glob = self._optional_string_argument(call.arguments, "include")
+        exclude_glob = self._optional_string_argument(call.arguments, "exclude")
+        before_context = self._bounded_int(
+            call.arguments,
+            "before_context",
+            default=0,
+            minimum=0,
+            maximum=20,
+        )
+        after_context = self._bounded_int(
+            call.arguments,
+            "after_context",
+            default=0,
+            minimum=0,
+            maximum=20,
+        )
         resolved = self._resolve_path(context, raw_path)
         root = resolved.path
         if not root.exists():
@@ -485,6 +536,11 @@ class CoreReadOnlyToolProvider:
                 if self._is_sensitive(relative):
                     skipped_files += 1
                     continue
+                relative_path = relative.as_posix()
+                if include_glob and not fnmatch.fnmatch(relative_path, include_glob):
+                    continue
+                if exclude_glob and fnmatch.fnmatch(relative_path, exclude_glob):
+                    continue
             except (_WorkspaceAccessError, _SensitivePathError):
                 skipped_files += 1
                 continue
@@ -504,17 +560,23 @@ class CoreReadOnlyToolProvider:
                 skipped_files += 1
                 continue
             scanned_files += 1
-            for line_number, line in enumerate(text.splitlines(), start=1):
+            lines = text.splitlines()
+            for line_number, line in enumerate(lines, start=1):
                 if pattern.search(line) is None:
                     continue
-                matches.append(
-                    {
-                        "path": relative.as_posix(),
-                        **self._resource_data(context, path, resolved.workspace),
-                        "line": line_number,
-                        "text": line[:_MAX_MATCH_TEXT_CHARS],
-                    }
-                )
+                match = {
+                    "path": relative_path,
+                    **self._resource_data(context, path, resolved.workspace),
+                    "line": line_number,
+                    "text": line[:_MAX_MATCH_TEXT_CHARS],
+                }
+                if before_context:
+                    start = max(0, line_number - before_context - 1)
+                    match["before_context"] = lines[start:line_number - 1]
+                if after_context:
+                    end = min(len(lines), line_number + after_context)
+                    match["after_context"] = lines[line_number:end]
+                matches.append(match)
                 if len(matches) >= max_matches:
                     truncated = True
                     break
@@ -759,6 +821,17 @@ class CoreReadOnlyToolProvider:
         arguments: Mapping[str, Any], name: str, default: str | None = None
     ) -> str:
         value = arguments.get(name, default)
+        if not isinstance(value, str):
+            raise TypeError(f"{name} must be a string")
+        return value
+
+    @staticmethod
+    def _optional_string_argument(
+        arguments: Mapping[str, Any], name: str,
+    ) -> str | None:
+        value = arguments.get(name)
+        if value is None:
+            return None
         if not isinstance(value, str):
             raise TypeError(f"{name} must be a string")
         return value

@@ -99,7 +99,7 @@ class RuleBasedSemanticActionClassifier:
         if name == "core.list_files":
             return (SemanticActionFamily.INSPECT_PROJECT_STRUCTURE, "structure",
                     "project-structure", 0.98)
-        if name in {"core.search_text", "core.find_files"}:
+        if name in {"core.search_text", "core.grep_search", "core.find_files"}:
             raw_query = arguments.get(
                 "query", arguments.get("pattern", "")
             )

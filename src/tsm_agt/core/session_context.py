@@ -879,6 +879,7 @@ class SessionContextProjector:
         safe_tool = call.name in {
             "core.list_files", "core.find_files",
             "core.read_file", "core.search_text",
+            "core.grep_search",
         }
         call_data: dict[str, Any] = {
             "call_id": call.call_id, "tool": call.name,
@@ -956,7 +957,7 @@ class SessionContextProjector:
                             value[:1000] if isinstance(value, str) else value
                         )
                 text = raw.get("text")
-                if isinstance(text, str) and tool_name == "core.search_text":
+                if isinstance(text, str) and tool_name in {"core.search_text", "core.grep_search"}:
                     item["text"] = text[:200]
                 if item:
                     items.append(item)

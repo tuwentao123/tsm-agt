@@ -258,7 +258,7 @@ class RuleBasedExplorationBudgetPolicy:
         """Allow bounded evidence completion, not a new broad investigation."""
         if action is None:
             return False
-        if call.name == "core.search_text":
+        if call.name in {"core.search_text", "core.grep_search"}:
             path = call.arguments.get("path")
             if not isinstance(path, str) or path.strip() in {"", "."}:
                 return False

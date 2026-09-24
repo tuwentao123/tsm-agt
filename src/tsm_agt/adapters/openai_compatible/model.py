@@ -1141,6 +1141,7 @@ class OpenAICompatibleModelProvider:
                 if tool_name in {
                     "core.read_file", "core.list_files",
                     "core.find_files", "core.search_text",
+                    "core.grep_search",
                 } else ""
             ),
         )

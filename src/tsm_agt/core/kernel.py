@@ -6142,6 +6142,7 @@ class Kernel:
                 if execution.call.name in {
                     "core.list_files", "core.find_files",
                     "core.read_file", "core.search_text",
+                    "core.grep_search",
                 } else ()
             )
             for key in safe_keys:
@@ -8489,6 +8490,7 @@ class Kernel:
                     and execution.call.name in {
                         "core.read_file", "core.list_files",
                         "core.find_files", "core.search_text",
+                        "core.grep_search",
                     }
                     and record.expected_scope.strip()
                 )
@@ -14283,7 +14285,7 @@ class Kernel:
         document_failure = await self._document_fetch_failure(task_id)
         if (
             document_failure is not None
-            and call.name in {"core.find_files", "core.search_text"}
+            and call.name in {"core.find_files", "core.search_text", "core.grep_search"}
         ):
             blocked = ToolResult(
                 call_id=call.call_id,

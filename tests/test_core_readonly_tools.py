@@ -326,7 +326,45 @@ class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(regex.data["matches"][0]["path"], "src/app.py")
         self.assertTrue(regex.truncated)
 
-    async def test_search_skips_generated_directories_but_keeps_source(self) -> None:
+    async def test_search_supports_grep_style_filters_and_context(self) -> None:
+        src = self.workspace / "src"
+        docs = self.workspace / "docs"
+        src.mkdir(exist_ok=True)
+        docs.mkdir(exist_ok=True)
+        (src / "service.py").write_text(
+            "class Service\n"
+            "def target_call():\n"
+            "    return 'ok'\n",
+            encoding="utf-8",
+        )
+        (docs / "service.md").write_text(
+            "target_call appears in docs\n",
+            encoding="utf-8",
+        )
+
+        result = await self.provider.invoke(
+            ToolCall(
+                "call-grep-search",
+                "core.grep_search",
+                {
+                    "query": "target_call",
+                    "path": ".",
+                    "include": "src/*.py",
+                    "exclude": "docs/*",
+                    "before_context": 1,
+                    "after_context": 1,
+                },
+            ),
+            self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(result.data["matches"]), 1)
+        match = result.data["matches"][0]
+        self.assertEqual(match["path"], "src/service.py")
+        self.assertEqual(match["before_context"], ["class Service"])
+        self.assertEqual(match["after_context"], ["    return 'ok'"])
+
         generated = self.workspace / "build" / "tmp" / "kapt3"
         generated.mkdir(parents=True)
         (generated / "Generated.java").write_text(

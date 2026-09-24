@@ -30,7 +30,7 @@ class RuleBasedReadHitsPolicy:
         SemanticActionFamily.SEARCH_REFERENCES,
     })
     _SEARCH_TOOLS = frozenset({
-        "core.search_text", "core.find_files",
+        "core.search_text", "core.grep_search", "core.find_files",
         "code.definition", "code.references",
         "code.implementations", "code.workspace_symbols",
     })
