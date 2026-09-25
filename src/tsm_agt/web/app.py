@@ -92,18 +92,19 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .trace-dot{width:10px;height:10px;border-radius:50%;box-shadow:0 0 0 4px rgba(255,255,255,.06)}
 .trace-dot.running{background:#1677ff}.trace-dot.waiting{background:#faad14}.trace-dot.done{background:#52c41a}.trace-dot.failed{background:#ff4d4f}
 .message{display:flex;flex-direction:column;position:relative;max-width:min(920px,100%);word-break:break-word;gap:8px}
-.message.assistant{align-self:flex-start;width:100%;padding-inline:0;background:rgba(255,255,255,.82);border:1px solid #e6edf5;border-radius:20px;padding:16px 18px;box-shadow:none}
+.message.assistant{align-self:flex-start;width:100%;padding:18px 8px 22px;background:linear-gradient(180deg,rgba(255,255,255,.72),rgba(248,250,252,.58));border:none;border-radius:0;box-shadow:none}
 .message.user{display:inline-flex;align-self:flex-end !important;margin-left:auto !important;margin-right:0 !important;width:fit-content;max-width:min(720px,calc(100% - 24px));background:transparent;color:#334155;border:none !important;outline:none !important;box-shadow:none !important;border-radius:16px;padding:12px 14px;text-align:left}
-.message-body{width:min(96ch,100%);white-space:normal;font-size:15px;line-height:1.72;letter-spacing:0;color:var(--text);font-family:Inter,"SF Pro Display","Segoe UI",sans-serif}
+.message-body{width:min(88ch,100%);margin:0 auto;white-space:normal;font-size:15px;line-height:1.68;letter-spacing:-.003em;color:var(--text);font-family:Inter,"SF Pro Display","Segoe UI",sans-serif}
 .message-body > *:first-child{margin-top:0}
 .message-body > *:last-child{margin-bottom:0}
-.message-body p{margin:.45em 0;color:var(--text-soft);max-width:96ch}
-.message-body h1,.message-body h2,.message-body h3{line-height:1.3;font-weight:600;letter-spacing:-.01em;color:var(--text)}
-.message-body h1{margin:1.2em 0 .55em;font-size:28px}
-.message-body h2{margin:1em 0 .45em;font-size:22px}
-.message-body h3{margin:.9em 0 .35em;font-size:18px}
-.message-body ul,.message-body ol{margin:.45em 0 .9em;padding-left:1.3em;color:var(--text-soft);max-width:96ch}
-.message-body li{margin:.2em 0}
+.message-body p{margin:.42em 0;color:var(--text-soft);max-width:88ch}
+.message-body h1,.message-body h2,.message-body h3{line-height:1.24;font-weight:650;letter-spacing:-.022em;color:var(--text)}
+.message-body h1{margin:1.1em 0 .42em;font-size:28px}
+.message-body h2{margin:.95em 0 .38em;font-size:22px}
+.message-body h3{margin:.8em 0 .3em;font-size:18px}
+.message-body ul,.message-body ol{margin:.42em 0 .7em;padding-left:1.35em;color:var(--text-soft);max-width:88ch}
+.message-body li{margin:.18em 0;line-height:1.68}
+.message-body li > ul,.message-body li > ol{margin:.3em 0 .15em}
 .message-body strong{color:var(--text);font-weight:600}
 .message-body a{color:var(--accent);text-decoration:none}
 .message-body a:hover{text-decoration:underline}
@@ -115,7 +116,11 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .message-body pre code .token.string,.message-body pre code .token.attr-value,.message-body pre code .token.char,.message-body pre code .token.builtin,.message-body pre code .token.inserted{color:#047857}
 .message-body pre code .token.function,.message-body pre code .token.class-name{color:#0f766e}
 .message-body pre code .token.number,.message-body pre code .token.boolean,.message-body pre code .token.constant{color:#b45309}
-.message-body blockquote{margin:1rem 0;padding:12px 16px;border-left:3px solid #7b8798;background:#343d49;border-radius:0 12px 12px 0;color:#eef2f7;max-width:86ch}
+.message-body blockquote{margin:1.15rem 0;padding:10px 18px;border-left:3px solid #94a3b8;background:rgba(241,245,249,.78);border-radius:0 14px 14px 0;color:#475569;max-width:84ch}
+.message-body blockquote p{color:inherit}
+.message-body table{width:100%;border-collapse:collapse;margin:1.1rem 0;display:block;overflow-x:auto}
+.message-body th,.message-body td{padding:10px 12px;border:1px solid #dbe3ee;text-align:left}
+.message-body th{background:#f8fafc;color:#0f172a;font-weight:600}
 .message-body hr{border:none;height:1px;background:#e5edf5;margin:1.5rem 0}
 .message-section{display:flex;flex-direction:column;gap:10px;padding:0;background:transparent;border:none;box-shadow:none}
 .message-section + .message-section{margin-top:12px}
@@ -135,7 +140,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .message-role::before{content:'';width:8px;height:8px;border-radius:999px;background:currentColor;opacity:.85}
 .message.assistant .message-role{color:#4b5563}
 .message.user .message-role{color:#d1d5db}
-.message-body{font-size:15px;line-height:1.72;color:inherit}
+.message-body{font-size:15px;line-height:inherit;color:inherit}
 .message-body p:first-child,.message-body h1:first-child,.message-body h2:first-child,.message-body h3:first-child{margin-top:0}
 .message-body p:last-child{margin-bottom:0}
 .message.system{align-self:flex-start;max-width:100%;color:var(--muted);font-size:12px;padding:0 2px}
@@ -175,6 +180,9 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .task-card-state.running{color:#8ab4f8}.task-card-state.waiting{color:#f0c674}.task-card-state.failed{color:#f4837a}.task-card-state.done{color:#81c995}
 .task-progress{display:flex;flex-direction:column;gap:3px;border-top:1px solid var(--border);padding-top:7px}
 .task-progress-line{font-size:12px;color:var(--muted);white-space:pre-wrap;word-break:break-word}
+.task-progress-line.markdown-progress{padding:0;border:none;background:transparent;white-space:normal;color:#475569;font-size:14px;line-height:1.68}
+.task-progress-line.markdown-progress .message-section{gap:0}
+.task-progress-line.markdown-progress .tool-call-markdown{max-width:100%}
 .task-progress-empty{font-size:12px;color:#686d75}
 .task-card .message.approval{max-width:100%;align-self:stretch;margin-top:4px}
 .message.approval{align-self:flex-start;max-width:min(920px,100%);background:linear-gradient(180deg,#ffffff,#f8fafc);border:1px solid #d9e1ec;border-radius:18px;padding:10px 12px;display:flex;flex-direction:column;gap:8px;box-shadow:0 6px 14px rgba(15,23,42,.05);position:relative;overflow:hidden}
@@ -197,10 +205,14 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .approval-btn:hover::after{opacity:1}
 .approval-btn.approve{background:linear-gradient(135deg,#809671,#5f7752);border-color:#a9be9b;color:#f6fff2;box-shadow:0 10px 20px rgba(96,119,82,.28)}
 .approval-btn.deny{background:linear-gradient(135deg,#8f5c5c,#704545);border-color:#b78d8d;color:#fff4f4;box-shadow:0 10px 20px rgba(112,69,69,.24)}
-.markdown-list{margin:14px 0;padding-left:18px;color:#475569;display:flex;flex-direction:column;gap:10px;line-height:1.7}
-.markdown-list li::marker{color:#94a3b8}
-.markdown-table{width:100%;border-collapse:separate;border-spacing:0;margin:18px 0;background:#ffffff;border:1px solid #d9e1ec;border-radius:18px;overflow:hidden;box-shadow:0 10px 30px rgba(15,23,42,.06)}
-.markdown-table th,.markdown-table td{padding:12px 14px;border-bottom:1px solid #e8edf5;text-align:left;font-size:13px;color:#475569;vertical-align:top}
+.markdown-list{margin:.42em 0 .7em;padding-left:1.35em;color:#475569;display:block;line-height:1.68}
+.markdown-list li{margin:.18em 0;padding:0}
+.markdown-list li::marker{color:#94a3b8;font-size:.95em}
+.markdown-blockquote{margin:18px 0;padding:14px 18px;border-left:4px solid #93c5fd;background:linear-gradient(180deg,#f8fbff 0%,#f8fafc 100%);border-radius:0 16px 16px 0;color:#475569;line-height:1.8;box-shadow:inset 0 1px 0 rgba(255,255,255,.5)}
+.markdown-blockquote p{margin:.25em 0}
+.markdown-table{width:100%;border-collapse:separate;border-spacing:0;margin:22px 0;background:#ffffff;border:1px solid #d9e1ec;border-radius:18px;overflow:hidden;box-shadow:0 12px 32px rgba(15,23,42,.07)}
+.markdown-table th,.markdown-table td{padding:14px 16px;border-bottom:1px solid #e8edf5;text-align:left;font-size:13px;color:#475569;vertical-align:top;line-height:1.7}
+.markdown-table tr:nth-child(even) td{background:rgba(248,250,252,.7)}
 .markdown-table tr:last-child td{border-bottom:none}
 .markdown-table th{background:#f8fafc;color:#0f172a;font-weight:700}
 .tool-call-card{margin:16px 0;padding:18px 20px;border-radius:20px;background:#fff;border:1px solid #dbe3ee;box-shadow:0 10px 28px rgba(15,23,42,.06);display:flex;flex-direction:column;gap:14px}
@@ -219,17 +231,23 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .tool-call-label{font-size:12px;font-weight:600;color:#64748b}
 .tool-call-value{font-size:14px;color:#1e293b;line-height:1.7;word-break:break-word}
 .tool-call-primary{font-weight:700;color:#0f172a}
-.tool-call-markdown{background:linear-gradient(180deg,#fbfdff 0%,#f8fafc 100%);border:1px solid #dbe3ee;border-radius:16px;padding:14px 16px;display:flex;flex-direction:column;gap:8px;overflow:hidden}
+.tool-call-markdown{display:block;padding:0;background:transparent;border:none;border-radius:0;overflow:visible;line-height:1.68}
 .tool-call-markdown>*:first-child{margin-top:0!important}
 .tool-call-markdown>*:last-child{margin-bottom:0!important}
-.tool-call-markdown p{margin:.3em 0;color:#475569;line-height:1.68;white-space:pre-wrap;word-break:break-word}
-.tool-call-markdown h1,.tool-call-markdown h2,.tool-call-markdown h3{margin:.2em 0 .45em;color:#0f172a;letter-spacing:-.01em;line-height:1.3}
-.tool-call-markdown h1{font-size:1.1rem}
-.tool-call-markdown h2{font-size:1rem}
-.tool-call-markdown h3{font-size:.94rem}
-.tool-call-markdown code{background:#eef2ff;color:#4338ca;padding:1px 5px;border-radius:5px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-.tool-call-markdown pre{margin:.45em 0}
-.tool-call-markdown hr{border:none;border-top:1px solid #dbe3ee;margin:10px 0}
+.tool-call-markdown p{margin:.42em 0;color:#475569;line-height:1.68;white-space:normal;word-break:break-word}
+.tool-call-markdown h1,.tool-call-markdown h2,.tool-call-markdown h3{margin:.65em 0 .55em;color:#0f172a;letter-spacing:-.02em;line-height:1.28}
+.tool-call-markdown h1{font-size:1.24rem}
+.tool-call-markdown h2{font-size:1.08rem}
+.tool-call-markdown h3{font-size:.98rem}
+.tool-call-markdown strong{color:#0f172a}
+.tool-call-markdown ul,.tool-call-markdown ol{margin:.2em 0;padding-left:1.35rem}
+.tool-call-markdown li + li{margin-top:.45em}
+.tool-call-markdown blockquote{margin:.3em 0;border-left:none}
+.tool-call-markdown blockquote>div,.tool-call-markdown blockquote>p,.tool-call-markdown blockquote{background:none}
+.tool-call-markdown code{background:#eef2ff;color:#4338ca;padding:2px 7px;border-radius:7px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;border:1px solid rgba(99,102,241,.12)}
+.tool-call-markdown pre{margin:.8em 0;padding:16px 18px;background:#0f172a;color:#e2e8f0;border-radius:16px;overflow:auto;border:1px solid rgba(148,163,184,.18);box-shadow:inset 0 1px 0 rgba(255,255,255,.04),0 10px 24px rgba(15,23,42,.16)}
+.tool-call-markdown pre code{display:block;background:transparent;border:none;padding:0;color:inherit;font-size:12.5px;line-height:1.75}
+.tool-call-markdown hr{border:none;border-top:1px solid #dbe3ee;margin:14px 0}
 .diff-viewer{display:flex;flex-direction:column;gap:14px;border:1px solid #d9e2ec;border-radius:16px;background:#ffffff;overflow:hidden;box-shadow:0 8px 24px rgba(15,23,42,.05)}
 .diff-viewer-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;background:#f8fafc;border-bottom:1px solid #e5edf5}
 .diff-viewer-title{font-size:13px;font-weight:700;color:#0f172a}
@@ -284,9 +302,15 @@ textarea::placeholder{color:#94a3b8}
 .send-btn:disabled{background:#3a4560}
 .preview-list{display:flex;gap:8px;overflow:auto}
 .preview-item{position:relative;flex:none}
-.preview-item img{width:40px;height:40px;object-fit:cover;border-radius:6px;display:block;border:1px solid var(--border)}
+.preview-item img{width:40px;height:40px;object-fit:cover;border-radius:6px;display:block;border:1px solid var(--border);cursor:pointer;transition:transform .16s ease,box-shadow .16s ease}
+.preview-item img:hover{transform:scale(1.05);box-shadow:0 4px 12px rgba(15,23,42,.18)}
 .preview-remove{position:absolute;top:-6px;right:-6px;width:18px;height:18px;line-height:1;border-radius:50%;background:#3a3d42;color:var(--text);font-size:12px}
 .preview-remove:hover{background:#4a4e55}
+.image-preview-modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(15,23,42,.45);backdrop-filter:blur(2px);z-index:1000;padding:24px}
+.image-preview-modal.visible{display:flex}
+.image-preview-content{position:relative;display:flex;align-items:center;justify-content:center;padding:14px;border-radius:18px;background:rgba(255,255,255,.96);box-shadow:0 18px 50px rgba(15,23,42,.28)}
+.image-preview-content img{max-width:min(80vw,960px);max-height:50vh;border-radius:12px;display:block;object-fit:contain}
+.image-preview-close{position:absolute;top:-10px;right:-10px;width:30px;height:30px;border-radius:50%;border:none;background:#0f172a;color:#fff;font-size:18px;cursor:pointer;box-shadow:0 4px 14px rgba(15,23,42,.24)}
 .loading,.error-banner{display:none;font-size:13px;color:var(--muted);padding:0 20px}
 .loading.visible,.error-banner.visible{display:block}
 .error-banner{color:#f4837a}
@@ -350,6 +374,12 @@ textarea::placeholder{color:#94a3b8}
 
     <div class=\"composer\">
       <div id=\"preview-list\" class=\"preview-list\"></div>
+      <div id=\"image-preview-modal\" class=\"image-preview-modal\">
+        <div class=\"image-preview-content\">
+          <button id=\"image-preview-close\" class=\"image-preview-close\" title=\"关闭预览\">×</button>
+          <img id=\"image-preview-target\" src=\"\" alt=\"图片预览\" />
+        </div>
+      </div>
       <div class=\"composer-box\">
         <div class=\"composer-meta\">
           <div>
@@ -656,7 +686,7 @@ function extractVisibleFollowUpRequest(content) {
     return null;
   }
 
-  const match = content.match(/Current request:\s*([\s\S]*?)(?:\n\n(?:Authority-free source Task|Historical outcomes|Safety boundary|Remaining work|Completed work):|$)/);
+  const match = content.match(/Current request:\\s*([\\s\\S]*?)(?:\\n\\n(?:Authority-free source Task|Historical outcomes|Safety boundary|Remaining work|Completed work):|$)/);
   if (!match) {
     return null;
   }
@@ -699,17 +729,19 @@ function renderStructuredToolCall(content) {
     `;
   }
 
-  const rows = content.split('\\n').filter((line) => line.includes('：'));
-  if (rows.length < 2) return null;
+  const rows = content.split(String.fromCharCode(10)).filter((line) => line.includes('：'));
+  const fieldRows = rows
+    .map((line) => line.match(/^\s*(工具|操作|命令|文件|状态)\s*：\s*(.+?)\s*$/))
+    .filter(Boolean);
+  if (fieldRows.length < 2) return null;
 
   const priorityLabels = ['工具', '操作', '命令', '文件', '状态'];
   const summary = [];
   const details = [];
 
-  rows.forEach((line) => {
-    const [label, ...rest] = line.split('：');
+  fieldRows.forEach((match) => {
+    const [, label, value] = match;
     const cleanLabel = label.trim();
-    const value = rest.join('：').trim();
     if (!value) return;
 
     const isPrimary = priorityLabels.some((item) => cleanLabel.includes(item));
@@ -752,7 +784,7 @@ function renderStructuredToolCall(content) {
 }
 
 function renderDiffBlocks(text) {
-  const lines = text.split('\\n');
+  const lines = text.split(String.fromCharCode(10));
   const sections = [];
   let current = null;
 
@@ -798,7 +830,7 @@ function renderDiffBlocks(text) {
           ${badge}
         </div>
         <div class="diff-code-block ${typeClass}">
-          <pre>${escapeHtml(section.lines.join('\\n').trim())}</pre>
+          <pre>${escapeHtml(section.lines.join(String.fromCharCode(10)).trim())}</pre>
         </div>
       </div>
     `;
@@ -830,10 +862,11 @@ function renderDiffBlocks(text) {
 
 function renderMarkdown(text) {
   const escaped = escapeHtml(text || '');
-  const lines = escaped.split('\\n');
+  const lines = escaped.split(String.fromCharCode(10));
   const blocks = [];
   let paragraph = [];
   let codeFence = null;
+  let blankLineCount = 0;
 
   function flushParagraph() {
     if (!paragraph.length) return;
@@ -851,7 +884,7 @@ function renderMarkdown(text) {
   function flushCodeFence() {
     if (!codeFence) return;
     const language = (codeFence.language || '').trim();
-    const code = codeFence.lines.join('\\n');
+    const code = codeFence.lines.join(String.fromCharCode(10));
     const isTerminal = ['bash', 'shell', 'sh', 'zsh', 'terminal'].includes(language);
     const languageBadge = language ? `<div class="code-block-header"><span>${language}</span></div>` : '';
     blocks.push(isTerminal
@@ -862,19 +895,7 @@ function renderMarkdown(text) {
 
   function flushList() {
     if (!listItems.length) return;
-    const collapseId = `change-list-${Math.random().toString(36).slice(2, 8)}`;
-    blocks.push(`
-      <div class="change-list">
-        <div class="change-item">
-          <div class="change-item-header">
-            <span class="change-item-title">改动清单</span>
-            <span class="change-item-meta">${listItems.length} 项</span>
-          </div>
-          <div class="change-item-body">
-            <ul class="markdown-list grouped-list">${listItems.join('')}</ul>
-          </div>
-        </div>
-      </div>`);
+    blocks.push(`<ul class="markdown-list">${listItems.join('')}</ul>`);
     listItems = [];
   }
 
@@ -897,10 +918,15 @@ function renderMarkdown(text) {
     }
 
     if (!line.trim()) {
-      flushParagraph();
-      flushList();
+      blankLineCount += 1;
+      if (blankLineCount >= 2) {
+        flushParagraph();
+        flushList();
+      }
       return;
     }
+
+    blankLineCount = 0;
 
     const heading = line.match(/^(#{1,3})\s+(.*)$/);
     if (heading) {
@@ -933,11 +959,16 @@ function renderMarkdown(text) {
   flushParagraph();
   flushList();
 
-  const markdownHtml = blocks.join('')
-    .replace(/<li>/g, '<div class="change-bullet"><div>')
-    .replace(/<\/li>/g, '</div></div>');
+  const markdownHtml = blocks.join('');
+  const structuredSection = structured
+    ? `<section class="message-tool-call">${structured}</section>`
+    : '';
 
-  return `<div class="message-section"><div class="message-body">${structured || ''}<div class="tool-call-markdown">${markdownHtml}</div></div></div>`;
+  return `
+    <article class="message-section">
+      ${structuredSection}
+      <div class="tool-call-markdown markdown-flow">${markdownHtml}</div>
+    </article>`;
 }
 
 let shouldAutoFollowChat = true;
@@ -1386,6 +1417,19 @@ function renderTraceView(tracePane, conversation) {
   tracePane.appendChild(board);
 }
 
+function isMarkdownProgress(text) {
+  return String(text || '')
+    .split(String.fromCharCode(10))
+    .some((line) => {
+      const normalized = line.trim();
+      return /^#{1,3} /.test(normalized)
+        || normalized.startsWith('- ')
+        || normalized.startsWith('* ')
+        || normalized === '---'
+        || normalized.startsWith('```');
+    });
+}
+
 function renderTaskCard(element, message, conversationId, mode = 'conversation') {
   const task = message.task || {};
   const card = document.createElement('div');
@@ -1439,7 +1483,12 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
     lines.slice(-30).forEach((item) => {
       const line = document.createElement('div');
       line.className = 'task-progress-line';
-      line.textContent = item.text;
+      if (isMarkdownProgress(item.text)) {
+        line.classList.add('markdown-progress');
+        line.innerHTML = renderMarkdown(item.text);
+      } else {
+        line.textContent = item.text;
+      }
       progress.appendChild(line);
     });
   }
@@ -1760,6 +1809,33 @@ async function fileToDataUrl(file) {
   });
 }
 
+function openImagePreview(src, alt) {
+  const modal = document.getElementById('image-preview-modal');
+  const target = document.getElementById('image-preview-target');
+  target.src = src;
+  target.alt = alt || '图片预览';
+  modal.classList.add('visible');
+}
+
+function closeImagePreview() {
+  const modal = document.getElementById('image-preview-modal');
+  const target = document.getElementById('image-preview-target');
+  modal.classList.remove('visible');
+  target.src = '';
+}
+
+document.addEventListener('click', (event) => {
+  const modal = document.getElementById('image-preview-modal');
+  if (!modal.classList.contains('visible')) return;
+
+  if (
+    event.target.id === 'image-preview-modal'
+    || event.target.id === 'image-preview-close'
+  ) {
+    closeImagePreview();
+  }
+});
+
 function renderPreviews() {
   const previewList = document.getElementById('preview-list');
   previewList.innerHTML = '';
@@ -1770,6 +1846,7 @@ function renderPreviews() {
     const thumb = document.createElement('img');
     thumb.src = image.image_url;
     thumb.alt = image.name;
+    thumb.onclick = () => openImagePreview(image.image_url, image.name);
     const remove = document.createElement('button');
     remove.className = 'preview-remove';
     remove.textContent = '×';

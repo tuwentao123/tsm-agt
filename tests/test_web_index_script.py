@@ -51,3 +51,17 @@ def test_index_html_script_has_balanced_brackets() -> None:
     for script in scripts:
         assert script.count("{") == script.count("}")
         assert script.count("(") == script.count(")")
+
+
+def test_render_markdown_collapses_single_blank_line_without_extra_breaks() -> None:
+    source = _index_html_source()
+
+    assert "let blankLineCount = 0;" in source
+    assert "blankLineCount += 1;" in source
+    assert "if (blankLineCount >= 2)" in source
+    assert "paragraph.push('');" not in source
+    assert 'blocks.push(`<ul class="markdown-list">${listItems.join(\'\')}</ul>`);' in source
+    assert source.count("split(String.fromCharCode(10))") == 4
+    assert source.count("join(String.fromCharCode(10))") == 2
+    assert "function isMarkdownProgress(text)" in source
+    assert "line.innerHTML = renderMarkdown(item.text);" in source
