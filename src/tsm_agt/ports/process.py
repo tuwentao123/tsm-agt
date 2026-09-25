@@ -65,6 +65,9 @@ class ProcessStartRequest:
 class ProcessHandle:
     process_id: str
     pid: int
+    # On POSIX LocalProcessExecutor this is the child PID because it starts a
+    # new session. Windows keeps the same value for its CREATE_NEW_PROCESS_GROUP
+    # handle. It remains an int: a handle always has a known group leader.
     pgid: int
     birth_marker: str
     argv_hash: str

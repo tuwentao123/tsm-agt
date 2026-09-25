@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime
+from unittest import mock
 from pathlib import Path
 
 from tsm_agt.adapters.local_process import LocalProcessExecutor
@@ -124,8 +125,26 @@ class ProcessSupervisorTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.handle.pid, result.handle.pgid)
             assert sandbox is not None
             self.assertEqual(sandbox.requests[0].environment["SAFE_FLAG"], "yes")
+            # Process governance deliberately forwards these three local
+            # identity/SSH variables; the assertion keeps the base plus caller
+            # supplied values strict without making the test host-dependent.
+            self.assertTrue(
+                {"PATH", "LANG", "SAFE_FLAG", "TSM_RUNTIME_TRUST_MODE"}
+                .issubset(sandbox.requests[0].environment)
+            )
             self.assertEqual(
-                set(sandbox.requests[0].environment), {"PATH", "LANG", "SAFE_FLAG"}
+                sandbox.requests[0].environment["TSM_RUNTIME_TRUST_MODE"],
+                "governed",
+            )
+            self.assertEqual(
+                {
+                    name for name in sandbox.requests[0].environment
+                    if name in {"HOME", "USER", "SSH_AUTH_SOCK"}
+                },
+                {
+                    name for name in {"HOME", "USER", "SSH_AUTH_SOCK"}
+                    if os.environ.get(name) is not None
+                },
             )
             self.assertFalse((Path(temporary.name) / "must-not-run").exists())
 
@@ -443,6 +462,40 @@ class ProcessSupervisorTest(unittest.IsolatedAsyncioTestCase):
 
 
 class LocalProcessExecutorContractTest(unittest.IsolatedAsyncioTestCase):
+    async def test_short_command_does_not_query_process_group_after_spawn(self) -> None:
+        """A child can exit before a post-spawn getpgid lookup runs.
+
+        ``start_new_session=True`` already guarantees that the child is its own
+        process-group leader. A second OS lookup is therefore redundant and, for
+        a short command such as ``git remote -v``, can turn a successful command
+        into ``ProcessLookupError: [Errno 3] No such process`` before Runtime has
+        a chance to drain its output.
+        """
+        executor = LocalProcessExecutor()
+        await executor.start(AdapterContext({}, lambda _type, _payload: None))
+        with tempfile.TemporaryDirectory() as directory:
+            request = ProcessStartRequest(
+                "short-command",
+                (sys.executable, "-c", "print('fast-command-ok')"),
+                Path(directory).resolve(),
+            )
+            # The regression is specifically a call to os.getpgid after spawn.
+            # If implementation reintroduces it, this test fails deterministically
+            # instead of relying on a timing-sensitive real child exit.
+            with mock.patch(
+                "tsm_agt.adapters.local_process.executor.os.getpgid",
+                side_effect=ProcessLookupError("simulated short-child race"),
+            ) as getpgid:
+                handle = await executor.start_process(request)
+            result = await executor.wait_process(handle)
+
+            getpgid.assert_not_called()
+            self.assertEqual(handle.pgid, handle.pid)
+            self.assertEqual(result.status, ProcessExitStatus.EXITED)
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(result.stdout.text, "fast-command-ok\n")
+        await executor.stop(datetime.now())
+
     async def test_rejects_forged_handle_identity(self) -> None:
         executor = LocalProcessExecutor()
         await executor.start(AdapterContext({}, lambda _type, _payload: None))

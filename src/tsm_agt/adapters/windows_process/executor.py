@@ -9,9 +9,6 @@ import os
 import signal
 import subprocess
 from dataclasses import dataclass, field
-from tsm_agt.bootstrap.process_environment_configuration import (
-    ProcessEnvironmentConfiguration,
-)
 
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus,
@@ -74,6 +71,12 @@ class WindowsProcessExecutor:
     def __init__(self) -> None:
         self._started = False
         self._live: dict[str, _LiveProcess] = {}
+        # See LocalProcessExecutor: importing bootstrap at adapter module load
+        # time creates a cycle when composition imports both platform executors.
+        from tsm_agt.bootstrap.process_environment_configuration import (
+            ProcessEnvironmentConfiguration,
+        )
+
         self._environment_configuration = ProcessEnvironmentConfiguration()
 
     async def start(self, context: AdapterContext) -> None:
@@ -95,11 +98,34 @@ class WindowsProcessExecutor:
         self._started = False
 
     def prepare_environment(self, environment, policy=None) -> dict[str, str]:
-        return self._environment_configuration.build_environment(
-            environment,
+        # Windows environment keys are case-insensitive. Normalize the caller's
+        # mapping *before* applying it to the base environment, so Path/PATH
+        # obey normal last-write-wins semantics instead of creating two keys.
+        requested: dict[str, str] = {}
+        requested_names: dict[str, str] = {}
+        for name, value in environment.items():
+            folded = name.casefold()
+            previous_name = requested_names.get(folded)
+            if previous_name is not None:
+                requested.pop(previous_name, None)
+            requested_names[folded] = name
+            requested[name] = value
+
+        built = self._environment_configuration.build_environment(
+            requested,
             policy,
             host_environment=os.environ,
         )
+        normalized: dict[str, str] = {}
+        normalized_names: dict[str, str] = {}
+        for name, value in built.items():
+            folded = name.casefold()
+            previous_name = normalized_names.get(folded)
+            if previous_name is not None:
+                normalized.pop(previous_name, None)
+            normalized_names[folded] = name
+            normalized[name] = value
+        return normalized
 
     async def start_process(self, request: ProcessStartRequest) -> ProcessHandle:
         if not self._started:

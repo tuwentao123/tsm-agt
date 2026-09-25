@@ -9,9 +9,6 @@ import os
 import signal
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from tsm_agt.bootstrap.process_environment_configuration import (
-    ProcessEnvironmentConfiguration,
-)
 
 from tsm_agt.ports import (
     AdapterContext,
@@ -88,6 +85,13 @@ class LocalProcessExecutor:
             str,
             tuple[ProcessHandle, ProcessResult, _LogBuffer, _LogBuffer],
         ] = {}
+        # Import lazily: bootstrap composes this adapter, so importing bootstrap
+        # at module load time creates a circular import for direct adapter users
+        # and its isolated contract tests.
+        from tsm_agt.bootstrap.process_environment_configuration import (
+            ProcessEnvironmentConfiguration,
+        )
+
         self._environment_configuration = ProcessEnvironmentConfiguration()
 
     async def start(self, context: AdapterContext) -> None:
@@ -131,14 +135,20 @@ class LocalProcessExecutor:
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
-        pgid = os.getpgid(process.pid)
+        # ``start_new_session=True`` makes the child the leader of a new
+        # session and process group, so its pgid is its pid. Do not call
+        # ``os.getpgid`` here: a fast command (for example ``git remote -v``)
+        # can exit between create_subprocess_exec returning and that lookup,
+        # turning a successfully started command into ProcessLookupError.
+        # The pid-derived value preserves the existing group-stop semantics
+        # without a second racy system call.
         argv_hash = hashlib.sha256(
             json.dumps(request.argv, ensure_ascii=False, separators=(",", ":")).encode()
         ).hexdigest()
         handle = ProcessHandle(
             process_id=request.process_id,
             pid=process.pid,
-            pgid=pgid,
+            pgid=process.pid,
             birth_marker=f"{process.pid}:{started_at.isoformat()}",
             argv_hash=argv_hash,
             cwd=str(request.cwd),
