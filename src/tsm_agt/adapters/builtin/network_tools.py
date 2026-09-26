@@ -10,10 +10,11 @@ import json
 import re
 import socket
 import ssl
+import time
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -36,7 +37,19 @@ from tsm_agt.ports import (
     WebEgressMode,
 )
 from tsm_agt.retrieval.pipeline import RetrievalPipeline
-from tsm_agt.retrieval.schemas import RetrievalResult
+from tsm_agt.retrieval.providers import (
+    DEFAULT_PROVIDER_TIMEOUT_SECONDS, RetrievalProvider,
+)
+from tsm_agt.retrieval.schemas import (
+    FRESHNESS_VALUES,
+    ProviderTimeoutError,
+    RetrievalResult,
+    freshness_cutoff,
+    is_timeout_error,
+    normalize_published_at,
+    published_at_datetime,
+    recency_sort_key,
+)
 
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -46,6 +59,43 @@ _USER_AGENT = (
 _MAX_FETCH_CHARS = 20000
 _MAX_SEARCH_BYTES = 200000
 _MAX_SUMMARY_SENTENCES = 5
+
+#: Wall-clock budget for one ``web.search`` when the caller supplies no Tool
+#: deadline (for example direct adapter use in tests). Must stay below the
+#: Runtime's default 30s Tool deadline so the pipeline can return telemetry
+#: instead of being killed mid-flight.
+_DEFAULT_SEARCH_DEADLINE_SECONDS = 25.0
+
+#: Leave this much of the Tool deadline unused: the pipeline needs a moment to
+#: turn the last provider timeout into a normal ToolResult before the Runtime's
+#: own hard timeout fires.
+_SEARCH_DEADLINE_RESERVE_SECONDS = 0.5
+
+#: Google News RSS recency operator. The endpoint has no date parameter; this
+#: is the only supported freshness control.
+_GOOGLE_NEWS_WHEN = {"day": "1d", "week": "7d", "month": "30d"}
+
+#: Tavily only accepts a day count for its ``news`` topic.
+_TAVILY_NEWS_DAYS = {"day": 1, "week": 7, "month": 30}
+
+
+def _apply_freshness(
+    results: list[RetrievalResult], freshness: str, top_k: int,
+) -> list[RetrievalResult]:
+    """Order dated results newest-first and drop clearly stale ones.
+
+    Undated results are kept (we cannot prove they are old) but sort last, so a
+    source that exposes no publish time can never outrank a fresh dated item.
+    """
+    cutoff = freshness_cutoff(freshness)
+    if cutoff is not None:
+        results = [
+            result for result in results
+            if (moment := published_at_datetime(result.published_at)) is None
+            or moment >= cutoff
+        ]
+    results.sort(key=recency_sort_key)
+    return results[:top_k]
 
 
 _MAX_FETCH_BYTES = 20000
@@ -433,13 +483,24 @@ class _DuckDuckGoInstantProvider:
     def __init__(self, tools: NetworkToolProvider) -> None:
         self._tools = tools
 
-    def search(self, query: str, top_k: int) -> list[RetrievalResult]:
+    def search(
+        self, query: str, top_k: int, *,
+        timeout_seconds: float = DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+        freshness: str = "any",
+    ) -> list[RetrievalResult]:
         try:
             payload = self._tools._load_json(
                 "https://api.duckduckgo.com/?q="
-                f"{quote_plus(query)}&format=json&no_redirect=1&no_html=1"
+                f"{quote_plus(query)}&format=json&no_redirect=1&no_html=1",
+                timeout_seconds=timeout_seconds,
             )
-        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError):
+        except (
+            HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError
+        ) as error:
+            if is_timeout_error(error):
+                raise ProviderTimeoutError(
+                    self.name, timeout_seconds, error
+                ) from error
             return []
 
         results: list[RetrievalResult] = []
@@ -474,7 +535,11 @@ class _DuckDuckGoHtmlProvider:
     def __init__(self, tools: "NetworkToolProvider") -> None:
         self._tools = tools
 
-    def search(self, query: str, top_k: int) -> list[RetrievalResult]:
+    def search(
+        self, query: str, top_k: int, *,
+        timeout_seconds: float = DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+        freshness: str = "any",
+    ) -> list[RetrievalResult]:
         return [
             RetrievalResult(
                 title=item["title"],
@@ -482,7 +547,9 @@ class _DuckDuckGoHtmlProvider:
                 snippet=item["snippet"],
                 provider=self.name,
             )
-            for item in self._tools._fallback_html_search(query, top_k)
+            for item in self._tools._fallback_html_search(
+                query, top_k, timeout_seconds=timeout_seconds
+            )
         ]
 
 
@@ -492,26 +559,39 @@ class _RssNewsProvider:
     def __init__(self, tools: "NetworkToolProvider") -> None:
         self._tools = tools
 
-    def search(self, query: str, top_k: int) -> list[RetrievalResult]:
-        rss_query = quote_plus(query)
+    def search(
+        self, query: str, top_k: int, *,
+        timeout_seconds: float = DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+        freshness: str = "any",
+    ) -> list[RetrievalResult]:
+        # Google News ranks by relevance, not recency: a query containing
+        # "today"/"latest" tends to surface evergreen round-ups. The `when:`
+        # operator is the only recency control this endpoint exposes.
+        effective_query = query
+        if freshness in _GOOGLE_NEWS_WHEN:
+            effective_query = f"{query} when:{_GOOGLE_NEWS_WHEN[freshness]}"
+        rss_query = quote_plus(effective_query)
         url = (
             "https://news.google.com/rss/search?q="
             f"{rss_query}&hl=en-US&gl=US&ceid=US:en"
         )
         request = Request(url, headers={"User-Agent": _USER_AGENT})
 
-        with urlopen(request, timeout=15) as response:
-            payload = response.read(_MAX_SEARCH_BYTES).decode(
-                "utf-8", errors="replace"
-            )
-
-        root = ET.fromstring(payload)
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                payload = response.read(_MAX_SEARCH_BYTES).decode(
+                    "utf-8", errors="replace"
+                )
+            root = ET.fromstring(payload)
+        except (HTTPError, URLError, TimeoutError, OSError, ET.ParseError) as error:
+            if is_timeout_error(error):
+                raise ProviderTimeoutError(
+                    self.name, timeout_seconds, error
+                ) from error
+            return []
         results: list[RetrievalResult] = []
 
         for item in root.findall("./channel/item"):
-            if len(results) >= top_k:
-                break
-
             title = item.findtext("title") or "RSS result"
             link = item.findtext("link") or ""
             description = item.findtext("description") or ""
@@ -535,10 +615,13 @@ class _RssNewsProvider:
                     provider=self.name,
                     source="news",
                     content_type="rss",
+                    published_at=normalize_published_at(
+                        item.findtext("pubDate")
+                    ),
                 )
             )
 
-        return results
+        return _apply_freshness(results, freshness, top_k)
 
 
 class _RssFeedProvider:
@@ -551,25 +634,31 @@ class _RssFeedProvider:
     def __init__(self, tools: "NetworkToolProvider") -> None:
         self._tools = tools
 
-    def search(self, query: str, top_k: int) -> list[RetrievalResult]:
+    def search(
+        self, query: str, top_k: int, *,
+        timeout_seconds: float = DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+        freshness: str = "any",
+    ) -> list[RetrievalResult]:
         url = self.feed_template.format(query=quote_plus(query))
         request = Request(url, headers={
             "User-Agent": _USER_AGENT,
             "Accept": "application/rss+xml, application/xml, text/xml, */*",
         })
         try:
-            with urlopen(request, timeout=15) as response:
+            with urlopen(request, timeout=timeout_seconds) as response:
                 payload = response.read(_MAX_SEARCH_BYTES).decode(
                     "utf-8", errors="replace"
                 )
             root = ET.fromstring(payload)
-        except (HTTPError, URLError, TimeoutError, OSError, ET.ParseError):
+        except (HTTPError, URLError, TimeoutError, OSError, ET.ParseError) as error:
+            if is_timeout_error(error):
+                raise ProviderTimeoutError(
+                    self.name, timeout_seconds, error
+                ) from error
             return []
 
         results: list[RetrievalResult] = []
         for item in root.findall("./channel/item"):
-            if len(results) >= top_k:
-                break
             link = (item.findtext("link") or "").strip()
             if not link:
                 continue
@@ -581,8 +670,9 @@ class _RssFeedProvider:
                 provider=self.name,
                 source=self.source,
                 content_type="rss",
+                published_at=normalize_published_at(item.findtext("pubDate")),
             ))
-        return results
+        return _apply_freshness(results, freshness, top_k)
 
 
 class _BingNewsRssProvider(_RssFeedProvider):
@@ -601,7 +691,11 @@ class _DuckDuckGoLiteProvider:
     def __init__(self, tools: "NetworkToolProvider") -> None:
         self._tools = tools
 
-    def search(self, query: str, top_k: int) -> list[RetrievalResult]:
+    def search(
+        self, query: str, top_k: int, *,
+        timeout_seconds: float = DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+        freshness: str = "any",
+    ) -> list[RetrievalResult]:
         request = Request(
             f"{self._endpoint}?q={quote_plus(query)}",
             headers={
@@ -611,11 +705,15 @@ class _DuckDuckGoLiteProvider:
             },
         )
         try:
-            with urlopen(request, timeout=15) as response:
+            with urlopen(request, timeout=timeout_seconds) as response:
                 payload = response.read(_MAX_SEARCH_BYTES).decode(
                     "utf-8", errors="replace"
                 )
-        except (HTTPError, URLError, TimeoutError, OSError):
+        except (HTTPError, URLError, TimeoutError, OSError) as error:
+            if is_timeout_error(error):
+                raise ProviderTimeoutError(
+                    self.name, timeout_seconds, error
+                ) from error
             return []
 
         parser = _DuckDuckGoLiteParser()
@@ -691,7 +789,11 @@ class _WikipediaProvider:
     def __init__(self, tools: "NetworkToolProvider") -> None:
         self._tools = tools
 
-    def search(self, query: str, top_k: int) -> list[RetrievalResult]:
+    def search(
+        self, query: str, top_k: int, *,
+        timeout_seconds: float = DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+        freshness: str = "any",
+    ) -> list[RetrievalResult]:
         results: list[RetrievalResult] = []
         for language in ("zh", "en"):
             if results:
@@ -700,11 +802,16 @@ class _WikipediaProvider:
                 payload = self._tools._load_json(
                     f"https://{language}.wikipedia.org/w/api.php?action=query"
                     "&list=search&format=json&srlimit="
-                    f"{top_k}&srsearch={quote_plus(query)}"
+                    f"{top_k}&srsearch={quote_plus(query)}",
+                    timeout_seconds=timeout_seconds,
                 )
             except (
                 HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError
-            ):
+            ) as error:
+                if is_timeout_error(error):
+                    raise ProviderTimeoutError(
+                        self.name, timeout_seconds, error
+                    ) from error
                 continue
             hits = payload.get("query", {}).get("search", [])
             if not isinstance(hits, list):
@@ -733,6 +840,92 @@ class _WikipediaProvider:
         return results
 
 
+class _TavilyProvider:
+    """Tavily search adapter (commercial, optional, opt-in).
+
+    Tavily is purpose-built for agent consumption: it ranks results and returns
+    a real ``published_date`` plus clean content. It supports an API key
+    (``Authorization: Bearer``) and a free keyless mode
+    (``X-Tavily-Access-Mode: keyless``). This provider is only added to the
+    pipeline when the host explicitly enables it, because it sends the user's
+    query to a third party.
+    """
+
+    name = "tavily"
+    _endpoint = "https://api.tavily.com/search"
+
+    def __init__(
+        self, tools: "NetworkToolProvider", api_key: str = "",
+        *, keyless: bool = False,
+    ) -> None:
+        self._tools = tools
+        self._api_key = api_key
+        self._keyless = keyless
+
+    def search(
+        self, query: str, top_k: int, *,
+        timeout_seconds: float = DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+        freshness: str = "any",
+    ) -> list[RetrievalResult]:
+        topic = "news" if freshness in _TAVILY_NEWS_DAYS else "general"
+        body: dict[str, Any] = {
+            "query": query,
+            "max_results": max(1, min(int(top_k), 20)),
+            "search_depth": "basic",
+            "topic": topic,
+            "include_answer": False,
+            "include_raw_content": False,
+            "include_images": False,
+        }
+        if topic == "news":
+            body["days"] = _TAVILY_NEWS_DAYS[freshness]
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": _USER_AGENT,
+        }
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        elif self._keyless:
+            headers["X-Tavily-Access-Mode"] = "keyless"
+        request = Request(
+            self._endpoint, data=json.dumps(body).encode("utf-8"),
+            headers=headers,
+        )
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                payload = json.loads(
+                    response.read(_MAX_SEARCH_BYTES).decode("utf-8", "replace")
+                )
+        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+            if is_timeout_error(error):
+                raise ProviderTimeoutError(
+                    self.name, timeout_seconds, error
+                ) from error
+            return []
+        if not isinstance(payload, Mapping):
+            return []
+
+        results: list[RetrievalResult] = []
+        for item in payload.get("results") or []:
+            if not isinstance(item, Mapping):
+                continue
+            url = str(item.get("url") or "").strip()
+            if not url:
+                continue
+            results.append(RetrievalResult(
+                title=str(item.get("title") or url).strip(),
+                url=url,
+                snippet=str(item.get("content") or "").strip(),
+                provider=self.name,
+                source="news" if topic == "news" else "web",
+                content_type="search_result",
+                published_at=normalize_published_at(item.get("published_date")),
+            ))
+            if len(results) >= top_k:
+                break
+        return _apply_freshness(results, freshness, top_k)
+
+
 class NetworkToolProvider:
     descriptor = AdapterDescriptor(
         adapter_id="builtin.network-tools",
@@ -745,12 +938,25 @@ class NetworkToolProvider:
     _tools = (
         ToolSpec(
             name="web.search",
-            description="Search the public web and return lightweight search results only.",
+            description=(
+                "Search the public web and return lightweight search results "
+                "with source URLs, and publish times when the source exposes "
+                "one. Set freshness for time-sensitive requests such as "
+                "'today's news'."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer"},
+                    "freshness": {
+                        "type": "string",
+                        "enum": list(FRESHNESS_VALUES),
+                        "description": (
+                            "Recency window: 'day' keeps only very recent items "
+                            "where the source supports it. Defaults to 'any'."
+                        ),
+                    },
                 },
                 "required": ["query"],
                 "additionalProperties": False,
@@ -813,13 +1019,43 @@ class NetworkToolProvider:
         fetch_transport: WebFetchTransport | None = None,
         address_resolver: AddressResolver | None = None,
         egress_mode: WebEgressMode | str = WebEgressMode.DIRECT,
+        search_provider_timeout_seconds: float = (
+            DEFAULT_PROVIDER_TIMEOUT_SECONDS
+        ),
+        search_fallback_deadline_seconds: float = (
+            _DEFAULT_SEARCH_DEADLINE_SECONDS
+        ),
+        search_tavily_mode: str = "off",
+        search_tavily_api_key: str = "",
     ) -> None:
         """Expose public search and a bounded document fetch.
 
         The default DIRECT mode validates and pins the destination address
         itself. DELEGATED mode is for hosts where egress already goes through a
         proxy, VPN, or TUN device that owns the policy; see ``WebEgressMode``.
+
+        ``search_provider_timeout_seconds`` caps a single public provider (each
+        source fails soft), while the whole ``web.search`` stays inside the Tool
+        deadline derived from the invocation context. The fallback deadline is
+        used only when no context supplies one.
+
+        ``search_tavily_mode`` is ``off`` (default), ``keyless``, or ``key``.
+        Tavily is prepended as the primary source only when explicitly enabled,
+        because it forwards the query to a third party.
         """
+        if search_provider_timeout_seconds <= 0:
+            raise ValueError("search_provider_timeout_seconds must be positive")
+        if search_fallback_deadline_seconds <= 0:
+            raise ValueError("search_fallback_deadline_seconds must be positive")
+        mode = (search_tavily_mode or "off").strip().lower()
+        if mode not in {"off", "keyless", "key"}:
+            raise ValueError(
+                "search_tavily_mode must be 'off', 'keyless', or 'key'"
+            )
+        if mode == "key" and not search_tavily_api_key.strip():
+            raise ValueError(
+                "search_tavily_mode='key' requires TSM_AGT_SEARCH_TAVILY_API_KEY"
+            )
         self._enable_fetch = enable_fetch
         self._egress_mode = WebEgressMode(egress_mode)
         self._fetch_transport = fetch_transport or (
@@ -829,18 +1065,29 @@ class NetworkToolProvider:
         )
         self._address_resolver = address_resolver or _resolve_public_addresses
         self._started = False
-        # Ordered by observed usefulness: general web results first, then news
-        # feeds, then encyclopedic fallback. Each provider fails soft so one
-        # blocked endpoint cannot disable search entirely.
+        self._search_fallback_deadline_seconds = (
+            search_fallback_deadline_seconds
+        )
+        # Ordered by observed usefulness: an opt-in commercial source first,
+        # then general web results, news feeds, and encyclopedic fallback. Each
+        # provider fails soft so one blocked endpoint cannot disable search.
+        providers: list[RetrievalProvider] = []
+        if mode != "off":
+            providers.append(_TavilyProvider(
+                self, search_tavily_api_key.strip(),
+                keyless=mode == "keyless",
+            ))
+        providers.extend([
+            _DuckDuckGoLiteProvider(self),
+            _DuckDuckGoHtmlProvider(self),
+            _BingNewsRssProvider(self),
+            _RssNewsProvider(self),
+            _DuckDuckGoInstantProvider(self),
+            _WikipediaProvider(self),
+        ])
         self._pipeline = RetrievalPipeline(
-            providers=[
-                _DuckDuckGoLiteProvider(self),
-                _DuckDuckGoHtmlProvider(self),
-                _BingNewsRssProvider(self),
-                _RssNewsProvider(self),
-                _DuckDuckGoInstantProvider(self),
-                _WikipediaProvider(self),
-            ]
+            providers=providers,
+            provider_timeout_seconds=search_provider_timeout_seconds,
         )
 
     async def start(self, context: AdapterContext) -> None:
@@ -867,7 +1114,8 @@ class NetworkToolProvider:
         try:
             if call.name == "web.search":
                 data = await asyncio.to_thread(
-                    self._web_search, call.arguments
+                    self._web_search, call.arguments,
+                    self._search_deadline(context),
                 )
             elif call.name == "web.fetch_markdown":
                 if not self._enable_fetch:
@@ -898,11 +1146,38 @@ class NetworkToolProvider:
         except (OSError, TimeoutError, URLError) as error:
             return ToolResult(call.call_id, False, error_code="NETWORK_ERROR", message=str(error), retryable=True)
 
-    def _web_search(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+    def _search_deadline(
+        self, context: ToolInvocationContext | None,
+    ) -> float:
+        """Translate the Tool deadline into a ``time.monotonic`` budget.
+
+        The Runtime wraps the Tool in its own hard timeout, but that timeout can
+        only fail the whole call. Handing the remaining budget to the pipeline
+        lets it stop asking slow providers and still return partial telemetry.
+        """
+        deadline = getattr(context, "deadline", None)
+        if deadline is None:
+            return time.monotonic() + self._search_fallback_deadline_seconds
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        remaining = (
+            (deadline - datetime.now(timezone.utc)).total_seconds()
+            - _SEARCH_DEADLINE_RESERVE_SECONDS
+        )
+        # A non-positive budget means the Runner skips every provider, which is
+        # the honest outcome: the Tool deadline is already behind us.
+        return time.monotonic() + max(remaining, 0.0)
+
+    def _web_search(
+        self, arguments: Mapping[str, Any], deadline: float | None = None,
+    ) -> Mapping[str, Any]:
         query = self._required_string(arguments, "query")
         top_k = min(max(int(arguments.get("top_k", 5)), 1), 10)
+        freshness = self._freshness(arguments)
 
-        response = self._pipeline.search(query, top_k)
+        response = self._pipeline.search(
+            query, top_k, deadline=deadline, freshness=freshness,
+        )
         if not response.results:
             degraded = response.to_dict()
             degraded["message"] = (
@@ -911,6 +1186,18 @@ class NetworkToolProvider:
             return degraded
 
         return response.to_dict()
+
+    @staticmethod
+    def _freshness(arguments: Mapping[str, Any]) -> str:
+        raw = arguments.get("freshness")
+        if raw is None:
+            return "any"
+        value = str(raw).strip().lower()
+        if value not in FRESHNESS_VALUES:
+            raise ValueError(
+                "freshness must be one of: " + ", ".join(FRESHNESS_VALUES)
+            )
+        return value
 
     @property
     def egress_mode(self) -> WebEgressMode:
@@ -1027,13 +1314,16 @@ class NetworkToolProvider:
             return None
         return {"title": text.split(" - ", 1)[0], "url": url, "snippet": text}
 
-    def _fallback_html_search(self, query: str, top_k: int) -> list[dict[str, str]]:
+    def _fallback_html_search(
+        self, query: str, top_k: int, *,
+        timeout_seconds: float = DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+    ) -> list[dict[str, str]]:
         url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
         request = Request(url, headers={
             "User-Agent": _USER_AGENT,
             "Accept-Language": "en-US,en;q=0.9",
         })
-        with urlopen(request, timeout=15) as response:
+        with urlopen(request, timeout=timeout_seconds) as response:
             payload = response.read(_MAX_SEARCH_BYTES).decode(
                 "utf-8", errors="replace"
             )
@@ -1067,14 +1357,21 @@ class NetworkToolProvider:
         return candidate
 
     @staticmethod
-    def _load_json(url: str) -> Mapping[str, Any]:
+    def _load_json(
+        url: str,
+        timeout_seconds: float = DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+    ) -> Mapping[str, Any]:
         request = Request(url, headers={
             "User-Agent": _USER_AGENT,
             "Accept-Language": "en-US,en;q=0.9",
         })
-        with urlopen(request, timeout=15) as response:
+        with urlopen(request, timeout=timeout_seconds) as response:
             payload = response.read(_MAX_SEARCH_BYTES)
         data = json.loads(payload.decode("utf-8"))
         if not isinstance(data, Mapping):
             raise ValueError("search provider returned an invalid payload")
         return data
+
+
+# Backward-compatible alias retained for older import paths.
+NetworkToolAdapter = NetworkToolProvider

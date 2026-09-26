@@ -24,6 +24,122 @@ from .session_resources import (
 from .runtime_input import SessionResumeCandidate
 
 
+def _restricted_event_ref(value: Any) -> str | None:
+    """Keep only a bounded opaque persisted-answer reference."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized[:256] if normalized else None
+
+
+def _restricted_mapping(value: Any, *, depth: int = 0) -> dict[str, Any] | None:
+    """Copy bounded structured protocol data without interpreting its meaning.
+
+    Session history intentionally carries no provider protocol or raw execution
+    payload. V3 conclusion objects are already explicit persisted protocol
+    facts, so this boundary preserves only JSON-like, size-bounded structure.
+    """
+    if not isinstance(value, Mapping) or depth > 2:
+        return None
+    result: dict[str, Any] = {}
+    for raw_key, raw_value in list(value.items())[:20]:
+        key = str(raw_key)[:80]
+        if isinstance(raw_value, str):
+            result[key] = raw_value[:1000]
+        elif isinstance(raw_value, (int, float, bool)) or raw_value is None:
+            result[key] = raw_value
+        elif isinstance(raw_value, Mapping):
+            nested = _restricted_mapping(raw_value, depth=depth + 1)
+            if nested is not None:
+                result[key] = nested
+        elif isinstance(raw_value, (list, tuple)):
+            values: list[Any] = []
+            for item in raw_value[:20]:
+                if isinstance(item, str):
+                    values.append(item[:1000])
+                elif isinstance(item, (int, float, bool)) or item is None:
+                    values.append(item)
+                elif isinstance(item, Mapping):
+                    nested = _restricted_mapping(item, depth=depth + 1)
+                    if nested is not None:
+                        values.append(nested)
+            result[key] = values
+    return result
+
+
+def _prompt_conclusion_summary(
+    assistant_conclusion: Mapping[str, Any] | None,
+    conclusion_validation: Mapping[str, Any] | None,
+    answer_event_ref: str | None,
+) -> dict[str, Any] | None:
+    """Keep the model handoff to a compact, non-authoritative V3 summary."""
+    claims: list[dict[str, Any]] = []
+    raw_claims = (
+        assistant_conclusion.get("claims", [])
+        if isinstance(assistant_conclusion, Mapping) else []
+    )
+    if isinstance(raw_claims, (list, tuple)):
+        for raw_claim in raw_claims[:5]:
+            if not isinstance(raw_claim, Mapping):
+                continue
+            claim: dict[str, Any] = {}
+            for field, limit in (
+                ("claim_id", 128), ("kind", 80), ("summary", 300),
+                ("reason", 300),
+            ):
+                value = raw_claim.get(field)
+                if isinstance(value, str) and value.strip():
+                    claim[field] = value.strip()[:limit]
+            for field in ("scope", "unverified_scope"):
+                value = raw_claim.get(field)
+                if isinstance(value, (list, tuple)):
+                    claim[field] = [
+                        item.strip()[:160] for item in value[:5]
+                        if isinstance(item, str) and item.strip()
+                    ]
+            if claim:
+                claims.append(claim)
+
+    validation: dict[str, Any] | None = None
+    if isinstance(conclusion_validation, Mapping):
+        validation = {}
+        status = conclusion_validation.get("status")
+        if isinstance(status, str) and status.strip():
+            validation["status"] = status.strip()[:80]
+        raw_validation_claims = conclusion_validation.get("claims", [])
+        if isinstance(raw_validation_claims, (list, tuple)):
+            validation_claims: list[dict[str, Any]] = []
+            for raw_claim in raw_validation_claims[:5]:
+                if not isinstance(raw_claim, Mapping):
+                    continue
+                item: dict[str, Any] = {}
+                for field, limit in (("claim_id", 128), ("status", 80)):
+                    value = raw_claim.get(field)
+                    if isinstance(value, str) and value.strip():
+                        item[field] = value.strip()[:limit]
+                reasons = raw_claim.get("reasons")
+                if isinstance(reasons, (list, tuple)):
+                    item["reasons"] = [
+                        reason.strip()[:200] for reason in reasons[:3]
+                        if isinstance(reason, str) and reason.strip()
+                    ]
+                if item:
+                    validation_claims.append(item)
+            if validation_claims:
+                validation["claims"] = validation_claims
+        if not validation:
+            validation = None
+
+    reference = _restricted_event_ref(answer_event_ref)
+    if reference is None and not claims and validation is None:
+        return None
+    return {
+        "answer_event_ref": reference,
+        "claims": claims,
+        "validation": validation,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class SessionConversationMessage:
     message_id: str
@@ -96,6 +212,12 @@ class SessionTaskSummary:
     workspace_roots: tuple[str, ...] = ()
     mutations: tuple[Mapping[str, Any], ...] = ()
     verification_status: str | None = None
+    # V3 keeps the model's explicit structured conclusion separate from both
+    # Task execution and the domain verifier. These fields are copied only
+    # from persisted protocol payloads; conversation text is never parsed.
+    assistant_conclusion: Mapping[str, Any] | None = None
+    conclusion_validation: Mapping[str, Any] | None = None
+    answer_event_ref: str | None = None
     task_spec_revision: int = 0
     continuation_mode: str = "NONE"
     outcomes: tuple[Mapping[str, Any], ...] = ()
@@ -127,6 +249,15 @@ class SessionTaskSummary:
             "workspace_roots": list(self.workspace_roots),
             "mutations": [dict(item) for item in self.mutations],
             "verification_status": self.verification_status,
+            "assistant_conclusion": (
+                _restricted_mapping(self.assistant_conclusion)
+                if self.assistant_conclusion is not None else None
+            ),
+            "conclusion_validation": (
+                _restricted_mapping(self.conclusion_validation)
+                if self.conclusion_validation is not None else None
+            ),
+            "answer_event_ref": self.answer_event_ref,
             "task_spec_revision": self.task_spec_revision,
             "continuation_mode": self.continuation_mode,
             "outcomes": [dict(item) for item in self.outcomes],
@@ -135,8 +266,19 @@ class SessionTaskSummary:
     def prompt_data(
         self, execution_events: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
-        """Render one non-redundant model view of this Task handoff."""
+        """Render one non-redundant, bounded model view of this Task handoff."""
         data = self.to_data()
+        # Durable Session history retains the full bounded protocol objects for
+        # UI/history. The model receives only a compact summary and never fact
+        # reference metadata or arbitrary nested conclusion fields.
+        data.pop("assistant_conclusion", None)
+        data.pop("conclusion_validation", None)
+        data.pop("answer_event_ref", None)
+        data["conclusion"] = _prompt_conclusion_summary(
+            self.assistant_conclusion,
+            self.conclusion_validation,
+            self.answer_event_ref,
+        )
         if execution_events:
             # Paired recent execution facts supersede the older coarse action
             # list. Keep important_actions only as a durable compatibility
@@ -188,6 +330,13 @@ class SessionTaskSummary:
                 str(data["verification_status"])
                 if data.get("verification_status") is not None else None
             ),
+            assistant_conclusion=_restricted_mapping(
+                data.get("assistant_conclusion")
+            ),
+            conclusion_validation=_restricted_mapping(
+                data.get("conclusion_validation")
+            ),
+            answer_event_ref=_restricted_event_ref(data.get("answer_event_ref")),
             task_spec_revision=max(0, int(data.get("task_spec_revision", 0))),
             continuation_mode=str(data.get("continuation_mode", "NONE")),
             outcomes=tuple(
@@ -424,7 +573,18 @@ class SessionContextProjector:
                 self._apply_catalogs(resources, questions, event.payload)
                 raw_summary = event.payload.get("task_summary")
                 if isinstance(raw_summary, Mapping):
-                    summary = SessionTaskSummary.from_data(raw_summary)
+                    # V3 originally wrote conclusion facts at the result-event
+                    # top level. Merge them into the durable summary only when
+                    # the nested record predates those fields; never rewrite or
+                    # infer values from the visible assistant message.
+                    summary_data = dict(raw_summary)
+                    for key in (
+                        "assistant_conclusion", "conclusion_validation",
+                        "answer_event_ref",
+                    ):
+                        if summary_data.get(key) is None and event.payload.get(key) is not None:
+                            summary_data[key] = event.payload[key]
+                    summary = SessionTaskSummary.from_data(summary_data)
                 else:
                     # Older runtime.db files predate task_summary. Rebuild the
                     # smallest useful handoff from fields those events already
@@ -487,6 +647,9 @@ class SessionContextProjector:
                             if event.payload.get("verification_status") is not None
                             else prior.verification_status
                         ),
+                        assistant_conclusion=prior.assistant_conclusion,
+                        conclusion_validation=prior.conclusion_validation,
+                        answer_event_ref=prior.answer_event_ref,
                         task_spec_revision=prior.task_spec_revision,
                         continuation_mode=prior.continuation_mode,
                         outcomes=prior.outcomes,
@@ -588,10 +751,10 @@ class SessionContextProjector:
         # deterministically before they become protected Session context; this
         # is retention, not routing.
         visible_messages = prompt_messages[-self.recent_visible_message_limit:]
-        recent_task_ids = list(dict.fromkeys(
+        recent_task_ids = list(reversed(list(dict.fromkeys(
             message.task_id for message in reversed(visible_messages)
             if message.task_id is not None
-        ))[:self.detailed_task_summary_limit]
+        ))[:self.detailed_task_summary_limit]))
         summaries_by_id = {item.task_id: item for item in projection.task_summaries}
         pinned_ids = [
             task_id for task_id in dict.fromkeys(pinned_task_ids)
@@ -873,6 +1036,11 @@ class SessionContextProjector:
                 "goal": self._bounded_text(summary.goal, 500),
                 "status": summary.recorded_task_state,
                 "verification_status": summary.verification_status,
+                "conclusion": _prompt_conclusion_summary(
+                    summary.assistant_conclusion,
+                    summary.conclusion_validation,
+                    summary.answer_event_ref,
+                ),
                 "artifacts": artifacts[:50],
                 "completed_work": self._bounded_texts(
                     summary.completed_work, 10, 500

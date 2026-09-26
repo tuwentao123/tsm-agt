@@ -144,6 +144,15 @@ class _RecordingClient:
         })
         return type("_Result", (), {"result": {"kind": "task"}})()
 
+    async def submit_user_input(
+        self, session_id, text, *, input_id, explicit_intent=None,
+        target_task_id=None, images=(), workspace=None,
+    ):
+        self.session_calls.append({
+            "session_id": session_id, "text": text, "workspace": workspace,
+        })
+        return type("_Result", (), {"result": {"kind": "task"}})()
+
     async def submit_task(
         self, goal, *, command_id, session_id=None, images=(), workspace=None,
     ):

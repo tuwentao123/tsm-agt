@@ -27,6 +27,10 @@ class RuntimeTaskResultTest(unittest.TestCase):
             "verification": None,
             "evidence_level": None,
             "projection": None,
+            "latest_answer_event_ref": None,
+            "conclusion_claims": [],
+            "conclusion_validation": None,
+            "completion_diagnostics": None,
         })
 
 

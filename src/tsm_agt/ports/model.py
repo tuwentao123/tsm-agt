@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any, Protocol, runtime_checkable
 
 from .adapter import RuntimeAdapter
+from .conclusion import AssistantConclusion
 from .tool import ToolCall, ToolResult, ToolSpec
 
 
@@ -33,6 +34,14 @@ class ModelCallPurpose(StrEnum):
     COMPACTION = "COMPACTION"
 
 
+class ConclusionProtocolMode(StrEnum):
+    """How an adapter may accept structured assistant conclusions."""
+
+    DISABLED = "disabled"
+    OBSERVE = "observe"
+    REQUIRE_STRUCTURED = "require_structured"
+
+
 class RecoverableToolProtocolError(RuntimeError):
     """One model response used a correctable tool-call wire format."""
 
@@ -52,12 +61,14 @@ class ProviderCapabilities:
     prompt_cache: bool = False
     stream_cancel: bool = False
     context_window: int = 0
+    structured_conclusion: bool = False
 
     def to_data(self) -> dict[str, bool | int]:
         return {
             "tools": self.tools,
             "parallel_tools": self.parallel_tools,
             "strict_json_schema": self.strict_json_schema,
+            "structured_conclusion": self.structured_conclusion,
             "reasoning_blocks": self.reasoning_blocks,
             "vision": self.vision,
             "prompt_cache": self.prompt_cache,
@@ -138,8 +149,16 @@ class ToolResultBlock:
         return {"type": "tool_result", **self.result.to_data()}
 
 
+@dataclass(frozen=True, slots=True)
+class ConclusionBlock:
+    conclusion: AssistantConclusion
+
+    def to_data(self) -> dict[str, object]:
+        return {"type": "conclusion", "conclusion": self.conclusion.to_data()}
+
+
 MessageBlock = (
-    TextBlock | ImageBlock | ToolCallBlock | ToolResultBlock
+    TextBlock | ImageBlock | ToolCallBlock | ToolResultBlock | ConclusionBlock
 )
 
 
@@ -183,6 +202,13 @@ class Message:
                 blocks.append(ToolCallBlock(ToolCall.from_data(raw_block)))
             elif block_type == "tool_result":
                 blocks.append(ToolResultBlock(ToolResult.from_data(raw_block)))
+            elif block_type == "conclusion":
+                raw_conclusion = raw_block.get("conclusion")
+                if not isinstance(raw_conclusion, Mapping):
+                    raise ValueError("conclusion block requires an object conclusion")
+                blocks.append(ConclusionBlock(
+                    AssistantConclusion.from_data(raw_conclusion)
+                ))
             else:
                 raise ValueError(f"unsupported message block type: {block_type}")
         return cls(
@@ -256,6 +282,7 @@ class ModelRequest:
     purpose: ModelCallPurpose = ModelCallPurpose.AGENT_TURN
     timeout_seconds: float | None = None
     max_provider_attempts: int | None = None
+    conclusion_protocol_mode: ConclusionProtocolMode = ConclusionProtocolMode.OBSERVE
 
 
 @dataclass(frozen=True, slots=True)

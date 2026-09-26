@@ -8,7 +8,8 @@ from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.cli import _finalize_standalone_agent_result
 from tsm_agt.core import AgentTurnResult, AgentTurnSuspended, TaskState
 from tsm_agt.ports import (
-    FinishReason, Message, MessageRole, ModelUsage, TextBlock,
+    CompletionReadinessMode, FinishReason, Message, MessageRole, ModelUsage,
+    TextBlock,
 )
 
 
@@ -57,6 +58,53 @@ class StandaloneFinalizationTest(unittest.IsolatedAsyncioTestCase):
             TaskState.SUCCEEDED,
         )
         self.assertTrue(any("verification: passed" in line for line in lines))
+        self.assertTrue(any(line.startswith("执行状态:") for line in lines))
+        self.assertTrue(any(line.startswith("领域检查:") for line in lines))
+        self.assertTrue(any(line.startswith("模型结论:") for line in lines))
+        self.assertTrue(any(line.startswith("引用校验:") for line in lines))
+
+    async def test_non_legacy_result_only_observes_verification(self) -> None:
+        lines: list[str] = []
+        application = compose_fixture_application(
+            tool_adapters=(),
+            completion_readiness_mode=CompletionReadinessMode.AGENT_DECIDES,
+        )
+        await application.registry.start_all()
+        try:
+            task = await application.kernel.create_task(
+                "observe standalone completion", self.root
+            )
+            for state in (
+                TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                TaskState.EXECUTING,
+            ):
+                task = await application.kernel.transition_task(
+                    task.task_id, state, state.value
+                )
+            result = AgentTurnResult(
+                "turn-observe", task.task_id,
+                Message("assistant-observe", MessageRole.ASSISTANT,
+                        (TextBlock("observed"),)),
+                FinishReason.STOP, ModelUsage(1, 1), 1, 0, (),
+            )
+            exit_code = await _finalize_standalone_agent_result(
+                application, task.task_id, result, lines.append, verbose=True,
+            )
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(
+                (await application.kernel.get_task(task.task_id)).state,
+                TaskState.EXECUTING,
+            )
+            self.assertTrue(any(
+                line.startswith("verification observation:") for line in lines
+            ))
+            self.assertTrue(any(line.startswith("执行状态:") for line in lines))
+            self.assertTrue(any(line.startswith("领域检查:") for line in lines))
+            self.assertTrue(any(line.startswith("模型结论:") for line in lines))
+            self.assertTrue(any(line.startswith("引用校验:") for line in lines))
+        finally:
+            await application.registry.stop_all()
 
     async def test_suspended_result_does_not_finalize_task(self) -> None:
         result = AgentTurnSuspended(

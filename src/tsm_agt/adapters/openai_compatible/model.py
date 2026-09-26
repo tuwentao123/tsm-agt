@@ -15,6 +15,9 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from tsm_agt.ports import (
+    ConclusionBlock,
+    ConclusionProtocolMode,
+    AssistantConclusion,
     AdapterContext,
     AdapterDescriptor,
     FinishReason,
@@ -37,6 +40,22 @@ from tsm_agt.ports import (
     ToolCall,
     EvidenceQuestion, ImageBlock, ToolCallBlock,
     ToolResultBlock,
+)
+
+
+_NATIVE_CONCLUSION_REQUEST = (
+    "Conclusion protocol: keep the user-visible answer in content. When a "
+    "structured conclusion is available, return it only in the optional "
+    "assistant message field `conclusion` as an AssistantConclusion v1 object "
+    "(schema_version, claims, overall_scope). Do not serialize that object in "
+    "natural-language content and do not infer conclusions from prose."
+)
+_CONTROLLED_CONCLUSION_REQUEST = (
+    "Conclusion protocol: keep the user-visible answer before the protocol. "
+    "If a structured conclusion is available, end the response with exactly one "
+    "<tsm-conclusion-v1>{...}</tsm-conclusion-v1> block containing one valid "
+    "AssistantConclusion v1 JSON object. Nothing may follow the closing tag. "
+    "Never infer a conclusion from prose."
 )
 
 
@@ -282,13 +301,14 @@ class OpenAICompatibleModelProvider:
         port_version="1.0",
         capabilities=frozenset({
             "text", "tools", "strict-json-schema", "streaming",
-            "stream-cancel",
+            "stream-cancel", "structured-conclusion",
         }),
     )
     capabilities = ProviderCapabilities(
         tools=True,
         parallel_tools=False,
         strict_json_schema=True,
+        structured_conclusion=True,
         vision=True,
         stream_cancel=True,
         context_window=128_000,
@@ -306,6 +326,7 @@ class OpenAICompatibleModelProvider:
         output_token_parameter: str = "max_tokens",
         strict_tool_schema: bool = True,
         streaming: bool = True,
+        native_structured_conclusion: bool = True,
         transport: HttpJsonTransport | None = None,
     ) -> None:
         normalized_url = base_url.strip().rstrip("/")
@@ -337,7 +358,12 @@ class OpenAICompatibleModelProvider:
         self._output_token_parameter = output_token_parameter
         self._strict_tool_schema = strict_tool_schema
         self._streaming = streaming
-        descriptor_capabilities = {"text", "tools"}
+        self._native_structured_conclusion = native_structured_conclusion
+        # `structured-conclusion` advertises a Kernel-reachable protocol, not
+        # only an optional provider-native message field.  Every compatible
+        # provider can receive the controlled text-block instruction below;
+        # `_native_structured_conclusion` selects which wire protocol is used.
+        descriptor_capabilities = {"text", "tools", "structured-conclusion"}
         if streaming:
             descriptor_capabilities.update({"streaming", "stream-cancel"})
         if strict_tool_schema:
@@ -352,6 +378,9 @@ class OpenAICompatibleModelProvider:
         self.capabilities = ProviderCapabilities(
             tools=True, parallel_tools=False,
             strict_json_schema=strict_tool_schema,
+            # The controlled block is an explicit, adapter-enforced fallback
+            # whenever the Chat Completions provider cannot carry `conclusion`.
+            structured_conclusion=True,
             vision=True,
             stream_cancel=streaming,
             context_window=128_000,
@@ -393,11 +422,15 @@ class OpenAICompatibleModelProvider:
             ),
             allow_text_tool_fallback=request.allow_tool_calls,
             allowed_outcome_refs=frozenset(request.outcome_refs),
+            conclusion_protocol_mode=request.conclusion_protocol_mode,
         )
         raw_text = self._provider_text(response)
-        return self._with_response_diagnostics(
-            normalized, transport_kind="json", raw_text=raw_text,
-            chunk_count=1, saw_finish_reason=True, saw_done=None,
+        return self._with_conclusion_protocol_diagnostics(
+            self._with_response_diagnostics(
+                normalized, transport_kind="json", raw_text=raw_text,
+                chunk_count=1, saw_finish_reason=True, saw_done=None,
+            ),
+            request.conclusion_protocol_mode,
         )
 
     async def stream_complete(
@@ -419,11 +452,18 @@ class OpenAICompatibleModelProvider:
         payload["stream_options"] = {"include_usage": True}
         text_parts: list[str] = []
         pending_text_parts: list[str] = []
+        conclusion_tail = ""
+        conclusion_captured = False
+        emitted_visible = ""
+        streamed_conclusion: Mapping[str, Any] | None = None
         text_tool_candidate = True
         tool_parts: dict[int, dict[str, str]] = {}
         message_id: str | None = None
         finish_reason: object = None
         usage: Mapping[str, Any] = {}
+        served_model: str | None = None
+        system_fingerprint: str | None = None
+        provider_routing: Mapping[str, Any] | None = None
         saw_done = False
         saw_chunk = False
         chunk_count = 0
@@ -452,6 +492,15 @@ class OpenAICompatibleModelProvider:
             chunk_id = chunk.get("id")
             if isinstance(chunk_id, str) and chunk_id:
                 message_id = chunk_id
+            chunk_model = chunk.get("model")
+            if isinstance(chunk_model, str) and chunk_model:
+                served_model = chunk_model
+            chunk_fingerprint = chunk.get("system_fingerprint")
+            if isinstance(chunk_fingerprint, str) and chunk_fingerprint:
+                system_fingerprint = chunk_fingerprint
+            chunk_routing = chunk.get("routing")
+            if isinstance(chunk_routing, Mapping):
+                provider_routing = chunk_routing
             raw_usage = chunk.get("usage")
             if raw_usage is not None:
                 if not isinstance(raw_usage, Mapping):
@@ -484,6 +533,15 @@ class OpenAICompatibleModelProvider:
                     "provider stream delta must be an object"
                 )
             content = delta.get("content")
+            raw_stream_conclusion = delta.get("conclusion")
+            if raw_stream_conclusion is not None:
+                if streamed_conclusion is not None or not isinstance(
+                    raw_stream_conclusion, Mapping
+                ):
+                    raise OpenAICompatibleProviderError(
+                        "provider stream conclusion must be a single object"
+                    )
+                streamed_conclusion = raw_stream_conclusion
             if content is not None:
                 if not isinstance(content, str):
                     raise OpenAICompatibleProviderError(
@@ -491,20 +549,49 @@ class OpenAICompatibleModelProvider:
                     )
                 if content:
                     text_parts.append(content)
-                    if text_tool_candidate:
-                        pending_text_parts.append(content)
-                        candidate = "".join(pending_text_parts).lstrip()
-                        marker = "<tool_use"
-                        text_tool_candidate = (
-                            marker.startswith(candidate)
-                            or candidate.startswith(marker)
-                        )
-                        if not text_tool_candidate:
-                            buffered = "".join(pending_text_parts)
-                            pending_text_parts.clear()
-                            yield ModelTextDelta(buffered)
+                    if conclusion_captured:
+                        visible = ""
                     else:
-                        yield ModelTextDelta(content)
+                        conclusion_tail += content
+                        marker = "<tsm-conclusion-v1>"
+                        marker_index = conclusion_tail.find(marker)
+                        if marker_index >= 0:
+                            visible = conclusion_tail[:marker_index]
+                            conclusion_tail = conclusion_tail[marker_index:]
+                            conclusion_captured = True
+                        else:
+                            partial_length = 0
+                            for size in range(
+                                min(len(marker) - 1, len(conclusion_tail)), 0, -1
+                            ):
+                                if conclusion_tail.endswith(marker[:size]):
+                                    partial_length = size
+                                    break
+                            visible = (
+                                conclusion_tail[:-partial_length]
+                                if partial_length else conclusion_tail
+                            )
+                            conclusion_tail = (
+                                conclusion_tail[-partial_length:]
+                                if partial_length else ""
+                            )
+                    if visible:
+                        if text_tool_candidate:
+                            pending_text_parts.append(visible)
+                            candidate = "".join(pending_text_parts).lstrip()
+                            tool_marker = "<tool_use"
+                            text_tool_candidate = (
+                                tool_marker.startswith(candidate)
+                                or candidate.startswith(tool_marker)
+                            )
+                            if not text_tool_candidate:
+                                buffered = "".join(pending_text_parts)
+                                pending_text_parts.clear()
+                                emitted_visible += buffered
+                                yield ModelTextDelta(buffered)
+                        else:
+                            emitted_visible += visible
+                            yield ModelTextDelta(visible)
             raw_calls = delta.get("tool_calls", [])
             if not isinstance(raw_calls, list):
                 raise OpenAICompatibleProviderError(
@@ -577,10 +664,14 @@ class OpenAICompatibleModelProvider:
             request.turn_id,
             {
                 "id": message_id,
+                "model": served_model,
+                "system_fingerprint": system_fingerprint,
+                "routing": provider_routing,
                 "choices": [{
                     "message": {
                         "role": "assistant",
                         "content": "".join(text_parts) or None,
+                        "conclusion": streamed_conclusion,
                         "tool_calls": raw_calls,
                     },
                     "finish_reason": finish_reason,
@@ -596,18 +687,44 @@ class OpenAICompatibleModelProvider:
             ),
             allow_text_tool_fallback=request.allow_tool_calls,
             allowed_outcome_refs=frozenset(request.outcome_refs),
+            conclusion_protocol_mode=request.conclusion_protocol_mode,
         )
-        # Exact text-form tool calls are either recovered by normalization or
-        # rejected when tools are disabled.  Ordinary text that merely began
-        # with a similar prefix is released only after that decision, so the UI
-        # never prints raw tool markup before the Runtime validates it.
-        if pending_text_parts and normalized.message.text:
-            yield ModelTextDelta("".join(pending_text_parts))
-        yield ModelStreamCompleted(self._with_response_diagnostics(
-            normalized, transport_kind="sse",
-            raw_text="".join(text_parts), chunk_count=chunk_count,
-            saw_finish_reason=finish_reason is not None, saw_done=saw_done,
-        ))
+        suppression = normalized.diagnostics.get("controlled_conclusion")
+        invalid_controlled_tail = (
+            conclusion_captured
+            and isinstance(suppression, Mapping)
+            and suppression.get("status") == "invalid_suppressed"
+        )
+        if invalid_controlled_tail:
+            # Once an opening marker reaches this transport, its remainder is
+            # an internal protocol channel. Never reveal malformed, duplicate,
+            # truncated, or trailing controlled JSON after withholding it.
+            normalized = self._suppress_streamed_conclusion_tail(
+                normalized, emitted_visible,
+            )
+        normalized = self._with_conclusion_protocol_diagnostics(
+            self._with_response_diagnostics(
+                normalized, transport_kind="sse",
+                raw_text="".join(text_parts), chunk_count=chunk_count,
+                saw_finish_reason=finish_reason is not None, saw_done=saw_done,
+            ),
+            request.conclusion_protocol_mode,
+            status=(
+                "controlled_block_invalid_suppressed"
+                if invalid_controlled_tail else None
+            ),
+        )
+        # Only normalized user-visible text may be released after completion.
+        if normalized.message.text:
+            if not normalized.message.text.startswith(emitted_visible):
+                raise OpenAICompatibleProviderError(
+                    "streamed text does not match normalized response"
+                )
+            remaining = normalized.message.text[len(emitted_visible):]
+            if remaining:
+                emitted_visible += remaining
+                yield ModelTextDelta(remaining)
+        yield ModelStreamCompleted(normalized)
 
     @staticmethod
     def _text_fingerprint(text: str) -> dict[str, object]:
@@ -617,6 +734,65 @@ class OpenAICompatibleModelProvider:
             "utf8_bytes": len(encoded),
             "sha256": hashlib.sha256(encoded).hexdigest(),
         }
+
+    _PROVIDER_METADATA_TEXT_LIMIT = 200
+
+    @classmethod
+    def _provider_response_diagnostics(
+        cls, response: Mapping[str, Any], usage: Mapping[str, Any],
+        message_id: object,
+    ) -> dict[str, object]:
+        """Record bounded, content-free provider metadata for post-hoc tracing.
+
+        Gateway identity and routing fields are provider-controlled data. They
+        are observability facts only: no Runtime decision reads them and they are
+        never fed back into a prompt, so every copied string is length-bounded.
+        """
+        diagnostics: dict[str, object] = {}
+        if isinstance(message_id, str) and message_id:
+            diagnostics["response_id"] = cls._bounded_provider_text(message_id)
+        model = response.get("model")
+        if isinstance(model, str) and model.strip():
+            diagnostics["model"] = cls._bounded_provider_text(model)
+        fingerprint = response.get("system_fingerprint")
+        if isinstance(fingerprint, str) and fingerprint.strip():
+            diagnostics["system_fingerprint"] = cls._bounded_provider_text(
+                fingerprint
+            )
+        routing = response.get("routing")
+        if isinstance(routing, Mapping):
+            bounded_routing = cls._scalar_mapping_diagnostics(routing)
+            if bounded_routing:
+                diagnostics["routing"] = bounded_routing
+        for key in (
+            "completion_tokens_details", "prompt_tokens_details", "total_tokens",
+        ):
+            value = usage.get(key)
+            if isinstance(value, Mapping):
+                bounded_details = cls._scalar_mapping_diagnostics(value)
+                if bounded_details:
+                    diagnostics[key] = bounded_details
+            elif isinstance(value, (int, float, bool)):
+                diagnostics[key] = value
+        return diagnostics
+
+    @classmethod
+    def _scalar_mapping_diagnostics(
+        cls, value: Mapping[str, Any],
+    ) -> dict[str, object]:
+        bounded: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                continue
+            if isinstance(item, str):
+                bounded[key[:64]] = cls._bounded_provider_text(item)
+            elif item is None or isinstance(item, (int, float, bool)):
+                bounded[key[:64]] = item
+        return bounded
+
+    @classmethod
+    def _bounded_provider_text(cls, value: str) -> str:
+        return value[:cls._PROVIDER_METADATA_TEXT_LIMIT]
 
     @staticmethod
     def _provider_text(response: Mapping[str, Any]) -> str:
@@ -644,10 +820,86 @@ class OpenAICompatibleModelProvider:
             "saw_done": saw_done,
             "text": cls._text_fingerprint(raw_text),
         }
-        adapter = {"text": cls._text_fingerprint(response.message.text)}
+        diagnostics = dict(response.diagnostics)
+        diagnostics["transport"] = transport
+        diagnostics["adapter"] = {
+            "text": cls._text_fingerprint(response.message.text),
+        }
         return ModelResponse(
             response.message, response.finish_reason, response.usage,
-            {"transport": transport, "adapter": adapter},
+            diagnostics,
+        )
+
+    def _conclusion_protocol_instruction(
+        self, mode: ConclusionProtocolMode,
+    ) -> str | None:
+        if mode is not ConclusionProtocolMode.REQUIRE_STRUCTURED:
+            return None
+        return (
+            _NATIVE_CONCLUSION_REQUEST
+            if self._native_structured_conclusion
+            else _CONTROLLED_CONCLUSION_REQUEST
+        )
+
+    @staticmethod
+    def _with_conclusion_protocol_diagnostics(
+        response: ModelResponse, mode: ConclusionProtocolMode, *,
+        status: str | None = None,
+    ) -> ModelResponse:
+        diagnostics = dict(response.diagnostics)
+        controlled = diagnostics.get("controlled_conclusion")
+        suppression_reason = (
+            controlled.get("reason")
+            if isinstance(controlled, Mapping)
+            and isinstance(controlled.get("reason"), str)
+            else None
+        )
+        if (
+            mode is not ConclusionProtocolMode.REQUIRE_STRUCTURED
+            and suppression_reason is None
+        ):
+            return response
+        conclusion_present = any(
+            isinstance(block, ConclusionBlock)
+            for block in response.message.content
+        )
+        protocol_status = status
+        if protocol_status is None and suppression_reason is not None:
+            protocol_status = (
+                "controlled_block_suppressed"
+                if suppression_reason == "controlled_protocol_disabled"
+                else "controlled_block_invalid_suppressed"
+            )
+        diagnostics["conclusion_protocol"] = {
+            "requested": mode.value,
+            "status": protocol_status or (
+                "structured_conclusion"
+                if conclusion_present else "plain_text_fallback"
+            ),
+        }
+        if suppression_reason is not None:
+            diagnostics["conclusion_protocol"]["reason"] = suppression_reason
+        return ModelResponse(
+            response.message, response.finish_reason, response.usage,
+            diagnostics,
+        )
+
+    @staticmethod
+    def _suppress_streamed_conclusion_tail(
+        response: ModelResponse, visible_text: str,
+    ) -> ModelResponse:
+        """Drop an invalid controlled tail already withheld from stream output."""
+        content = tuple(
+            block for block in response.message.content
+            if not isinstance(block, TextBlock)
+        )
+        if visible_text:
+            content = (TextBlock(visible_text), *content)
+        return ModelResponse(
+            Message(
+                response.message.message_id, response.message.role, content,
+            ),
+            response.finish_reason, response.usage, response.diagnostics,
         )
 
     def _build_payload(
@@ -681,20 +933,28 @@ class OpenAICompatibleModelProvider:
         } - set(internal_to_provider)):
             history_to_provider[name] = self._encode_tool_name(name)
         tool_outcome_refs = dict(request.tool_outcome_refs)
+        provider_messages = [
+            self._message_to_provider(
+                message, history_to_provider,
+                frozenset(
+                    tool.name for tool in request.tools
+                    if request.require_evidence_questions
+                    and tool.requires_evidence_question
+                ),
+                frozenset(request.outcome_refs),
+            )
+            for message in request.messages
+        ]
+        protocol_instruction = self._conclusion_protocol_instruction(
+            request.conclusion_protocol_mode
+        )
+        if protocol_instruction is not None:
+            provider_messages.insert(0, {
+                "role": "system", "content": protocol_instruction,
+            })
         payload: dict[str, Any] = {
             "model": self._model,
-            "messages": [
-                self._message_to_provider(
-                    message, history_to_provider,
-                    frozenset(
-                        tool.name for tool in request.tools
-                        if request.require_evidence_questions
-                        and tool.requires_evidence_question
-                    ),
-                    frozenset(request.outcome_refs),
-                )
-                for message in request.messages
-            ],
+            "messages": provider_messages,
             self._output_token_parameter: request.max_output_tokens,
         }
         if request.tools:
@@ -877,6 +1137,7 @@ class OpenAICompatibleModelProvider:
         evidence_required_tools: frozenset[str] | None = None,
         allow_text_tool_fallback: bool = True,
         allowed_outcome_refs: frozenset[str] = frozenset(),
+        conclusion_protocol_mode: ConclusionProtocolMode = ConclusionProtocolMode.OBSERVE,
     ) -> ModelResponse:
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices:
@@ -889,8 +1150,9 @@ class OpenAICompatibleModelProvider:
             raise OpenAICompatibleProviderError("provider choice has no message")
 
         raw_reason = choice.get("finish_reason")
-        content: list[TextBlock | ToolCallBlock] = []
+        content: list[TextBlock | ToolCallBlock | ConclusionBlock] = []
         text = provider_message.get("content")
+        raw_conclusion = provider_message.get("conclusion")
         raw_calls = provider_message.get("tool_calls", [])
         if not isinstance(raw_calls, list):
             raise OpenAICompatibleProviderError("provider tool_calls must be a list")
@@ -927,8 +1189,20 @@ class OpenAICompatibleModelProvider:
                     if allow_text_tool_fallback
                     else "tool_call_emitted_while_disabled"
                 )
+        conclusion: AssistantConclusion | None = None
+        controlled_suppression_reason: str | None = None
+        if text is None:
+            text = ""
+        if isinstance(text, str):
+            text, conclusion, controlled_suppression_reason = (
+                cls._extract_conclusion(
+                    text, raw_conclusion, conclusion_protocol_mode
+                )
+            )
         if isinstance(text, str) and text:
             content.append(TextBlock(text))
+        if conclusion is not None:
+            content.append(ConclusionBlock(conclusion))
         for raw_call in raw_calls:
             if not isinstance(raw_call, Mapping):
                 raise OpenAICompatibleProviderError("provider tool call must be an object")
@@ -1036,6 +1310,21 @@ class OpenAICompatibleModelProvider:
         if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
             raise OpenAICompatibleProviderError("provider token usage must be integers")
         message_id = response.get("id")
+        diagnostics: dict[str, object] = {}
+        provider_diagnostics = cls._provider_response_diagnostics(
+            response, usage, message_id
+        )
+        if provider_diagnostics:
+            diagnostics["provider"] = provider_diagnostics
+        if controlled_suppression_reason is not None:
+            # Keep protocol diagnostics content-free: report only a stable
+            # classification, never the model's hidden marker payload.
+            diagnostics["controlled_conclusion"] = {
+                "status": "disabled_suppressed"
+                if controlled_suppression_reason == "controlled_protocol_disabled"
+                else "invalid_suppressed",
+                "reason": controlled_suppression_reason,
+            }
         return ModelResponse(
             message=Message(
                 message_id=(
@@ -1048,7 +1337,90 @@ class OpenAICompatibleModelProvider:
             ),
             finish_reason=finish_reason,
             usage=ModelUsage(input_tokens, output_tokens),
+            diagnostics=diagnostics,
         )
+
+    @classmethod
+    def _extract_conclusion(
+        cls,
+        text: str,
+        raw_conclusion: object,
+        protocol_mode: ConclusionProtocolMode,
+    ) -> tuple[str, AssistantConclusion | None, str | None]:
+        """Normalize explicit conclusion channels without exposing bad blocks.
+
+        A controlled marker reserves the remainder of the assistant content for
+        protocol data as soon as it appears.  Invalid, duplicate, truncated,
+        or unsupported blocks therefore retain only the user-visible prefix.
+        """
+        native_conclusion: AssistantConclusion | None = None
+        if raw_conclusion is not None and protocol_mode is not (
+            ConclusionProtocolMode.DISABLED
+        ):
+            if isinstance(raw_conclusion, Mapping):
+                try:
+                    native_conclusion = AssistantConclusion.from_data(raw_conclusion)
+                except (TypeError, ValueError):
+                    pass
+
+        opening = "<tsm-conclusion-v1>"
+        closing = "</tsm-conclusion-v1>"
+        start = text.find(opening)
+        if start < 0:
+            return text, native_conclusion, None
+
+        visible_text = text[:start]
+        if protocol_mode is ConclusionProtocolMode.DISABLED:
+            return visible_text, None, "controlled_protocol_disabled"
+        if text.count(opening) != 1:
+            return visible_text, native_conclusion, "repeated_marker"
+        if text.count(closing) == 0:
+            return visible_text, native_conclusion, "truncated"
+        if text.count(closing) != 1:
+            return visible_text, native_conclusion, "repeated_marker"
+        end = text.find(closing, start + len(opening))
+        if end < 0:
+            return visible_text, native_conclusion, "truncated"
+        if text[end + len(closing):].strip():
+            return visible_text, native_conclusion, "trailing_suffix"
+        raw_json = text[start + len(opening):end].strip()
+        if not raw_json:
+            return visible_text, native_conclusion, "invalid_json"
+        try:
+            conclusion_data = json.loads(
+                raw_json,
+                object_pairs_hook=cls._reject_duplicate_json_keys,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return visible_text, native_conclusion, "invalid_json"
+        if not isinstance(conclusion_data, Mapping):
+            return visible_text, native_conclusion, "invalid_schema"
+        try:
+            controlled_conclusion = AssistantConclusion.from_data(conclusion_data)
+        except (TypeError, ValueError):
+            return visible_text, native_conclusion, "invalid_schema"
+        if native_conclusion is not None:
+            # A native field and a controlled block in one response are not a
+            # valid single-channel protocol response.  Preserve the native
+            # data, but never expose the controlled payload.
+            return visible_text, native_conclusion, "multiple_channels"
+        return visible_text, AssistantConclusion(
+            schema_version=controlled_conclusion.schema_version,
+            claims=controlled_conclusion.claims,
+            overall_scope=controlled_conclusion.overall_scope,
+            origin="controlled_text_block",
+        ), None
+
+    @staticmethod
+    def _reject_duplicate_json_keys(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate conclusion JSON key: {key}")
+            result[key] = value
+        return result
 
     @classmethod
     def _recover_text_tool_calls(

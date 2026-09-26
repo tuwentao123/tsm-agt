@@ -332,6 +332,57 @@ class SessionContextProjectorTest(unittest.TestCase):
         self.assertNotIn("process-1", serialized)
         self.assertNotIn("token", serialized)
 
+    def test_v3_result_fields_fill_legacy_summary_and_prompt_is_restricted(self) -> None:
+        snapshot = SessionSnapshot.create(
+            "session-1", "uid:1", "v3 result"
+        ).bump_context()
+        base = self._event(1, "inspect V3", "visible result")
+        event = SessionEvent(
+            base.event_id, base.session_id, base.sequence, base.event_type,
+            {
+                **base.payload,
+                "assistant_conclusion": {
+                    "schema_version": 1,
+                    "claims": [{
+                        "claim_id": "claim-1", "kind": "verified",
+                        "summary": "tests passed",
+                        "scope": ["targeted tests"],
+                        "fact_refs": [{
+                            "event_id": "private-fact", "source_id": "secret"
+                        }],
+                    }],
+                },
+                "conclusion_validation": {
+                    "status": "valid",
+                    "claims": [{"claim_id": "claim-1", "status": "valid"}],
+                },
+                "answer_event_ref": "evt-final-answer",
+            },
+        )
+
+        projector = SessionContextProjector()
+        projection = projector.project(snapshot, (event,))
+        summary = projection.task_summaries[0]
+        self.assertEqual(summary.answer_event_ref, "evt-final-answer")
+        self.assertEqual(summary.assistant_conclusion["claims"][0]["claim_id"], "claim-1")
+        self.assertEqual(summary.conclusion_validation["status"], "valid")
+
+        body = json.loads(projector.for_prompt(projection).message.text)
+        handoff = body["recent_task_summaries"][0]["conclusion"]
+        self.assertEqual(handoff["answer_event_ref"], "evt-final-answer")
+        self.assertEqual(handoff["claims"], [{
+            "claim_id": "claim-1", "kind": "verified",
+            "summary": "tests passed", "scope": ["targeted tests"],
+        }])
+        self.assertEqual(handoff["validation"]["status"], "valid")
+        encoded = json.dumps(body, ensure_ascii=False)
+        self.assertNotIn("private-fact", encoded)
+        self.assertNotIn("secret", encoded)
+        self.assertEqual(
+            body["task_index"][0]["conclusion"]["claims"][0]["claim_id"],
+            "claim-1",
+        )
+
     def test_legacy_event_builds_minimal_recent_task_summary(self) -> None:
         snapshot = SessionSnapshot.create(
             "session-1", "uid:1", "legacy"

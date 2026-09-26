@@ -47,20 +47,27 @@ pytest exit=0 succeeded=true
 
 ## 3. 现状核实
 
-| 组件 | 位置 | 状态 |
+> 行号以修订时的代码为准（原稿行号已漂移，已在括号中给出原值）。
+
+| 组件 | 位置（原稿） | 状态 |
 |---|---|---|
-| `ToolExecutionRecord` | `core/execution.py:25` | 有完整生命周期，**无** `effect` / `result_authority` |
-| `ToolCommitState` | `core/execution.py:14` | `COMMITTED/FAILED/CANCELLED/UNKNOWN_OUTCOME` |
-| `ToolEffect` | `ports/tool.py:31` | 7 值封闭枚举 |
+| `ToolExecutionRecord` | `core/execution.py:25` | 有完整生命周期，**无** `effect` / `result_authority`；已新增 `reconciled_outcome` / `reconciliation_ref` / `reconciled_at` 对账字段 |
+| `ToolCommitState` | `core/execution.py:14` | `PREPARED/RUNNING/COMMITTED/FAILED/CANCELLED/UNKNOWN_OUTCOME`（新增 `PREPARED`、`RUNNING`） |
+| `ToolEffect` | `ports/tool.py:31`（现 `~172` 使用） | 7 值封闭枚举；`ToolSpec` 已声明 `effect` / `result_authority` |
 | `ToolResultAuthority` | `ports/tool.py:49` | 9 值封闭枚举 |
-| `ProcessResult.succeeded/failure_code` | `ports/process.py` | 已实施 |
+| `ProcessResult.succeeded/failure_code` | `ports/process.py` | 已实施；注意 `failure_code` 对 `CANCELLED` 也返回 `PROCESS_CANCELLED`，判定须读 `status` |
 | `CompletionReadinessProbe` | `ports/completion_readiness.py:128` | 10 字段，**无失败动作输入** |
 | `CompletionReadinessAction` | `ports/completion_readiness.py:15` | 4 值，已够用 |
-| `_evaluate_completion_readiness` | `core/kernel.py:7139` | **已持有 `task.tool_executions`** |
-| `_latest_recoverable_tool_batch` | `core/kernel.py:9346` | **已批次范围、已通用、并行就绪** |
-| `ToolBatchSnapshot` | `core/agent_loop.py:193` | 批次协议边界，为并行预留 |
+| `CompletionReadinessMode` | `ports/completion_readiness.py:14` | **新增（本 SPEC 未覆盖）**：`LEGACY_GATE`（默认）/ `OBSERVE_ONLY` / `AGENT_DECIDES`；只有 `LEGACY_GATE` 的 readiness 是强制的 |
+| `_evaluate_completion_readiness` | `core/kernel.py:7139`（现 `~7360`） | **已持有 `task.tool_executions`** |
+| `_completion_readiness_gaps` | `core/kernel.py`（现 `7189`） | gap 种类：`REQUIRED_OUTCOME_UNSATISFIED` / `TASK_SPEC_*` / `EVIDENCE_QUESTION` / `PLAN_STEP` / `POST_MUTATION_VERIFICATION` |
+| `_latest_recoverable_tool_batch` | `core/kernel.py:9346`（现 `9710`） | **已批次范围、已通用、并行就绪** |
+| `ToolBatchSnapshot` | `core/agent_loop.py:193` | 批次协议边界，为并行预留（`calls` / `pending_call_ids` / `is_open`） |
+| `ToolSpec.is_concurrency_safe` | `ports/tool.py:165` | 已有 per-tool 并发声明 |
 | 取消能力 | `CancelTaskInput` / `TaskState.CANCELLED` | 已完整 |
-| Outcome 死代码 | `kernel.py:6953` `for outcome in ()` | 恒空，不可达 |
+| 命令失败已有部分补偿 | `kernel.py:7401` `POST_MUTATION_VERIFICATION`、`7339` `TASK_SPEC_POST_MUTATION_COMMAND` | 仅覆盖**有 mutation** 的任务；不覆盖无 mutation 的副作用命令 |
+| 结构化结论 | `ports/conclusion.py`、`core/conclusion_reference_validator.py` | **新增（本 SPEC 未覆盖）**：`FactReference.expected_effect` / `FactLifecycle`；与 `FactResolution` 需划清概念 |
+| Outcome 残迹 | `kernel.py:7240`、`8338` `for outcome in ()` | 仅该字面循环不可达；**Outcome 机制本身已活跃**（见 §6.4） |
 
 ## 4. 目标流程
 
@@ -405,16 +412,22 @@ async def _protocol_gate(task_id) -> ProtocolBlock | None:
 
 原第二批条目已提升为首批 5.5，理由与实测死锁证据见该节。本节保留编号以便对照历史版本。
 
-### 6.4 Outcome 死代码清理
+### 6.4 Outcome 残迹清理（方向已修正）
 
-前置条件：先统计历史分布。
+**原稿判断「Outcome 死代码，恒空不可达，停止新写」在当前代码上已不成立。**
 
-```sql
-SELECT event_type, COUNT(*) FROM runtime_events
-WHERE event_type LIKE 'task_outcome.%' GROUP BY event_type;
-```
+修订时核实：Outcome 机制已经活跃——
 
-确认后删除 `_completion_readiness_gaps()` 与 `verify_task_acceptance()` 中的 `for outcome in ()` 及其不可达分支。保留 Outcome 的兼容读取，停止新写。
+- `kernel.py:2581 request_task_outcome_completion`、`2677 _task_outcome_completion_gaps` 是活跃执行路径；
+- `ports/tool.py:88 OutcomeBindingMode`（`FULFILLMENT` / `SUPPORTING`）在用；
+- `kernel.py:7285` 已有 `REQUIRED_OUTCOME_UNSATISFIED` gap；
+- 实测事件分布：`task_outcome.binding_decided=1321`、`state_changed=1489`、`completion_requested=17`、`support_observed=1`。
+
+因此本节调整为：
+
+1. **不得停止 Outcome 写入**；它是当前完成判定的一部分。
+2. 只清理字面空循环残迹 `for outcome in ()`（`kernel.py:7240`、`8338`）及其不可达分支。
+3. 清理前仍需先完成一次事件分布统计（现已有数据），确认这两个循环所在路径与 `_task_outcome_completion_gaps` 不重叠、删除后无行为变化。
 
 ## 7. 测试要求
 
@@ -477,7 +490,7 @@ task-a1ca6115134a42759ad2428eeee3e6dd
 
 ### 7.5 回归范围
 
-全量套件基线 `956 passed, 8 skipped`。重点检查断言 `completion.readiness_evaluated` payload、快照结构、`successful_tool_calls` 的既有测试。
+修订时全量套件实测基线 `1023 passed, 8 skipped`（另有 9 个既有失败：`test_cli_line_editing` PTY 5 个、`test_composition` 2 个、`test_dependencies` 1 个、`test_investigation_status` 1 个，均与本 SPEC 无关）。重点检查断言 `completion.readiness_evaluated` payload、快照结构、`successful_tool_calls`、`test_checkpoint_compatibility` 的既有测试。**新增默认字段不得改变该基线。**
 
 ## 8. 改动面汇总
 
@@ -514,3 +527,93 @@ task-a1ca6115134a42759ad2428eeee3e6dd
 1. `_continue_agent_turn` final-response 分支的完整结构尚未通读，Protocol Gate 的精确插入点需在实施前确认。
 2. 并行 MUTATE 的路径级串行化现状未核实。与本 SPEC 无关，但并行执行落地前需单独评估。
 3. `.agent/runtime.db` 中 legacy outcome 事件的真实分布未统计，6.4 的清理不得先于统计执行。
+
+---
+
+# 11. 相对当前代码的差异与适配（修订时新增）
+
+原稿写在更早的代码形态上。实施前必须按以下 5 条适配，否则会做错。
+
+### 11.1 完成判定已分模式，新增 gap 必须 mode-aware
+
+现在存在 `CompletionReadinessMode`（`LEGACY_GATE` 默认 / `OBSERVE_ONLY` / `AGENT_DECIDES`）。
+
+- `completion.readiness_evaluated` 的 `enforced` 只有 `LEGACY_GATE` 为 true（`kernel.py:7503-7506`）；
+- 非 `LEGACY_GATE` 下 `verify_task_acceptance` 走 `observation_mode`（`kernel.py:8304-8308`），gap 是**诊断不阻断**。
+
+**适配**：`UNRESOLVED_EFFECT_FAILURE` 可以无条件产出（诊断价值独立），但"阻断"语义只在 `LEGACY_GATE` 成立。§7.2 的验收期望必须标注适用模式，其余模式只断言 gap 被产出。
+
+### 11.2 Outcome 机制已活跃
+
+见 §6.4。`REQUIRED_OUTCOME_UNSATISFIED` 是既有 gap；新增失败事实时要注意**不要与 outcome 未闭合重复计 gap**。
+
+### 11.3 命令验证已有部分补偿，必须划边界
+
+`POST_MUTATION_VERIFICATION`（`kernel.py:7401`）与 `TASK_SPEC_POST_MUTATION_COMMAND`（`kernel.py:7339`）已覆盖"有 mutation + 命令验证未通过"。
+
+**适配**：新增 `UNRESOLVED_EFFECT_FAILURE` 前先判断该失败是否已被上述 gap 表达；若已被表达则**不重复产出**（或明确优先级：spec 级 > 通用 effect 级）。否则同一失败会被计两次，加速耗尽有界纠正配额。
+
+### 11.4 判定须读 `ProcessResult.status`，不能只看 `failure_code`
+
+`ports/process.py:100-110`：`failure_code` 对 `CANCELLED` 也返回 `PROCESS_CANCELLED`（非 `None`）。
+
+**适配**：§5.1 决策表里"取消 → UNKNOWN（不作为失败阻断）"必须显式读 `status`，否则取消会被误判为 FAILED，违背 SPEC 原则。
+
+### 11.5 结构化结论已存在，概念要划清
+
+现在有 `ports/conclusion.py`（`FactReference.expected_effect`、`FactLifecycle`）与 `core/conclusion_reference_validator.py`。
+
+**适配**：
+
+- `FactResolution`（unresolved/retried/superseded）与 `FactLifecycle`（active/orphaned/expired/purged）不是同一维度，文档中必须写明，避免后续误合并；
+- "未解决 effect 失败"将来可作为**引用校验的 INCOMPLETE 原因**（与证据完整性同构）。本批仍走 probe 字段，但实现时不要与 `ConclusionReferenceValidator` 的只读约束冲突（该校验器明确不做状态变更）。
+
+---
+
+# 12. 面向并行与 Plan-and-Execute 的扩展点与预留决策（修订时新增）
+
+### 12.1 预留判据
+
+只在下面三条**同时**成立时才预留：
+
+1. 写进**持久层或对外协议**（不是纯内存结构）；
+2. 是**当时才知道、事后无法重建**的观测值；
+3. 加上去**零行为变化**（默认值 + `from_data` 容错 + 不进兼容哈希）。
+
+纯代码分支、纯内存 dataclass、可由事件推导的内容，一律**不预留**——晚加成本几乎为零，提前预留只会变成兼容负担或锁死错误 schema。
+
+### 12.2 决定预留（仅两项）
+
+1. **`ToolExecutionRecord` 增加 `effect` / `result_authority`（即 6.1 的前两个字段）。**
+   - 满足判据 1：进入 `TaskSnapshot.to_data()` → `runtime_tasks.data_json`；
+   - 满足判据 2：只有执行发生时 `ToolSpec` 在手才知道；晚加则历史记录永久缺失，而工具 spec 会变，无法回填；
+   - 满足判据 3：记录不参与 checkpoint 兼容哈希（`test_checkpoint_compatibility` 只看 `adapter_lock_hash` / `prompt_manifest_hash` / `policy_hash` 与 `tool_execution_count`）；项目已有 `legacy_execution_focus_revision` 同类先例；
+   - `semantic_signature` 不预留（可由 `call` 派生）。
+
+2. **`FinalAcceptanceProbe.required_plan_step_refs` 保留字段，只换数据源。**
+   - 5.5 实施时**删除数据来源**（WorkingMemory plan），但**不删除字段**；
+   - 留给 Plan-and-Execute 把契约步骤从这里接入。
+
+### 12.3 决定不预留
+
+| 项 | 原因 |
+|---|---|
+| `ExecutionFact` 的 `batch_id` / `step_ref` | 纯投影、非持久化，后加零成本 |
+| gap 的 batch 级聚合 | 纯代码，届时在 `_completion_readiness_gaps` 局部改 |
+| Protocol Gate 抽象（6.2） | 行为重构，提前抽接口等于猜接口 |
+| 并行调度 / 路径级锁 | 是功能不是预留 |
+| 新的 Plan / Contract 实体 | 真正做 Plan-and-Execute 时才能定形；原则 1 现在不建是对的 |
+
+### 12.4 并行落地前必须解决（本批不做，仅登记）
+
+1. **gap 粒度 vs 纠正配额**：gap 现为 per-execution，配额为 per-turn；并行一批 N 个失败会产生 N 个 gap，误判"无进展"。需 batch 级聚合。
+2. **`resolution` 定序**：retried/superseded 隐含全序，并行需确定性规则（batch 序 + 批内 index）。
+3. **UNKNOWN × effect 类别**：OBSERVE 的 UNKNOWN 可放过；MUTATE/EXECUTE 的 `UNKNOWN_OUTCOME` 必须接入既有 `reconciled_*` 对账，不能静默放过。
+4. **事实缺批次归属**：`ToolExecutionRecord` 无 `batch_id`（可用 `ToolBatchSnapshot.calls` join，但批次快照关闭后可能不再保留）。
+5. **路径级串行化**：并行 MUTATE 需按路径串行，否则丢失更新（原 §10 未核实事项 2）。
+
+### 12.5 Plan-and-Execute 落地前必须解决（本批不做，仅登记）
+
+1. **事实缺步骤维度**：`ExecutionFact` 需要 `step_ref` 才能表达"某步骤的动作失败未解决"。
+2. **契约 seam 迁移**：`required_plan_step_refs` 的数据源应从 WorkingMemory 迁到 TaskSpec/Plan。
+3. **原则 1 限定适用范围**：`不新增持久化实体`应表述为"**本批**不新增"；runtime 拥有的 plan（步骤/依赖/per-step 验收/重试）未来需要持久化实体。

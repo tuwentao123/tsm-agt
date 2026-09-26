@@ -25,7 +25,7 @@ from tsm_agt.ports import (
     RuntimeCommandRecord,
 )
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 class SQLiteRuntimeStore:
@@ -650,7 +650,7 @@ class SQLiteRuntimeStore:
             );
             CREATE TABLE IF NOT EXISTS session_task_commands (
                 command_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL,
-                created_at TEXT NOT NULL, UNIQUE(session_id, task_id),
+                created_at TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES runtime_sessions(session_id),
                 FOREIGN KEY(task_id) REFERENCES runtime_tasks(task_id)
             );
@@ -709,10 +709,20 @@ class SQLiteRuntimeStore:
                     "INSERT INTO runtime_meta(key, value) VALUES ('schema_version', ?)",
                     (str(_SCHEMA_VERSION),),
                 )
-            elif int(row["value"]) != _SCHEMA_VERSION:
-                raise RuntimeError(
-                    f"unsupported SQLite schema version: {row['value']}"
-                )
+            else:
+                version = int(row["value"])
+                if version == 1:
+                    SQLiteRuntimeStore._migrate_session_task_commands_v1_to_v2(
+                        connection
+                    )
+                    connection.execute(
+                        "UPDATE runtime_meta SET value = ? WHERE key = 'schema_version'",
+                        (str(_SCHEMA_VERSION),),
+                    )
+                elif version != _SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"unsupported SQLite schema version: {row['value']}"
+                    )
             SQLiteRuntimeStore._migrate_standalone_sessions(connection)
             connection.execute("COMMIT")
         except Exception:
@@ -730,6 +740,37 @@ class SQLiteRuntimeStore:
             ),
             datetime.fromisoformat(str(row["created_at"])),
             datetime.fromisoformat(str(row["updated_at"])),
+        )
+
+    @staticmethod
+    def _migrate_session_task_commands_v1_to_v2(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Remove the obsolete one-command-per-session/task constraint."""
+        connection.execute(
+            """
+            CREATE TABLE session_task_commands_v2 (
+                command_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES runtime_sessions(session_id),
+                FOREIGN KEY(task_id) REFERENCES runtime_tasks(task_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO session_task_commands_v2(
+                command_id, session_id, task_id, created_at
+            )
+            SELECT command_id, session_id, task_id, created_at
+            FROM session_task_commands
+            """
+        )
+        connection.execute("DROP TABLE session_task_commands")
+        connection.execute(
+            "ALTER TABLE session_task_commands_v2 RENAME TO session_task_commands"
         )
 
     @staticmethod

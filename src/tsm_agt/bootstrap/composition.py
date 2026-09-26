@@ -64,6 +64,9 @@ from tsm_agt.adapters.rule_based_model_recovery import (
     RuleBasedModelRecoveryPolicy,
 )
 from tsm_agt.adapters.model_runtime_input import ModelRuntimeInputClassifier
+from tsm_agt.adapters.default_session_input_relation import (
+    DefaultSessionInputRelationJudge,
+)
 from tsm_agt.adapters.model_session_input import ModelSessionInputResolver
 from tsm_agt.adapters.model_task_spec_planner import ModelTaskSpecPlanner
 from tsm_agt.adapters.local_process import LocalProcessExecutor
@@ -108,6 +111,7 @@ from tsm_agt.ports import (
     ProjectMemoryPort,
     CodeIntelligencePort,
     RuntimeInputClassifierPort,
+    SessionInputRelationPort,
     SessionInputResolverPort,
     TaskSpecPlannerPort,
     EvidenceDeltaEvaluatorPort,
@@ -116,6 +120,7 @@ from tsm_agt.ports import (
     ArtifactReadPolicyPort,
     ProgressiveScopePolicyPort,
     ToolScopeConsistencyPolicyPort,
+    CompletionReadinessMode,
     CompletionReadinessPolicyPort,
     CheckpointCompatibilityPolicyPort,
     FinalAcceptancePolicyPort,
@@ -141,12 +146,18 @@ from .context_configuration import (
 from .egress_configuration import (
     WebEgressConfiguration, load_web_egress_configuration,
 )
+from .search_configuration import (
+    SearchConfiguration, load_search_configuration,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class Application:
     kernel: Kernel
     registry: AdapterRegistry
+    #: Non-fatal configuration problems the host should surface (for example an
+    #: invalid optional-search value that degraded to the free providers).
+    configuration_issues: tuple[str, ...] = ()
 
 
 def _endpoint_origin(base_url: str) -> str:
@@ -159,6 +170,9 @@ def _configuration_metadata(
     sources: Mapping[str, str] | None = None,
     exploration_budget: ExplorationBudgetConfiguration | None = None,
     context_configuration: ContextConfiguration | None = None,
+    completion_readiness_mode: CompletionReadinessMode = (
+        CompletionReadinessMode.LEGACY_GATE
+    ),
     output_token_parameter: str = "max_tokens",
     strict_tool_schema: bool = True,
     streaming: bool = True,
@@ -175,8 +189,14 @@ def _configuration_metadata(
         data["endpoint_origin"] = _endpoint_origin(base_url)
     result: dict[str, object] = {
         "model": data,
+        "completion_readiness": {
+            "mode": completion_readiness_mode.value,
+        },
         "sources": dict(sources or {}),
     }
+    result["sources"].setdefault(
+        "completion_readiness.mode", "composition"
+    )
     if exploration_budget is not None:
         result["exploration_budget"] = exploration_budget.snapshot_data()
         result["sources"].update(exploration_budget.sources or {})
@@ -194,6 +214,15 @@ def _kernel_dependencies(
     classifiers = registry.all(RuntimeInputClassifierPort)
     if len(classifiers) > 1:
         raise ValueError("at most one RuntimeInputClassifierPort may be registered")
+    if not registry.all(SessionInputRelationPort):
+        # Safe default: every live input is a supplement, so a running Task is
+        # never interrupted by an unproven relation guess. Replaceable Adapter.
+        registry.register(
+            SessionInputRelationPort, DefaultSessionInputRelationJudge()
+        )
+    relation_judges = registry.all(SessionInputRelationPort)
+    if len(relation_judges) > 1:
+        raise ValueError("at most one SessionInputRelationPort may be registered")
     session_input_resolvers = registry.all(SessionInputResolverPort)
     if len(session_input_resolvers) > 1:
         raise ValueError("at most one SessionInputResolverPort may be registered")
@@ -288,6 +317,17 @@ def _kernel_dependencies(
         raise ValueError("at most one ModelRecoveryPolicyPort may be registered")
     raw_budget = configuration_metadata.get("exploration_budget", {})
     budget = dict(raw_budget) if isinstance(raw_budget, Mapping) else {}
+    raw_readiness = configuration_metadata.get("completion_readiness", {})
+    readiness = dict(raw_readiness) if isinstance(raw_readiness, Mapping) else {}
+    try:
+        completion_readiness_mode = CompletionReadinessMode(
+            str(readiness.get("mode", CompletionReadinessMode.LEGACY_GATE.value))
+        )
+    except ValueError as error:
+        raise ValueError(
+            "completion readiness mode must be LEGACY_GATE, OBSERVE_ONLY, or "
+            "AGENT_DECIDES"
+        ) from error
     return KernelDependencies(
         model=registry.require(ModelProviderPort),
         store=registry.require(RuntimeStorePort),
@@ -320,6 +360,7 @@ def _kernel_dependencies(
             completion_readiness_policies[0]
             if completion_readiness_policies else None
         ),
+        completion_readiness_mode=completion_readiness_mode,
         final_acceptance_policy=(
             final_acceptance_policies[0] if final_acceptance_policies else None
         ),
@@ -354,6 +395,9 @@ def _kernel_dependencies(
             if investigation_flow_projectors else None
         ),
         runtime_input_classifier=(classifiers[0] if classifiers else None),
+        session_input_relation=(
+            relation_judges[0] if relation_judges else None
+        ),
         session_input_resolver=(
             session_input_resolvers[0] if session_input_resolvers else None
         ),
@@ -430,6 +474,22 @@ def _platform_local_identity() -> LocalIdentityPort:
     return PosixLocalIdentity()
 
 
+def _completion_readiness_mode_from_env(
+    environment: Mapping[str, str],
+) -> CompletionReadinessMode:
+    raw = environment.get(
+        "TSM_AGT_COMPLETION_READINESS_MODE",
+        CompletionReadinessMode.LEGACY_GATE.value,
+    ).strip().upper()
+    try:
+        return CompletionReadinessMode(raw)
+    except ValueError as error:
+        raise ValueError(
+            "TSM_AGT_COMPLETION_READINESS_MODE must be LEGACY_GATE, "
+            "OBSERVE_ONLY, or AGENT_DECIDES"
+        ) from error
+
+
 def _register_exploration_profile(
     registry: AdapterRegistry, profile: str | None = None,
 ) -> str:
@@ -472,6 +532,7 @@ def compose_fixture_application(
     context_manager: ContextWindowManager | None = None,
     enable_working_memory: bool = False,
     runtime_input_classifier_adapter: RuntimeInputClassifierPort | None = None,
+    session_input_relation_adapter: SessionInputRelationPort | None = None,
     session_input_resolver_adapter: SessionInputResolverPort | None = None,
     task_spec_planner_adapter: TaskSpecPlannerPort | None = None,
     checkpoint_compatibility_policy_adapter: (
@@ -489,6 +550,9 @@ def compose_fixture_application(
     completion_readiness_policy_adapter: (
         CompletionReadinessPolicyPort | None
     ) = None,
+    completion_readiness_mode: CompletionReadinessMode = (
+        CompletionReadinessMode.LEGACY_GATE
+    ),
     final_acceptance_policy_adapter: FinalAcceptancePolicyPort | None = None,
     exploration_budget_policy_adapter: ExplorationBudgetPolicyPort | None = None,
     stop_or_pivot_policy_adapter: StopOrPivotPolicyPort | None = None,
@@ -540,6 +604,10 @@ def compose_fixture_application(
     if runtime_input_classifier_adapter is not None:
         registry.register(
             RuntimeInputClassifierPort, runtime_input_classifier_adapter
+        )
+    if session_input_relation_adapter is not None:
+        registry.register(
+            SessionInputRelationPort, session_input_relation_adapter
         )
     if session_input_resolver_adapter is not None:
         registry.register(
@@ -638,6 +706,7 @@ def compose_fixture_application(
                 "model.model": "harness_default",
                 "model.credentials_configured": "harness_default",
             },
+            completion_readiness_mode=completion_readiness_mode,
         ), context_manager,
         require_evidence_questions=require_evidence_questions,
     )
@@ -721,6 +790,10 @@ def compose_openai_compatible_readonly_application(
     model_streaming: bool = True,
     context_configuration: ContextConfiguration | None = None,
     web_egress_configuration: WebEgressConfiguration | None = None,
+    search_configuration: SearchConfiguration | None = None,
+    completion_readiness_mode: CompletionReadinessMode = (
+        CompletionReadinessMode.LEGACY_GATE
+    ),
 ) -> Application:
     """Compose a real OpenAI-compatible model with built-in read-only tools."""
 
@@ -728,6 +801,7 @@ def compose_openai_compatible_readonly_application(
     budget = exploration_budget_configuration or ExplorationBudgetConfiguration()
     context = context_configuration or ContextConfiguration()
     egress = web_egress_configuration or WebEgressConfiguration()
+    search = search_configuration or SearchConfiguration()
     physical_model = OpenAICompatibleModelProvider(
         base_url, model, api_key, timeout_seconds=model_timeout_seconds,
         max_retries=0, retry_backoff_seconds=0,
@@ -821,6 +895,8 @@ def compose_openai_compatible_readonly_application(
     registry.register(ToolProviderPort, CoreReadOnlyToolProvider())
     registry.register(ToolProviderPort, NetworkToolProvider(
         enable_fetch=True, egress_mode=egress.mode,
+        search_tavily_mode=search.tavily_mode,
+        search_tavily_api_key=search.tavily_api_key,
     ))
     registry.register(ToolProviderPort, CoreMemoryToolProvider())
     registry.register(ToolProviderPort, CoreWorkingMemoryToolProvider())
@@ -841,6 +917,7 @@ def compose_openai_compatible_readonly_application(
             },
             exploration_budget=budget,
             context_configuration=context,
+            completion_readiness_mode=completion_readiness_mode,
             output_token_parameter=model_output_token_parameter,
             strict_tool_schema=model_strict_tool_schema,
             streaming=model_streaming,
@@ -851,7 +928,10 @@ def compose_openai_compatible_readonly_application(
         ),
         default_max_output_tokens=8192,
     )
-    return Application(kernel=Kernel(dependencies), registry=registry)
+    return Application(
+        kernel=Kernel(dependencies), registry=registry,
+        configuration_issues=search.issues,
+    )
 
 
 def compose_openai_compatible_engineering_application(
@@ -867,6 +947,10 @@ def compose_openai_compatible_engineering_application(
     model_streaming: bool = True,
     context_configuration: ContextConfiguration | None = None,
     web_egress_configuration: WebEgressConfiguration | None = None,
+    search_configuration: SearchConfiguration | None = None,
+    completion_readiness_mode: CompletionReadinessMode = (
+        CompletionReadinessMode.LEGACY_GATE
+    ),
 ) -> Application:
     """Compose the engineering Agent with workspace and process tools."""
 
@@ -874,6 +958,7 @@ def compose_openai_compatible_engineering_application(
     budget = exploration_budget_configuration or ExplorationBudgetConfiguration()
     context = context_configuration or ContextConfiguration()
     egress = web_egress_configuration or WebEgressConfiguration()
+    search = search_configuration or SearchConfiguration()
     workspace_path = _platform_workspace_path()
     physical_model = OpenAICompatibleModelProvider(
         base_url, model, api_key, timeout_seconds=model_timeout_seconds,
@@ -966,6 +1051,8 @@ def compose_openai_compatible_engineering_application(
     registry.register(ToolProviderPort, CoreReadOnlyToolProvider())
     registry.register(ToolProviderPort, NetworkToolProvider(
         enable_fetch=True, egress_mode=egress.mode,
+        search_tavily_mode=search.tavily_mode,
+        search_tavily_api_key=search.tavily_api_key,
     ))
     registry.register(ToolProviderPort, CoreProcessToolProvider())
     registry.register(ToolProviderPort, CoreWorkspaceMutationToolProvider())
@@ -988,6 +1075,7 @@ def compose_openai_compatible_engineering_application(
             },
             exploration_budget=budget,
             context_configuration=context,
+            completion_readiness_mode=completion_readiness_mode,
             output_token_parameter=model_output_token_parameter,
             strict_tool_schema=model_strict_tool_schema,
             streaming=model_streaming,
@@ -998,7 +1086,9 @@ def compose_openai_compatible_engineering_application(
         ),
         default_max_output_tokens=8192,
     )
-    return Application(Kernel(dependencies), registry)
+    return Application(
+        Kernel(dependencies), registry, configuration_issues=search.issues,
+    )
 
 
 def compose_openai_compatible_readonly_application_from_env(
@@ -1026,6 +1116,10 @@ def compose_openai_compatible_readonly_application_from_env(
     egress = load_web_egress_configuration(
         env_file or Path.cwd() / ".env", os.environ
     )
+    search = load_search_configuration(
+        env_file or Path.cwd() / ".env", os.environ
+    )
+    completion_readiness_mode = _completion_readiness_mode_from_env(os.environ)
     return compose_openai_compatible_readonly_application(
         base_url=configuration.base_url,
         model=configuration.model,
@@ -1041,6 +1135,8 @@ def compose_openai_compatible_readonly_application_from_env(
         model_streaming=configuration.streaming,
         context_configuration=context,
         web_egress_configuration=egress,
+        search_configuration=search,
+        completion_readiness_mode=completion_readiness_mode,
     )
 
 
@@ -1068,6 +1164,10 @@ def compose_openai_compatible_engineering_application_from_env(
     egress = load_web_egress_configuration(
         env_file or Path.cwd() / ".env", os.environ
     )
+    search = load_search_configuration(
+        env_file or Path.cwd() / ".env", os.environ
+    )
+    completion_readiness_mode = _completion_readiness_mode_from_env(os.environ)
     return compose_openai_compatible_engineering_application(
         base_url=configuration.base_url,
         model=configuration.model,
@@ -1083,4 +1183,6 @@ def compose_openai_compatible_engineering_application_from_env(
         model_streaming=configuration.streaming,
         context_configuration=context,
         web_egress_configuration=egress,
+        search_configuration=search,
+        completion_readiness_mode=completion_readiness_mode,
     )

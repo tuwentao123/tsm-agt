@@ -7,7 +7,19 @@ from .adapter import (
     HealthStatus,
     RuntimeAdapter,
 )
+from .conclusion import (
+    AssistantConclusion,
+    ClaimReferenceValidation,
+    ConclusionClaim,
+    ConclusionKind,
+    ConclusionReferenceValidation,
+    ConclusionValidationStatus,
+    FactLifecycle,
+    FactReference,
+)
 from .model import (
+    ConclusionBlock,
+    ConclusionProtocolMode,
     FinishReason,
     ImageBlock,
     Message,
@@ -71,6 +83,11 @@ from .replay_cursor_store import ReplayCursor, ReplayCursorStorePort
 from .project_memory import MemoryOperationResult, ProjectMemoryPort, StoredMemory
 from .code_intelligence import CodeIntelligencePort
 from .runtime_input_classifier import RuntimeInputClassifierPort
+from .session_input_relation import (
+    SessionInputRelation,
+    SessionInputRelationJudgement,
+    SessionInputRelationPort,
+)
 from .session_input_resolver import (
     SessionInputResolverPort, SessionRouteResolutionError,
 )
@@ -106,8 +123,8 @@ from .tool_scope_consistency import (
 )
 from .completion_readiness import (
     CompletionGap, CompletionReadinessAction, CompletionReadinessDecision,
-    CompletionReadinessPolicyPort, CompletionReadinessProbe,
-    CompletionReadinessState,
+    CompletionReadinessMode, CompletionReadinessPolicyPort,
+    CompletionReadinessProbe, CompletionReadinessState,
 )
 from .final_acceptance import (
     FinalAcceptanceAction, FinalAcceptanceDecision, FinalAcceptancePolicyPort,
@@ -150,6 +167,7 @@ from .investigation_flow import (
 )
 from .tool import (
     EvidenceQuestion,
+    ToolFactDescriptor,
     OutcomeBindingMode,
     WebEgressMode,
     ToolCall,
@@ -174,7 +192,13 @@ __all__ = [
     "AdapterContext",
     "AdapterDescriptor",
     "CommitResult",
-    "CodeIntelligencePort",
+    "ConclusionClaim",
+    "ConclusionKind",
+    "ConclusionReferenceValidation",
+    "ConclusionValidationStatus",
+    "FactLifecycle",
+    "FactReference",
+    "ClaimReferenceValidation",
     "CrossProcessLockPort",
     "WorkspaceFilesystemPort",
     "WorkspacePathPort",
@@ -183,8 +207,11 @@ __all__ = [
     "HealthState",
     "HealthStatus",
     "FinishReason",
+    "ConclusionBlock",
+    "ConclusionProtocolMode",
     "ImageBlock",
     "EvidenceQuestion",
+    "ToolFactDescriptor",
     "WebEgressMode",
     "ToolEffect",
     "ToolResultAuthority",
@@ -192,6 +219,7 @@ __all__ = [
     "CompletionGap",
     "CompletionReadinessAction",
     "CompletionReadinessDecision",
+    "CompletionReadinessMode",
     "CompletionReadinessPolicyPort",
     "CompletionReadinessProbe",
     "CompletionReadinessState",
@@ -248,6 +276,9 @@ __all__ = [
     "process_result_succeeded",
     "RuntimeAdapter",
     "RuntimeInputClassifierPort",
+    "SessionInputRelation",
+    "SessionInputRelationJudgement",
+    "SessionInputRelationPort",
     "SessionInputResolverPort",
     "SessionRouteResolutionError",
     "TaskSpecPlannerPort",

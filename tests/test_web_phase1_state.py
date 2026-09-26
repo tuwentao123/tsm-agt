@@ -34,6 +34,21 @@ class _FakeRuntimeServer:
             phase1_state="RUNNING",
             status="running",
             cursor=3,
+            projection={
+                "display_status": "running",
+                "execution_status": "running",
+                "verification_status": "passed",
+                "latest_answer_event_ref": "evt-web-answer",
+                "conclusion_claims": [{
+                    "claim_id": "claim-web", "summary": "web projection",
+                }],
+                "conclusion_validation": {"status": "valid"},
+            },
+            latest_answer_event_ref="evt-web-answer",
+            conclusion_claims=({
+                "claim_id": "claim-web", "summary": "web projection",
+            },),
+            conclusion_validation={"status": "valid"},
         )
 
 
@@ -51,6 +66,12 @@ class WebPhase1StateTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/session-input", web_app.INDEX_HTML)
         self.assertIn("const task = data.task", web_app.INDEX_HTML)
         self.assertIn("data.kind === 'answer'", web_app.INDEX_HTML)
+        self.assertEqual(response["latest_answer_event_ref"], "evt-web-answer")
+        self.assertEqual(response["conclusion_claims"][0]["claim_id"], "claim-web")
+        self.assertEqual(response["conclusion_validation"]["status"], "valid")
+        for label in ("执行状态", "领域检查", "模型结论", "引用校验"):
+            self.assertIn(label, web_app.INDEX_HTML)
+        self.assertIn("applyTaskProtocol", web_app.INDEX_HTML)
 
 
 class WorkspaceDirectoryPickerTest(unittest.IsolatedAsyncioTestCase):

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from tsm_agt.adapters.builtin import NetworkToolProvider
 from tsm_agt.adapters.builtin.network_tools import (
     FetchResponse, _BingNewsRssProvider, _DuckDuckGoLiteProvider,
-    _RssNewsProvider, _WikipediaProvider,
+    _RssNewsProvider, _TavilyProvider, _WikipediaProvider,
 )
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import CoreToolPolicy, PolicyAction, ProjectTrustLevel, TaskState
@@ -245,10 +248,11 @@ class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok, result.to_data())
         self.assertEqual(result.data["provider"], "degraded-no-results")
         self.assertEqual(result.data["results"], [])
-        statuses = {entry["status"] for entry in result.data["telemetry"]}
-        # Every configured provider has to report, and none may raise out.
+        # A timeout must stay visible in telemetry instead of being silently
+        # downgraded to an empty result list.
         self.assertEqual(len(result.data["telemetry"]), 6)
-        self.assertTrue(statuses <= {"empty", "error"}, statuses)
+        statuses = {entry["status"] for entry in result.data["telemetry"]}
+        self.assertEqual(statuses, {"timeout"}, statuses)
 
     async def test_pipeline_covers_the_additional_keyless_providers(self):
         names = [provider.name for provider in self.provider._pipeline._providers]
@@ -355,6 +359,153 @@ class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(decision.requires_network)
             finally:
                 await app.registry.stop_all()
+
+
+def _rss_item(title, link, pub_date):
+    return (
+        f"<item><title>{title}</title><link>{link}</link>"
+        f"<description>summary</description><pubDate>{pub_date}</pubDate></item>"
+    )
+
+
+class SearchRecencyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.provider = NetworkToolProvider()
+        self.now = datetime.now(timezone.utc)
+
+    def _feed(self, *items: str) -> bytes:
+        return (
+            "<rss><channel>" + "".join(items) + "</channel></rss>"
+        ).encode()
+
+    def test_google_news_sorts_newest_first_and_keeps_published_at(self):
+        feed = self._feed(
+            _rss_item("old", "https://e/old", format_datetime(
+                self.now - timedelta(days=20)
+            )),
+            _rss_item("new", "https://e/new", format_datetime(
+                self.now - timedelta(hours=2)
+            )),
+        )
+        with patch(
+            "tsm_agt.adapters.builtin.network_tools.urlopen",
+            return_value=_Response(feed),
+        ):
+            results = _RssNewsProvider(self.provider).search("nba", 5)
+
+        self.assertEqual([item.url for item in results],
+                         ["https://e/new", "https://e/old"])
+        self.assertIsNotNone(results[0].published_at)
+
+    def test_google_news_adds_the_when_operator_for_freshness(self):
+        captured: dict[str, str] = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            return _Response(self._feed(
+                _rss_item("n", "https://e/n", format_datetime(self.now))
+            ))
+
+        with patch(
+            "tsm_agt.adapters.builtin.network_tools.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            _RssNewsProvider(self.provider).search(
+                "nba", 5, freshness="week",
+            )
+
+        self.assertIn("when%3A7d", captured["url"])
+
+    def test_bing_news_drops_items_outside_the_freshness_window(self):
+        feed = self._feed(
+            _rss_item("stale", "https://e/stale", format_datetime(
+                self.now - timedelta(days=10)
+            )),
+            _rss_item("fresh", "https://e/fresh", format_datetime(
+                self.now - timedelta(hours=3)
+            )),
+        )
+        with patch(
+            "tsm_agt.adapters.builtin.network_tools.urlopen",
+            return_value=_Response(feed),
+        ):
+            results = _BingNewsRssProvider(self.provider).search(
+                "NBA", 5, freshness="day",
+            )
+
+        self.assertEqual([item.url for item in results], ["https://e/fresh"])
+
+    def test_tavily_maps_freshness_and_parses_published_date(self):
+        captured: dict[str, object] = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["headers"] = dict(request.headers)
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return _Response(json.dumps({"results": [{
+                "title": "NBA news",
+                "url": "https://example.com/nba",
+                "content": "fresh snippet",
+                "published_date": "2026-09-25T15:40:00Z",
+            }]}).encode())
+
+        with patch(
+            "tsm_agt.adapters.builtin.network_tools.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            results = _TavilyProvider(
+                self.provider, "tvly-secret"
+            ).search("nba", 3, freshness="day")
+
+        body = captured["body"]
+        self.assertEqual(body["topic"], "news")
+        self.assertEqual(body["days"], 1)
+        self.assertEqual(
+            captured["headers"].get("Authorization"), "Bearer tvly-secret"
+        )
+        self.assertEqual(results[0].url, "https://example.com/nba")
+        self.assertTrue(results[0].published_at.startswith("2026-09-25"))
+
+    def test_tavily_keyless_sends_access_mode_header(self):
+        captured: dict[str, object] = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["headers"] = dict(request.headers)
+            return _Response(json.dumps({"results": []}).encode())
+
+        with patch(
+            "tsm_agt.adapters.builtin.network_tools.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            _TavilyProvider(
+                self.provider, "", keyless=True
+            ).search("nba", 3)
+
+        self.assertEqual(
+            captured["headers"].get("X-tavily-access-mode"), "keyless"
+        )
+        self.assertNotIn("Authorization", captured["headers"])
+
+    def test_tavily_is_prepended_only_when_enabled(self):
+        default = NetworkToolProvider()
+        self.assertNotIn(
+            "tavily", [p.name for p in default._pipeline._providers]
+        )
+        keyless = NetworkToolProvider(search_tavily_mode="keyless")
+        self.assertEqual(keyless._pipeline._providers[0].name, "tavily")
+        keyed = NetworkToolProvider(
+            search_tavily_mode="key", search_tavily_api_key="tvly-x"
+        )
+        self.assertEqual(keyed._pipeline._providers[0].name, "tavily")
+
+    def test_tavily_key_mode_requires_a_key(self):
+        with self.assertRaises(ValueError):
+            NetworkToolProvider(search_tavily_mode="key")
+
+    def test_web_search_rejects_unknown_freshness(self):
+        with self.assertRaises(ValueError):
+            self.provider._freshness({"freshness": "year"})
+        self.assertEqual(self.provider._freshness({}), "any")
+        self.assertEqual(self.provider._freshness({"freshness": " WEEK "}), "week")
 
 
 class _Headers:

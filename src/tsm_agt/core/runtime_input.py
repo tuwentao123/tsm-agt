@@ -238,6 +238,10 @@ class RuntimeInputIntent(StrEnum):
     REVIEW_PENDING_ACTION = "REVIEW_PENDING_ACTION"
     STATUS_QUERY = "STATUS_QUERY"
     NEW_TASK_AFTER_CURRENT = "NEW_TASK_AFTER_CURRENT"
+    #: Unified user-input entry only: start an independent Task now.
+    NEW_TASK = "NEW_TASK"
+    #: Unified user-input entry only: stop the running Task (recoverable).
+    INTERRUPT = "INTERRUPT"
     AMBIGUOUS = "AMBIGUOUS"
 
 

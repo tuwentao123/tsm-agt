@@ -19,6 +19,7 @@ from .context import (
     ContextBudget, ContextBudgetAllocation, ContextCompactionReceipt, ContextWindowExceeded,
     ContextWindowManager, PreparedContext,
 )
+from .conclusion_reference_validator import ConclusionReferenceValidator
 from .prompt import (
     PromptAssembly, PromptAssemblyReceipt, PromptManifest, PromptTemplate,
     PromptTemplateSegment,
@@ -168,6 +169,7 @@ __all__ = [
     "ContextWindowExceeded",
     "ContextWindowManager",
     "PreparedContext",
+    "ConclusionReferenceValidator",
     "PromptAssembly",
     "PromptAssemblyReceipt",
     "PromptManifest",

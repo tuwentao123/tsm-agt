@@ -102,7 +102,7 @@ class PromptTemplate:
     def default(cls) -> PromptTemplate:
         return cls(
             manifest_id="builtin.engineering-agent",
-            revision=8,
+            revision=9,
             static_segments=(
                 PromptTemplateSegment(
                     "system-safety", "core", "1.0",
@@ -136,7 +136,13 @@ class PromptTemplate:
                     "A directory listing proves only that a file or directory exists. If a "
                     "conclusion depends on a referenced resource, configuration key, alias, "
                     "constant, or localized string, search for and read its definition before "
-                    "claiming its value or behavior. Do not offer to continue later when "
+                    "claiming its value or behavior. A search result cites a "
+                    "document you have not read: it gives a title, a URL, and "
+                    "usually only a snippet. When a claim depends on what such "
+                    "a document says, read it with web.fetch_markdown before "
+                    "asserting the claim, or state explicitly which part you "
+                    "could not verify. This applies to any external document. "
+                    "Do not offer to continue later when "
                     "specific in-scope read-only checks are still needed for the requested "
                     "conclusion and the runtime still permits those checks; perform them now.",
                 ),

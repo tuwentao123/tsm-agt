@@ -74,6 +74,7 @@ from tsm_agt.ports import (
     ModelProviderPort,
     ModelRequest,
     ModelResponse,
+    ConclusionProtocolMode,
     ModelStreamCompleted,
     ModelTextDelta,
     ModelTransportProgress,
@@ -123,6 +124,9 @@ from tsm_agt.ports import (
     LocalIdentityPort,
     ProjectMemoryPort,
     RuntimeInputClassifierPort,
+    SessionInputRelation,
+    SessionInputRelationJudgement,
+    SessionInputRelationPort,
     SessionInputResolverPort,
     TaskSpecPlannerPort,
     CheckpointCompatibilityAction,
@@ -145,6 +149,7 @@ from tsm_agt.ports import (
     CompletionGap,
     CompletionReadinessAction,
     CompletionReadinessDecision,
+    CompletionReadinessMode,
     CompletionReadinessPolicyPort,
     CompletionReadinessProbe,
     CompletionReadinessState,
@@ -154,6 +159,10 @@ from tsm_agt.ports import (
     FinalAcceptanceProbe,
     FinalAcceptanceViolation,
     FinalQuestionEvidence,
+    AssistantConclusion,
+    ConclusionBlock,
+    ConclusionReferenceValidation,
+    ConclusionValidationStatus,
 )
 
 from .agent_loop import (
@@ -190,6 +199,13 @@ from .execution import (
     ToolExecutionInProgress,
     ToolExecutionRecord,
 )
+from .execution_facts import (
+    EffectStatus,
+    FactResolution,
+    classify_effect_status,
+    project_execution_facts,
+    project_unresolved_failures,
+)
 from .flow import FlowProjection, FlowProjector
 from .replay import (
     FlowReplay, FlowReplayBoundary, FlowReplayIndex, FlowReplayPlayback,
@@ -200,6 +216,7 @@ from .configuration import (
     EffectiveConfigurationSnapshot, canonical_hash, effective_toolset_hash,
 )
 from .context import ContextWindowExceeded, ContextWindowManager
+from .conclusion_reference_validator import ConclusionReferenceValidator
 from .document_references import extract_document_references
 from .prompt import PromptAssemblyReceipt, PromptTemplate
 from .memory import MemoryRecord, MemoryScope, MemorySourceKind, MemoryView
@@ -319,6 +336,9 @@ class KernelDependencies:
     progressive_scope_policy: ProgressiveScopePolicyPort | None = None
     tool_scope_consistency_policy: ToolScopeConsistencyPolicyPort | None = None
     completion_readiness_policy: CompletionReadinessPolicyPort | None = None
+    completion_readiness_mode: CompletionReadinessMode = (
+        CompletionReadinessMode.LEGACY_GATE
+    )
     final_acceptance_policy: FinalAcceptancePolicyPort | None = None
     exploration_budget_policy: ExplorationBudgetPolicyPort | None = None
     stop_or_pivot_policy: StopOrPivotPolicyPort | None = None
@@ -334,6 +354,7 @@ class KernelDependencies:
     ) = None
     investigation_flow_projector: InvestigationFlowProjectorPort | None = None
     runtime_input_classifier: RuntimeInputClassifierPort | None = None
+    session_input_relation: SessionInputRelationPort | None = None
     session_input_resolver: SessionInputResolverPort | None = None
     task_spec_planner: TaskSpecPlannerPort | None = None
     checkpoint_compatibility_policy: (
@@ -640,6 +661,26 @@ def _post_mutation_verification_observed(
             "usually lacks the project's test dependencies."
         )
     return " ".join(parts)
+
+
+def _temporal_context_instruction(now: datetime | None = None) -> str:
+    """Return the per-call "what day is it" anchor for the model.
+
+    Models otherwise fall back to their training prior: a real, freshly
+    retrieved item dated with the current year gets dismissed as a "future" or
+    "simulated" timeline, and the answer degrades to stale recollection. Kept
+    short because it is carried on every model call.
+    """
+    moment = (now or datetime.now()).astimezone()
+    offset = moment.strftime("%z")
+    offset = f"{offset[:3]}:{offset[3:]}" if offset else ""
+    return (
+        f"Today is {moment.strftime('%Y-%m-%d')} "
+        f"({moment.tzname() or 'local'} UTC{offset}). Retrieved publish dates at "
+        "or before today are current, never a future or simulated timeline; "
+        "dated tool results from this turn outrank earlier conversation claims "
+        "about what is current."
+    )
 
 
 def _continuation_made_no_progress(
@@ -1018,6 +1059,10 @@ class Kernel:
     @property
     def dependencies(self) -> KernelDependencies:
         return self._dependencies
+
+    @property
+    def completion_readiness_mode(self) -> CompletionReadinessMode:
+        return self._dependencies.completion_readiness_mode
 
     async def create_session(
         self, title: str, session_id: str | None = None,
@@ -2395,6 +2440,7 @@ class Kernel:
                 messages=(system, history_message, current_user),
                 tools=(escalation,), max_output_tokens=4096,
                 allow_tool_calls=True, require_evidence_questions=False,
+                conclusion_protocol_mode=ConclusionProtocolMode.DISABLED,
             ),
             on_text_delta,
         )
@@ -2442,6 +2488,7 @@ class Kernel:
                     ),
                     tools=(escalation,), max_output_tokens=4096,
                     allow_tool_calls=True, require_evidence_questions=False,
+                conclusion_protocol_mode=ConclusionProtocolMode.DISABLED,
                 ),
                 on_text_delta,
             )
@@ -3023,6 +3070,29 @@ class Kernel:
             )
         raise TypeError(f"unsupported runtime input event: {type(event)!r}")
 
+    async def _judge_input_relation(
+        self, text: str, task: TaskSnapshot,
+    ) -> SessionInputRelationJudgement:
+        """Ask the shared relation judge; a failure never changes the Task."""
+        judge = self._dependencies.session_input_relation
+        if judge is None:
+            return SessionInputRelationJudgement(
+                SessionInputRelation.SUPPLEMENT, 0.0, "no_relation_judge",
+            )
+        context = {
+            "session_id": task.session_id,
+            "active_task": {
+                "task_id": task.task_id, "state": task.state.value,
+                "goal": task.goal,
+            },
+        }
+        try:
+            return await judge.judge_input_relation(text, context)
+        except Exception:
+            return SessionInputRelationJudgement(
+                SessionInputRelation.UNKNOWN, 0.0, "relation_judge_failed",
+            )
+
     async def route_runtime_input(
         self, task_id: str, text: str, input_id: str, *,
         explicit_intent: RuntimeInputIntent | None = None,
@@ -3090,36 +3160,27 @@ class Kernel:
             )
             classified_intent: RuntimeInputIntent | None = None
             classified_confidence: float | None = None
-            classifier = self._dependencies.runtime_input_classifier
+            judge = self._dependencies.session_input_relation
             if (
                 explicit_intent is None
                 and not context.awaiting_approval
                 and not context.awaiting_clarification
                 and fallback_intent is None
-                and classifier is not None
+                and judge is not None
             ):
-                try:
-                    proposed = await classifier.classify_runtime_input(
-                        normalized, context.to_classifier_data()
-                    )
-                    candidate = RuntimeInputIntent(
-                        str(proposed.get("intent", "")).upper()
-                    )
-                    confidence = float(proposed.get("confidence", 0.0))
-                    if candidate in {
-                        RuntimeInputIntent.STEER, RuntimeInputIntent.REPLACE,
-                        RuntimeInputIntent.NEW_TASK_AFTER_CURRENT,
-                        RuntimeInputIntent.STATUS_QUERY,
-                    } and confidence >= 0.75:
-                        classified_intent = candidate
-                        classified_confidence = confidence
-                except (
-                    ValueError, TypeError, KeyError, TimeoutError,
-                    asyncio.TimeoutError,
-                ):
-                    # An unavailable semantic proposal must not change the Task.
-                    classified_intent = None
-                    classified_confidence = None
+                # One general judge says how the input relates to the Session and
+                # Task; Runtime maps that relation onto a control intent. This is
+                # the same judge the unified user-input entry uses, so Web, CLI
+                # and SDK share one decision source.
+                judgement = await self._judge_input_relation(normalized, task)
+                relation_intent = {
+                    SessionInputRelation.SUPPLEMENT: RuntimeInputIntent.STEER,
+                    SessionInputRelation.REPLACE: RuntimeInputIntent.REPLACE,
+                    SessionInputRelation.STATUS_QUERY: RuntimeInputIntent.STATUS_QUERY,
+                }.get(judgement.relation)
+                if relation_intent is not None and judgement.confidence >= 0.85:
+                    classified_intent = relation_intent
+                    classified_confidence = judgement.confidence
             route = RuntimeInputRouter().route(
                 normalized, context, explicit_intent, fallback_intent,
                 classified_intent, classified_confidence,
@@ -6138,58 +6199,74 @@ class Kernel:
             MessageRole.SYSTEM, (TextBlock(body),),
         )
 
-    async def _record_session_task_result(
-        self, task_id: str, turn_id: str, user_message: Message,
-        assistant_message: Message,
-    ) -> None:
-        task = await self.get_task(task_id)
+    async def _session_task_result_unit(
+        self, task: TaskSnapshot, turn_id: str, user_message: Message,
+        assistant_message: Message, *,
+        assistant_conclusion: AssistantConclusion | None = None,
+        conclusion_validation: ConclusionReferenceValidation | None = None,
+        answer_event_ref: str | None = None,
+    ) -> SessionUnitOfWork:
         message_data = assistant_message.to_data()
-        effective_memory = await self.get_effective_working_memory(task_id)
+        effective_memory = await self.get_effective_working_memory(task.task_id)
         working_memory = effective_memory.snapshot
         resource_catalog, question_catalog = await self._session_reference_catalogs(
-            task_id
+            task.task_id
         )
-        task_spec = await self.get_task_spec(task_id)
+        task_spec = await self.get_task_spec(task.task_id)
         task_summary = self._session_task_summary(
             task, turn_id, working_memory, resource_catalog,
             effective_remaining_work=effective_memory.remaining_work,
             effective_evidence=effective_memory.evidence,
             task_spec=task_spec,
         )
-        for attempt in range(3):
-            stored = await self._dependencies.store.load_session(task.session_id)
-            if stored is None:
-                raise LookupError(f"session not found: {task.session_id}")
-            current = SessionSnapshot.from_data(stored.data)
-            self._authorize_session(current)
-            updated = current.bump_context()
-            event = SessionEvent(
+        stored = await self._dependencies.store.load_session(task.session_id)
+        if stored is None:
+            raise LookupError(f"session not found: {task.session_id}")
+        current = SessionSnapshot.from_data(stored.data)
+        self._authorize_session(current)
+        updated = current.bump_context()
+        payload: dict[str, Any] = {
+            "task_id": task.task_id, "turn_id": turn_id,
+            "task_state": task.state.value,
+            "phase1_state": task.state.phase1_state.value,
+            "user_message": user_message.to_data(),
+            "assistant_message": message_data,
+            "content_hash": canonical_hash(message_data),
+            "context_revision": updated.context_revision,
+            "working_state": effective_memory.session_state_data(),
+            "working_memory_revision": working_memory.revision,
+            "working_memory_hash": working_memory.content_hash,
+            "resource_catalog": [item.to_data() for item in resource_catalog],
+            "question_catalog": [item.to_data() for item in question_catalog],
+            "task_summary": task_summary,
+        }
+        if assistant_conclusion is not None:
+            payload["assistant_conclusion"] = assistant_conclusion.to_data()
+        if conclusion_validation is not None:
+            payload["conclusion_validation"] = conclusion_validation.to_data()
+        if answer_event_ref is not None:
+            payload["answer_event_ref"] = answer_event_ref
+        return SessionUnitOfWork(
+            task.session_id, stored.version, updated.to_data(),
+            (SessionEvent(
                 f"sevt-{uuid4().hex}", task.session_id,
                 stored.last_event_sequence + 1, "session.task_result_recorded",
-                {
-                    "task_id": task_id, "turn_id": turn_id,
-                    "task_state": task.state.value,
-                    "phase1_state": task.state.phase1_state.value,
-                    "user_message": user_message.to_data(),
-                    "assistant_message": message_data,
-                    "content_hash": canonical_hash(message_data),
-                    "context_revision": updated.context_revision,
-                    "working_state": effective_memory.session_state_data(),
-                    "working_memory_revision": working_memory.revision,
-                    "working_memory_hash": working_memory.content_hash,
-                    "resource_catalog": [
-                        item.to_data() for item in resource_catalog
-                    ],
-                    "question_catalog": [
-                        item.to_data() for item in question_catalog
-                    ],
-                    "task_summary": task_summary,
-                },
+                payload,
+            ),),
+        )
+
+    async def _record_session_task_result(
+        self, task_id: str, turn_id: str, user_message: Message,
+        assistant_message: Message,
+    ) -> None:
+        """Compatibility writer for non-final visible checkpoints only."""
+        for attempt in range(3):
+            task = await self.get_task(task_id)
+            unit = await self._session_task_result_unit(
+                task, turn_id, user_message, assistant_message,
             )
             try:
-                await self._dependencies.store.commit_session(SessionUnitOfWork(
-                    task.session_id, stored.version, updated.to_data(), (event,)
-                ))
+                await self._dependencies.store.commit_session(unit)
                 return
             except ValueError as error:
                 if "version conflict" not in str(error) or attempt == 2:
@@ -6236,6 +6313,16 @@ class Kernel:
             if execution.result is not None:
                 action["ok"] = execution.result.ok
                 action["error_code"] = execution.result.error_code
+                # ok means "the call ran"; the effect may still have failed.
+                # Keep the real business outcome in the handoff summary so a
+                # later Turn does not read a non-zero exit as a success.
+                result_data = getattr(execution.result, "data", None)
+                if isinstance(result_data, Mapping):
+                    if "succeeded" in result_data:
+                        action["succeeded"] = bool(result_data.get("succeeded"))
+                    failure_code = result_data.get("failure_code")
+                    if isinstance(failure_code, str) and failure_code.strip():
+                        action["failure_code"] = failure_code.strip()[:120]
             actions.append(action)
 
         roots = tuple(dict.fromkeys(
@@ -6938,34 +7025,161 @@ class Kernel:
         await self._save_agent_checkpoint(updated, "tool-batch-cancelled-by-replace")
         return updated
 
+    @staticmethod
+    def _assistant_conclusion(message: Message) -> AssistantConclusion | None:
+        conclusions = [
+            block.conclusion for block in message.content
+            if isinstance(block, ConclusionBlock)
+        ]
+        if len(conclusions) > 1:
+            raise InvalidModelResponse(
+                "assistant response may contain at most one conclusion block"
+            )
+        return conclusions[0] if conclusions else None
+
+    @staticmethod
+    def _source_user_message(messages: Sequence[Message]) -> Message | None:
+        generated_prefixes = (
+            "project-onboarding-context-", "project-memory-context-",
+            "session-context-", "working-memory-context-", "task-spec-context-",
+            "project-instructions-context-", "completion-readiness-",
+        )
+        return next((
+            message for message in messages
+            if message.role is MessageRole.USER
+            and not message.message_id.startswith(generated_prefixes)
+        ), None)
+
+    async def _commit_final_agent_result(
+        self, *, task_id: str, turn_id: str, user_message: Message,
+        assistant_message: Message, llm_payload: Mapping[str, Any],
+        additional_events: tuple[tuple[str, Mapping[str, Any]], ...] = (),
+        clear_agent_checkpoint: bool = True,
+    ) -> ConclusionReferenceValidation | None:
+        """Atomically record the final Task answer and its Session handoff.
+
+        This boundary is intentionally archival only.  Completion readiness has
+        already selected the answer; a conclusion validation can never change
+        task state, trigger a retry, or reinterpret its visible text.
+        """
+        conclusion = self._assistant_conclusion(assistant_message)
+        for attempt in range(3):
+            stored = await self._require_stored_task(task_id)
+            task = TaskSnapshot.from_data(stored.data)
+            events = await self._dependencies.store.read_events(task_id)
+            validation = (
+                ConclusionReferenceValidator().validate(task, events, conclusion)
+                if conclusion is not None else None
+            )
+            updated_task = (
+                task.with_agent_checkpoint(None)
+                if clear_agent_checkpoint else task
+            )
+            llm_event = RuntimeEvent(
+                f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
+                "llm.completed", dict(llm_payload),
+            )
+            task_events: list[RuntimeEvent] = [llm_event]
+            if validation is not None:
+                validation_event_type = {
+                    ConclusionValidationStatus.VALID: "conclusion.references_validated",
+                    ConclusionValidationStatus.INVALID: "conclusion.references_invalid",
+                    ConclusionValidationStatus.INCOMPLETE: "conclusion.references_incomplete",
+                }[validation.status]
+                task_events.append(RuntimeEvent(
+                    f"evt-{uuid4().hex}", task_id,
+                    stored.last_event_sequence + len(task_events) + 1,
+                    validation_event_type, {
+                        "turn_id": turn_id,
+                        "assistant_message_id": assistant_message.message_id,
+                        "conclusion": conclusion.to_data(),
+                        "validation": validation.to_data(),
+                    },
+                ))
+            for event_type, payload in additional_events:
+                task_events.append(RuntimeEvent(
+                    f"evt-{uuid4().hex}", task_id,
+                    stored.last_event_sequence + len(task_events) + 1,
+                    event_type, payload,
+                ))
+            task_events.append(RuntimeEvent(
+                f"evt-{uuid4().hex}", task_id,
+                stored.last_event_sequence + len(task_events) + 1,
+                "turn.completed", {
+                    "turn_id": turn_id,
+                    "model_calls": llm_payload.get("model_call"),
+                },
+            ))
+            session_unit = await self._session_task_result_unit(
+                updated_task, turn_id, user_message, assistant_message,
+                assistant_conclusion=conclusion,
+                conclusion_validation=validation,
+                answer_event_ref=llm_event.event_id,
+            )
+            command_id = "final-agent-result:" + canonical_hash({
+                "task_id": task_id,
+                "turn_id": turn_id,
+                "assistant_message": assistant_message.to_data(),
+                "conclusion": conclusion.to_data() if conclusion is not None else None,
+                "validation": validation.to_data() if validation is not None else None,
+            })
+            try:
+                await self._dependencies.store.commit_session_and_task(
+                    SessionTaskUnitOfWork(
+                        session_unit,
+                        RuntimeUnitOfWork(
+                            task_id, stored.version, updated_task.to_data(),
+                            tuple(task_events),
+                        ),
+                        command_id,
+                    )
+                )
+                return validation
+            except ValueError as error:
+                # Final Task/session results are a single archival boundary.
+                # Stores must provide an atomic commit (SQLite schema v2 does);
+                # retrying separate task and session writes could publish a
+                # half-result after a process interruption.
+                if "version conflict" not in str(error) or attempt == 2:
+                    raise
+        raise RuntimeError("unreachable final result retry state")
+
     async def _commit_model_response_checkpoint(
         self, checkpoint: AgentTurnCheckpoint, response: Any,
         prompt_receipt: PromptAssemblyReceipt, context_budget: Any, *,
         final: bool,
         additional_events: tuple[tuple[str, Mapping[str, Any]], ...] = (),
     ) -> None:
+        response_diagnostics = self._response_diagnostics(response)
+        llm_payload = {
+            "turn_id": checkpoint.turn_id,
+            "model_call": checkpoint.model_calls,
+            "message": response.message.to_data(),
+            "finish_reason": response.finish_reason.value,
+            "usage": response.usage.to_data(),
+            "response_diagnostics": response_diagnostics,
+            "context_window": context_budget.context_window,
+            "context_estimated_input_tokens": context_budget.estimated_input_tokens,
+            "context_estimation_method": context_budget.estimation_method,
+            "context_budget": context_budget.event_data(),
+            **prompt_receipt.event_data(),
+        }
+        if final:
+            user_message = self._source_user_message(checkpoint.messages)
+            if user_message is None:
+                raise RuntimeError("Agent turn lost its source user message")
+            await self._commit_final_agent_result(
+                task_id=checkpoint.task_id, turn_id=checkpoint.turn_id,
+                user_message=user_message, assistant_message=response.message,
+                llm_payload=llm_payload, additional_events=additional_events,
+            )
+            return
         stored = await self._require_stored_task(checkpoint.task_id)
         task = TaskSnapshot.from_data(stored.data)
-        updated = task.with_agent_checkpoint(None if final else checkpoint.to_data())
-        response_diagnostics = self._response_diagnostics(response)
+        updated = task.with_agent_checkpoint(checkpoint.to_data())
         llm_event = RuntimeEvent(
             f"evt-{uuid4().hex}", checkpoint.task_id,
-            stored.last_event_sequence + 1, "llm.completed",
-            {
-                "turn_id": checkpoint.turn_id,
-                "model_call": checkpoint.model_calls,
-                "message": response.message.to_data(),
-                "finish_reason": response.finish_reason.value,
-                "usage": response.usage.to_data(),
-                "response_diagnostics": response_diagnostics,
-                "context_window": context_budget.context_window,
-                "context_estimated_input_tokens": (
-                    context_budget.estimated_input_tokens
-                ),
-                "context_estimation_method": context_budget.estimation_method,
-                "context_budget": context_budget.event_data(),
-                **prompt_receipt.event_data(),
-            },
+            stored.last_event_sequence + 1, "llm.completed", llm_payload,
         )
         extra_events = tuple(
             RuntimeEvent(
@@ -7014,8 +7228,9 @@ class Kernel:
 
         Free-form ``remaining_work`` and ``open_questions`` are intentionally not
         hard gates: they may contain optional ideas. Only explicit Task criteria,
-        the tool-bound Evidence Question lifecycle, required plan steps, and
-        post-mutation verification can reject a proposed final answer.
+        the tool-bound Evidence Question lifecycle, unresolved effect failures,
+        and post-mutation verification can reject a proposed final answer. The
+        model's scratchpad plan is deliberately not a gate.
         """
         task = await self.get_task(task_id)
         events = await self._dependencies.store.read_events(task_id)
@@ -7208,16 +7423,12 @@ class Kernel:
                 candidate_tools=observe_tools if recoverable else (),
             ))
 
-        for step in memory.plan:
-            if step.status not in {
-                WorkingPlanStepStatus.PENDING, WorkingPlanStepStatus.IN_PROGRESS,
-            }:
-                continue
-            gaps.append(CompletionGap(
-                gap_id=f"plan-step:{step.step_id}", kind="PLAN_STEP",
-                description=step.completion_criteria,
-                status=step.status.value, required=True, recoverable=False,
-            ))
+        # The working-memory plan is the model's own scratchpad, not a delivery
+        # contract. Its unfinished steps were previously required gaps, which
+        # let a forgotten scratchpad update override the Runtime's own recorded
+        # facts and dead-lock a Task that had actually finished. It is now only
+        # surfaced as an advisory runtime instruction (see
+        # ``_unfinished_plan_instruction``).
 
         if (
             task.mutation_journal
@@ -7243,7 +7454,80 @@ class Kernel:
                         verification, self._local_interpreter(task)
                     ),
                 ))
+        # Effect-level failures come from the Runtime's own ledger, not from
+        # model prose. A process that exits non-zero returns ok=True, so this is
+        # the only place that turns "the call ran" into "the effect failed".
+        # Skip failures already represented by the stricter post-mutation
+        # verification gap so one failure is not counted twice.
+        specs_by_name = {tool.name: tool for tool in visible_tools}
+        known_mutations = frozenset(
+            mutation.mutation_id for mutation in task.mutation_journal
+        )
+        post_mutation_gap_present = any(
+            gap.kind == "POST_MUTATION_VERIFICATION" for gap in gaps
+        )
+        for fact in project_unresolved_failures(
+            task.tool_executions.values(), specs_by_name,
+            known_mutation_ids=known_mutations,
+        ):
+            if not fact.is_blocking_failure:
+                continue
+            required_effect = fact.required_effect
+            if required_effect is ToolEffect.UNSPECIFIED:
+                continue
+            if (
+                post_mutation_gap_present
+                and required_effect is ToolEffect.EXECUTE
+            ):
+                continue
+            candidates = {
+                ToolEffect.EXECUTE: execute_tools,
+                ToolEffect.MUTATE: mutate_tools,
+                ToolEffect.OBSERVE: observe_tools,
+            }.get(required_effect, ())
+            gaps.append(CompletionGap(
+                gap_id=f"execution-failure:{fact.execution_id}",
+                kind="UNRESOLVED_EFFECT_FAILURE",
+                description=(
+                    f"{fact.tool_name} reported "
+                    f"{fact.failure_code or fact.effect_status.value}"
+                ),
+                status=fact.effect_status.value,
+                required=True,
+                recoverable=True,
+                required_effects=(required_effect,),
+                candidate_tools=candidates,
+                observed=fact.detail,
+            ))
         return tuple(gaps)
+
+    async def _unfinished_plan_instruction(self, task_id: str) -> str | None:
+        """Advisory nudge for an un-updated scratchpad plan.
+
+        The plan is the model's temporary state, not a delivery contract, so an
+        unfinished step must never reject completion. A short instruction keeps
+        the scratchpad honest without letting it override recorded facts.
+        """
+        task = await self.get_task(task_id)
+        events = await self._dependencies.store.read_events(task_id)
+        memory = self._dependencies.working_memory_projector.project(
+            task_id, task.goal, events
+        )
+        unfinished = any(
+            step.status in {
+                WorkingPlanStepStatus.PENDING,
+                WorkingPlanStepStatus.IN_PROGRESS,
+            }
+            for step in memory.plan
+        )
+        if not unfinished:
+            return None
+        return (
+            "Working-memory plan still lists unfinished steps. If the underlying "
+            "work is already done, update the scratchpad with "
+            "core.working_memory_update before finishing; the plan itself is not "
+            "a delivery contract."
+        )
 
     async def _evaluate_completion_readiness(
         self, task_id: str, turn_id: str, checkpoint: AgentTurnCheckpoint,
@@ -7275,6 +7559,23 @@ class Kernel:
         ))
         task = await self.get_task(task_id)
         inventory = EvidenceInventory.from_data(checkpoint.evidence_inventory)
+        specs_by_name = {tool.name: tool for tool in visible_tools}
+        execution_facts = project_execution_facts(
+            task.tool_executions.values(), specs_by_name,
+            known_mutation_ids=frozenset(
+                mutation.mutation_id for mutation in task.mutation_journal
+            ),
+            include_successful=True,
+        )
+        unresolved_failure_facts = tuple(
+            fact for fact in execution_facts
+            if fact.is_blocking_failure
+            and fact.resolution is FactResolution.UNRESOLVED
+        )
+        non_succeeded_ids = {
+            fact.execution_id for fact in execution_facts
+            if fact.effect_status is not EffectStatus.SUCCEEDED
+        }
         probe = CompletionReadinessProbe(
             goal=task.goal, gaps=gaps,
             remaining_model_calls=max(
@@ -7293,8 +7594,10 @@ class Kernel:
             successful_tool_calls=sum(
                 execution.state is ToolCommitState.COMMITTED
                 and execution.result is not None and execution.result.ok
+                and execution.execution_id not in non_succeeded_ids
                 for execution in task.tool_executions.values()
             ),
+            unresolved_failures=unresolved_failure_facts,
         )
         if policy is None:
             decision = CompletionReadinessDecision(
@@ -7318,7 +7621,13 @@ class Kernel:
         await self._append_events(task_id, ((
             "completion.readiness_evaluated", {
                 "turn_id": turn_id, "action": decision.action.value,
+                "raw_action": decision.action.value,
                 "reason": decision.reason,
+                "mode": self.completion_readiness_mode.value,
+                "enforced": (
+                    self.completion_readiness_mode
+                    is CompletionReadinessMode.LEGACY_GATE
+                ),
                 "forced_wrap_up": forced_wrap_up,
                 "remaining_model_calls": probe.remaining_model_calls,
                 "remaining_tool_calls": probe.remaining_tool_calls,
@@ -7331,6 +7640,33 @@ class Kernel:
             },
         ),))
         return decision
+
+    async def _inject_agent_decides_completion_diagnostics(
+        self, checkpoint: AgentTurnCheckpoint,
+        visible_tools: tuple[ToolSpec, ...],
+    ) -> AgentTurnCheckpoint:
+        """Give AGENT_DECIDES factual readiness context without directives."""
+        if self.completion_readiness_mode is not CompletionReadinessMode.AGENT_DECIDES:
+            return checkpoint
+        decision = await self._evaluate_completion_readiness(
+            checkpoint.task_id, checkpoint.turn_id, checkpoint, visible_tools,
+            forced_wrap_up=False,
+        )
+        diagnostic = {
+            "boundary": "completion_readiness_diagnostics",
+            "mode": self.completion_readiness_mode.value,
+            "action": decision.action.value,
+            "reason": decision.reason,
+            "gaps": [gap.to_data() for gap in decision.gaps],
+        }
+        return replace(
+            checkpoint,
+            messages=(*checkpoint.messages, Message(
+                f"completion-diagnostics-{uuid4().hex}", MessageRole.USER,
+                (TextBlock(json.dumps(diagnostic, sort_keys=True,
+                                      separators=(",", ":"))),),
+            )),
+        )
 
     @staticmethod
     def _completion_correction_message(
@@ -8089,7 +8425,12 @@ class Kernel:
         """Verify persisted effects without rerunning model or command side effects."""
         stored = await self._require_stored_task(task_id)
         task = TaskSnapshot.from_data(stored.data)
-        if task.state is not TaskState.VERIFYING:
+        observation_mode = (
+            task.state is TaskState.EXECUTING
+            and self.completion_readiness_mode
+            is not CompletionReadinessMode.LEGACY_GATE
+        )
+        if task.state is not TaskState.VERIFYING and not observation_mode:
             raise InvalidTurnState(
                 f"task {task_id} must be VERIFYING, got {task.state.value}"
             )
@@ -8598,16 +8939,10 @@ class Kernel:
                 record.blocking_reason or "",
             ))
 
-        memory = self._dependencies.working_memory_projector.project(
-            task.task_id, task.goal, events
-        )
-        required_plan_steps = tuple(
-            f"plan-step:{step.step_id}"
-            for step in memory.plan
-            if step.status in {
-                WorkingPlanStepStatus.PENDING, WorkingPlanStepStatus.IN_PROGRESS,
-            }
-        )
+        # Reserved seam: the probe field stays for a future runtime-owned plan
+        # contract, but the model's scratchpad is no longer a delivery contract.
+        # See 完成判定改造SPEC.md §5.5 / §12.2.
+        required_plan_steps: tuple[str, ...] = ()
         readiness_events = [
             event for event in events
             if event.event_type == "completion.readiness_evaluated"
@@ -9007,15 +9342,23 @@ class Kernel:
                 prompt_template=self._dependencies.prompt_template,
                 context_window=self._dependencies.model.capabilities.context_window,
                 max_output_tokens=max_output_tokens,
+                runtime_instruction=_temporal_context_instruction(),
             )
         except ContextWindowExceeded as error:
             await self._record_turn_failure(task_id, turn_id, error)
             raise ModelInvocationFailed(turn_id, str(error)) from error
-        prompt = self._dependencies.prompt_template.assemble(prepared.messages, ())
+        prompt = self._dependencies.prompt_template.assemble(
+            prepared.messages, (), _temporal_context_instruction()
+        )
         request = ModelRequest(
             turn_id=turn_id,
             messages=prompt.messages,
             max_output_tokens=max_output_tokens,
+            conclusion_protocol_mode=(
+                ConclusionProtocolMode.REQUIRE_STRUCTURED
+                if self._dependencies.model.capabilities.structured_conclusion
+                else ConclusionProtocolMode.OBSERVE
+            ),
         )
         try:
             response = await self._dependencies.model.complete(request)
@@ -9028,6 +9371,36 @@ class Kernel:
         except Exception as error:
             await self._record_turn_failure(task_id, turn_id, error, prompt.receipt)
             raise ModelInvocationFailed(turn_id, str(error)) from error
+
+        additional_events: tuple[tuple[str, Mapping[str, Any]], ...] = ()
+        if prepared.compaction is not None:
+            additional_events = (("context.compacted", {
+                "turn_id": turn_id, "model_call": 1,
+                **prepared.compaction.event_data(),
+            }),)
+        await self._commit_final_agent_result(
+            task_id=task_id, turn_id=turn_id, user_message=user_message,
+            assistant_message=response.message,
+            llm_payload={
+                "turn_id": turn_id,
+                "message": response.message.to_data(),
+                "finish_reason": response.finish_reason.value,
+                "usage": response.usage.to_data(),
+                "response_diagnostics": self._response_diagnostics(response),
+                "context_window": prepared.budget.context_window,
+                "context_estimated_input_tokens": prepared.budget.estimated_input_tokens,
+                "context_estimation_method": prepared.budget.estimation_method,
+                "context_budget": prepared.budget.event_data(),
+                **prompt.receipt.event_data(),
+            },
+            additional_events=additional_events,
+            clear_agent_checkpoint=False,
+        )
+        return TurnResult(
+            turn_id=turn_id, task_id=task_id,
+            assistant_message=response.message,
+            finish_reason=response.finish_reason, usage=response.usage,
+        )
 
         after_model = await self._dependencies.store.load_task(task_id)
         if after_model is None:
@@ -10205,6 +10578,9 @@ class Kernel:
             checkpoint, task_spec_revision=live_spec.revision,
             task_spec_hash=live_spec.content_hash,
         )
+        checkpoint = await self._inject_agent_decides_completion_diagnostics(
+            checkpoint, visible_tools
+        )
         messages = list(checkpoint.messages)
         if initial_tool_message is not None:
             messages.append(initial_tool_message)
@@ -11220,6 +11596,24 @@ class Kernel:
                     last_tool_error = (
                         f"{call.name}: {result.error_code or 'TOOL_ERROR'}"
                     )
+                else:
+                    # A command that exits non-zero returns ok=True: the call
+                    # ran, the effect failed. Surface it here so the model is
+                    # told the real outcome instead of a silent success.
+                    live_spec = visible_tool_by_name.get(call.name)
+                    classified = (
+                        classify_effect_status(
+                            live_spec.effect, live_spec.result_authority,
+                            invocation_state=ToolCommitState.COMMITTED,
+                            ok=True, data=result.data,
+                        )
+                        if live_spec is not None else None
+                    )
+                    if (
+                        classified is not None
+                        and classified[0] is EffectStatus.FAILED
+                    ):
+                        last_tool_error = f"{call.name}: {classified[1]}"
                 tool_call_count = next_tool_count
                 messages.append(
                     Message(
@@ -11334,13 +11728,17 @@ class Kernel:
             completion_state = CompletionReadinessState.from_data(
                 checkpoint.completion_readiness_state
             )
-            disclosure_only = (
+            legacy_completion_gate = (
+                self.completion_readiness_mode
+                is CompletionReadinessMode.LEGACY_GATE
+            )
+            disclosure_only = legacy_completion_gate and (
                 completion_state.last_action in {
                     CompletionReadinessAction.REPORT_BLOCKED.value,
                     CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE.value,
                 }
             )
-            wrap_up = (
+            wrap_up = legacy_completion_gate and (
                 remaining_model_calls <= wrap_up_threshold
                 or no_progress_stop
                 or budget_wrap_up
@@ -11365,7 +11763,13 @@ class Kernel:
             )
             recovery_batch = self._latest_recoverable_tool_batch(messages)
             recovery_result = recovery_batch[-1] if recovery_batch else None
-            structured_recovery = recovery_result is not None
+            # An effect-level failure produces an explicit gap even though the
+            # call itself returned ok=True, so it must open the same recovery
+            # barrier as a retryable tool error.
+            structured_recovery = recovery_result is not None or any(
+                gap.kind == "UNRESOLVED_EFFECT_FAILURE"
+                for gap in required_gaps
+            )
             # A soft exploration stop must not consume capacity reserved for a
             # known recovery or a required executable outcome. Keep one final
             # model call, while allowing the preceding call to use tools.
@@ -11514,10 +11918,20 @@ class Kernel:
                     "blocker. Never ask the user to increase or unlock an internal "
                     "budget."
                 )
-            if protocol_correction is not None:
-                runtime_instruction = "\n\n".join(filter(None, (
-                    runtime_instruction, protocol_correction,
-                )))
+            if not legacy_completion_gate:
+                # Non-legacy modes may record factual diagnostics but must not
+                # turn readiness, recovery, or budget signals into commands.
+                runtime_instruction = None
+            # Anchor the model to the host clock on every call. Without it the
+            # model falls back to its training prior, calls genuinely current
+            # search results (which carry a real publish date) "future" or
+            # "simulated", and answers from stale recollection instead.
+            runtime_instruction = "\n\n".join(filter(None, (
+                _temporal_context_instruction(),
+                runtime_instruction,
+                await self._unfinished_plan_instruction(task_id),
+                protocol_correction,
+            )))
             live_spec = await self.get_task_spec(task_id)
             # Tool availability is stable within a turn. Outcome completion is
             # legacy-only and is never advertised for new runtime calls.
@@ -11626,6 +12040,11 @@ class Kernel:
                     self._dependencies.require_evidence_questions
                 ),
                 on_transport_progress=record_transport,
+                conclusion_protocol_mode=(
+                    ConclusionProtocolMode.REQUIRE_STRUCTURED
+                    if self._dependencies.model.capabilities.structured_conclusion
+                    else ConclusionProtocolMode.OBSERVE
+                ),
             )
             model_started_at = time.monotonic()
             live_goal = (await self.get_task(task_id)).goal
@@ -11944,6 +12363,10 @@ class Kernel:
                     response_checkpoint.completion_readiness_state
                 ),
             )
+            legacy_completion_gate = (
+                self.completion_readiness_mode
+                is CompletionReadinessMode.LEGACY_GATE
+            )
             if not tool_calls and not has_late_steering:
                 readiness = await self._evaluate_completion_readiness(
                     task_id, turn_id, response_checkpoint, visible_tools,
@@ -11954,7 +12377,7 @@ class Kernel:
                     completion_readiness_state=readiness.state.to_data(),
                 )
                 renewal_events: tuple[tuple[str, Mapping[str, Any]], ...] = ()
-                renewable_action = (
+                renewable_action = legacy_completion_gate and (
                     readiness.action in {
                         CompletionReadinessAction.CONTINUE,
                         CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE,
@@ -11998,7 +12421,7 @@ class Kernel:
                     ),
                     required_recoverable_work=required_recoverable_work,
                 )
-                if renewal is not None:
+                if legacy_completion_gate and renewal is not None:
                     renewed_state = CompletionReadinessState(
                         continue_attempts=0,
                         disclosure_attempts=0,
@@ -12044,12 +12467,24 @@ class Kernel:
                     }),)
             else:
                 renewal_events = ()
-            unmet_acceptance_criteria = any(
-                gap.gap_id.startswith("task-spec:") and gap.required
-                for gap in readiness.gaps
+            if (
+                not legacy_completion_gate
+                and not tool_calls
+                and not has_late_steering
+            ):
+                readiness = CompletionReadinessDecision(
+                    CompletionReadinessAction.COMPLETE,
+                    "diagnostic_only", readiness.state, readiness.gaps,
+                )
+            unmet_acceptance_criteria = (
+                legacy_completion_gate and any(
+                    gap.gap_id.startswith("task-spec:") and gap.required
+                    for gap in readiness.gaps
+                )
             )
             if (
-                unmet_acceptance_criteria
+                legacy_completion_gate
+                and unmet_acceptance_criteria
                 and readiness.action is CompletionReadinessAction.COMPLETE
                 and not disclosure_only
             ):
@@ -12076,10 +12511,12 @@ class Kernel:
                 and readiness.action is CompletionReadinessAction.REPORT_BLOCKED
             )
             incomplete_recovery_boundary = bool(
-                (final_response and disclosure_only
-                 and completion_state.last_action
-                 == CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE.value)
-                or acceptance_incomplete_boundary
+                legacy_completion_gate and (
+                    (final_response and disclosure_only
+                     and completion_state.last_action
+                     == CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE.value)
+                    or acceptance_incomplete_boundary
+                )
             )
             await self._commit_model_response_checkpoint(
                 response_checkpoint, response, prompt.receipt, prepared.budget,
@@ -12168,9 +12605,6 @@ class Kernel:
                 ), None)
                 if source_user_message is None:
                     raise RuntimeError("Agent turn lost its source user message")
-                await self._record_session_task_result(
-                    task_id, turn_id, source_user_message, response.message
-                )
                 return AgentTurnResult(
                     turn_id=turn_id,
                     task_id=task_id,
@@ -14942,6 +15376,8 @@ class Kernel:
             effective_risk=effective_risk,
             approval_request_id=approval_request_id,
             idempotency=selected_spec.idempotency,
+            effect=selected_spec.effect,
+            result_authority=selected_spec.result_authority,
         )
         prepared_task = task.with_tool_execution(execution)
         if next_state is not None:
@@ -15177,6 +15613,10 @@ class Kernel:
                 "turn_id": turn_id,
                 "invocation_id": invocation_id,
                 "result": result.to_data(),
+                "fact_descriptor": (
+                    result.fact_descriptor.to_data()
+                    if result.fact_descriptor is not None else None
+                ),
                 "execution_id": execution.execution_id,
                 "outcome_ref": call.outcome_ref,
                 "commit_state": commit_state.value,

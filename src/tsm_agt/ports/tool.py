@@ -302,6 +302,72 @@ class ToolCall:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolFactDescriptor:
+    """A normalized description of facts observable from a tool result.
+
+    This is evidence metadata only: it cannot assert business completion or
+    repair.  ``ToolResult.meta`` remains opaque compatibility metadata.
+    """
+
+    authority: str
+    scope: tuple[str, ...] = ()
+    artifact_refs: tuple[str, ...] = ()
+    observed_at: str | None = None
+    content_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.authority, str) or not self.authority.strip():
+            raise ValueError("tool fact authority must be a non-empty string")
+        for name in ("scope", "artifact_refs"):
+            values = getattr(self, name)
+            if any(not isinstance(value, str) or not value.strip() for value in values):
+                raise ValueError(f"tool fact {name} must contain non-empty strings")
+        for name in ("observed_at", "content_hash"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"tool fact {name} must be a non-empty string when present")
+
+    def to_data(self) -> dict[str, object]:
+        data: dict[str, object] = {
+            "authority": self.authority,
+            "scope": list(self.scope),
+            "artifact_refs": list(self.artifact_refs),
+        }
+        if self.observed_at is not None:
+            data["observed_at"] = self.observed_at
+        if self.content_hash is not None:
+            data["content_hash"] = self.content_hash
+        return data
+
+    @classmethod
+    def from_data(cls, data: Mapping[str, Any]) -> ToolFactDescriptor:
+        authority = data.get("authority")
+        if not isinstance(authority, str) or not authority.strip():
+            raise ValueError("tool fact authority must be a non-empty string")
+        def strings(name: str) -> tuple[str, ...]:
+            values = data.get(name, [])
+            if not isinstance(values, list) or any(
+                not isinstance(value, str) or not value.strip() for value in values
+            ):
+                raise ValueError(f"tool fact {name} must be a list of non-empty strings")
+            return tuple(values)
+        def optional_string(name: str) -> str | None:
+            value = data.get(name)
+            if value is None:
+                return None
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"tool fact {name} must be a non-empty string when present")
+            return value
+        return cls(
+            authority=authority,
+            scope=strings("scope"),
+            artifact_refs=strings("artifact_refs"),
+            observed_at=optional_string("observed_at"),
+            content_hash=optional_string("content_hash"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ToolResult:
     call_id: str
     ok: bool
@@ -314,6 +380,7 @@ class ToolResult:
     recovery_action: Mapping[str, Any] = field(default_factory=dict)
     truncated: bool = False
     meta: Mapping[str, Any] = field(default_factory=dict)
+    fact_descriptor: ToolFactDescriptor | None = None
 
     def __post_init__(self) -> None:
         if not self.call_id.strip():
@@ -326,6 +393,10 @@ class ToolResult:
             raise ValueError("successful tool result cannot require recovery")
         if self.ok and self.recovery_action:
             raise ValueError("successful tool result cannot have a recovery action")
+        if self.fact_descriptor is not None and not isinstance(
+            self.fact_descriptor, ToolFactDescriptor
+        ):
+            raise ValueError("tool result fact_descriptor must be ToolFactDescriptor")
 
     @property
     def effective_recovery_kind(self) -> ToolRecoveryKind:
@@ -354,6 +425,8 @@ class ToolResult:
             result["recovery_kind"] = self.effective_recovery_kind.value
             if self.recovery_action:
                 result["recovery_action"] = dict(self.recovery_action)
+        if self.fact_descriptor is not None:
+            result["fact_descriptor"] = self.fact_descriptor.to_data()
         return result
 
     @classmethod
@@ -364,6 +437,9 @@ class ToolResult:
         recovery_action = data.get("recovery_action", {})
         if not isinstance(recovery_action, Mapping):
             raise ValueError("tool result recovery_action must be an object")
+        raw_fact_descriptor = data.get("fact_descriptor")
+        if raw_fact_descriptor is not None and not isinstance(raw_fact_descriptor, Mapping):
+            raise ValueError("tool result fact_descriptor must be an object")
         return cls(
             call_id=str(data["call_id"]),
             ok=bool(data["ok"]),
@@ -380,6 +456,10 @@ class ToolResult:
             recovery_action=dict(recovery_action),
             truncated=bool(data.get("truncated", False)),
             meta=dict(meta),
+            fact_descriptor=(
+                ToolFactDescriptor.from_data(raw_fact_descriptor)
+                if isinstance(raw_fact_descriptor, Mapping) else None
+            ),
         )
 
 

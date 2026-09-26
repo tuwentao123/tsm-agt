@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,12 +21,15 @@ from tsm_agt.core import (
     InterruptTaskInput, RuntimeTextInput, SessionTextInput,
     SessionAnswerRequiresTask,
     SessionInputDecision, SessionRouteDisposition, SessionTaskRelation,
+    SessionSnapshot,
     TaskRuntimeProjection, TaskRuntimeProjector,
     TaskSnapshot, TaskState, build_session_follow_up_goal,
     canonical_hash, SteeringKind, RuntimeInputIntent,
 )
 from tsm_agt.ports import (
-    ImageBlock, RuntimeCommandRecord, RuntimeStorePort, TextBlock,
+    CompletionReadinessMode, ImageBlock, RuntimeCommandRecord,
+    RuntimeStorePort, SessionInputRelation, SessionInputRelationJudgement,
+    SessionInputRelationPort, TextBlock,
 )
 
 
@@ -88,6 +91,10 @@ class RuntimeTaskResult:
     verification: Mapping[str, Any] | None = None
     evidence_level: Mapping[str, Any] | None = None
     projection: Mapping[str, Any] | None = None
+    latest_answer_event_ref: str | None = None
+    conclusion_claims: tuple[Mapping[str, Any], ...] = ()
+    conclusion_validation: Mapping[str, Any] | None = None
+    completion_diagnostics: Mapping[str, Any] | None = None
 
     def to_data(self) -> dict[str, Any]:
         return {
@@ -104,6 +111,16 @@ class RuntimeTaskResult:
                 dict(self.evidence_level) if self.evidence_level else None
             ),
             "projection": dict(self.projection) if self.projection else None,
+            "latest_answer_event_ref": self.latest_answer_event_ref,
+            "conclusion_claims": [dict(item) for item in self.conclusion_claims],
+            "conclusion_validation": (
+                dict(self.conclusion_validation)
+                if self.conclusion_validation is not None else None
+            ),
+            "completion_diagnostics": (
+                dict(self.completion_diagnostics)
+                if self.completion_diagnostics is not None else None
+            ),
         }
 
 
@@ -142,9 +159,36 @@ class SessionTextResult:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class UserInputResult:
+    """Outcome of one unified user input, independent of the calling client."""
+
+    command_id: str
+    kind: str
+    relation: str
+    reason_code: str
+    decision: Mapping[str, Any] | None = None
+    task: RuntimeTaskResult | None = None
+    answer: str | None = None
+    clarification: str | None = None
+    routed_task_id: str | None = None
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "command_id": self.command_id,
+            "kind": self.kind,
+            "relation": self.relation,
+            "reason_code": self.reason_code,
+            "decision": dict(self.decision) if self.decision else None,
+            "task": self.task.to_data() if self.task else None,
+            "answer": self.answer,
+            "clarification": self.clarification,
+            "routed_task_id": self.routed_task_id,
+        }
+
+
 class EngineeringAgentClient:
     """Async SDK facade; it owns Adapter lifecycle, never reimplements the loop."""
-
     def __init__(
         self, workspace: Path, *,
         application_factory: Callable[[], Application] | None = None,
@@ -167,6 +211,8 @@ class EngineeringAgentClient:
         self._progress_sequences: dict[str, int] = {}
         self._progress_changed = asyncio.Condition()
         self._submit_lock = asyncio.Lock()
+        # One foreground Task per Session: serialize inputs per Session id.
+        self._session_input_locks: dict[str, asyncio.Lock] = {}
 
     @property
     def application(self) -> Application:
@@ -398,6 +444,274 @@ class EngineeringAgentClient:
             }, execute, lambda result: result.to_data(),
         )
 
+    # A relation must be at least this confident to override the safe default.
+    _RELATION_CONFIDENCE_FLOOR = 0.85
+    _RUNNING_TASK_STATES = frozenset({
+        TaskState.EXECUTING, TaskState.RUNNING_WORKFLOW,
+    })
+    _TRANSITIONAL_TASK_STATES = frozenset({
+        TaskState.CREATED, TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+        TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING, TaskState.PLANNING,
+        TaskState.VERIFYING, TaskState.FINALIZING, TaskState.INTERRUPTING,
+        TaskState.RESUMING,
+    })
+    _INTERRUPTIBLE_TASK_STATES = frozenset({
+        TaskState.EXECUTING, TaskState.RUNNING_WORKFLOW,
+        TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER,
+    })
+
+    async def submit_user_input(
+        self, session_id: str, text: str, *, input_id: str,
+        explicit_intent: RuntimeInputIntent | None = None,
+        target_task_id: str | None = None,
+        images: tuple[ImageBlock, ...] = (),
+        workspace: Path | None = None,
+    ) -> RuntimeCommandResult:
+        """One entry point for every client (Web / CLI / SDK).
+
+        The client only names the Session and, optionally, an explicit intent.
+        Core owns the routing decision; clients never pick a router.
+        """
+        normalized = text.strip()
+        if not normalized and explicit_intent is not RuntimeInputIntent.INTERRUPT:
+            raise ValueError("user input text must not be empty")
+        if not input_id.strip():
+            raise ValueError("input_id must not be empty")
+        image_blocks = tuple(images)
+        resolved_workspace = workspace or self.workspace
+        lock = self._session_input_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            return await self._route_user_input(
+                session_id, normalized, input_id,
+                explicit_intent=explicit_intent,
+                target_task_id=target_task_id,
+                image_blocks=image_blocks, workspace=resolved_workspace,
+            )
+
+    async def _route_user_input(
+        self, session_id: str, text: str, input_id: str, *,
+        explicit_intent: RuntimeInputIntent | None,
+        target_task_id: str | None,
+        image_blocks: tuple[ImageBlock, ...],
+        workspace: Path,
+    ) -> RuntimeCommandResult:
+        session = await self._ensure_session(session_id, text)
+        active = await self._active_task(target_task_id or session.active_task_id)
+
+        # (0) The foreground Task is between stable states: never start a second
+        #     one, and never steer a Task that cannot absorb steering yet.
+        if active is not None and active.state in self._TRANSITIONAL_TASK_STATES:
+            return RuntimeCommandResult(input_id, False, UserInputResult(
+                input_id, "busy", SessionInputRelation.UNKNOWN.value,
+                "task_processing_retry",
+                clarification=(
+                    "当前任务正在处理中，请稍后重试，或使用显式命令。"
+                ),
+                routed_task_id=active.task_id,
+            ).to_data())
+
+        # (1) An explicit client intent always wins and never uses the judge.
+        if explicit_intent is not None:
+            return await self._apply_explicit_intent(
+                session_id, text, input_id, explicit_intent, active,
+                image_blocks, workspace,
+            )
+        # (2) Attachments always start a fresh Task: steering is text-only.
+        if image_blocks:
+            return await self._delegate_session_text(
+                session_id, text, input_id, image_blocks, workspace, None,
+            )
+        # (3) Waiting for the user: never reinterpret plain text as a new topic.
+        if active is not None and active.state in {
+            TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER,
+        }:
+            return RuntimeCommandResult(input_id, False, UserInputResult(
+                input_id, "clarify", SessionInputRelation.UNKNOWN.value,
+                "task_awaits_user_action",
+                clarification=(
+                    "当前任务正在等待审批或回答，请通过对应通道回复，"
+                    "或使用显式命令（/new、/stop）。"
+                ),
+                routed_task_id=active.task_id,
+            ).to_data())
+        # (4) Running Task: one general judge decides the relation.
+        if active is not None and active.state in self._RUNNING_TASK_STATES:
+            judgement = await self._judge_relation(text, session_id, active)
+            relation = judgement.relation
+            reason = judgement.reason_code
+            if (
+                relation is not SessionInputRelation.SUPPLEMENT
+                and judgement.confidence < self._RELATION_CONFIDENCE_FLOOR
+            ):
+                relation = SessionInputRelation.SUPPLEMENT
+                reason = "below_confidence_floor_supplement"
+            if relation is SessionInputRelation.SUPPLEMENT:
+                return await self._steer_active(
+                    text, input_id, active, relation, reason,
+                    RuntimeInputIntent.STEER,
+                )
+            if relation is SessionInputRelation.REPLACE:
+                return await self._steer_active(
+                    text, input_id, active, relation, reason,
+                    RuntimeInputIntent.REPLACE,
+                )
+            if relation is SessionInputRelation.UNRELATED:
+                await self._stop_active_task(active.task_id, input_id)
+            return await self._delegate_session_text(
+                session_id, text, input_id, image_blocks, workspace, relation,
+            )
+        # (5) No running Task: existing Session routing creates/answers/clarifies.
+        return await self._delegate_session_text(
+            session_id, text, input_id, image_blocks, workspace, None,
+        )
+
+    async def _ensure_session(self, session_id: str, text: str) -> SessionSnapshot:
+        kernel = self.application.kernel
+        try:
+            return await kernel.get_session(session_id)
+        except LookupError:
+            return await kernel.create_session(text[:120], session_id=session_id)
+
+    async def _active_task(self, task_id: str | None) -> TaskSnapshot | None:
+        if not task_id:
+            return None
+        try:
+            return await self.application.kernel.get_task(task_id)
+        except LookupError:
+            return None
+
+    async def _judge_relation(
+        self, text: str, session_id: str, active: TaskSnapshot,
+    ) -> SessionInputRelationJudgement:
+        judges = self.application.registry.all(SessionInputRelationPort)
+        if not judges:
+            return SessionInputRelationJudgement(
+                SessionInputRelation.SUPPLEMENT, 0.0,
+                "no_relation_judge_registered_supplement",
+            )
+        try:
+            conversation = await self.application.kernel.get_session_conversation(
+                session_id
+            )
+            recent = [
+                {
+                    "role": message.role.value, "text": message.text,
+                    "task_id": message.task_id,
+                }
+                for message in conversation.messages[-12:]
+            ]
+        except (LookupError, RuntimeError, ValueError):
+            recent = []
+        context = {
+            "session_id": session_id,
+            "recent_messages": recent,
+            "active_task": {
+                "task_id": active.task_id, "state": active.state.value,
+                "goal": active.goal,
+            },
+        }
+        try:
+            return await judges[0].judge_input_relation(text, context)
+        except Exception:
+            # A judge failure must not change the Task: fall back to supplement.
+            return SessionInputRelationJudgement(
+                SessionInputRelation.SUPPLEMENT, 0.0,
+                "relation_judge_failed_supplement",
+            )
+
+    async def _steer_active(
+        self, text: str, input_id: str, active: TaskSnapshot,
+        relation: SessionInputRelation, reason: str,
+        explicit_intent: RuntimeInputIntent,
+    ) -> RuntimeCommandResult:
+        # Delegate to the Kernel's live-input router so steering, approval
+        # supersession and idempotency are identical across Web, CLI and SDK.
+        route = await self.application.kernel.dispatch_input_event(
+            RuntimeTextInput(active.task_id, text, input_id, explicit_intent)
+        )
+        task = await self.get_task_result(active.task_id)
+        return RuntimeCommandResult(input_id, False, {
+            "kind": (
+                "replaced" if relation is SessionInputRelation.REPLACE
+                else "steered"
+            ),
+            "relation": relation.value,
+            "reason_code": getattr(route, "reason_code", reason),
+            "applied": getattr(route, "applied", True),
+            "routed_task_id": active.task_id,
+            "task": task.to_data(),
+        })
+
+    async def _stop_active_task(self, task_id: str, input_id: str) -> None:
+        task = await self._active_task(task_id)
+        if task is None or task.state not in self._INTERRUPTIBLE_TASK_STATES:
+            return
+        try:
+            await self.interrupt(
+                task_id, command_id=f"{input_id}:stop",
+                reason="superseded by new user input",
+            )
+        except (RuntimeError, ValueError):
+            # Best effort: failing to stop the old Task must not block the new.
+            pass
+
+    async def _delegate_session_text(
+        self, session_id: str, text: str, input_id: str,
+        image_blocks: tuple[ImageBlock, ...], workspace: Path,
+        relation: SessionInputRelation | None,
+    ) -> RuntimeCommandResult:
+        result = await self.submit_session_text(
+            session_id, text, command_id=input_id, images=image_blocks,
+            workspace=workspace,
+        )
+        if relation is None:
+            return result
+        data = dict(result.result)
+        data["relation"] = relation.value
+        return RuntimeCommandResult(result.command_id, result.replayed, data)
+
+    async def _apply_explicit_intent(
+        self, session_id: str, text: str, input_id: str,
+        intent: RuntimeInputIntent, active: TaskSnapshot | None,
+        image_blocks: tuple[ImageBlock, ...], workspace: Path,
+    ) -> RuntimeCommandResult:
+        if intent is RuntimeInputIntent.INTERRUPT:
+            if active is None:
+                raise ValueError("interrupt requires an active Task")
+            inner = await self.interrupt(
+                active.task_id, command_id=input_id,
+                reason="interrupted by explicit user command",
+            )
+            data = dict(inner.result)
+            data.update({
+                "kind": "interrupted", "relation": "EXPLICIT",
+                "reason_code": "explicit_interrupt",
+                "routed_task_id": active.task_id,
+            })
+            return RuntimeCommandResult(inner.command_id, inner.replayed, data)
+        if intent is RuntimeInputIntent.NEW_TASK:
+            if active is not None:
+                await self._stop_active_task(active.task_id, input_id)
+            return await self._delegate_session_text(
+                session_id, text, input_id, image_blocks, workspace, None,
+            )
+        if active is not None and active.state in self._RUNNING_TASK_STATES:
+            if intent is RuntimeInputIntent.STEER:
+                return await self._steer_active(
+                    text, input_id, active,
+                    SessionInputRelation.SUPPLEMENT, "explicit_steer",
+                    RuntimeInputIntent.STEER,
+                )
+            if intent is RuntimeInputIntent.REPLACE:
+                return await self._steer_active(
+                    text, input_id, active,
+                    SessionInputRelation.REPLACE, "explicit_replace",
+                    RuntimeInputIntent.REPLACE,
+                )
+        return await self._delegate_session_text(
+            session_id, text, input_id, image_blocks, workspace, None,
+        )
+
     async def _run_submitted_task(
         self, task_id: str, goal: str, *, images: tuple[ImageBlock, ...] = (),
     ) -> RuntimeTaskResult:
@@ -514,7 +828,8 @@ class EngineeringAgentClient:
         stored = await self._store().load_task(task_id)
         assert stored is not None
         events = await self._store().read_events(task_id)
-        projection = TaskRuntimeProjector.project(task, events).to_data()
+        projected = TaskRuntimeProjector.project(task, events)
+        projection = projected.to_data()
         cached = self._latest_results.get(task_id)
         assistant_text = (
             cached.assistant_text
@@ -530,6 +845,10 @@ class EngineeringAgentClient:
             verification=cached.verification if cached else None,
             evidence_level=cached.evidence_level if cached else None,
             projection=projection,
+            latest_answer_event_ref=projected.latest_answer_event_ref,
+            conclusion_claims=projected.conclusion_claims,
+            conclusion_validation=projected.conclusion_validation,
+            completion_diagnostics=_completion_diagnostics(events),
         )
 
     async def read_events(
@@ -815,9 +1134,9 @@ class EngineeringAgentClient:
             task_result = await self.get_task_result(result.task_id)
         elif isinstance(result, AgentClarificationSuspended):
             base = await self.get_task_result(result.task_id)
-            task_result = RuntimeTaskResult(
-                base.task_id, base.state, base.phase1_state, "awaiting_user",
-                base.cursor,
+            task_result = replace(
+                base,
+                status="awaiting_user",
                 clarification={
                     "request_id": result.request_id,
                     "question": result.question, "reason": result.reason,
@@ -833,9 +1152,9 @@ class EngineeringAgentClient:
             )
         elif isinstance(result, AgentContinuationSuspended):
             base = await self.get_task_result(result.task_id)
-            task_result = RuntimeTaskResult(
-                base.task_id, base.state, base.phase1_state, "awaiting_user",
-                base.cursor,
+            task_result = replace(
+                base,
+                status="awaiting_user",
                 assistant_text=result.assistant_message.text,
                 clarification={
                     "kind": "CONTINUATION",
@@ -849,27 +1168,32 @@ class EngineeringAgentClient:
             )
         elif isinstance(result, AgentTurnResult):
             kernel = self.application.kernel
-            await kernel.transition_task(
-                result.task_id, TaskState.VERIFYING, "SDK verifier started"
-            )
-            verification = await kernel.verify_task_acceptance(result.task_id)
-            if verification.passed:
+            if kernel.completion_readiness_mode is CompletionReadinessMode.LEGACY_GATE:
                 await kernel.transition_task(
-                    result.task_id, TaskState.FINALIZING, "SDK finalizing"
+                    result.task_id, TaskState.VERIFYING, "SDK verifier started"
                 )
-                await kernel.transition_task(
-                    result.task_id, TaskState.SUCCEEDED, "SDK succeeded"
-                )
+                verification = await kernel.verify_task_acceptance(result.task_id)
+                if verification.passed:
+                    await kernel.transition_task(
+                        result.task_id, TaskState.FINALIZING, "SDK finalizing"
+                    )
+                    await kernel.transition_task(
+                        result.task_id, TaskState.SUCCEEDED, "SDK succeeded"
+                    )
+                else:
+                    await kernel.transition_task(
+                        result.task_id, TaskState.FAILED,
+                        f"SDK verifier {verification.status.value}",
+                    )
             else:
-                await kernel.transition_task(
-                    result.task_id, TaskState.FAILED,
-                    f"SDK verifier {verification.status.value}",
-                )
+                # Diagnostics remain observable, but only an explicit caller
+                # decision may advance or fail the Task outside legacy gating.
+                verification = await kernel.verify_task_acceptance(result.task_id)
             base = await self.get_task_result(result.task_id)
-            task_result = RuntimeTaskResult(
-                base.task_id, base.state, base.phase1_state,
-                _status_for_state(TaskState(base.state)),
-                base.cursor, assistant_text=result.assistant_message.text,
+            task_result = replace(
+                base,
+                status=_status_for_state(TaskState(base.state)),
+                assistant_text=result.assistant_message.text,
                 verification={
                     "status": verification.status.value,
                     "passed": verification.passed,
@@ -940,6 +1264,15 @@ def _session_decision_data(decision: SessionInputDecision) -> dict[str, Any]:
         "clarification": decision.clarification,
         "candidate_task_ids": list(decision.candidate_task_ids),
     }
+
+
+def _completion_diagnostics(
+    events: tuple[Any, ...] | list[Any],
+) -> Mapping[str, Any] | None:
+    for event in reversed(events):
+        if event.event_type == "completion.readiness_evaluated":
+            return dict(event.payload)
+    return None
 
 
 def _status_for_state(state: TaskState) -> str:

@@ -55,6 +55,17 @@ def _selected(
     return default, "default"
 
 
+def _unquoted(value: str) -> str:
+    """Return an unquoted dotenv value with any trailing `` # comment`` removed."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    for marker in (" #", "\t#"):
+        index = value.find(marker)
+        if index != -1:
+            value = value[:index]
+    return value.strip()
+
+
 def _read_values(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
@@ -68,7 +79,5 @@ def _read_values(path: Path) -> dict[str, str]:
         name, value = (part.strip() for part in line.split("=", 1))
         if name not in EGRESS_ENV_NAMES:
             continue
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        values[name] = value
+        values[name] = _unquoted(value)
     return values

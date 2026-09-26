@@ -10,9 +10,12 @@ from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import ApprovalDecision, TaskState
 from tsm_agt.ports import (
-    AdapterDescriptor, FinishReason, Message, MessageRole, ModelRequest,
-    ModelResponse, ModelUsage, ProviderCapabilities, TextBlock, ToolCall,
+    AdapterDescriptor, CompletionReadinessMode, FinishReason, Message,
+    MessageRole, ModelRequest,
+    ModelResponse, ModelUsage, ProviderCapabilities, RuntimeStorePort, TextBlock,
+    ToolCall,
     ToolCallBlock, ToolIdempotency, ToolResult, ToolResultBlock, ToolRisk, ToolSpec,
+    RuntimeEvent, RuntimeUnitOfWork,
 )
 from tsm_agt.sdk import EngineeringAgentClient
 
@@ -191,6 +194,38 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertFalse(any(
                     "payload" in event.to_data() for event in all_events
+                ))
+
+    async def test_non_legacy_mode_reports_verification_without_finalizing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+                completion_readiness_mode=CompletionReadinessMode.OBSERVE_ONLY,
+            )
+            client = EngineeringAgentClient(
+                root, application_factory=lambda: application, poll_interval=0.001
+            )
+            async with client:
+                accepted = await client.submit_task(
+                    "observe completion", command_id="sdk-observe-create"
+                )
+                final = await client.wait_task(accepted.task_id, timeout=5)
+                self.assertEqual(final.state, TaskState.EXECUTING.value)
+                self.assertEqual(final.status, "running")
+                self.assertIsNotNone(final.verification)
+                self.assertTrue(final.verification["passed"])
+                self.assertIsNotNone(final.completion_diagnostics)
+                events = await application.registry.require(RuntimeStorePort).read_events(
+                    final.task_id
+                )
+                self.assertFalse(any(
+                    event.event_type == "task.state_changed"
+                    and event.payload.get("next_state") in {
+                        TaskState.VERIFYING.value, TaskState.FINALIZING.value,
+                        TaskState.SUCCEEDED.value, TaskState.FAILED.value,
+                    }
+                    for event in events
                 ))
 
     async def test_subscribe_from_acknowledged_cursor_has_no_gap_or_duplicate(self) -> None:
@@ -395,6 +430,51 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertTrue(replayed.replayed)
                 self.assertEqual(replayed.result, resolved.result)
+    async def test_v3_projection_fields_survive_sqlite_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "runtime.db"
+            first = fixture_client(root, SQLiteRuntimeStore(database))
+            async with first:
+                created = await first.create_task(
+                    "recover V3 result", command_id="sdk-v3-create"
+                )
+                stored = await first._store().load_task(created.task_id)
+                assert stored is not None
+                snapshot = await first.application.kernel.get_task(created.task_id)
+                await first._store().commit(RuntimeUnitOfWork(
+                    created.task_id,
+                    stored.version,
+                    snapshot.to_data(),
+                    (RuntimeEvent(
+                        "evt-v3-conclusion", created.task_id,
+                        stored.last_event_sequence + 1,
+                        "conclusion.recorded", {
+                            "latest_answer_event_ref": "evt-v3-answer",
+                            "conclusion_claims": [{
+                                "claim_id": "claim-v3", "kind": "checked",
+                                "summary": "restart-safe structured result",
+                            }],
+                            "conclusion_validation": {
+                                "status": "valid",
+                                "claims": [{
+                                    "claim_id": "claim-v3", "status": "valid",
+                                }],
+                            },
+                        },
+                    ),),
+                ))
+
+            restarted = fixture_client(root, SQLiteRuntimeStore(database))
+            async with restarted:
+                result = await restarted.get_task_result(created.task_id)
+
+        self.assertEqual(result.latest_answer_event_ref, "evt-v3-answer")
+        self.assertEqual(result.conclusion_claims[0]["claim_id"], "claim-v3")
+        self.assertEqual(result.conclusion_validation["status"], "valid")
+        self.assertEqual(
+            result.to_data()["latest_answer_event_ref"], "evt-v3-answer"
+        )
 
 
 if __name__ == "__main__":

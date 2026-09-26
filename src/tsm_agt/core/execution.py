@@ -9,7 +9,10 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
 
-from tsm_agt.ports import ToolCall, ToolIdempotency, ToolResult, ToolRisk
+from tsm_agt.ports import (
+    ToolCall, ToolEffect, ToolIdempotency, ToolResult, ToolResultAuthority,
+    ToolRisk,
+)
 
 
 class ToolCommitState(StrEnum):
@@ -40,6 +43,11 @@ class ToolExecutionRecord:
     reconciled_outcome: str | None = None
     reconciliation_ref: str | None = None
     reconciled_at: datetime | None = None
+    #: Frozen effect semantics of the ToolSpec at execution time. Recorded so a
+    #: later ToolSpec change cannot rewrite how history is judged. Defaults keep
+    #: historical snapshots decodable.
+    effect: ToolEffect = ToolEffect.UNSPECIFIED
+    result_authority: ToolResultAuthority = ToolResultAuthority.UNSPECIFIED
 
     @classmethod
     def start(
@@ -54,6 +62,8 @@ class ToolExecutionRecord:
         effective_risk: ToolRisk,
         approval_request_id: str | None,
         idempotency: ToolIdempotency,
+        effect: ToolEffect = ToolEffect.UNSPECIFIED,
+        result_authority: ToolResultAuthority = ToolResultAuthority.UNSPECIFIED,
     ) -> ToolExecutionRecord:
         now = datetime.now(timezone.utc)
         execution_id = cls.identity(turn_id, call.call_id)
@@ -77,6 +87,8 @@ class ToolExecutionRecord:
             result=None,
             started_at=now,
             updated_at=now,
+            effect=effect,
+            result_authority=result_authority,
         )
 
     @staticmethod
@@ -179,6 +191,14 @@ class ToolExecutionRecord:
                 datetime.fromisoformat(str(data["reconciled_at"]))
                 if data.get("reconciled_at") is not None else None
             ),
+            effect=ToolEffect(
+                str(data.get("effect", ToolEffect.UNSPECIFIED.value))
+            ),
+            result_authority=ToolResultAuthority(
+                str(data.get(
+                    "result_authority", ToolResultAuthority.UNSPECIFIED.value
+                ))
+            ),
         )
 
     def to_data(self) -> dict[str, Any]:
@@ -202,6 +222,8 @@ class ToolExecutionRecord:
             "reconciled_at": (
                 self.reconciled_at.isoformat() if self.reconciled_at else None
             ),
+            "effect": self.effect.value,
+            "result_authority": self.result_authority.value,
         }
 
 

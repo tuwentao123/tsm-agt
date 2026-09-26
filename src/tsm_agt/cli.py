@@ -37,7 +37,6 @@ from tsm_agt.core import (
     ApprovalResolutionInput,
     ClarificationReplyInput,
     InterruptTaskInput,
-    ChatDispatcher,
     FlowNode,
     FlowNodeDiagnostic,
     FlowNodeKind,
@@ -64,6 +63,7 @@ from tsm_agt.core import (
     ModelInvocationFailed,
     SteeringKind,
     TaskState,
+    TaskRuntimeProjector,
     build_flow_export_document,
 )
 
@@ -356,6 +356,7 @@ def _should_print_result_body(response_text_was_emitted: bool) -> bool:
     """Decide from durable display state, never a cleared token buffer."""
     return not response_text_was_emitted
 from tsm_agt.ports import (
+    CompletionReadinessMode,
     FlowArtifactExportPort, ReplayCursor, ReplayCursorStorePort,
     RuntimeStorePort, ToolCall, ModelFailureCategory, ModelRecoveryAction,
 )
@@ -570,6 +571,25 @@ async def _finalize_standalone_agent_result(
     if not isinstance(result, AgentTurnResult):
         return 0
     task = await application.kernel.get_task(task_id)
+    if (
+        application.kernel.completion_readiness_mode
+        is not CompletionReadinessMode.LEGACY_GATE
+    ):
+        verification = await application.kernel.verify_task_acceptance(task.task_id)
+        if verbose and verification.evidence_level is not None:
+            output_fn(_render_evidence_level(verification.evidence_level))
+        if verbose:
+            for criterion in verification.criteria:
+                output_fn(
+                    f"verification criterion: {criterion.criterion_id} "
+                    f"{criterion.status.value}"
+                )
+        await _print_standalone_protocol_status(application, task_id, output_fn)
+        output_fn(
+            f"verification observation: {verification.status.value}; "
+            "Task state was not changed by completion diagnostics"
+        )
+        return 0
     task = await application.kernel.transition_task(
         task.task_id, TaskState.VERIFYING, "standalone verifier started"
     )
@@ -587,6 +607,7 @@ async def _finalize_standalone_agent_result(
             task = await application.kernel.transition_task(
                 task.task_id, target, f"standalone {target.value.lower()}",
             )
+        await _print_standalone_protocol_status(application, task_id, output_fn)
         if verbose:
             output_fn(
                 f"verification: passed ({len(verification.criteria)} criteria)"
@@ -596,11 +617,45 @@ async def _finalize_standalone_agent_result(
         task.task_id, TaskState.FAILED,
         f"trusted verifier {verification.status.value}",
     )
+    await _print_standalone_protocol_status(application, task_id, output_fn)
     output_fn(
         f"verification: {verification.status.value}; "
         "Task was not marked successful"
     )
     return 1
+
+
+async def _print_standalone_protocol_status(application, task_id: str, output_fn) -> None:
+    """Print four independent persisted result categories for one-shot CLI."""
+    task = await application.kernel.get_task(task_id)
+    store = application.registry.require(RuntimeStorePort)
+    projection = TaskRuntimeProjector.project(
+        task, await store.read_events(task_id)
+    )
+    output_fn(
+        "执行状态: "
+        f"display={projection.display_status.value}; "
+        f"phase={projection.phase.value}; "
+        f"execution={projection.execution_status.value}"
+    )
+    output_fn(f"领域检查: {projection.verification_status.value}")
+    claims = [dict(item) for item in projection.conclusion_claims]
+    output_fn(
+        "模型结论: "
+        + (json.dumps(claims, ensure_ascii=False, sort_keys=True)
+           if claims else "未提供")
+    )
+    validation = (
+        dict(projection.conclusion_validation)
+        if projection.conclusion_validation is not None else None
+    )
+    reference = projection.latest_answer_event_ref or "未提供"
+    output_fn(
+        "引用校验: "
+        f"answer_event_ref={reference}; "
+        + (json.dumps(validation, ensure_ascii=False, sort_keys=True)
+           if validation is not None else "未提供")
+    )
 
 
 def _render_exploration_progress(progress: AgentProgress) -> tuple[str, ...]:
@@ -1449,15 +1504,12 @@ async def _chat(
                             "[续接] 已记录明确的审批决定，正在继续同一 Task。"
                         )
                     else:
-                        dispatcher = ChatDispatcher(application.kernel)
-                        dispatch = await dispatcher.dispatch_runtime_input(
+                        route = await application.kernel.route_runtime_input(
                             task.task_id,
                             prompt,
                             f"input-{uuid4().hex}",
                             explicit_intent=explicit_runtime_intent,
                         )
-                        route = dispatch.route
-                        assert route is not None
                         if route.applied:
                             session = await application.kernel.select_session_task(
                                 session.session_id, task.task_id
@@ -1856,8 +1908,7 @@ async def _chat(
                                             read_input("control> ")
                                         )
                                         continue
-                                    dispatcher = ChatDispatcher(application.kernel)
-                                    dispatch = await dispatcher.dispatch_runtime_input(
+                                    route = await application.kernel.route_runtime_input(
                                         task.task_id,
                                         routed_text,
                                         f"input-{uuid4().hex}",
@@ -1868,8 +1919,6 @@ async def _chat(
                                             else None
                                         ),
                                     )
-                                    route = dispatch.route
-                                    assert route is not None
                                     if route.intent is RuntimeInputIntent.STATUS_QUERY:
                                         await _print_chat_status(
                                             application, session, task.task_id, output_fn

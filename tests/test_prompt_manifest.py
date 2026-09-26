@@ -112,6 +112,21 @@ class PromptManifestTest(unittest.TestCase):
         self.assertIn("resolved_root over assumptions", segment.content)
         self.assertNotIn("ExplicitScopeHint", segment.content)
 
+    def test_external_document_guidance_is_generic_not_scenario_bound(self) -> None:
+        segment = next(
+            item for item in self.template.static_segments
+            if item.segment_id == "harness-instructions"
+        )
+        content = segment.content.lower()
+
+        # The rule keys off evidence form ("a document you have not read"), so
+        # it must never name a content category the harness cannot judge.
+        self.assertIn("a document you have not read", content)
+        self.assertIn("web.fetch_markdown", content)
+        for scenario in ("news", "headline", "article", "financial", "新闻"):
+            self.assertNotIn(scenario, content)
+        self.assertEqual(self.template.revision, 9)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -355,7 +355,9 @@ class ContextWindowManagerTest(unittest.TestCase):
 
 
 class GrowingContextModel(EchoModelProvider):
-    capabilities = ProviderCapabilities(tools=True, context_window=1800)
+    # Baseline raised from 1800 to 2048: every call now carries the short
+    # temporal anchor, which is protected and cannot be compacted away.
+    capabilities = ProviderCapabilities(tools=True, context_window=2048)
 
     def __init__(self) -> None:
         super().__init__()

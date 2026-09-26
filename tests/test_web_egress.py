@@ -266,6 +266,16 @@ class WebEgressConfigurationTest(unittest.TestCase):
                     {"TSM_AGT_WEB_EGRESS_MODE": "off"},
                 )
 
+    def test_inline_comment_is_not_part_of_the_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text(
+                "TSM_AGT_WEB_EGRESS_MODE=delegated  # behind the tunnel\n",
+                encoding="utf-8",
+            )
+            configuration = load_web_egress_configuration(env_file, {})
+        self.assertEqual(configuration.mode, WebEgressMode.DELEGATED)
+
 
 class WebEgressCompositionTest(unittest.IsolatedAsyncioTestCase):
     @staticmethod

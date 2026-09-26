@@ -260,34 +260,20 @@ class FinalAcceptanceTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
-    async def test_required_plan_and_latest_completion_gap_block_success(self) -> None:
+    async def test_latest_completion_gap_blocks_success(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             app = self.application()
             await app.registry.start_all()
             try:
                 task = await executing_task(app, root, "final-required-work")
-                await app.kernel.update_working_memory(
-                    task.task_id, 1, {
-                        "goal": task.goal, "constraints": [], "facts": [],
-                        "decisions": [], "hypotheses": [],
-                        "open_questions": [],
-                        "plan": [{
-                            "step_id": "verify-output",
-                            "description": "Verify the output",
-                            "status": "IN_PROGRESS",
-                            "completion_criteria": "Output check passes",
-                        }],
-                        "completed_work": [], "remaining_work": [],
-                        "evidence": [],
-                    }, "required-plan", "test",
-                )
                 await app.kernel._append_events(task.task_id, ((
                     "completion.readiness_evaluated", {
                         "action": "REPORT_BLOCKED",
                         "gaps": [{
-                            "gap_id": "plan-step:verify-output",
-                            "required": True, "kind": "PLAN_STEP",
+                            "gap_id": "execution-failure:turn-1:call-1",
+                            "required": True,
+                            "kind": "UNRESOLVED_EFFECT_FAILURE",
                         }],
                     },
                 ),))
@@ -301,7 +287,47 @@ class FinalAcceptanceTest(unittest.IsolatedAsyncioTestCase):
                     item for item in verification.criteria
                     if item.criterion_id == "final-evidence-integrity"
                 )
-                self.assertEqual(len(integrity.evidence), 2)
+                # Exactly one violation: the required completion gap. The plan
+                # is no longer a delivery contract, so it must not contribute.
+                self.assertEqual(len(integrity.evidence), 1)
+            finally:
+                await app.registry.stop_all()
+
+    async def test_unfinished_plan_step_is_not_a_completion_gate(self) -> None:
+        # 完成判定改造SPEC.md §5.5: the working-memory plan is the model's
+        # scratchpad, not a delivery contract. A forgotten update must not turn
+        # real, recorded work into a blocked Task.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = self.application()
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, root, "scratchpad-not-a-gate")
+                await app.kernel.update_working_memory(
+                    task.task_id, 1, {
+                        "goal": task.goal, "constraints": [], "facts": [],
+                        "decisions": [], "hypotheses": [],
+                        "open_questions": [],
+                        "plan": [{
+                            "step_id": "verify-output",
+                            "description": "Verify the output",
+                            "status": "IN_PROGRESS",
+                            "completion_criteria": "Output check passes",
+                        }],
+                        "completed_work": [], "remaining_work": [],
+                        "evidence": [],
+                    }, "scratchpad", "test",
+                )
+                await persist_final_answer(app, task.task_id)
+                await app.kernel.transition_task(
+                    task.task_id, TaskState.VERIFYING, "verify"
+                )
+                verification = await app.kernel.verify_task_acceptance(task.task_id)
+                self.assertEqual(verification.status, AcceptanceStatus.PASSED)
+                self.assertNotIn(
+                    "INCOMPLETE_REQUIRED_PLAN",
+                    repr(verification.to_data()),
+                )
             finally:
                 await app.registry.stop_all()
 

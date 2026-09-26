@@ -10,7 +10,10 @@ from tsm_agt.core import (
     RuntimeInputContext, RuntimeInputIntent, RuntimeInputRouter,
     SessionInputAction, SessionTextInput, TaskState,
 )
-from tsm_agt.ports import AdapterDescriptor, HealthState, HealthStatus
+from tsm_agt.ports import (
+    AdapterDescriptor, HealthState, HealthStatus,
+    SessionInputRelation, SessionInputRelationJudgement,
+)
 
 
 class FixtureClassifier:
@@ -36,6 +39,35 @@ class FixtureClassifier:
     async def classify_runtime_input(self, text, context):
         self.contexts.append(dict(context))
         return {"intent": self.intent, "confidence": self.confidence}
+
+
+class FixtureRelationJudge:
+    """Stand-in strategy for the shared Session input relation judge."""
+
+    descriptor = AdapterDescriptor(
+        "fixture.session-input-relation", "1.0",
+        "SessionInputRelationPort", "1.0",
+    )
+
+    async def start(self, context):
+        pass
+
+    async def health(self):
+        return HealthStatus(HealthState.HEALTHY)
+
+    async def stop(self, deadline):
+        pass
+
+    def __init__(self, relation=SessionInputRelation.REPLACE, confidence=0.93):
+        self.relation = SessionInputRelation(relation)
+        self.confidence = confidence
+        self.contexts = []
+
+    async def judge_input_relation(self, text, context):
+        self.contexts.append(dict(context))
+        return SessionInputRelationJudgement(
+            self.relation, self.confidence, "fixture_relation",
+        )
 
 
 async def executing_task(application, root: Path):
@@ -116,12 +148,12 @@ class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
-    async def test_classifier_routes_high_confidence_live_input(self):
+    async def test_relation_judge_routes_high_confidence_live_input(self):
         with tempfile.TemporaryDirectory() as directory:
-            classifier = FixtureClassifier("REPLACE")
+            judge = FixtureRelationJudge(SessionInputRelation.REPLACE)
             app = compose_fixture_application(
                 model_adapter=EchoModelProvider(), tool_adapters=(),
-                runtime_input_classifier_adapter=classifier,
+                session_input_relation_adapter=judge,
             )
             await app.registry.start_all()
             try:
@@ -131,7 +163,7 @@ class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(route.intent, RuntimeInputIntent.REPLACE)
                 self.assertTrue(route.applied)
-                self.assertEqual(len(classifier.contexts), 1)
+                self.assertEqual(len(judge.contexts), 1)
             finally:
                 await app.registry.stop_all()
 
@@ -241,7 +273,10 @@ class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
     async def test_ambiguous_input_is_recorded_but_not_applied(self):
         with tempfile.TemporaryDirectory() as directory:
             app = compose_fixture_application(
-                model_adapter=EchoModelProvider(), tool_adapters=()
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+                session_input_relation_adapter=FixtureRelationJudge(
+                    SessionInputRelation.UNKNOWN, 0.0
+                ),
             )
             await app.registry.start_all()
             try:

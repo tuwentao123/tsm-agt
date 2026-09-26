@@ -11,6 +11,14 @@ from .adapter import RuntimeAdapter
 from .tool import ToolEffect
 
 
+class CompletionReadinessMode(StrEnum):
+    """Controls whether completion diagnostics can direct Agent execution."""
+
+    LEGACY_GATE = "LEGACY_GATE"
+    OBSERVE_ONLY = "OBSERVE_ONLY"
+    AGENT_DECIDES = "AGENT_DECIDES"
+
+
 class CompletionReadinessAction(StrEnum):
     COMPLETE = "COMPLETE"
     CONTINUE = "CONTINUE"
@@ -136,6 +144,11 @@ class CompletionReadinessProbe:
     successful_tool_calls: int = 0
     available_effects: frozenset[ToolEffect] = frozenset()
     available_tools: tuple[str, ...] = ()
+    #: Effect-level failures that no later action resolved. Holds
+    #: ``core.execution_facts.ExecutionFact`` values; typed loosely here because
+    #: ports must not import core. Kept so a policy can inspect the failure
+    #: facts independently of the gaps they produced.
+    unresolved_failures: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

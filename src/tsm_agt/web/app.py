@@ -4,8 +4,10 @@ import asyncio
 import json
 import subprocess
 import sys
+from collections.abc import Mapping
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -13,7 +15,9 @@ from fastapi.responses import (
     HTMLResponse, JSONResponse, Response, StreamingResponse,
 )
 
-from tsm_agt.core import AgentLoopLimitExceeded, ApprovalDecision
+from tsm_agt.core import (
+    AgentLoopLimitExceeded, ApprovalDecision, RuntimeInputIntent,
+)
 from tsm_agt.local_api import LocalEventApiServer
 from tsm_agt.ports import ImageBlock
 
@@ -311,9 +315,10 @@ textarea::placeholder{color:#94a3b8}
 .image-preview-content{position:relative;display:flex;align-items:center;justify-content:center;padding:14px;border-radius:18px;background:rgba(255,255,255,.96);box-shadow:0 18px 50px rgba(15,23,42,.28)}
 .image-preview-content img{max-width:min(80vw,960px);max-height:50vh;border-radius:12px;display:block;object-fit:contain}
 .image-preview-close{position:absolute;top:-10px;right:-10px;width:30px;height:30px;border-radius:50%;border:none;background:#0f172a;color:#fff;font-size:18px;cursor:pointer;box-shadow:0 4px 14px rgba(15,23,42,.24)}
-.loading,.error-banner{display:none;font-size:13px;color:var(--muted);padding:0 20px}
-.loading.visible,.error-banner.visible{display:block}
+.loading,.error-banner,.config-banner{display:none;font-size:13px;color:var(--muted);padding:0 20px}
+.loading.visible,.error-banner.visible,.config-banner.visible{display:block}
 .error-banner{color:#f4837a}
+.config-banner{color:#d98b2b;white-space:pre-line}
 @media(max-width:1500px){.workspace-stage{grid-template-columns:minmax(0,1fr) 380px}.trace-board{grid-template-columns:minmax(0,1fr) 220px}}
 @media(max-width:1280px){.workspace-stage{grid-template-columns:1fr}.trace-board{grid-template-columns:1fr}.trace-sidebar{position:static;order:-1;opacity:.72}.task-card-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.trace-future-grid{grid-template-columns:1fr}}
 @media(max-width:1024px){.layout{grid-template-columns:1fr;height:auto}.sidebar{display:none}.topbar{padding-inline:16px}.chat-shell{padding:16px 16px 14px}.chat-area,.trace-pane{padding:14px}.message.user{max-width:100%}.composer{padding:8px 14px 10px}.composer-box{padding:9px 10px}.textarea{min-height:44px}}
@@ -346,6 +351,7 @@ textarea::placeholder{color:#94a3b8}
     </div>
 
     <div id=\"error-banner\" class=\"error-banner\"></div>
+    <div id=\"config-banner\" class=\"config-banner\"></div>
     <div id=\"loading\" class=\"loading\">正在等待运行结果…</div>
     <div class=\"chat-shell\">
       <div class=\"workspace-stage\">
@@ -1164,6 +1170,32 @@ function applyTaskProjection(task, projection) {
   }
 }
 
+function applyTaskProtocol(task, result) {
+  if (!task || !result) return;
+  const projection = result.projection || task.projection || {};
+  task.protocol = {
+    latestAnswerEventRef: result.latest_answer_event_ref
+      ?? projection.latest_answer_event_ref ?? null,
+    conclusionClaims: result.conclusion_claims
+      ?? projection.conclusion_claims ?? [],
+    conclusionValidation: result.conclusion_validation
+      ?? projection.conclusion_validation ?? null,
+  };
+}
+
+function taskProtocol(task) {
+  const protocol = task?.protocol || {};
+  const projection = taskProjection(task) || {};
+  return {
+    latestAnswerEventRef: protocol.latestAnswerEventRef
+      ?? projection.latest_answer_event_ref ?? null,
+    conclusionClaims: protocol.conclusionClaims
+      ?? projection.conclusion_claims ?? [],
+    conclusionValidation: protocol.conclusionValidation
+      ?? projection.conclusion_validation ?? null,
+  };
+}
+
 function taskProjection(task) {
   return task?.projection || null;
 }
@@ -1468,6 +1500,40 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
   `;
   card.appendChild(summary);
 
+  const protocol = taskProtocol(task);
+  const protocolSummary = document.createElement('div');
+  protocolSummary.className = 'task-card-summary';
+  const addProtocolItem = (label, value) => {
+    const item = document.createElement('div');
+    item.className = 'task-summary-item';
+    const name = document.createElement('div');
+    name.className = 'task-summary-label';
+    name.textContent = label;
+    const content = document.createElement('div');
+    content.className = 'task-summary-value';
+    content.textContent = value;
+    item.append(name, content);
+    protocolSummary.appendChild(item);
+  };
+  const claims = Array.isArray(protocol.conclusionClaims)
+    ? protocol.conclusionClaims : [];
+  const modelConclusion = claims.length
+    ? claims.map((claim) => {
+      const kind = String(claim?.kind || 'claim');
+      const summaryText = String(claim?.summary || claim?.claim_id || '未提供');
+      return `${kind}: ${summaryText}`;
+    }).join('；')
+    : '未提供';
+  const validation = protocol.conclusionValidation;
+  const validationStatus = validation && typeof validation === 'object'
+    ? String(validation.status || '未提供') : '未提供';
+  const reference = protocol.latestAnswerEventRef || '未提供';
+  addProtocolItem('执行状态', executionLabel);
+  addProtocolItem('领域检查', projection?.verification_status || '未开始');
+  addProtocolItem('模型结论', modelConclusion);
+  addProtocolItem('引用校验', `${validationStatus} · ${reference}`);
+  card.appendChild(protocolSummary);
+
   const progress = document.createElement('div');
   progress.className = `task-progress task-panel ${mode === 'conversation' ? 'active' : ''}`;
   progress.classList.add('task-collapsible');
@@ -1599,6 +1665,7 @@ function upsertTaskCard(conversationId, rawTask) {
       },
     };
     applyTaskProjection(message.task, rawTask.projection);
+    applyTaskProtocol(message.task, rawTask);
     conversation.messages.push(message);
   } else {
     message.task.goal = rawTask.goal || message.task.goal;
@@ -1609,6 +1676,7 @@ function upsertTaskCard(conversationId, rawTask) {
     );
     message.task.waiting = rawTask.waiting ?? message.task.waiting;
     applyTaskProjection(message.task, rawTask.projection);
+    applyTaskProtocol(message.task, rawTask);
   }
   if (conversationId === activeConversationId) renderMessages();
   return message;
@@ -2157,6 +2225,7 @@ function renderFinalResult(taskId, state, conversationId) {
     || upsertTaskCard(conversationId, { task_id: taskId });
   if (card) {
     applyTaskProjection(card.task, state.projection);
+    applyTaskProtocol(card.task, state);
     card.task.phase1State = state.phase1_state || card.task.phase1State;
     card.task.status = state.status || card.task.status;
     card.task.waiting = null;
@@ -2216,6 +2285,7 @@ function followTask(taskId, conversationId) {
     appendTaskAssistantText(taskId, state.assistant_text, conversationId);
     if (current) {
       applyTaskProjection(current.task, state.projection);
+      applyTaskProtocol(current.task, state);
       if (!state.projection) {
         current.task.phase1State = state.phase1_state;
         current.task.status = state.status;
@@ -2277,6 +2347,7 @@ function followTask(taskId, conversationId) {
         const currentCard = taskMessage(conversationId, taskId);
         if (currentCard) {
           applyTaskProjection(currentCard.task, payload.projection);
+          applyTaskProtocol(currentCard.task, payload);
           if (!payload.projection) currentCard.task.phase1State = 'WAITING';
           currentCard.task.waiting = payload.waiting;
         }
@@ -2517,6 +2588,33 @@ if (promptComposer) {
   console.error('未找到消息输入框，仍继续加载工作区与会话。');
 }
 
+async function loadDiagnostics() {
+  try {
+    const response = await fetch('/diagnostics');
+    if (!response.ok) {
+      return;
+    }
+    const data = await response.json();
+    const notes = [];
+    if (data.runtime_error) {
+      notes.push('Runtime 启动失败：' + data.runtime_error);
+    }
+    for (const issue of (data.configuration_issues || [])) {
+      notes.push('配置提示：' + issue);
+    }
+    if (notes.length > 0) {
+      const banner = document.getElementById('config-banner');
+      if (banner) {
+        banner.textContent = notes.join('\\n');
+        banner.classList.add('visible');
+      }
+    }
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+loadDiagnostics();
 loadWorkspaces();
 """ + """
 </script>
@@ -2526,8 +2624,22 @@ loadWorkspaces();
 
 runtime_server: LocalEventApiServer | None = None
 runtime_error: str | None = None
+configuration_issues: list[str] = []
 workspace_registry: list[dict[str, str]] = []
 session_workspace_bindings: dict[str, str] = {}
+
+
+def _root_cause_message(error: BaseException) -> str:
+    """Return the deepest chained message so a config fault names its variable."""
+    current: BaseException = error
+    seen: set[int] = set()
+    while id(current) not in seen:
+        seen.add(id(current))
+        cause = current.__cause__ or current.__context__
+        if cause is None:
+            break
+        current = cause
+    return str(current) or current.__class__.__name__
 
 
 def workspace_registry_path() -> Path:
@@ -2668,7 +2780,7 @@ def recover_workspace_registry_from_runtime() -> None:
 
 @app.on_event("startup")
 async def startup() -> None:
-    global runtime_server, runtime_error
+    global runtime_server, runtime_error, configuration_issues
     load_workspace_registry()
     load_session_workspace_bindings()
     runtime_server = LocalEventApiServer(Path.cwd())
@@ -2676,9 +2788,13 @@ async def startup() -> None:
         runtime_server.start()
         recover_workspace_registry_from_runtime()
         runtime_error = None
+        configuration_issues = list(getattr(
+            runtime_server._client.application, "configuration_issues", ()
+        ))
     except Exception as error:
         runtime_server = None
-        runtime_error = str(error)
+        configuration_issues = []
+        runtime_error = _root_cause_message(error)
 
 
 @app.on_event("shutdown")
@@ -2700,6 +2816,20 @@ async def index() -> HTMLResponse:
 @app.get("/workspaces")
 async def list_workspaces() -> dict:
     return {"workspaces": workspace_registry}
+
+
+@app.get("/diagnostics")
+async def diagnostics() -> dict:
+    """Surface configuration faults instead of showing an empty page.
+
+    A fatal fault (for example an invalid egress mode or a missing model key)
+    leaves ``runtime_error`` set; optional-search faults degrade the Runtime and
+    arrive as non-fatal ``configuration_issues``.
+    """
+    return {
+        "runtime_error": runtime_error,
+        "configuration_issues": list(configuration_issues),
+    }
 
 
 def register_workspace(raw_path: str) -> dict[str, str]:
@@ -2860,9 +2990,11 @@ async def submit_session_input(payload: dict) -> dict:
     # Attachments stay structured. Inlining base64 into the text would blow
     # past the Task SPEC goal limit and fail task creation outright.
     image_blocks = _normalize_image_blocks(payload.get("images"))
+    intent = _explicit_user_input_intent(payload.get("intent"))
     try:
-        result = runtime_server._call(runtime_server._client.submit_session_text(
-            session_id, text, command_id=request_id,
+        result = runtime_server._call(runtime_server._client.submit_user_input(
+            session_id, text, input_id=request_id,
+            explicit_intent=intent,
             images=tuple(image_blocks),
             workspace=Path(workspace["path"]),
         ))
@@ -2880,6 +3012,84 @@ async def submit_session_input(payload: dict) -> dict:
     data = dict(result.result)
     status = 202 if data.get("kind") == "task" else 200
     return JSONResponse(content=data, status_code=status)
+
+
+def _explicit_user_input_intent(raw: object) -> RuntimeInputIntent | None:
+    """Map a client's explicit command onto one unified entry intent."""
+    if raw is None:
+        return None
+    value = str(raw).strip().lower()
+    if not value:
+        return None
+    mapping = {
+        "steer": RuntimeInputIntent.STEER,
+        "replace": RuntimeInputIntent.REPLACE,
+        "new": RuntimeInputIntent.NEW_TASK,
+        "stop": RuntimeInputIntent.INTERRUPT,
+        "queue": RuntimeInputIntent.NEW_TASK_AFTER_CURRENT,
+    }
+    if value not in mapping:
+        raise HTTPException(
+            status_code=400,
+            detail="intent must be one of: steer, replace, new, stop, queue",
+        )
+    return mapping[value]
+
+
+@app.post("/tasks/{task_id}/stop")
+async def stop_task(task_id: str, payload: dict | None = None) -> dict:
+    """Stop (recoverable interrupt) one running Task through the unified entry."""
+    if runtime_server is None:
+        raise HTTPException(
+            status_code=503, detail=runtime_error or "runtime unavailable"
+        )
+
+    async def stop() -> Mapping[str, Any]:
+        task = await runtime_server._client.application.kernel.get_task(task_id)
+        result = await runtime_server._client.submit_user_input(
+            task.session_id, "", input_id=f"stop-{task_id}",
+            explicit_intent=RuntimeInputIntent.INTERRUPT,
+            target_task_id=task_id,
+        )
+        return dict(result.result)
+
+    try:
+        data = runtime_server._call(stop())
+    except (LookupError, ValueError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return dict(data)
+
+
+@app.post("/tasks/{task_id}/input")
+async def submit_task_input(task_id: str, payload: dict) -> dict:
+    """Apply one explicit steer/replace/queue input to an active Task."""
+    if runtime_server is None:
+        raise HTTPException(
+            status_code=503, detail=runtime_error or "runtime unavailable"
+        )
+    text = str(payload.get("text", "")).strip()
+    request_id = str(payload.get("request_id", "")).strip()
+    if not text or not request_id:
+        raise HTTPException(
+            status_code=400, detail="text and request_id are required"
+        )
+    intent = _explicit_user_input_intent(payload.get("intent") or "steer")
+    if intent is RuntimeInputIntent.INTERRUPT:
+        raise HTTPException(status_code=400, detail="use /tasks/{id}/stop to stop")
+
+    async def apply() -> Mapping[str, Any]:
+        task = await runtime_server._client.application.kernel.get_task(task_id)
+        result = await runtime_server._client.submit_user_input(
+            task.session_id, text, input_id=request_id,
+            explicit_intent=intent, target_task_id=task_id,
+        )
+        return dict(result.result)
+
+    try:
+        data = runtime_server._call(apply())
+    except (LookupError, ValueError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return dict(data)
 
 
 @app.post("/tasks")
@@ -3198,6 +3408,14 @@ async def stream(task_id: str, after: int = 0):
                             "task_id": task_id,
                             "waiting": waiting,
                             "projection": result.projection,
+                            "latest_answer_event_ref": result.latest_answer_event_ref,
+                            "conclusion_claims": [
+                                dict(item) for item in result.conclusion_claims
+                            ],
+                            "conclusion_validation": (
+                                dict(result.conclusion_validation)
+                                if result.conclusion_validation is not None else None
+                            ),
                             # A Task may generate a useful response and then
                             # suspend for clarification or continuation. Waiting
                             # must not hide that already durable response.
@@ -3221,6 +3439,14 @@ async def stream(task_id: str, after: int = 0):
                             "task_id": task_id,
                             "final": True,
                             "projection": result.projection,
+                            "latest_answer_event_ref": result.latest_answer_event_ref,
+                            "conclusion_claims": [
+                                dict(item) for item in result.conclusion_claims
+                            ],
+                            "conclusion_validation": (
+                                dict(result.conclusion_validation)
+                                if result.conclusion_validation is not None else None
+                            ),
                             "phase1_state": result.phase1_state,
                             "assistant_text": result.assistant_text,
                             "clarification": result.clarification,

@@ -11,6 +11,12 @@ from tsm_agt.adapters.openai_compatible import (
 )
 from tsm_agt.ports import (
     AdapterContext,
+    AssistantConclusion,
+    ConclusionBlock,
+    ConclusionProtocolMode,
+    ConclusionClaim,
+    ConclusionKind,
+    FactReference,
     EvidenceQuestion,
     FinishReason,
     ImageBlock,
@@ -273,6 +279,70 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
             diagnostics["adapter"]["text"]["sha256"],
         )
         self.assertTrue(transport.requests[0]["payload"]["stream"])
+
+    async def test_stream_records_bounded_provider_metadata(self) -> None:
+        provider, _ = await self._streaming_provider([
+            '{"id":"chat-meta","model":"served-alias",'
+            '"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}',
+            '{"id":"chat-meta","model":"served-alias","system_fingerprint":"fp-1",'
+            '"routing":{"serving_pipereplica":"replica-a"},'
+            '"choices":[{"delta":{"content":"!"},"finish_reason":"stop"}]}',
+            '{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,'
+            '"total_tokens":7,'
+            '"completion_tokens_details":{"reasoning_tokens":1}}}',
+            "[DONE]",
+        ])
+        request = ModelRequest("turn-provider-meta", (Message(
+            "user-1", MessageRole.USER, (TextBlock("hi"),)
+        ),))
+        events = [event async for event in provider.stream_complete(request)]
+        provider_meta = events[-1].response.diagnostics["provider"]
+        self.assertEqual(provider_meta["response_id"], "chat-meta")
+        self.assertEqual(provider_meta["model"], "served-alias")
+        self.assertEqual(provider_meta["system_fingerprint"], "fp-1")
+        self.assertEqual(
+            provider_meta["routing"]["serving_pipereplica"], "replica-a"
+        )
+        self.assertEqual(
+            provider_meta["completion_tokens_details"]["reasoning_tokens"], 1
+        )
+        self.assertEqual(provider_meta["total_tokens"], 7)
+
+    async def test_non_streaming_records_provider_metadata_without_body(
+        self,
+    ) -> None:
+        answer = "provider body must not leak into diagnostics"
+        provider, _ = await self._provider([{
+            "id": "chat-meta-json",
+            "model": "served-alias",
+            "system_fingerprint": "fp-2",
+            "routing": {"serving_pipereplica": "replica-b"},
+            "choices": [{
+                "message": {"role": "assistant", "content": answer},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 3, "completion_tokens": 4,
+                "completion_tokens_details": {"reasoning_tokens": 2},
+            },
+        }])
+        response = await provider.complete(ModelRequest(
+            "turn-provider-meta-json",
+            (Message("user-1", MessageRole.USER, (TextBlock("hello"),)),),
+        ))
+        provider_meta = response.diagnostics["provider"]
+        self.assertEqual(provider_meta["response_id"], "chat-meta-json")
+        self.assertEqual(provider_meta["model"], "served-alias")
+        self.assertEqual(provider_meta["system_fingerprint"], "fp-2")
+        self.assertEqual(
+            provider_meta["routing"]["serving_pipereplica"], "replica-b"
+        )
+        self.assertEqual(
+            provider_meta["completion_tokens_details"]["reasoning_tokens"], 2
+        )
+        self.assertNotIn(
+            answer, json.dumps(response.diagnostics, ensure_ascii=False)
+        )
 
     async def test_non_streaming_records_json_fingerprint_without_body(self) -> None:
         answer = "private provider answer must not be copied into diagnostics"
@@ -1161,6 +1231,359 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("enum", schema["properties"]["outcome_ref"])
         self.assertNotIn("outcome_binding_mode", schema["properties"])
         self.assertNotIn("outcome_binding_mode", call.arguments)
+
+    @staticmethod
+    def _conclusion_data() -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "claims": [{
+                "claim_id": "claim-1",
+                "kind": "verified",
+                "summary": "tests passed",
+                "scope": ["unit tests"],
+                "fact_refs": [{
+                    "task_id": "task-1",
+                    "event_id": "event-1",
+                    "sequence": 1,
+                    "source_type": "tool_result",
+                    "source_id": "execution-1",
+                }],
+                "unverified_scope": [],
+                "reason": "",
+            }],
+            "overall_scope": ["unit tests"],
+        }
+
+    async def test_native_conclusion_object_becomes_conclusion_block(self) -> None:
+        provider, _ = await self._provider([{
+            "id": "chat-native-conclusion",
+            "choices": [{
+                "message": {
+                    "role": "assistant", "content": "Verified.",
+                    "conclusion": self._conclusion_data(),
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        }])
+        response = await provider.complete(ModelRequest(
+            "turn-native-conclusion",
+            (Message("user", MessageRole.USER, (TextBlock("verify"),)),),
+        ))
+        self.assertEqual(response.message.text, "Verified.")
+        conclusion = next(
+            block.conclusion for block in response.message.content
+            if isinstance(block, ConclusionBlock)
+        )
+        self.assertEqual(conclusion.origin, "native_structured")
+        self.assertEqual(conclusion.claims[0].kind, ConclusionKind.VERIFIED)
+
+    async def test_controlled_conclusion_block_is_removed_from_visible_text(self) -> None:
+        body = "Verified.\n<tsm-conclusion-v1>\n" + json.dumps(
+            self._conclusion_data()
+        ) + "\n</tsm-conclusion-v1>"
+        provider, _ = await self._provider([{
+            "id": "chat-controlled-conclusion",
+            "choices": [{
+                "message": {"role": "assistant", "content": body},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        }])
+        response = await provider.complete(ModelRequest(
+            "turn-controlled-conclusion",
+            (Message("user", MessageRole.USER, (TextBlock("verify"),)),),
+        ))
+        self.assertEqual(response.message.text, "Verified.\n")
+        conclusion = next(
+            block.conclusion for block in response.message.content
+            if isinstance(block, ConclusionBlock)
+        )
+        self.assertEqual(conclusion.origin, "controlled_text_block")
+
+    async def test_invalid_or_natural_language_conclusions_stay_plain_text(self) -> None:
+        malformed = "verified\n<tsm-conclusion-v1>{broken}</tsm-conclusion-v1>"
+        provider, _ = await self._provider([{
+            "choices": [{
+                "message": {"role": "assistant", "content": malformed},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        }, {
+            "choices": [{
+                "message": {"role": "assistant", "content": "已验证，修复完成。"},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        }])
+        request = ModelRequest(
+            "turn-fallback", (Message("user", MessageRole.USER, (TextBlock("verify"),)),)
+        )
+        malformed_response = await provider.complete(request)
+        self.assertEqual(malformed_response.message.text, "verified\n")
+        self.assertFalse(any(
+            isinstance(block, ConclusionBlock)
+            for block in malformed_response.message.content
+        ))
+        self.assertEqual(
+            malformed_response.diagnostics["conclusion_protocol"]["status"],
+            "controlled_block_invalid_suppressed",
+        )
+        natural_language_response = await provider.complete(request)
+        self.assertEqual(natural_language_response.message.text, "已验证，修复完成。")
+        self.assertFalse(any(
+            isinstance(block, ConclusionBlock)
+            for block in natural_language_response.message.content
+        ))
+
+    async def test_stream_hides_complete_controlled_conclusion_block(self) -> None:
+        body = "Visible answer.\n<tsm-conclusion-v1>" + json.dumps(
+            self._conclusion_data()
+        ) + "</tsm-conclusion-v1>"
+        provider, _ = await self._streaming_provider([
+            json.dumps({
+                "id": "chat-stream-conclusion",
+                "choices": [{
+                    "delta": {"content": body[:27]}, "finish_reason": None,
+                }],
+            }),
+            json.dumps({
+                "id": "chat-stream-conclusion",
+                "choices": [{
+                    "delta": {"content": body[27:]}, "finish_reason": "stop",
+                }],
+            }),
+            "[DONE]",
+        ])
+        events = [event async for event in provider.stream_complete(ModelRequest(
+            "turn-stream-conclusion",
+            (Message("user", MessageRole.USER, (TextBlock("verify"),)),),
+        ))]
+        visible = "".join(
+            event.text for event in events if isinstance(event, ModelTextDelta)
+        )
+        completed = next(
+            event.response for event in events if isinstance(event, ModelStreamCompleted)
+        )
+        self.assertEqual(visible, "Visible answer.\n")
+        self.assertEqual(completed.message.text, visible)
+        self.assertNotIn("tsm-conclusion", visible)
+        self.assertTrue(any(
+            isinstance(block, ConclusionBlock) for block in completed.message.content
+        ))
+    async def test_require_structured_negotiates_native_message_field_and_degrades_missing_output(self) -> None:
+        provider, transport = await self._provider([{
+            "id": "chat-required-conclusion",
+            "choices": [{
+                "message": {"role": "assistant", "content": "Visible only."},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        }])
+        response = await provider.complete(ModelRequest(
+            "turn-required-conclusion",
+            (Message("user", MessageRole.USER, (TextBlock("verify"),)),),
+            conclusion_protocol_mode=ConclusionProtocolMode.REQUIRE_STRUCTURED,
+        ))
+        instruction = transport.requests[0]["payload"]["messages"][0]
+        self.assertEqual(instruction["role"], "system")
+        self.assertIn("optional", instruction["content"])
+        self.assertIn("`conclusion`", instruction["content"])
+        self.assertEqual(response.message.text, "Visible only.")
+        self.assertFalse(any(
+            isinstance(block, ConclusionBlock) for block in response.message.content
+        ))
+        self.assertEqual(
+            response.diagnostics["conclusion_protocol"]["status"],
+            "plain_text_fallback",
+        )
+
+    async def test_require_structured_uses_controlled_protocol_when_native_field_is_unavailable(self) -> None:
+        body = "Visible. <tsm-conclusion-v1>" + json.dumps(
+            self._conclusion_data()
+        ) + "</tsm-conclusion-v1>"
+        transport = RecordingTransport([{
+            "id": "chat-controlled-required",
+            "choices": [{
+                "message": {"role": "assistant", "content": body},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        }])
+        provider = OpenAICompatibleModelProvider(
+            "https://models.example.test/v1", "test-model", "secret",
+            streaming=False, native_structured_conclusion=False,
+            transport=transport,
+        )
+        await provider.start(AdapterContext(
+            config={}, emit_event=lambda _type, _payload: None
+        ))
+        response = await provider.complete(ModelRequest(
+            "turn-controlled-required",
+            (Message("user", MessageRole.USER, (TextBlock("verify"),)),),
+            conclusion_protocol_mode=ConclusionProtocolMode.REQUIRE_STRUCTURED,
+        ))
+        self.assertTrue(provider.capabilities.structured_conclusion)
+        self.assertIn("structured-conclusion", provider.descriptor.capabilities)
+        instruction = transport.requests[0]["payload"]["messages"][0]["content"]
+        self.assertIn("end the response with exactly one", instruction)
+        self.assertEqual(response.message.text, "Visible. ")
+        self.assertTrue(any(
+            isinstance(block, ConclusionBlock) for block in response.message.content
+        ))
+        self.assertEqual(
+            response.diagnostics["conclusion_protocol"]["status"],
+            "structured_conclusion",
+        )
+
+    async def test_complete_and_non_streaming_hide_invalid_controlled_blocks(self) -> None:
+        valid = json.dumps(self._conclusion_data())
+        cases = {
+            "truncated": "Visible\n<tsm-conclusion-v1>{",
+            "duplicate": (
+                "Visible\n<tsm-conclusion-v1>" + valid
+                + "</tsm-conclusion-v1><tsm-conclusion-v1>{}</tsm-conclusion-v1>"
+            ),
+            "invalid_json": "Visible\n<tsm-conclusion-v1>{bad}</tsm-conclusion-v1>",
+            "invalid_schema": "Visible\n<tsm-conclusion-v1>{}</tsm-conclusion-v1>",
+            "trailing_suffix": (
+                "Visible\n<tsm-conclusion-v1>" + valid
+                + "</tsm-conclusion-v1> not allowed"
+            ),
+        }
+        request = ModelRequest(
+            "turn-invalid-non-stream-conclusion",
+            (Message("user", MessageRole.USER, (TextBlock("verify"),)),),
+            conclusion_protocol_mode=ConclusionProtocolMode.REQUIRE_STRUCTURED,
+        )
+        for name, body in cases.items():
+            response_payload = {
+                "id": "chat-invalid-non-stream-conclusion",
+                "choices": [{
+                    "message": {"role": "assistant", "content": body},
+                    "finish_reason": "stop",
+                }],
+                "usage": {},
+            }
+            with self.subTest(transport="complete", name=name):
+                provider, _ = await self._provider([response_payload])
+                response = await provider.complete(request)
+                self.assertEqual(response.message.text, "Visible\n")
+                self.assertNotIn("tsm-conclusion", response.message.text)
+                self.assertFalse(any(
+                    isinstance(block, ConclusionBlock)
+                    for block in response.message.content
+                ))
+                self.assertEqual(
+                    response.diagnostics["conclusion_protocol"]["status"],
+                    "controlled_block_invalid_suppressed",
+                )
+                self.assertEqual(
+                    response.diagnostics["conclusion_protocol"]["reason"],
+                    {
+                        "duplicate": "repeated_marker",
+                        "invalid_json": "invalid_json",
+                        "invalid_schema": "invalid_schema",
+                        "trailing_suffix": "trailing_suffix",
+                        "truncated": "truncated",
+                    }[name],
+                )
+            with self.subTest(transport="streaming_false", name=name):
+                transport = RecordingTransport([response_payload])
+                provider = OpenAICompatibleModelProvider(
+                    "https://models.example.test/v1", "test-model", "secret",
+                    streaming=False, native_structured_conclusion=False,
+                    transport=transport,
+                )
+                await provider.start(AdapterContext(
+                    config={}, emit_event=lambda _type, _payload: None
+                ))
+                events = [event async for event in provider.stream_complete(request)]
+                self.assertEqual(len(events), 1)
+                self.assertIsInstance(events[0], ModelStreamCompleted)
+                response = events[0].response
+                self.assertEqual(response.message.text, "Visible\n")
+                self.assertNotIn("tsm-conclusion", response.message.text)
+                self.assertFalse(any(
+                    isinstance(block, ConclusionBlock)
+                    for block in response.message.content
+                ))
+                self.assertEqual(
+                    response.diagnostics["conclusion_protocol"]["status"],
+                    "controlled_block_invalid_suppressed",
+                )
+                self.assertEqual(
+                    response.diagnostics["conclusion_protocol"]["reason"],
+                    {
+                        "duplicate": "repeated_marker",
+                        "invalid_json": "invalid_json",
+                        "invalid_schema": "invalid_schema",
+                        "trailing_suffix": "trailing_suffix",
+                        "truncated": "truncated",
+                    }[name],
+                )
+
+    async def test_stream_never_releases_invalid_controlled_conclusion_tails(self) -> None:
+        valid = json.dumps(self._conclusion_data())
+        cases = {
+            "truncated": "Visible\\n<tsm-conclusion-v1>{",
+            "duplicate": (
+                "Visible\\n<tsm-conclusion-v1>" + valid
+                + "</tsm-conclusion-v1><tsm-conclusion-v1>{}</tsm-conclusion-v1>"
+            ),
+            "invalid_json": "Visible\\n<tsm-conclusion-v1>{bad}</tsm-conclusion-v1>",
+            "invalid_schema": "Visible\\n<tsm-conclusion-v1>{}</tsm-conclusion-v1>",
+            "trailing_suffix": (
+                "Visible\\n<tsm-conclusion-v1>" + valid
+                + "</tsm-conclusion-v1> not allowed"
+            ),
+        }
+        request = ModelRequest(
+            "turn-invalid-stream-conclusion",
+            (Message("user", MessageRole.USER, (TextBlock("verify"),)),),
+            conclusion_protocol_mode=ConclusionProtocolMode.REQUIRE_STRUCTURED,
+        )
+        for name, body in cases.items():
+            with self.subTest(name=name):
+                provider, _ = await self._streaming_provider([
+                    json.dumps({
+                        "id": "chat-invalid-stream-conclusion",
+                        "choices": [{
+                            "delta": {"content": body[:19]},
+                            "finish_reason": None,
+                        }],
+                    }),
+                    json.dumps({
+                        "id": "chat-invalid-stream-conclusion",
+                        "choices": [{
+                            "delta": {"content": body[19:]},
+                            "finish_reason": "stop",
+                        }],
+                    }),
+                    "[DONE]",
+                ])
+                events = [
+                    event async for event in provider.stream_complete(request)
+                ]
+                visible = "".join(
+                    event.text for event in events
+                    if isinstance(event, ModelTextDelta)
+                )
+                completed = next(
+                    event.response for event in events
+                    if isinstance(event, ModelStreamCompleted)
+                )
+                self.assertEqual(visible, "Visible\\n")
+                self.assertEqual(completed.message.text, visible)
+                self.assertNotIn("tsm-conclusion", visible)
+                self.assertFalse(any(
+                    isinstance(block, ConclusionBlock)
+                    for block in completed.message.content
+                ))
+                self.assertEqual(
+                    completed.diagnostics["conclusion_protocol"]["status"],
+                    "controlled_block_invalid_suppressed",
+                )
 
 
 if __name__ == "__main__":

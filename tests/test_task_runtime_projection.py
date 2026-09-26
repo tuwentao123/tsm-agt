@@ -78,6 +78,51 @@ class TaskRuntimeProjectionTest(unittest.TestCase):
         self.assertEqual(projection.waiting_kind, "approval")
         self.assertEqual(projection.phase, TaskRuntimePhase.EXECUTING)
 
+    def test_v3_conclusion_projection_is_independent_from_domain_check(self) -> None:
+        projection = TaskRuntimeProjector.project(task(TaskState.SUCCEEDED), (
+            event(1, "verify.completed", {"status": "passed"}),
+            event(2, "conclusion.recorded", {
+                "latest_answer_event_ref": "evt-answer",
+                "conclusion_claims": [{
+                    "claim_id": "claim-1", "kind": "verified",
+                    "summary": "targeted tests passed",
+                }],
+                "conclusion_validation": {
+                    "status": "invalid",
+                    "claims": [{"claim_id": "claim-1", "status": "invalid"}],
+                },
+            }),
+        ))
+
+        self.assertEqual(projection.verification_status, TaskVerificationStatus.PASSED)
+        self.assertEqual(projection.latest_answer_event_ref, "evt-answer")
+        self.assertEqual(projection.conclusion_claims[0]["claim_id"], "claim-1")
+        self.assertEqual(projection.conclusion_validation["status"], "invalid")
+
+    def test_legacy_conclusion_event_never_derives_facts_from_assistant_text(self) -> None:
+        projection = TaskRuntimeProjector.project(task(TaskState.SUCCEEDED), (
+            event(1, "llm.completed", {
+                "assistant_text": "验证通过，引用完全有效",
+            }),
+            event(2, "conclusion.references_validated", {
+                "conclusion": {
+                    "claims": [{
+                        "claim_id": "claim-legacy", "kind": "checked",
+                        "summary": "checked persisted fact",
+                    }],
+                },
+                "validation": {
+                    "status": "valid",
+                    "claims": [{"claim_id": "claim-legacy", "status": "valid"}],
+                },
+            }),
+        ))
+
+        self.assertIsNone(projection.latest_answer_event_ref)
+        self.assertEqual(projection.conclusion_claims[0]["claim_id"], "claim-legacy")
+        self.assertEqual(projection.conclusion_validation["status"], "valid")
+        self.assertNotIn("验证通过", str(projection.to_data()))
+
     def test_progress_does_not_participate_in_projection_input(self) -> None:
         projection = TaskRuntimeProjector.project(task(TaskState.SUCCEEDED), (
             event(1, "task.created"),

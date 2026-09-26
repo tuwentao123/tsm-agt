@@ -88,6 +88,24 @@ python scripts/run_in_project_env.py web
 python scripts/run_in_project_env.py module unittest discover -s tests
 ```
 
+本地重启 Web UI / API（自动清理旧实例与孤儿进程，再启动并健康检查）：
+
+```bash
+./scripts/restart.sh            # 重启 Web UI（127.0.0.1:8080）
+./scripts/restart.sh status     # 查看进程 / 端口 / HTTP 状态
+./scripts/restart.sh logs       # 跟踪日志
+```
+
+完整说明见 [`docs/tsm-agt-restart.md`](docs/tsm-agt-restart.md)。
+
+检索层（`web.search`）默认只使用无需账号的公开端点（DuckDuckGo + Google/Bing News RSS），会解析来源发布时间、按新鲜度排序，并支持 `freshness=day|week|month` 的时效过滤。如需更稳定的实时新闻与结构化 `published_date`，可显式启用 Tavily（默认关闭：启用后查询会发给第三方）：
+
+```bash
+# .env
+TSM_AGT_SEARCH_TAVILY_MODE=keyless   # 免 key 试用；生产建议 =key + API key
+# TSM_AGT_SEARCH_TAVILY_API_KEY=tvly-...
+```
+
 适用边界与部署说明：
 
 - 本地开发：兼容 `uv run`、激活 venv、direnv 或系统 Python shim。

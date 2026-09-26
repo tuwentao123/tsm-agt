@@ -30,13 +30,14 @@ from tsm_agt.core.kernel import (
 )
 from tsm_agt.ports import (
     CompletionGap, CompletionReadinessAction, CompletionReadinessDecision,
-    CompletionReadinessProbe,
+    CompletionReadinessMode, CompletionReadinessProbe,
     CompletionReadinessState, EvidenceQuestion, FinishReason, Message, MessageRole, ModelRequest,
     ModelResponse, ModelStreamCompleted, ModelTextDelta, ModelUsage,
     ProviderCapabilities, RuntimeStorePort, TextBlock, ToolCall, ToolCallBlock,
     ToolEffect, ToolIdempotency, ToolInvocationContext, ToolRecoveryKind,
     ToolResult,
     ToolResultBlock, ToolRisk,
+    ToolResultAuthority, ToolSpec,
 )
 
 
@@ -333,6 +334,16 @@ class CriterionBlockedModel(EchoModelProvider):
             ),
             FinishReason.STOP, ModelUsage(1, 1),
         )
+
+
+class PromptRecordingCriterionModel(CriterionBlockedModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests: list[ModelRequest] = []
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        self.requests.append(request)
+        return await super().complete(request)
 
 
 async def executing_task(application, root: Path, task_id: str):
@@ -832,6 +843,88 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 await app.registry.stop_all()
+
+    async def test_non_legacy_modes_record_diagnostics_without_enforcing_gaps(self) -> None:
+        for mode in (
+            CompletionReadinessMode.OBSERVE_ONLY,
+            CompletionReadinessMode.AGENT_DECIDES,
+        ):
+            with self.subTest(mode=mode.value), tempfile.TemporaryDirectory() as directory:
+                model = PromptRecordingCriterionModel()
+                app = compose_fixture_application(
+                    model_adapter=model, tool_adapters=(),
+                    completion_readiness_policy_adapter=(
+                        RuleBasedCompletionReadinessPolicy()
+                    ),
+                    completion_readiness_mode=mode,
+                )
+                await app.registry.start_all()
+                try:
+                    task = await executing_task(app, Path(directory), mode.value)
+                    await self._set_acceptance_criteria(
+                        app, task,
+                        TaskAcceptanceCriterion(
+                            "command", "Run verification after mutation",
+                            TaskCriterionKind.POST_MUTATION_COMMAND,
+                        ),
+                    )
+                    await app.kernel.write_workspace_text(
+                        task.task_id, "change", "changed.txt", "after\n", None,
+                    )
+                    result = await app.kernel.run_agent_turn(
+                        task.task_id, "complete the task", max_model_calls=4,
+                        max_tool_calls=1,
+                    )
+                    self.assertIsInstance(result, AgentTurnResult)
+                    assert isinstance(result, AgentTurnResult)
+                    self.assertEqual(result.assistant_message.text, "The task is complete.")
+                    self.assertEqual(
+                        (await app.kernel.get_task(task.task_id)).state,
+                        TaskState.EXECUTING,
+                    )
+                    events = await app.registry.require(RuntimeStorePort).read_events(
+                        task.task_id
+                    )
+                    diagnostics = [
+                        event for event in events
+                        if event.event_type == "completion.readiness_evaluated"
+                    ]
+                    self.assertTrue(diagnostics)
+                    self.assertTrue(all(
+                        event.payload["mode"] == mode.value
+                        and event.payload["enforced"] is False
+                        for event in diagnostics
+                    ))
+                    self.assertFalse(any(
+                        event.event_type in {
+                            "completion.continuation_requested",
+                            "completion.incomplete_recoverable_requested",
+                            "completion.blocker_disclosure_requested",
+                            "budget.renewed",
+                        }
+                        for event in events
+                    ))
+                    if mode is CompletionReadinessMode.AGENT_DECIDES:
+                        self.assertTrue(any(
+                            message.message_id.startswith("completion-diagnostics-")
+                            and '"boundary":"completion_readiness_diagnostics"'
+                            in message.text
+                            for message in result.messages
+                        ))
+                    prompt_text = "\n".join(
+                        message.text
+                        for request in model.requests
+                        for message in request.messages
+                    )
+                    for directive in (
+                        "Choose a legal recovery action",
+                        "Execution capacity is reserved",
+                        "The execution budget is nearly exhausted",
+                        "Completion readiness found required work",
+                    ):
+                        self.assertNotIn(directive, prompt_text)
+                finally:
+                    await app.registry.stop_all()
 
     async def test_continuation_at_a_spent_budget_regains_capacity(self) -> None:
         """A continuation the user is invited to give must be able to act.
@@ -1390,3 +1483,124 @@ class ContinuationStallTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIs(decision.action, CompletionReadinessAction.CONTINUE)
         self.assertEqual(decision.state.stalled_continuations, 1)
+
+
+class BusinessFailureCommandTool(EchoToolProvider):
+    """Command tool whose process exits non-zero while the call returns ok."""
+
+    _spec = ToolSpec(
+        name="fixture.run_command",
+        description="Run a command; the process outcome is the real result.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "argv": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["argv"],
+            "additionalProperties": False,
+        },
+        risk=ToolRisk.R0,
+        is_read_only=True,
+        is_concurrency_safe=True,
+        idempotency=ToolIdempotency.IDEMPOTENT,
+        effect=ToolEffect.EXECUTE,
+        result_authority=ToolResultAuthority.PROCESS_FACT,
+    )
+
+    async def invoke(
+        self, call: ToolCall, context: ToolInvocationContext,
+    ) -> ToolResult:
+        return ToolResult(call.call_id, True, data={
+            "status": "exited", "succeeded": False, "exit_code": 3,
+            "failure_code": "PROCESS_EXIT_NON_ZERO",
+            "stdout": "", "stderr": "boom",
+        })
+
+
+class BusinessFailureModel(EchoModelProvider):
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        saw_result = any(
+            isinstance(block, ToolResultBlock)
+            for message in request.messages for block in message.content
+        )
+        if not saw_result:
+            return ModelResponse(
+                Message(
+                    "business-failure-call", MessageRole.ASSISTANT,
+                    (ToolCallBlock(ToolCall(
+                        "business-failure", "fixture.run_command",
+                        {"argv": ["false"]},
+                    )),),
+                ),
+                FinishReason.TOOL_CALL,
+            )
+        return ModelResponse(
+            Message(
+                "business-failure-final", MessageRole.ASSISTANT,
+                (TextBlock("done"),),
+            ),
+            FinishReason.STOP,
+        )
+
+
+class UnresolvedEffectFailureTest(unittest.IsolatedAsyncioTestCase):
+    """SPEC 5.2/5.3 regression: a failed effect must not be reported complete."""
+
+    async def test_nonzero_command_creates_a_required_effect_failure_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = compose_fixture_application(
+                model_adapter=BusinessFailureModel(),
+                tool_adapters=(BusinessFailureCommandTool(),),
+                completion_readiness_policy_adapter=(
+                    RuleBasedCompletionReadinessPolicy()
+                ),
+            )
+            await application.registry.start_all()
+            try:
+                task = await executing_task(
+                    application, root, "nonzero-command"
+                )
+                await application.kernel.run_agent_turn(
+                    task.task_id, "run the command", max_model_calls=3,
+                )
+                gaps = await application.kernel._completion_readiness_gaps(
+                    task.task_id, await application.kernel.list_tools()
+                )
+                effect_gaps = [
+                    gap for gap in gaps
+                    if gap.kind == "UNRESOLVED_EFFECT_FAILURE"
+                ]
+                self.assertTrue(effect_gaps, [gap.kind for gap in gaps])
+                self.assertEqual(
+                    effect_gaps[0].required_effects, (ToolEffect.EXECUTE,),
+                )
+                self.assertEqual(
+                    effect_gaps[0].status, "failed",
+                )
+                events = await application.registry.require(
+                    RuntimeStorePort
+                ).read_events(task.task_id)
+                readiness = [
+                    event for event in events
+                    if event.event_type == "completion.readiness_evaluated"
+                ]
+                self.assertTrue(readiness)
+                # Corrections may run out and force a COMPLETE, but a forced
+                # COMPLETE must still carry the required gap so the fail-closed
+                # final acceptance turns it into a BLOCK. No clean completion
+                # (COMPLETE with no required gap) may exist.
+                clean_completions = [
+                    event for event in readiness
+                    if event.payload["action"] == "COMPLETE"
+                    and not any(
+                        gap.get("kind") == "UNRESOLVED_EFFECT_FAILURE"
+                        and gap.get("required", True)
+                        for gap in event.payload.get("gaps", [])
+                    )
+                ]
+                self.assertEqual(clean_completions, [])
+            finally:
+                await application.registry.stop_all()
