@@ -283,6 +283,9 @@ class ModelRequest:
     timeout_seconds: float | None = None
     max_provider_attempts: int | None = None
     conclusion_protocol_mode: ConclusionProtocolMode = ConclusionProtocolMode.OBSERVE
+    # Process-local only: lets a streaming adapter register its worker thread /
+    # stop signal with the Task's CancellationScope. Never serialized.
+    cancellation_scope: object | None = None
 
 
 @dataclass(frozen=True, slots=True)

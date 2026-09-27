@@ -37,6 +37,7 @@ class TaskStateMachineTest(unittest.TestCase):
             TaskState.SUCCEEDED: Phase1TaskState.DONE,
             TaskState.CANCELLED: Phase1TaskState.CANCELLED,
             TaskState.FAILED: Phase1TaskState.FAILED,
+            TaskState.NEEDS_REVIEW: Phase1TaskState.NEEDS_REVIEW,
         }
         self.assertEqual(set(expected), set(TaskState))
         for legacy, phase1 in expected.items():

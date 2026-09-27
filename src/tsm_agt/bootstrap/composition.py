@@ -16,6 +16,7 @@ from tsm_agt.adapters.builtin import (
     NetworkToolProvider,
 )
 from tsm_agt.adapters.text_code_intelligence import TextCodeIntelligenceProvider
+from tsm_agt.adapters.model_rubric_judge import ModelRubricJudge
 from tsm_agt.adapters.structured_evidence import StructuredEvidenceDeltaEvaluator
 from tsm_agt.adapters.rule_based_semantic_action import (
     RuleBasedSemanticActionClassifier,
@@ -114,6 +115,7 @@ from tsm_agt.ports import (
     SessionInputRelationPort,
     SessionInputResolverPort,
     TaskSpecPlannerPort,
+    RubricJudgePort,
     EvidenceDeltaEvaluatorPort,
     SemanticActionClassifierPort,
     ReadHitsPolicyPort,
@@ -158,6 +160,16 @@ class Application:
     #: Non-fatal configuration problems the host should surface (for example an
     #: invalid optional-search value that degraded to the free providers).
     configuration_issues: tuple[str, ...] = ()
+
+    async def start(self) -> None:
+        """Start adapters, then settle crash-left Tasks (spec §6.2 plan A).
+
+        Every entry point (web, CLI, SDK) must use this instead of
+        ``registry.start_all()`` so INTERRUPTING Tasks are reconciled before any
+        user input is accepted.
+        """
+        await self.registry.start_all()
+        await self.kernel.reconcile_interrupting_tasks()
 
 
 def _endpoint_origin(base_url: str) -> str:
@@ -229,6 +241,9 @@ def _kernel_dependencies(
     task_spec_planners = registry.all(TaskSpecPlannerPort)
     if len(task_spec_planners) > 1:
         raise ValueError("at most one TaskSpecPlannerPort may be registered")
+    rubric_judges = registry.all(RubricJudgePort)
+    if len(rubric_judges) > 1:
+        raise ValueError("at most one RubricJudgePort may be registered")
     checkpoint_compatibility_policies = registry.all(
         CheckpointCompatibilityPolicyPort
     )
@@ -404,6 +419,7 @@ def _kernel_dependencies(
         task_spec_planner=(
             task_spec_planners[0] if task_spec_planners else None
         ),
+        rubric_judge=(rubric_judges[0] if rubric_judges else None),
         checkpoint_compatibility_policy=(
             checkpoint_compatibility_policies[0]
             if checkpoint_compatibility_policies else None
@@ -535,6 +551,7 @@ def compose_fixture_application(
     session_input_relation_adapter: SessionInputRelationPort | None = None,
     session_input_resolver_adapter: SessionInputResolverPort | None = None,
     task_spec_planner_adapter: TaskSpecPlannerPort | None = None,
+    rubric_judge_adapter: RubricJudgePort | None = None,
     checkpoint_compatibility_policy_adapter: (
         CheckpointCompatibilityPolicyPort | None
     ) = None,
@@ -615,6 +632,8 @@ def compose_fixture_application(
         )
     if task_spec_planner_adapter is not None:
         registry.register(TaskSpecPlannerPort, task_spec_planner_adapter)
+    if rubric_judge_adapter is not None:
+        registry.register(RubricJudgePort, rubric_judge_adapter)
     registry.register(
         CheckpointCompatibilityPolicyPort,
         checkpoint_compatibility_policy_adapter
@@ -830,6 +849,14 @@ def compose_openai_compatible_readonly_application(
         TaskSpecPlannerPort,
         ModelTaskSpecPlanner(registry.require(ModelProviderPort)),
     )
+    # INV-10: a judged criterion must have a judge. Without this the Planner's
+    # rubric criteria would have no way to pass and every judged Task would fall
+    # to NEEDS_REVIEW.
+    if not registry.all(RubricJudgePort):
+        registry.register(
+            RubricJudgePort,
+            ModelRubricJudge(registry.require(ModelProviderPort)),
+        )
     registry.register(
         CheckpointCompatibilityPolicyPort,
         RuleBasedCheckpointCompatibilityPolicy(),
@@ -988,6 +1015,14 @@ def compose_openai_compatible_engineering_application(
         TaskSpecPlannerPort,
         ModelTaskSpecPlanner(registry.require(ModelProviderPort)),
     )
+    # INV-10: a judged criterion must have a judge. Without this the Planner's
+    # rubric criteria would have no way to pass and every judged Task would fall
+    # to NEEDS_REVIEW.
+    if not registry.all(RubricJudgePort):
+        registry.register(
+            RubricJudgePort,
+            ModelRubricJudge(registry.require(ModelProviderPort)),
+        )
     registry.register(
         CheckpointCompatibilityPolicyPort,
         RuleBasedCheckpointCompatibilityPolicy(),

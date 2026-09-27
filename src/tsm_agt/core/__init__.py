@@ -57,6 +57,12 @@ from .replay import (
     FlowReplayPlayback, FlowReplayPlaybackFrame, FlowReplaySnapshot,
     FlowReplaySpeed, FlowReplayTarget,
 )
+from .cancellation import (
+    CANCELLATION_METRICS, CancellationMetrics, CancellationScope,
+    CancellationSignal, CleanupReport, TaskCancellationSignal,
+    note_cancel_requested, note_interrupting_settled, note_scope_closed,
+    note_scope_opened, note_stream_released,
+)
 from .execution import (
     IdempotencyConflict,
     ToolCommitState,
@@ -82,6 +88,9 @@ from .task_spec import (
     TaskOutcomeEligibilityCalculator, TaskOutcomeKind, TaskOutcomeProposal,
     TaskOutcomeSnapshot, TaskOutcomeStatus, TaskSpecProjector,
     TaskSpecProposal, TaskSpecSnapshot,
+    MACHINE_REFERENCE_PREFIXES, MAX_AUTHORED_ACCEPTANCE_CRITERIA,
+    REQUIRED_EFFECT_CRITERION_ID, RUNTIME_AUTHORED_CRITERION_KINDS,
+    validate_authored_reference,
 )
 from .session import (
     SessionChoiceOption, SessionInteractionKind, SessionInteractionRequest,
@@ -96,6 +105,7 @@ from .session_context import (
     SessionActiveCheckpoint, SessionConversationProjection,
     SessionPromptProjection, SessionTaskSummary,
     SessionWorkingState,
+    ContextAuthority, ContextScope, select_messages_by_scope,
 )
 from .session_resources import (
     SessionQuestionReference, SessionResourceKind, SessionResourceReference,
@@ -118,7 +128,10 @@ from .runtime_input import (
     SessionInputAction, SessionInputDecision, SessionInputGrounding,
     SessionRouteDisposition, SessionTaskCatalogEntry, SessionTaskRelation,
 )
-from .session_handoff import build_session_follow_up_goal
+from .session_handoff import (
+    SessionFollowUpHandoff, build_session_follow_up_goal,
+    build_session_follow_up_handoff, clip_text, find_background_leak,
+)
 from .plan_guard import (
     ActionProgressState, GoalSlice, PlanGuard, PlanGuardDecision,
 )
@@ -246,6 +259,10 @@ __all__ = [
     "SessionTaskCatalogEntry",
     "SessionTaskRelation",
     "build_session_follow_up_goal",
+    "build_session_follow_up_handoff",
+    "SessionFollowUpHandoff",
+    "clip_text",
+    "find_background_leak",
     "IdempotencyConflict",
     "ToolCommitState",
     "ToolExecutionInProgress",
@@ -274,6 +291,22 @@ __all__ = [
     "TASK_SPEC_PROPOSAL_SCHEMA_V1",
     "TaskContinuationMode",
     "TaskCriterionKind",
+    "MACHINE_REFERENCE_PREFIXES",
+    "MAX_AUTHORED_ACCEPTANCE_CRITERIA",
+    "REQUIRED_EFFECT_CRITERION_ID",
+    "RUNTIME_AUTHORED_CRITERION_KINDS",
+    "validate_authored_reference",
+    "CancellationScope",
+    "CancellationSignal",
+    "TaskCancellationSignal",
+    "CleanupReport",
+    "CancellationMetrics",
+    "CANCELLATION_METRICS",
+    "note_cancel_requested",
+    "note_interrupting_settled",
+    "note_stream_released",
+    "note_scope_opened",
+    "note_scope_closed",
     "OutcomeBindingAction",
     "OutcomeBindingDecision",
     "OutcomeBindingReason",
@@ -304,6 +337,9 @@ __all__ = [
     "SessionPromptProjection",
     "SessionTaskSummary",
     "SessionWorkingState",
+    "ContextAuthority",
+    "ContextScope",
+    "select_messages_by_scope",
     "SessionQuestionReference",
     "SessionResourceKind",
     "SessionResourceReference",

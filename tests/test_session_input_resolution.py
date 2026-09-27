@@ -412,8 +412,11 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                     decision.relation, SessionTaskRelation.FOLLOW_UP
                 )
                 self.assertEqual(decision.source_task_id, "task-awaiting")
-                self.assertIn("[session-follow-up]", decision.resolved_goal)
-                self.assertIn("continue pending work", decision.resolved_goal)
+                # INV-9: the goal is the user's request; the source is carried
+                # only as non-authoritative background.
+                self.assertEqual(
+                    decision.resolved_goal, "continue pending work"
+                )
                 self.assertEqual(
                     decision.candidates[0].safety,
                     SessionResumeSafety.AWAIT_USER_ACTION,
@@ -845,5 +848,201 @@ class SessionAnswerTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(all(
                     item.task_id is None for item in conversation.messages
                 ))
+            finally:
+                await app.registry.stop_all()
+
+
+class ContextDependentResumeIdentityTest(unittest.IsolatedAsyncioTestCase):
+    """INV-12: resume needs an explicit identity, never a similarity guess."""
+
+    @staticmethod
+    async def _app(root: Path, resolver):
+        app = compose_fixture_application(
+            model_adapter=EchoModelProvider(), tool_adapters=(),
+            session_input_resolver_adapter=resolver,
+        )
+        await app.registry.start_all()
+        return app
+
+    @staticmethod
+    def _candidate(task_id: str, goal: str, root: Path):
+        return SessionResumeCandidate(
+            task_id, goal, "AWAITING_USER", str(root),
+            SessionResumeSafety.REQUIRES_VALIDATION, "interrupted",
+        )
+
+    async def test_context_dependent_with_single_candidate_resumes_it(self):
+        resolver = FixtureResolver({
+            "disposition": "CREATE_TASK", "relation": "CONTEXTUAL",
+            "source_task_id": None, "input_grounding": "CONTEXT_DEPENDENT",
+            "confidence": 0.96, "reason_code": "scripted",
+            "clarification": None, "candidate_task_ids": [],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = await self._app(root, resolver)
+            try:
+                session = await app.kernel.create_session("single candidate")
+                candidate = self._candidate("task-one", "keep going", root)
+                with patch.object(
+                    app.kernel, "list_session_resume_candidates",
+                    AsyncMock(return_value=(candidate,)),
+                ):
+                    decision = await app.kernel.resolve_session_input(
+                        session.session_id, "接着弄", root
+                    )
+                self.assertEqual(
+                    decision.disposition, SessionRouteDisposition.CREATE_TASK
+                )
+                self.assertEqual(
+                    decision.relation, SessionTaskRelation.FOLLOW_UP
+                )
+                self.assertEqual(decision.source_task_id, "task-one")
+                self.assertEqual(decision.resolved_goal, "接着弄")
+                self.assertEqual(
+                    decision.reason_code,
+                    "unique_candidate_context_derived_follow_up",
+                )
+            finally:
+                await app.registry.stop_all()
+
+    async def test_context_dependent_with_multiple_candidates_clarifies(self):
+        resolver = FixtureResolver({
+            "disposition": "CREATE_TASK", "relation": "CONTEXTUAL",
+            "source_task_id": None, "input_grounding": "CONTEXT_DEPENDENT",
+            "confidence": 0.96, "reason_code": "scripted",
+            "clarification": None, "candidate_task_ids": [],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = await self._app(root, resolver)
+            try:
+                session = await app.kernel.create_session("many candidates")
+                candidates = (
+                    self._candidate("task-one", "first", root),
+                    self._candidate("task-two", "second", root),
+                )
+                with patch.object(
+                    app.kernel, "list_session_resume_candidates",
+                    AsyncMock(return_value=candidates),
+                ):
+                    decision = await app.kernel.resolve_session_input(
+                        session.session_id, "接着弄", root
+                    )
+                self.assertEqual(
+                    decision.disposition, SessionRouteDisposition.CLARIFY
+                )
+                self.assertEqual(
+                    decision.relation, SessionTaskRelation.UNCERTAIN
+                )
+                self.assertIsNone(decision.source_task_id)
+                self.assertIsNone(decision.resolved_goal)
+                self.assertEqual(
+                    set(decision.candidate_task_ids),
+                    {"task-one", "task-two"},
+                )
+                self.assertEqual(
+                    decision.reason_code,
+                    "multiple_candidates_require_explicit_choice",
+                )
+                self.assertIsNotNone(decision.clarification)
+            finally:
+                await app.registry.stop_all()
+
+    async def test_context_dependent_without_candidates_stays_contextual(self):
+        resolver = FixtureResolver({
+            "disposition": "CREATE_TASK", "relation": "CONTEXTUAL",
+            "source_task_id": None, "input_grounding": "CONTEXT_DEPENDENT",
+            "confidence": 0.96, "reason_code": "scripted",
+            "clarification": None, "candidate_task_ids": [],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = await self._app(root, resolver)
+            try:
+                session = await app.kernel.create_session("no candidates")
+                # A finished Task keeps the catalog non-empty so the semantic
+                # resolver actually runs; it is not a resume candidate.
+                done = await app.kernel.create_task(
+                    "already finished", root, session_id=session.session_id,
+                )
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING, TaskState.VERIFYING,
+                    TaskState.FINALIZING, TaskState.SUCCEEDED,
+                ):
+                    done = await app.kernel.transition_task(
+                        done.task_id, state, state.value
+                    )
+                decision = await app.kernel.resolve_session_input(
+                    session.session_id, "接着弄", root
+                )
+                self.assertEqual(
+                    decision.disposition, SessionRouteDisposition.CREATE_TASK
+                )
+                self.assertEqual(
+                    decision.relation, SessionTaskRelation.CONTEXTUAL
+                )
+                self.assertEqual(decision.resolved_goal, "接着弄")
+            finally:
+                await app.registry.stop_all()
+
+    async def test_self_contained_new_task_is_unaffected(self):
+        resolver = FixtureResolver({
+            "disposition": "CREATE_TASK", "relation": "INDEPENDENT",
+            "source_task_id": None, "input_grounding": "SELF_CONTAINED",
+            "confidence": 0.96, "reason_code": "scripted",
+            "clarification": None, "candidate_task_ids": [],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = await self._app(root, resolver)
+            try:
+                session = await app.kernel.create_session("self contained")
+                candidate = self._candidate("task-one", "old work", root)
+                with patch.object(
+                    app.kernel, "list_session_resume_candidates",
+                    AsyncMock(return_value=(candidate,)),
+                ):
+                    decision = await app.kernel.resolve_session_input(
+                        session.session_id, "explain Sessions", root
+                    )
+                self.assertEqual(
+                    decision.relation, SessionTaskRelation.INDEPENDENT
+                )
+                self.assertIsNone(decision.source_task_id)
+                self.assertEqual(decision.resolved_goal, "explain Sessions")
+            finally:
+                await app.registry.stop_all()
+
+    async def test_router_failure_fallback_is_unchanged(self):
+        def boom(_text, _context):
+            raise RuntimeError("resolver unavailable")
+
+        resolver = FixtureResolver({})
+        resolver.resolve_session_input = boom
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = await self._app(root, resolver)
+            try:
+                session = await app.kernel.create_session("router failure")
+                candidate = self._candidate("task-one", "old work", root)
+                with patch.object(
+                    app.kernel, "list_session_resume_candidates",
+                    AsyncMock(return_value=(candidate,)),
+                ):
+                    decision = await app.kernel.resolve_session_input(
+                        session.session_id, "接着弄", root
+                    )
+                # A timeout/unavailable router never guesses a source.
+                self.assertEqual(
+                    decision.relation, SessionTaskRelation.CONTEXTUAL
+                )
+                self.assertIsNone(decision.source_task_id)
+                self.assertEqual(decision.resolved_goal, "接着弄")
+                self.assertTrue(
+                    decision.reason_code.startswith("semantic_router_")
+                )
             finally:
                 await app.registry.stop_all()

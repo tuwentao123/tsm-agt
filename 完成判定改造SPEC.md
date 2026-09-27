@@ -547,6 +547,8 @@ task-a1ca6115134a42759ad2428eeee3e6dd
 
 见 §6.4。`REQUIRED_OUTCOME_UNSATISFIED` 是既有 gap；新增失败事实时要注意**不要与 outcome 未闭合重复计 gap**。
 
+> **修订（2026-09，§13）**：该 gap 的产生位置已被写成死循环 `for outcome in ():`，实际**不会再产出**。outcome 的"要求是否满足"现由两条路径承担：契约声明的副作用由 §13 的 `required_effect` 验收条目负责；outcome 的显式完成声明由 `request_task_outcome_completion` 的耐用校验负责。
+
 ### 11.3 命令验证已有部分补偿，必须划边界
 
 `POST_MUTATION_VERIFICATION`（`kernel.py:7401`）与 `TASK_SPEC_POST_MUTATION_COMMAND`（`kernel.py:7339`）已覆盖"有 mutation + 命令验证未通过"。
@@ -617,3 +619,48 @@ task-a1ca6115134a42759ad2428eeee3e6dd
 1. **事实缺步骤维度**：`ExecutionFact` 需要 `step_ref` 才能表达"某步骤的动作失败未解决"。
 2. **契约 seam 迁移**：`required_plan_step_refs` 的数据源应从 WorkingMemory 迁到 TaskSpec/Plan。
 3. **原则 1 限定适用范围**：`不新增持久化实体`应表述为"**本批**不新增"；runtime 拥有的 plan（步骤/依赖/per-step 验收/重试）未来需要持久化实体。
+
+---
+
+# 13. 交付对账：把"契约要求的动作"变成一条运行时验收条目（已实施）
+
+## 13.1 要解决的问题（实测故障）
+
+`task-77a407`：契约声明了 2 条 required `WORKSPACE_DELIVERY`（`required_effects=["mutate"]`），但 `mutation_journal` 为空、`mutation_count=0`，6 条 `workspace_integrity` 全部以 "no mutation required verification" 判**通过**，任务假 SUCCEEDED，最终文案还与输入不相关。
+
+`task-48858`：契约要求 `observe+mutate+execute`，验收条目全是 `post_mutation_command`，零改动时该条"不适用"直接跳过，同样假成功。
+
+根因不是判错，而是**契约里"必须有改动/必须跑过命令"这件事，验收侧没有能表达它的条目类型**：
+
+- `workspace_integrity` 只表达"磁盘与改动流水一致"。空流水对空磁盘天然一致，语义上它没有说谎，是**问错了问题**。
+- `post_mutation_command` 零改动时前置条件不成立，只能"不适用"。
+
+## 13.2 做法：一条运行时作者的验收条目
+
+1. **新增判据种类** `TaskCriterionKind.REQUIRED_EFFECT = "required_effect"`，与 `GOAL_ALIGNMENT` 一起列入 `RUNTIME_AUTHORED_CRITERION_KINDS`。它们被**排除在所有模型可见 schema** 之外（`TASK_SPEC_PROPOSAL_SCHEMA_V1` 与 `core.task_spec_update` 的枚举都由枚举反推，不再硬编码），并且在两条授权路径上被**剥离后由运行时重新生成**，所以规划器既不能伪造也不能删除。
+2. **运行时按契约派生**：`_required_effects_from_outcomes()` 取所有 required outcome 里声明的、且属于 `_DELIVERABLE_EFFECTS = {mutate, execute}` 的副作用；只要有，就追加一条 `criterion_id="required-effect-delivery"` 的条目。
+   - `observe` / `interact` **故意排除**：观察由证据类条目约束，问用户由交互流程闭环（`kernel.py:11188` 一带）。两者都不是"我干了活"的声明，无法靠文案伪造，也不该被塞进交付断言。
+3. **判定只认耐用记录**（`_recorded_effect_deliveries`）：
+   - `mutate`：改动流水按路径取首末哈希，**首末不同**才算留下改动（写一次再回滚 = 没改）。流水只追加，回滚本身也是记录，所以不能数条数。
+   - `execute`：存在 `effect=EXECUTE` 且 `COMMITTED` 且工具级 `ok` 的执行记录。**含义是"动作被执行过"，不是"命令成功"**——命令跑挂了也是执行过，成不成功由契约自己的命令类条目判。
+4. **两处消费同一事实**：
+   - 回合内完成度评估：缺交付 → 产出 required gap（`REQUIRED_DELIVERY_UNSATISFIED`，`required_effects=缺失集合`，`candidate_tools` 按缺失 effect 过滤），策略据此继续而不是收工；
+   - 最终验收：判 `FAILED`，证据逐 effect 列出"有/无耐用记录"。
+5. **验收条目容量**：模型可作者化条目上限由 30 降为 `MAX_AUTHORED_ACCEPTANCE_CRITERIA = 28`，为运行时自己的条目（对齐 + 交付，最多 2 条）预留位置，快照 30 条上限不变。
+
+## 13.3 撤掉的两处临时补丁
+
+- `workspace_integrity` 不再因"契约要求改动却零改动"被判 FAILED（恢复"一致性"本义）；
+- `post_mutation_command` 零改动时恢复 `NOT_APPLICABLE`。
+
+两者原先被迫替交付断言背锅，现在各归其位；`_completion_readiness_gaps` 里那段墓碑式死循环 `for outcome in ():`（原 `REQUIRED_OUTCOME_UNSATISFIED` 产生处）随之删除，注释改为说明真实归属。
+
+## 13.4 测试
+
+`tests/test_completion_claim_gate.py`（23 例）：耐用记录定义（回滚不算、失败命令不算、未提交不算）、判据派生与注入、规划器伪造被剥离、修订后条目被重新派生、容量上限、只读契约不设门槛、`mutate`/`execute` 缺失各自产出 gap、最终验收 FAILED / PASSED（含真实跑通一条命令）。
+
+## 13.5 已知边界
+
+- 只覆盖 `mutate` / `execute`。`observe` / `interact` 不在交付断言范围内（理由见 13.2）。
+- 闸门依赖该条目存在于契约中，因此**只对经由 `plan_task_spec` / `revise_task_spec` 生成契约的 Task 生效**；手写或 `schema_version=0` 的历史契约没有它。
+- 条目内容由规划模型写的 outcome 派生，所以契约写歪时闸门同向歪：该写 `mutate` 却只写了 `ANSWER` 的任务仍可零改动通过；反之纯问答被误判成实现类会误伤。

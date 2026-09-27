@@ -27,6 +27,8 @@ class TaskDisplayStatus(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     COMPLETED = "completed"
+    #: Terminal but not verified: unmet required work was handed to a human.
+    NEEDS_REVIEW = "needs_review"
 
 
 class TaskRuntimePhase(StrEnum):
@@ -184,6 +186,8 @@ class TaskRuntimeProjector:
             return TaskDisplayStatus.INTERRUPTED
         if state is TaskState.SUCCEEDED:
             return TaskDisplayStatus.COMPLETED
+        if state is TaskState.NEEDS_REVIEW:
+            return TaskDisplayStatus.NEEDS_REVIEW
         if state is TaskState.CANCELLED:
             return TaskDisplayStatus.CANCELLED
         if state is TaskState.FAILED:

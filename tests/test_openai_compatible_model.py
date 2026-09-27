@@ -87,7 +87,7 @@ class StreamingTransport(RecordingTransport):
         self.events = events
 
     async def stream_sse(
-        self, url, headers, payload, timeout_seconds,
+        self, url, headers, payload, timeout_seconds, cancellation_scope=None,
     ):
         self.requests.append({
             "url": url, "headers": dict(headers),
@@ -102,7 +102,9 @@ class AttemptStreamingTransport(RecordingTransport):
         super().__init__([])
         self.attempts = attempts
 
-    async def stream_sse(self, url, headers, payload, timeout_seconds):
+    async def stream_sse(
+        self, url, headers, payload, timeout_seconds, cancellation_scope=None,
+    ):
         self.requests.append({
             "url": url, "headers": dict(headers),
             "payload": dict(payload), "timeout_seconds": timeout_seconds,

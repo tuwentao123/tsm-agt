@@ -44,6 +44,70 @@ class TaskCriterionKind(StrEnum):
     WORKSPACE_INTEGRITY = "workspace_integrity"
     POST_MUTATION_COMMAND = "post_mutation_command"
     EVIDENCE_REFERENCE = "evidence_reference"
+    #: A judgement channel with no machine proof. It is advisory in the per-turn
+    #: readiness gate and is evaluated by a bounded rubric judge before final
+    #: acceptance. Added so the Planner never has to disguise a subjective
+    #: requirement as an evidence reference.
+    RUBRIC = "rubric"
+    #: Runtime-authored alignment criterion for answer-bearing Tasks. The
+    #: Planner may never author it, so it is excluded from the proposal schema;
+    #: a Task that answers must be judged on whether it answered *this* request.
+    GOAL_ALIGNMENT = "goal_alignment"
+    #: Runtime-authored delivery criterion. The contract's declared required
+    #: side effects (``mutate``, ``execute``) are asserted to have left a durable
+    #: record, so a Task that promised work cannot be closed by prose. The
+    #: Planner may never author or drop it; the Runtime derives it from the
+    #: proposal's Outcomes and re-derives it on every revision.
+    REQUIRED_EFFECT = "required_effect"
+
+
+#: Criterion kinds only the Runtime may author. They are excluded from every
+#: model-facing schema, and the authoring paths strip any submission that
+#: carries them before building the snapshot, so a Planner can neither add nor
+#: remove them.
+RUNTIME_AUTHORED_CRITERION_KINDS: frozenset[TaskCriterionKind] = frozenset({
+    TaskCriterionKind.GOAL_ALIGNMENT,
+    TaskCriterionKind.REQUIRED_EFFECT,
+})
+
+#: Canonical id of the Runtime-authored delivery criterion.
+REQUIRED_EFFECT_CRITERION_ID = "required-effect-delivery"
+
+#: Acceptance criteria a single Planner submission may carry. Two slots are
+#: reserved for the Runtime-authored criteria above (a Task can carry both an
+#: answer-alignment and a delivery criterion), keeping the snapshot within its
+#: 30-criterion bound.
+MAX_AUTHORED_ACCEPTANCE_CRITERIA = 28
+
+
+#: The only reference prefixes the Runtime verifier can resolve. Anything else
+#: (such as the ``turn-...`` id a Planner copied from session context) is
+#: permanently unverifiable.
+MACHINE_REFERENCE_PREFIXES: tuple[str, ...] = ("event:", "tool_call:", "mutation:")
+
+
+def validate_authored_reference(
+    kind: TaskCriterionKind, reference: str | None,
+) -> None:
+    """Authoring-time validation for a newly written acceptance criterion.
+
+    Call this only from the authoring paths (``Kernel.plan_task_spec`` and
+    ``Kernel.revise_task_spec``). It must NOT live in ``__post_init__`` or
+    ``from_data``: historical snapshots already contain unresolvable references
+    (``task-2c8f8fbb75714516a94ab442995626b5`` stores ``turn-...``), and a hard
+    failure there would make those Tasks impossible to replay.
+    """
+    if kind is not TaskCriterionKind.EVIDENCE_REFERENCE:
+        return
+    ref = (reference or "").strip()
+    if not ref:
+        raise ValueError("evidence_reference criterion requires a reference")
+    if not ref.startswith(MACHINE_REFERENCE_PREFIXES):
+        raise ValueError(
+            "evidence_reference must start with one of "
+            + "/".join(MACHINE_REFERENCE_PREFIXES)
+            + f"; got {ref!r}"
+        )
 
 
 class TaskOutcomeKind(StrEnum):
@@ -340,8 +404,12 @@ class TaskSpecProposal:
         if len({item.outcome_id for item in self.outcomes}) != len(self.outcomes):
             raise ValueError("Task SPEC proposal outcome IDs must be unique")
         _validate_outcome_dependencies(self.outcomes)
-        if len(self.acceptance_criteria) > 30:
-            raise ValueError("Task SPEC proposal supports at most 30 acceptance criteria")
+        if len(self.acceptance_criteria) > MAX_AUTHORED_ACCEPTANCE_CRITERIA:
+            raise ValueError(
+                "Task SPEC proposal supports at most "
+                f"{MAX_AUTHORED_ACCEPTANCE_CRITERIA} acceptance criteria "
+                "(the Runtime reserves two criterion slots)"
+            )
         if len({item.criterion_id for item in self.acceptance_criteria}) != len(
             self.acceptance_criteria
         ):
@@ -611,7 +679,8 @@ TASK_SPEC_PROPOSAL_SCHEMA_V1: Mapping[str, Any] = {
         "scope": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
         "constraints": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
         "acceptance_criteria": {
-            "type": "array", "minItems": 1, "maxItems": 30,
+            "type": "array", "minItems": 1,
+            "maxItems": MAX_AUTHORED_ACCEPTANCE_CRITERIA,
             "items": {
                 "type": "object",
                 "properties": {
@@ -619,7 +688,10 @@ TASK_SPEC_PROPOSAL_SCHEMA_V1: Mapping[str, Any] = {
                     "description": {"type": "string", "minLength": 1, "maxLength": 1000},
                     "verification_kind": {
                         "type": "string",
-                        "enum": [item.value for item in TaskCriterionKind],
+                        "enum": [
+                            item.value for item in TaskCriterionKind
+                            if item not in RUNTIME_AUTHORED_CRITERION_KINDS
+                        ],
                     },
                     "evidence_reference": {"type": ["string", "null"]},
                 },

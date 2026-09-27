@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -80,6 +81,9 @@ class ContextCompactionReceipt:
     summary_hash: str
     protected_message_count: int
     protected_sections: tuple[str, ...]
+    forgotten_message_ids: tuple[str, ...] = ()
+    forgotten_event_sequences: tuple[int, ...] = ()
+    pinned_message_ids: tuple[str, ...] = ()
 
     def event_data(self) -> dict[str, Any]:
         return {
@@ -97,6 +101,9 @@ class ContextCompactionReceipt:
             "summary_hash": self.summary_hash,
             "protected_message_count": self.protected_message_count,
             "protected_sections": list(self.protected_sections),
+            "forgotten_message_ids": list(self.forgotten_message_ids),
+            "forgotten_event_sequences": list(self.forgotten_event_sequences),
+            "pinned_message_ids": list(self.pinned_message_ids),
             "summary_body_persisted": False,
         }
 
@@ -113,6 +120,9 @@ class ContextWindowManager:
     trigger_ratio: float = 0.80
     recent_message_floor: int = 8
     latency_soft_input_tokens: int = 0
+    #: Ceiling for the union of recency-selected and pinned messages. Pinning
+    #: decides eligibility; this only bounds the result.
+    pinned_message_ceiling: int = 32
 
     def __post_init__(self) -> None:
         if not 0 < self.trigger_ratio < 1:
@@ -123,6 +133,10 @@ class ContextWindowManager:
             raise ValueError(
                 "latency_soft_input_tokens must be zero or positive"
             )
+        if self.pinned_message_ceiling < self.recent_message_floor:
+            raise ValueError(
+                "pinned_message_ceiling must be at least recent_message_floor"
+            )
 
     def snapshot_data(self) -> dict[str, Any]:
         return {
@@ -131,11 +145,13 @@ class ContextWindowManager:
             "trigger_ratio": self.trigger_ratio,
             "recent_message_floor": self.recent_message_floor,
             "latency_soft_input_tokens": self.latency_soft_input_tokens,
+            "pinned_message_ceiling": self.pinned_message_ceiling,
             "estimation_method": "utf8-bytes-div-4-conservative-v1",
             "preserve_first_user_goal": True,
             "preserve_session_and_working_memory": True,
             "preserve_all_session_task_indexes": True,
             "preserve_session_artifact_paths": True,
+            "preserve_pinned_session_messages": True,
             "preserve_tool_call_result_groups": True,
         }
 
@@ -383,26 +399,45 @@ class ContextWindowManager:
             ):
                 projected.append(message)
                 continue
-            raw_messages = body.get("recent_messages", [])
+            raw_messages = body.get("recent_messages") or []
             if not isinstance(raw_messages, list):
                 projected.append(message)
                 continue
+            # INV-8 at the compression layer: eligibility is provenance, not
+            # recency. A Task the caller pinned (for example the source of a
+            # derived Task) is retained even when none of its messages are recent.
+            pinned = {
+                str(item) for item in body.get("pinned_task_ids", [])
+                if isinstance(item, (str, int)) and str(item)
+            }
             recent = raw_messages[-self.recent_message_floor:]
+            if pinned:
+                pinned_messages = [
+                    item for item in raw_messages
+                    if isinstance(item, dict)
+                    and str(item.get("task_id")) in pinned
+                ]
+                recent = pinned_messages + [
+                    item for item in recent if item not in pinned_messages
+                ]
+                recent = recent[-self.pinned_message_ceiling:]
             recent_task_ids = {
                 str(item.get("task_id")) for item in recent
                 if isinstance(item, dict) and item.get("task_id")
             }
+            eligible_task_ids = recent_task_ids | pinned
             summaries = body.get("recent_task_summaries", [])
             if isinstance(summaries, list):
                 kept_summaries = [
                     item for item in summaries
                     if isinstance(item, dict)
-                    and str(item.get("task_id")) in recent_task_ids
+                    and str(item.get("task_id")) in eligible_task_ids
                 ]
                 removed += len(summaries) - len(kept_summaries)
                 body["recent_task_summaries"] = kept_summaries
             removed += len(raw_messages) - len(recent)
-            body["recent_messages"] = recent
+            if raw_messages or body.get("recent_messages"):
+                body["recent_messages"] = recent
             historical = body.get("historical_investigation")
             if isinstance(historical, dict):
                 for key in ("resources", "questions"):
@@ -412,7 +447,7 @@ class ContextWindowManager:
                     kept = [
                         item for item in values
                         if isinstance(item, dict)
-                        and str(item.get("source_task_id")) in recent_task_ids
+                        and str(item.get("source_task_id")) in eligible_task_ids
                     ]
                     removed += len(values) - len(kept)
                     historical[key] = kept
@@ -421,6 +456,8 @@ class ContextWindowManager:
                 "task_index_preserved": True,
                 "artifact_paths_preserved": True,
                 "recent_message_floor": self.recent_message_floor,
+                "pinned_message_ceiling": self.pinned_message_ceiling,
+                "pinned_task_ids": sorted(pinned),
             }
             text = json.dumps(
                 body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -438,6 +475,44 @@ class ContextWindowManager:
     ) -> ContextCompactionReceipt:
         source_data = [self._message_hash_data(message) for message in source]
         summary_data = [self._message_hash_data(message) for message in preserved]
+        preserved_ids = {message.message_id for message in preserved}
+
+        def survived(message_id: str) -> bool:
+            # A rewritten message keeps its identity but gains "-compacted".
+            return (
+                message_id in preserved_ids
+                or message_id + "-compacted" in preserved_ids
+            )
+
+        forgotten = tuple(
+            message.message_id for message in source
+            if not survived(message.message_id)
+        )
+        # Provenance: every dropped fact must stay traceable to the durable
+        # events it summarised, so a compacted context is auditable. Either the
+        # whole message went away, or its session detail was reduced in place.
+        preserved_by_source_id = {
+            message.message_id.removesuffix("-compacted"): message
+            for message in preserved
+        }
+        forgotten_sequences: set[int] = set()
+        for message in source:
+            if not survived(message.message_id):
+                forgotten_sequences.update(
+                    self._message_event_sequences(message)
+                )
+                continue
+            after = preserved_by_source_id.get(message.message_id)
+            if after is not None:
+                forgotten_sequences.update(
+                    set(self._message_event_sequences(message))
+                    - set(self._message_event_sequences(after))
+                )
+        pinned_message_ids = tuple(
+            message.message_id for message in preserved
+            if message.message_id.startswith("session-context-")
+            and self._session_pinned_task_ids(message)
+        )
         return ContextCompactionReceipt(
             algorithm="provider-budget-managed-session", version=2,
             source_message_count=len(source),
@@ -460,6 +535,50 @@ class ContextWindowManager:
                 "task_goal_constraints_plan_evidence",
                 "recent_tool_protocol_atomic_groups",
             ),
+            forgotten_message_ids=forgotten,
+            forgotten_event_sequences=tuple(sorted(forgotten_sequences)),
+            pinned_message_ids=pinned_message_ids,
+        )
+
+    @staticmethod
+    def _session_body(message: Message) -> Mapping[str, Any] | None:
+        if not message.message_id.startswith("session-context-"):
+            return None
+        try:
+            body = json.loads(message.text)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(body, dict) or body.get("boundary") != (
+            "session_conversation_projection"
+        ):
+            return None
+        return body
+
+    @classmethod
+    def _message_event_sequences(cls, message: Message) -> tuple[int, ...]:
+        """Durable event sequences a session projection message pointed at."""
+        body = cls._session_body(message)
+        if body is None:
+            return ()
+        sequences: set[int] = set()
+        for value in body.get("source_event_sequences", []):
+            if isinstance(value, int):
+                sequences.add(value)
+        for item in body.get("recent_messages", []):
+            if isinstance(item, Mapping) and isinstance(
+                item.get("source_event_sequence"), int
+            ):
+                sequences.add(item["source_event_sequence"])
+        return tuple(sorted(sequences))
+
+    @classmethod
+    def _session_pinned_task_ids(cls, message: Message) -> tuple[str, ...]:
+        body = cls._session_body(message)
+        if body is None:
+            return ()
+        return tuple(
+            str(item) for item in body.get("pinned_task_ids", [])
+            if isinstance(item, (str, int)) and str(item)
         )
 
     @staticmethod

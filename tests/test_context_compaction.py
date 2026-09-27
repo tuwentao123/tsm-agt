@@ -474,3 +474,129 @@ class ContextCompactionKernelTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PinnedProvenanceCompactionTest(unittest.TestCase):
+    """INV-8 at the compression layer: eligibility is provenance, not recency."""
+
+    def setUp(self) -> None:
+        self.template = PromptTemplate.default()
+
+    @staticmethod
+    def _body(*, pinned: tuple[str, ...] = ()) -> dict:
+        return {
+            "boundary": "session_conversation_projection",
+            "work_state": {"goal": "continue design"},
+            "pinned_task_ids": list(pinned),
+            "task_index": [
+                {"task_id": f"task-{index}", "goal": f"goal {index}"}
+                for index in range(1, 7)
+            ],
+            "recent_task_summaries": [
+                {"task_id": f"task-{index}", "goal": "detail " * 80}
+                for index in range(1, 7)
+            ],
+            "historical_investigation": {
+                "resources": [
+                    {"source_task_id": f"task-{index}",
+                     "canonical_path": f"plan-{index}.md"}
+                    for index in range(1, 7)
+                ],
+                "questions": [],
+            },
+            "recent_messages": [
+                {
+                    "task_id": f"task-{index}",
+                    "role": "assistant",
+                    "text": "large visible result " * 80,
+                    "source_event_sequence": index,
+                }
+                for index in range(1, 7)
+            ],
+        }
+
+    def _compact(self, body: dict):
+        manager = ContextWindowManager(
+            trigger_ratio=0.50, recent_message_floor=2,
+            pinned_message_ceiling=8,
+        )
+        session = text(
+            "session-context-12-a", MessageRole.USER, json.dumps(body),
+        )
+        return manager.prepare(
+            conversation=(
+                text("goal", MessageRole.USER, "current request"), session,
+            ),
+            tools=(), prompt_template=self.template,
+            context_window=3000, max_output_tokens=256,
+        )
+
+    @staticmethod
+    def _compacted_body(prepared) -> dict:
+        compacted = next(
+            item for item in prepared.messages
+            if item.message_id.startswith("session-context-")
+        )
+        return json.loads(compacted.text)
+
+    def test_pinned_task_summary_survives_compaction(self) -> None:
+        prepared = self._compact(self._body(pinned=("task-1",)))
+
+        body = self._compacted_body(prepared)
+        summary_ids = [
+            item["task_id"] for item in body["recent_task_summaries"]
+        ]
+        self.assertIn("task-1", summary_ids)
+        resource_ids = {
+            item["source_task_id"]
+            for item in body["historical_investigation"]["resources"]
+        }
+        self.assertIn("task-1", resource_ids)
+
+    def test_pinned_task_messages_survive_compaction(self) -> None:
+        prepared = self._compact(self._body(pinned=("task-1",)))
+
+        body = self._compacted_body(prepared)
+        message_task_ids = [
+            item["task_id"] for item in body["recent_messages"]
+        ]
+        self.assertIn("task-1", message_task_ids)
+        self.assertLessEqual(
+            len(body["recent_messages"]), 8,
+        )
+
+    def test_unpinned_old_summary_is_still_dropped(self) -> None:
+        prepared = self._compact(self._body())
+
+        body = self._compacted_body(prepared)
+        summary_ids = [
+            item["task_id"] for item in body["recent_task_summaries"]
+        ]
+        self.assertNotIn("task-1", summary_ids)
+        self.assertEqual(summary_ids, ["task-5", "task-6"])
+
+    def test_compaction_receipt_lists_forgotten_event_sequences(self) -> None:
+        prepared = self._compact(self._body(pinned=("task-1",)))
+
+        receipt = prepared.compaction
+        assert receipt is not None
+        # Sequences 2..4 were pruned; the pinned and recent ones were kept.
+        self.assertTrue(receipt.forgotten_event_sequences)
+        self.assertIn(2, receipt.forgotten_event_sequences)
+        self.assertNotIn(1, receipt.forgotten_event_sequences)
+        self.assertNotIn(6, receipt.forgotten_event_sequences)
+        event_data = receipt.event_data()
+        self.assertEqual(
+            event_data["forgotten_event_sequences"],
+            list(receipt.forgotten_event_sequences),
+        )
+        self.assertTrue(event_data["pinned_message_ids"])
+
+    def test_compaction_event_never_persists_summary_body(self) -> None:
+        prepared = self._compact(self._body(pinned=("task-1",)))
+
+        receipt = prepared.compaction
+        assert receipt is not None
+        rendered = json.dumps(receipt.event_data())
+        self.assertNotIn("large visible result", rendered)
+        self.assertFalse(receipt.event_data()["summary_body_persisted"])

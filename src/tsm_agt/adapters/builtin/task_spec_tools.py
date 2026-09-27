@@ -5,10 +5,21 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime
 
+from tsm_agt.core import (
+    MAX_AUTHORED_ACCEPTANCE_CRITERIA, RUNTIME_AUTHORED_CRITERION_KINDS,
+    TaskCriterionKind,
+)
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ToolCall,
     ToolEffect, ToolIdempotency, ToolInvocationContext, ToolResult,
     ToolResultAuthority, ToolRisk, ToolSpec,
+)
+
+#: The criterion kinds a model may author. Derived from the enum so a new
+#: Runtime-authored kind can never leak into this model-facing schema.
+AUTHORABLE_CRITERION_KINDS: tuple[str, ...] = tuple(
+    item.value for item in TaskCriterionKind
+    if item not in RUNTIME_AUTHORED_CRITERION_KINDS
 )
 
 
@@ -35,7 +46,8 @@ class CoreTaskSpecToolProvider:
             "Revise scope, constraints, and acceptance criteria using the current "
             "revision. This cannot change the user goal. Use only verification kinds "
             "the Runtime can prove: workspace_integrity, post_mutation_command, or "
-            "evidence_reference with an existing event:/tool_call:/mutation: reference.",
+            "evidence_reference with an existing event:/tool_call:/mutation: reference. "
+            "Use rubric for judgements that cannot be machine-checked.",
             {
                 "type": "object",
                 "properties": {
@@ -43,7 +55,8 @@ class CoreTaskSpecToolProvider:
                     "scope": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
                     "constraints": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
                     "acceptance_criteria": {
-                        "type": "array", "minItems": 1, "maxItems": 30,
+                        "type": "array", "minItems": 1,
+                        "maxItems": MAX_AUTHORED_ACCEPTANCE_CRITERIA,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -51,7 +64,7 @@ class CoreTaskSpecToolProvider:
                                 "description": {"type": "string"},
                                 "verification_kind": {
                                     "type": "string",
-                                    "enum": ["workspace_integrity", "post_mutation_command", "evidence_reference"],
+                                    "enum": list(AUTHORABLE_CRITERION_KINDS),
                                 },
                                 "evidence_reference": {"type": ["string", "null"]},
                             },

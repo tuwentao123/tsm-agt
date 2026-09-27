@@ -129,6 +129,10 @@ from tsm_agt.ports import (
     SessionInputRelationPort,
     SessionInputResolverPort,
     TaskSpecPlannerPort,
+    JudgeVerdict,
+    RubricEvidence,
+    RubricJudgePort,
+    RubricJudgement,
     CheckpointCompatibilityAction,
     CheckpointCompatibilityDecision,
     CheckpointCompatibilityPolicyPort,
@@ -193,6 +197,14 @@ from .clarification import (
     ClarificationChoice, ClarificationKind, ClarificationNotPending, ClarificationRequest,
     ClarificationRequired, ClarificationTokenMismatch,
 )
+from .cancellation import (
+    CancellationScope,
+    TaskCancellationSignal,
+    note_cancel_requested,
+    note_interrupting_settled,
+    note_scope_closed,
+    note_scope_opened,
+)
 from .execution import (
     IdempotencyConflict,
     ToolCommitState,
@@ -238,8 +250,12 @@ from .task_spec import (
     OutcomeBindingAction, OutcomeBindingDecision, OutcomeBindingReason,
     TaskExecutionFocus, TaskExecutionFocusProjector,
     TaskOutcomeCompletionPolicy, TaskOutcomeEligibilityCalculator,
-    TaskOutcomeKind, TaskOutcomeStatus,
+    TaskOutcomeKind, TaskOutcomeProposal, TaskOutcomeSnapshot,
+    TaskOutcomeStatus,
     TaskSpecProjector, TaskSpecProposal, TaskSpecSnapshot,
+    MAX_AUTHORED_ACCEPTANCE_CRITERIA,
+    REQUIRED_EFFECT_CRITERION_ID, RUNTIME_AUTHORED_CRITERION_KINDS,
+    validate_authored_reference,
 )
 from .session import (
     SessionChoiceOption, SessionInteractionKind, SessionInteractionRequest,
@@ -252,6 +268,7 @@ from .session_interaction import (
 from .session_context import (
     SessionActiveCheckpoint, SessionContextProjector,
     SessionConversationProjection, SessionPromptProjection, SessionWorkingState,
+    ContextAuthority, ContextScope,
 )
 from .working_memory import (
     EffectiveWorkingMemory, EffectiveWorkingMemoryProjector,
@@ -268,7 +285,9 @@ from .runtime_input import (
     SessionInputDecision, SessionInputGrounding, SessionRouteDisposition,
     SessionTaskCatalogEntry, SessionTaskRelation,
 )
-from .session_handoff import build_session_follow_up_goal
+from .session_handoff import (
+    build_session_follow_up_goal, clip_text, find_background_leak,
+)
 from .exploration_coordinator import (
     ExplorationCoordinator, ExplorationCoordinatorAction,
 )
@@ -357,6 +376,15 @@ class KernelDependencies:
     session_input_relation: SessionInputRelationPort | None = None
     session_input_resolver: SessionInputResolverPort | None = None
     task_spec_planner: TaskSpecPlannerPort | None = None
+    #: Bounded judge for `rubric` acceptance criteria. When absent, rubric
+    #: criteria are recorded but never block (their P0 behaviour).
+    rubric_judge: RubricJudgePort | None = None
+    rubric_judge_max_attempts: int = 2
+    #: INV-10 bound: how much proof a judge may read. A judge that only receives
+    #: opaque references cannot decide anything, so the Runtime resolves them
+    #: into bounded excerpts.
+    rubric_evidence_max_items: int = 4
+    rubric_evidence_excerpt_characters: int = 800
     checkpoint_compatibility_policy: (
         CheckpointCompatibilityPolicyPort | None
     ) = None
@@ -367,6 +395,11 @@ class KernelDependencies:
     default_max_model_calls: int = 40
     default_max_tool_calls: int = 120
     default_max_output_tokens: int = 1024
+    #: INV-4 bound: how many consecutive no-progress continuations are allowed
+    #: before an unclosable required gap is finalized as NEEDS_REVIEW instead of
+    #: suspending again. Keep aligned with the readiness policy's own
+    #: ``max_stalled_continuations`` so the two thresholds never drift.
+    completion_max_stalled_continuations: int = 2
     finalization_model_calls: int = 2
     execution_reserve_model_calls: int = 1
     recovery_reserve_model_calls: int = 1
@@ -391,11 +424,22 @@ class KernelDependencies:
     require_evidence_questions: bool = True
 
 
+#: Who may drive a Task into each terminal state. "runtime" enforces limits and
+#: verification, "user" is an explicit cancel, and "model" may only *propose* an
+#: outcome by finishing a Turn (it never writes a terminal state directly).
+#: INV: a terminal state must be reachable only by an authorised actor.
+TERMINAL_AUTHORITY: Mapping[TaskState, frozenset[str]] = {
+    TaskState.SUCCEEDED: frozenset({"runtime"}),
+    TaskState.FAILED: frozenset({"runtime"}),
+    TaskState.CANCELLED: frozenset({"user", "runtime"}),
+    TaskState.NEEDS_REVIEW: frozenset({"runtime"}),
+}
+
+
 @dataclass(slots=True)
 class _PathLockEntry:
     lock: asyncio.Lock
     users: int = 0
-
 
 class _WorkspacePathLockCoordinator:
     """Serialize one canonical path across Tasks, Kernels, and local processes."""
@@ -541,6 +585,148 @@ def _task_spec_requires_command_verification(spec: TaskSpecSnapshot) -> bool:
     return any(
         criterion.verification_kind is TaskCriterionKind.POST_MUTATION_COMMAND
         for criterion in spec.acceptance_criteria
+    )
+
+
+#: Effects whose delivery is a performed side effect. ``observe`` and
+#: ``interact`` are deliberately excluded: observation is governed by the
+#: evidence criteria, and asking the user is closed by the interaction flow.
+#: Neither is a claim that work was carried out, so neither can be faked by
+#: prose and neither belongs in a delivery assertion.
+_DELIVERABLE_EFFECTS: frozenset[ToolEffect] = frozenset({
+    ToolEffect.MUTATE, ToolEffect.EXECUTE,
+})
+
+
+def _required_effect_deliveries(spec: TaskSpecSnapshot) -> frozenset[ToolEffect]:
+    """Side effects the contract requires the Task to leave a record of.
+
+    Keyed strictly on a required Outcome's declared effects. A bare
+    ``workspace_integrity`` criterion does NOT imply a required change -- with
+    an empty Mutation Journal it is trivially satisfied -- so it must not turn
+    an answer-only Task into a blocked one.
+    """
+    return _required_effects_from_outcomes(spec.outcomes)
+
+
+def _required_effects_from_outcomes(
+    outcomes: Sequence[TaskOutcomeProposal | TaskOutcomeSnapshot],
+) -> frozenset[ToolEffect]:
+    """Same derivation, usable before a snapshot exists (Planner proposals)."""
+    return frozenset(
+        effect
+        for outcome in outcomes
+        if outcome.required
+        for effect in outcome.required_effects
+        if effect in _DELIVERABLE_EFFECTS
+    )
+
+
+def _recorded_effect_deliveries(task: TaskSnapshot) -> frozenset[ToolEffect]:
+    """Side effects that left a durable record on this Task.
+
+    Delivery asserts that the action *was performed*, not that it succeeded: a
+    command that ran and exited non-zero is still an execution, and whether its
+    result is good enough is the contract's own command criteria to judge.
+    """
+    recorded = set()
+    if _has_active_workspace_mutation(task):
+        recorded.add(ToolEffect.MUTATE)
+    if any(
+        execution.effect is ToolEffect.EXECUTE
+        and execution.state is ToolCommitState.COMMITTED
+        and execution.result is not None and execution.result.ok
+        for execution in task.tool_executions.values()
+    ):
+        recorded.add(ToolEffect.EXECUTE)
+    return frozenset(recorded)
+
+
+def _missing_effect_deliveries(
+    task: TaskSnapshot, spec: TaskSpecSnapshot,
+) -> tuple[ToolEffect, ...]:
+    """Required side effects with no durable record, in a stable order."""
+    return tuple(sorted(
+        _required_effect_deliveries(spec) - _recorded_effect_deliveries(task),
+        key=lambda item: item.value,
+    ))
+
+
+def _effect_candidate_tools(
+    visible_tools: tuple[ToolSpec, ...], effects: frozenset[ToolEffect],
+) -> tuple[str, ...]:
+    return tuple(sorted(
+        tool.name for tool in visible_tools
+        if not tool.is_internal_state and tool.effect in effects
+    ))
+
+
+def _required_effect_criterion(
+    effects: frozenset[ToolEffect],
+) -> TaskAcceptanceCriterion:
+    """Build the Runtime-authored criterion asserting declared delivery."""
+    named = ", ".join(sorted(effect.value for effect in effects))
+    return TaskAcceptanceCriterion(
+        criterion_id=REQUIRED_EFFECT_CRITERION_ID,
+        description=(
+            "Every side effect the Task contract declares as required has a "
+            f"durable record of actually being performed: {named} "
+            "(a surviving workspace change for mutate, a successful committed "
+            "execution for execute)."
+        ),
+        verification_kind=TaskCriterionKind.REQUIRED_EFFECT,
+    )
+
+
+def _answer_alignment_criterion(goal: str) -> TaskAcceptanceCriterion:
+    """INV-11 criterion: an answer must address the goal it was asked."""
+    return TaskAcceptanceCriterion(
+        criterion_id="answer-alignment",
+        description=(
+            "The delivered answer directly addresses the user's current "
+            "goal: " + clip_text(goal, 400)
+        ),
+        verification_kind=TaskCriterionKind.GOAL_ALIGNMENT,
+    )
+
+
+def _runtime_authored_criteria(
+    outcomes: Sequence[TaskOutcomeProposal | TaskOutcomeSnapshot], goal: str,
+) -> tuple[TaskAcceptanceCriterion, ...]:
+    """The Runtime's own criteria for a contract; never Planner-authored.
+
+    Deterministic in the contract alone, so both authoring paths (initial
+    planning and every later revision) derive exactly the same set.
+    """
+    criteria: list[TaskAcceptanceCriterion] = []
+    if any(outcome.kind is TaskOutcomeKind.ANSWER for outcome in outcomes):
+        criteria.append(_answer_alignment_criterion(goal))
+    effects = _required_effects_from_outcomes(outcomes)
+    if effects:
+        criteria.append(_required_effect_criterion(effects))
+    return tuple(criteria)
+
+
+def _required_effect_delivery_result(
+    criterion_id: str, task: TaskSnapshot, spec: TaskSpecSnapshot,
+) -> AcceptanceResult:
+    """Judge the delivery criterion from durable records, never from prose."""
+    required = _required_effect_deliveries(spec)
+    missing = set(_missing_effect_deliveries(task, spec))
+    evidence = tuple(
+        Evidence(
+            "tool_effect",
+            f"the contract requires a performed {effect.value} action",
+            ("a durable record exists" if effect not in missing
+             else "no durable record exists"),
+            "verifier", effect not in missing,
+        )
+        for effect in sorted(required, key=lambda item: item.value)
+    )
+    return AcceptanceResult(
+        criterion_id,
+        (AcceptanceStatus.PASSED if not missing else AcceptanceStatus.FAILED),
+        evidence,
     )
 
 
@@ -1037,6 +1223,12 @@ class Kernel:
         self._dependencies = dependencies
         self._tool_policy = CoreToolPolicy()
         self._background_deadline_tasks: dict[str, asyncio.Task[None]] = {}
+        #: Per-Task in-process cancellation resources (task-cancellation-spec
+        #: §5.1). Not persisted; closed when the Task settles.
+        self._cancellation_scopes: dict[str, CancellationScope] = {}
+        #: In-memory cancel snapshot behind CancellationSignal.requested().
+        #: Durable truth stays in task.state_changed; this is only a fast read.
+        self._cancelled_task_ids: set[str] = set()
         self._workspace_path_locks = _WorkspacePathLockCoordinator(
             dependencies.cross_process_lock, dependencies.workspace_path,
             dependencies.workspace_filesystem,
@@ -1908,11 +2100,46 @@ class Kernel:
             ))
             if any(item not in catalog_by_id for item in candidate_task_ids):
                 raise ValueError("resolver proposed unknown candidate Task")
+            # INV-12: a context-dependent input with resumable candidates must
+            # never silently become a brand-new Task whose goal is the raw
+            # utterance. One unambiguous candidate is resumed deterministically;
+            # several candidates require the user to choose.
+            if (
+                disposition is SessionRouteDisposition.CREATE_TASK
+                and relation in {
+                    SessionTaskRelation.INDEPENDENT,
+                    SessionTaskRelation.CONTEXTUAL,
+                }
+                and input_grounding is not SessionInputGrounding.SELF_CONTAINED
+                and candidates
+            ):
+                unique_candidates = tuple(dict.fromkeys(
+                    item.task_id for item in candidates
+                ))
+                if len(unique_candidates) == 1:
+                    source_task_id = unique_candidates[0]
+                    relation = SessionTaskRelation.FOLLOW_UP
+                    resolved_goal = build_session_follow_up_goal(
+                        normalized, catalog_by_id[source_task_id]
+                    )
+                    reason = "unique_candidate_context_derived_follow_up"
+                    clarification = None
+                else:
+                    disposition = SessionRouteDisposition.CLARIFY
+                    relation = SessionTaskRelation.UNCERTAIN
+                    source_task_id = None
+                    resolved_goal = None
+                    reason = "multiple_candidates_require_explicit_choice"
+                    clarification = (
+                        "这条输入需要结合历史才能理解，且关联多项历史工作。"
+                        "请指定要接续的 Task，或完整描述一个新目标。"
+                    )
+                    candidate_task_ids = unique_candidates[:5]
             if disposition is SessionRouteDisposition.CLARIFY:
-                # A choice is justified only by at least two concrete semantic
-                # candidates proposed by the resolver. Never turn the entire
-                # history catalog into a mandatory menu.
-                if len(candidate_task_ids) < 2:
+                # A choice is justified only by at least one concrete candidate
+                # proposed by the resolver. Never turn the entire history catalog
+                # into a mandatory menu.
+                if not candidate_task_ids:
                     disposition = SessionRouteDisposition.CREATE_TASK
                     relation = SessionTaskRelation.CONTEXTUAL
                     source_task_id = None
@@ -2819,7 +3046,23 @@ class Kernel:
             session, events
         )
         source_task_id: str | None = None
+        context_handoff: Mapping[str, Any] | None = None
+        # The Task's own creation record is the authoritative provenance fact
+        # (INV-8). Deriving lineage from a recent-window summary instead would
+        # make the source depend on recency, which is the defect being fixed.
+        for event in await self._dependencies.store.read_events(task.task_id):
+            if event.event_type != "task.created":
+                continue
+            candidate = event.payload.get("source_task_id")
+            if isinstance(candidate, str) and candidate:
+                source_task_id = candidate
+            raw_handoff = event.payload.get("context_handoff")
+            if isinstance(raw_handoff, Mapping):
+                context_handoff = dict(raw_handoff)
+            break
         for summary in reversed(projection.task_summaries):
+            if source_task_id is not None:
+                break
             if summary.task_id == task.task_id:
                 for outcome in reversed(summary.outcomes):
                     candidate = outcome.get("source_task_id")
@@ -2828,9 +3071,20 @@ class Kernel:
                         break
                 if source_task_id is not None:
                     break
+        # INV-8: the Planner is scoped to this Task's own lineage and receives
+        # no background at all. Another Task's conversation can therefore never
+        # become this Task's goal or acceptance criterion, and recency is not an
+        # eligibility rule.
+        scope = ContextScope(
+            session_id=task.session_id,
+            task_id=task.task_id,
+            lineage_task_ids=(task.task_id,),
+        )
         prompt_projection = self._dependencies.session_context_projector.for_prompt(
             projection,
             pinned_task_ids=((source_task_id,) if source_task_id else ()),
+            scope=scope,
+            include_background=False,
         )
         prompt_data = dict(prompt_projection.prompt_data or {})
         related_task: Mapping[str, Any] | None = None
@@ -2853,18 +3107,47 @@ class Kernel:
                     "historical_remaining_work": summary.get("remaining_work", []),
                     "completed_work": summary.get("completed_work", []),
                     "mutations": summary.get("mutations", []),
+                    "authority": ContextAuthority.SCOPED_BACKGROUND.value,
                 }
                 break
+        if related_task is None and context_handoff is not None:
+            # INV-9: the persisted handoff is the source identity/state block and
+            # is explicitly SCOPED_BACKGROUND; it never carries authority.
+            related_task = {
+                **context_handoff,
+                "authority": ContextAuthority.SCOPED_BACKGROUND.value,
+            }
+        if related_task is None and source_task_id is not None:
+            # A Task that has not recorded an execution summary yet still has an
+            # identity. Give the Planner the bounded, non-authoritative source
+            # reference rather than silently dropping the lineage.
+            try:
+                source_task = await self.get_task(source_task_id)
+            except TaskNotFound:
+                source_task = None
+            if source_task is not None:
+                related_task = {
+                    "task_id": source_task.task_id,
+                    "state": source_task.state.value,
+                    "verification_status": None,
+                    "goal": source_task.goal,
+                    "historical_remaining_work": [],
+                    "completed_work": [],
+                    "mutations": [],
+                    "authority": ContextAuthority.SCOPED_BACKGROUND.value,
+                }
         planning_context = {
             "workspace": task.workspace,
             "available_tool_effects": sorted({
                 tool.effect.value for tool in await self.list_tools()
                 if not tool.is_internal_state
             }),
+            "authority": dict(prompt_data.get("authority", {})),
             "session": {
                 "revision": prompt_projection.revision,
                 "working_state": prompt_data.get("work_state", {}),
-                "recent_messages": prompt_data.get("recent_messages", []),
+                "scoped_messages": prompt_data.get("scoped_messages", []),
+                "background_messages": prompt_data.get("background_messages", []),
                 "recent_artifacts": [
                     {
                         "canonical_path": item.get("canonical_path"),
@@ -2877,6 +3160,7 @@ class Kernel:
                 ][:24],
             },
             "related_task": related_task,
+            "selection": dict(prompt_data.get("selection", {})),
         }
         context_hash = canonical_hash(planning_context)
         return (
@@ -2885,6 +3169,122 @@ class Kernel:
             prompt_projection.revision,
             context_hash,
         )
+
+    def _demote_unresolvable_criteria(
+        self, task: TaskSnapshot, events: tuple[RuntimeEvent, ...],
+        criteria: tuple[TaskAcceptanceCriterion, ...],
+    ) -> tuple[tuple[TaskAcceptanceCriterion, ...], list[dict[str, str]]]:
+        """Demote unresolvable evidence_reference criteria to rubric (advisory).
+
+        An ``evidence_reference`` criterion asserts a fact that must already be
+        true; it is never work that execution can produce. A reference that no
+        event/tool_call/mutation can resolve is permanently unverifiable and
+        must not survive as a required gate.
+        """
+        kept: list[TaskAcceptanceCriterion] = []
+        demoted: list[dict[str, str]] = []
+        for criterion in criteria:
+            if (
+                criterion.verification_kind
+                is not TaskCriterionKind.EVIDENCE_REFERENCE
+            ):
+                kept.append(criterion)
+                continue
+            reference = criterion.evidence_reference or ""
+            evidence = self._verify_task_spec_reference(
+                task, events, reference, criterion.description
+            )
+            if evidence.passed:
+                kept.append(criterion)
+                continue
+            kept.append(TaskAcceptanceCriterion(
+                criterion_id=criterion.criterion_id,
+                description=criterion.description,
+                verification_kind=TaskCriterionKind.RUBRIC,
+                evidence_reference=None,
+            ))
+            demoted.append({
+                "criterion_id": criterion.criterion_id,
+                "from": TaskCriterionKind.EVIDENCE_REFERENCE.value,
+                "to": TaskCriterionKind.RUBRIC.value,
+                "reference": reference,
+                "reason": evidence.observed,
+            })
+        return tuple(kept), demoted
+
+    def _demote_background_leaks(
+        self, criteria: tuple[TaskAcceptanceCriterion, ...],
+        planning_context: Mapping[str, Any], current_request: str,
+    ) -> tuple[tuple[TaskAcceptanceCriterion, ...], list[dict[str, str]]]:
+        """INV-9: a criterion copied from non-authoritative text is demoted.
+
+        Only text the user did not already say counts as copyable background, so
+        a criterion that legitimately restates the current request is never
+        mistaken for a leak. Demotion is to the advisory ``rubric`` channel, so
+        the criterion survives inspection but can no longer gate completion.
+        """
+        request_normalized = " ".join(current_request.casefold().split())
+        background_texts = tuple(
+            text for text in self._background_texts(planning_context)
+            if " ".join(text.casefold().split()) not in request_normalized
+        )
+        if not background_texts:
+            return criteria, []
+        kept: list[TaskAcceptanceCriterion] = []
+        demoted: list[dict[str, str]] = []
+        for criterion in criteria:
+            leak = find_background_leak(
+                criterion.criterion_id + " " + criterion.description,
+                background_texts,
+            )
+            if leak is None or (
+                criterion.verification_kind is TaskCriterionKind.RUBRIC
+            ):
+                kept.append(criterion)
+                continue
+            kept.append(TaskAcceptanceCriterion(
+                criterion_id=criterion.criterion_id,
+                description=criterion.description,
+                verification_kind=TaskCriterionKind.RUBRIC,
+                evidence_reference=None,
+            ))
+            demoted.append({
+                "criterion_id": criterion.criterion_id,
+                "from": criterion.verification_kind.value,
+                "to": TaskCriterionKind.RUBRIC.value,
+                "leaked_span": leak,
+                "source": ContextAuthority.SCOPED_BACKGROUND.value,
+            })
+        return tuple(kept), demoted
+
+    @staticmethod
+    def _background_texts(
+        planning_context: Mapping[str, Any],
+    ) -> tuple[str, ...]:
+        """Every non-authoritative string the Planner was shown."""
+        texts: list[str] = []
+        related = planning_context.get("related_task")
+        if isinstance(related, Mapping):
+            goal = related.get("goal")
+            if isinstance(goal, str):
+                texts.append(goal)
+            for key in ("historical_remaining_work", "completed_work"):
+                values = related.get(key)
+                if isinstance(values, (list, tuple)):
+                    texts.extend(
+                        str(item) for item in values if isinstance(item, str)
+                    )
+        session = planning_context.get("session")
+        working = session.get("working_state") if isinstance(session, Mapping) else None
+        if isinstance(working, Mapping):
+            for value in working.values():
+                if isinstance(value, str):
+                    texts.append(value)
+                elif isinstance(value, (list, tuple)):
+                    texts.extend(
+                        str(item) for item in value if isinstance(item, str)
+                    )
+        return tuple(text for text in texts if text.strip())
 
     async def plan_task_spec(self, task_id: str) -> TaskSpecSnapshot:
         """Ask the semantic Planner for a proposal; Runtime owns persistence."""
@@ -2906,6 +3306,68 @@ class Kernel:
             )
             proposal = TaskSpecProposal.from_data(
                 raw, require_acceptance_criteria=True
+            )
+            # Any evidence_reference the Runtime cannot resolve right now --
+            # malformed like ``turn-...`` or simply not present -- is demoted to
+            # rubric (advisory). Demotion, not a hard failure: a Planner that
+            # cannot bind a reference must not fail the whole Task, and an
+            # unverifiable required criterion is exactly the dead-lock shape of
+            # task-2c8f8fbb75714516a94ab442995626b5. The hard format rejection
+            # lives on the model-facing tool path (revise_task_spec), where the
+            # caller can simply try again.
+            criteria, demoted = self._demote_unresolvable_criteria(
+                task, await self._dependencies.store.read_events(task_id),
+                proposal.acceptance_criteria,
+            )
+            if demoted:
+                proposal = replace(proposal, acceptance_criteria=criteria)
+                await self._append_events(task_id, ((
+                    "task_spec.criteria_demoted", {
+                        "writer": "task-spec-planner", "demoted": demoted,
+                    },
+                ),))
+            # INV-9: authority is a data boundary, so the Runtime checks what the
+            # Planner actually wrote against the background it was given instead
+            # of trusting the prompt instruction.
+            criteria, leaked = self._demote_background_leaks(
+                criteria, planning_context, current_request,
+            )
+            if leaked:
+                proposal = replace(proposal, acceptance_criteria=criteria)
+                await self._append_events(task_id, ((
+                    "task_spec.background_leak_demoted", {
+                        "writer": "task-spec-planner", "demoted": leaked,
+                    },
+                ),))
+            # Runtime-authored criteria are derived from the contract and never
+            # accepted from the Planner. Strip any the Planner smuggled in -- the
+            # model-facing schemas exclude them, but the text-JSON path does not
+            # enforce a schema -- so the checks below always see the authored set
+            # and the Runtime's own copy is the only one that survives.
+            authored = tuple(
+                item for item in proposal.acceptance_criteria
+                if item.verification_kind not in RUNTIME_AUTHORED_CRITERION_KINDS
+            )
+            if authored != proposal.acceptance_criteria:
+                proposal = replace(proposal, acceptance_criteria=authored)
+            runtime_criteria = _runtime_authored_criteria(
+                proposal.outcomes, current_request
+            )
+            if any(
+                item.verification_kind is TaskCriterionKind.GOAL_ALIGNMENT
+                for item in runtime_criteria
+            ):
+                await self._append_events(task_id, ((
+                    "task_spec.alignment_criterion_added", {
+                        "criterion_id": "answer-alignment",
+                        "goal_hash": canonical_hash(current_request),
+                    },
+                ),))
+            proposal = replace(
+                proposal,
+                acceptance_criteria=(
+                    proposal.acceptance_criteria + runtime_criteria
+                ),
             )
             candidate = TaskSpecSnapshot.from_proposal(
                 task_id, current.revision + 1, proposal
@@ -2935,6 +3397,10 @@ class Kernel:
         allow_goal_change: bool = False,
     ) -> TaskSpecSnapshot:
         """Revise one Task contract; only Replace may change its goal."""
+        for item in acceptance_criteria:
+            validate_authored_reference(
+                item.verification_kind, item.evidence_reference
+            )
         if not operation_id.strip() or not writer.strip():
             raise ValueError("Task SPEC operation and writer are required")
         stored = await self._require_stored_task(task_id)
@@ -2948,6 +3414,21 @@ class Kernel:
         selected_goal = (goal if goal is not None else current.goal).strip()
         if selected_goal != current.goal and not allow_goal_change:
             raise ValueError("Task SPEC goal can change only through Runtime Replace")
+        # The Runtime's own criteria are re-derived from the (immutable) Outcome
+        # set on every revision, so a caller can neither drop them nor smuggle in
+        # a weaker look-alike.
+        authored = tuple(
+            item for item in acceptance_criteria
+            if item.verification_kind not in RUNTIME_AUTHORED_CRITERION_KINDS
+        )
+        if len(authored) > MAX_AUTHORED_ACCEPTANCE_CRITERIA:
+            raise ValueError(
+                f"Task SPEC accepts at most {MAX_AUTHORED_ACCEPTANCE_CRITERIA} "
+                "author-supplied acceptance criteria; the Runtime reserves two"
+            )
+        acceptance_criteria = authored + _runtime_authored_criteria(
+            current.outcomes, selected_goal
+        )
         request_hash = canonical_hash({
             "expected_revision": expected_revision,
             "goal": selected_goal, "scope": list(scope),
@@ -3050,13 +3531,33 @@ class Kernel:
             task = await self.get_task(event.task_id)
             if task.state is TaskState.CANCELLED:
                 return task
-            if task.state.is_terminal:
+            # NEEDS_REVIEW is a settled handoff that a human may still abandon,
+            # so it stays cancellable. Every other terminal state keeps the
+            # existing "terminal task cannot be cancelled" semantics.
+            if (
+                task.state.is_terminal
+                and task.state is not TaskState.NEEDS_REVIEW
+            ):
                 raise InvalidTurnState(
                     f"terminal task {event.task_id} cannot be cancelled"
                 )
-            return await self.transition_task(
-                event.task_id, TaskState.CANCELLED, event.reason
+            # Spec §9.4: settle any unstarted batch calls before the Task
+            # settles, so no orphan execution record is left behind.
+            if task.active_agent_checkpoint is not None:
+                checkpoint = AgentTurnCheckpoint.from_data(
+                    task.active_agent_checkpoint
+                )
+                settled = await self._settle_open_batch_for_cancel(checkpoint)
+                if settled is not checkpoint:
+                    await self._save_agent_checkpoint(
+                        settled, "tool-batch-cancelled-by-user"
+                    )
+            result = await self.transition_task(
+                event.task_id, TaskState.CANCELLED, event.reason,
+                intent="cancel",
             )
+            note_cancel_requested(event.task_id)
+            return result
         if isinstance(event, SessionTextInput):
             return await self.resolve_session_input(
                 event.session_id, event.text,
@@ -3943,6 +4444,21 @@ class Kernel:
             },
         )
         self._schedule_background_deadline(task_id, record)
+
+        async def stop_background() -> None:
+            current = await self._get_background_process(
+                task_id, record.process_id
+            )
+            if current.state is BackgroundProcessState.RUNNING:
+                await self._stop_background_record(
+                    task_id, current, ProcessExitStatus.CANCELLED, 2.0
+                )
+
+        # Idempotent with _cleanup_background_processes_for_task_end: it only
+        # stops a process that is still RUNNING at scope-close time.
+        self._cancellation_scope(task_id).register_cleanup(
+            f"process:{process_id}", stop_background
+        )
         return record
 
     async def get_background_process_status(
@@ -4095,6 +4611,35 @@ class Kernel:
             ),
         }
 
+    def _cancellation_scope(self, task_id: str) -> CancellationScope:
+        """Return the Task's in-process resource scope, creating it on demand."""
+        scope = self._cancellation_scopes.get(task_id)
+        if scope is None:
+            scope = CancellationScope()
+            self._cancellation_scopes[task_id] = scope
+            note_scope_opened()
+        return scope
+
+    def cancellation_signal(self, task_id: str) -> TaskCancellationSignal:
+        """Spec §5 facade: the Task-level cancellation signal."""
+        return TaskCancellationSignal(
+            task_id, self._cancelled_task_ids.__contains__, self._request_cancel,
+        )
+
+    def _request_cancel(self, task_id: str, reason: str) -> None:
+        """Write durable cancel intent from a synchronous facade call."""
+        loop = asyncio.get_running_loop()
+        loop.create_task(self.dispatch_input_event(
+            CancelTaskInput(task_id, reason)
+        ))
+
+    async def _close_cancellation_scope(self, task_id: str) -> None:
+        """Release every in-process resource of a settled Task generation."""
+        scope = self._cancellation_scopes.pop(task_id, None)
+        if scope is None:
+            return
+        note_scope_closed(await scope.close_all())
+
     def _schedule_background_deadline(
         self, task_id: str, record: BackgroundProcessRecord
     ) -> None:
@@ -4106,7 +4651,11 @@ class Kernel:
                 await self._stop_background_record(
                     task_id, current, ProcessExitStatus.TIMED_OUT, 2.0
                 )
-        self._background_deadline_tasks[record.process_id] = asyncio.create_task(enforce())
+        deadline_task = asyncio.create_task(enforce())
+        self._background_deadline_tasks[record.process_id] = deadline_task
+        self._cancellation_scope(task_id).register_task(
+            deadline_task, name=f"deadline:{record.process_id}"
+        )
 
     def _require_process_executor(self) -> ProcessExecutorPort:
         executor = self._dependencies.process_executor
@@ -4221,6 +4770,7 @@ class Kernel:
         source_task_id: str | None = None,
         task_relation: SessionTaskRelation = SessionTaskRelation.INDEPENDENT,
         original_user_text: str | None = None,
+        context_handoff: Mapping[str, Any] | None = None,
     ) -> TaskSnapshot:
         """Create one Task and attach it to its Session.
 
@@ -4375,6 +4925,13 @@ class Kernel:
                 "session_id": session_identity,
                 "source_task_id": source_task_id,
                 "task_relation": task_relation.value,
+                # INV-9: a derived Task's source facts are persisted separately
+                # from its goal and are explicitly non-authoritative. The goal
+                # itself is only ever the user's current request.
+                "context_handoff": (
+                    dict(context_handoff)
+                    if context_handoff is not None else None
+                ),
                 "project_trust": snapshot.project_trust.value,
                 "project_fingerprint": snapshot.project_fingerprint,
                 "trust_subject": snapshot.trust_subject,
@@ -6971,6 +7528,51 @@ class Kernel:
                     raise
         raise RuntimeError("unreachable steering apply retry state")
 
+    async def _settle_open_batch_for_cancel(
+        self, checkpoint: AgentTurnCheckpoint,
+    ) -> AgentTurnCheckpoint:
+        """Close unstarted calls when the Task itself is cancelled.
+
+        Spec §9.4: the batch must produce one terminal ``ToolResult`` per
+        accepted call before the Task settles, otherwise an orphan execution
+        record is left behind. Started / unknown calls are handled by the
+        execution ledger and the in-process hard interrupt, so they are left
+        untouched.
+        """
+        if not checkpoint.pending_tool_calls:
+            return checkpoint
+        task = await self.get_task(checkpoint.task_id)
+        cancellable: list[ToolCall] = []
+        for call in checkpoint.pending_tool_calls:
+            execution = task.tool_executions.get(
+                ToolExecutionRecord.identity(checkpoint.turn_id, call.call_id)
+            )
+            if execution is not None and execution.state in {
+                ToolCommitState.RUNNING, ToolCommitState.UNKNOWN_OUTCOME,
+            }:
+                return checkpoint
+            cancellable.append(call)
+        messages = list(checkpoint.messages)
+        for call in cancellable:
+            messages.append(Message(
+                f"msg-tool-cancelled-{uuid4().hex}", MessageRole.TOOL,
+                (ToolResultBlock(ToolResult(
+                    call.call_id, False, error_code="CANCELLED_BY_USER",
+                    message="The call was not started because the Task was cancelled.",
+                    recovery_kind=ToolRecoveryKind.TERMINAL,
+                    meta={"cancelled_by_user_input": True},
+                )),),
+            ))
+        return replace(
+            checkpoint, revision=checkpoint.revision + 1,
+            messages=tuple(messages), pending_tool_calls=(),
+            tool_batch=(
+                checkpoint.tool_batch.with_pending(
+                    (), status=ToolBatchStatus.CANCELLED
+                ) if checkpoint.tool_batch is not None else None
+            ),
+        )
+
     async def _cancel_open_batch_for_queued_replace(
         self, checkpoint: AgentTurnCheckpoint,
     ) -> AgentTurnCheckpoint:
@@ -7257,75 +7859,14 @@ class Kernel:
             tool.name for tool in visible_tools
             if not tool.is_internal_state and tool.effect is ToolEffect.MUTATE
         ))
-        # Observation is Task-scoped evidence. A model can conservatively bind a
-        # read to a broader delivery Outcome even though the same committed fact
-        # also supports separate Evidence Outcomes. Reuse only successful
-        # observation references here; side-effect references remain strictly
-        # local to their declared Outcome. Final Acceptance still validates the
-        # completed answer and evidence-question integrity before closing work.
-        shared_observation_refs = tuple(dict.fromkeys(
-            reference
-            for candidate in spec.outcomes
-            for reference in candidate.fulfillment_refs
-            if reference.rsplit(":", 1)[-1] == ToolEffect.OBSERVE.value
-        ))
         gaps: list[CompletionGap] = []
 
-        # Outcomes remain in old snapshots for replay only; task completion is
-        # evaluated exclusively through Task-level acceptance criteria.
-        for outcome in ():
-            if not outcome.required or outcome.status.is_closed:
-                continue
-            # A candidate assistant response itself can satisfy ANSWER; its text
-            # is verified and recorded before final Task acceptance. Other
-            # outcomes require durable structured facts.
-            if outcome.kind.value == "ANSWER":
-                continue
-            fulfilled_effects = {
-                ToolEffect(ref.rsplit(":", 1)[-1])
-                for ref in outcome.fulfillment_refs
-                if ref.rsplit(":", 1)[-1] in {item.value for item in ToolEffect}
-            }
-            if (
-                outcome.kind is TaskOutcomeKind.EVIDENCE
-                and shared_observation_refs
-            ):
-                fulfilled_effects.add(ToolEffect.OBSERVE)
-            remaining = tuple(
-                effect for effect in outcome.required_effects
-                if effect not in fulfilled_effects
-            )
-            synthesized_kind = (
-                outcome.kind is TaskOutcomeKind.EVIDENCE
-                or (
-                    outcome.kind is TaskOutcomeKind.ARTIFACT_DELIVERY
-                    and ToolEffect.MUTATE not in outcome.required_effects
-                )
-            )
-            # A final assistant response performs the synthesis for analysis
-            # and recommendation Outcomes. Once all declared effects have
-            # durable refs, let it reach Final Acceptance, which validates the
-            # visible answer before closing the Outcome.
-            if synthesized_kind and not remaining:
-                continue
-            candidate_tools = tuple(sorted(
-                tool.name for tool in visible_tools
-                if not tool.is_internal_state and tool.effect in remaining
-            ))
-            available_remaining = {
-                tool.effect for tool in visible_tools
-                if not tool.is_internal_state and tool.effect in remaining
-            }
-            gaps.append(CompletionGap(
-                gap_id=f"task-outcome:{outcome.outcome_id}",
-                kind="REQUIRED_OUTCOME_UNSATISFIED",
-                description=outcome.description,
-                status=outcome.status.value, required=True,
-                recoverable=bool(remaining) and set(remaining).issubset(
-                    available_remaining
-                ),
-                required_effects=remaining, candidate_tools=candidate_tools,
-            ))
+        # Outcomes stay in old snapshots for replay, but they no longer form
+        # gaps directly. What a contract requires is asserted by its criteria:
+        # a required side effect becomes the Runtime-authored REQUIRED_EFFECT
+        # criterion (handled in the criteria loop below), and declared Outcome
+        # completion is validated on the durable path in
+        # ``request_task_outcome_completion`` rather than re-derived here.
 
         for criterion in spec.acceptance_criteria:
             gap_id = f"task-spec:{criterion.criterion_id}"
@@ -7385,17 +7926,52 @@ class Kernel:
                             verification, self._local_interpreter(task)
                         ),
                     ))
+            elif criterion.verification_kind is TaskCriterionKind.REQUIRED_EFFECT:
+                missing = _missing_effect_deliveries(task, spec)
+                if missing:
+                    missing_effects = frozenset(missing)
+                    candidate_tools = _effect_candidate_tools(
+                        visible_tools, missing_effects
+                    )
+                    gaps.append(CompletionGap(
+                        gap_id=gap_id, kind="REQUIRED_DELIVERY_UNSATISFIED",
+                        description=(
+                            "Task contract requires "
+                            + ", ".join(effect.value for effect in missing)
+                            + " delivery, but no durable record of "
+                            + ("it" if len(missing) == 1 else "them")
+                            + " was produced"
+                        ),
+                        status="MISSING", required=True,
+                        recoverable=bool(candidate_tools),
+                        required_effects=missing,
+                        candidate_tools=candidate_tools,
+                    ))
+            elif criterion.verification_kind in {
+                TaskCriterionKind.RUBRIC, TaskCriterionKind.GOAL_ALIGNMENT,
+            }:
+                # A judgement criterion has no machine proof. It is evaluated
+                # before final acceptance by a bounded rubric judge, never as a
+                # per-turn required gap.
+                continue
             else:
                 reference = criterion.evidence_reference or ""
                 evidence = self._verify_task_spec_reference(
                     task, events, reference, criterion.description
                 )
                 if not evidence.passed:
+                    # An evidence_reference criterion asserts a fact that must
+                    # already be true; it is never work to be done (SPEC §3.2).
+                    # An unmet one must therefore not block the Turn: a
+                    # required-but-unclosable gap is exactly the dead-lock
+                    # shape of task-2c8f8fbb75714516a94ab442995626b5. It is
+                    # still evaluated at Final Acceptance, where failure is
+                    # visible (Task FAILED) instead of hanging as AWAITING_USER.
                     gaps.append(CompletionGap(
                         gap_id=gap_id,
                         kind="TASK_SPEC_EVIDENCE",
                         description=criterion.description,
-                        status="MISSING", required=True, recoverable=False,
+                        status="MISSING", required=False, recoverable=False,
                         evidence_reference=reference,
                     ))
 
@@ -7499,6 +8075,62 @@ class Kernel:
                 candidate_tools=candidates,
                 observed=fact.detail,
             ))
+
+        # INV-10: a judged criterion with no judge can neither pass nor be worked
+        # on. It is a configuration gap, not work, so it must not be demoted by
+        # INV-3 below: the Task is bounded into NEEDS_REVIEW via the stall cap
+        # instead of silently succeeding or looping forever.
+        if (
+            self._dependencies.rubric_judge is None
+            and any(
+                criterion.verification_kind in {
+                    TaskCriterionKind.RUBRIC, TaskCriterionKind.GOAL_ALIGNMENT,
+                }
+                for criterion in spec.acceptance_criteria
+            )
+        ):
+            gaps.append(CompletionGap(
+                gap_id="judged-criterion-without-judge",
+                kind="JUDGED_CRITERION_WITHOUT_JUDGE",
+                description=(
+                    "The Task SPEC contains a judged criterion but no rubric "
+                    "judge is configured, so it can neither pass nor be closed "
+                    "by work."
+                ),
+                status="MISSING", required=True, recoverable=False,
+            ))
+
+        # INV-3: a required gap must be closable. A required gap with no
+        # effective effects and no judged kind can never be closed, which is
+        # exactly the dead-lock shape of task-2c8f8fbb75714516a94ab442995626b5.
+        # Demote it and record the violation instead of suspending the Task
+        # forever. This function keeps returning one tuple so its existing
+        # internal and test callers stay unchanged.
+        _JUDGED_GAP_KINDS = frozenset({
+            "TASK_SPEC_RUBRIC", "EVIDENCE_QUESTION",
+            "JUDGED_CRITERION_WITHOUT_JUDGE",
+        })
+        _violations = [
+            gap for gap in gaps
+            if gap.required
+            and not gap.effective_required_effects
+            and gap.kind not in _JUDGED_GAP_KINDS
+        ]
+        if _violations:
+            _violation_ids = {gap.gap_id for gap in _violations}
+            gaps = [
+                replace(gap, required=False)
+                if gap.gap_id in _violation_ids else gap
+                for gap in gaps
+            ]
+            await self._append_events(task_id, ((
+                "completion.invariant_violated", {
+                    "violations": [
+                        {"gap_id": gap.gap_id, "kind": gap.kind}
+                        for gap in _violations
+                    ],
+                },
+            ),))
         return tuple(gaps)
 
     async def _unfinished_plan_instruction(self, task_id: str) -> str | None:
@@ -7600,6 +8232,8 @@ class Kernel:
             unresolved_failures=unresolved_failure_facts,
         )
         if policy is None:
+            # A missing policy is a configuration fact, not a crash. Keep
+            # COMPLETE for compositions that intentionally omit it.
             decision = CompletionReadinessDecision(
                 CompletionReadinessAction.COMPLETE, "policy_not_configured",
                 state, gaps,
@@ -7612,12 +8246,13 @@ class Kernel:
                     "completion.readiness_failed", {
                         "turn_id": turn_id,
                         "error_type": type(error).__name__,
+                        "fail_closed": True,
                     },
                 ),))
-                decision = CompletionReadinessDecision(
-                    CompletionReadinessAction.COMPLETE, "policy_failed",
-                    state, gaps,
-                )
+                # INV-5: never accept a final answer on a crashed judge. The
+                # caller surfaces a defined failure (Task FAILED) instead of
+                # success. Diagnostics callers wrap this in their own guard.
+                raise
         await self._append_events(task_id, ((
             "completion.readiness_evaluated", {
                 "turn_id": turn_id, "action": decision.action.value,
@@ -7648,10 +8283,14 @@ class Kernel:
         """Give AGENT_DECIDES factual readiness context without directives."""
         if self.completion_readiness_mode is not CompletionReadinessMode.AGENT_DECIDES:
             return checkpoint
-        decision = await self._evaluate_completion_readiness(
-            checkpoint.task_id, checkpoint.turn_id, checkpoint, visible_tools,
-            forced_wrap_up=False,
-        )
+        try:
+            decision = await self._evaluate_completion_readiness(
+                checkpoint.task_id, checkpoint.turn_id, checkpoint, visible_tools,
+                forced_wrap_up=False,
+            )
+        except Exception:
+            # Diagnostics are observational and must never break a Turn.
+            return checkpoint
         diagnostic = {
             "boundary": "completion_readiness_diagnostics",
             "mode": self.completion_readiness_mode.value,
@@ -8289,16 +8928,30 @@ class Kernel:
         )
 
     async def transition_task(
-        self, task_id: str, target: TaskState, reason: str
+        self, task_id: str, target: TaskState, reason: str, *,
+        authority: str = "runtime", intent: str | None = None,
     ) -> TaskSnapshot:
         normalized_reason = reason.strip()
         if not normalized_reason:
             raise ValueError("transition reason must not be empty")
+        allowed_authority = TERMINAL_AUTHORITY.get(target)
+        if allowed_authority is not None and authority not in allowed_authority:
+            raise InvalidTurnState(
+                f"transition to {target.value} requires authority in "
+                f"{sorted(allowed_authority)}, got {authority!r}"
+            )
 
         stored = await self._dependencies.store.load_task(task_id)
         if stored is None:
             raise TaskNotFound(f"task not found: {task_id}")
         current = TaskSnapshot.from_data(stored.data)
+        if current.state is TaskState.CANCELLED and target in {
+            TaskState.FINALIZING, TaskState.SUCCEEDED,
+        }:
+            raise InvalidTurnState(
+                f"cancelled task {task_id} cannot enter {target.value}"
+            )
+
         if (
             target in {TaskState.FINALIZING, TaskState.SUCCEEDED}
             and self._dependencies.final_acceptance_policy is not None
@@ -8361,6 +9014,10 @@ class Kernel:
                 "previous_state": current.state.value,
                 "next_state": updated.state.value,
                 "reason": normalized_reason,
+                **(
+                    {"intent": intent, "schema_version": 1}
+                    if intent is not None else {}
+                ),
             },
         )
         events.append(event)
@@ -8374,12 +9031,119 @@ class Kernel:
         )
         if target.is_terminal:
             await self._record_session_task_state(updated)
+            await self._close_cancellation_scope(task_id)
+            if target is TaskState.CANCELLED:
+                self._cancelled_task_ids.add(task_id)
         if target is TaskState.RESOLVING_PROJECT:
             await self.run_project_onboarding(task_id)
             # Inspect the one explicit optional instructions file during project
             # resolution so Turn event boundaries remain stable and auditable.
             await self.get_project_instructions(task_id, audit=True)
             return await self.get_task(task_id)
+        return updated
+
+    async def resolve_needs_review(
+        self, task_id: str, decision: str, *, reason: str,
+    ) -> TaskSnapshot:
+        """Resolve a NEEDS_REVIEW Task with an explicit human decision.
+
+        ``decision`` is ``accept`` (SUCCEEDED, recorded as manual verification),
+        ``return_for_revision`` (EXECUTING with the unmet criteria queued as
+        steering), or ``cancel`` (CANCELLED). Only this explicit channel can
+        leave NEEDS_REVIEW; it bypasses machine verification on purpose because
+        the human, not the verifier, is accepting the unverified result.
+        """
+        normalized = decision.strip().lower()
+        if normalized not in {"accept", "return_for_revision", "cancel"}:
+            raise ValueError(
+                "decision must be accept, return_for_revision, or cancel"
+            )
+        stored = await self._require_stored_task(task_id)
+        task = TaskSnapshot.from_data(stored.data)
+        if task.state is not TaskState.NEEDS_REVIEW:
+            raise InvalidTurnState(
+                f"task {task_id} is not awaiting human review, "
+                f"got {task.state.value}"
+            )
+        target = {
+            "accept": TaskState.SUCCEEDED,
+            "return_for_revision": TaskState.EXECUTING,
+            "cancel": TaskState.CANCELLED,
+        }[normalized]
+
+        if target.is_terminal:
+            # Mirror transition_task: a terminal Task must not leave background
+            # processes running. Cleanup may commit its own events.
+            await self._cleanup_background_processes_for_task_end(task_id, task)
+            stored = await self._require_stored_task(task_id)
+            task = TaskSnapshot.from_data(stored.data)
+
+        events: list[RuntimeEvent] = []
+        sequence = stored.last_event_sequence
+
+        def next_event(event_type: str, payload: Mapping[str, Any]) -> RuntimeEvent:
+            nonlocal sequence
+            sequence += 1
+            return RuntimeEvent(
+                f"evt-{uuid4().hex}", task_id, sequence, event_type, dict(payload),
+            )
+
+        events.append(next_event("task.review_resolved", {
+            "decision": normalized,
+            "reason": reason.strip() or f"human review: {normalized}",
+            "actor": "user",
+        }))
+        if normalized == "accept":
+            # A human accepted an unverified result. Record it as a manual pass
+            # so downstream projections stay consistent and auditable.
+            events.append(next_event("verify.completed", {
+                "status": AcceptanceStatus.PASSED.value,
+                "manual_verified": True,
+                "actor": "user",
+                "criterion_count": 0,
+            }))
+        elif normalized == "return_for_revision":
+            gaps = await self._completion_readiness_gaps(
+                task_id, await self.list_tools()
+            )
+            unmet = "; ".join(
+                gap.description for gap in gaps if gap.required
+            ) or "the remaining required work"
+            text = f"按人工复核意见继续完成：{unmet}"
+            steering = SteeringProjector.project(
+                task_id, await self._dependencies.store.read_events(task_id)
+            )
+            events.append(next_event("steering.queued", {
+                "steering_id": f"review-{uuid4().hex}",
+                "inbound_sequence": steering.latest_inbound_sequence + 1,
+                "kind": SteeringKind.STEER.value,
+                "text": text,
+                "text_hash": canonical_hash(text),
+                "request_hash": canonical_hash({
+                    "kind": SteeringKind.STEER.value, "text": text,
+                }),
+            }))
+        updated = task.transition(target)
+        if task.active_agent_checkpoint is not None:
+            checkpoint = AgentTurnCheckpoint.from_data(
+                task.active_agent_checkpoint
+            )
+            updated = updated.with_agent_checkpoint(replace(
+                checkpoint, pending_user_action={},
+            ).to_data())
+        events.append(next_event("task.state_changed", {
+            "previous_state": task.state.value,
+            "next_state": target.value,
+            "reason": f"human review: {normalized}",
+        }))
+        await self._dependencies.store.commit(RuntimeUnitOfWork(
+            task_id, stored.version, updated.to_data(), tuple(events)
+        ))
+        if target.is_terminal:
+            await self._record_session_task_state(updated)
+            await self._close_cancellation_scope(task_id)
+            if target is TaskState.CANCELLED:
+                self._cancelled_task_ids.add(task_id)
         return updated
 
     async def _record_session_task_state(self, task: TaskSnapshot) -> None:
@@ -8657,10 +9421,14 @@ class Kernel:
                 ),
                 mutation.step_id, passed, path,
             ))
+        # Integrity only: "did the disk keep what the journal recorded?" An
+        # empty journal trivially satisfies it. Whether a change was *required*
+        # is the delivery criterion's business, not this one's.
         workspace_passed = all(item.passed for item in workspace_evidence)
         workspace_result = AcceptanceResult(
             "workspace-integrity",
-            AcceptanceStatus.PASSED if workspace_passed else AcceptanceStatus.FAILED,
+            (AcceptanceStatus.PASSED if workspace_passed
+             else AcceptanceStatus.FAILED),
             tuple(workspace_evidence) or (Evidence(
                 "workspace_hash", "task introduced no workspace mutation",
                 "no mutation required verification", "verifier", True,
@@ -8750,6 +9518,45 @@ class Kernel:
                             item.source_step_id, item.passed, item.artifact_path,
                         ) for item in command_result.evidence),
                     ))
+            elif criterion.verification_kind is TaskCriterionKind.REQUIRED_EFFECT:
+                # Completion-claim gate: the contract declares side effects, so a
+                # Task that produced none is missing required delivery -- the
+                # claim fails here rather than passing as "nothing to verify".
+                criteria.append(_required_effect_delivery_result(
+                    criterion.criterion_id, task, task_spec,
+                ))
+            elif criterion.verification_kind in {
+                TaskCriterionKind.RUBRIC, TaskCriterionKind.GOAL_ALIGNMENT,
+            }:
+                # A judgement criterion has no machine proof, so a bounded judge
+                # evaluates it instead of the reference verifier. INV-10: with no
+                # judge wired it must NOT silently pass or vanish -- a criterion
+                # nobody can decide is BLOCKED, which routes to NEEDS_REVIEW.
+                if self._dependencies.rubric_judge is None:
+                    criteria.append(AcceptanceResult(
+                        criterion.criterion_id, AcceptanceStatus.BLOCKED,
+                        (Evidence(
+                            "rubric_unavailable", criterion.description,
+                            "no rubric judge is configured; a judged criterion "
+                            "cannot pass",
+                            "rubric-judge", False,
+                        ),),
+                    ))
+                    continue
+                judgement = await self._judge_rubric_criterion(
+                    task, events, criterion, answer_reference,
+                    shared_observation_refs,
+                )
+                passed = judgement.verdict is JudgeVerdict.SATISFIED
+                criteria.append(AcceptanceResult(
+                    criterion.criterion_id,
+                    (AcceptanceStatus.PASSED if passed
+                     else AcceptanceStatus.BLOCKED),
+                    (Evidence(
+                        "rubric", criterion.description, judgement.reason,
+                        "rubric-judge", passed,
+                    ),),
+                ))
             else:
                 reference = criterion.evidence_reference or ""
                 evidence = self._verify_task_spec_reference(
@@ -9207,6 +10014,114 @@ class Kernel:
             ),),
         )
 
+    async def _judge_rubric_criterion(
+        self, task: TaskSnapshot, events: tuple[RuntimeEvent, ...],
+        criterion: TaskAcceptanceCriterion,
+        answer_reference: str, observation_refs: tuple[str, ...],
+    ) -> RubricJudgement:
+        """Evaluate one judgement criterion under a bounded attempt budget.
+
+        A judge that keeps erroring is not retried forever; every attempt is
+        recorded and the last verdict is returned for final acceptance. The
+        judge receives bounded excerpts, not opaque references, or it would be
+        judging blind.
+        """
+        judge = self._dependencies.rubric_judge
+        references = tuple(dict.fromkeys(
+            ([answer_reference] if answer_reference else [])
+            + list(observation_refs)
+        ))
+        evidence = self._rubric_evidence(task, events, references)
+        attempts = max(1, self._dependencies.rubric_judge_max_attempts)
+        judgement = RubricJudgement(
+            criterion.criterion_id, JudgeVerdict.UNDECIDABLE,
+            "rubric judge was not invoked",
+        )
+        for attempt in range(1, attempts + 1):
+            assert judge is not None
+            judgement = await judge.judge(
+                criterion.criterion_id, criterion.description, evidence,
+            )
+            await self._append_events(task.task_id, ((
+                "rubric.evaluated", {
+                    "attempt": attempt,
+                    "evidence_count": len(evidence),
+                    **judgement.to_data(),
+                },
+            ),))
+            if judgement.verdict is not JudgeVerdict.JUDGE_ERROR:
+                break
+        return judgement
+
+    def _rubric_evidence(
+        self, task: TaskSnapshot, events: tuple[RuntimeEvent, ...],
+        references: tuple[str, ...],
+    ) -> tuple[RubricEvidence, ...]:
+        """Resolve evidence references into bounded text a judge can read."""
+        limit = self._dependencies.rubric_evidence_excerpt_characters
+        maximum = self._dependencies.rubric_evidence_max_items
+        executions = {
+            execution.call.call_id: execution
+            for execution in task.tool_executions.values()
+        }
+        mutations = {
+            mutation.mutation_id: mutation
+            for mutation in task.mutation_journal
+        }
+        resolved: list[RubricEvidence] = []
+        for reference in references:
+            excerpt: str | None = None
+            if reference.startswith("event:"):
+                try:
+                    sequence = int(reference.removeprefix("event:"))
+                except ValueError:
+                    sequence = -1
+                event = next(
+                    (item for item in events if item.sequence == sequence), None,
+                )
+                if event is not None:
+                    excerpt = self._event_excerpt(event)
+            elif reference.startswith("tool_call:"):
+                execution = executions.get(
+                    reference.removeprefix("tool_call:")
+                )
+                if execution is not None and execution.result is not None:
+                    excerpt = json.dumps(
+                        execution.result.data,
+                        ensure_ascii=False, sort_keys=True, default=str,
+                    )
+            elif reference.startswith("mutation:"):
+                mutation = mutations.get(reference.removeprefix("mutation:"))
+                if mutation is not None:
+                    excerpt = (
+                        f"path={mutation.path} "
+                        f"before={mutation.before_hash} "
+                        f"after={mutation.after_hash}"
+                    )
+            if excerpt is None:
+                continue
+            resolved.append(RubricEvidence(reference, excerpt[:limit]))
+            if len(resolved) >= maximum:
+                break
+        return tuple(resolved)
+
+    @staticmethod
+    def _event_excerpt(event: RuntimeEvent) -> str:
+        """Return the human-readable body of one persisted event."""
+        if event.event_type == "llm.completed":
+            message = event.payload.get("message")
+            if isinstance(message, Mapping):
+                texts = [
+                    str(block.get("text"))
+                    for block in message.get("content", [])
+                    if isinstance(block, Mapping) and block.get("text")
+                ]
+                if texts:
+                    return "\n".join(texts)
+        return json.dumps(
+            event.payload, ensure_ascii=False, sort_keys=True, default=str,
+        )
+
     def _verify_task_spec_reference(
         self, task: TaskSnapshot, events: tuple[RuntimeEvent, ...],
         reference: str, assertion: str,
@@ -9576,6 +10491,8 @@ class Kernel:
         on_text_delta: Callable[[str], None] | None = None,
         on_progress: Callable[[AgentProgress], None] | None = None,
     ) -> AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended:
+        # Spec §5.1: a resume starts a new in-process scope generation.
+        await self._close_cancellation_scope(task_id)
         await self.recover_workspace_transactions(task_id)
         await self.reconcile_background_processes(task_id)
         stored = await self._dependencies.store.load_task(task_id)
@@ -9730,6 +10647,8 @@ class Kernel:
         on_progress: Callable[[AgentProgress], None] | None = None,
     ) -> AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended:
         """Resume an interrupted Agent loop without granting new authority."""
+        # Spec §5.1: a resume starts a new in-process scope generation.
+        await self._close_cancellation_scope(task_id)
         await self.recover_workspace_transactions(task_id)
         await self.reconcile_background_processes(task_id)
         stored = await self._require_stored_task(task_id)
@@ -9939,6 +10858,8 @@ class Kernel:
         | AgentContinuationSuspended
     ):
         """Resume a model-selected completed-unit boundary without authority."""
+        # Spec §5.1: a resume starts a new in-process scope generation.
+        await self._close_cancellation_scope(task_id)
         normalized = user_text.strip()
         if not normalized or not input_id.strip():
             raise ValueError("continuation input and input_id are required")
@@ -9958,6 +10879,20 @@ class Kernel:
         pending = checkpoint.pending_user_action
         if pending.get("kind") != "CONTINUATION":
             raise ClarificationNotPending("task has no pending continuation")
+        readiness_state = CompletionReadinessState.from_data(
+            checkpoint.completion_readiness_state
+        )
+        if (
+            readiness_state.stalled_continuations
+            >= self._dependencies.completion_max_stalled_continuations
+        ):
+            # INV-4: never re-enter a loop that is already known to be
+            # unproductive. Finalize for human review instead.
+            return await self._finalize_needs_review(
+                checkpoint, (), reason="stalled_continuation_refused",
+                stalled=readiness_state.stalled_continuations,
+                message=checkpoint.messages[-1],
+            )
         # An explicit user continuation is a new authorization to spend, so the
         # resumed Turn must be able to act. Without this, a continuation that
         # was suspended at an exhausted budget resumes with zero capacity, dies
@@ -10532,7 +11467,8 @@ class Kernel:
                 "task.state_changed",
                 {"previous_state": current.state.value,
                  "next_state": interrupting.state.value,
-                 "reason": normalized_reason},
+                 "reason": normalized_reason,
+                 "intent": "interrupt", "schema_version": 1},
             ),
             RuntimeEvent(
                 f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 2,
@@ -10552,6 +11488,53 @@ class Kernel:
             task_id, stored.version, interrupted.to_data(), events
         ))
         return interrupted
+
+    async def _interrupting_intent(self, task_id: str) -> str:
+        """Read the intent recorded on the latest INTERRUPTING transition.
+
+        The intent lives on the durable event, never in memory. A missing field
+        is a historical record and defaults to ``"interrupt"`` (safe side: keep
+        the work and allow resume).
+        """
+        for event in reversed(
+            await self._dependencies.store.read_events(task_id)
+        ):
+            if (
+                event.event_type == "task.state_changed"
+                and str(event.payload.get("next_state", ""))
+                == TaskState.INTERRUPTING.value
+            ):
+                return str(event.payload.get("intent") or "interrupt")
+        return "interrupt"
+
+    async def reconcile_interrupting_tasks(self) -> tuple[str, ...]:
+        """Settle INTERRUPTING Tasks left behind by a crash (spec §6.2, plan A).
+
+        Called once after adapters start and before any user input is accepted.
+        Idempotent: a settled Task is no longer INTERRUPTING, and the settling
+        transition is recorded with reason ``interrupting_settled_on_startup``.
+        """
+        settled: list[str] = []
+        for session in await self.list_sessions(include_archived=True):
+            for task in await self.list_session_tasks(session.session_id):
+                if task.state is not TaskState.INTERRUPTING:
+                    continue
+                intent = await self._interrupting_intent(task.task_id)
+                target = (
+                    TaskState.CANCELLED if intent == "cancel"
+                    else TaskState.INTERRUPTED
+                )
+                try:
+                    await self.transition_task(
+                        task.task_id, target,
+                        "interrupting_settled_on_startup",
+                        authority="runtime", intent=intent,
+                    )
+                except (InvalidTurnState, TaskNotFound):
+                    continue
+                settled.append(task.task_id)
+                note_interrupting_settled(task.task_id, intent)
+        return tuple(settled)
 
     async def _continue_agent_turn(
         self,
@@ -10607,6 +11590,15 @@ class Kernel:
         pending_tool_calls = list(checkpoint.pending_tool_calls)
 
         while True:
+            # Cooperative cancellation boundary (task-cancellation-spec §7): a
+            # durable cancel may have landed since the last step (another
+            # process, or a restart without this in-process runner). Stop before
+            # starting new work; the SDK never writes SUCCEEDED for a cancelled
+            # Task.
+            if self.cancellation_signal(task_id).requested():
+                raise asyncio.CancelledError(
+                    "task cancelled at a turn boundary"
+                )
             checkpoint = self._synchronize_tool_batch(replace(
                 checkpoint, messages=tuple(messages),
                 pending_tool_calls=tuple(pending_tool_calls),
@@ -12045,6 +13037,7 @@ class Kernel:
                     if self._dependencies.model.capabilities.structured_conclusion
                     else ConclusionProtocolMode.OBSERVE
                 ),
+                cancellation_scope=self._cancellation_scope(task_id),
             )
             model_started_at = time.monotonic()
             live_goal = (await self.get_task(task_id)).goal
@@ -12935,6 +13928,62 @@ class Kernel:
                 return event.payload
         return {}
 
+    async def _finalize_needs_review(
+        self, checkpoint: AgentTurnCheckpoint, gaps: tuple[CompletionGap, ...],
+        *, reason: str, stalled: int, message: Message,
+    ) -> AgentContinuationSuspended:
+        """Terminate an unclosable required gap as a human-review state.
+
+        INV-4's bounded escape hatch: after the stall cap the Runtime must stop
+        and hand the decision to a human instead of suspending forever in
+        AWAITING_USER. ``message`` is the model's last user-facing text so the
+        caller can still show what was produced.
+        """
+        stored = await self._require_stored_task(checkpoint.task_id)
+        task = TaskSnapshot.from_data(stored.data)
+        if task.state not in {TaskState.EXECUTING, TaskState.AWAITING_USER}:
+            raise InvalidTurnState(
+                "needs-review finalization requires EXECUTING/AWAITING_USER, "
+                f"got {task.state.value}"
+            )
+        finalized = task.transition(TaskState.NEEDS_REVIEW).with_agent_checkpoint(
+            replace(
+                checkpoint,
+                revision=checkpoint.revision + 1,
+                pending_user_action={},
+            ).to_data()
+        )
+        required_gap_ids = tuple(gap.gap_id for gap in gaps if gap.required)
+        events = (
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", checkpoint.task_id,
+                stored.last_event_sequence + 1,
+                "completion.finalized_needs_review", {
+                    "turn_id": checkpoint.turn_id,
+                    "reason": reason,
+                    "stalled_continuations": stalled,
+                    "unmet_gap_ids": list(required_gap_ids),
+                },
+            ),
+            RuntimeEvent(
+                f"evt-{uuid4().hex}", checkpoint.task_id,
+                stored.last_event_sequence + 2, "task.state_changed", {
+                    "previous_state": task.state.value,
+                    "next_state": finalized.state.value,
+                    "reason": reason,
+                },
+            ),
+        )
+        await self._dependencies.store.commit(RuntimeUnitOfWork(
+            checkpoint.task_id, stored.version, finalized.to_data(), events
+        ))
+        # NEEDS_REVIEW is terminal: release its in-process resources now.
+        await self._close_cancellation_scope(checkpoint.task_id)
+        return AgentContinuationSuspended(
+            checkpoint.task_id, checkpoint.turn_id,
+            checkpoint.revision + 1, (), required_gap_ids, message,
+        )
+
     async def _suspend_incomplete_recoverable(
         self, checkpoint: AgentTurnCheckpoint, message: Message,
         gaps: tuple[CompletionGap, ...], *, reason: str = "incomplete_recoverable",
@@ -12970,6 +14019,14 @@ class Kernel:
             )
             else 0
         )
+        if stalled >= self._dependencies.completion_max_stalled_continuations:
+            # INV-4: the same required gaps survived several continuations with
+            # no progress. Stop asking the user to retry an unclosable
+            # requirement and hand the decision to a human instead.
+            return await self._finalize_needs_review(
+                checkpoint, gaps, reason="required_work_unverifiable_or_stalled",
+                stalled=stalled, message=message,
+            )
         pending = {
             "kind": "CONTINUATION",
             "reason": reason,

@@ -35,6 +35,7 @@ from tsm_agt.core import (
     AgentContinuationSuspended,
     ApprovalDecision,
     ApprovalResolutionInput,
+    CancelTaskInput,
     ClarificationReplyInput,
     InterruptTaskInput,
     FlowNode,
@@ -364,7 +365,7 @@ from tsm_agt.ports import (
 
 async def _task_demo(goal: str, workspace: Path) -> int:
     application = compose_fixture_application()
-    await application.registry.start_all()
+    await application.start()
     try:
         task = await application.kernel.create_task(goal, workspace)
         route = (
@@ -404,7 +405,7 @@ async def _task_demo(goal: str, workspace: Path) -> int:
 
 async def _turn_demo(prompt: str, workspace: Path) -> int:
     application = compose_fixture_application()
-    await application.registry.start_all()
+    await application.start()
     try:
         task = await application.kernel.create_task("single text turn", workspace)
         for target in (
@@ -433,7 +434,7 @@ async def _turn_demo(prompt: str, workspace: Path) -> int:
 
 async def _tool_demo(text: str, workspace: Path) -> int:
     application = compose_fixture_application()
-    await application.registry.start_all()
+    await application.start()
     try:
         task = await application.kernel.create_task("single tool call", workspace)
         for target in (
@@ -464,7 +465,7 @@ async def _tool_demo(text: str, workspace: Path) -> int:
 
 async def _agent_demo(prompt: str, workspace: Path) -> int:
     application = compose_fixture_agent_application()
-    await application.registry.start_all()
+    await application.start()
     try:
         task = await application.kernel.create_task("bounded Agent loop", workspace)
         for target in (
@@ -491,7 +492,7 @@ async def _agent_demo(prompt: str, workspace: Path) -> int:
 
 async def _files_demo(path: str, workspace: Path, recursive: bool) -> int:
     application = compose_readonly_application()
-    await application.registry.start_all()
+    await application.start()
     try:
         task = await application.kernel.create_task("inspect workspace files", workspace)
         for target in (
@@ -536,7 +537,7 @@ async def _agent(
         env_file=root / ".env",
         database_path=root / ".agent" / "runtime.db",
     )
-    await application.registry.start_all()
+    await application.start()
     try:
         task = await application.kernel.create_task(prompt, root)
         for target in (
@@ -962,7 +963,7 @@ async def _chat(
         )
     ))
     application = factory()
-    await application.registry.start_all()
+    await application.start()
     output_context = (
         terminal_input.output_context()
         if terminal_input is not None
@@ -1064,7 +1065,8 @@ async def _chat(
                 output_fn(
                     "Enter a request to run one Agent Task. While it runs, type "
                     "ordinary language to update the active Task, or use "
-                    "/steer, /queue, /redirect and /interrupt. /followup shows or "
+                    "/steer, /queue, /redirect, /interrupt and /cancel. "
+                    "/followup shows or "
                     "changes the mode. /status, /plan, /diff and "
                     "/spec, /permissions are read-only; /sessions and /use switch "
                     "durable conversations; /exit saves and leaves."
@@ -1858,6 +1860,22 @@ async def _chat(
                                     root, output_fn,
                                 ):
                                     pass
+                                elif live_text == "/cancel":
+                                    # Spec §11 explicit confirmation: cancel is
+                                    # terminal, unlike the recoverable
+                                    # /interrupt.
+                                    await application.kernel.dispatch_input_event(
+                                        CancelTaskInput(
+                                            task.task_id,
+                                            "interactive user cancel",
+                                        )
+                                    )
+                                    agent_future.cancel()
+                                    await asyncio.gather(
+                                        agent_future, return_exceptions=True
+                                    )
+                                    output_fn(f"task cancelled: {task.task_id}")
+                                    return 0
                                 elif live_text == "/interrupt":
                                     await application.kernel.dispatch_input_event(
                                         InterruptTaskInput(
@@ -2266,7 +2284,7 @@ async def _resolve_agent_approval(
         env_file=root / ".env",
         database_path=root / ".agent" / "runtime.db"
     )
-    await application.registry.start_all()
+    await application.start()
     try:
         result = await application.kernel.dispatch_input_event(
             ApprovalResolutionInput(request_id, decision, reason),
@@ -2289,7 +2307,7 @@ async def _resolve_agent_clarification(
         env_file=root / ".env",
         database_path=root / ".agent" / "runtime.db"
     )
-    await application.registry.start_all()
+    await application.start()
     try:
         result = await application.kernel.dispatch_input_event(
             ClarificationReplyInput(
@@ -2311,7 +2329,7 @@ async def _resume_agent_task(task_id: str, workspace: Path) -> int:
         env_file=root / ".env",
         database_path=root / ".agent" / "runtime.db"
     )
-    await application.registry.start_all()
+    await application.start()
     try:
         result = await application.kernel.resume_checkpointed_agent_turn(
             task_id, on_progress=_print_standalone_agent_progress
@@ -2327,7 +2345,7 @@ async def _resume_agent_task(task_id: str, workspace: Path) -> int:
 async def _project_trust_get(workspace: Path) -> int:
     root = workspace.expanduser().resolve()
     application = compose_local_project_control_application(root)
-    await application.registry.start_all()
+    await application.start()
     try:
         trust = await application.kernel.get_project_trust(root)
         print(f"workspace: {trust.workspace}")
@@ -2342,7 +2360,7 @@ async def _project_trust_get(workspace: Path) -> int:
 async def _project_trust_set(workspace: Path, level: ProjectTrustLevel) -> int:
     root = workspace.expanduser().resolve()
     application = compose_local_project_control_application(root)
-    await application.registry.start_all()
+    await application.start()
     try:
         trust = await application.kernel.set_project_trust(root, level)
         print(f"workspace: {trust.workspace}")
@@ -2359,7 +2377,7 @@ async def _memory_list(
 ) -> int:
     root = workspace.expanduser().resolve()
     application = compose_local_project_control_application(root)
-    await application.registry.start_all()
+    await application.start()
     try:
         memories = await application.kernel.list_task_memories(
             task_id, include_stale=include_stale
@@ -2395,7 +2413,7 @@ async def _working_memory_show(
 ) -> int:
     root = workspace.expanduser().resolve()
     application = compose_local_project_control_application(root)
-    await application.registry.start_all()
+    await application.start()
     try:
         effective = await application.kernel.get_effective_working_memory(task_id)
         snapshot = effective.snapshot
@@ -2446,7 +2464,7 @@ async def _working_memory_show(
 async def _session_command(args: argparse.Namespace) -> int:
     root = args.workspace.expanduser().resolve()
     application = compose_local_project_control_application(root)
-    await application.registry.start_all()
+    await application.start()
     try:
         if args.session_command == "create":
             session = await application.kernel.create_session(args.title)
@@ -2524,7 +2542,7 @@ async def _task_create(
 ) -> int:
     root = workspace.expanduser().resolve()
     application = compose_local_project_control_application(root)
-    await application.registry.start_all()
+    await application.start()
     try:
         task = await application.kernel.create_task(
             goal, root, session_id=session_id, command_id=command_id
@@ -2538,7 +2556,7 @@ async def _task_create(
 async def _steering_command(args: argparse.Namespace) -> int:
     root = args.workspace.expanduser().resolve()
     application = compose_local_project_control_application(root)
-    await application.registry.start_all()
+    await application.start()
     try:
         if args.steering_command == "show":
             projection = await application.kernel.get_steering(args.task_id)
@@ -2583,7 +2601,7 @@ async def _steering_command(args: argparse.Namespace) -> int:
 async def _onboarding_run(task_id: str, workspace: Path, as_json: bool) -> int:
     root = workspace.expanduser().resolve()
     application = compose_local_project_control_application(root)
-    await application.registry.start_all()
+    await application.start()
     try:
         result = await application.kernel.run_project_onboarding(task_id)
         if not isinstance(result, ProjectOnboardingSnapshot):
@@ -2599,7 +2617,7 @@ async def _onboarding_show(
 ) -> int:
     root = workspace.expanduser().resolve()
     application = compose_local_project_control_application(root)
-    await application.registry.start_all()
+    await application.start()
     try:
         snapshot, stale = await application.kernel.get_project_onboarding(
             task_id, include_stale=include_stale
@@ -2723,7 +2741,7 @@ async def _flow_query(
         )
     root = workspace.expanduser().resolve()
     application = compose_local_flow_query_application(root)
-    await application.registry.start_all()
+    await application.start()
     try:
         projection: FlowProjection | None = None
         while True:
@@ -2790,7 +2808,7 @@ async def _inspect_effective_configuration(
 ) -> int:
     root = workspace.expanduser().resolve()
     application = compose_local_flow_query_application(root)
-    await application.registry.start_all()
+    await application.start()
     try:
         configuration = await application.kernel.get_effective_configuration(
             task_id, revision
@@ -3096,7 +3114,7 @@ async def _replay(
         raise ValueError("--step cannot be combined with --json")
     root = workspace.expanduser().resolve()
     application = compose_local_flow_query_application(root)
-    await application.registry.start_all()
+    await application.start()
     try:
         if play:
             cursor_store = application.registry.require(ReplayCursorStorePort)

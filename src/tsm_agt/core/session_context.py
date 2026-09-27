@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from tsm_agt.ports import Message, MessageRole, SessionEvent, TextBlock
@@ -166,6 +167,64 @@ class SessionConversationMessage:
             "turn_id": self.turn_id,
             "source_event_sequence": self.source_event_sequence,
         }
+
+
+class ContextAuthority(StrEnum):
+    """Who is allowed to author a Task goal or an acceptance criterion.
+
+    AUTHORITATIVE        the user's current input, explicit references, the
+                         current Task SPEC and approvals
+    SCOPED_BACKGROUND    identity/state of a source Task that the caller named
+                         explicitly; bounded, never a requirement
+    NON_AUTHORITATIVE    conversation history, other Tasks' messages, summaries,
+                         subagent reports
+    """
+
+    AUTHORITATIVE = "AUTHORITATIVE"
+    SCOPED_BACKGROUND = "SCOPED_BACKGROUND"
+    NON_AUTHORITATIVE = "NON_AUTHORITATIVE"
+
+
+@dataclass(frozen=True, slots=True)
+class ContextScope:
+    """The provenance closure of one Task: a Task IS a context boundary.
+
+    Eligibility is membership in this set, never recency. ``lineage_task_ids``
+    is the Task's own lineage (itself plus any explicitly named ancestors);
+    explicit message/event references may pull in a single outside fact without
+    widening the boundary to a whole Task.
+    """
+
+    session_id: str
+    task_id: str | None = None
+    lineage_task_ids: tuple[str, ...] = ()
+    explicit_message_ids: tuple[str, ...] = ()
+    explicit_event_sequences: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.session_id.strip():
+            raise ValueError("ContextScope requires a session id")
+
+    @property
+    def eligible_task_ids(self) -> frozenset[str]:
+        return frozenset(self.lineage_task_ids)
+
+    def allows(self, message: SessionConversationMessage) -> bool:
+        if message.message_id in self.explicit_message_ids:
+            return True
+        if message.source_event_sequence in self.explicit_event_sequences:
+            return True
+        return (
+            message.task_id is not None
+            and message.task_id in self.eligible_task_ids
+        )
+
+
+def select_messages_by_scope(
+    messages: Sequence[SessionConversationMessage], scope: ContextScope,
+) -> tuple[SessionConversationMessage, ...]:
+    """Provenance selector. Recency is never an eligibility criterion."""
+    return tuple(message for message in messages if scope.allows(message))
 
 
 @dataclass(frozen=True, slots=True)
@@ -506,6 +565,9 @@ class SessionContextProjector:
     detailed_task_summary_limit: int = 4
     historical_resource_limit: int = 24
     historical_question_limit: int = 12
+    #: Cap for messages that passed the provenance filter. It is a size bound,
+    #: not an eligibility rule: recency decides order, never membership.
+    scoped_visible_message_limit: int = 32
 
     def __post_init__(self) -> None:
         if min(
@@ -513,6 +575,7 @@ class SessionContextProjector:
             self.execution_result_item_limit, self.small_read_content_characters,
             self.recent_visible_message_limit, self.detailed_task_summary_limit,
             self.historical_resource_limit, self.historical_question_limit,
+            self.scoped_visible_message_limit,
         ) < 1:
             raise ValueError("Session context projection limits must be positive")
 
@@ -699,6 +762,8 @@ class SessionContextProjector:
         active_checkpoint: SessionActiveCheckpoint | None = None,
         suspended_tasks: Sequence[SessionResumeCandidate] = (),
         pinned_task_ids: Sequence[str] = (),
+        scope: ContextScope | None = None,
+        include_background: bool = True,
     ) -> SessionPromptProjection:
         if not projection.messages and not any((
             projection.working_state.goal, projection.working_state.constraints,
@@ -719,6 +784,30 @@ class SessionContextProjector:
                 "recent_task_summaries": [],
                 "task_index": [],
                 "work_state": projection.working_state.to_data(),
+                "scoped_messages": [],
+                "background_messages": [],
+                "pinned_task_ids": [],
+                "scope": {
+                    "session_id": projection.session_id,
+                    "task_id": scope.task_id if scope else None,
+                    "lineage_task_ids": (
+                        list(scope.lineage_task_ids) if scope else []
+                    ),
+                },
+                "authority": {
+                    "scoped_messages": ContextAuthority.AUTHORITATIVE.value,
+                    "background_messages": (
+                        ContextAuthority.NON_AUTHORITATIVE.value
+                    ),
+                    "working_state": ContextAuthority.NON_AUTHORITATIVE.value,
+                    "recent_task_summaries": (
+                        ContextAuthority.NON_AUTHORITATIVE.value
+                    ),
+                    "historical_investigation": (
+                        ContextAuthority.NON_AUTHORITATIVE.value
+                    ),
+                    "task_index": ContextAuthority.NON_AUTHORITATIVE.value,
+                },
             }
             return SessionPromptProjection(
                 None, projection.revision, projection.content_hash,
@@ -747,10 +836,33 @@ class SessionContextProjector:
                 and message.task_id in terminal_failure_task_ids
             )
         )
-        # Verbose user-visible text and detailed handoffs are bounded
-        # deterministically before they become protected Session context; this
-        # is retention, not routing.
-        visible_messages = prompt_messages[-self.recent_visible_message_limit:]
+        # Selection is by provenance, not recency. ``scope`` names the Task
+        # lineage whose messages are AUTHORITATIVE; everything else is bounded
+        # background and is dropped entirely when the caller asks for it (the
+        # Planner must never see another Task's conversation). Recency only
+        # decides how many already-eligible messages survive the size cap and,
+        # for background, which unrelated tail is worth showing at all.
+        if scope is None:
+            # Legacy unscoped path: recency still selects, and the payload keeps
+            # the single ``recent_messages`` alias so its size is unchanged.
+            scoped_messages: tuple[SessionConversationMessage, ...] = ()
+            background_messages: tuple[SessionConversationMessage, ...] = ()
+            visible_messages = prompt_messages[
+                -self.recent_visible_message_limit:
+            ]
+        else:
+            in_scope = select_messages_by_scope(prompt_messages, scope)
+            scoped_messages = in_scope[-self.scoped_visible_message_limit:]
+            scoped_ids = {message.message_id for message in scoped_messages}
+            background = tuple(
+                message for message in prompt_messages
+                if message.message_id not in scoped_ids
+            )
+            background_messages = (
+                background[-self.recent_visible_message_limit:]
+                if include_background else ()
+            )
+            visible_messages = scoped_messages + background_messages
         recent_task_ids = list(reversed(list(dict.fromkeys(
             message.task_id for message in reversed(visible_messages)
             if message.task_id is not None
@@ -865,9 +977,56 @@ class SessionContextProjector:
                 "tasks": summary_source["tasks"],
                 "omitted_task_count": summary_source["omitted_task_count"],
             },
-            "recent_messages": [
-                message.source_data() for message in visible_messages
+            # ``recent_messages`` stays a legacy alias for the unscoped path so
+            # its payload size is unchanged. In scoped mode the same content is
+            # carried once, by scoped_messages/background_messages, and must not
+            # be duplicated here or the prompt budget doubles.
+            "recent_messages": (
+                [message.source_data() for message in visible_messages]
+                if scope is None else []
+            ),
+            "scoped_messages": [
+                {
+                    **message.source_data(),
+                    "authority": ContextAuthority.AUTHORITATIVE.value,
+                }
+                for message in scoped_messages
             ],
+            "background_messages": [
+                {
+                    **message.source_data(),
+                    "authority": ContextAuthority.NON_AUTHORITATIVE.value,
+                }
+                for message in background_messages
+            ],
+            "pinned_task_ids": list(pinned_ids),
+            "scope": {
+                "session_id": projection.session_id,
+                "task_id": scope.task_id if scope else None,
+                "lineage_task_ids": (
+                    list(scope.lineage_task_ids) if scope else []
+                ),
+            },
+            "authority": {
+                "scoped_messages": ContextAuthority.AUTHORITATIVE.value,
+                "background_messages": ContextAuthority.NON_AUTHORITATIVE.value,
+                "working_state": ContextAuthority.NON_AUTHORITATIVE.value,
+                "recent_task_summaries": (
+                    ContextAuthority.NON_AUTHORITATIVE.value
+                ),
+                "historical_investigation": (
+                    ContextAuthority.NON_AUTHORITATIVE.value
+                ),
+                "task_index": ContextAuthority.NON_AUTHORITATIVE.value,
+            },
+            "selection": {
+                "algorithm": "provenance-scope-v1",
+                "scoped_message_count": len(scoped_messages),
+                "background_message_count": len(background_messages),
+                "dropped_message_count": (
+                    len(prompt_messages) - len(visible_messages)
+                ),
+            },
         }
         body = json.dumps(
             body_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")

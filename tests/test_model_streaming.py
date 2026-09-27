@@ -76,7 +76,9 @@ class MismatchedStreamingModel(StreamingEchoModel):
 
 
 class DiagnosticStreamingTransport:
-    async def stream_sse(self, url, headers, payload, timeout_seconds):
+    async def stream_sse(
+        self, url, headers, payload, timeout_seconds, cancellation_scope=None,
+    ):
         yield json.dumps({
             "id": "chat-diagnostic",
             "choices": [{

@@ -173,6 +173,36 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     reason="finish duplicate submit test",
                 )
 
+    async def test_cancel_command_transitions_task_to_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = BlockingModel()
+            application = compose_fixture_application(
+                model_adapter=model, tool_adapters=()
+            )
+            client = EngineeringAgentClient(
+                root, application_factory=lambda: application, poll_interval=0.001
+            )
+            async with client:
+                accepted = await client.submit_task(
+                    "cancel me", command_id="sdk-cancel-create"
+                )
+                await asyncio.wait_for(model.entered.wait(), 5)
+                result = await client.cancel(
+                    accepted.task_id,
+                    command_id="sdk-cancel-command",
+                    reason="cancel runtime execution",
+                )
+                replay = await client.cancel(
+                    accepted.task_id,
+                    command_id="sdk-cancel-command",
+                    reason="cancel runtime execution",
+                )
+                self.assertTrue(replay.replayed)
+                self.assertEqual(result.result["state"], TaskState.CANCELLED.value)
+                final = await client.get_task_result(accepted.task_id)
+                self.assertEqual(final.state, TaskState.CANCELLED.value)
+
     async def test_submit_wait_and_cursor_resume_expose_no_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -195,6 +225,26 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(any(
                     "payload" in event.to_data() for event in all_events
                 ))
+
+    async def test_resume_continuation_is_wired_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            async with fixture_client(root) as client:
+                accepted = await client.submit_task(
+                    "hello resume", command_id="sdk-resume-create"
+                )
+                final = await client.wait_task(accepted.task_id, timeout=5)
+                self.assertEqual(final.state, TaskState.SUCCEEDED.value)
+                # A Task that is not awaiting a continuation simply returns its
+                # current result, so the explicit channel is always safe.
+                first = await client.resume_continuation(
+                    final.task_id, command_id="sdk-resume-1", text="继续"
+                )
+                self.assertIn("task_id", first.result)
+                again = await client.resume_continuation(
+                    final.task_id, command_id="sdk-resume-1", text="继续"
+                )
+                self.assertEqual(again.result, first.result)
 
     async def test_non_legacy_mode_reports_verification_without_finalizing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

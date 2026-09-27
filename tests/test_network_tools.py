@@ -437,6 +437,9 @@ class SearchRecencyTest(unittest.TestCase):
 
     def test_tavily_maps_freshness_and_parses_published_date(self):
         captured: dict[str, object] = {}
+        # Keep the fixture inside the "day" window regardless of wall clock.
+        published = datetime.now(timezone.utc) - timedelta(hours=1)
+        published_text = published.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         def fake_urlopen(request, timeout=None):
             captured["headers"] = dict(request.headers)
@@ -445,7 +448,7 @@ class SearchRecencyTest(unittest.TestCase):
                 "title": "NBA news",
                 "url": "https://example.com/nba",
                 "content": "fresh snippet",
-                "published_date": "2026-09-25T15:40:00Z",
+                "published_date": published_text,
             }]}).encode())
 
         with patch(
@@ -463,7 +466,7 @@ class SearchRecencyTest(unittest.TestCase):
             captured["headers"].get("Authorization"), "Bearer tvly-secret"
         )
         self.assertEqual(results[0].url, "https://example.com/nba")
-        self.assertTrue(results[0].published_at.startswith("2026-09-25"))
+        self.assertTrue(results[0].published_at.startswith(published_text[:10]))
 
     def test_tavily_keyless_sends_access_mode_header(self):
         captured: dict[str, object] = {}

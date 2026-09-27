@@ -116,8 +116,16 @@ class KernelTaskTest(unittest.IsolatedAsyncioTestCase):
                 "task_id": "task-follow-up",
                 "turn_id": None,
                 "source_event_sequence": 3,
+                "authority": "AUTHORITATIVE",
             },
-            planning_context["session"]["recent_messages"],
+            planning_context["session"]["scoped_messages"],
+        )
+        self.assertEqual(
+            planning_context["session"]["background_messages"], []
+        )
+        self.assertEqual(
+            planning_context["related_task"]["authority"],
+            "SCOPED_BACKGROUND",
         )
 
     def test_for_prompt_preserves_pinned_task_summaries(self) -> None:

@@ -243,6 +243,13 @@ class LocalEventApiServer:
                             reason=_required_text(body, "reason"),
                         ))
                         self._json(HTTPStatus.OK, result.to_data())
+                    elif method == "POST" and len(parts) == 4 and parts[:2] == ("v1", "tasks") and parts[3] == "cancel":
+                        body = self._body()
+                        result = owner._call(owner._client.cancel(
+                            parts[2], command_id=_required_text(body, "command_id"),
+                            reason=_required_text(body, "reason"),
+                        ))
+                        self._json(HTTPStatus.OK, result.to_data())
                     elif method == "POST" and len(parts) == 4 and parts[:2] == ("v1", "tasks") and parts[3] in {"steer", "replace"}:
                         body = self._body()
                         operation = (

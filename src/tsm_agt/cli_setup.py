@@ -274,7 +274,7 @@ def _configuration_file_permission_check(path: Path) -> DiagnosticCheck:
 async def _adapter_check() -> DiagnosticCheck:
     application = compose_fixture_application()
     try:
-        await application.registry.start_all()
+        await application.start()
         unhealthy: list[str] = []
         for adapter in application.registry.runtime_adapters():
             health = await adapter.health()
@@ -316,7 +316,7 @@ async def _probe_model(configuration: ModelConfiguration) -> None:
             model_strict_tool_schema=configuration.strict_tool_schema,
             model_streaming=configuration.streaming,
         )
-        await application.registry.start_all()
+        await application.start()
         try:
             provider = application.registry.require(ModelProviderPort)
             response = await asyncio.wait_for(provider.complete(ModelRequest(

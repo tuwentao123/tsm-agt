@@ -135,9 +135,8 @@ class DerivedTaskGoalAuthorshipTest(unittest.IsolatedAsyncioTestCase):
         assert decision.resolved_goal is not None
         self.assertNotEqual(decision.resolved_goal, FABRICATED_GOAL)
         self.assertNotIn(FABRICATED_GOAL, decision.resolved_goal)
-        # The deterministic handoff, recognisable by its own markers.
-        self.assertIn("[session-follow-up]", decision.resolved_goal)
-        self.assertIn("Current request:", decision.resolved_goal)
+        # Runtime builds the goal deterministically from the user's own words.
+        self.assertEqual(decision.resolved_goal, text)
 
     async def test_derived_goal_carries_the_request_as_its_body(self) -> None:
         """The user's words must survive; that is the whole point of the fix."""
@@ -146,23 +145,21 @@ class DerivedTaskGoalAuthorshipTest(unittest.IsolatedAsyncioTestCase):
         )
 
         assert decision.resolved_goal is not None
-        self.assertIn(text, decision.resolved_goal)
-        request_index = decision.resolved_goal.index("Current request:")
-        source_index = decision.resolved_goal.index("Authority-free source Task:")
-        self.assertLess(request_index, source_index)
+        self.assertEqual(decision.resolved_goal, text)
+        # INV-9: no template body, no historical work promoted into the goal.
+        self.assertNotIn("[session-follow-up]", decision.resolved_goal)
+        self.assertNotIn("Current request:", decision.resolved_goal)
 
-    async def test_source_goal_appears_only_as_labelled_reference(self) -> None:
+    async def test_source_goal_never_enters_the_derived_goal(self) -> None:
         """Reusing the source goal as the body is the defect, not the fix."""
-        decision, _, _ = await self.resolve("FOLLOW_UP", "接着弄")
+        decision, _, text = await self.resolve("FOLLOW_UP", "接着弄")
 
         assert decision.resolved_goal is not None
         goal = decision.resolved_goal
-        self.assertIn("- original goal: 修复 trace 节点刷新后顺序错乱的问题", goal)
-        # The reference sits inside the source section, never before the request.
-        self.assertGreater(
-            goal.index("- original goal:"), goal.index("Current request:")
-        )
-        self.assertIn("Safety boundary:", goal)
+        self.assertEqual(goal, text)
+        self.assertNotIn("修复 trace 节点刷新后顺序错乱的问题", goal)
+        self.assertNotIn("- original goal:", goal)
+        self.assertNotIn("Safety boundary:", goal)
 
     async def test_branch_uses_the_same_deterministic_construction(self) -> None:
         decision, source_task_id, text = await self.resolve("BRANCH", "换个思路试试")
@@ -170,8 +167,8 @@ class DerivedTaskGoalAuthorshipTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.relation, SessionTaskRelation.BRANCH)
         self.assertEqual(decision.source_task_id, source_task_id)
         assert decision.resolved_goal is not None
-        self.assertIn("[session-follow-up]", decision.resolved_goal)
-        self.assertIn(text, decision.resolved_goal)
+        self.assertEqual(decision.resolved_goal, text)
+        self.assertNotIn("[session-follow-up]", decision.resolved_goal)
 
     async def test_independent_goal_is_exactly_the_request(self) -> None:
         """With no source there is nothing to name, so no template applies."""

@@ -27,6 +27,10 @@ class Phase1TaskState(StrEnum):
     RUNNING = "RUNNING"
     WAITING = "WAITING"
     INTERRUPTED = "INTERRUPTED"
+    #: The Task stopped with unmet work that the Runtime cannot verify or no
+    #: longer advances. It is a terminal state for a human to review, distinct
+    #: from DONE (verified) and FAILED (definite error).
+    NEEDS_REVIEW = "NEEDS_REVIEW"
     DONE = "DONE"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
@@ -52,10 +56,16 @@ class TaskState(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"
+    #: Bounded escape hatch (INV-4/INV-6): unmet required work that cannot be
+    #: verified or no longer makes progress ends here for human review instead of
+    #: suspending forever as AWAITING_USER.
+    NEEDS_REVIEW = "NEEDS_REVIEW"
 
     @property
     def is_terminal(self) -> bool:
-        return self in {self.SUCCEEDED, self.CANCELLED, self.FAILED}
+        return self in {
+            self.SUCCEEDED, self.CANCELLED, self.FAILED, self.NEEDS_REVIEW,
+        }
 
     @property
     def phase1_state(self) -> Phase1TaskState:
@@ -81,6 +91,8 @@ class TaskState(StrEnum):
             return Phase1TaskState.WAITING
         if self in {self.INTERRUPTING, self.INTERRUPTED}:
             return Phase1TaskState.INTERRUPTED
+        if self is self.NEEDS_REVIEW:
+            return Phase1TaskState.NEEDS_REVIEW
         if self is self.SUCCEEDED:
             return Phase1TaskState.DONE
         if self is self.CANCELLED:
@@ -132,13 +144,18 @@ LEGAL_TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = {
             TaskState.VERIFYING,
             TaskState.CANCELLED,
             TaskState.FAILED,
+            TaskState.NEEDS_REVIEW,
         }
     ),
     TaskState.AWAITING_APPROVAL: frozenset(
         {TaskState.EXECUTING, TaskState.RUNNING_WORKFLOW, TaskState.INTERRUPTING, TaskState.CONFLICT, TaskState.CANCELLED}
     ),
     TaskState.AWAITING_USER: frozenset(
-        {TaskState.EXECUTING, TaskState.RUNNING_WORKFLOW, TaskState.INTERRUPTING, TaskState.CANCELLED}
+        {
+            TaskState.EXECUTING, TaskState.RUNNING_WORKFLOW,
+            TaskState.INTERRUPTING, TaskState.CANCELLED,
+            TaskState.NEEDS_REVIEW,
+        }
     ),
     TaskState.INTERRUPTING: frozenset(
         {TaskState.INTERRUPTED, TaskState.CANCELLED, TaskState.FAILED}
@@ -154,7 +171,10 @@ LEGAL_TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = {
         {TaskState.RESUMING, TaskState.CANCELLED, TaskState.FAILED}
     ),
     TaskState.VERIFYING: frozenset(
-        {TaskState.EXECUTING, TaskState.FINALIZING, TaskState.CANCELLED, TaskState.FAILED}
+        {
+            TaskState.EXECUTING, TaskState.FINALIZING,
+            TaskState.CANCELLED, TaskState.FAILED, TaskState.NEEDS_REVIEW,
+        }
     ),
     TaskState.FINALIZING: frozenset(
         {TaskState.SUCCEEDED, TaskState.CANCELLED, TaskState.FAILED}
@@ -162,6 +182,11 @@ LEGAL_TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = {
     TaskState.SUCCEEDED: frozenset(),
     TaskState.CANCELLED: frozenset(),
     TaskState.FAILED: frozenset(),
+    #: A human may accept the unverified result, return it for revision, or
+    #: cancel it. Only an explicit human review reaches these edges.
+    TaskState.NEEDS_REVIEW: frozenset({
+        TaskState.EXECUTING, TaskState.CANCELLED, TaskState.SUCCEEDED,
+    }),
 }
 
 

@@ -17,13 +17,16 @@ from tsm_agt.core import (
     AgentClarificationSuspended, AgentProgress, AgentTurnResult,
     AgentTurnSuspended,
     AgentContinuationSuspended,
-    ApprovalDecision, ApprovalResolutionInput, ClarificationReplyInput,
-    InterruptTaskInput, RuntimeTextInput, SessionTextInput,
+    AcceptanceStatus,
+    ApprovalDecision, ApprovalResolutionInput, CancelTaskInput,
+    ClarificationReplyInput, InterruptTaskInput, RuntimeTextInput,
+    SessionTextInput,
     SessionAnswerRequiresTask,
     SessionInputDecision, SessionRouteDisposition, SessionTaskRelation,
     SessionSnapshot,
     TaskRuntimeProjection, TaskRuntimeProjector,
     TaskSnapshot, TaskState, build_session_follow_up_goal,
+    build_session_follow_up_handoff,
     canonical_hash, SteeringKind, RuntimeInputIntent,
 )
 from tsm_agt.ports import (
@@ -223,7 +226,9 @@ class EngineeringAgentClient:
     async def start(self) -> EngineeringAgentClient:
         if self._application is None:
             self._application = self._application_factory()
-            await self._application.registry.start_all()
+            # Adapters, then settle crash-left INTERRUPTING Tasks (§6.2 plan A)
+            # before any user input is accepted.
+            await self._application.start()
         return self
 
     async def close(self) -> None:
@@ -260,6 +265,7 @@ class EngineeringAgentClient:
         task_relation: SessionTaskRelation = SessionTaskRelation.INDEPENDENT,
         workspace: Path | None = None,
         original_user_text: str | None = None,
+        context_handoff: Mapping[str, Any] | None = None,
     ) -> TaskSnapshot:
         """Create one Task, optionally in a workspace other than the client's.
 
@@ -275,6 +281,7 @@ class EngineeringAgentClient:
             command_id=command_id, source_task_id=source_task_id,
             task_relation=task_relation,
             original_user_text=original_user_text,
+            context_handoff=context_handoff,
         )
 
     async def submit_task(
@@ -284,12 +291,14 @@ class EngineeringAgentClient:
         images: tuple[ImageBlock, ...] = (),
         workspace: Path | None = None,
         original_user_text: str | None = None,
+        context_handoff: Mapping[str, Any] | None = None,
     ) -> RuntimeTaskResult:
         async with self._submit_lock:
             task = await self.create_task(
                 goal, command_id=command_id, session_id=session_id,
                 source_task_id=source_task_id, task_relation=task_relation,
                 workspace=workspace, original_user_text=original_user_text,
+                context_handoff=context_handoff,
             )
             current = await self.application.kernel.get_task(task.task_id)
             if (
@@ -402,13 +411,15 @@ class EngineeringAgentClient:
                 # derived goal must state the user's own request and reference
                 # the source Task only as bounded context, and that is a
                 # deterministic construction, not something a router may author.
-                goal = build_session_follow_up_goal(normalized, source)
+                handoff = build_session_follow_up_handoff(normalized, source)
+                goal = handoff.goal
                 task = await self.submit_task(
                     goal, command_id=command_id, session_id=session_id,
                     source_task_id=decision.source_task_id,
                     task_relation=SessionTaskRelation.FOLLOW_UP,
                     images=image_blocks, workspace=resolved_workspace,
                     original_user_text=normalized,
+                    context_handoff=handoff.background_task,
                 )
                 derived = SessionInputDecision(
                     SessionRouteDisposition.CREATE_TASK,
@@ -425,6 +436,20 @@ class EngineeringAgentClient:
                 )
             assert decision.disposition is SessionRouteDisposition.CREATE_TASK
             assert decision.resolved_goal is not None
+            # INV-9: the source facts travel as an explicitly non-authoritative
+            # background block, never merged into the goal.
+            context_handoff = None
+            if decision.source_task_id is not None:
+                source_entry = next(
+                    (
+                        item for item in decision.task_catalog
+                        if item.task_id == decision.source_task_id
+                    ), None,
+                )
+                if source_entry is not None:
+                    context_handoff = build_session_follow_up_handoff(
+                        normalized, source_entry
+                    ).background_task
             task = await self.submit_task(
                 decision.resolved_goal,
                 command_id=command_id, session_id=session_id,
@@ -432,6 +457,7 @@ class EngineeringAgentClient:
                 task_relation=decision.relation,
                 images=image_blocks, workspace=resolved_workspace,
                 original_user_text=normalized,
+                context_handoff=context_handoff,
             )
             return SessionTextResult(command_id, "task", decision_data, task=task)
 
@@ -970,6 +996,55 @@ class EngineeringAgentClient:
             lambda task: {"task_id": task.task_id, "state": task.state.value},
         )
 
+    async def resume_continuation(
+        self, task_id: str, *, command_id: str, text: str,
+    ) -> RuntimeCommandResult:
+        """Explicitly resume a Task suspended at a CONTINUATION boundary.
+
+        Ordinary session text is refused while a Task is AWAITING_USER
+        (``_route_user_input`` rule 3). This is the structured entry that lets a
+        client continue a legitimate completed-unit continuation on purpose.
+        ``run_task`` already handles the AWAITING_USER + CONTINUATION shape.
+        """
+        return await self._command(
+            command_id, "resume_continuation",
+            {"task_id": task_id, "text_hash": canonical_hash(text)},
+            lambda: self.run_task(task_id, text),
+            lambda result: result.to_data(),
+        )
+
+    async def resolve_needs_review(
+        self, task_id: str, decision: str, *, command_id: str, reason: str = "",
+    ) -> RuntimeCommandResult:
+        """Resolve a NEEDS_REVIEW Task: accept, return_for_revision, or cancel."""
+        async def execute():
+            return await self.application.kernel.resolve_needs_review(
+                task_id, decision, reason=reason,
+            )
+        return await self._command(
+            command_id, "resolve_needs_review",
+            {"task_id": task_id, "decision": decision, "reason": reason},
+            execute,
+            lambda task: {"task_id": task.task_id, "state": task.state.value},
+        )
+
+    async def cancel(
+        self, task_id: str, *, command_id: str, reason: str,
+    ) -> RuntimeCommandResult:
+        async def execute():
+            task = await self.application.kernel.dispatch_input_event(
+                CancelTaskInput(task_id, reason)
+            )
+            runner = self._run_tasks.get(task_id)
+            if runner is not None and not runner.done():
+                runner.cancel()
+            return task
+        return await self._command(
+            command_id, "cancel", {"task_id": task_id, "reason": reason},
+            execute,
+            lambda task: {"task_id": task.task_id, "state": task.state.value},
+        )
+
     async def steer(
         self, task_id: str, text: str, *, command_id: str,
     ) -> RuntimeCommandResult:
@@ -1152,11 +1227,16 @@ class EngineeringAgentClient:
             )
         elif isinstance(result, AgentContinuationSuspended):
             base = await self.get_task_result(result.task_id)
+            current = await self.application.kernel.get_task(result.task_id)
+            # A stall-cap finalization reuses this suspension shape but ends the
+            # Task as NEEDS_REVIEW, so the reported status must follow the Task,
+            # not the suspension type.
+            finalized = current.state is TaskState.NEEDS_REVIEW
             task_result = replace(
                 base,
-                status="awaiting_user",
+                status=_status_for_state(current.state),
                 assistant_text=result.assistant_message.text,
-                clarification={
+                clarification=None if finalized else {
                     "kind": "CONTINUATION",
                     "completed_outcome_ids": list(
                         result.completed_outcome_ids
@@ -1179,6 +1259,15 @@ class EngineeringAgentClient:
                     )
                     await kernel.transition_task(
                         result.task_id, TaskState.SUCCEEDED, "SDK succeeded"
+                    )
+                elif verification.status is AcceptanceStatus.BLOCKED:
+                    # INV-6: "cannot decide" is not "failed". A blocked verdict
+                    # (for example a judged criterion with no available judge)
+                    # must go to human review rather than be reported as a
+                    # failure the work did not cause.
+                    await kernel.transition_task(
+                        result.task_id, TaskState.NEEDS_REVIEW,
+                        f"SDK verifier {verification.status.value}",
                     )
                 else:
                     await kernel.transition_task(
@@ -1283,7 +1372,11 @@ def _status_for_state(state: TaskState) -> str:
     if state is TaskState.INTERRUPTED:
         return "interrupted"
     if state.is_terminal:
-        return "completed" if state is TaskState.SUCCEEDED else "failed"
+        if state is TaskState.SUCCEEDED:
+            return "completed"
+        if state is TaskState.NEEDS_REVIEW:
+            return "needs_review"
+        return "failed"
     return "running"
 
 

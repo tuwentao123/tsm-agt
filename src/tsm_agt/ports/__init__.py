@@ -92,6 +92,9 @@ from .session_input_resolver import (
     SessionInputResolverPort, SessionRouteResolutionError,
 )
 from .task_spec_planner import TaskSpecPlannerPort
+from .rubric_judge import (
+    JudgeVerdict, RubricEvidence, RubricJudgePort, RubricJudgement,
+)
 from .checkpoint_compatibility import (
     CheckpointCompatibilityAction, CheckpointCompatibilityDecision,
     CheckpointCompatibilityPolicyPort, CheckpointCompatibilityProbe,
@@ -282,6 +285,10 @@ __all__ = [
     "SessionInputResolverPort",
     "SessionRouteResolutionError",
     "TaskSpecPlannerPort",
+    "JudgeVerdict",
+    "RubricJudgePort",
+    "RubricEvidence",
+    "RubricJudgement",
     "CheckpointCompatibilityAction",
     "CheckpointCompatibilityDecision",
     "CheckpointCompatibilityPolicyPort",

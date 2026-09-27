@@ -1,77 +1,117 @@
-"""Deterministic, authority-free Session Task handoff construction."""
+"""Deterministic, authority-free Session Task handoff construction.
+
+The goal a derived Task carries is the user's own current request and nothing
+else. Facts about the source Task travel separately as ``background_task``, an
+explicitly non-authoritative block, so no amount of prompt drift can promote
+historical work into this Task's goal or acceptance criteria.
+"""
 
 from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
 
 from .runtime_input import SessionTaskCatalogEntry
 
 _MAX_GOAL_CHARACTERS = 2000
+#: Shortest verbatim span that counts as "copied from background". Long enough
+#: to ignore incidental word overlap, short enough to catch a lifted sentence.
+_BACKGROUND_SPAN_MIN = 24
 
 
-def _clip(value: str, limit: int) -> str:
+def clip_text(value: str, limit: int) -> str:
     normalized = " ".join(value.split())
     if len(normalized) <= limit:
         return normalized
     return normalized[: max(1, limit - 1)].rstrip() + "…"
 
 
-def _list_lines(
-    heading: str, values: tuple[str, ...], *, maximum: int, item_limit: int,
+#: Backwards-compatible private alias.
+_clip = clip_text
+
+
+def _normalize_for_overlap(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def find_background_leak(
+    authored_text: str, background_texts: Sequence[str], *,
+    min_span: int = _BACKGROUND_SPAN_MIN,
 ) -> str | None:
-    selected = tuple(
-        _clip(value, item_limit) for value in values[:maximum] if value.strip()
-    )
-    if not selected:
+    """Return a background span that appears verbatim in ``authored_text``.
+
+    Deterministic and pure: case-folded, whitespace-collapsed bidirectional
+    substring scan. It answers one question only -- did the author copy text
+    that it was not allowed to copy? -- and never decides what the author meant.
+    """
+    authored = _normalize_for_overlap(authored_text)
+    if not authored:
         return None
-    return heading + "\n" + "\n".join(f"- {value}" for value in selected)
+    for background in background_texts:
+        source = _normalize_for_overlap(background)
+        if len(source) < min_span:
+            continue
+        for start in range(0, len(source) - min_span + 1):
+            if source[start:start + min_span] in authored:
+                return source[start:start + min_span]
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionFollowUpHandoff:
+    """One derived Task's split inputs: an authoritative goal and background."""
+
+    goal: str
+    background_task: Mapping[str, Any]
+    background_texts: tuple[str, ...] = ()
+
+
+def build_session_follow_up_handoff(
+    current_input: str, source: SessionTaskCatalogEntry,
+) -> SessionFollowUpHandoff:
+    """Split the current request from the bounded, non-authoritative source facts.
+
+    Old approvals, checkpoints, tool payloads, process handles and grants are
+    deliberately unavailable to this function.
+    """
+    goal = clip_text(current_input, _MAX_GOAL_CHARACTERS)
+    remaining_work = tuple(
+        clip_text(value, 140) for value in source.remaining_work[:4]
+        if value.strip()
+    )
+    completed_work = tuple(
+        clip_text(value, 110) for value in source.completed_work[:3]
+        if value.strip()
+    )
+    source_goal = clip_text(source.goal, 320)
+    background_task: dict[str, Any] = {
+        "task_id": source.task_id,
+        "state": source.task_state,
+        "phase": source.phase1_state or "unknown",
+        "verification": source.verification_status or "unknown",
+        "goal": source_goal,
+        "historical_remaining_work": list(remaining_work),
+        "completed_work": list(completed_work),
+        "authority": "SCOPED_BACKGROUND",
+    }
+    background_texts = tuple(
+        value for value in (source_goal, *remaining_work, *completed_work) if value
+    )
+    return SessionFollowUpHandoff(goal, background_task, background_texts)
 
 
 def build_session_follow_up_goal(
     current_input: str, source: SessionTaskCatalogEntry,
 ) -> str:
-    """Build a bounded goal without replaying privileged source Task state.
+    """Backward-compatible facade: the goal is ONLY the user's current request."""
+    return build_session_follow_up_handoff(current_input, source).goal
 
-    The current request has the largest budget. Source summaries are already
-    deterministic Session projections, so this needs no additional model call.
-    Old approvals, checkpoints, tool payloads, process handles and grants are
-    deliberately unavailable to this function.
-    """
-    request = _clip(current_input, 1050)
-    sections = [
-        "[session-follow-up]",
-        f"Current request:\n{request}",
-        (
-            "Authority-free source Task:\n"
-            f"- task_id: {source.task_id}\n"
-            f"- state: {source.task_state}\n"
-            f"- phase: {source.phase1_state or 'unknown'}\n"
-            f"- verification: {source.verification_status or 'unknown'}\n"
-            f"- original goal: {_clip(source.goal, 320)}"
-        ),
-    ]
-    for section in (
-        _list_lines(
-            "Remaining work:", source.remaining_work,
-            maximum=4, item_limit=140,
-        ),
-        _list_lines(
-            "Completed work:", source.completed_work,
-            maximum=3, item_limit=110,
-        ),
-        _list_lines(
-            "Historical outcomes:", source.outcome_summaries,
-            maximum=3, item_limit=100,
-        ),
-    ):
-        if section:
-            sections.append(section)
-    sections.append(
-        "Safety boundary:\n"
-        "Create an independent FOLLOW_UP Task under the current Runtime. "
-        "Revalidate current workspace and external state. Do not inherit or "
-        "replay source approvals, grants, checkpoints, tool batches, process "
-        "handles, or unknown outcomes."
-    )
-    result = "\n\n".join(sections)
-    if len(result) > _MAX_GOAL_CHARACTERS:
-        result = result[: _MAX_GOAL_CHARACTERS - 1].rstrip() + "…"
-    return result
+
+__all__ = [
+    "SessionFollowUpHandoff",
+    "build_session_follow_up_goal",
+    "build_session_follow_up_handoff",
+    "clip_text",
+    "find_background_leak",
+]

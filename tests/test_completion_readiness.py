@@ -1604,3 +1604,135 @@ class UnresolvedEffectFailureTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(clean_completions, [])
             finally:
                 await application.registry.stop_all()
+
+
+class AcceptanceGateInvariantTest(unittest.IsolatedAsyncioTestCase):
+    """P0-2 / P0-3 regression guards.
+
+    An unresolved ``evidence_reference`` criterion must be advisory (it asserts
+    an already-true fact, never work to be done), and a crashed readiness policy
+    must be fail-closed instead of fail-open.
+    """
+
+    async def _set_acceptance_criteria(self, app, task, *criteria) -> None:
+        current = await app.kernel.get_task_spec(task.task_id)
+        spec = replace(
+            current, revision=current.revision + 1,
+            acceptance_criteria=tuple(criteria), content_hash="",
+        )
+        await app.kernel._append_events(task.task_id, ((
+            "task_spec.revised", {"snapshot": spec.to_data()},
+        ),))
+
+    async def test_unresolved_evidence_reference_gap_is_advisory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(tool_adapters=())
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, Path(directory), "advisory-evidence")
+                await self._set_acceptance_criteria(
+                    app, task,
+                    TaskAcceptanceCriterion(
+                        "evidence", "Record a trusted event",
+                        TaskCriterionKind.EVIDENCE_REFERENCE, "event:999999",
+                    ),
+                )
+                gaps = await app.kernel._completion_readiness_gaps(
+                    task.task_id, await app.kernel.list_tools()
+                )
+                evidence_gaps = [
+                    gap for gap in gaps if gap.gap_id == "task-spec:evidence"
+                ]
+                self.assertEqual(len(evidence_gaps), 1)
+                self.assertEqual(evidence_gaps[0].kind, "TASK_SPEC_EVIDENCE")
+                self.assertFalse(evidence_gaps[0].required)
+
+                # INV-3: every required gap must be closable (or judged).
+                for gap in gaps:
+                    if gap.required:
+                        self.assertTrue(
+                            gap.effective_required_effects
+                            or gap.kind in {
+                                "TASK_SPEC_RUBRIC", "EVIDENCE_QUESTION",
+                            },
+                            f"unclosable required gap {gap.gap_id} ({gap.kind})",
+                        )
+            finally:
+                await app.registry.stop_all()
+
+    async def test_unresolved_evidence_reference_does_not_suspend_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(
+                model_adapter=CriterionBlockedModel(), tool_adapters=(),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(
+                    app, Path(directory), "advisory-evidence-turn"
+                )
+                await self._set_acceptance_criteria(
+                    app, task,
+                    TaskAcceptanceCriterion(
+                        "evidence", "Record a trusted event",
+                        TaskCriterionKind.EVIDENCE_REFERENCE, "event:999999",
+                    ),
+                )
+                result = await app.kernel.run_agent_turn(
+                    task.task_id, "answer the question", max_model_calls=4,
+                    max_tool_calls=1,
+                )
+                # The incident shape: this used to suspend as AWAITING_USER.
+                self.assertIsInstance(result, AgentTurnResult)
+                self.assertEqual(
+                    (await app.kernel.get_task(task.task_id)).state,
+                    TaskState.EXECUTING,
+                )
+            finally:
+                await app.registry.stop_all()
+
+    async def test_crashed_readiness_policy_is_fail_closed(self) -> None:
+        from tsm_agt.ports import HealthState, HealthStatus
+
+        class _ExplodingPolicy:
+            descriptor = RuleBasedCompletionReadinessPolicy.descriptor
+
+            async def start(self, context) -> None:
+                pass
+
+            async def stop(self, deadline) -> None:
+                pass
+
+            async def health(self) -> HealthStatus:
+                return HealthStatus(HealthState.HEALTHY, "exploding")
+
+            async def evaluate(self, probe, state):
+                raise RuntimeError("readiness policy crashed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(
+                model_adapter=CriterionBlockedModel(), tool_adapters=(),
+                completion_readiness_policy_adapter=_ExplodingPolicy(),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, Path(directory), "exploding-policy")
+                with self.assertRaises(RuntimeError):
+                    await app.kernel.run_agent_turn(
+                        task.task_id, "answer", max_model_calls=4, max_tool_calls=1,
+                    )
+                events = await app.registry.require(RuntimeStorePort).read_events(
+                    task.task_id
+                )
+                failed = [
+                    event for event in events
+                    if event.event_type == "completion.readiness_failed"
+                ]
+                self.assertTrue(failed)
+                self.assertTrue(failed[-1].payload["fail_closed"])
+                # The crashed turn must not have been accepted as final.
+                self.assertFalse(any(
+                    event.event_type == "turn.completed" for event in events
+                ))
+            finally:
+                await app.registry.stop_all()
+

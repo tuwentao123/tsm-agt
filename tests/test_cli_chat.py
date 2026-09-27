@@ -627,7 +627,13 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
                 output_fn=output.append, application_factory=lambda: application,
             )
             self.assertEqual(result, 0)
+            # The derived Task's goal is the user's own request, so that is what
+            # the Agent sees and echoes.
             self.assertTrue(any(
+                "Use the preserved checkpoint with this exact input" in line
+                for line in output if line.startswith("agent> ")
+            ))
+            self.assertFalse(any(
                 "[session-follow-up]" in line
                 for line in output if line.startswith("agent> ")
             ))

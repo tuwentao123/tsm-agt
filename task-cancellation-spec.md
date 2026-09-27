@@ -25,7 +25,7 @@ v1 把取消当成"建立一套新的运行时所有权系统"，与本项目的
 
 | 能力 | 位置 | 说明 |
 |---|---|---|
-| 任务状态机含取消三态 | `core/task.py:35-57` | `INTERRUPTING` / `INTERRUPTED`（可恢复）/ `CANCELLED`（终态）；`is_terminal = {SUCCEEDED, CANCELLED, FAILED}` |
+| 任务状态机含取消三态 | `core/task.py:35-57` | `INTERRUPTING` / `INTERRUPTED`（可恢复）/ `CANCELLED`（终态）；`is_terminal = {SUCCEEDED, CANCELLED, FAILED, NEEDS_REVIEW}`（`NEEDS_REVIEW` 由验收判定改造引入，见 §17） |
 | 取消转换已定义 | `core/task.py:144-160` | `INTERRUPTING → {INTERRUPTED, CANCELLED, FAILED}`；`INTERRUPTED → {RESUMING, CONFLICT, CANCELLED, FAILED}` |
 | 显式取消指令 | `core/runtime_input.py:307-314` | `CancelTaskInput(task_id, reason)`，`channel=STRUCTURED_EVENT` |
 | 取消已接线到 kernel | `core/kernel.py:3045-3055` | 幂等：已 `CANCELLED` 直接返回；终态报 `InvalidTurnState`；否则 `transition_task(CANCELLED, reason)` |
@@ -43,7 +43,7 @@ v1 把取消当成"建立一套新的运行时所有权系统"，与本项目的
 
 1. **没有公共 cancel 入口**：`CancelTaskInput` 可被派发，但全仓没有任何 HTTP/SDK/CLI 构造它。
 2. **没有断连处理**：全仓无 `is_disconnected` / `WebSocketDisconnect` / `ClientDisconnect`，SSE 生成器与响应对象在客户端断开后缺少释放路径。
-3. **`INTERRUPTING` 没有崩溃收敛**：进程在取消中途退出后，重启任务停留在中间态，无对账规则。
+3. **`INTERRUPTING` 没有崩溃收敛**：中断（interrupt）中途进程退出后，重启任务停留在中间态，无对账规则。
 4. **没有统一的 in-process 资源归属**：stream / worker thread / async generator / process handle 分散在各层，无法一次性收拢清理（仅 `_background_deadline_tasks` 一处）。
 5. **`web.search` 的 `asyncio.to_thread` 不可取消**：runtime 的 `asyncio.timeout` 只取消 await，worker 线程会继续跑完（已确认）。
 6. **没有文档化的取消契约**：来源（用户/断连/预算）语义、交互矩阵、幂等规则都未成文。
@@ -221,13 +221,13 @@ Ownership / lifetime 规则：
 
 `CancelTaskInput` 不要求必须经过 `INTERRUPTING`。runtime 可以直接把任意 non-terminal state 转为 `CANCELLED`。`INTERRUPTING` 主要用于 interrupt、graceful settle、tool cleanup 或需要 checkpoint 收敛的场景。
 
-**取消意图的载体（D1 决策）**：**不新增事件类型**，复用现有 `task.state_changed`；在转往 `INTERRUPTING` 的那条事件 payload 上新增字段 `intent`（见 §6.3）。
+**取消意图的载体（D1 决策）**：**不新增事件类型**，复用现有 `task.state_changed`，在其 payload 上新增字段 `intent`（见 §6.3）。按 D7-b：cancel 写在直连 `CANCELLED` 的事件上；interrupt 写在 `INTERRUPTING` 的事件上。
 
 **收敛规则**：
 
 - 正常路径：`INTERRUPTING → INTERRUPTED`（可恢复）或 `→ CANCELLED`（终态化）；
 - 崩溃恢复：进入 `INTERRUPTING` 后进程退出，重启时按 `intent` 收敛：
-  - `intent == "cancel"` → `CANCELLED`；
+  - `intent == "cancel"` → `CANCELLED`（**仅历史/兼容**：D7-b 后新 cancel 直连 `CANCELLED`，不产生 `INTERRUPTING`）；
   - `intent == "interrupt"` → `INTERRUPTED`；
   - **字段缺失（历史记录）→ `INTERRUPTED`**（安全侧：保留工作、允许 resume）。
 
@@ -250,12 +250,14 @@ Ownership / lifetime 规则：
 ```json
 {
   "previous_state": "EXECUTING",
-  "next_state": "INTERRUPTING",
+  "next_state": "CANCELLED",
   "reason": "user cancelled",
   "intent": "cancel",
   "schema_version": 1
 }
 ```
+
+`intent` 有两种载体（D7-b）：**cancel 直连 `CANCELLED`**；**interrupt 写 `INTERRUPTING`**（`intent="interrupt"`）。历史事件缺字段时视为 `interrupt`。
 
 字段约定：
 
@@ -283,7 +285,7 @@ Ownership / lifetime 规则：
 Web / CLI / SDK
    │  request(mode=cancel|interrupt)
    ▼
-CancelTaskInput → task.state_changed(INTERRUPTING, intent="cancel")   ← durable intent
+CancelTaskInput → task.state_changed(CANCELLED, intent="cancel")   ← durable intent（D7-b，不经过 INTERRUPTING）
    │
    ▼
 Kernel：轮次边界协作检查（每轮模型调用前 / 每次工具调用前）
@@ -306,6 +308,8 @@ cleanup(shield) → 状态收敛（INTERRUPTED | CANCELLED）
 
 与 v1 的差别：取消意图先落库再传播；每一级都是"检查 + 停止"，不是"只有叶子被 cancel"。
 
+> D7-b 的顺序：cancel 在 ① 就写入 `CANCELLED`（终态意图先落库）；②③ 仍要执行以释放进程内资源，但**不再改变 Task 状态**。interrupt 则 ① 写 `INTERRUPTING`，由 ③ 收敛为 `INTERRUPTED`。
+
 ---
 
 # 8. 各层接入点
@@ -318,7 +322,7 @@ cleanup(shield) → 状态收敛（INTERRUPTED | CANCELLED）
 | Agent Loop | `core/agent_loop.py` | 在 step 调度前读取意图；停止 retry/规划 |
 | Model Stream | `adapters/openai_compatible/model.py` | 复用 `stopped` Event；把 worker 线程登记到 in-process scope |
 | Tool（命令/进程） | `adapters/builtin/process_tools.py`、`adapters/local_process/executor.py` | 复用 `stop_process`/`killpg`；把 handle 登记到 scope |
-| Tool（搜索等 IO） | `adapters/builtin/network_tools.py` | `to_thread` 不可取消：登记为 in-process 资源 + 保留 deadline 兜底（见 §16 决策点 D4） |
+| Tool（搜索等 IO） | `adapters/builtin/network_tools.py` | `to_thread` 不可取消：**不登记**进 scope（线程没有停止信号，登记会让每次任务结束都误报 `cleanup_timeout`）；保留既有 deadline 兜底。真正修复见 §16.1 |
 | Web | `web/app.py` | SSE/`StreamingResponse` 生成器：断连时释放流资源（§9.6）；可选 UI 取消按钮 → SDK `cancel` |
 
 ---
@@ -440,7 +444,7 @@ await client.cancel(task_id, reason="user cancelled")   # → CANCELLED
 await client.interrupt(task_id, reason="...")           # → INTERRUPTED（可恢复，已存在）
 ```
 
-CLI：`Ctrl+C` → 第一次映射 `interrupt`（可恢复，现状行为）；连续第二次或显式确认 → `cancel`。
+CLI：`Ctrl+C` → 第一次映射 `interrupt`（可恢复，现状行为）；**显式 `/cancel`** → `cancel`（已实现，见 `cli.py` 控制循环）。双击 Ctrl+C 的自动升级未实现。
 
 权限（D5）：MVP **不设** cancel 权限门 —— 与现有本地单用户模型一致。后续接入 Trust/Approval 时，`POST /v1/tasks/{id}/cancel` 与 `interrupt` 共用同一权限判定，不在本 spec 范围内。
 
@@ -450,7 +454,7 @@ CLI：`Ctrl+C` → 第一次映射 `interrupt`（可恢复，现状行为）；�
 
 | # | 场景 | 断言 |
 |---|---|---|
-| 1 | 用户 cancel 运行中 Task | `task.state_changed` 出现 `CANCELLED`；且此前有一条 `INTERRUPTING` 事件带 `intent="cancel"` |
+| 1 | 用户 cancel 运行中 Task | 出现一条 `task.state_changed`，`next_state=CANCELLED` 且 `intent="cancel"`（D7-b：**不要求**经过 `INTERRUPTING`） |
 | 2 | cancel 已 CANCELLED | 返回同一 Task，不产生第二条状态转移事件 |
 | 3 | cancel 已 SUCCEEDED | 抛 `InvalidTurnState`，状态不被改写 |
 | 4 | 等审批中 cancel | 任务 `CANCELLED`；无新审批批准记录 |
@@ -458,7 +462,7 @@ CLI：`Ctrl+C` → 第一次映射 `interrupt`（可恢复，现状行为）；�
 | 6 | 子进程工具在跑 | `terminate → kill`；进程组无残留；`ToolResult=CANCELLED` |
 | 7 | 客户端断连（默认） | SSH/流被释放；`TaskState` 不变；无 generator 泄漏 |
 | 8 | 断连 + `cancel_on_disconnect=true` | 任务最终 `CANCELLED` |
-| 9 | 取消中途崩溃重启 | 启动对账后 `INTERRUPTING` 收敛为 `INTERRUPTED` 或 `CANCELLED`，不停留中间态 |
+| 9 | 中断（interrupt）中途崩溃重启 | 启动对账后 `INTERRUPTING` 收敛为 `INTERRUPTED` 或 `CANCELLED`，不停留中间态；cancel 直连 `CANCELLED`（D7-b），无中间态可对账 |
 | 10 | `CancelledError` 处理 | 清理执行且异常被 re-raise，无 `except Exception: pass` 吞掉 |
 | 11 | 预算耗尽 | 结果为 `SUCCEEDED/FAILED`，**不得**为 `CANCELLED` |
 | 12 | 已提交 mutation 后取消 | mutation 记录保持，不出现回滚事件 |
@@ -467,27 +471,35 @@ CLI：`Ctrl+C` → 第一次映射 `interrupt`（可恢复，现状行为）；�
 
 # 13. 分阶段实施（对齐现状）
 
+> 实施状态（2026-09-26）：Phase 0 完成（启动对账经 `Application.start()` 覆盖 web/CLI/SDK 全部入口）；Phase 1 完成（含取消时的 pending batch 收尾 §9.4）；Phase 2 完成（scope 类 + deadline/进程/模型流接线 + resume 新建 generation + 终态 close_all + 断连释放 + 开关 + §12 #5/#6/#7/#8 测试；`to_thread` 与 SSE generator 按 D4 不登记）；Phase 3 完成（进程内计数 + 日志 + cleanup_timeout 告警；未做 alive 扫描器与 latency 直方图）；§5 `CancellationSignal` 门面已实现并被轮次边界检查使用；§11 CLI `/cancel`（显式确认）与 §8 Web 任务卡片取消按钮已实现（双击 Ctrl+C 未实现）。
+
 ## Phase 0 — 契约与对账（无新机制）
 - 落文档：本 spec 的交互矩阵与收敛规则；
 - 实现 `INTERRUPTING` 启动对账（§6.2）；
 - 补测试：§12 #2/#3/#9/#10。
+- **状态：完成**。`Kernel.reconcile_interrupting_tasks()` + `_interrupting_intent()`，在 `EngineeringAgentClient.start()` 中于 `registry.start_all()` 之后调用；测试见 `tests/test_task_cancellation.py`。
 
 ## Phase 1 — 公共入口 + durable intent
 - `POST /v1/tasks/{id}/cancel` → `CancelTaskInput`；
 - SDK `cancel()`；
 - 轮次边界协作检查（kernel/agent loop 读取意图）；
 - 补测试：§12 #1/#4/#11。
+- **状态：完成**。`local_api.py` /cancel + SDK `cancel()`（stash 恢复）；`transition_task(intent=...)` 写入 `intent`/`schema_version`；cancel 走 `intent="cancel"`、interrupt 走 `intent="interrupt"`；`_continue_agent_turn` 每轮开头检查 `CANCELLED` 并 `raise CancelledError`；取消前先按 §9.4 收尾未启动的 pending batch（`_settle_open_batch_for_cancel`）。§12 #1/#2/#3/#4/#9/#10/#11 见 `tests/test_task_cancellation.py`。
 
 ## Phase 2 — in-process scope + 断连资源释放
 - `CancellationScope`（进程内）：streams / threads / handles / generators / cleanups；
 - 合并现有 `_background_deadline_tasks`；
 - SSE / `StreamingResponse` 断连释放；`cancel_on_disconnect` 开关；
 - 补测试：§12 #5/#6/#7/#8。
+- **状态：完成**。`core/cancellation.py` 已落地；SSE `request.is_disconnected()` + `TSM_AGT_CANCEL_ON_DISCONNECT` 已落地；per-Task `CancellationScope` 由 Kernel 拥有（`_cancellation_scopes`），**已接线**：`_background_deadline_tasks`（deadline 任务）、后台进程句柄（`stop_background`，与 `_cleanup_background_processes_for_task_end` 幂等）、模型流 worker 线程（`ModelRequest.cancellation_scope` → `UrllibHttpJsonTransport.stream_sse` 登记 `stopped`）；**resume 时先 `close_all` 旧 scope，下一次使用新建 generation**（§5.1）；任务终态 / 取消 / `NEEDS_REVIEW` 时 `close_all`；§12 #5/#6/#7/#8 均有测试。
+- **有意偏差**：SSE generator 与 `to_thread` 检索线程**不登记**进 scope——前者断连即释放，后者无停止信号（登记会误报 `cleanup_timeout`，见 D4）。
+- **接口偏差**：`register_process(handle, *, name, stop)` 比 §5.1 多一个 `stop` 回调——裸 `ProcessHandle` 不能自停，停止操作归 executor（`executor.stop_process`）。
 
 ## Phase 3 — 可观测与泄漏检测
 - metrics：active / cancelling / cleanup duration / cancel latency；
 - 日志：`task_cancel_requested` / `task_cancel_propagated` / `model_stream_closed` / `subprocess_terminated` / `cleanup_completed` / `cleanup_timeout`；
 - 泄漏检测：alive subprocess / alive async task / dangling stream / leaked generator。
+- **状态：完成（最小版）**。`CancellationMetrics`：`cancel_requested` / `interrupting_settled` / `stream_released` / `active_scopes` / `cleanup_completed` / `cleanup_timed_out` / `cleanup_failed` / `cleanup_duration_seconds_total`；`note_*` 日志：`task_cancel_requested` / `task_cancel_propagated` / `stream_released` / `cleanup_completed` / `cleanup_timeout` / `cleanup_failed`。泄漏以 `cleanup_timeout` / `cleanup_failed` 告警体现。**未做**：独立的 alive-subprocess / async-task 扫描器与 cancel latency 直方图。
 
 ---
 
@@ -524,12 +536,13 @@ CLI：`Ctrl+C` → 第一次映射 `interrupt`（可恢复，现状行为）；�
 
 | 编号 | 决策 | 落地位置 |
 |---|---|---|
-| **D1** | 取消意图**不新增事件**，复用 `task.state_changed(INTERRUPTING)`，payload 新增可选 `intent: "cancel"\|"interrupt"`；缺省视为 `interrupt` | §6.2、§6.3 |
+| **D1** | 取消意图**不新增事件**，复用 `task.state_changed`，payload 新增可选 `intent: "cancel"\|"interrupt"`；缺省视为 `interrupt`。cancel 写 `CANCELLED`（D7-b），interrupt 写 `INTERRUPTING` | §6.2、§6.3 |
 | **D2** | cleanup 整体预算 **10s**；子进程 `terminate → wait(2s) → killpg`（与 `process_stop` 默认一致）；其余单资源 3s | §10.3 |
 | **D3** | 断连**默认只释放流**；`TSM_AGT_CANCEL_ON_DISCONNECT=false` 为默认，`true` 时断连等价于取消 | §9.6 |
-| **D4** | `web.search` 等 `to_thread` 暂不改造：登记为 in-process 资源 + 保留 deadline 兜底；可取消 HTTP 客户端列入后续迭代 | §8、§16.1 |
+| **D4** | `web.search` 等 `to_thread` 暂不改造：**不登记**进 scope（无停止信号，登记会误报 `cleanup_timeout`），仅保留既有 deadline 兜底；可取消 HTTP 客户端列入后续迭代（§16.1） | §8、§16.1 |
 | **D5** | MVP **不做** cancel 权限门；复用现有 Trust/Approval 留作后续 | §11 |
 | **D6** | 断连检测落点：SSE/`StreamingResponse` 生成器内**每次 yield 前** `await request.is_disconnected()` | §9.6 |
+| **D7（已定：b）** | cancel **不经过** `INTERRUPTING`，从任意 non-terminal state 直接写一条 `task.state_changed(CANCELLED, intent="cancel")`。§6.2 为准，§12 #1 已同步。`INTERRUPTING` 仅用于 interrupt / graceful settle | §6.2 / §6.3 / §7 / §12 #1 |
 
 | **D-对账** | `INTERRUPTING` 收敛：**采用启动阶段全量对账**；幂等、写 `reason="interrupting_settled_on_startup"` | §6.2 |
 | **D-接口** | `CancellationScope` / `CleanupReport` 接口签名固定 | §5.1 |
@@ -545,3 +558,37 @@ CLI：`Ctrl+C` → 第一次映射 `interrupt`（可恢复，现状行为）；�
 - 已提交 mutation 的回滚（独立能力，见 §9.4）；
 - 跨进程 / 跨机取消（§3 非目标）；
 - 取消的审计报表与长期指标留存（Phase 3 只做最小 metrics/log）。
+
+---
+
+# 17. 与验收判定改造（P0–P3）的交叉影响
+
+《验收判定改造实施SPEC.md》P0–P3 已实施，与本文档有 4 个接触点。
+
+## 17.1 已修：`NEEDS_REVIEW` 必须保持可取消
+
+`TaskState.NEEDS_REVIEW` 现已加入 `is_terminal`。取消派发原本对任何 terminal 态一律拒绝，导致标准入口无法取消 NEEDS_REVIEW 任务。已放行（其余终态仍拒绝）：
+
+```python
+if task.state.is_terminal and task.state is not TaskState.NEEDS_REVIEW:
+    raise InvalidTurnState(...)
+```
+
+## 17.2 需同步的本文档位置
+
+| 位置 | 改动 |
+|---|---|
+| §1.1 | `is_terminal` 已改为含 `NEEDS_REVIEW`（行号亦已漂移） |
+| §4.1 / §6.1 | 可取消终态特例：`NEEDS_REVIEW` 允许取消；`SUCCEEDED/FAILED/CANCELLED` 拒绝 |
+| §9 交互矩阵 | 新增：`NEEDS_REVIEW → CANCELLED` 允许；`NEEDS_REVIEW → INTERRUPTED` 不允许 |
+| §15 | "不新增状态枚举"限定为"不新增**取消**状态枚举"；`NEEDS_REVIEW` 由验收判定改造引入，与本 spec 正交 |
+
+## 17.3 待决策：取消路径需统一
+
+取消实现合入后，会同时存在两条取消路径：`CancelTaskInput`（本文档正统路径）与 `resolve_needs_review("cancel")`（验收判定 P3 产物，直接 commit）。建议后者复用 `transition_task(CANCELLED)`，维持 §5 的"统一门面"。
+
+Phase 1 还需补一处：现有 `transition_task` 写 `task.state_changed` 时不带 `intent`，按 D7-b 需在 cancel 直连 `CANCELLED` 的那条事件上补 `intent="cancel"`。
+
+## 17.4 实施顺序
+
+取消改动与 P0–P3 无代码冲突（`git apply --check` 已验证可干净应用）。建议先合入取消改动，再实现本文档 Phase 0/1。

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -10,13 +11,14 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import (
     HTMLResponse, JSONResponse, Response, StreamingResponse,
 )
 
 from tsm_agt.core import (
     AgentLoopLimitExceeded, ApprovalDecision, RuntimeInputIntent,
+    note_stream_released,
 )
 from tsm_agt.local_api import LocalEventApiServer
 from tsm_agt.ports import ImageBlock
@@ -97,7 +99,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .trace-dot.running{background:#1677ff}.trace-dot.waiting{background:#faad14}.trace-dot.done{background:#52c41a}.trace-dot.failed{background:#ff4d4f}
 .message{display:flex;flex-direction:column;position:relative;max-width:min(920px,100%);word-break:break-word;gap:8px}
 .message.assistant{align-self:flex-start;width:100%;padding:18px 8px 22px;background:linear-gradient(180deg,rgba(255,255,255,.72),rgba(248,250,252,.58));border:none;border-radius:0;box-shadow:none}
-.message.user{display:inline-flex;align-self:flex-end !important;margin-left:auto !important;margin-right:0 !important;width:fit-content;max-width:min(720px,calc(100% - 24px));background:transparent;color:#334155;border:none !important;outline:none !important;box-shadow:none !important;border-radius:16px;padding:12px 14px;text-align:left}
+.message.user{display:inline-flex;align-self:flex-end !important;margin-left:auto !important;margin-right:0 !important;width:fit-content;max-width:min(720px,calc(100% - 24px));background:#f3f4f6;color:#334155;border:none !important;outline:none !important;box-shadow:none !important;border-radius:16px;padding:12px 14px;text-align:left}
 .message-body{width:min(88ch,100%);margin:0 auto;white-space:normal;font-size:15px;line-height:1.68;letter-spacing:-.003em;color:var(--text);font-family:Inter,"SF Pro Display","Segoe UI",sans-serif}
 .message-body > *:first-child{margin-top:0}
 .message-body > *:last-child{margin-bottom:0}
@@ -138,7 +140,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .message-images{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
 .message-images img{width:56px;height:56px;object-fit:cover;border-radius:10px;display:block;cursor:zoom-in;border:1px solid #dbe5f0}
 .message.user,.message.assistant{position:relative;display:flex;flex-direction:column;gap:8px;padding:12px 14px;border-radius:14px;box-shadow:none;backdrop-filter:none}
-.message.user{justify-content:flex-end;align-self:flex-end !important;margin-left:auto !important;margin-right:0 !important;background:transparent;border:none !important;outline:none !important;box-shadow:none !important;border-bottom-right-radius:8px;color:#334155;text-align:left}
+.message.user{justify-content:flex-end;align-self:flex-end !important;margin-left:auto !important;margin-right:0 !important;background:#f3f4f6;border:none !important;outline:none !important;box-shadow:none !important;border-bottom-right-radius:8px;color:#334155;text-align:left}
 .message.assistant{align-self:flex-start;background:#ffffff;border:1px solid var(--border);border-bottom-left-radius:8px;color:#1f2937;width:100%}
 .message-role{display:flex;align-items:center;gap:8px;font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#64748b}
 .message-role::before{content:'';width:8px;height:8px;border-radius:999px;background:currentColor;opacity:.85}
@@ -291,19 +293,20 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .empty-state h2{margin:0;font-size:15px;font-weight:500;color:var(--text)}
 .link-btn{color:var(--accent)}
 .composer{padding:8px 20px 10px;display:flex;flex-direction:column;gap:6px;background:#f7f9fc;border-top:1px solid #e2e8f0}
-.composer-box{border:1px solid #dbe3ee;border-radius:16px;padding:10px 12px;background:#ffffff;box-shadow:none}
+.composer-box{border:none;border-radius:16px;padding:10px 12px;background:#f3f4f6;box-shadow:none}
 .composer-box:focus-within{border-color:#91caff;box-shadow:0 0 0 2px rgba(22,119,255,.08)}
 .composer-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
 .composer-title{font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#94a3b8}
 .composer-hint{font-size:11px;color:var(--muted);white-space:nowrap;display:flex;align-items:center;min-height:36px}
 .composer-input-row{display:flex;align-items:center;gap:10px;min-width:0}
 .textarea-wrap{flex:1;min-width:0;display:flex;align-items:center}
-textarea{width:100%;min-height:48px;max-height:140px;background:#ffffff;border:1px solid #e2e8f0;color:#0f172a;font:inherit;font-size:14px;line-height:1.45;resize:none;outline:none;padding:10px 12px;border-radius:12px;transition:border-color .2s ease,background .2s ease,box-shadow .2s ease}
+textarea{width:100%;min-height:48px;max-height:140px;background:#f3f4f6;border:none;color:#0f172a;font:inherit;font-size:14px;line-height:1.45;resize:none;outline:none;padding:10px 12px;border-radius:12px;transition:background .2s ease,box-shadow .2s ease}
 textarea:focus{border-color:#91caff;background:#ffffff;box-shadow:0 0 0 3px rgba(22,119,255,.08)}
 textarea::placeholder{color:#94a3b8}
 .composer-actions{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-shrink:0;min-height:48px}
-.send-btn{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:linear-gradient(135deg,#4096ff,#1677ff);color:#fff;padding:9px 16px;border-radius:999px;font-weight:600;letter-spacing:.01em;box-shadow:0 6px 14px rgba(22,119,255,.16)}
-.send-btn:disabled{background:#3a4560}
+.send-btn{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:linear-gradient(135deg,#4096ff,#1677ff);color:#fff;padding:9px 16px;border-radius:999px;font-weight:600;letter-spacing:.01em;box-shadow:0 6px 14px rgba(22,119,255,.16);transition:background .2s ease,box-shadow .2s ease}
+.send-btn.cancel-state{background:linear-gradient(135deg,#ff7875,#cf1322);box-shadow:0 6px 14px rgba(207,19,34,.24)}
+.send-btn:disabled{background:#3a4560;box-shadow:none;cursor:not-allowed}
 .preview-list{display:flex;gap:8px;overflow:auto}
 .preview-item{position:relative;flex:none}
 .preview-item img{width:40px;height:40px;object-fit:cover;border-radius:6px;display:block;border:1px solid var(--border);cursor:pointer;transition:transform .16s ease,box-shadow .16s ease}
@@ -401,7 +404,7 @@ textarea::placeholder{color:#94a3b8}
           <div class=\"composer-actions\">
             <button class=\"icon-btn\" onclick=\"document.getElementById('image-input').click()\" title=\"上传图片\">＋ 图片</button>
             <input id=\"image-input\" type=\"file\" accept=\"image/*\" multiple onchange=\"handleImages(event)\" style=\"display:none\" />
-            <button class=\"send-btn\" onclick=\"runTask()\">发送</button>
+            <button id=\"send-btn\" class=\"send-btn\" onclick=\"handleComposerAction()\">发送</button>
           </div>
         </div>
       </div>
@@ -510,6 +513,33 @@ function getActiveWorkspace() {
   return workspaces.find((item) => item.id === activeWorkspaceId);
 }
 
+function updateComposerButtonState() {
+  const button = document.getElementById('send-btn');
+  if (!button) return;
+
+  const runningTask = conversations
+    .flatMap((conversation) => conversation.messages || [])
+    .find((message) => {
+      const task = message.task;
+      return task && !TERMINAL_STATES.includes(task.phase1State);
+    });
+
+  if (runningTask?.task?.taskId) {
+    button.textContent = '取消';
+    button.classList.add('cancel-state');
+    button.dataset.mode = 'cancel';
+    button.dataset.taskId = runningTask.task.taskId;
+    button.disabled = false;
+    return;
+  }
+
+  button.textContent = '发送';
+  button.classList.remove('cancel-state');
+  button.dataset.mode = 'send';
+  button.dataset.taskId = '';
+  button.disabled = !getActiveWorkspace();
+}
+
 function updateWorkspaceState() {
   const activeWorkspace = getActiveWorkspace();
   const disabled = !activeWorkspace;
@@ -517,7 +547,7 @@ function updateWorkspaceState() {
   document.getElementById('new-conversation-btn').disabled = disabled;
   document.getElementById('prompt').disabled = disabled;
   document.getElementById('image-input').disabled = disabled;
-  document.querySelector('.send-btn').disabled = disabled;
+  updateComposerButtonState();
   document.getElementById('workspace-status').textContent = activeWorkspace
     ? activeWorkspace.name
     : '';
@@ -703,6 +733,7 @@ function extractVisibleFollowUpRequest(content) {
 
 const toolCallCollapseState = new Map();
 const diffCollapseState = new Map();
+const taskDetailCollapseState = new Map();
 
 function buildStableCollapseKey(prefix, content) {
   const normalized = String(content || '').slice(0, 600);
@@ -1143,6 +1174,7 @@ function taskStateClass(task) {
   if (state === 'completed' || state === 'DONE') return 'done';
   if (state === 'failed' || state === 'cancelled' || state === 'FAILED' || state === 'CANCELLED') return 'failed';
   if (state === 'waiting' || state === 'interrupted' || state === 'WAITING' || state === 'INTERRUPTED') return 'waiting';
+  if (state === 'needs_review' || state === 'NEEDS_REVIEW') return 'waiting';
   return 'running';
 }
 
@@ -1154,7 +1186,7 @@ function applyTaskProjection(task, projection) {
   task.phase1State = {
     pending: 'PREPARING', running: 'RUNNING', waiting: 'WAITING',
     interrupted: 'INTERRUPTED', failed: 'FAILED',
-    cancelled: 'CANCELLED', completed: 'DONE',
+    cancelled: 'CANCELLED', completed: 'DONE', needs_review: 'NEEDS_REVIEW',
   }[display] || task.phase1State;
   task.status = {
     waiting_approval: 'awaiting_approval',
@@ -1207,7 +1239,7 @@ function taskDisplayLabel(task) {
       pending: '准备中', running: '执行中', waiting: (
         projection.execution_status === 'waiting_approval' ? '等待授权' : '等待输入'
       ), interrupted: '已中断', failed: '已失败',
-      cancelled: '已取消', completed: '已完成',
+      cancelled: '已取消', completed: '已完成', needs_review: '待人工复核',
     }[projection.display_status] || projection.display_status;
   }
   if (task?.phase1State === 'WAITING') return taskWaitingLabel(task);
@@ -1602,14 +1634,21 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
     return panel.scrollHeight > 260 || panel.childElementCount > 8;
   });
 
-  collapsibleSections.forEach((panel) => {
-    panel.classList.add('collapsed');
+  collapsibleSections.forEach((panel, index) => {
+    const collapseKey = `${task.taskId || 'task'}-${mode}-${panel.className}-${index}`;
+    const isCollapsed = taskDetailCollapseState.has(collapseKey)
+      ? taskDetailCollapseState.get(collapseKey)
+      : true;
+
+    panel.classList.toggle('collapsed', isCollapsed);
+
     const toggle = document.createElement('button');
     toggle.type = 'button';
     toggle.className = 'task-collapse-toggle';
-    toggle.textContent = '展开详情';
+    toggle.textContent = isCollapsed ? '展开详情' : '收起详情';
     toggle.addEventListener('click', () => {
       const collapsed = panel.classList.toggle('collapsed');
+      taskDetailCollapseState.set(collapseKey, collapsed);
       toggle.textContent = collapsed ? '展开详情' : '收起详情';
     });
     card.appendChild(toggle);
@@ -1635,6 +1674,30 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
     waiting.className = 'task-progress-line';
     waiting.textContent = task.waiting.question || '该任务正在等待你的输入。';
     card.appendChild(waiting);
+    // Ordinary chat text is refused while a Task awaits the user, so a
+    // CONTINUATION boundary needs its own explicit channel.
+    if (task.waiting.kind === 'CONTINUATION') {
+      const actions = document.createElement('div');
+      actions.className = 'approval-actions';
+      const resume = document.createElement('button');
+      resume.className = 'approval-btn approve';
+      resume.textContent = '继续';
+      resume.onclick = () => resumeContinuation(task.taskId, conversationId);
+      actions.appendChild(resume);
+      card.appendChild(actions);
+    }
+  }
+  // Optional cancel affordance for any non-terminal Task (spec §8).
+  if (['running', 'awaiting_approval', 'awaiting_user', 'interrupted']
+      .includes(task.status)) {
+    const actions = document.createElement('div');
+    actions.className = 'approval-actions';
+    const cancel = document.createElement('button');
+    cancel.className = 'approval-btn deny';
+    cancel.textContent = '取消任务';
+    cancel.onclick = () => cancelTask(task.taskId, conversationId);
+    actions.appendChild(cancel);
+    card.appendChild(actions);
   }
   element.appendChild(card);
 }
@@ -1773,6 +1836,50 @@ function renderApprovalCard(element, message) {
     actions.appendChild(deny);
   }
   element.appendChild(actions);
+}
+
+async function resumeContinuation(taskId, conversationId) {
+  clearError();
+  try {
+    const response = await fetch(`/tasks/${taskId}/resume`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command_id: crypto.randomUUID() }),
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      throw new Error(detail.detail || `继续失败，状态码 ${response.status}`);
+    }
+  } catch (error) {
+    console.error(error);
+    showError(error.message || '继续任务失败。');
+    return;
+  }
+  const card = taskMessage(conversationId || activeConversationId, taskId);
+  if (card) card.task.waiting = null;
+  renderMessages();
+  setLoading(true);
+  followTask(taskId, conversationId || activeConversationId);
+}
+
+async function cancelTask(taskId, conversationId) {
+  clearError();
+  try {
+    const response = await fetch(`/tasks/${taskId}/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command_id: crypto.randomUUID() }),
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      throw new Error(detail.detail || `取消失败，状态码 ${response.status}`);
+    }
+  } catch (error) {
+    console.error(error);
+    showError(error.message || '取消任务失败。');
+    return;
+  }
+  followTask(taskId, conversationId || activeConversationId);
 }
 
 async function decideApproval(message, decision) {
@@ -2089,6 +2196,41 @@ function describeProgress(progress) {
   return progress.activity || '';
 }
 
+async function handleComposerAction() {
+  const button = document.getElementById('send-btn');
+  if (button?.dataset.mode === 'cancel') {
+    await cancelRunningTask(button.dataset.taskId);
+    return;
+  }
+
+  await runTask();
+}
+
+async function cancelRunningTask(taskId) {
+  clearError();
+  if (!taskId) {
+    showError('当前没有可取消的任务。');
+    return;
+  }
+
+  try {
+    const response = await fetch(`/tasks/${taskId}/stop`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+
+    if (!response.ok) {
+      throw new Error(`取消任务失败，状态码 ${response.status}`);
+    }
+
+    updateComposerButtonState();
+  } catch (error) {
+    console.error(error);
+    showError(error.message || '取消任务时发生未知错误。');
+  }
+}
+
 async function runTask() {
   clearError();
   if (!activeWorkspaceId) {
@@ -2102,7 +2244,7 @@ async function runTask() {
   const promptElement = document.getElementById('prompt');
   const prompt = promptElement.value.trim();
   if (!prompt) {
-    showError('请输入内容后再发送。');
+    showError('请输入描述');
     return;
   }
 
@@ -2121,6 +2263,7 @@ async function runTask() {
   selectedImages.length = 0;
   renderPreviews();
   setLoading(true);
+  updateComposerButtonState();
   const requestId = crypto.randomUUID();
   try {
     const response = await fetch('/session-input', {
@@ -2170,6 +2313,7 @@ async function runTask() {
     if (TERMINAL_STATES.includes(task.phase1_state)) {
       renderFinalResult(task.task_id, task, conversationId);
       setLoading(false);
+      updateComposerButtonState();
     } else if (
       task.phase1_state === 'WAITING'
       || task.status === 'awaiting_user'
@@ -2178,23 +2322,26 @@ async function runTask() {
       appendTaskAssistantText(task.task_id, task.assistant_text, conversationId);
       if (card) card.task.waiting = card.task.waiting || { kind: 'INPUT' };
       setLoading(false);
+      updateComposerButtonState();
       renderMessages();
     } else {
       followTask(task.task_id, conversationId);
+      updateComposerButtonState();
     }
   } catch (error) {
     console.error(error);
     showError(error.message || '发送消息时发生未知错误。');
     setLoading(false);
+    updateComposerButtonState();
   }
 }
 
 const 状态文案 = {
   PREPARING: '准备中', RUNNING: '执行中', WAITING: '等待操作',
   INTERRUPTED: '已中断', DONE: '已完成', FAILED: '已失败',
-  CANCELLED: '已取消',
+  CANCELLED: '已取消', NEEDS_REVIEW: '待人工复核',
 };
-const TERMINAL_STATES = ['DONE', 'FAILED', 'CANCELLED'];
+const TERMINAL_STATES = ['DONE', 'FAILED', 'CANCELLED', 'NEEDS_REVIEW'];
 const MAX_STREAM_RETRIES = 6;
 const followers = new Map();
 
@@ -2230,6 +2377,7 @@ function renderFinalResult(taskId, state, conversationId) {
     card.task.status = state.status || card.task.status;
     card.task.waiting = null;
   }
+  updateComposerButtonState();
   if (state.assistant_text) {
     appendTaskAssistantText(taskId, state.assistant_text, conversationId);
   } else if (state.clarification?.question) {
@@ -3014,6 +3162,17 @@ async def submit_session_input(payload: dict) -> dict:
     return JSONResponse(content=data, status_code=status)
 
 
+def _cancel_on_disconnect() -> bool:
+    """Spec D3: by default a disconnect only releases the stream.
+
+    Setting ``TSM_AGT_CANCEL_ON_DISCONNECT`` turns a disconnect into a cancel,
+    which trades a durable session for a volatile one; it is opt-in.
+    """
+    return os.environ.get(
+        "TSM_AGT_CANCEL_ON_DISCONNECT", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _explicit_user_input_intent(raw: object) -> RuntimeInputIntent | None:
     """Map a client's explicit command onto one unified entry intent."""
     if raw is None:
@@ -3055,6 +3214,82 @@ async def stop_task(task_id: str, payload: dict | None = None) -> dict:
 
     try:
         data = runtime_server._call(stop())
+    except (LookupError, ValueError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return dict(data)
+
+
+@app.post("/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str, payload: dict | None = None) -> dict:
+    """Cancel one Task (terminal) through the SDK cancel command."""
+    if runtime_server is None:
+        raise HTTPException(
+            status_code=503, detail=runtime_error or "runtime unavailable"
+        )
+    body = payload or {}
+    command_id = str(body.get("command_id", "")).strip() or f"web-cancel-{task_id}"
+    reason = str(body.get("reason", "")).strip() or "cancelled from the web UI"
+
+    async def cancel() -> Mapping[str, Any]:
+        result = await runtime_server._client.cancel(
+            task_id, command_id=command_id, reason=reason,
+        )
+        return dict(result.result)
+
+    try:
+        data = runtime_server._call(cancel())
+    except (LookupError, ValueError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return dict(data)
+
+
+@app.post("/tasks/{task_id}/resume")
+async def resume_task(task_id: str, payload: dict | None = None) -> JSONResponse:
+    """Resume a Task suspended at a CONTINUATION boundary.
+
+    Ordinary chat text is refused while a Task awaits the user, so this is the
+    structured channel the wait banner points at. The continuation runs as
+    Runtime work rather than inside this request.
+    """
+    if runtime_server is None:
+        raise HTTPException(
+            status_code=503, detail=runtime_error or "runtime unavailable"
+        )
+    body = payload or {}
+    command_id = str(body.get("command_id", "")).strip() or f"web-resume-{task_id}"
+    text = str(body.get("text", "")).strip() or "继续"
+    runtime_server.submit_background(
+        runtime_server._client.resume_continuation(
+            task_id, command_id=command_id, text=text,
+        )
+    )
+    return JSONResponse(
+        content={"accepted": True, "task_id": task_id}, status_code=202,
+    )
+
+
+@app.post("/tasks/{task_id}/review")
+async def review_task(task_id: str, payload: dict) -> dict:
+    """Resolve a NEEDS_REVIEW Task with an explicit human decision."""
+    if runtime_server is None:
+        raise HTTPException(
+            status_code=503, detail=runtime_error or "runtime unavailable"
+        )
+    decision = str(payload.get("decision", "")).strip().lower()
+    reason = str(payload.get("reason", "")).strip()
+    if decision not in {"accept", "return_for_revision", "cancel"}:
+        raise HTTPException(
+            status_code=400,
+            detail="decision must be accept, return_for_revision, or cancel",
+        )
+    async def resolve() -> Mapping[str, Any]:
+        task = await runtime_server._client.application.kernel.resolve_needs_review(
+            task_id, decision, reason=reason,
+        )
+        return {"task_id": task.task_id, "state": task.state.value}
+
+    try:
+        data = runtime_server._call(resolve())
     except (LookupError, ValueError) as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     return dict(data)
@@ -3367,7 +3602,9 @@ def _task_failure_reason(task_id: str) -> str | None:
 
 
 @app.get("/stream/{task_id}")
-async def stream(task_id: str, after: int = 0):
+async def stream(
+    task_id: str, after: int = 0, request: Request = None,  # type: ignore[assignment]
+):
     if runtime_server is None:
         raise HTTPException(
             status_code=503,
@@ -3380,6 +3617,17 @@ async def stream(task_id: str, after: int = 0):
         cursor = after
         announced_wait: str | None = None
         while True:
+            # Spec D6: check the connection before every yield. A disconnect
+            # always releases this stream; it only cancels the Task when
+            # explicitly configured, because durable sessions are the point.
+            if request is not None and await request.is_disconnected():
+                note_stream_released(task_id)
+                if _cancel_on_disconnect():
+                    await runtime_server._client.cancel(
+                        task_id, command_id=f"disconnect-{task_id}",
+                        reason="client disconnected",
+                    )
+                return
             items = runtime_server._client.read_progress(task_id, after=cursor)
             for item in items:
                 cursor = max(cursor, item.sequence)

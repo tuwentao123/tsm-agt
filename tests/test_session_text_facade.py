@@ -149,8 +149,9 @@ class SessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
             )
             task_id = result.result["task"]["task_id"]
             task = await kernel.get_task(task_id)
-            # The goal still carries the bounded handoff the Agent needs.
-            self.assertTrue(task.goal.startswith("[session-follow-up]"))
+            # INV-9: the goal is the user's own request; source facts live in
+            # the separate, non-authoritative handoff block.
+            self.assertEqual(task.goal, "那继续验证啊")
 
             projection = await kernel.get_session_conversation(session.session_id)
             derived = [
@@ -280,8 +281,16 @@ class SessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(created.payload["source_task_id"], source.task_id)
             self.assertEqual(created.payload["task_relation"], "FOLLOW_UP")
-            self.assertIn("continue and push now", created.payload["goal"])
-            self.assertIn(source.task_id, created.payload["goal"])
+            self.assertEqual(created.payload["goal"], "continue and push now")
+            # The source is named only in the non-authoritative handoff.
+            self.assertNotIn(source.task_id, created.payload["goal"])
+            self.assertEqual(
+                created.payload["context_handoff"]["task_id"], source.task_id
+            )
+            self.assertEqual(
+                created.payload["context_handoff"]["authority"],
+                "SCOPED_BACKGROUND",
+            )
             original = await kernel.get_task(source.task_id)
             self.assertEqual(original.state, TaskState.SUCCEEDED)
             self.assertIsNone(original.active_agent_checkpoint)

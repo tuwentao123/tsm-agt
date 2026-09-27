@@ -101,6 +101,7 @@ class HttpJsonTransport(Protocol):
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_seconds: float,
+        cancellation_scope: object | None = None,
     ) -> AsyncIterator[str]: ...
 
 
@@ -124,6 +125,7 @@ class UrllibHttpJsonTransport:
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_seconds: float,
+        cancellation_scope: object | None = None,
     ) -> AsyncIterator[str]:
         request = Request(
             url,
@@ -138,6 +140,12 @@ class UrllibHttpJsonTransport:
         loop = asyncio.get_running_loop()
         items: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
         stopped = threading.Event()
+        # Register the cooperative stop signal with the Task's in-process scope
+        # (task-cancellation-spec §8). The scope only signals; it never joins.
+        if cancellation_scope is not None:
+            register = getattr(cancellation_scope, "register_thread", None)
+            if register is not None:
+                register(stopped, name="model-stream")
         response_lock = threading.Lock()
         response_holder: list[Any] = []
 
@@ -473,6 +481,7 @@ class OpenAICompatibleModelProvider:
             {"Authorization": f"Bearer {self._api_key}"},
             payload,
             self._timeout_seconds,
+            cancellation_scope=getattr(request, "cancellation_scope", None),
         ):
             if data == "[DONE]":
                 saw_done = True
