@@ -8,13 +8,37 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
+MODEL_PROTOCOL_OPEN = "open"
+MODEL_PROTOCOL_ANTHROPIC = "anthropic"
+MODEL_PROTOCOLS = frozenset({
+    MODEL_PROTOCOL_OPEN,
+    MODEL_PROTOCOL_ANTHROPIC,
+})
+
+MODEL_BASE_URL_ENV_NAME = "TSM_AGT_MODEL_BASE_URL"
+# The selector determines both the active model variable and the wire provider.
+MODEL_SELECTOR_ENV_NAME = "TSM_AGT_MODEL"
+MODEL_OPEN_MODEL_ENV_NAME = "TSM_AGT_OPEN_MODEL"
+MODEL_ANTHROPIC_MODEL_ENV_NAME = "TSM_AGT_ANTHROPIC_MODEL"
+
 MODEL_ENV_NAMES = (
-    "TSM_AGT_MODEL_BASE_URL",
-    "TSM_AGT_MODEL",
+    MODEL_BASE_URL_ENV_NAME,
+    MODEL_SELECTOR_ENV_NAME,
+    MODEL_OPEN_MODEL_ENV_NAME,
     "TSM_AGT_MODEL_API_KEY",
+)
+MODEL_COMMON_ENV_NAMES = (
+    MODEL_BASE_URL_ENV_NAME,
+    MODEL_SELECTOR_ENV_NAME,
+    "TSM_AGT_MODEL_API_KEY",
+)
+MODEL_MODEL_ENV_NAMES = (
+    MODEL_OPEN_MODEL_ENV_NAME,
+    MODEL_ANTHROPIC_MODEL_ENV_NAME,
 )
 
 MODEL_OPTIONAL_ENV_NAMES = (
+    "TSM_AGT_ANTHROPIC_VERSION",
     "TSM_AGT_MODEL_TIMEOUT_SECONDS",
     "TSM_AGT_MODEL_MAX_RETRIES",
     "TSM_AGT_MODEL_RETRY_BACKOFF_SECONDS",
@@ -22,13 +46,26 @@ MODEL_OPTIONAL_ENV_NAMES = (
     "TSM_AGT_MODEL_STRICT_TOOL_SCHEMA",
     "TSM_AGT_MODEL_STREAMING",
 )
-MODEL_SUPPORTED_ENV_NAMES = MODEL_ENV_NAMES + MODEL_OPTIONAL_ENV_NAMES
+MODEL_SUPPORTED_ENV_NAMES = (
+    MODEL_COMMON_ENV_NAMES + MODEL_MODEL_ENV_NAMES + MODEL_OPTIONAL_ENV_NAMES
+)
+
+# Keep this import name for composition callers while exposing a two-mode
+# configuration surface. The native Messages adapter is selected by
+# ``MODEL_PROTOCOL_ANTHROPIC``.
+MODEL_PROTOCOL_ANTHROPIC_MESSAGES = MODEL_PROTOCOL_ANTHROPIC
 
 MODEL_ENV_TEMPLATE = """# tsm-agt model configuration. Keep this file private.
-# Exported TSM_AGT_MODEL_* variables override values in this file.
+# Exported TSM_AGT_* variables override values in this file.
+# Select open (Chat Completions) or anthropic (native Messages API).
+TSM_AGT_MODEL=open
 TSM_AGT_MODEL_BASE_URL=http://127.0.0.1:5580
-TSM_AGT_MODEL=your-model-name
+TSM_AGT_OPEN_MODEL=your-open-model-name
+# Used when TSM_AGT_MODEL=anthropic.
+# TSM_AGT_ANTHROPIC_MODEL=your-anthropic-model-name
 TSM_AGT_MODEL_API_KEY=your-api-key
+# Used only when TSM_AGT_MODEL=anthropic.
+# TSM_AGT_ANTHROPIC_VERSION=2023-06-01
 # TSM_AGT_MODEL_TIMEOUT_SECONDS=180
 # TSM_AGT_MODEL_MAX_RETRIES=2
 # TSM_AGT_MODEL_RETRY_BACKOFF_SECONDS=1
@@ -48,7 +85,8 @@ TSM_AGT_MODEL_API_KEY=your-api-key
 """
 
 _PLACEHOLDER_VALUES = {
-    "TSM_AGT_MODEL": {"your-model-name"},
+    MODEL_OPEN_MODEL_ENV_NAME: {"your-open-model-name"},
+    MODEL_ANTHROPIC_MODEL_ENV_NAME: {"your-anthropic-model-name"},
     "TSM_AGT_MODEL_API_KEY": {"your-api-key"},
 }
 
@@ -84,8 +122,17 @@ class ModelConfiguration:
     max_retries: int = 2
     retry_backoff_seconds: float = 1.0
     output_token_parameter: str = "max_tokens"
+    protocol: str = MODEL_PROTOCOL_OPEN
+    model_env_name: str = MODEL_OPEN_MODEL_ENV_NAME
+    anthropic_version: str = "2023-06-01"
     strict_tool_schema: bool = True
     streaming: bool = True
+
+    @property
+    def effective_output_token_parameter(self) -> str:
+        if self.protocol == MODEL_PROTOCOL_ANTHROPIC:
+            return "max_tokens"
+        return self.output_token_parameter
 
     @property
     def endpoint_origin(self) -> str:
@@ -113,7 +160,7 @@ def endpoint_origin(base_url: str) -> str:
 def load_model_configuration(
     path: Path, environment: Mapping[str, str], *, require_complete: bool = True,
 ) -> ModelConfiguration | None:
-    """Load the three supported settings without mutating the process environment."""
+    """Load the selected protocol model without mutating the process environment."""
 
     env_file = path.expanduser().resolve()
     file_values = _read_model_env_file(env_file)
@@ -131,15 +178,45 @@ def load_model_configuration(
         else:
             values[name] = ""
 
-    missing = tuple(
-        name for name in MODEL_ENV_NAMES
-        if not values[name] or values[name] in _PLACEHOLDER_VALUES.get(name, set())
-    )
+    selector = values[MODEL_SELECTOR_ENV_NAME]
+    if selector in MODEL_PROTOCOLS:
+        protocol = selector
+        model_env_name = (
+            MODEL_ANTHROPIC_MODEL_ENV_NAME
+            if protocol == MODEL_PROTOCOL_ANTHROPIC
+            else MODEL_OPEN_MODEL_ENV_NAME
+        )
+        model = values[model_env_name]
+    elif values[MODEL_OPEN_MODEL_ENV_NAME] or values[MODEL_ANTHROPIC_MODEL_ENV_NAME]:
+        raise ValueError("TSM_AGT_MODEL must be 'open' or 'anthropic'")
+    else:
+        # Migration fallback for existing private configuration files where
+        # TSM_AGT_MODEL contained the OpenAI-compatible model name.
+        protocol = MODEL_PROTOCOL_OPEN
+        model_env_name = MODEL_SELECTOR_ENV_NAME
+        model = selector
+
+    missing_names: list[str] = []
+    if not values[MODEL_BASE_URL_ENV_NAME]:
+        missing_names.append(MODEL_BASE_URL_ENV_NAME)
+    if selector in MODEL_PROTOCOLS:
+        if (
+            not model
+            or model in _PLACEHOLDER_VALUES.get(model_env_name, set())
+        ):
+            missing_names.append(model_env_name)
+    elif not selector:
+        missing_names.append(MODEL_SELECTOR_ENV_NAME)
+    if not values["TSM_AGT_MODEL_API_KEY"] or values[
+        "TSM_AGT_MODEL_API_KEY"
+    ] in _PLACEHOLDER_VALUES["TSM_AGT_MODEL_API_KEY"]:
+        missing_names.append("TSM_AGT_MODEL_API_KEY")
+    missing = tuple(missing_names)
     if missing:
         if require_complete:
             raise ModelConfigurationError(missing, env_file)
         return None
-    endpoint_origin(values["TSM_AGT_MODEL_BASE_URL"])
+    endpoint_origin(values[MODEL_BASE_URL_ENV_NAME])
     try:
         timeout_seconds = float(
             values["TSM_AGT_MODEL_TIMEOUT_SECONDS"] or "180"
@@ -168,6 +245,9 @@ def load_model_configuration(
             "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER must be 'max_tokens' or "
             "'max_completion_tokens'"
         )
+    anthropic_version = values["TSM_AGT_ANTHROPIC_VERSION"] or "2023-06-01"
+    if not anthropic_version:
+        raise ValueError("TSM_AGT_ANTHROPIC_VERSION must not be empty")
     raw_strict_tool_schema = (
         values["TSM_AGT_MODEL_STRICT_TOOL_SCHEMA"] or "true"
     ).casefold()
@@ -178,11 +258,10 @@ def load_model_configuration(
     raw_streaming = (values["TSM_AGT_MODEL_STREAMING"] or "true").casefold()
     if raw_streaming not in {"true", "false"}:
         raise ValueError(
-            "TSM_AGT_MODEL_STREAMING must be 'true' or 'false'"
-        )
+            "TSM_AGT_MODEL_STREAMING must be 'true' or 'false'")
     return ModelConfiguration(
-        base_url=values["TSM_AGT_MODEL_BASE_URL"],
-        model=values["TSM_AGT_MODEL"],
+        base_url=values[MODEL_BASE_URL_ENV_NAME],
+        model=model,
         api_key=values["TSM_AGT_MODEL_API_KEY"],
         sources=sources,
         env_file=env_file,
@@ -190,6 +269,9 @@ def load_model_configuration(
         max_retries=max_retries,
         retry_backoff_seconds=retry_backoff_seconds,
         output_token_parameter=output_token_parameter,
+        protocol=protocol,
+        model_env_name=model_env_name,
+        anthropic_version=anthropic_version,
         strict_tool_schema=(raw_strict_tool_schema == "true"),
         streaming=(raw_streaming == "true"),
     )
@@ -211,22 +293,26 @@ def model_configuration_sources(
 ) -> dict[str, str]:
     return {
         "model.provider": "composition",
-        "model.endpoint_origin": configuration.sources[
-            "TSM_AGT_MODEL_BASE_URL"
-        ],
-        "model.model": configuration.sources["TSM_AGT_MODEL"],
+        "model.endpoint_origin": configuration.sources[MODEL_BASE_URL_ENV_NAME],
+        "model.model": configuration.sources[configuration.model_env_name],
         "model.credentials_configured": configuration.sources[
             "TSM_AGT_MODEL_API_KEY"
         ],
         "model.output_token_parameter": configuration.sources.get(
             "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER", "default"
-        ),
+        ) or "default",
+        "model.protocol": configuration.sources.get(
+            MODEL_SELECTOR_ENV_NAME, "default"
+        ) or "default",
+        "model.anthropic_version": configuration.sources.get(
+            "TSM_AGT_ANTHROPIC_VERSION", "default"
+        ) or "default",
         "model.strict_tool_schema": configuration.sources.get(
             "TSM_AGT_MODEL_STRICT_TOOL_SCHEMA", "default"
-        ),
+        ) or "default",
         "model.streaming": configuration.sources.get(
             "TSM_AGT_MODEL_STREAMING", "default"
-        ),
+        ) or "default",
     }
 
 

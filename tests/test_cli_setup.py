@@ -18,10 +18,11 @@ from tsm_agt.cli_setup import initialize_workspace, run_doctor
 
 
 COMPLETE_ENV = {
+    "TSM_AGT_MODEL": "open",
     "TSM_AGT_MODEL_BASE_URL": (
         "https://user:password@models.example.test:8443/v1?token=hidden"
     ),
-    "TSM_AGT_MODEL": "test-model",
+    "TSM_AGT_OPEN_MODEL": "test-model",
     "TSM_AGT_MODEL_API_KEY": "sk-doctor-secret",
 }
 
@@ -69,7 +70,11 @@ class FirstRunSetupTest(unittest.TestCase):
             path = Path(directory) / ".env"
             with self.assertRaises(ModelConfigurationError) as caught:
                 load_model_configuration(
-                    path, {"TSM_AGT_MODEL": "private-model"}
+                    path,
+                    {
+                        "TSM_AGT_MODEL": "open",
+                        "TSM_AGT_OPEN_MODEL": "private-model",
+                    },
                 )
             message = str(caught.exception)
             self.assertIn("tsm-agt init", message)
@@ -85,8 +90,71 @@ class FirstRunSetupTest(unittest.TestCase):
                 load_model_configuration(root / ".env", {})
             self.assertEqual(
                 caught.exception.missing,
-                ("TSM_AGT_MODEL", "TSM_AGT_MODEL_API_KEY"),
+                ("TSM_AGT_OPEN_MODEL", "TSM_AGT_MODEL_API_KEY"),
             )
+
+    def test_model_selector_selects_its_own_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text(
+                "TSM_AGT_MODEL=open\n"
+                "TSM_AGT_MODEL_BASE_URL=https://gateway.example.test/v1\n"
+                "TSM_AGT_OPEN_MODEL=open-model\n"
+                "TSM_AGT_MODEL_API_KEY=secret\n"
+                "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=max_completion_tokens\n",
+                encoding="utf-8",
+            )
+            configuration = load_model_configuration(env_file, {})
+            assert configuration is not None
+            self.assertEqual(configuration.protocol, "open")
+            self.assertEqual(configuration.model, "open-model")
+            self.assertEqual(
+                configuration.effective_output_token_parameter,
+                "max_completion_tokens",
+            )
+            self.assertEqual(
+                configuration.sources["TSM_AGT_OPEN_MODEL"], "env_file"
+            )
+
+            env_file.write_text(
+                "TSM_AGT_MODEL=anthropic\n"
+                "TSM_AGT_MODEL_BASE_URL=https://gateway.example.test/v1\n"
+                "TSM_AGT_ANTHROPIC_MODEL=anthropic-model\n"
+                "TSM_AGT_MODEL_API_KEY=secret\n"
+                "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=max_completion_tokens\n",
+                encoding="utf-8",
+            )
+            configuration = load_model_configuration(env_file, {})
+            assert configuration is not None
+            self.assertEqual(configuration.protocol, "anthropic")
+            self.assertEqual(configuration.model, "anthropic-model")
+            self.assertEqual(configuration.effective_output_token_parameter, "max_tokens")
+            self.assertEqual(
+                configuration.sources["TSM_AGT_ANTHROPIC_MODEL"], "env_file"
+            )
+
+    def test_unknown_model_protocol_and_token_parameter_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text(
+                "TSM_AGT_MODEL=unknown_protocol\n"
+                "TSM_AGT_MODEL_BASE_URL=https://gateway.example.test/v1\n"
+                "TSM_AGT_OPEN_MODEL=test-model\n"
+                "TSM_AGT_MODEL_API_KEY=secret\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "TSM_AGT_MODEL"):
+                load_model_configuration(env_file, {})
+            env_file.write_text(
+                "TSM_AGT_MODEL=open\n"
+                "TSM_AGT_MODEL_BASE_URL=https://gateway.example.test/v1\n"
+                "TSM_AGT_OPEN_MODEL=test-model\n"
+                "TSM_AGT_MODEL_API_KEY=secret\n"
+                "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=token_budget\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "MODEL_OUTPUT_TOKEN_PARAMETER"):
+                load_model_configuration(env_file, {})
 
     def test_cli_version_uses_package_version(self) -> None:
         output = io.StringIO()
@@ -114,7 +182,12 @@ class DoctorTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(configuration["status"], "fail")
             self.assertEqual(
-                configuration["details"]["missing"], list(MODEL_ENV_NAMES)
+                configuration["details"]["missing"],
+                [
+                    "TSM_AGT_MODEL_BASE_URL",
+                    "TSM_AGT_MODEL",
+                    "TSM_AGT_MODEL_API_KEY",
+                ],
             )
             self.assertIn("tsm-agt init", configuration["remedy"])
 

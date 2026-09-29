@@ -7,6 +7,15 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).parents[2] / "src" / "tsm_agt"
 FORBIDDEN_FROM_CORE = ("tsm_agt.adapters", "tsm_agt.extensions")
 
+#: Modules under ``adapters/`` that hold protocol-neutral shared infrastructure
+#: rather than a provider adapter. Any adapter may depend on these. The rule
+#: below exists so provider adapters cannot depend on each *other* (an Anthropic
+#: adapter must not import the OpenAI-compatible package to reuse its HTTP/SSE
+#: plumbing); a shared transport is not a provider adapter.
+SHARED_ADAPTER_MODULES = frozenset({
+    "tsm_agt.adapters.http_json",
+})
+
 
 def imported_modules(path: Path) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -33,9 +42,33 @@ class DependencyArchitectureTest(unittest.TestCase):
         violations: list[str] = []
         for path in (PACKAGE_ROOT / "adapters").rglob("*.py"):
             for module in imported_modules(path):
-                if module.startswith("tsm_agt.adapters"):
-                    violations.append(f"{path.relative_to(PACKAGE_ROOT)} -> {module}")
+                if not module.startswith("tsm_agt.adapters"):
+                    continue
+                if module in SHARED_ADAPTER_MODULES:
+                    continue
+                violations.append(f"{path.relative_to(PACKAGE_ROOT)} -> {module}")
         self.assertEqual(violations, [])
+
+    def test_shared_adapter_modules_are_not_provider_adapters(self) -> None:
+        """The allowlist must never legalise provider-to-provider coupling."""
+        provider_packages = {
+            path.name
+            for path in (PACKAGE_ROOT / "adapters").iterdir()
+            if path.is_dir() and (path / "__init__.py").exists()
+        }
+        for module in SHARED_ADAPTER_MODULES:
+            leaf = module.rsplit(".", 1)[-1]
+            self.assertNotIn(
+                leaf, provider_packages,
+                f"{module} looks like a provider adapter package",
+            )
+
+    def test_anthropic_adapter_does_not_import_the_openai_adapter(self) -> None:
+        """The concrete regression: shared plumbing must not drag in a peer."""
+        path = PACKAGE_ROOT / "adapters" / "anthropic_messages" / "model.py"
+        self.assertNotIn(
+            "tsm_agt.adapters.openai_compatible", imported_modules(path)
+        )
 
     def test_core_does_not_import_platform_lock_modules(self) -> None:
         forbidden = {"ctypes", "fcntl", "msvcrt"}

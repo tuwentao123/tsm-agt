@@ -180,9 +180,15 @@ class EvidenceQuestionProjection:
         current = self.get(question.question_id)
         if current is None:
             updated = EvidenceQuestionRecord(
-                question.question_id, question.question, EvidenceQuestionStatus.OPEN,
-                self.task_id, turn_id, (tool_call_id,), (), None, None, 1,
-                event_sequence, question.expected_scope.strip(),
+                question_id=question.question_id,
+                question=question.question,
+                status=EvidenceQuestionStatus.OPEN,
+                source_task_id=self.task_id,
+                source_turn_id=turn_id,
+                tool_call_ids=(tool_call_id,),
+                revision=1,
+                updated_event_sequence=event_sequence,
+                expected_scope=question.expected_scope.strip(),
             )
             return replace(self, records=self.records + (updated,))
         calls = current.tool_call_ids
@@ -219,15 +225,18 @@ class EvidenceQuestionProjection:
             )
             reason = result.error_code or "TOOL_FAILED"
         else:
-            status = EvidenceQuestionStatus.RESOLVED
             reason = None
             if call.name == "core.read_file":
+                status = EvidenceQuestionStatus.RESOLVED
                 kind = EvidenceObservationKind.ARTIFACT_READ
             elif delta is not None and delta.counts.get("new_exclusions", 0):
+                status = EvidenceQuestionStatus.RESOLVED
                 kind = EvidenceObservationKind.EMPTY_RESULT
             elif delta is not None and delta.total_new:
+                status = EvidenceQuestionStatus.RESOLVED
                 kind = EvidenceObservationKind.NON_EMPTY_RESULT
             else:
+                status = EvidenceQuestionStatus.RESOLVED
                 kind = EvidenceObservationKind.STRUCTURED_RESULT
         refs = list(current.evidence_references)
         call_ref = f"tool_call:{call.call_id}"

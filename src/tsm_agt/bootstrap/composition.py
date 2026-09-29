@@ -60,6 +60,7 @@ from tsm_agt.adapters.rule_based_investigation_flow import (
     RuleBasedInvestigationFlowProjector,
 )
 from tsm_agt.adapters.openai_compatible import OpenAICompatibleModelProvider
+from tsm_agt.adapters.anthropic_messages import AnthropicMessagesModelProvider
 from tsm_agt.adapters.resilient_model import ResilientModelProvider
 from tsm_agt.adapters.rule_based_model_recovery import (
     RuleBasedModelRecoveryPolicy,
@@ -137,7 +138,10 @@ from tsm_agt.ports import (
     RejectionLoopPolicyPort, ExplorationOutcomePolicyPort,
 )
 from .model_configuration import (
-    endpoint_origin, load_model_configuration, model_configuration_sources,
+    MODEL_PROTOCOL_ANTHROPIC_MESSAGES,
+    endpoint_origin,
+    load_model_configuration,
+    model_configuration_sources,
 )
 from .exploration_configuration import (
     ExplorationBudgetConfiguration, load_exploration_budget_configuration,
@@ -176,6 +180,41 @@ def _endpoint_origin(base_url: str) -> str:
     return endpoint_origin(base_url)
 
 
+def _physical_model_provider(
+    *,
+    base_url: str,
+    model: str,
+    api_key: str,
+    protocol: str,
+    anthropic_version: str,
+    timeout_seconds: float,
+    output_token_parameter: str,
+    strict_tool_schema: bool,
+    streaming: bool,
+):
+    """Select the wire adapter while preserving one Kernel model contract."""
+    if protocol == MODEL_PROTOCOL_ANTHROPIC_MESSAGES:
+        return AnthropicMessagesModelProvider(
+            base_url,
+            model,
+            api_key,
+            anthropic_version=anthropic_version,
+            timeout_seconds=timeout_seconds,
+            streaming=streaming,
+        )
+    return OpenAICompatibleModelProvider(
+        base_url,
+        model,
+        api_key,
+        timeout_seconds=timeout_seconds,
+        max_retries=0,
+        retry_backoff_seconds=0,
+        output_token_parameter=output_token_parameter,
+        strict_tool_schema=strict_tool_schema,
+        streaming=streaming,
+    )
+
+
 def _configuration_metadata(
     *, provider: str, model: str, base_url: str | None = None,
     credentials_configured: bool = False,
@@ -186,6 +225,7 @@ def _configuration_metadata(
         CompletionReadinessMode.LEGACY_GATE
     ),
     output_token_parameter: str = "max_tokens",
+    model_protocol: str = "openai_compatible",
     strict_tool_schema: bool = True,
     streaming: bool = True,
 ) -> dict[str, object]:
@@ -194,6 +234,7 @@ def _configuration_metadata(
         "model": model,
         "credentials_configured": credentials_configured,
         "output_token_parameter": output_token_parameter,
+        "protocol": model_protocol,
         "strict_tool_schema": strict_tool_schema,
         "streaming": streaming,
     }
@@ -805,6 +846,8 @@ def compose_openai_compatible_readonly_application(
     model_max_retries: int = 2,
     model_retry_backoff_seconds: float = 1.0,
     model_output_token_parameter: str = "max_tokens",
+    model_protocol: str = "openai_compatible",
+    model_anthropic_version: str = "2023-06-01",
     model_strict_tool_schema: bool = True,
     model_streaming: bool = True,
     context_configuration: ContextConfiguration | None = None,
@@ -821,11 +864,16 @@ def compose_openai_compatible_readonly_application(
     context = context_configuration or ContextConfiguration()
     egress = web_egress_configuration or WebEgressConfiguration()
     search = search_configuration or SearchConfiguration()
-    physical_model = OpenAICompatibleModelProvider(
-        base_url, model, api_key, timeout_seconds=model_timeout_seconds,
-        max_retries=0, retry_backoff_seconds=0,
+    physical_model = _physical_model_provider(
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        protocol=model_protocol,
+        anthropic_version=model_anthropic_version,
+        timeout_seconds=model_timeout_seconds,
         output_token_parameter=model_output_token_parameter,
-        strict_tool_schema=model_strict_tool_schema, streaming=model_streaming,
+        strict_tool_schema=model_strict_tool_schema,
+        streaming=model_streaming,
     )
     recovery_policy = RuleBasedModelRecoveryPolicy(
         model_retry_backoff_seconds
@@ -934,7 +982,12 @@ def compose_openai_compatible_readonly_application(
     registry.register(ToolProviderPort, CoreInteractionToolProvider())
     dependencies = _kernel_dependencies(
         registry, _configuration_metadata(
-            provider="openai-compatible", model=model, base_url=base_url,
+            provider=(
+                "anthropic-messages"
+                if model_protocol == MODEL_PROTOCOL_ANTHROPIC_MESSAGES
+                else "openai-compatible"
+            ),
+            model=model, base_url=base_url,
             credentials_configured=bool(api_key),
             sources=configuration_sources or {
                 "model.provider": "composition",
@@ -946,6 +999,7 @@ def compose_openai_compatible_readonly_application(
             context_configuration=context,
             completion_readiness_mode=completion_readiness_mode,
             output_token_parameter=model_output_token_parameter,
+            model_protocol=model_protocol,
             strict_tool_schema=model_strict_tool_schema,
             streaming=model_streaming,
         ),
@@ -970,6 +1024,8 @@ def compose_openai_compatible_engineering_application(
     model_max_retries: int = 2,
     model_retry_backoff_seconds: float = 1.0,
     model_output_token_parameter: str = "max_tokens",
+    model_protocol: str = "openai_compatible",
+    model_anthropic_version: str = "2023-06-01",
     model_strict_tool_schema: bool = True,
     model_streaming: bool = True,
     context_configuration: ContextConfiguration | None = None,
@@ -987,11 +1043,16 @@ def compose_openai_compatible_engineering_application(
     egress = web_egress_configuration or WebEgressConfiguration()
     search = search_configuration or SearchConfiguration()
     workspace_path = _platform_workspace_path()
-    physical_model = OpenAICompatibleModelProvider(
-        base_url, model, api_key, timeout_seconds=model_timeout_seconds,
-        max_retries=0, retry_backoff_seconds=0,
+    physical_model = _physical_model_provider(
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        protocol=model_protocol,
+        anthropic_version=model_anthropic_version,
+        timeout_seconds=model_timeout_seconds,
         output_token_parameter=model_output_token_parameter,
-        strict_tool_schema=model_strict_tool_schema, streaming=model_streaming,
+        strict_tool_schema=model_strict_tool_schema,
+        streaming=model_streaming,
     )
     recovery_policy = RuleBasedModelRecoveryPolicy(
         model_retry_backoff_seconds
@@ -1100,7 +1161,12 @@ def compose_openai_compatible_engineering_application(
     registry.register(ToolProviderPort, CoreInteractionToolProvider())
     dependencies = _kernel_dependencies(
         registry, _configuration_metadata(
-            provider="openai-compatible", model=model, base_url=base_url,
+            provider=(
+                "anthropic-messages"
+                if model_protocol == MODEL_PROTOCOL_ANTHROPIC_MESSAGES
+                else "openai-compatible"
+            ),
+            model=model, base_url=base_url,
             credentials_configured=bool(api_key),
             sources=configuration_sources or {
                 "model.provider": "composition",
@@ -1112,6 +1178,7 @@ def compose_openai_compatible_engineering_application(
             context_configuration=context,
             completion_readiness_mode=completion_readiness_mode,
             output_token_parameter=model_output_token_parameter,
+            model_protocol=model_protocol,
             strict_tool_schema=model_strict_tool_schema,
             streaming=model_streaming,
         ),
@@ -1132,16 +1199,9 @@ def compose_openai_compatible_readonly_application_from_env(
 ) -> Application:
     """Load optional .env, then read the three explicit TSM_AGT_* variables."""
 
-    configuration = load_model_configuration(
-        env_file or Path.cwd() / ".env", os.environ
-    )
+    selected_env_file = env_file or Path.cwd() / ".env"
+    configuration = load_model_configuration(selected_env_file, os.environ)
     assert configuration is not None
-    for name, value in (
-        ("TSM_AGT_MODEL_BASE_URL", configuration.base_url),
-        ("TSM_AGT_MODEL", configuration.model),
-        ("TSM_AGT_MODEL_API_KEY", configuration.api_key),
-    ):
-        os.environ.setdefault(name, value)
     budget = load_exploration_budget_configuration(
         env_file or Path.cwd() / ".env", os.environ
     )
@@ -1165,7 +1225,11 @@ def compose_openai_compatible_readonly_application_from_env(
         model_timeout_seconds=configuration.timeout_seconds,
         model_max_retries=configuration.max_retries,
         model_retry_backoff_seconds=configuration.retry_backoff_seconds,
-        model_output_token_parameter=configuration.output_token_parameter,
+        model_output_token_parameter=(
+            configuration.effective_output_token_parameter
+        ),
+        model_protocol=configuration.protocol,
+        model_anthropic_version=configuration.anthropic_version,
         model_strict_tool_schema=configuration.strict_tool_schema,
         model_streaming=configuration.streaming,
         context_configuration=context,
@@ -1180,16 +1244,9 @@ def compose_openai_compatible_engineering_application_from_env(
 ) -> Application:
     """Load local model settings and compose the engineering Agent."""
 
-    configuration = load_model_configuration(
-        env_file or Path.cwd() / ".env", os.environ
-    )
+    selected_env_file = env_file or Path.cwd() / ".env"
+    configuration = load_model_configuration(selected_env_file, os.environ)
     assert configuration is not None
-    for name, value in (
-        ("TSM_AGT_MODEL_BASE_URL", configuration.base_url),
-        ("TSM_AGT_MODEL", configuration.model),
-        ("TSM_AGT_MODEL_API_KEY", configuration.api_key),
-    ):
-        os.environ.setdefault(name, value)
     budget = load_exploration_budget_configuration(
         env_file or Path.cwd() / ".env", os.environ
     )
@@ -1213,7 +1270,11 @@ def compose_openai_compatible_engineering_application_from_env(
         model_timeout_seconds=configuration.timeout_seconds,
         model_max_retries=configuration.max_retries,
         model_retry_backoff_seconds=configuration.retry_backoff_seconds,
-        model_output_token_parameter=configuration.output_token_parameter,
+        model_output_token_parameter=(
+            configuration.effective_output_token_parameter
+        ),
+        model_protocol=configuration.protocol,
+        model_anthropic_version=configuration.anthropic_version,
         model_strict_tool_schema=configuration.strict_tool_schema,
         model_streaming=configuration.streaming,
         context_configuration=context,

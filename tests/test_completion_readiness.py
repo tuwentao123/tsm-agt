@@ -153,6 +153,10 @@ class BlockedReadTool(EchoToolProvider):
         return ToolResult(
             call.call_id, False, error_code="PERMISSION_DENIED",
             message="The required source is not authorized.",
+            # A permission denial cannot be fixed by acting again: the user has
+            # to grant access. Declaring that keeps the readiness gate from
+            # promising work no available capability can perform.
+            recovery_kind=ToolRecoveryKind.USER_ACTION_REQUIRED,
         )
 
 
@@ -180,6 +184,14 @@ class ReadinessSequenceModel(EchoModelProvider):
             and '"boundary":"completion_readiness"' in message.text
         ), "")
         if '"action":"REPORT_BLOCKED"' in correction:
+            return ModelResponse(
+                Message(
+                    "blocked-final", MessageRole.ASSISTANT,
+                    (TextBlock("Blocked: permission denied; source remains unverified."),),
+                ),
+                FinishReason.STOP, ModelUsage(1, 1),
+            )
+        if '"action":"EXHAUSTED"' in correction:
             return ModelResponse(
                 Message(
                     "blocked-final", MessageRole.ASSISTANT,
@@ -578,7 +590,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await policy.stop(None)  # type: ignore[arg-type]
 
-    async def test_execute_gap_reports_blocked_without_execute_capability(self) -> None:
+    async def test_execute_gap_is_exhausted_without_execute_capability(self) -> None:
         policy = RuleBasedCompletionReadinessPolicy()
         await policy.start(None)  # type: ignore[arg-type]
         try:
@@ -596,8 +608,14 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 ),
                 CompletionReadinessState(),
             )
+            # No available capability can close it: a bounded stop with the
+            # requirement still open, never a success claim.
             self.assertEqual(
-                decision.action, CompletionReadinessAction.REPORT_BLOCKED,
+                decision.action, CompletionReadinessAction.EXHAUSTED,
+            )
+            self.assertEqual(
+                decision.reason,
+                "required_work_not_closable_with_available_effects",
             )
         finally:
             await policy.stop(None)  # type: ignore[arg-type]
@@ -839,7 +857,8 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                     if event.event_type == "continuation.requested"
                 )
                 self.assertEqual(
-                    continuation.payload["reason"], "unmet_acceptance_criteria"
+                    continuation.payload["reason"],
+                    "completion_exhausted_with_required_gaps",
                 )
             finally:
                 await app.registry.stop_all()
@@ -963,7 +982,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(
                     checkpoint.pending_user_action["reason"],
-                    "unmet_acceptance_criteria",
+                    "completion_exhausted_with_required_gaps",
                 )
                 self.assertGreaterEqual(
                     checkpoint.model_calls, checkpoint.max_model_calls
@@ -1017,7 +1036,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(
                 decision.action,
-                CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE,
+                CompletionReadinessAction.EXHAUSTED,
             )
             self.assertEqual(decision.state.continue_attempts, 0)
         finally:
@@ -1109,7 +1128,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 model_adapter=model, tool_adapters=(tool,),
                 require_evidence_questions=True,
                 completion_readiness_policy_adapter=(
-                    RuleBasedCompletionReadinessPolicy(max_continue_attempts=1)
+                    RuleBasedCompletionReadinessPolicy()
                 ),
             )
             await app.registry.start_all()
@@ -1454,12 +1473,13 @@ class ContinuationStallTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIs(first.action, CompletionReadinessAction.CONTINUE)
 
-        # At the limit the same requirement is reported as a blocker, and the
-        # stall count keeps travelling with the state.
+        # At the limit the same requirement stops the attempt with the gaps
+        # still open (never a success claim), and the stall count keeps
+        # travelling with the state.
         blocked = await policy.evaluate(
             probe, CompletionReadinessState(stalled_continuations=2)
         )
-        self.assertIs(blocked.action, CompletionReadinessAction.REPORT_BLOCKED)
+        self.assertIs(blocked.action, CompletionReadinessAction.EXHAUSTED)
         self.assertEqual(
             blocked.reason, "required_gaps_unchanged_across_continuations"
         )
@@ -1520,17 +1540,25 @@ class BusinessFailureCommandTool(EchoToolProvider):
 class BusinessFailureModel(EchoModelProvider):
     capabilities = ProviderCapabilities(tools=True, context_window=8192)
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
     async def complete(self, request: ModelRequest) -> ModelResponse:
         saw_result = any(
             isinstance(block, ToolResultBlock)
             for message in request.messages for block in message.content
         )
         if not saw_result:
+            # Tool call ids must be unique within a turn, so a model that is
+            # asked to keep working issue a fresh id instead of replaying one.
+            self.calls += 1
+            call_id = f"business-failure-{self.calls}"
             return ModelResponse(
                 Message(
-                    "business-failure-call", MessageRole.ASSISTANT,
+                    f"{call_id}-message", MessageRole.ASSISTANT,
                     (ToolCallBlock(ToolCall(
-                        "business-failure", "fixture.run_command",
+                        call_id, "fixture.run_command",
                         {"argv": ["false"]},
                     )),),
                 ),

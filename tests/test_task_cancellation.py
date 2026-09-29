@@ -424,9 +424,7 @@ class ScopeWiringTest(unittest.IsolatedAsyncioTestCase):
     async def test_model_stream_registers_stop_event_in_scope(self) -> None:
         from unittest.mock import patch
 
-        from tsm_agt.adapters.openai_compatible.model import (
-            UrllibHttpJsonTransport,
-        )
+        from tsm_agt.adapters.http_json import UrllibHttpJsonTransport
         from tsm_agt.core import CancellationScope
 
         class _FakeStreamResponse:
@@ -439,7 +437,9 @@ class ScopeWiringTest(unittest.IsolatedAsyncioTestCase):
         scope = CancellationScope()
         transport = UrllibHttpJsonTransport()
         with patch(
-            "tsm_agt.adapters.openai_compatible.model.urlopen",
+            # The transport is shared infrastructure and lives in http_json;
+            # this patch target must follow the implementation.
+            "tsm_agt.adapters.http_json.urlopen",
             return_value=_FakeStreamResponse(),
         ):
             chunks = [

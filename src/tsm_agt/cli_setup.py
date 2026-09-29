@@ -311,8 +311,10 @@ async def _probe_model(configuration: ModelConfiguration) -> None:
             model_max_retries=configuration.max_retries,
             model_retry_backoff_seconds=configuration.retry_backoff_seconds,
             model_output_token_parameter=(
-                configuration.output_token_parameter
+                configuration.effective_output_token_parameter
             ),
+            model_protocol=configuration.protocol,
+            model_anthropic_version=configuration.anthropic_version,
             model_strict_tool_schema=configuration.strict_tool_schema,
             model_streaming=configuration.streaming,
         )

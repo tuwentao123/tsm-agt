@@ -17,7 +17,6 @@ from tsm_agt.core import (
     AgentClarificationSuspended, AgentProgress, AgentTurnResult,
     AgentTurnSuspended,
     AgentContinuationSuspended,
-    AcceptanceStatus,
     ApprovalDecision, ApprovalResolutionInput, CancelTaskInput,
     ClarificationReplyInput, InterruptTaskInput, RuntimeTextInput,
     SessionTextInput,
@@ -1253,27 +1252,12 @@ class EngineeringAgentClient:
                     result.task_id, TaskState.VERIFYING, "SDK verifier started"
                 )
                 verification = await kernel.verify_task_acceptance(result.task_id)
-                if verification.passed:
-                    await kernel.transition_task(
-                        result.task_id, TaskState.FINALIZING, "SDK finalizing"
-                    )
-                    await kernel.transition_task(
-                        result.task_id, TaskState.SUCCEEDED, "SDK succeeded"
-                    )
-                elif verification.status is AcceptanceStatus.BLOCKED:
-                    # INV-6: "cannot decide" is not "failed". A blocked verdict
-                    # (for example a judged criterion with no available judge)
-                    # must go to human review rather than be reported as a
-                    # failure the work did not cause.
-                    await kernel.transition_task(
-                        result.task_id, TaskState.NEEDS_REVIEW,
-                        f"SDK verifier {verification.status.value}",
-                    )
-                else:
-                    await kernel.transition_task(
-                        result.task_id, TaskState.FAILED,
-                        f"SDK verifier {verification.status.value}",
-                    )
+                # One shared verdict -> terminal-state mapping (AG-16). Clients
+                # must not map for themselves: doing so is how a BLOCKED
+                # (undecided) verdict gets reported as a product failure.
+                await kernel.finalize_acceptance(
+                    result.task_id, verification.status
+                )
             else:
                 # Diagnostics remain observable, but only an explicit caller
                 # decision may advance or fail the Task outside legacy gating.

@@ -88,7 +88,10 @@ class CoreReadOnlyToolProvider:
                 "properties": {
                     "path": {"type": "string"},
                     "recursive": {"type": "boolean"},
-                    "limit": {"type": "integer"},
+                    "limit": {
+                        "type": "integer", "minimum": 1,
+                        "maximum": _MAX_LIST_LIMIT,
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -121,7 +124,10 @@ class CoreReadOnlyToolProvider:
                     "pattern": {"type": "string"},
                     "path": {"type": "string"},
                     "case_sensitive": {"type": "boolean"},
-                    "limit": {"type": "integer"},
+                    "limit": {
+                        "type": "integer", "minimum": 1,
+                        "maximum": _MAX_FIND_LIMIT,
+                    },
                 },
                 "required": ["pattern"],
                 "additionalProperties": False,
@@ -152,8 +158,11 @@ class CoreReadOnlyToolProvider:
                 "properties": {
                     "path": {"type": "string"},
                     "resource_ref": {"type": "string"},
-                    "start_line": {"type": "integer"},
-                    "max_lines": {"type": "integer"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "max_lines": {
+                        "type": "integer", "minimum": 1,
+                        "maximum": _MAX_READ_LINES,
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -184,11 +193,18 @@ class CoreReadOnlyToolProvider:
                     "path": {"type": "string"},
                     "regex": {"type": "boolean"},
                     "case_sensitive": {"type": "boolean"},
-                    "max_matches": {"type": "integer"},
+                    "max_matches": {
+                        "type": "integer", "minimum": 1,
+                        "maximum": _MAX_SEARCH_MATCHES,
+                    },
                     "include": {"type": "string"},
                     "exclude": {"type": "string"},
-                    "before_context": {"type": "integer"},
-                    "after_context": {"type": "integer"}
+                    "before_context": {
+                        "type": "integer", "minimum": 0, "maximum": 20,
+                    },
+                    "after_context": {
+                        "type": "integer", "minimum": 0, "maximum": 20,
+                    }
                 },
                 "required": ["query"],
                 "additionalProperties": False,
@@ -214,11 +230,18 @@ class CoreReadOnlyToolProvider:
                     "path": {"type": "string"},
                     "regex": {"type": "boolean"},
                     "case_sensitive": {"type": "boolean"},
-                    "max_matches": {"type": "integer"},
+                    "max_matches": {
+                        "type": "integer", "minimum": 1,
+                        "maximum": _MAX_SEARCH_MATCHES,
+                    },
                     "include": {"type": "string"},
                     "exclude": {"type": "string"},
-                    "before_context": {"type": "integer"},
-                    "after_context": {"type": "integer"}
+                    "before_context": {
+                        "type": "integer", "minimum": 0, "maximum": 20,
+                    },
+                    "after_context": {
+                        "type": "integer", "minimum": 0, "maximum": 20,
+                    }
                 },
                 "required": ["query"],
                 "additionalProperties": False,

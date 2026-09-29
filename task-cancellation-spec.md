@@ -4,6 +4,8 @@
 目标系统：当前事件溯源 + asyncio + FastAPI + streaming runtime 架构
 适用范围：web session、local API、kernel、agent loop、model streaming、tool execution、process supervisor、runtime lifecycle
 
+> 注：近期修复包含发送/取消按钮状态同步与取消流程相关行为校正，规格说明需与当前实现保持一致。
+
 ## 0. v2 改版说明（相对 v1 的关键修正）
 
 v1 把取消当成"建立一套新的运行时所有权系统"，与本项目的事件溯源、可恢复、Ports/Adapters 架构冲突。本版修正五处：

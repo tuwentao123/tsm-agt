@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
+from tsm_agt.core import WorkspaceMutationConflict, WorkspacePatchConflict
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ToolCall,
     ToolEffect, ToolIdempotency, ToolInvocationContext, ToolRecoveryKind,
@@ -452,22 +453,45 @@ class CoreWorkspaceMutationToolProvider:
             return self._error(call, "PERMISSION_DENIED", str(error))
         except FileNotFoundError as error:
             return self._error(call, "NOT_FOUND", str(error))
+        except WorkspacePatchConflict as error:
+            # The caller's quoted old_text does not match the file that is
+            # actually there. Nothing is stale on disk, so the fix is to re-read
+            # the file and re-issue the edit: a correctable input error, not a
+            # terminal failure. The error carries a typed reason, so the Agent
+            # loop never has to parse human text.
+            return ToolResult(
+                call.call_id, False, error_code="PATCH_CONFLICT",
+                message=str(error),
+                hint=(
+                    "Read the current file content, locate the exact text, and "
+                    "re-issue core.apply_patch with an old_text that occurs "
+                    "exactly once."
+                ),
+                recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+                recovery_action={
+                    "required_change": "re_read_file_then_retry",
+                    "resource": error.path,
+                    "edit_index": error.index,
+                    "reason": error.reason,
+                    "same_call_safe": False,
+                },
+            )
         except (TypeError, ValueError) as error:
             return self._error(call, "INVALID_PARAM", str(error))
+        except WorkspaceMutationConflict as error:
+            return ToolResult(
+                call.call_id, False, error_code="CONFLICT",
+                message=str(error),
+                recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+                recovery_action={
+                    "required_change": "refresh_resource_then_retry",
+                    "resource": error.path,
+                    "expected_hash": error.expected_hash,
+                    "actual_hash": error.actual_hash,
+                    "same_call_safe": False,
+                },
+            )
         except RuntimeError as error:
-            if error.__class__.__name__ == "WorkspaceMutationConflict":
-                return ToolResult(
-                    call.call_id, False, error_code="CONFLICT",
-                    message=str(error),
-                    recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
-                    recovery_action={
-                        "required_change": "refresh_resource_then_retry",
-                        "resource": getattr(error, "path", None),
-                        "expected_hash": getattr(error, "expected_hash", None),
-                        "actual_hash": getattr(error, "actual_hash", None),
-                        "same_call_safe": False,
-                    },
-                )
             return self._error(call, "TOOL_FAILED", str(error))
 
     @staticmethod

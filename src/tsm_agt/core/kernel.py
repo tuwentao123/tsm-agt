@@ -123,7 +123,6 @@ from tsm_agt.ports import (
     is_sensitive_read_path,
     LocalIdentityPort,
     ProjectMemoryPort,
-    RuntimeInputClassifierPort,
     SessionInputRelation,
     SessionInputRelationJudgement,
     SessionInputRelationPort,
@@ -298,7 +297,8 @@ from .trust import (
 )
 from .workspace import (
     MutationOperation, MutationRecord, WorkspaceChangeSet,
-    WorkspaceMutationConflict, WorkspaceTransactionEntry,
+    WorkspaceMutationConflict, WorkspacePatchConflict,
+    WorkspaceTransactionEntry,
     WorkspaceTransactionManifest,
     capture_workspace_baseline, commit_prepared_workspace_deletion,
     commit_prepared_workspace_mutation, compare_workspace_baseline,
@@ -312,6 +312,7 @@ from .workspace import (
 )
 from .verification import (
     AcceptanceResult, AcceptanceStatus, Evidence, TaskVerificationResult,
+    terminal_state_for,
 )
 from .evidence_question import (
     EvidenceQuestionProjector, EvidenceQuestionProjection,
@@ -506,7 +507,8 @@ class _WorkspacePathLockCoordinator:
 
 
 def _render_workspace_patch(
-    before_bytes: bytes | None, edits: tuple[Mapping[str, str], ...],
+    path: str, before_bytes: bytes | None,
+    edits: tuple[Mapping[str, str], ...],
 ) -> str:
     if before_bytes is None:
         if len(edits) != 1 or edits[0]["old_text"] != "":
@@ -521,17 +523,19 @@ def _render_workspace_patch(
     for index, edit in enumerate(edits):
         old_text = edit["old_text"]
         if not old_text:
-            raise ValueError(
-                f"edits[{index}].old_text must not be empty for an existing file"
+            # The caller believed the file was absent (or did not read it), but
+            # it exists. Re-reading is the fix, not abandonment.
+            raise WorkspacePatchConflict(
+                path, index, "old_text must not be empty for an existing file"
             )
         matches = content.count(old_text)
         if matches == 0:
-            raise ValueError(
-                f"edits[{index}].old_text was not found in the current file"
+            raise WorkspacePatchConflict(
+                path, index, "old_text was not found in the current file"
             )
         if matches > 1:
-            raise ValueError(
-                f"edits[{index}].old_text is ambiguous: found {matches} matches"
+            raise WorkspacePatchConflict(
+                path, index, f"old_text is ambiguous: found {matches} matches"
             )
         content = content.replace(old_text, edit["new_text"], 1)
     return content
@@ -1019,7 +1023,7 @@ class _TaskWorkspaceControl(ToolWorkspaceControl):
             Path(task.workspace), path, "", expected_hash,
             self.kernel.dependencies.workspace_path,
         )
-        content = _render_workspace_patch(prepared.before_bytes, edits)
+        content = _render_workspace_patch(path, prepared.before_bytes, edits)
 
         record = await self.kernel.write_workspace_text(
             self.task_id, self.invocation_id, path, content, expected_hash
@@ -1044,7 +1048,8 @@ class _TaskWorkspaceControl(ToolWorkspaceControl):
                 self.kernel.dependencies.workspace_path,
             )
             writes.append((
-                path, _render_workspace_patch(prepared.before_bytes, edits),
+                path,
+                _render_workspace_patch(path, prepared.before_bytes, edits),
                 expected_hash,
             ))
         if total_edits > 500:
@@ -8061,18 +8066,30 @@ class Kernel:
                 ToolEffect.MUTATE: mutate_tools,
                 ToolEffect.OBSERVE: observe_tools,
             }.get(required_effect, ())
+            # A failure the producer itself classified as unfixable by acting
+            # again (terminal / user_action_required / unknown_outcome) must not
+            # be advertised as a closable gap: the gate would keep promising work
+            # that no available capability can perform and burn the whole turn
+            # budget. An unclassified failure stays conservatively correctable.
+            correctable = fact.recovery_kind not in {
+                "terminal", "user_action_required", "unknown_outcome",
+            }
             gaps.append(CompletionGap(
                 gap_id=f"execution-failure:{fact.execution_id}",
                 kind="UNRESOLVED_EFFECT_FAILURE",
                 description=(
                     f"{fact.tool_name} reported "
                     f"{fact.failure_code or fact.effect_status.value}"
+                    + (
+                        "" if correctable else
+                        "; the failure is not correctable by acting again"
+                    )
                 ),
                 status=fact.effect_status.value,
                 required=True,
-                recoverable=True,
-                required_effects=(required_effect,),
-                candidate_tools=candidates,
+                recoverable=correctable and bool(candidates),
+                required_effects=(required_effect,) if correctable else (),
+                candidate_tools=candidates if correctable else (),
                 observed=fact.detail,
             ))
 
@@ -8101,14 +8118,21 @@ class Kernel:
             ))
 
         # INV-3: a required gap must be closable. A required gap with no
-        # effective effects and no judged kind can never be closed, which is
+        # effective effects and no exempt kind can never be closed, which is
         # exactly the dead-lock shape of task-2c8f8fbb75714516a94ab442995626b5.
         # Demote it and record the violation instead of suspending the Task
         # forever. This function keeps returning one tuple so its existing
         # internal and test callers stay unchanged.
+        #
+        # The exempt kinds are not demoted because a bounded, explicit escape
+        # exists instead of a vacuous success: a judged gap is closed by the
+        # judge, and an effect failure the producer declared unfixable is
+        # escalated by the readiness gate to EXHAUSTED (a resumable stop that
+        # the stall cap turns into human review). Demoting the latter would let
+        # a Task whose required side effect never happened report success.
         _JUDGED_GAP_KINDS = frozenset({
             "TASK_SPEC_RUBRIC", "EVIDENCE_QUESTION",
-            "JUDGED_CRITERION_WITHOUT_JUDGE",
+            "JUDGED_CRITERION_WITHOUT_JUDGE", "UNRESOLVED_EFFECT_FAILURE",
         })
         _violations = [
             gap for gap in gaps
@@ -9182,6 +9206,38 @@ class Kernel:
             except ValueError as error:
                 if "version conflict" not in str(error) or attempt == 2:
                     raise
+
+    async def finalize_acceptance(
+        self, task_id: str, status: AcceptanceStatus,
+    ) -> TaskSnapshot:
+        """Move a VERIFYING Task to the one terminal state its verdict implies.
+
+        Every entry point (CLI / SDK / Web / Local API) must call this instead of
+        mapping a verdict itself. The mapping is Runtime policy: when clients map
+        for themselves, the same verdict becomes ``FAILED`` on one surface and
+        ``NEEDS_REVIEW`` on another -- which is precisely what the CLI used to do
+        for a ``BLOCKED`` verdict.
+
+        ``PASSED`` still passes through ``FINALIZING`` because that is the only
+        legal edge to ``SUCCEEDED``.
+        """
+        target = terminal_state_for(status)
+        stored = await self._require_stored_task(task_id)
+        current = TaskSnapshot.from_data(stored.data)
+        if current.state is target:
+            return current
+        if current.state.is_terminal:
+            raise InvalidTurnState(
+                f"task {task_id} is already terminal in {current.state.value}; "
+                f"cannot apply acceptance verdict {status.value}"
+            )
+        if target is TaskState.SUCCEEDED:
+            await self.transition_task(
+                task_id, TaskState.FINALIZING, "acceptance passed"
+            )
+        return await self.transition_task(
+            task_id, target, f"acceptance verdict {status.value}"
+        )
 
     async def verify_task_acceptance(
         self, task_id: str,
@@ -12728,6 +12784,10 @@ class Kernel:
                 completion_state.last_action in {
                     CompletionReadinessAction.REPORT_BLOCKED.value,
                     CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE.value,
+                    # A resolved "stop with work open" verdict gets one wrap-up
+                    # round: no new substantive work, state the blocker
+                    # honestly. The round after that suspends resumably.
+                    CompletionReadinessAction.EXHAUSTED.value,
                 }
             )
             wrap_up = legacy_completion_gate and (
@@ -13374,12 +13434,11 @@ class Kernel:
                     readiness.action in {
                         CompletionReadinessAction.CONTINUE,
                         CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE,
+                        # A bounded stop with recoverable work left is exactly
+                        # what the renewal budget exists for. Keyed on the
+                        # action, never on a reason string.
+                        CompletionReadinessAction.EXHAUSTED,
                     }
-                    or (
-                        readiness.action is CompletionReadinessAction.COMPLETE
-                        and readiness.reason
-                        == "bounded_completion_corrections_exhausted"
-                    )
                 )
                 renewable_effects = {
                     ToolEffect.OBSERVE
@@ -13469,47 +13528,75 @@ class Kernel:
                     CompletionReadinessAction.COMPLETE,
                     "diagnostic_only", readiness.state, readiness.gaps,
                 )
-            unmet_acceptance_criteria = (
-                legacy_completion_gate and any(
-                    gap.gap_id.startswith("task-spec:") and gap.required
-                    for gap in readiness.gaps
-                )
+            # INV-13 / INV-16: a required gap may never coexist with a success
+            # verdict. This is enforced here, at the consumer, so it also covers
+            # policies this Runtime does not own -- including the "no policy
+            # configured" default and any custom adapter. The diagnostic-only
+            # per-turn override above is intentionally exempt: it hands the
+            # decision to the caller and never finalises or fails the Task.
+            required_gaps_open = any(
+                gap.required for gap in readiness.gaps
             )
             if (
                 legacy_completion_gate
-                and unmet_acceptance_criteria
+                and required_gaps_open
                 and readiness.action is CompletionReadinessAction.COMPLETE
-                and not disclosure_only
             ):
-                blocked_state = replace(
+                await self._append_events(task_id, ((
+                    "completion.invariant_violated", {
+                        "turn_id": turn_id,
+                        "violation": "complete_with_open_required_gaps",
+                        "reason": readiness.reason,
+                        "gap_ids": [
+                            gap.gap_id for gap in readiness.gaps if gap.required
+                        ],
+                    },
+                ),))
+                exhausted_state = replace(
                     readiness.state,
-                    last_action=CompletionReadinessAction.REPORT_BLOCKED.value,
+                    last_action=CompletionReadinessAction.EXHAUSTED.value,
                 )
                 readiness = CompletionReadinessDecision(
-                    CompletionReadinessAction.REPORT_BLOCKED,
-                    "acceptance_criteria_unmet", blocked_state, readiness.gaps,
+                    CompletionReadinessAction.EXHAUSTED,
+                    "complete_with_open_required_gaps",
+                    exhausted_state, readiness.gaps,
                 )
                 response_checkpoint = replace(
                     response_checkpoint,
-                    completion_readiness_state=blocked_state.to_data(),
+                    completion_readiness_state=exhausted_state.to_data(),
                 )
             final_response = bool(
                 not tool_calls and not has_late_steering
                 and readiness.action is CompletionReadinessAction.COMPLETE
-                and not unmet_acceptance_criteria
+                and not required_gaps_open
             )
-            acceptance_incomplete_boundary = bool(
+            # A bounded stop with requirements still open ends the turn at a
+            # resumable boundary (INV-14): the objective axis records "work
+            # remains" here, so the acceptance layer is never the first to
+            # discover it (INV-16).
+            unmet_boundary = bool(
                 not tool_calls
-                and unmet_acceptance_criteria
-                and readiness.action is CompletionReadinessAction.REPORT_BLOCKED
+                and required_gaps_open
+                and readiness.action in {
+                    CompletionReadinessAction.REPORT_BLOCKED,
+                    CompletionReadinessAction.EXHAUSTED,
+                }
+            )
+            # The first "stop with work open" verdict buys one wrap-up round so
+            # the user gets an honest blocker report; the second one suspends.
+            # Derived from the persisted last action, not from a counter.
+            # ``remaining_model_calls`` still counts the call just made, so a
+            # further round needs more than one left; otherwise suspend with the
+            # checkpoint already in hand.
+            exhausted_wrap_up_due = bool(
+                readiness.action is CompletionReadinessAction.EXHAUSTED
+                and completion_state.last_action
+                != CompletionReadinessAction.EXHAUSTED.value
+                and remaining_model_calls > 1
             )
             incomplete_recovery_boundary = bool(
-                legacy_completion_gate and (
-                    (final_response and disclosure_only
-                     and completion_state.last_action
-                     == CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE.value)
-                    or acceptance_incomplete_boundary
-                )
+                legacy_completion_gate and unmet_boundary
+                and not exhausted_wrap_up_due
             )
             await self._commit_model_response_checkpoint(
                 response_checkpoint, response, prompt.receipt, prepared.budget,
@@ -13535,9 +13622,9 @@ class Kernel:
                     suspension = await self._suspend_incomplete_recoverable(
                         response_checkpoint, response.message, readiness.gaps,
                         reason=(
-                            "unmet_acceptance_criteria"
-                            if acceptance_incomplete_boundary
-                            else "incomplete_recoverable"
+                            "completion_exhausted_with_required_gaps"
+                            if readiness.action is CompletionReadinessAction.EXHAUSTED
+                            else "unmet_acceptance_criteria"
                         ),
                     )
                     source_user_message = next((

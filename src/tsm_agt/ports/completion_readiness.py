@@ -20,10 +20,19 @@ class CompletionReadinessMode(StrEnum):
 
 
 class CompletionReadinessAction(StrEnum):
+    #: The proposed final answer may be finalised. INV-13: this action must
+    #: never be emitted while a required gap is open -- completion is earned by
+    #: the gap evidence, not declared by the presence of a verdict.
     COMPLETE = "COMPLETE"
     CONTINUE = "CONTINUE"
     REPORT_INCOMPLETE_RECOVERABLE = "REPORT_INCOMPLETE_RECOVERABLE"
     REPORT_BLOCKED = "REPORT_BLOCKED"
+    #: The Runtime stopped itself with requirements still open: the bounded
+    #: correction budget is spent, or the remaining gap cannot be closed with
+    #: any available capability. It is deliberately neither success nor failure
+    #: (INV-14) -- the turn ends at a resumable boundary and the outstanding
+    #: requirements continue to be tracked on the goal axis.
+    EXHAUSTED = "EXHAUSTED"
 
 
 @dataclass(frozen=True, slots=True)

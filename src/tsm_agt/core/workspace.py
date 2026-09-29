@@ -125,6 +125,24 @@ class WorkspaceMutationConflict(RuntimeError):
         self.actual_hash = actual_hash
 
 
+class WorkspacePatchConflict(ValueError):
+    """A patch hunk does not match the current file content.
+
+    This is deliberately distinct from :class:`WorkspaceMutationConflict`: the
+    caller's ``expected_hash`` may still be current, so nothing about the file
+    has to be refreshed -- the *caller's* quoted ``old_text`` is simply wrong or
+    stale. The correct recovery is to re-read the file and re-issue the edit
+    against the text that is actually there, which makes this a correctable
+    model input error rather than a terminal failure.
+    """
+
+    def __init__(self, path: str, index: int, reason: str) -> None:
+        super().__init__(f"edits[{index}].{reason}")
+        self.path = path
+        self.index = index
+        self.reason = reason
+
+
 @dataclass(frozen=True, slots=True)
 class MutationRecord:
     mutation_id: str

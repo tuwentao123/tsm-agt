@@ -564,6 +564,23 @@ async def _agent(
         await application.registry.stop_all()
 
 
+#: Process exit codes. NEEDS_REVIEW is deliberately distinct from FAILED so a
+#: script can tell "a human must decide" apart from "the work failed" instead of
+#: treating every non-zero exit as a failure.
+_EXIT_SUCCEEDED = 0
+_EXIT_FAILED = 1
+_EXIT_NEEDS_REVIEW = 2
+
+
+def _exit_code_for(state: TaskState) -> int:
+    """Derive the exit code from the Task's terminal state (AG-16)."""
+    if state is TaskState.SUCCEEDED:
+        return _EXIT_SUCCEEDED
+    if state is TaskState.NEEDS_REVIEW:
+        return _EXIT_NEEDS_REVIEW
+    return _EXIT_FAILED
+
+
 async def _finalize_standalone_agent_result(
     application, task_id: str, result,
     output_fn: Callable[[str], None] = print, *, verbose: bool = False,
@@ -614,16 +631,18 @@ async def _finalize_standalone_agent_result(
                 f"verification: passed ({len(verification.criteria)} criteria)"
             )
         return 0
-    await application.kernel.transition_task(
-        task.task_id, TaskState.FAILED,
-        f"trusted verifier {verification.status.value}",
+    # Same shared mapping the SDK uses: a BLOCKED (undecided) verdict is
+    # human review, not a failure. Mapping it per client is what made the CLI
+    # disagree with the SDK.
+    task = await application.kernel.finalize_acceptance(
+        task.task_id, verification.status
     )
     await _print_standalone_protocol_status(application, task_id, output_fn)
     output_fn(
         f"verification: {verification.status.value}; "
-        "Task was not marked successful"
+        f"Task state {task.state.value}"
     )
-    return 1
+    return _exit_code_for(task.state)
 
 
 async def _print_standalone_protocol_status(application, task_id: str, output_fn) -> None:
@@ -2179,13 +2198,14 @@ async def _chat(
                             f"verification: passed ({len(verification.criteria)} criteria)"
                         )
                 else:
-                    task = await application.kernel.transition_task(
-                        task.task_id, TaskState.FAILED,
-                        f"trusted verifier {verification.status.value}",
+                    # Shared verdict -> terminal-state mapping (AG-16): a
+                    # BLOCKED verdict is human review, not a failure.
+                    task = await application.kernel.finalize_acceptance(
+                        task.task_id, verification.status
                     )
                     output_fn(
                         f"verification: {verification.status.value}; "
-                        "Task was not marked successful"
+                        f"Task state {task.state.value}"
                     )
                 session = await application.kernel.get_session(session.session_id)
             except AgentLoopLimitExceeded as error:

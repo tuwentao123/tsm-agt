@@ -361,6 +361,7 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
                 ),
                 store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
                 task_spec_planner_adapter=ProductionPlanner(),
+                rubric_judge_adapter=AlwaysSatisfiedJudge(),
                 require_evidence_questions=True,
             )
             await app.registry.start_all()

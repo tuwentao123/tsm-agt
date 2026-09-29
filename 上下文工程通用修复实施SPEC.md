@@ -905,20 +905,26 @@ def test_unpinned_old_summary_is_still_dropped() -> None: ...
 .venv/bin/python -m pytest -q 2>&1 | tail -5
 ```
 
-**通过定义**：定向测试全绿；全量结果与 §8 基线**同为 9 个既有失败**，且失败集合不变。
+**通过定义**：定向测试全绿；全量结果与 §8 基线**同为 8 个既有失败**，且失败集合不变。
 
 ---
 
 ## 8. 基线与已知失败（不得新增）
 
+收尾后口径（2026-09，同一 venv；失败项已用 HEAD `a2a9c1e` 干净 worktree 逐项复现）：
+
 ```
-1111 passed / 9 failed / 8 skipped
+1198 passed / 8 failed / 8 skipped / 175 subtests passed
 失败（既有，与本次改动无关）：
-  tests/test_cli_line_editing.py            ×5
-  tests/test_composition.py                 ×2
-  tests/test_architecture/test_dependencies.py ×1
-  tests/test_investigation_status.py        ×1
+  tests/test_cli_line_editing.py             ×5   OSError: out of pty devices
+  tests/test_local_workspace_sandbox.py      ×2   OS 隔离 / 信任缓存环境
+  tests/test_investigation_status.py         ×1   status.tool_calls 实测 0、期望 1
 ```
+
+> 早期记录里的 `test_composition` ×2 与 `test_architecture/test_dependencies.py` ×1 **已修复**，
+> 不再计入基线：前者是期望工具表过期（缺 `core.grep_search`）叠加一处测试不密闭，
+> 后者是 Anthropic 适配器跨 provider 依赖（已抽 `adapters/http_json` 中立传输）。
+> 详见《完成判定反面漏洞修复SPEC.md》§8。
 
 **门禁**：若某阶段使既有失败集合扩大，或使 `test_composition` 数量变化，视为回归，必须修复后再进入下一阶段。
 

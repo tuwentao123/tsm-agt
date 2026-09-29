@@ -70,6 +70,13 @@ class ExecutionFact:
     resolution: FactResolution = FactResolution.UNRESOLVED
     failure_code: str = ""
     detail: str = ""
+    #: The producer's explicit recovery classification for this failure
+    #: (``ToolRecoveryKind`` value). Empty means the producer did not classify
+    #: it, which is treated conservatively as correctable. A classification
+    #: that says the caller cannot fix this by acting again (``terminal``,
+    #: ``user_action_required``, ``unknown_outcome``) must stop the completion
+    #: gate from promising more work, so it is surfaced here.
+    recovery_kind: str = ""
 
     @property
     def required_effect(self) -> ToolEffect:
@@ -113,6 +120,7 @@ class ExecutionFact:
             "resolution": self.resolution.value,
             "failure_code": self.failure_code,
             "detail": self.detail,
+            "recovery_kind": self.recovery_kind,
         }
 
 
@@ -203,6 +211,7 @@ def project_execution_fact(
 
     def fact(
         status: EffectStatus, *, failure_code: str = "", detail: str = "",
+        recovery_kind: str = "",
     ) -> ExecutionFact:
         return ExecutionFact(
             execution_id=record.execution_id,
@@ -213,6 +222,7 @@ def project_execution_fact(
             effect_status=status,
             failure_code=failure_code,
             detail=detail,
+            recovery_kind=recovery_kind,
         )
 
     # Cancellation and unknown outcome are terminal states that may carry no
@@ -221,7 +231,10 @@ def project_execution_fact(
     if record.state is ToolCommitState.CANCELLED:
         return fact(EffectStatus.UNKNOWN, failure_code="CANCELLED")
     if record.state is ToolCommitState.UNKNOWN_OUTCOME:
-        return fact(EffectStatus.UNKNOWN, failure_code="UNKNOWN_OUTCOME")
+        return fact(
+            EffectStatus.UNKNOWN, failure_code="UNKNOWN_OUTCOME",
+            recovery_kind="unknown_outcome",
+        )
 
     result = record.result
     if result is None:
@@ -249,6 +262,10 @@ def project_execution_fact(
         effect_status=status,
         failure_code=failure_code,
         detail=detail,
+        recovery_kind=(
+            result.recovery_kind.value
+            if status is not EffectStatus.SUCCEEDED else ""
+        ),
     )
 
 
@@ -361,6 +378,7 @@ def _with_resolution(
         resolution=resolution,
         failure_code=fact.failure_code,
         detail=fact.detail,
+        recovery_kind=fact.recovery_kind,
     )
 
 

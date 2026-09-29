@@ -238,14 +238,16 @@ Project Onboarding 会在 Task 首次进入 `RESOLVING_PROJECT` 时进行有界�
 
 ## 使用真实模型
 
-真实 Agent 只读取三个显式环境变量，不会自动复用其他应用的 API Key。可以在终端中 `export`，也可以复制 `.env.example` 为项目根目录的 `.env`；已导出的变量优先于 `.env`：
+真实 Agent 使用 `TSM_AGT_MODEL` 选择协议和对应模型名，不会自动复用其他应用的 API Key。Open 与 Anthropic 可共用同一个 Base URL，Provider 会根据选择值使用不同的请求路径。可以在终端中 `export`，也可以复制 `.env.example` 为项目根目录的 `.env`；已导出的变量优先于 `.env`：
 
 ```bash
+# Open Chat Completions 模式
+export TSM_AGT_MODEL="open"
 export TSM_AGT_MODEL_BASE_URL="https://api.example.com/v1"
-export TSM_AGT_MODEL="your-model-name"
+export TSM_AGT_OPEN_MODEL="your-open-model-name"
 export TSM_AGT_MODEL_API_KEY="your-api-key"
 # GPT-5 类接口若拒绝 max_tokens，则改用 max_completion_tokens。
-export TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER="max_tokens"
+export TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER="max_completion_tokens"
 # 兼容网关若拒绝 function.strict=true，可设为 false；Kernel 仍会本地校验参数。
 export TSM_AGT_MODEL_STRICT_TOOL_SCHEMA="true"
 export TSM_AGT_MODEL_STREAMING="true"
@@ -254,7 +256,9 @@ uv run tsm-agt agent \
   "分析这个项目的入口文件" --workspace .
 ```
 
-本地 `.env` 已被 Git 忽略。三个必填模型字段是 Base URL、模型名和 API Key；此外可显式配置超时、重试、输出 Token 参数名和严格工具 Schema。预算加载器只接受下文列出的 `TSM_AGT_AGENT_*` 和 `TSM_AGT_EXPLORATION_*` 字段，其他变量不会被注入进程环境。
+Anthropic 原生 Messages 模式只需将 `TSM_AGT_MODEL` 设为 `anthropic`，并设置 `TSM_AGT_ANTHROPIC_MODEL`。Base URL 与 API Key 继续使用 `TSM_AGT_MODEL_BASE_URL`、`TSM_AGT_MODEL_API_KEY`；Provider 会改为请求 `/v1/messages`。原生模式固定使用 `max_tokens`，可用 `TSM_AGT_ANTHROPIC_VERSION` 配置 API 版本。
+
+本地 `.env` 已被 Git 忽略。两种模式都需要 Base URL、API Key 和当前选择器对应的模型名；此外可显式配置超时、重试、输出 Token 参数名和严格工具 Schema。预算加载器只接受下文列出的 `TSM_AGT_AGENT_*` 和 `TSM_AGT_EXPLORATION_*` 字段，其他变量不会被注入进程环境。
 导出的环境变量优先于 `<workspace>/.env`。`agent`、`chat`、`resume`、`approve/reject` 和 `answer` 都以 `--workspace` 定位同一份配置和 `.agent/runtime.db`；配置缺失时会给出 `init`、编辑位置和 `doctor --model-check` 的可执行修复步骤，不再只输出变量名。
 
 调查工具没有写死为 12 次。默认软上限为 24 次，Agent 仍可能因为连续无新证据、累计工具耗时或需要给最终回答预留额度而提前收尾；Agent Loop 另有 40 次工具调用硬上限，负责阻止失控循环。可以在工作区 `.env` 中按项目覆盖软预算，导出的同名环境变量优先：
@@ -386,9 +390,9 @@ tsm-agt api serve --workspace . --host 127.0.0.1 --port 8765
 
 `progress` 是只存在于当前 Runtime 进程内的实时 UI 通道。它通过同一个 Bearer Token 保护，直接返回完整 Goal、Evidence Question、工具名与参数、路径/查询范围、预算明细和收尾原因，不做内容脱敏，也不写 SQLite；Runtime 重启后旧的实时明文不会恢复。Web UI 应在任务执行时订阅 `progress` 显示操作内容，并使用 `events`/Flow 做可恢复历史与审计，不能再从脱敏 Event 猜当前问题或范围。两条通道都不提供模型隐藏思维链。
 
-`TSM_AGT_MODEL_BASE_URL` 应填写 `/v1` 根地址，Adapter 会请求其 `/chat/completions`。目前使用 Chat Completions 的函数工具协议；Provider 必须支持 `tools`、`tool_calls` 和 JSON Schema 参数。内部工具名如 `core.read_file` 会在 Adapter 内映射成兼容的函数名，模型结果进入 Kernel 前再还原。
+`TSM_AGT_MODEL_BASE_URL` 应填写 `/v1` 根地址。`TSM_AGT_MODEL=open` 时，Open Provider 会请求其 `/chat/completions` 并使用 `TSM_AGT_OPEN_MODEL`；`TSM_AGT_MODEL=anthropic` 时，Anthropic Provider 会请求其 `/v1/messages` 并使用 `TSM_AGT_ANTHROPIC_MODEL`。Open 模式的 Provider 必须支持 `tools`、`tool_calls` 和 JSON Schema 参数。内部工具名如 `core.read_file` 会在 Adapter 内映射成兼容的函数名，模型结果进入 Kernel 前再还原。
 
-不同 OpenAI-compatible 网关可能只在可选字段上有差异：GPT-5 类模型常要求 `TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=max_completion_tokens`；部分网关收到 `function.strict=true` 会直接空断流，此时配置 `TSM_AGT_MODEL_STRICT_TOOL_SCHEMA=false`。关闭 strict 只是不向模型声明严格模式，工具调用进入 Kernel 后仍必须通过本地参数 Schema、Policy、Approval、Sandbox 和 Workspace Boundary 校验。
+不同 Open Chat Completions 网关可能只在可选字段上有差异：GPT-5 类模型常要求 `TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=max_completion_tokens`；部分网关收到 `function.strict=true` 会直接空断流，此时配置 `TSM_AGT_MODEL_STRICT_TOOL_SCHEMA=false`。关闭 strict 只是不向模型声明严格模式，工具调用进入 Kernel 后仍必须通过本地参数 Schema、Policy、Approval、Sandbox 和 Workspace Boundary 校验。
 
 如果网关可以正常返回非流式 JSON，但 SSE 响应总是在缺少 `finish_reason` 的情况下结束，可在私有 `.env` 设置 `TSM_AGT_MODEL_STREAMING=false`。Agent 的工具调用和多轮循环保持不变，只是不再逐字显示模型输出。默认值为 `true`。
 

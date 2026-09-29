@@ -131,7 +131,7 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
             (await self.application.kernel.get_task(self.task.task_id)).mutation_journal, ()
         )
 
-    async def test_missing_and_ambiguous_exact_text_fail_without_write(self) -> None:
+    async def test_missing_and_ambiguous_exact_text_are_recoverable_conflicts(self) -> None:
         for suffix, content, old_text, message in (
             ("missing", "alpha\n", "beta", "not found"),
             ("ambiguous", "same same\n", "same", "ambiguous"),
@@ -147,9 +147,41 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
                     f"turn-{suffix}",
                 )
                 self.assertFalse(result.ok)
-                self.assertEqual(result.error_code, "INVALID_PARAM")
+                # A stale or ambiguous hunk is a correctable input error: the
+                # caller re-reads the file and retries instead of the Task dying
+                # on a terminal failure.
+                self.assertEqual(result.error_code, "PATCH_CONFLICT")
+                self.assertIs(
+                    result.effective_recovery_kind,
+                    ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+                )
+                self.assertEqual(
+                    result.recovery_action["required_change"],
+                    "re_read_file_then_retry",
+                )
+                self.assertEqual(result.recovery_action["resource"], target.name)
+                self.assertFalse(result.recovery_action["same_call_safe"])
                 self.assertIn(message, result.message)
                 self.assertEqual(target.read_text(encoding="utf-8"), content)
+
+    async def test_empty_old_text_for_existing_file_is_recoverable_conflict(self) -> None:
+        target = self.workspace / "existing.txt"
+        target.write_text("already here\n", encoding="utf-8")
+
+        result = await self.approve(
+            self.call(
+                "call-empty-old", target.name, sha256("already here\n"),
+                [{"old_text": "", "new_text": "created"}],
+            ),
+            "turn-empty-old",
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "PATCH_CONFLICT")
+        self.assertEqual(
+            result.recovery_action["required_change"], "re_read_file_then_retry"
+        )
+        self.assertEqual(target.read_text(encoding="utf-8"), "already here\n")
 
     async def test_multiple_edits_are_applied_sequentially(self) -> None:
         target = self.workspace / "sequence.txt"
@@ -224,3 +256,82 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+
+class PatchConflictRecoveryWiringTest(unittest.IsolatedAsyncioTestCase):
+    """A recoverable patch conflict must actually open a recovery barrier."""
+
+    async def test_patch_conflict_enters_the_recoverable_batch(self) -> None:
+        from tsm_agt.core.kernel import Kernel
+        from tsm_agt.ports import (
+            Message, MessageRole, ToolCallBlock, ToolResult, ToolResultBlock,
+        )
+
+        result = ToolResult(
+            "call-stale-hunk", False, error_code="PATCH_CONFLICT",
+            message="edits[0].old_text was not found in the current file",
+            recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+            recovery_action={"required_change": "re_read_file_then_retry"},
+        )
+        messages = (
+            Message("assistant", MessageRole.ASSISTANT, (ToolCallBlock(
+                ToolCall(
+                    "call-stale-hunk", "core.apply_patch", {"path": "app.py"},
+                ),
+            ),)),
+            Message("results", MessageRole.TOOL, (ToolResultBlock(result),)),
+        )
+
+        batch = Kernel._latest_recoverable_tool_batch(messages)
+
+        self.assertEqual([item.call_id for item in batch], ["call-stale-hunk"])
+        self.assertEqual(
+            batch[0].recovery_action["required_change"],
+            "re_read_file_then_retry",
+        )
+
+
+class ToolSchemaBoundsTest(unittest.IsolatedAsyncioTestCase):
+    """Enforced argument bounds must be advertised in the tool schema."""
+
+    async def asyncSetUp(self) -> None:
+        from datetime import datetime
+        from tsm_agt.adapters.builtin import CoreReadOnlyToolProvider
+        from tsm_agt.ports import AdapterContext
+
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temp_dir.name)
+        provider = CoreReadOnlyToolProvider()
+        await provider.start(AdapterContext({}, lambda _type, _payload: None))
+        self.addAsyncCleanup(provider.stop, datetime.now())
+        self.specs = {spec.name: spec for spec in await provider.list_tools()}
+
+    async def asyncTearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_search_tools_advertise_context_and_match_bounds(self) -> None:
+        for name in ("core.search_text", "core.grep_search"):
+            with self.subTest(tool=name):
+                properties = self.specs[name].parameters["properties"]
+                self.assertEqual(properties["after_context"]["minimum"], 0)
+                self.assertEqual(properties["after_context"]["maximum"], 20)
+                self.assertEqual(properties["before_context"]["minimum"], 0)
+                self.assertEqual(properties["before_context"]["maximum"], 20)
+                self.assertEqual(properties["max_matches"]["minimum"], 1)
+                self.assertEqual(properties["max_matches"]["maximum"], 500)
+
+    def test_read_and_list_tools_advertise_bounds(self) -> None:
+        read = self.specs["core.read_file"].parameters["properties"]
+        self.assertEqual(read["start_line"]["minimum"], 1)
+        self.assertEqual(read["max_lines"]["minimum"], 1)
+        self.assertEqual(read["max_lines"]["maximum"], 1000)
+
+        listing = self.specs["core.list_files"].parameters["properties"]
+        self.assertEqual(listing["limit"]["minimum"], 1)
+        self.assertEqual(listing["limit"]["maximum"], 1000)
+
+        find = self.specs["core.find_files"].parameters["properties"]
+        self.assertEqual(find["limit"]["minimum"], 1)
+        self.assertEqual(find["limit"]["maximum"], 500)

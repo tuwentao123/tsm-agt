@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tsm_agt.adapters.anthropic_messages import AnthropicMessagesModelProvider
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import (
     compose_local_flow_query_application,
@@ -143,7 +144,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                 [tool.name for tool in await application.kernel.list_tools()],
                 [
                     "core.list_files", "core.find_files",
-                    "core.read_file", "core.search_text",
+                    "core.read_file", "core.search_text", "core.grep_search",
                 ],
             )
         finally:
@@ -172,16 +173,22 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                 )
 
     async def test_real_provider_engineering_composition_has_process_tools(self) -> None:
-        with patch.dict(
-            os.environ,
-            {
-                "TSM_AGT_MODEL_BASE_URL": "https://models.example.test/v1",
-                "TSM_AGT_MODEL": "test-model",
-                "TSM_AGT_MODEL_API_KEY": "test-secret",
-            },
-            clear=True,
-        ):
-            application = compose_openai_compatible_engineering_application_from_env()
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            # Hermetic by construction: without an explicit env file this test
+            # would read the developer's real `.env`, so an unrelated local
+            # setting could decide (or reject) the composition under test.
+            env_file.write_text(
+                "TSM_AGT_MODEL_BASE_URL=https://models.example.test/v1\n"
+                "TSM_AGT_MODEL=open\n"
+                "TSM_AGT_OPEN_MODEL=test-model\n"
+                "TSM_AGT_MODEL_API_KEY=test-secret\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                application = compose_openai_compatible_engineering_application_from_env(
+                    env_file
+                )
         await application.registry.start_all()
         try:
             self.assertEqual(
@@ -205,7 +212,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                 [tool.name for tool in await application.kernel.list_tools()],
                 [
                     "core.list_files", "core.find_files",
-                    "core.read_file", "core.search_text",
+                    "core.read_file", "core.search_text", "core.grep_search",
                     "web.search", "web.fetch_markdown", "content.summarize",
                     "core.run_command",
                     "core.process_status", "core.process_logs",
@@ -350,8 +357,9 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             env_file = Path(directory) / ".env"
             env_file.write_text(
                 "# local settings\n"
+                "TSM_AGT_MODEL=open\n"
                 "TSM_AGT_MODEL_BASE_URL='http://127.0.0.1:5580'\n"
-                "export TSM_AGT_MODEL=local-model\n"
+                "export TSM_AGT_OPEN_MODEL=local-model\n"
                 "TSM_AGT_MODEL_API_KEY=local-secret\n"
                 "UNRELATED_SECRET=must-not-load\n",
                 encoding="utf-8",
@@ -360,7 +368,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                 application = compose_openai_compatible_readonly_application_from_env(
                     env_file
                 )
-                self.assertEqual(os.environ["TSM_AGT_MODEL"], "local-model")
+                self.assertNotIn("TSM_AGT_OPEN_MODEL", os.environ)
                 self.assertNotIn("UNRELATED_SECRET", os.environ)
             self.assertIsNotNone(application.registry.require(ModelProviderPort))
 
@@ -369,12 +377,13 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             env_file = Path(directory) / ".env"
             env_file.write_text(
                 "TSM_AGT_MODEL_BASE_URL=http://127.0.0.1:5580\n"
-                "TSM_AGT_MODEL=test-model\n"
+                "TSM_AGT_OPEN_MODEL=test-model\n"
                 "TSM_AGT_MODEL_API_KEY=test-secret\n"
                 "TSM_AGT_MODEL_TIMEOUT_SECONDS=240\n"
                 "TSM_AGT_MODEL_MAX_RETRIES=4\n"
                 "TSM_AGT_MODEL_RETRY_BACKOFF_SECONDS=0.5\n"
-                "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=max_completion_tokens\n"
+                "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=max_tokens\n"
+                "TSM_AGT_MODEL=open\n"
                 "TSM_AGT_MODEL_STRICT_TOOL_SCHEMA=false\n"
                 "TSM_AGT_MODEL_STREAMING=false\n",
                 encoding="utf-8",
@@ -390,21 +399,48 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(provider._max_retries, 4)
             self.assertEqual(provider._retry_backoff_seconds, 0.5)
             self.assertEqual(
-                provider._output_token_parameter, "max_completion_tokens"
+                provider._output_token_parameter, "max_tokens"
             )
+            metadata = application.kernel.dependencies.configuration_metadata
+            self.assertEqual(metadata["model"]["protocol"], "open")
+            self.assertEqual(metadata["model"]["output_token_parameter"], "max_tokens")
             self.assertFalse(provider._strict_tool_schema)
             self.assertFalse(provider._streaming)
             self.assertFalse(provider.capabilities.strict_json_schema)
+
+    async def test_native_anthropic_protocol_selects_messages_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text(
+                "TSM_AGT_MODEL_BASE_URL=https://gateway.example.test\n"
+                "TSM_AGT_ANTHROPIC_MODEL=claude-gateway-model\n"
+                "TSM_AGT_MODEL_API_KEY=test-secret\n"
+                "TSM_AGT_MODEL=anthropic\n"
+                "TSM_AGT_ANTHROPIC_VERSION=2023-06-01\n"
+                "TSM_AGT_MODEL_STREAMING=false\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                application = compose_openai_compatible_engineering_application_from_env(env_file)
+            provider = application.registry.require(ModelProviderPort)
+            self.assertIsInstance(provider._provider, AnthropicMessagesModelProvider)
+            self.assertEqual(provider._provider._anthropic_version, "2023-06-01")
+            metadata = application.kernel.dependencies.configuration_metadata
+            self.assertEqual(metadata["model"]["provider"], "anthropic-messages")
+            self.assertEqual(metadata["model"]["protocol"], "anthropic")
 
     async def test_context_compaction_settings_enter_effective_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
             env_file = Path(directory) / ".env"
             env_file.write_text(
                 "TSM_AGT_MODEL_BASE_URL=http://127.0.0.1:5580\n"
-                "TSM_AGT_MODEL=test-model\n"
+                "TSM_AGT_OPEN_MODEL=test-model\n"
                 "TSM_AGT_MODEL_API_KEY=test-secret\n"
                 "TSM_AGT_CONTEXT_COMPACTION_RATIO=0.75\n"
-                "TSM_AGT_CONTEXT_LATENCY_SOFT_TOKENS=60000\n",
+                "TSM_AGT_CONTEXT_LATENCY_SOFT_TOKENS=60000\n"
+                # Protocol selector is required alongside the per-protocol model
+                # name (see .env.example).
+                "TSM_AGT_MODEL=open\n",
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):
@@ -449,13 +485,16 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             env_file = Path(directory) / ".env"
             env_file.write_text(
                 "TSM_AGT_MODEL_BASE_URL=http://127.0.0.1:5580\n"
-                "TSM_AGT_MODEL=test-model\n"
+                "TSM_AGT_OPEN_MODEL=test-model\n"
                 "TSM_AGT_MODEL_API_KEY=test-secret\n"
                 "TSM_AGT_AGENT_MAX_MODEL_CALLS=18\n"
                 "TSM_AGT_AGENT_MAX_TOOL_CALLS=48\n"
                 "TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS=3\n"
                 "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS=32\n"
-                "TSM_AGT_EXPLORATION_MAX_ACTIONS=31\n",
+                "TSM_AGT_EXPLORATION_MAX_ACTIONS=31\n"
+                # Protocol selector is required alongside the per-protocol model
+                # name (see .env.example).
+                "TSM_AGT_MODEL=open\n",
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):

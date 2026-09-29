@@ -298,15 +298,18 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .composer-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
 .composer-title{font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#94a3b8}
 .composer-hint{font-size:11px;color:var(--muted);white-space:nowrap;display:flex;align-items:center;min-height:36px}
-.composer-input-row{display:flex;align-items:center;gap:10px;min-width:0}
+.composer-input-row{display:flex;align-items:flex-start;gap:10px;min-width:0}
 .textarea-wrap{flex:1;min-width:0;display:flex;align-items:center}
 textarea{width:100%;min-height:48px;max-height:140px;background:#f3f4f6;border:none;color:#0f172a;font:inherit;font-size:14px;line-height:1.45;resize:none;outline:none;padding:10px 12px;border-radius:12px;transition:background .2s ease,box-shadow .2s ease}
 textarea:focus{border-color:#91caff;background:#ffffff;box-shadow:0 0 0 3px rgba(22,119,255,.08)}
 textarea::placeholder{color:#94a3b8}
-.composer-actions{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-shrink:0;min-height:48px}
-.send-btn{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:linear-gradient(135deg,#4096ff,#1677ff);color:#fff;padding:9px 16px;border-radius:999px;font-weight:600;letter-spacing:.01em;box-shadow:0 6px 14px rgba(22,119,255,.16);transition:background .2s ease,box-shadow .2s ease}
-.send-btn.cancel-state{background:linear-gradient(135deg,#ff7875,#cf1322);box-shadow:0 6px 14px rgba(207,19,34,.24)}
-.send-btn:disabled{background:#3a4560;box-shadow:none;cursor:not-allowed}
+.composer-actions{display:flex;flex-direction:column;align-items:flex-start;justify-content:flex-start;gap:8px;flex-shrink:0;min-height:40px}
+.composer-action-buttons{display:flex;align-items:center;gap:10px}
+.send-btn,.cancel-btn{display:inline-flex;align-items:center;justify-content:center;min-height:40px;color:#fff;padding:9px 16px;border-radius:8px;font-weight:600;letter-spacing:.01em;transition:background .2s ease,box-shadow .2s ease}
+.send-btn{background:linear-gradient(135deg,#4096ff,#1677ff);box-shadow:0 6px 14px rgba(22,119,255,.16)}
+.cancel-btn{background:linear-gradient(135deg,#ff7875,#cf1322);box-shadow:0 6px 14px rgba(207,19,34,.24)}
+.cancel-btn.hidden{display:none}
+.send-btn:disabled,.cancel-btn:disabled{background:#3a4560;box-shadow:none;cursor:not-allowed}
 .preview-list{display:flex;gap:8px;overflow:auto}
 .preview-item{position:relative;flex:none}
 .preview-item img{width:40px;height:40px;object-fit:cover;border-radius:6px;display:block;border:1px solid var(--border);cursor:pointer;transition:transform .16s ease,box-shadow .16s ease}
@@ -393,18 +396,19 @@ textarea::placeholder{color:#94a3b8}
         <div class=\"composer-meta\">
           <div>
             <div class=\"composer-title\">当前任务</div>
-            <div class=\"composer-hint\">Enter 发送消息，Shift + Enter 换行</div>
           </div>
-          <div class=\"composer-hint\">支持粘贴截图与 markdown</div>
         </div>
         <div class=\"composer-input-row\">
           <div class=\"textarea-wrap\">
             <textarea id=\"prompt\" placeholder=\"描述你希望完成的任务、修复的问题或需要分析的内容…\" onpaste=\"handlePaste(event)\"></textarea>
           </div>
           <div class=\"composer-actions\">
-            <button class=\"icon-btn\" onclick=\"document.getElementById('image-input').click()\" title=\"上传图片\">＋ 图片</button>
-            <input id=\"image-input\" type=\"file\" accept=\"image/*\" multiple onchange=\"handleImages(event)\" style=\"display:none\" />
-            <button id=\"send-btn\" class=\"send-btn\" onclick=\"handleComposerAction()\">发送</button>
+            <button id=\"cancel-btn\" class=\"cancel-btn hidden\" onclick=\"handleCancelAction()\">cancel</button>
+            <div class=\"composer-action-buttons\">
+              <button class=\"icon-btn\" onclick=\"document.getElementById('image-input').click()\" title=\"上传图片\">＋ 图片</button>
+              <input id=\"image-input\" type=\"file\" accept=\"image/*\" multiple onchange=\"handleImages(event)\" style=\"display:none\" />
+              <button id=\"send-btn\" class=\"send-btn\" onclick=\"runTask()\">发送</button>
+            </div>
           </div>
         </div>
       </div>
@@ -514,8 +518,9 @@ function getActiveWorkspace() {
 }
 
 function updateComposerButtonState() {
-  const button = document.getElementById('send-btn');
-  if (!button) return;
+  const sendButton = document.getElementById('send-btn');
+  const cancelButton = document.getElementById('cancel-btn');
+  if (!sendButton || !cancelButton) return;
 
   const runningTask = conversations
     .flatMap((conversation) => conversation.messages || [])
@@ -524,20 +529,18 @@ function updateComposerButtonState() {
       return task && !TERMINAL_STATES.includes(task.phase1State);
     });
 
+  sendButton.disabled = !getActiveWorkspace();
+
   if (runningTask?.task?.taskId) {
-    button.textContent = '取消';
-    button.classList.add('cancel-state');
-    button.dataset.mode = 'cancel';
-    button.dataset.taskId = runningTask.task.taskId;
-    button.disabled = false;
+    cancelButton.classList.remove('hidden');
+    cancelButton.dataset.taskId = runningTask.task.taskId;
+    cancelButton.disabled = false;
     return;
   }
 
-  button.textContent = '发送';
-  button.classList.remove('cancel-state');
-  button.dataset.mode = 'send';
-  button.dataset.taskId = '';
-  button.disabled = !getActiveWorkspace();
+  cancelButton.classList.add('hidden');
+  cancelButton.disabled = false;
+  cancelButton.dataset.taskId = '';
 }
 
 function updateWorkspaceState() {
@@ -1687,18 +1690,6 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
       card.appendChild(actions);
     }
   }
-  // Optional cancel affordance for any non-terminal Task (spec §8).
-  if (['running', 'awaiting_approval', 'awaiting_user', 'interrupted']
-      .includes(task.status)) {
-    const actions = document.createElement('div');
-    actions.className = 'approval-actions';
-    const cancel = document.createElement('button');
-    cancel.className = 'approval-btn deny';
-    cancel.textContent = '取消任务';
-    cancel.onclick = () => cancelTask(task.taskId, conversationId);
-    actions.appendChild(cancel);
-    card.appendChild(actions);
-  }
   element.appendChild(card);
 }
 
@@ -2196,14 +2187,9 @@ function describeProgress(progress) {
   return progress.activity || '';
 }
 
-async function handleComposerAction() {
-  const button = document.getElementById('send-btn');
-  if (button?.dataset.mode === 'cancel') {
-    await cancelRunningTask(button.dataset.taskId);
-    return;
-  }
-
-  await runTask();
+async function handleCancelAction() {
+  const button = document.getElementById('cancel-btn');
+  await cancelRunningTask(button?.dataset.taskId);
 }
 
 async function cancelRunningTask(taskId) {
