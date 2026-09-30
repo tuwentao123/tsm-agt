@@ -143,18 +143,50 @@ HEAD 有差异，**优先用备份覆盖它们**（前提是先按第 6 节备�
 
 ---
 
-## 6. 覆盖备份前的安全动作
+## 6. 覆盖备份前的安全动作（已做成脚本）
+
+**不要手敲 29 次 `cp`。** 用 `scripts/restore_from_backup.sh`，它默认只预览：
 
 ```bash
-cd /Users/tusima/Documents/学习/tsm-agt
-git log --oneline -1 > /tmp/BASE.txt   # 记为 BASE，出问题可回来
-git diff HEAD > /tmp/current.patch     # 现在应为空
+# ① 预览：逐文件打印「当前 HEAD 版本 vs 备份版本」的差异行数，不写任何文件
+scripts/restore_from_backup.sh <备份根目录>
+
+# ② 确认差异方向正确（备份不应比当前更旧）后，才真正恢复
+scripts/restore_from_backup.sh <备份根目录> --apply
 ```
 
-**只覆盖文件，不要 `git add` 整个目录，也不要提交。** 覆盖后：
+脚本的四个保证：
+
+1. **默认只预览**，不加 `--apply` 绝不写文件。
+2. **只碰清单里的 29 个文件**，并明确跳过第 1 节末尾那 3 个「勿覆盖」文件。
+3. 先检查备份根目录确实含 `src/tsm_agt/core/kernel.py`，避免路径拼错后到处乱拷。
+4. `--apply` 前自动打标签 `pre-restore-<HEAD>`，且要求**已跟踪文件干净**
+   （未跟踪文件不拦），排除恢复后分不清差异来源的情况。
+
+**回退方式（关键）**：我这轮全部改动都已提交，所以任何被覆盖的文件都能原样拿回：
 
 ```bash
+git checkout HEAD -- <路径>
+# 或整体回到恢复前：
+git checkout pre-restore-<HEAD> -- .
+```
+
+已实测的完整流程：预览 → `--apply` → `git checkout HEAD -- <路径>` 回退 →
+工作区干净、全量仍 `1429 passed / 13 skipped`、无遗留标签。
+
+恢复后的验收命令脚本会直接打印，核心四条：
+
+```bash
+# ① 用例数应回到 ~1470（事故前 1469 + 本轮新增 1）
+.venv/bin/python -m pytest tests/ --collect-only -q | tail -1
+
+# ② 全量
 .venv/bin/python -m pytest tests/ -q
+
+# ③ 主导失败模式的产码应出现（此前只有 turn_outcome.py 的识别列表有这串）
+grep -rn "verifier blocked" src/ --include=*.py
+
+# ④ 真库的 EXECUTING 数应从 3 降到 0（先看 §8.3 的扫描范围）
 ```
 
 ---
