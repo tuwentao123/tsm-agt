@@ -325,6 +325,9 @@ from .verification import (
     AcceptanceResult, AcceptanceStatus, Evidence, TaskVerificationResult,
     terminal_state_for,
 )
+from .verification_criteria import (
+    seed_acceptance_criteria,
+)
 from .evidence_question import (
     EvidenceQuestionProjector, EvidenceQuestionProjection,
     EvidenceQuestionStatus, ToolActionDisposition,
@@ -9578,68 +9581,6 @@ class Kernel:
             for reference in candidate.fulfillment_refs
             if reference.rsplit(":", 1)[-1] == ToolEffect.OBSERVE.value
         ))
-        # Legacy Outcome events are never synthesized during new verification.
-        for outcome in ():
-            local_fulfilled_effects = {
-                ToolEffect(ref.rsplit(":", 1)[-1])
-                for ref in outcome.fulfillment_refs
-                if ref.rsplit(":", 1)[-1] in {
-                    item.value for item in ToolEffect
-                }
-            }
-            reusable_refs = (
-                tuple(
-                    reference for reference in shared_observation_refs
-                    if reference not in outcome.fulfillment_refs
-                )
-                if outcome.kind in {
-                    TaskOutcomeKind.ANSWER, TaskOutcomeKind.EVIDENCE,
-                }
-                and ToolEffect.OBSERVE in outcome.required_effects
-                else ()
-            )
-            fulfilled_effects = set(local_fulfilled_effects)
-            if reusable_refs:
-                fulfilled_effects.add(ToolEffect.OBSERVE)
-            synthesized_kind = (
-                outcome.kind in {
-                    TaskOutcomeKind.ANSWER, TaskOutcomeKind.EVIDENCE,
-                }
-                or (
-                    outcome.kind is TaskOutcomeKind.ARTIFACT_DELIVERY
-                    and ToolEffect.MUTATE not in outcome.required_effects
-                )
-            )
-            effects_ready = set(outcome.required_effects).issubset(
-                fulfilled_effects
-            )
-            if (
-                outcome.required and not outcome.status.is_closed
-                and synthesized_kind and effects_ready
-                and answer_result is not None
-                and answer_result.status is AcceptanceStatus.PASSED
-            ):
-                fulfillment_events = tuple(
-                    ("task_outcome.state_changed", {
-                        "outcome_id": outcome.outcome_id,
-                        "status": TaskOutcomeStatus.IN_PROGRESS.value,
-                        "fulfillment_ref": reference,
-                        "reason": "shared_task_observation",
-                    })
-                    for reference in reusable_refs
-                )
-                await self._append_events(task_id, fulfillment_events + ((
-                    "task_outcome.state_changed", {
-                        "outcome_id": outcome.outcome_id,
-                        "status": TaskOutcomeStatus.DELIVERED.value,
-                        "fulfillment_ref": answer_reference,
-                        "reason": (
-                            "verified_assistant_answer"
-                            if outcome.kind is TaskOutcomeKind.ANSWER
-                            else "verified_synthesized_outcome"
-                        ),
-                    },
-                ),))
         if task_spec.schema_version == 0:
             events = await self._dependencies.store.read_events(task_id)
             task_spec = TaskSpecProjector.project(task_id, task.goal, events)
@@ -9684,76 +9625,15 @@ class Kernel:
             "task_spec_hash": task_spec.content_hash,
         }),))
 
-        criteria: list[AcceptanceResult] = []
-        # Judgement criteria are *deferred* so the semantic stage always runs
-        # after every deterministic criterion (SPEC §7 P2 three-stage split).
-        # Two things fall out of that order, both required by the SPEC: a Task
-        # that already fails deterministically never pays for a judge call, and
-        # a read-only diagnostic caller can reuse the deterministic stage alone.
-        deferred_semantic: list[TaskAcceptanceCriterion] = []
-        if mandatory_answer_completeness:
-            assert answer_result is not None
-            criteria.append(answer_result)
-        if task_spec.schema_version == 0:
-            open_required = tuple(
-                outcome for outcome in task_spec.outcomes
-                if outcome.required and not outcome.status.is_closed
-            )
-            criteria.append(AcceptanceResult(
-                "task-outcome-fulfillment",
-                (AcceptanceStatus.BLOCKED if open_required
-                 else AcceptanceStatus.PASSED),
-                tuple(Evidence(
-                    "task_outcome",
-                    "required Task outcome has durable fulfillment",
-                    f"{outcome.status.value}: {outcome.description}",
-                    outcome.outcome_id, False,
-                ) for outcome in open_required) or (Evidence(
-                    "task_outcome",
-                    "required Task outcomes have durable fulfillment",
-                    "all required outcomes are closed",
-                    "task-spec", True,
-                ),),
-            ))
-        if answer_evidence_result is not None:
-            criteria.append(answer_evidence_result)
-        if goal_command_result is not None:
-            criteria.append(goal_command_result)
-        if incomplete_questions:
-            criteria.append(AcceptanceResult(
-                "evidence-question-lifecycle", AcceptanceStatus.BLOCKED,
-                tuple(Evidence(
-                    "evidence_question",
-                    "a tool-bound evidence question obtained a trustworthy result",
-                    (
-                        f"question {record.question_ref} blocked: "
-                        f"{record.blocking_reason or 'UNKNOWN'}"
-                    ),
-                    record.tool_call_ids[-1] if record.tool_call_ids else "verifier",
-                    False,
-                ) for record in incomplete_questions),
-            ))
-        if final_acceptance is not None:
-            criteria.append(AcceptanceResult(
-                "final-evidence-integrity",
-                (AcceptanceStatus.PASSED
-                 if final_acceptance.action is FinalAcceptanceAction.PASS
-                 else AcceptanceStatus.BLOCKED),
-                tuple(
-                    Evidence(
-                        "final_evidence_integrity",
-                        "required final conclusions are backed by trusted, "
-                        "in-scope persisted evidence",
-                        violation.observed, violation.subject_ref, False,
-                    )
-                    for violation in final_acceptance.violations
-                ) or (Evidence(
-                    "final_evidence_integrity",
-                    "required final conclusions are backed by trusted, "
-                    "in-scope persisted evidence",
-                    final_acceptance.reason, "final-acceptance-policy", True,
-                ),),
-            ))
+        criteria, deferred_semantic = seed_acceptance_criteria(
+            task_spec=task_spec,
+            mandatory_answer_completeness=mandatory_answer_completeness,
+            answer_result=answer_result,
+            answer_evidence_result=answer_evidence_result,
+            goal_command_result=goal_command_result,
+            incomplete_questions=incomplete_questions,
+            final_acceptance=final_acceptance,
+        )
         workspace_evidence: list[Evidence] = []
         root = Path(task.workspace)
         active_mutations: dict[str, MutationRecord] = {}
@@ -12126,14 +12006,6 @@ class Kernel:
         state.checkpoint = self._synchronize_tool_batch(state.checkpoint)
         state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
 
-        # --- MIGRATION SCAFFOLDING -------------------------------------------
-        # The turn body below still reads these as bare locals. Each alias is
-        # deleted as its region is converted to ``state.<field>``; the remaining
-        # ones are exactly the fields not yet migrated, so this block shrinks to
-        # nothing and then goes away. Do not add a name here -- a new value
-        # belongs on ``TurnState``.
-        # ---------------------------------------------------------------------
-
         while True:
             # Cooperative cancellation boundary (task-cancellation-spec §7): a
             # durable cancel may have landed since the last step (another
@@ -12157,49 +12029,12 @@ class Kernel:
             if _final.action is PhaseAction.CONTINUE:
                 continue
     async def _begin_iteration(self, state: TurnState) -> PhaseVerdict:
-        """Loop-head hygiene: cancellation, steering and the tool batch.
+        """Forward to the turn-phase sibling (late import: no cycle)."""
 
-        Extracted from ``_continue_agent_turn``. ``OK`` means the iteration is
-        cleared to prepare its model call; ``RETURN`` carries a terminal outcome
-        the caller must return unchanged.
-        """
-        if self.cancellation_signal(state.task_id).requested():
-            raise asyncio.CancelledError(
-                "task cancelled at a turn boundary"
-            )
-        state.checkpoint = self._synchronize_tool_batch(replace(
-            state.checkpoint, messages=tuple(state.messages),
-            pending_tool_calls=tuple(state.pending_tool_calls),
-        ))
-        state.checkpoint = await self._cancel_open_batch_for_queued_replace(
-            state.checkpoint
-        )
-        state.messages = list(state.checkpoint.messages)
-        state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
-        state.checkpoint, replaced = await self._apply_pending_steering(
-            replace(
-                state.checkpoint, messages=tuple(state.messages),
-                pending_tool_calls=tuple(state.pending_tool_calls),
-                seen_call_ids=tuple(sorted(state.seen_call_ids)),
-                model_calls=state.model_call_count, tool_calls=state.tool_call_count,
-                input_tokens=state.input_tokens, output_tokens=state.output_tokens,
-            ),
-            "before-tool-batch" if state.pending_tool_calls else "before-model",
-        )
-        state.messages = list(state.checkpoint.messages)
-        state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
-        if replaced:
-            state.pending_tool_calls.clear()
-            await self.plan_task_spec(state.task_id)
-            refreshed_spec = await self.get_task_spec(state.task_id)
-            state.checkpoint = replace(
-                state.checkpoint, task_spec_revision=refreshed_spec.revision,
-                task_spec_hash=refreshed_spec.content_hash,
-            )
-        _batch_outcome = await self._run_tool_batch(state)
-        if _batch_outcome is not None:
-                        return PhaseVerdict(PhaseAction.RETURN, _batch_outcome)
-        return PhaseVerdict(PhaseAction.OK)
+        from .turn_phases import _begin_iteration as _phase
+
+        return await _phase(self, state)
+
     async def _finish_iteration(self, state: TurnState) -> PhaseVerdict:
         """Forward to the turn-phase sibling (late import: no cycle)."""
 

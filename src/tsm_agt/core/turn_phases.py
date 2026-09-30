@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import asyncio
 import json
 import time
 from .agent_loop import (
@@ -42,6 +43,53 @@ from .turn import (
 from typing import (
     Any,
 )
+
+
+async def _begin_iteration(
+    kernel: Any, state: TurnState,
+) -> PhaseVerdict:
+    """Loop-head hygiene: cancellation, steering and the tool batch.
+
+    ``OK`` means the iteration is cleared to prepare its model call; ``RETURN``
+    carries a terminal outcome the caller must return unchanged.
+    """
+    if kernel.cancellation_signal(state.task_id).requested():
+        raise asyncio.CancelledError(
+            "task cancelled at a turn boundary"
+        )
+    state.checkpoint = kernel._synchronize_tool_batch(replace(
+        state.checkpoint, messages=tuple(state.messages),
+        pending_tool_calls=tuple(state.pending_tool_calls),
+    ))
+    state.checkpoint = await kernel._cancel_open_batch_for_queued_replace(
+        state.checkpoint
+    )
+    state.messages = list(state.checkpoint.messages)
+    state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
+    state.checkpoint, replaced = await kernel._apply_pending_steering(
+        replace(
+            state.checkpoint, messages=tuple(state.messages),
+            pending_tool_calls=tuple(state.pending_tool_calls),
+            seen_call_ids=tuple(sorted(state.seen_call_ids)),
+            model_calls=state.model_call_count, tool_calls=state.tool_call_count,
+            input_tokens=state.input_tokens, output_tokens=state.output_tokens,
+        ),
+        "before-tool-batch" if state.pending_tool_calls else "before-model",
+    )
+    state.messages = list(state.checkpoint.messages)
+    state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
+    if replaced:
+        state.pending_tool_calls.clear()
+        await kernel.plan_task_spec(state.task_id)
+        refreshed_spec = await kernel.get_task_spec(state.task_id)
+        state.checkpoint = replace(
+            state.checkpoint, task_spec_revision=refreshed_spec.revision,
+            task_spec_hash=refreshed_spec.content_hash,
+        )
+    batch_outcome = await kernel._run_tool_batch(state)
+    if batch_outcome is not None:
+        return PhaseVerdict(PhaseAction.RETURN, batch_outcome)
+    return PhaseVerdict(PhaseAction.OK)
 
 
 async def _prepare_model_call(
