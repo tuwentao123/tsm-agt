@@ -211,7 +211,7 @@ derive_turn_outcome(FAILED, "SDK verifier blocked")
 `# The exact wording from the ledger: 69 + 46 tasks reached FAILED this way.`
 —— 与我独立从台账数出来的 69 + 46 完全一致。
 
-### 9.2 但这个修复**没有接进生产**
+### 8.2 但这个修复**没有接进生产**
 
 ```
 derive_turn_outcome        无生产消费者
@@ -228,7 +228,7 @@ finalize_turn              无生产消费者
 `turn_outcome.py` 的识别列表里作为子串出现）。产码在 `sdk/runtime.py` / `cli.py` 里，
 而这两个文件都在丢失清单上。→ **恢复备份很可能就把这一步带回来了，不必我从头接线。**
 
-### 9.3 三个真实 Task 永久卡在 EXECUTING，且启动期 reconcile 够不到
+### 8.3 三个真实 Task 永久卡在 EXECUTING，且启动期 reconcile 够不到
 
 ```
 task-c83385c6ba8447868cbd596f11b58cb0  EXECUTING  查下今天的nba新闻
