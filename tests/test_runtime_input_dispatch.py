@@ -22,7 +22,10 @@ import asyncio
 import unittest
 from typing import get_args
 
-from tsm_agt.core.kernel import Kernel, _INPUT_HANDLERS
+from tsm_agt.core.kernel import Kernel
+# The dispatch table moved with the input-routing slice; an *import* follows the
+# definition (a *patch target* would follow wherever the moved body reads it).
+from tsm_agt.core.kernel_input import _INPUT_HANDLERS
 from tsm_agt.core.runtime_input import RuntimeInputEvent
 
 
