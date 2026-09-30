@@ -560,16 +560,6 @@ def _render_workspace_patch(
     return content
 
 
-def _is_verification_command(arguments: Mapping[str, Any]) -> bool:
-    """Whether a tool call is a bounded build/test/lint command.
-
-    Delegates to the single recognizer shared with authoring-time validation, so
-    "what the Runtime demands" and "what the Runtime accepts" cannot drift apart
-    (see ``core/verification_command.py``).
-    """
-
-    return is_verification_request(arguments)
-
 
 def _task_spec_requires_command_verification(spec: TaskSpecSnapshot) -> bool:
     """Derive command verification solely from the declared Task contract."""
@@ -895,7 +885,7 @@ def _post_mutation_verification(
         data = execution.result.data if execution.result is not None else None
         if (
             execution.call.name != "core.run_command"
-            or not _is_verification_command(execution.call.arguments)
+            or not is_verification_request(execution.call.arguments)
             or not _matches_declared_command(
                 execution.call.arguments, declared_command,
             )
@@ -7544,7 +7534,7 @@ class Kernel(SessionMixin):
             verification_runs = [
                 execution for execution in task.tool_executions.values()
                 if execution.call.name == "core.run_command"
-                and _is_verification_command(execution.call.arguments)
+                and is_verification_request(execution.call.arguments)
                 and execution.updated_at >= latest_mutation.created_at
                 and execution.state is ToolCommitState.COMMITTED
                 and execution.result is not None and execution.result.ok
@@ -12004,7 +11994,7 @@ class Kernel(SessionMixin):
                 if (
                     call.name == "core.run_command"
                     and task.mutation_journal
-                    and _is_verification_command(call.arguments)
+                    and is_verification_request(call.arguments)
                 ):
                     return result(
                         OutcomeBindingAction.ACCEPT,
