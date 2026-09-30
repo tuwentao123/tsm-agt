@@ -526,6 +526,69 @@ class AgentTurnCheckpoint:
         return {**self._content_data(), "checkpoint_hash": self.checkpoint_hash}
 
 
+@dataclass(slots=True)
+class TurnState:
+    """Every local the agent turn threads through its loop body.
+
+    Mirrors Hermes' ``_LoopState`` (``agent/conversation_loop.py:1385-1420``),
+    including two of its choices that look like sloppiness and are not:
+
+    * **Most fields are ``Any``.** Hermes types only ``retry_count`` and
+      ``finish_reason``; everything else is opaque to the state holder. The loop
+      passes values through without interpreting them, and naming a type per
+      field would add an import edge per field for no reader. Concrete types
+      appear below only where the initial value carries meaning.
+    * **Slots are rebound before any later reader.** That docstring is explicit:
+      "Per-iteration slots are rebound by the phases before any later phase reads
+      them, exactly as the former inline locals were."
+
+    The point of the object is the contract stated in that same docstring: a new
+    phase input or output needs **a field here and nothing else**. Until this
+    exists, splitting the 2,133-line turn body
+    (``core/kernel.py::_continue_agent_turn``) would only trade one god function
+    for several tightly-coupled ones -- every extracted phase would have to take
+    twenty-odd values as parameters and return as many.
+
+    Nothing mutates this yet: the turn body still uses its inline locals, and the
+    type is introduced first so the split has somewhere to land.
+    """
+
+    # Fixed for the turn.
+    task_id: str = ""
+    turn_id: str = ""
+    visible_tools: Any = ()
+    initial_tool_message: Any = None
+    recover_interrupted: bool = False
+    on_text_delta: Any = None
+    on_progress: Any = None
+
+    # Resolved once during the prologue.
+    live_spec: Any = None
+    closed_outcomes_at_entry: Any = None
+    checkpoint: Any = None
+    visible_tool_by_name: Any = None
+
+    # Per-iteration slots, rebound as the loop progresses.
+    messages: Any = None
+    pending_tool_calls: Any = None
+    seen_call_ids: Any = None
+    model_call_count: int = 0
+    tool_call_count: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    last_tool_error: Any = None
+    plan_guard: Any = None
+
+    # Bounded-correction and wrap-up bookkeeping. These start false/zero and are
+    # latched by the phases that own them -- the fields a future ``_run_phase``
+    # would copy back by name rather than clear.
+    no_progress_stop: bool = False
+    budget_wrap_up: bool = False
+    budget_wrap_up_decision: Any = None
+    protocol_recovery_attempts: int = 0
+    protocol_correction: Any = None
+
+
 @dataclass(frozen=True, slots=True)
 class AgentTurnResult:
     turn_id: str

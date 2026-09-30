@@ -1067,3 +1067,63 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TurnStateTest(unittest.TestCase):
+    """The turn state must be a mutable, slotted, self-describing bag.
+
+    It exists so a future phase split needs "a field here and nothing else"
+    (Hermes ``agent/conversation_loop.py:1385-1420``). That contract makes three
+    properties load-bearing, and each one is asserted rather than assumed.
+    """
+
+    def test_defaults_are_the_documented_initial_values(self):
+        from tsm_agt.core import TurnState
+
+        state = TurnState()
+        # Bounded-correction counters start clear and are latched by their owner.
+        self.assertFalse(state.no_progress_stop)
+        self.assertFalse(state.budget_wrap_up)
+        self.assertIsNone(state.budget_wrap_up_decision)
+        self.assertEqual(state.protocol_recovery_attempts, 0)
+        self.assertIsNone(state.protocol_correction)
+        self.assertEqual(state.model_call_count, 0)
+        self.assertEqual(state.tool_call_count, 0)
+        self.assertEqual(state.input_tokens, 0)
+        self.assertEqual(state.output_tokens, 0)
+
+    def test_slots_are_rebindable(self):
+        """Phases rebind slots rather than reassigning enclosing locals."""
+
+        from tsm_agt.core import TurnState
+
+        state = TurnState(task_id="task-1", turn_id="turn-1")
+        state.messages = ["m"]
+        state.pending_tool_calls = ["c"]
+        state.model_call_count += 1
+        self.assertEqual(state.messages, ["m"])
+        self.assertEqual(state.pending_tool_calls, ["c"])
+        self.assertEqual(state.model_call_count, 1)
+
+    def test_an_undeclared_slot_fails_loudly(self):
+        """Slots keep a typo from silently creating a parallel field.
+
+        A phase that writes ``state.message`` instead of ``state.messages`` must
+        fail at the write, not mysteriously lose its input.
+        """
+
+        from tsm_agt.core import TurnState
+
+        state = TurnState()
+        with self.assertRaises(AttributeError):
+            state.message = "typo"
+
+    def test_it_is_not_frozen(self):
+        """Contrast with the turn's *results*, which are frozen."""
+
+        import dataclasses as dc
+
+        from tsm_agt.core import AgentTurnResult, TurnState
+
+        self.assertFalse(dc.fields(TurnState) and TurnState.__dataclass_params__.frozen)
+        self.assertTrue(AgentTurnResult.__dataclass_params__.frozen)
