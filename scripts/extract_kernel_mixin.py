@@ -392,7 +392,22 @@ def main(argv: list[str] | None = None) -> int:
     # branch nobody exercises -- which is the failure this whole script exists to
     # prevent.
     late_sites: dict[str, list[str]] = {}
+    def _is_static(name: str) -> bool:
+        """Whether the method has no ``self``, so ``self.`` must not be emitted."""
+
+        return any(
+            (isinstance(d, ast.Name) and d.id in {"staticmethod", "classmethod"})
+            or (isinstance(d, ast.Attribute) and d.attr in {"staticmethod", "classmethod"})
+            for d in methods[name].decorator_list
+        )
+
     for index, body in enumerate(method_bodies):
+        if not _is_static(names[index]):
+            body, rewritten = _rewrite_facade_static_calls(body)
+            if rewritten:
+                method_bodies[index] = body
+                print(f"  facade static call rewritten to self. in "
+                      f"{names[index]}: {rewritten}")
         needed = _reads_stuck_globals(body, set(stuck), wrapped=True)
         if needed:
             method_bodies[index] = _insert_late_imports(body, needed)
@@ -621,6 +636,29 @@ def _detached_symbol_imports(module: str) -> list[str]:
     return [f"{name} (imported at {', '.join(imported[name][:3])})" for name in names]
 
 
+def _rewrite_facade_static_calls(text: str) -> tuple[str, list[str]]:
+    """``Kernel.some_call(x)`` -> ``self.some_call(x)`` inside an **instance** method.
+
+    The only non-verbatim rewrite this script performs, so it reports every hit.
+    A moved method that reaches a sibling through the *class name* would otherwise
+    need a late import of ``Kernel`` itself -- correct at call time, but it drags
+    the facade back in and ignores the MRO the mixin shape exists to use. ``self``
+    is already a ``Kernel`` instance, and any ``Kernel.f(x)`` in this codebase must
+    be a ``@staticmethod``/``@classmethod`` (a plain method would already miss
+    ``self``), so ``self.f(x)`` is equivalent for both.
+    """
+
+    rewritten: list[str] = []
+    patched = re.sub(
+        r"\bKernel\.([A-Za-z_][A-Za-z0-9_]*)\(",
+        lambda match: (
+            rewritten.append(match.group(1)) or f"self.{match.group(1)}("
+        ),
+        text,
+    )
+    return patched, sorted(set(rewritten))
+
+
 def _reads_stuck_globals(text: str, stuck: set[str], *, wrapped: bool) -> list[str]:
     """Which of ``stuck`` this fragment reads as a global.
 
@@ -668,8 +706,14 @@ def _insert_late_imports(text: str, names: list[str]) -> str:
         and isinstance(first.value, ast.Constant)
         and isinstance(first.value.value, str)
     )
-    anchor = first.end_lineno if is_docstring else first.lineno
-    indent = re.match(r"\s*", lines[anchor]).group(0)
+    # ``lines[:anchor]`` is kept, so the anchor is the last line that stays *above*
+    # the insertion: the docstring's last line when there is one, otherwise the
+    # line just before the first statement.
+    anchor = first.end_lineno if is_docstring else first.lineno - 1
+    # Indentation comes from the first body statement, not from the line at the
+    # anchor: a blank line between the docstring and the code has no indentation,
+    # and reading it there emitted the import at column zero.
+    indent = re.match(r"\s*", lines[first.lineno - 1]).group(0)
     statements = [f"{indent}from .kernel import {name}" for name in names]
     patched = "\n".join(lines[:anchor] + statements + lines[anchor:])
     return textwrap.indent(patched, prefix) if prefix else patched
