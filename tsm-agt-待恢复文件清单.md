@@ -145,6 +145,10 @@ HEAD 有差异，**优先用备份覆盖它们**（前提是先按第 6 节备�
 
 ## 6. 覆盖备份前的安全动作（已做成脚本）
 
+> ⚠️ 前提：**得先有一份备份。** 我在本机没找到任何可用恢复源（§8.4 有完整排查表）。
+> 如果备份在别的机器/移动硬盘/云端，用下面的脚本；如果没有，这一节跳过，
+> 因为 §8.2 已说明主导失败模式在当前代码里就是对的，不缺这一步。
+
 **不要手敲 29 次 `cp`。** 用 `scripts/restore_from_backup.sh`，它默认只预览：
 
 ```bash
@@ -198,24 +202,33 @@ grep -rn "verifier blocked" src/ --include=*.py
    一次 `git clean` 就能让整包不可导入——这正是"138 个收集错误"能发生的前提。
    现已全部入库（`c45f376`、`579e36a`），并用干净导出验证过。
 
-2. **两个模块目前只有测试消费者，未接入生产组合**（按原样入库存档，未擅自接线，
-   因为接线需要原始设计意图）：
-   - `core/turn_finalizer.py` —— 仅被 `tests/test_proof_closure.py:2429` 引用
+2. **两个模块目前只有测试消费者，未接入生产组合**（按原样入库存档，未擅自接线）：
+   - `core/turn_outcome.py` / `core/turn_finalizer.py` —— 仅被
+     `tests/test_proof_closure.py` 引用
    - `adapters/builtin/todo_tools.py` —— `adapters/builtin/__init__.py` 未注册它
 
-   这两个是否应该接进组合，需要你确认。
+   ⚠️ **不要把它们误读成「主导失败模式的修复没接线」**——那个修复在生产里是
+   `finalize_acceptance` → `terminal_state_for`，一直是接好的（见 §8.2 的更正）。
+   `turn_outcome` 是**读旧台账时的分类器**（把历史里的
+   `FAILED_STATE_WITH_UNDECIDABLE_REASON` 标出来），要不要在 CLI/Web 上展示
+   outcome 轴是独立的产品决定，需要你确认。
 
 ---
 
-## 8. 用真实台账核对后的三个发现（只读副本，原库未改动）
+## 8. 用真实台账核对后的发现（含两处**更正**）
 
 方法：用 SQLite 自己的 `backup()` API 把 `.agent/runtime.db`（447 MB）复制到 `/tmp` 再分析，
 原库全程只读。真实规模：77 Session / 687 Task / 114,840 事件。
 
+> ⚠️ 8.2 与 8.3 是**对同一份文档上一版的更正**。上一版我给的两个结论（"修复没接进
+> 生产"、"reconcile 扫描范围 bug"）都**不准确**，原因是我只看了 `turn_outcome.py`
+> 的消费者，没有顺着 `finalize_acceptance` 查下去，也没有查 `legacy-local-subject`
+> 这个值的来源。这里按证据改正。
+
 ### 8.1 主导失败模式是「无法判定被写成失败」，占真实的 71%
 
 真实 687 个 Task：`SUCCEEDED 446` / `FAILED 161` / `AWAITING_USER 32` /
-`INTERRUPTED 23` / `NEEDS_REVIEW 11` / `CANCELLED 7` / **`EXECUTING 3（永久卡住）`** /
+`INTERRUPTED 23` / `NEEDS_REVIEW 11` / `CANCELLED 7` / **`EXECUTING 3（卡住）`** /
 `AWAITING_APPROVAL 2` / `CONFLICT 2`。
 
 161 个 FAILED 的收尾原因：
@@ -243,53 +256,126 @@ derive_turn_outcome(FAILED, "SDK verifier blocked")
 `# The exact wording from the ledger: 69 + 46 tasks reached FAILED this way.`
 —— 与我独立从台账数出来的 69 + 46 完全一致。
 
-### 8.2 但这个修复**没有接进生产**
+**注意「reads 旧台账」这四个字**：这条测试是在**读历史数据**，不是在断言当前行为。
+下一节解释为什么。
+
+### 8.2 更正：这个修复**已经接进生产**了
+
+上一版我写「修复没有接进生产」，**错了**。生产路径是
+`finalize_acceptance` → `terminal_state_for`：
 
 ```
-derive_turn_outcome        无生产消费者
-outcome_inconsistencies    无生产消费者   (它能报 FAILED_STATE_WITH_UNDECIDABLE_REASON)
-classify_transition_reason 无生产消费者
-finalize_turn              无生产消费者
+core/kernel.py:2628      async def finalize_acceptance(task_id, status)
+core/verification.py:32  TERMINAL_STATE_BY_VERDICT = {
+                             PASSED: SUCCEEDED,
+                             BLOCKED: NEEDS_REVIEW,  # "Cannot decide" is not "the work failed"
+                             FAILED: FAILED,
+                             NOT_APPLICABLE: NEEDS_REVIEW,
+                         }
+core/verification.py:44  def terminal_state_for(status)   # 唯一映射入口
 ```
 
-四个都只被 `tests/test_proof_closure.py` 引用。所以运行时仍然把「无法判定」写成 `FAILED`，
-这就是「不知道如何完成闭环」在台账里的样子。
-
-**接线正是被销毁的那批未提交改动在做的事**：HEAD 源码里**没有任何地方生产**
-`"SDK verifier blocked"` / `"trusted verifier blocked"` 这两个字符串（只有
-`turn_outcome.py` 的识别列表里作为子串出现）。产码在 `sdk/runtime.py` / `cli.py` 里，
-而这两个文件都在丢失清单上。→ **恢复备份很可能就把这一步带回来了，不必我从头接线。**
-
-### 8.3 三个真实 Task 永久卡在 EXECUTING，且启动期 reconcile 够不到
+三个入口全部在调它，不是各写各的：
 
 ```
-task-c83385c6ba8447868cbd596f11b58cb0  EXECUTING  查下今天的nba新闻
-task-5711c97fe5244a388779fa855ee6c049  EXECUTING  帮我看下当前项目有哪几个文件夹 分别是啥功能
-task-9998de4ddd134474825800c8a01ed435  EXECUTING  必须使用可用的只读工具读取 src/tsm_agt/core/pol...
+src/tsm_agt/cli.py:637
+src/tsm_agt/cli.py:2203
+src/tsm_agt/sdk/runtime.py:1330
 ```
 
-它们的 3 个 Session 的 `subject = 'legacy-local-subject'`，而当前身份是 `uid:501`
-（77 个 Session 里 74 个是 `uid:501`）。会话查询按 subject 过滤：
+`tests/test_terminal_state_mapping.py` → 9 passed。
+
+git 历史也印证了这个演进过程（这正是你说的「git log 里面有信息」）：
+
+- `a2a9c1e`（09-27）里这段映射还**内联在** `sdk/runtime.py`：
+
+  ```python
+  elif verification.status is AcceptanceStatus.BLOCKED:
+      # INV-6: "cannot decide" is not "failed". A blocked verdict
+      # (for example a judged criterion with no available judge)
+      # must go to human review rather than be reported as a
+      # failure the work did not cause.
+      await kernel.transition_task(
+          result.task_id, TaskState.NEEDS_REVIEW,
+          f"SDK verifier {verification.status.value}",
+      )
+  ```
+
+- `fa44560`（我本轮动手**之前**的 HEAD）把它上收进内核，注释写着：
+
+  > Clients must not map for themselves: doing so is how a BLOCKED
+  > (undecided) verdict gets reported as a product failure.
+
+**所以那 115 个历史 FAILED 全部产生于 `fa44560` 之前，是历史数据，不代表当前行为。**
+
+那 `core/turn_outcome.py` / `core/turn_finalizer.py` 是什么？是**读旧台账时的分类器**：
+`outcome_inconsistencies()` 专门把老数据里的 `FAILED_STATE_WITH_UNDECIDABLE_REASON`
+标出来（8.1 引的那条测试正是在读历史）。它们没有生产消费者是一个**独立**问题
+（CLI/Web 要不要展示 outcome 轴、要不要把历史不一致报出来），**不是**「修复没接线」。
+
+我上一版的错误根源：看到 `derive_turn_outcome` 无消费者就下了结论，没有继续查
+`finalize_acceptance`。这是我该避免的推断方式。
+
+### 8.3 更正：那 3 个卡住的 Task 是身份功能上线前的 legacy 数据，**不是**扫描 bug
+
+上一版我写「问题出在扫描范围」。**不准确。** `legacy-local-subject` 并不是某个
+「另一个主体」，它是 store 在**数据里没有记录 subject 时**的兜底值：
+
+```
+src/tsm_agt/adapters/sqlite/runtime_store.py:813
+    subject = str(data.get("trust_subject") or "legacy-local-subject")
+```
+
+也就是说这 3 个 Session 是**身份功能上线之前**（2026-08-31）建的，本来就没有 subject
+可归属。当前身份 `uid:501` 看不到它们，是**设计上的主体边界**：
+
+```
+get_session(legacy_session) -> PermissionError: session belongs to another local subject
+```
+
+因此我**不会**把 `reconcile_orphaned_running_tasks` 改成跨主体扫描——那会越过一条
+安全边界，属于「未授权的扩大范围」。能确认的是 settle 逻辑本身没问题：
 
 ```
 list_sessions(include_archived=True) -> 74   （不是 77）
-get_session(legacy_session)          -> PermissionError: session belongs to another local subject
-reconcile_orphaned_running_tasks()   -> settled 0
-settle_orphaned_task(task)           -> True   （单独调用是成功的！）
+settle_orphaned_task(legacy task)    -> True （单独调用成功）
 ```
 
-所以问题出在**扫描范围**，不在 settle 逻辑。这三个 Session 建于 2026-08-31，
-恰好是身份从占位符 `legacy-local-subject` 切到 `uid:501` 之前。
+这 3 行 phantom `EXECUTING` 只存在于旧 Session 里，当前身份既看不到、也不会路由过去，
+**不影响你现在的使用**。要不要结算它们是一次数据迁移决定，需要你点头。
+
+### 8.4 「你来执行恢复」的结论：本机没有任何可用恢复源
+
+你让我自己执行，我把所有可能藏着一份工作区副本的地方全找了一遍：
+
+| 恢复源 | 结果 |
+|---|---|
+| APFS 本地快照（`tmutil listlocalsnapshots /`） | 只有 3 个 `com.apple.os.update-*`，**没有可用快照** |
+| Time Machine | 无 |
+| Cursor 本地历史（1087 项） | 按 `tsm-agt` 与 `task_spec.py`/`tool.py`/`kernel.py`/`sandbox.py`/`planner.py`/`runtime.py`/`cli.py` 搜，**0 命中**（历史只覆盖 `workSp/` 下的项目） |
+| VS Code 本地历史（94 项） | 同样 0 命中 |
+| `/tmp/tsm-agt-step6.g382PG`、`step7.ZnsJBi` | 只是 uv 缓存目录，不是仓库副本 |
+| `.git/lost-found` 的 18 个游离提交 | 12 个是 **`git stash` 提交**（09-16 ~ 09-27，此前 `git stash list` 为空但对象还在）、6 个是我本轮自己的重构提交。**逐个对比其相对父提交的差集**，用六个丢失符号（`EvidenceCapability`、`evidence_intent`、`validate_authored_criterion`、`ProofPlanCompiler`、`pending_steering`、`cited_evidence_ids`、`review_model`）搜 → **全部 0 命中** |
+| 全部 1077 个 git 对象 | 逐个解出搜 `SDK verifier blocked` / `trusted verifier blocked`，命中的都是**提交可达**的版本（SPEC 文档、`a2a9c1e` 的 `runtime.py`），**没有游离对象含丢失内容** |
+
+**结论：那 29 个文件的未提交改动在本机确实不可恢复。** §5 里我重建的部分已经是行为
+等价的替代品（全量绿 + 干净导出可跑）。
+
+如果你在**别的机器 / 移动硬盘 / 云端**还有一份备份，值得最后确认一次；但**继续工作
+不再需要等它**——因为 8.2 更正后可以看到，主导失败模式在当前代码里已经是对的。
 
 ---
 
 ## 9. 一句话结论
 
-代码层面已修到全量绿、干净导出可跑、真实 socket 的模型 HTTP 往返也实测通过；
-但**「真实场景能正常用」还不能确认**，差三件事：§8.2 的接线（或等备份恢复）、
-§8.3 的扫描范围、以及本沙箱无法访问模型端点（DNS 把
-`aibrain-large-model-engine-slow.hellobike.cn` 解析到 `198.18.0.71` 黑洞，
-`danger-full-access` 下依然如此）。
+| 维度 | 状态 |
+|---|---|
+| 代码 | 全量 `1429 passed / 13 skipped / 0 failed`；干净导出可跑；真实 socket 的模型 HTTP 往返实测通过 |
+| 真实台账的主导失败模式（71%） | **当前代码已经是对的**（§8.2 更正） |
+| 3 个 phantom EXECUTING | 身份功能上线前的 legacy 数据，不影响当前使用；结算需你点头（§8.3） |
+| 本机可恢复源 | **无**（§8.4） |
+| 仍缺的测试用例 | 28 个（§4），只有别的备份里才有 |
+| 唯一无法验证的 | **真实模型端点的端到端**：本沙箱把 `aibrain-large-model-engine-slow.hellobike.cn` 解析到 `198.18.0.71` 黑洞，`danger-full-access` 下依然如此；而 `pypi.org` / `github.com` 的 TLS 正常 → 是沙箱网络策略，不是本项目代码 |
 
 ---
 
