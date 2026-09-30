@@ -78,14 +78,57 @@ kernel.py              15,990 行
 | | 行数 |
 |---|---|
 | `run_agent.py`（门面） | **1,582** |
+| `AIAgent` 类本身 | **1,176 行 / 71 个方法** |
 | `agent/` 目录 | **250 文件 / 114,134 行**（平均 456 行） |
 
 **目标不是"每个文件 <2000 行"。** Hermes 自己 >2000 行的 `.py` 有 **50 个**，最大
 8,255 行（`agent/auxiliary_client.py`）。`AGENTS.md:246-248` 的规则是"**过 2000 就按
 `<stem>_<topic>` 拆，且单独一个 commit**"——是拆分**信号**，不是"必须小于"。
 
-⇒ 真正的目标是：**`kernel.py` 变成 ~1,500 行的门面（公开入口 + 别处 import 的名字），
-其余按 topic 变成 `core/*` 兄弟**，就像 `run_agent.py` 之于 `agent/turn_*.py`。
+### 3.2.1 门面的形状是 **Mixin**，不是"搬到模块级函数"
+
+这是 `run_agent.py:137-150` 读出来的、也是整个重构的关键：
+
+```python
+from agent.client_lifecycle import ClientLifecycleMixin
+from agent.stream_delivery import StreamDeliveryMixin
+...
+from agent.session_persistence import SessionPersistenceMixin
+from agent.turn_facade import TurnFacadeMixin
+...                                    # 共 13 个
+
+class AIAgent(
+    ClientLifecycleMixin, StreamDeliveryMixin, StatusOutputMixin, ApiRequestHooksMixin,
+    ApiErrorSummaryMixin, InterruptControlMixin, TurnExplainersMixin, ActivityTrackingMixin,
+    RateLimitCreditsMixin, SessionPersistenceMixin, CompressionFacadeMixin, TurnFacadeMixin,
+    VisionMessagePrepMixin, ReasoningParamsMixin,
+):
+```
+
+Mixin 文件自身（`agent/session_persistence.py:413`）就是裸类：
+
+```python
+class SessionPersistenceMixin:
+```
+
+**这意味着搬迁是"方法体一字不改"**——`self._dependencies`、`self._append_events`、
+`Kernel` 自己的类属性全部照旧解析，因为实例的 `self.__class__` 仍是 `Kernel`，
+属性查找从 `Kernel.__mro__` 开始。**没有重命名、没有签名改动、没有跨边界分析。**
+这正是 Hermes 能连拆 15 个 god file 而不炸的原因，也正是本项目前四刀反复踩坑
+（AST 改名、闭包断言、多行 `replace` 续行）的根因：**那些坑是自己造出来的。**
+
+`agent/lazy_forward.py` 是配套的转发器（`forward(module, name)` 在**每次调用时**
+解析目标），存在的理由是两条：`patch("<module>.<name>")` 仍能拦截，以及重模块
+不进 `run_agent` 的 import 路径。
+
+Hermes 同时保留**模块级函数**形式（`conversation_loop.py`、`turn_stop_gates.py`
+的 `apply_stop_gates(agent, ...)`）。两者分工：**属于 `AIAgent` 自身的内聚方法组
+→ Mixin；相位/策略助手 → 模块级函数**。本项目已抽的
+`turn_phases.py` / `turn_tool_batch.py` 属后者，形状正确，不必改。
+
+⇒ 真正的目标：**`kernel.py` 变成 ~1,200–1,800 行的门面（`class Kernel(<诸 Mixin>)`），
+其余按 topic 变成 `core/kernel_<topic>.py` 的 `<Topic>Mixin`。**
+
 
 ### 3.3 分域清单（AST 聚类，27 个方法被多域命中时归首个匹配）
 
@@ -250,35 +293,56 @@ Hermes 有三层（工具内 per-tool cap → 落盘 + 预览 → `enforce_turn_
 
 排序依据：被引用少、依赖单向、Hermes 有对应 topic（好照抄）。
 
-| # | 域 | 行数 | 目标文件（`core/` 下） | 依据 |
-|---|---|---:|---|---|
-| 1 | session | 2,173 | `session_persistence.py`, `session_prompts.py` | Hermes 同名文件存在；`session_context.py` 已在 |
-| 2 | tool | 1,769 | `tool_invocation.py`, `tool_guardrails.py` | 对应 `agent/tool_executor.py` |
-| 3 | projection / flow | 758 | `*_projection.py` | 纯投影，无副作用，最安全 |
-| 4 | workspace / mutation + process | 834 + 379 | `workspace_mutation.py`, `process_control.py` | 对应 `file_safety.py` 等 |
-| 5 | context / prompt | 503 | `turn_context.py`, `prompt_assembly.py` | 对应 `turn_context.py` |
-| 6 | approval / policy + memory | 378 + 194 | `approval.py`（已在 core）, `memory.py`（已在 core） | 小 |
-| 7 | task-lifecycle + task-spec | 544 + 351 | `task_lifecycle.py` | **本项目新增域**，形状自定 |
-| 8 | verify / proof | 1,715 + §4.4 的 8 个文件 | 先定性再拆 | **本项目新增域**，最后做 |
-| 9 | 剩余 turn/agent-loop + "未归类" | — | `turn_checkpoint.py`, `completion_readiness.py` … | 收尾 |
+| # | 域 | 行数 | 目标文件（`core/` 下） | 依据 | 状态 |
+|---|---|---:|---|---|---|
+| 1 | session | 2,173 | `kernel_session.py` / `SessionMixin` | Hermes 同名文件存在；`session_context.py` 已在 | ✅ 已完成 |
+| 2 | tool | 1,769 | `kernel_tool.py` / `ToolMixin` | 对应 `agent/tool_executor.py` | |
+| 3 | projection / flow | 758 | `kernel_projection.py` | 纯投影，无副作用，最安全 | |
+| 4 | workspace / mutation + process | 834 + 379 | `kernel_workspace.py` | 对应 `file_safety.py` 等 | |
+| 5 | context / prompt | 503 | `kernel_context.py` | 对应 `turn_context.py` | |
+| 6 | approval / policy + memory | 378 + 194 | `kernel_approval.py`, `kernel_memory.py` | 小 | |
+| 7 | task-lifecycle + task-spec | 544 + 351 | `kernel_task.py` | **本项目新增域** | |
+| 8 | verify / proof | 1,715 + §4.4 的 8 个文件 | 先定性再拆 | **本项目新增域**，最后做 | |
+| 9 | 剩余 turn/agent-loop + "未归类" | — | `kernel_completion.py`, … | 收尾 | |
 
-预期终态：`kernel.py` **~1,200–1,800 行门面** + 20 个左右兄弟。
+每刀完成后的状态：
+
+```
+kernel.py              15,990 → 13,818 行（272 → 232 方法）
+core/kernel_session.py              2,267 行 / 40 方法
+```
+
+预期终态：`kernel.py` **~1,200–1,800 行门面** + 20 个左右 `kernel_<topic>.py`。
 
 ---
 
-## 6. 每刀必须走的清单（从四次真实失败里固化的）
+## 6. 每刀必须走的清单（含新增的第五条，全部来自真实失败）
 
-1. **跨边界分析**：本刀绑定的名字 ∩ 后续阶段的读取 → 该进 `TurnState`（或本刀自己的
-   slots dataclass）的字段，**先加字段再搬代码**。
-2. **AST 定位 + 断言唯一性**。四次失败全是"用第一个像的当目标"：
-   保护带只取首行（漏多行 `replace(...)` 续行）、`next()` 命中另一个 1 行赋值而目标是
-   26 行、`"\nclass Kernel"` 子串命中非预期位置。**不许用第一个 substring 匹配。**
-3. **搬完立刻断言闭包** `== ['self', 'state']`（或本刀的等价物），**在写入前**。
-4. **先跑定向测试（~0.6 s）再跑全量（~23 s）**。前两次失败用全量当第一道验证，
-   超时只报"挂了"不报"哪挂"。
-5. **禁止 source-text 测试**（`AGENTS.md:487-502` banned outright）。移动符号后若
-   有测试挂了，先看它是不是在读源码——是就改成行为测试。
-6. **不给内部迁移留 re-export shim**（`AGENTS.md:250`）。
+1. **选出内聚的方法组**，不做 AST 改名。Mixin 形状下方法体**一字不改**。
+2. **装饰器感知的行区间**。`ast.FunctionDef.lineno` **不含装饰器**——装饰器在
+   `decorator_list` 里各有自己的 `lineno`。第一刀正是漏了这一点：`_session_task_summary`
+   的 `@staticmethod` 被留在原处，**粘到了下一个方法 `get_task` 上**，于是
+   `self.get_task(task_id)` 变成静态调用、报 `missing 1 required positional argument`。
+   搬运与删除都必须用 `min(decorator_list.lineno + [lineno])`。
+3. **断言方法集合守恒**：搬运前的 `Kernel` 成员名集合 == 搬运后的
+   `Kernel` ∪ `<Topic>Mixin`。第一刀实测 272 == 272，无缺无增无重名。
+4. **断言 MRO 与大类冲突**：`<Topic>Mixin in Kernel.__mro__`，且
+   `Kernel` 自身命名空间与各 Mixin **无同名方法**（类自身命名空间优先，重名会让另一个
+   定义**静默**不可达）。已固化为 `tests/architecture/test_kernel_facade.py`，并做了
+   注入缺陷的负向验证（确认它真的会失败）。
+5. **断言依赖单向**：`kernel.py` 模块级导入兄弟，兄弟**不得**在模块级绑定门面
+   （`AGENTS.md:243-244`）。注意 `sys.modules` 判据**无效**：`core/__init__.py:55`
+   的 `from .kernel import Kernel` 让任何 `core/*` 导入都拖进门面；可判的是
+   sibling 模块 globals 里有没有 `__module__ == 'tsm_agt.core.kernel'` 的对象。
+6. **棘轮表按搬迁重分布**：`tests/architecture/test_dependencies.py` 的
+   `_TERMINAL_STATE_COUPLING_BASELINE` 量 `TaskState.<终止态>` 引用点，**只许降**。
+   纯搬迁时该表要跟着改行，判据是**列求和守恒**（第一刀 56 == 56，`kernel.py` 34→32、
+   新文件 2），不是"总数不许变"。
+7. **先跑定向测试（~0.6–3 s）再跑全量（~23–28 s）**。
+8. **禁止 source-text 测试**（`AGENTS.md:487-502`）。移动符号后若有测试挂了，先看它
+   是不是在读源码——是就改成行为测试。
+9. **不给内部迁移留 re-export shim**（`AGENTS.md:250`）。
+
 
 ---
 

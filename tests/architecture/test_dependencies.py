@@ -153,3 +153,86 @@ class DependencyArchitectureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+#: Terminal-state coupling outside the decision authority, measured at the time
+#: the convergence started. This is a **ratchet**: the counts may only go down.
+#: A new file or a bigger count means fresh "one more place decides the terminal
+#: state" -- which is exactly how this codebase accumulated five competing
+#: vocabularies and 115 tasks whose ``FAILED`` contradicted their own reason.
+#:
+#: To lower a number: route that site through ``core.turn_outcome`` (the outcome
+#: vocabulary) and then update this table.
+#:
+#: **When a cohesive method group moves to a mixin sibling of ``core/kernel.py``
+#: (the Hermes facade+siblings shape), redistribute these counts instead of
+#: leaving them behind: the moved bodies carry their ``TaskState.X`` references
+#: with them. What the ratchet forbids is a *new decision site*, so the rule for
+#: a pure move is that the column **sum is conserved**. ``kernel_session.py``'s
+#: two references came out of ``kernel.py``'s 34; the sum stayed at 56.
+_TERMINAL_STATE_COUPLING_BASELINE = {
+    "cli.py": 7,
+    "core/kernel.py": 32,
+    "core/kernel_session.py": 2,
+    "core/task_runtime_projection.py": 7,
+    "sdk/runtime.py": 8,
+}
+
+#: Modules allowed to name terminal states: the enum itself, the verdict mapping,
+#: and the outcome vocabulary.
+_TERMINAL_STATE_AUTHORITY = {
+    "core/task.py",
+    "core/verification.py",
+    "core/turn_outcome.py",
+}
+
+
+class TerminalStateConvergenceTest(unittest.TestCase):
+    """The terminal state must converge on one authority, not spread further."""
+
+    _TERMINAL = {"SUCCEEDED", "FAILED", "NEEDS_REVIEW", "CANCELLED", "CONFLICT"}
+
+    def _coupling(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for path in sorted(PACKAGE_ROOT.rglob("*.py")):
+            relative = str(path.relative_to(PACKAGE_ROOT))
+            if relative in _TERMINAL_STATE_AUTHORITY:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            found = sum(
+                1 for node in ast.walk(tree)
+                if isinstance(node, ast.Attribute)
+                and node.attr in self._TERMINAL
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "TaskState"
+            )
+            if found:
+                counts[relative] = found
+        return counts
+
+    def test_terminal_state_coupling_never_grows(self) -> None:
+        counts = self._coupling()
+        grew = {
+            name: (count, _TERMINAL_STATE_COUPLING_BASELINE.get(name, 0))
+            for name, count in counts.items()
+            if count > _TERMINAL_STATE_COUPLING_BASELINE.get(name, 0)
+        }
+        self.assertEqual(
+            grew, {},
+            "terminal-state coupling grew; route it through core.turn_outcome "
+            "instead of deciding the terminal state locally",
+        )
+
+    def test_no_new_module_decides_terminal_states(self) -> None:
+        new_modules = set(self._coupling()) - set(_TERMINAL_STATE_COUPLING_BASELINE)
+        self.assertEqual(new_modules, set(), "new terminal-state decision site")
+
+    def test_the_baseline_only_shrinks(self) -> None:
+        counts = self._coupling()
+        for name, baseline in _TERMINAL_STATE_COUPLING_BASELINE.items():
+            # A file that dropped below its baseline means the ratchet can be
+            # tightened -- keep the table honest instead of leaving slack.
+            self.assertLessEqual(
+                counts.get(name, 0), baseline,
+                f"{name} couples terminal states more than its baseline",
+            )
