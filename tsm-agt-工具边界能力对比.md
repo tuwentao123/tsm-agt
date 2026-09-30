@@ -1,5 +1,12 @@
 # tsm-agt 工具边界能力 vs Hermes（决定 transcript 能否收录 tool 行）
 
+> **行号引用已失效（2026 更正中）**：本文写作时 `core/kernel.py` 尚未分解。
+> 此后轮循环已抽为 `core/turn_phases.py` / `core/turn_tool_batch.py`，
+> 并按 Hermes 门面+Mixin 形状开始分解（第 1 刀 `core/kernel_session.py`，
+> 见 `tsm-agt-按Hermes重构kernel映射.md`）。文中 `kernel.py:NNNN` 一律不再
+> 指向所述代码；请按同处已写出的**方法名**重新定位。
+> 保留原行号是为了让这份记录仍可追溯到当时的代码。
+
 > 问题：能不能像 Hermes 那样，把 **tool 行**（含工具结果）纳入会话记录？
 > Hermes 敢全录，是因为它在**工具边界**有兜底。本文逐项核实 tsm-agt 是否有等价能力。
 > 全部数字为实测（`wc -l`）。
@@ -100,8 +107,8 @@ Hermes 对应的只有一个字符串列 `messages.effect_disposition`。
 ## 3. 对决策的直接影响
 
 **B 路（先只录 user/assistant）为什么现在就能做**：
-- 用户/助手的**文本**是双方有意表达的对话内容，`_session_task_summary`（`kernel.py:6998`）已经证明作者认为这部分可以进会话上下文
-- 不触碰 `:7020-7022` 那条明确的安全决策：*"Never copy command argv/environment, patch bodies or arbitrary third-party Tool arguments into Session context"*
+- 用户/助手的**文本**是双方有意表达的对话内容，`_session_task_summary`（现 `core/kernel_session.py`）已经证明作者认为这部分可以进会话上下文
+- 不触碰 `_session_task_summary` 里那条明确的安全决策（其正文随方法搬到了 `core/kernel_session.py`）：*"Never copy command argv/environment, patch bodies or arbitrary third-party Tool arguments into Session context"*
 
 **A 路（全录 tool 行）的前置条件**（按必要性排序）：
 

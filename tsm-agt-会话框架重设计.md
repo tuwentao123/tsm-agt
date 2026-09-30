@@ -1,5 +1,12 @@
 # tsm-agt 会话框架重设计
 
+> **行号引用已失效（2026 更正中）**：本文写作时 `core/kernel.py` 尚未分解。
+> 此后轮循环已抽为 `core/turn_phases.py` / `core/turn_tool_batch.py`，
+> 并按 Hermes 门面+Mixin 形状开始分解（第 1 刀 `core/kernel_session.py`，
+> 见 `tsm-agt-按Hermes重构kernel映射.md`）。文中 `kernel.py:NNNN` 一律不再
+> 指向所述代码；请按同处已写出的**方法名**重新定位。
+> 保留原行号是为了让这份记录仍可追溯到当时的代码。
+
 > ## ⚠️ 更正（2026-09-30）：本文档的**核心前提有误**
 >
 > 本文原先断言"多轮接不上"，依据是 `SessionSnapshot` 无 transcript、会话内容靠每轮重投影。**该诊断已被实测推翻。**
@@ -18,7 +25,7 @@
 >
 > **仍然成立的部分**：
 > * 会话内容是**有界渲染**（`session-context-*` JSON 块，实测 3726 字符），受 `recent_visible_message_limit` 等上限约束——长会话会丢旧轮，但这不是"接不上"。
-> * **tool 调用与结果确实不跨轮**——但这是**刻意的安全决策**（`core/kernel.py:7020-7022`），不是疏漏。
+> * **tool 调用与结果确实不跨轮**——但这是**刻意的安全决策**（`Kernel._session_task_summary @ core/kernel_session.py`），不是疏漏。
 > * `SessionSnapshot` 确实没有一等 transcript；这影响的是**保真度与可审计性**，不是连续性。
 >
 > **下述"决定 1"的原始论证请以本节为准修正。** 决定 2/3/4/5 未受此错误影响（它们分别依据循环结构、完成判定与状态机，均独立核实过）。

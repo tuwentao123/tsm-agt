@@ -179,13 +179,16 @@ MessageBlock = (
 #: rather than another ``message_id.startswith(...)`` list at a call site.
 SCAFFOLDING_KINDS = frozenset({
     #: The bounded correction the completion gate injects when a proposed final
-    #: answer is not accepted (``core/kernel.py:8593``).
+    #: answer is not accepted: ``Kernel._completion_correction_message``, which
+    #: builds the message with ``scaffolding="completion-readiness"``. Cited by
+    #: symbol, not by line: ``core/kernel.py`` is being decomposed into mixin
+    #: siblings (Hermes ``AGENTS.md:232-248``) and line numbers do not survive it.
     "completion-readiness",
-    #: The prompt that re-enters the loop after a user continuation
-    #: (``core/kernel.py:11253``).
+    #: The prompt that re-enters the loop after a user continuation, re-emitted
+    #: as ``continuation-input-*`` by ``Kernel._compact_continuation_messages``.
     "continuation-input",
-    #: A user message delivered mid-turn by the steering channel
-    #: (``core/kernel.py:7500``).
+    #: A user message delivered mid-turn by the steering channel, built as
+    #: ``steering-*`` by ``Kernel._apply_pending_steering``.
     "steering",
 })
 

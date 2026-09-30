@@ -1,6 +1,13 @@
 # tsm-agt 完成判定机制（M1 动作 1 / M2 的依据）
 
-> 来源：`src/tsm_agt/ports/completion_readiness.py`（176 行，**已通读**）+ `kernel.py:8593-8625`、`:13219-13275`、`:13862`、`:14097`。
+> **行号引用已失效（2026 更正中）**：本文写作时 `core/kernel.py` 尚未分解。
+> 此后轮循环已抽为 `core/turn_phases.py` / `core/turn_tool_batch.py`，
+> 并按 Hermes 门面+Mixin 形状开始分解（第 1 刀 `core/kernel_session.py`，
+> 见 `tsm-agt-按Hermes重构kernel映射.md`）。文中 `kernel.py:NNNN` 一律不再
+> 指向所述代码；请按同处已写出的**方法名**重新定位。
+> 保留原行号是为了让这份记录仍可追溯到当时的代码。
+
+> 来源：`src/tsm_agt/ports/completion_readiness.py`（176 行，**已通读**）+ `Kernel._completion_correction_message`、`Kernel._completion_readiness_gaps`、完成门与出口分支（后两者见下方横幅说明）。
 > 结论：**完成判定本身是干净的（Port + 数据类），但它的"续跑"实现违反了 Hermes 的一条硬不变量。**
 
 ---
@@ -71,7 +78,7 @@ class CompletionReadinessPolicyPort(RuntimeAdapter, Protocol):
 
 ## 4. 关键冲突：纠正靠**合成 USER 消息注入轮内**
 
-`kernel.py:8593-8625` 全文要点：
+`Kernel._completion_correction_message`（`core/kernel.py`）全文要点：
 
 ```python
 @staticmethod

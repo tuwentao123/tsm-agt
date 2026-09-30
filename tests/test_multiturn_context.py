@@ -14,7 +14,7 @@ that prior turns **are** carried: each turn's model request includes a
 
 What is genuinely absent, and is characterized below, is everything that is not
 user/assistant text: tool calls and tool results never enter that projection.
-That is a deliberate safety decision recorded at ``core/kernel.py:7020-7022``
+That is a deliberate safety decision recorded at ``Kernel._session_task_summary`` in ``core/kernel_session.py``
 ("Never copy command argv/environment, patch bodies or arbitrary third-party
 Tool arguments into Session context"), not an oversight.
 
@@ -206,7 +206,7 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_tool_rows_are_not_carried_across_turns(self):
         """The real gap. Tool calls and results never enter the projection, by
-        the deliberate decision at ``core/kernel.py:7020-7022``: only read-only
+        the deliberate decision at ``Kernel._session_task_summary`` in ``core/kernel_session.py``: only read-only
         navigation metadata is allowed to reach a later Turn's Session context.
 
         This test pins today's behaviour so that changing it is a visible,

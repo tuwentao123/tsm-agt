@@ -1,5 +1,12 @@
 # tsm-agt 单轮 / 多轮会话重构方案
 
+> **行号引用已失效（2026 更正中）**：本文写作时 `core/kernel.py` 尚未分解。
+> 此后轮循环已抽为 `core/turn_phases.py` / `core/turn_tool_batch.py`，
+> 并按 Hermes 门面+Mixin 形状开始分解（第 1 刀 `core/kernel_session.py`，
+> 见 `tsm-agt-按Hermes重构kernel映射.md`）。文中 `kernel.py:NNNN` 一律不再
+> 指向所述代码；请按同处已写出的**方法名**重新定位。
+> 保留原行号是为了让这份记录仍可追溯到当时的代码。
+
 > 目标：**让一轮跑得通、让多轮接得上**。
 > 纪律：每条设计都标出处。Hermes 侧写 `file:line`（分册见 `hermes-架构梳理/`）；**tsm-agt 侧凡是 Hermes 没有的东西，明确标"本项目新增，非 Hermes"**。
 > 本方案不引入任何 Hermes 里不存在的新概念类型（`TurnOutcome` 那次的教训）。
