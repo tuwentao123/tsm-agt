@@ -368,6 +368,11 @@ class ToolCall:
     # Runtime-owned and persisted after binding. Provider adapters never accept
     # this value from model-generated arguments.
     outcome_binding_mode: OutcomeBindingMode = OutcomeBindingMode.FULFILLMENT
+    #: The model's declared evidence intent for this call. Diagnostic only: it is
+    #: validated and may only *add* attribution -- never remove it and never block
+    #: the action (§5.2) -- which is why the raw mapping is carried here and parsed
+    #: by the proof layer rather than trusted at the tool boundary.
+    evidence_intent: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.call_id.strip():
@@ -389,6 +394,11 @@ class ToolCall:
             data["outcome_ref"] = self.outcome_ref
         if self.outcome_binding_mode is not OutcomeBindingMode.FULFILLMENT:
             data["outcome_binding_mode"] = self.outcome_binding_mode.value
+        # Omitted when absent, like every other optional key here: this is
+        # checkpoint wire, and a new unconditional key would change the bytes --
+        # and the content hash -- of every ToolCall already recorded.
+        if self.evidence_intent is not None:
+            data["evidence_intent"] = dict(self.evidence_intent)
         return data
 
     @classmethod
@@ -399,6 +409,9 @@ class ToolCall:
         raw_question = data.get("evidence_question")
         if raw_question is not None and not isinstance(raw_question, Mapping):
             raise ValueError("tool call evidence_question must be an object")
+        raw_intent = data.get("evidence_intent")
+        if raw_intent is not None and not isinstance(raw_intent, Mapping):
+            raise ValueError("tool call evidence_intent must be an object")
         return cls(
             call_id=str(data["call_id"]),
             name=str(data["name"]),
@@ -414,6 +427,9 @@ class ToolCall:
             outcome_binding_mode=OutcomeBindingMode(str(
                 data.get("outcome_binding_mode", "FULFILLMENT")
             )),
+            evidence_intent=(
+                dict(raw_intent) if isinstance(raw_intent, Mapping) else None
+            ),
         )
 
 

@@ -93,6 +93,7 @@ class CodeIntelligenceToolProvider:
             "Return available static diagnostics. The built-in fallback currently "
             "provides Python syntax diagnostics and explicitly reports coverage.",
             {"path": {"type": "string"}, "limit": {"type": "integer"}},
+            extra=frozenset({EvidenceCapability.ENUMERATE_SCOPE}),
         ),
         _spec.__func__(
             "code.rename_preview",
