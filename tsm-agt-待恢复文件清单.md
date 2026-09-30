@@ -9,8 +9,8 @@
 
 ## 0. 现状（一句话）
 
-`HEAD` 自包含（干净导出可导入、可跑全量），全量 **1429 passed / 13 skipped / 0 failed**；
-13 个 skip 与事故前完全一致。但**事故前有 1469 个用例，现在只有 1442 个**——
+`HEAD` 自包含（干净导出可导入、可跑全量），全量 **1430 passed / 13 skipped / 0 failed**；
+13 个 skip 与事故前完全一致。但**事故前有 1469 个用例，现在只有 1443 个**（含我新增的 2 个）——
 **28 个用例只存在于你的备份里**，绿色测试测不出它们的缺失（第 4 节）。
 
 ---
@@ -35,9 +35,31 @@
 | 检查 | 命令 | 结果 |
 |---|---|---|
 | 工作区干净 | `git status --short` | 无输出 |
-| HEAD 自包含 | `git archive HEAD \| tar -x -C /tmp/x && cd /tmp/x && pytest -q` | `1429 passed, 13 skipped` |
-| 全量 | `.venv/bin/python -m pytest tests/ -q` | `1429 passed, 13 skipped, 4 warnings, 307 subtests passed` |
+| HEAD 自包含 | `git archive HEAD \| tar -x -C /tmp/x && cd /tmp/x && pytest -q` | `1430 passed, 13 skipped` |
+| 全量 | `.venv/bin/python -m pytest tests/ -q` | `1430 passed, 13 skipped, 4 warnings, 307 subtests passed` |
 | 架构约束棘轮 | `pytest tests/architecture -q` | 通过（含 `test_kernel_facade.py` 5 条门禁） |
+| CLI / Web 入口 | `tsm-agt --help`、`import tsm_agt.web.app` | 24 个子命令、21 条路由均可加载 |
+| `tsm-agt doctor` | `.venv/bin/tsm-agt doctor` | `healthy`，14 个 adapter started and healthy |
+| **真实 HTTP 上的完整工程闭环** | `pytest tests/test_engineering_loop_over_http.py -q` | 见下 |
+
+### 真实 HTTP 上的完整工程闭环（`57b281b` 新增）
+
+只把**模型端点**换成本地 127.0.0.1 上的 OpenAI 兼容服务，其余全是生产代码。一条
+测试里跑完并逐步断言：
+
+```
+run_agent_turn → planner 经真实 HTTP 调用（planner__submit_task_spec）
+               → proposal 解析成真 TaskSpec（ac-durable-change）
+               → agent 发 core__apply_patch（R1）→ turn 停在审批（文件此时不存在）
+resolve_agent_approval(APPROVE) → 续跑 → 磁盘上真的出现 DELIVERABLE.md
+verify_task_acceptance → PASSED
+finalize_acceptance    → SUCCEEDED
+```
+
+这条测试覆盖了此前离线用例**完全没碰**的三个接缝：套接字层、provider 侧工具名
+编解码（`core.apply_patch` ↔ `core__apply_patch`）、以及 planner 的独立工具列表。
+负向验证过：把 `TERMINAL_STATE_BY_VERDICT[PASSED]` 改成 `NEEDS_REVIEW`，测试立刻
+失败（`AssertionError: NEEDS_REVIEW is not SUCCEEDED`）。
 
 事故前实测为 `1456 passed, 13 skipped`。**13 个 skip 对上了**，这很重要：它证明
 13 个里没有任何一个是因为错误而被跳过的。
@@ -73,13 +95,13 @@
 | | 收集到的用例 | passed | skipped |
 |---|---|---|---|
 | 事故前 | **1469** | 1456 | 13 |
-| 现在 | **1442** | 1429 | 13 |
-| 差额 | **−27** | | |
+| 现在 | **1443** | 1430 | 13 |
 
-现在这 1442 里包含**我本轮新增的 1 个**用例（`test_task_being_started_is_not_settled_as_an_orphan`）。
-所以：
+现在这 1443 里包含**我本轮自己新增的 2 个**用例
+（`test_task_being_started_is_not_settled_as_an_orphan`、
+`test_plan_approve_mutate_verify_and_finalize`）。所以：
 
-> **1469 − (1442 − 1) = 28 个用例在事故中丢失。**
+> **1469 − (1443 − 2) = 28 个用例在事故中丢失。**
 
 它们来自 29 个丢失改动里的**测试文件**：事故把工作区版本冲回 HEAD 版本，而 HEAD
 版本比工作区版本**少**这些用例。**一个变小的测试集照样全绿**，所以 `0 failed`
@@ -104,7 +126,8 @@ tests/test_task_spec_criteria_validation.py
 ### 怎么用你的备份核对
 
 ```bash
-# 备份里的用例总数；应当是 1470（事故前 1469 + 我新增的 1）
+# 备份里的用例总数；恢复到事故前水平的话应当是 ~1469
+# （低于 1469 就说明备份里的测试文件仍不完整）
 <python> -m pytest <备份目录>/tests --collect-only -q | tail -1
 
 # 逐文件比对用例数，差值就是缺失的用例在哪
@@ -176,12 +199,12 @@ git checkout pre-restore-<HEAD> -- .
 ```
 
 已实测的完整流程：预览 → `--apply` → `git checkout HEAD -- <路径>` 回退 →
-工作区干净、全量仍 `1429 passed / 13 skipped`、无遗留标签。
+工作区干净、全量仍 `1430 passed / 13 skipped`、无遗留标签。
 
 恢复后的验收命令脚本会直接打印，核心四条：
 
 ```bash
-# ① 用例数应回到 ~1470（事故前 1469 + 本轮新增 1）
+# ① 用例数应回到 ~1469（事故前水平；低于它就说明备份里的测试文件不完整）
 .venv/bin/python -m pytest tests/ --collect-only -q | tail -1
 
 # ② 全量
@@ -370,11 +393,11 @@ settle_orphaned_task(legacy task)    -> True （单独调用成功）
 
 | 维度 | 状态 |
 |---|---|
-| 代码 | 全量 `1429 passed / 13 skipped / 0 failed`；干净导出可跑；真实 socket 的模型 HTTP 往返实测通过 |
+| 代码 | 全量 `1430 passed / 13 skipped / 0 failed`；干净导出可跑；**真实 HTTP 上的完整工程闭环实测通过**（planner → 审批 → 真写文件 → 验证 → SUCCEEDED） |
 | 真实台账的主导失败模式（71%） | **当前代码已经是对的**（§8.2 更正） |
 | 3 个 phantom EXECUTING | 身份功能上线前的 legacy 数据，不影响当前使用；结算需你点头（§8.3） |
 | 本机可恢复源 | **无**（§8.4） |
-| 仍缺的测试用例 | 28 个（§4），只有别的备份里才有 |
+| 仍缺的测试用例 | 28 个（§4），只有别的备份里才有（我本轮自己新增 2 条，故现在收集数是 1443） |
 | 唯一无法验证的 | **真实模型端点的端到端**：本沙箱把 `aibrain-large-model-engine-slow.hellobike.cn` 解析到 `198.18.0.71` 黑洞，`danger-full-access` 下依然如此；而 `pypi.org` / `github.com` 的 TLS 正常 → 是沙箱网络策略，不是本项目代码 |
 
 ---
