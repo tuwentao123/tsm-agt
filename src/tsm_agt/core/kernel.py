@@ -1345,6 +1345,38 @@ class _TaskSpecControl(ToolTaskSpecControl):
             writer=self.invocation_id,
         )
 
+#: reason_code -> repair text for one recoverable tool-protocol error.
+#:
+#: A table keyed on the code rather than an if/elif ladder, per the shape rule
+#: (AGENTS.md:252). Each entry names the one thing to REPAIR: a generic
+#: "invalid envelope" message once sent the model back to fix the wrong thing,
+#: so a missing-argument failure repeated itself (task-ce19b33b...).
+_PROTOCOL_CORRECTION_BY_REASON = {
+    "tool_call_emitted_while_disabled": (
+        "Your previous response attempted a tool call after the Runtime disabled "
+        "tools for finalization. Do not emit XML, tool_use markup, JSON tool "
+        "requests, or structured tool calls. Answer the user's request directly "
+        "now from the evidence already collected, and explicitly state any "
+        "remaining uncertainty."
+    ),
+    "invalid_tool_batch": (
+        "One of your tool calls was rejected before execution: {detail} "
+        "Re-issue that call with every required argument filled in, or choose a "
+        "different approach if you cannot supply them. Do not repeat the rejected "
+        "call unchanged."
+    ),
+}
+
+#: Used when the code is unknown: one retry with an explicitly correct envelope.
+_GENERIC_PROTOCOL_CORRECTION = (
+    "Your previous response used an invalid tool-call envelope. Retry the "
+    "response once. For every tool call, pass exactly an evidence_question "
+    "object with question_id and question, plus a tool_arguments object "
+    "containing the tool's normal parameters. Do not repeat or describe the "
+    "invalid call."
+)
+
+
 class Kernel:
     def __init__(self, dependencies: KernelDependencies) -> None:
         self._dependencies = dependencies
@@ -12648,31 +12680,8 @@ class Kernel:
                 is ModelRecoveryAction.RESAMPLE_WITH_CORRECTION
                 and state.model_call_count < state.checkpoint.max_model_calls
             ):
-                state.protocol_correction = (
-                    (
-                        "Your previous response attempted a tool call after the "
-                        "Runtime disabled tools for finalization. Do not emit XML, "
-                        "tool_use markup, JSON tool requests, or structured tool "
-                        "calls. Answer the user's request directly now from the "
-                        "evidence already collected, and explicitly state any "
-                        "remaining uncertainty."
-                    )
-                    if error.reason_code == "tool_call_emitted_while_disabled" else (
-                        self._outcome_binding_correction(error.detail)
-                    ) if error.reason_code == "invalid_outcome_binding" else (
-                        "One of your tool calls was rejected before execution: "
-                        f"{error.detail} "
-                        "Re-issue that call with every required argument filled "
-                        "in, or choose a different approach if you cannot supply "
-                        "them. Do not repeat the rejected call unchanged."
-                    ) if error.reason_code == "invalid_tool_batch" else
-                    (
-                        "Your previous response used an invalid tool-call envelope. "
-                        "Retry the response once. For every tool call, pass exactly "
-                        "an evidence_question object with question_id and question, "
-                        "plus a tool_arguments object containing the tool's normal "
-                        "parameters. Do not repeat or describe the invalid call."
-                    )
+                state.protocol_correction = self._protocol_correction_text(
+                    error.reason_code, error.detail
                 )
                 await self._append_events(state.task_id, ((
                     "llm.protocol_retry_requested", {
@@ -15077,6 +15086,21 @@ class Kernel:
                 names.add(spec.name)
                 tools.append(spec)
         return tuple(tools)
+
+    @staticmethod
+    def _protocol_correction_text(reason_code: str, detail: str) -> str:
+        """The retry text for one recoverable tool-protocol error.
+
+        Table-driven, so a new code adds a row instead of another ladder branch,
+        and callable from a test without reading source (Hermes AGENTS.md:487-502).
+        """
+
+        if reason_code == "invalid_outcome_binding":
+            return Kernel._outcome_binding_correction(detail)
+        template = _PROTOCOL_CORRECTION_BY_REASON.get(reason_code)
+        if template is None:
+            return _GENERIC_PROTOCOL_CORRECTION
+        return template.format(detail=detail)
 
     @staticmethod
     def _outcome_binding_correction(detail: str) -> str:

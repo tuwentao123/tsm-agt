@@ -8,7 +8,7 @@ from pathlib import Path
 from tsm_agt.adapters.fixture import EchoModelProvider
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
-from tsm_agt.core import ApprovalDecision, TaskState
+from tsm_agt.core import ApprovalDecision, ModelInvocationFailed, TaskState
 from tsm_agt.ports import (
     AdapterDescriptor, CompletionReadinessMode, FinishReason, Message,
     MessageRole, ModelRequest,
@@ -17,7 +17,11 @@ from tsm_agt.ports import (
     ToolCallBlock, ToolIdempotency, ToolResult, ToolResultBlock, ToolRisk, ToolSpec,
     RuntimeEvent, RuntimeUnitOfWork,
 )
+from tsm_agt.ports import (
+    ModelFailureCategory, ModelRecoveryAction, ModelRetrySafety,
+)
 from tsm_agt.sdk import EngineeringAgentClient
+from tsm_agt.sdk.runtime import _is_resumable_stop
 
 
 def fixture_client(root: Path, store=None) -> EngineeringAgentClient:
@@ -525,6 +529,100 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result.to_data()["latest_answer_event_ref"], "evt-v3-answer"
         )
+
+    async def test_classified_resumable_stop_is_not_overwritten_with_failed(
+        self,
+    ) -> None:
+        # INV-14: a Runtime stop that was classified as resumable keeps its
+        # checkpoint and its resumable state. This is the case that produced
+        # "task-ce19b33b..." -- one exhausted protocol correction was turned into
+        # a product failure by the SDK's catch-all.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = compose_fixture_application(tool_adapters=())
+            client = EngineeringAgentClient(
+                root, application_factory=lambda: application, poll_interval=0.001
+            )
+            async with client:
+                task = await application.kernel.create_task(
+                    "resumable stop", root, task_id="sdk-resumable",
+                )
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    task = await application.kernel.transition_task(
+                        task.task_id, state, state.value,
+                    )
+                # The runtime always interrupts through INTERRUPTING.
+                await application.kernel.transition_task(
+                    task.task_id, TaskState.INTERRUPTING, "recoverable stop",
+                )
+                await application.kernel.transition_task(
+                    task.task_id, TaskState.INTERRUPTED, "recoverable stop",
+                )
+
+                error = ModelInvocationFailed(
+                    "turn-x", "model did not satisfy the tool-call protocol",
+                    failure_kind="tool_protocol",
+                    failure_category=ModelFailureCategory.CORRECTABLE_PROTOCOL,
+                    retry_safety=ModelRetrySafety.SAFE_WITH_CORRECTION,
+                    recovery_action=ModelRecoveryAction.PRESERVE_AND_INTERRUPT,
+                )
+                self.assertTrue(_is_resumable_stop(error))
+
+                async def _raise(*_args, **_kwargs):
+                    raise error
+
+                client.run_task = _raise  # type: ignore[assignment]
+                result = await client._run_submitted_task(task.task_id, "goal")
+                self.assertEqual(result.state, TaskState.INTERRUPTED.value)
+
+    def test_unclassified_error_still_converges_to_failed(self) -> None:
+        # The complement: an error nobody classified is a defect and must stay
+        # visible as a failure rather than masquerade as a resumable stop.
+        self.assertFalse(_is_resumable_stop(RuntimeError("boom")))
+
+    def test_tool_batch_correction_names_the_rejected_call(self) -> None:
+        # The retry must aim at the actual defect. Before this, a missing-argument
+        # failure fell into the generic "invalid envelope" text and told the model
+        # to fix its evidence_question -- so the correction round repeated the same
+        # mistake and was wasted ("task-ce19b33b...").
+        #
+        # Asserted by CALLING the producer, not by reading the Kernel class's
+        # source. A source assertion tests the shape of the code rather than its
+        # behaviour: it passes while the call site is mis-wired and fails on a
+        # correct refactor (Hermes AGENTS.md:487-502) -- which is exactly what
+        # happened when this phase moved out of Kernel.
+        from tsm_agt.core.kernel import Kernel
+
+        retry = Kernel._protocol_correction_text(
+            "invalid_tool_batch", "core.read_file: path is required",
+        )
+        self.assertIn("core.read_file: path is required", retry)
+        self.assertIn("Re-issue that call with every required argument", retry)
+        self.assertIn("Do not repeat the rejected call unchanged", retry)
+
+    def test_unclassified_protocol_reason_falls_back_to_envelope_retry(self) -> None:
+        """An unknown code must still produce one actionable retry, not silence."""
+
+        from tsm_agt.core.kernel import Kernel
+
+        retry = Kernel._protocol_correction_text("something_new", "detail")
+        self.assertIn("invalid tool-call envelope", retry)
+        self.assertIn("evidence_question", retry)
+
+    def test_disabled_tools_correction_forbids_more_tool_calls(self) -> None:
+        """The finalization correction must stop tool use, not invite a retry."""
+
+        from tsm_agt.core.kernel import Kernel
+
+        retry = Kernel._protocol_correction_text(
+            "tool_call_emitted_while_disabled", "",
+        )
+        self.assertIn("Do not emit XML", retry)
+        self.assertIn("Answer the user's request directly", retry)
 
 
 if __name__ == "__main__":
