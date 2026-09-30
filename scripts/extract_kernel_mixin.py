@@ -596,6 +596,22 @@ def _verify(
     return 0 if ok else 1
 
 
+def _project_python_files() -> list[Path]:
+    """Project ``.py`` files, skipping vendored and generated trees.
+
+    ``REPO.rglob("*.py")`` also walks ``.venv`` -- 1,378 files of third-party
+    code here -- which made this check take over a minute and time the run out.
+    Third-party code cannot import this project's facade, so skipping it loses
+    nothing.
+    """
+
+    skip = {".venv", ".git", "__pycache__", "node_modules", "build", "dist", ".mypy_cache"}
+    return [
+        path for path in REPO.rglob("*.py")
+        if not any(part in skip for part in path.relative_to(REPO).parts)
+    ]
+
+
 def _detached_symbol_imports(module: str) -> list[str]:
     """Repo-wide ``from tsm_agt.core.kernel import X`` where ``X`` has left.
 
@@ -604,7 +620,7 @@ def _detached_symbol_imports(module: str) -> list[str]:
     """
 
     imported: dict[str, list[str]] = {}
-    for path in sorted(REPO.rglob("*.py")):
+    for path in sorted(_project_python_files()):
         if "__pycache__" in str(path):
             continue
         try:

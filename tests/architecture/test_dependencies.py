@@ -175,7 +175,8 @@ if __name__ == "__main__":
 #: which travelled with ``transition_task``).
 _TERMINAL_STATE_COUPLING_BASELINE = {
     "cli.py": 7,
-    "core/kernel.py": 14,
+    "core/kernel.py": 11,
+    "core/kernel_checkpoint.py": 3,
     "core/kernel_input.py": 4,
     "core/kernel_session.py": 2,
     "core/kernel_steering.py": 1,
