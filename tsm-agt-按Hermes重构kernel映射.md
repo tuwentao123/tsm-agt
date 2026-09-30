@@ -304,29 +304,49 @@ Hermes 有三层（工具内 per-tool cap → 落盘 + 预览 → `enforce_turn_
 | 2 | tool | 1,500 / 22 | `kernel_tool.py` / `ToolMixin` | ✅ `f3d3f18` |
 | 3 | workspace / mutation | 1,075 / 16 | `kernel_workspace.py` / `WorkspaceMixin` | ✅ `1b42605` |
 | 4 | process / background | 476 / 20 | `kernel_process.py` / `ProcessMixin` | ✅ `41aae86` |
-| 5 | projection（flow/replay + progress/scope + configuration/status） | ~400 / 11 | `kernel_projection.py` | 待做 |
-| 6 | project-onboarding | 445 / 10 | `kernel_onboarding.py` | 待做 |
-| 7 | approval + memory | 339 + 218 | `kernel_approval.py`, `kernel_memory.py` | 待做 |
-| 8 | verify / proof + completion（纠缠，一起做） | 1,397 + 731 | 先给 §4.4 的 8 个文件定性 | 待做 |
-| 9 | 剩余 turn/agent-loop + 未归类 | — | 收尾 | 待做 |
+| 5 | projection（flow/replay + investigation status + effective configuration） | 283 / 11 | `kernel_projection.py` / `ProjectionMixin` | ✅ `2db8ecb` |
+| 6 | project-onboarding / 项目指令 / 信任 | 310 / 9 | `kernel_onboarding.py` / `OnboardingMixin` | ✅ `5d2f743` |
+| 7 | 进度上报 + 渐进作用域探针 | 262 / 5 | `kernel_progress.py` / `ProgressMixin` | ✅ `6b8262e` |
+| 8 | approval | 340 / 7 | `kernel_approval.py` / `ApprovalMixin` | ✅ `bf0acb9` |
+| 9 | memory（任务记忆 + 工作记忆） | 337 / 11 | `kernel_memory.py` / `MemoryMixin` | ✅ `4dc45a5` |
+| 10 | task 生命周期 + SPEC 规划 | 897 / 13 + 4 符号 | `kernel_task.py` / `TaskMixin` | ✅ `def49cb` |
+| 11 | 策略 before/after 探针 + 资源目录 | 496 / 14 | `kernel_policy.py` / `PolicyMixin` | ✅ `7fe8c85` |
+| 12 | model 响应校验 / 诊断 / 失败记录 | 346 / 8 + 2 表 | `kernel_model.py` / `ModelMixin` | ✅ `3081d54` |
+| 13 | 输入路由（`dispatch_input_event` / `route_runtime_input` / …） | ~380 / 4 | `kernel_input.py` | 待做 |
+| 14 | agent-loop / turn（`run_agent_turn`、resume/suspend/clarify、取消） | 2,724 / 37 | `kernel_turn.py` | 待做 |
+| 15 | **verify / proof + completion（纠缠，一起做）** | 2,318 / 34 + 18 个模块级函数 | 先给 §4.4 的 8 个文件定性 | 待做 |
+| 16 | 门面收尾（`__init__` / `dependencies` / `_append_events` / `_require_stored_task` / 存储键） | ~200 | 留在门面 | 待做 |
 
 当前状态：
 
 ```
-kernel.py            15,990 → 10,445 行（272 → 194 方法，−35%）
+kernel.py            15,990 → 7,146 行（272 → 96 方法，−55%）
 core/kernel_session.py     2,267 行 / 40 方法
 core/kernel_tool.py        1,960 行 / 22 方法
 core/kernel_workspace.py   1,150 行 / 16 方法
+core/kernel_task.py        1,038 行 / 13 方法 + 4 符号
+core/kernel_policy.py        564 行 / 14 方法
 core/kernel_process.py       558 行 / 20 方法
-class Kernel(ToolMixin, SessionMixin, WorkspaceMixin, ProcessMixin)
+core/kernel_memory.py        398 行 / 11 方法
+core/kernel_approval.py      396 行 /  7 方法
+core/kernel_model.py         396 行 /  8 方法
+core/kernel_onboarding.py    373 行 /  9 方法
+core/kernel_projection.py    342 行 / 11 方法
+core/kernel_progress.py      303 行 /  5 方法
+class Kernel(ModelMixin, PolicyMixin, TaskMixin, MemoryMixin, ApprovalMixin,
+             ProgressMixin, OnboardingMixin, ProjectionMixin, ProcessMixin,
+             WorkspaceMixin, ToolMixin, SessionMixin)
 ```
 
-预期终态：`kernel.py` **~1,200–1,800 行门面** + 20 个左右 `kernel_<topic>.py`。
+预期终态：`kernel.py` **~1,200–1,800 行门面** + 16 个左右 `kernel_<topic>.py`。
 
 **命名约定**：兄弟文件一律 `kernel_<topic>.py`。Hermes 用不带前缀的
 `agent/session_persistence.py`，但本项目的 `core/` 已经有同名的**领域模块**
 （`session.py` / `workspace.py` / `tool.py` / `process.py`），它们不是 Mixin；
 加 `kernel_` 前缀让"Mixin 兄弟"与"领域模块"一眼可分。
+
+**待收尾的一件事**：MRO 顺序是抽取顺序的副产物（新 Mixin 一律插到最前），不是设计
+决定。语义上安全（跨贡献者重名由守卫测试挡住），但第 16 刀应排成一个有意图的顺序。
 
 ---
 
@@ -359,8 +379,9 @@ class Kernel(ToolMixin, SessionMixin, WorkspaceMixin, ProcessMixin)
 7. **棘轮表按搬迁重分布**：`tests/architecture/test_dependencies.py` 的
    `_TERMINAL_STATE_COUPLING_BASELINE` 量 `TaskState.<终止态>` 引用点，**只许降**。
    纯搬迁时该表要跟着改行，判据是**列求和守恒**（第 1 刀 56 == 56，`kernel.py` 34→32、
-   新文件 2），不是"总数不许变"。第 2–4 刀该域无引用，表不动。
-8. **先跑定向测试（~0.6–4 s）再跑全量（~23 s）**。
+   新文件 2；第 10 刀 `TERMINAL_AUTHORITY` 随 `transition_task` 搬走，`kernel.py` 32→19、
+   `kernel_task.py` +13，仍是 56）。其余刀该域无引用，表不动。
+8. **先跑定向测试（~0.6–5 s）再跑全量（~23–27 s）**。
 9. **禁止 source-text 测试**（`AGENTS.md:487-502`）。移动符号后若有测试挂了，先看它
    是不是在读源码——是就改成行为测试。
 10. **patch 缝（第 3 刀新增，唯一无法静态检查的一条）**：
@@ -373,7 +394,28 @@ class Kernel(ToolMixin, SessionMixin, WorkspaceMixin, ProcessMixin)
     因为补偿路径也搬走了而同样命中。
     **处理方式是把 patch 目标修到 production 真正读的模块**，不是"重新指向定义模块"。
     脚本每次抽取后打印 `seam_names()` 供人工核对；真正的兜底是全量测试。
-11. **不给内部迁移留 re-export shim**（`AGENTS.md:250`）。
+11. **符号 import 跟定义走（第 10 刀新增）。** 它与第 10 条是同一件事的两半，但规则**相反**：
+    `from tsm_agt.core.kernel import X` 里 X 搬走了 → **repoint 到兄弟模块**（定义处），
+    因为它**响**（导入即 ImportError，不是静默）。
+    已固化为脚本的 `_detached_symbol_imports()`：在子进程里对**真实模块**做 hasattr
+    检查，不读源码文本（re-export 与条件定义骗不过它），并做过注入缺陷的负向验证。
+    第 10 刀命中 2 个测试文件。**记住三者的区别：import 跟定义；patch 跟读取点；
+    两者都不是"重新指向定义模块"就能了事。**
+12. **跨域符号用 late-import（第 10 刀新增）**。某符号同时被搬移集与留守代码使用
+    （`_required_effects_from_outcomes`：任务域 ↔ verify 域），它**不能**搬。
+    Hermes 的正解是**在读到它的函数里 `from .kernel import X`**（`AGENTS.md:243-244`）。
+    额外好处：它在**调用时**从门面命名空间解析，所以 `patch(<facade>.<name>)` 照样拦截。
+    已固化为脚本的 late-import 注入。**覆盖两种位置**：搬走的**方法体**和搬走的
+    **模块级函数**——只覆盖前者会漏掉真实读取者（第 10 刀正是如此）。搬走的是
+    **class** 时脚本显式 REFUSING，因为需要往它自己的方法里注入。
+13. **`Kernel.<static>(...)` 改写为 `self.<static>(...)`（第 12 刀新增）**。
+    这是脚本**唯一**的非逐字改写，因此逐处报告。Mixin 形状下 `Kernel` 不是兄弟模块的
+    裸名，不改写就得给门面做 late-import（能跑，但把门面拖回来、绕过 MRO）。
+    等价性：任何 `Kernel.f(x)` 必是 staticmethod/classmethod（普通方法这样调本来就缺
+    `self`），`self.f(x)` 对两者都成立。
+    **但对 `@staticmethod`/`@classmethod` 必须禁止改写**——它没有 `self`，改了就把
+    `self` 变成未定义全局名（第 12 刀当场被 symtable 检查抓到）。
+14. **不给内部迁移留 re-export shim**（`AGENTS.md:250`）。
 
 
 ---
