@@ -29,17 +29,27 @@ class RubricJudgement:
     criterion_id: str
     verdict: JudgeVerdict
     reason: str = ""
+    #: Evidence ids the judge says it relied on. Only the first three fields are
+    #: required, so an adapter may construct this without deciding how to cite --
+    #: ``normalize_judgement`` then treats an uncited affirmation as undecidable
+    #: rather than as a pass (SPEC §6.2).
+    cited_evidence_ids: tuple[str, ...] = ()
 
     @property
     def passed(self) -> bool:
         return self.verdict is JudgeVerdict.SATISFIED
 
     def to_data(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "criterion_id": self.criterion_id,
             "verdict": self.verdict.value,
             "reason": self.reason,
         }
+        # Omitted when empty: this is checkpoint wire, and an unconditional new
+        # key would change the bytes of every RubricJudgement already recorded.
+        if self.cited_evidence_ids:
+            data["cited_evidence_ids"] = list(self.cited_evidence_ids)
+        return data
 
 
 @dataclass(frozen=True, slots=True)

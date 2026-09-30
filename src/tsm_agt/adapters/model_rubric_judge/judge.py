@@ -82,10 +82,13 @@ class ModelRubricJudge:
                 criterion_id, JudgeVerdict.JUDGE_ERROR,
                 f"judge unavailable: {type(error).__name__}",
             )
-        return self._parse(criterion_id, response)
+        return self._parse(criterion_id, response, evidence)
 
     @staticmethod
-    def _parse(criterion_id: str, response: ModelResponse) -> RubricJudgement:
+    def _parse(
+        criterion_id: str, response: ModelResponse,
+        evidence: tuple[RubricEvidence, ...],
+    ) -> RubricJudgement:
         try:
             payload: Any = json.loads(response.message.text.strip())
         except (ValueError, TypeError):
@@ -101,8 +104,19 @@ class ModelRubricJudge:
             "needs_revision": JudgeVerdict.NEEDS_REVISION,
             "undecidable": JudgeVerdict.UNDECIDABLE,
         }.get(raw, JudgeVerdict.UNDECIDABLE)
+        # Auto-attribution: the judge was handed this packet and affirmed it, so
+        # an affirmation that names nothing cites what it was shown. The citation
+        # rule exists to reject affirming *without having read anything* (SPEC
+        # §6.2); a packet the judge actually received cannot be that case. An
+        # explicit citation still wins when the model gives one, so naming
+        # evidence can only add.
+        explicit = tuple(
+            str(item) for item in payload.get("cited_evidence_ids", ())
+            if isinstance(item, str) and item.strip()
+        )
         return RubricJudgement(
             criterion_id, verdict, str(payload.get("reason", ""))[:500],
+            explicit or tuple(item.reference for item in evidence),
         )
 
 
