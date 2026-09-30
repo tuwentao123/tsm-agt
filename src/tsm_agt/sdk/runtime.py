@@ -104,7 +104,7 @@ class RuntimeTaskResult:
     pending_steering: tuple[Mapping[str, Any], ...] = ()
 
     def to_data(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "task_id": self.task_id, "state": self.state,
             "phase1_state": self.phase1_state,
             "status": self.status, "cursor": self.cursor,
@@ -128,8 +128,13 @@ class RuntimeTaskResult:
                 dict(self.completion_diagnostics)
                 if self.completion_diagnostics is not None else None
             ),
-            "pending_steering": [dict(item) for item in self.pending_steering],
         }
+        # Omitted when empty, like every other optional key here: this payload is
+        # compared and hashed, so an unconditional new key would change the shape
+        # of every result a caller already receives.
+        if self.pending_steering:
+            data["pending_steering"] = [dict(item) for item in self.pending_steering]
+        return data
 
 
 @dataclass(frozen=True, slots=True)
