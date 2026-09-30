@@ -238,5 +238,73 @@ class ConversationMessageContractTest(unittest.TestCase):
         self.assertIsNone(message.tool_name)
 
 
+class ScaffoldingMarkerTest(unittest.TestCase):
+    """Runtime-authored rows must be markable as never-durable.
+
+    Without this, persisting a turn's messages into conversation history would
+    write a Runtime-authored "user" turn that later outranks the real
+    instruction -- the failure Hermes' ``_EPHEMERAL_SCAFFOLDING_FLAGS``
+    (``agent/session_persistence.py:36-54``) exists to prevent.
+    """
+
+    def _message(self, **overrides):
+        from tsm_agt.ports import Message, TextBlock
+
+        fields = {
+            "message_id": "msg-1", "role": MessageRole.USER,
+            "content": (TextBlock("correction"),),
+        }
+        fields.update(overrides)
+        return Message(**fields)
+
+    def test_every_kind_used_by_the_runtime_is_declared(self) -> None:
+        from tsm_agt.ports import SCAFFOLDING_KINDS
+
+        self.assertEqual(
+            SCAFFOLDING_KINDS,
+            {"completion-readiness", "continuation-input", "steering"},
+        )
+
+    def test_ordinary_messages_are_not_scaffolding(self) -> None:
+        self.assertFalse(self._message().is_scaffolding)
+
+    def test_a_marked_message_reports_its_kind(self) -> None:
+        message = self._message(scaffolding="completion-readiness")
+        self.assertTrue(message.is_scaffolding)
+        self.assertEqual(message.scaffolding, "completion-readiness")
+
+    def test_unknown_kind_fails_closed(self) -> None:
+        """A typo must not silently mark nothing and let the row persist."""
+
+        with self.assertRaises(ValueError):
+            self._message(scaffolding="completion_readiness")
+
+    def test_only_user_rows_may_be_scaffolding(self) -> None:
+        for role in (MessageRole.ASSISTANT, MessageRole.TOOL, MessageRole.SYSTEM):
+            with self.subTest(role=role):
+                with self.assertRaises(ValueError):
+                    self._message(role=role, scaffolding="steering")
+
+    def test_absent_marker_is_omitted_from_the_payload(self) -> None:
+        """``to_data`` is the checkpoint wire; emitting the key unconditionally
+        would change every existing payload's bytes."""
+
+        self.assertNotIn("scaffolding", self._message().to_data())
+
+    def test_marker_survives_a_checkpoint_round_trip(self) -> None:
+        from tsm_agt.ports import Message
+
+        original = self._message(scaffolding="steering")
+        self.assertEqual(Message.from_data(original.to_data()), original)
+
+    def test_round_trip_of_an_unmarked_message_stays_unmarked(self) -> None:
+        from tsm_agt.ports import Message
+
+        original = self._message()
+        restored = Message.from_data(original.to_data())
+        self.assertIsNone(restored.scaffolding)
+        self.assertEqual(restored, original)
+
+
 if __name__ == "__main__":
     unittest.main()

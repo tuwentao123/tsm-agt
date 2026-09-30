@@ -244,6 +244,7 @@ from .process import (
     ProcessSandboxDenied,
 )
 from .task import LEGAL_TRANSITIONS, TaskNotFound, TaskSnapshot, TaskState
+from .verification_command import is_verification_command, is_verification_request
 from .task_spec import (
     TaskAcceptanceCriterion, TaskContinuationMode, TaskCriterionKind,
     OutcomeBindingAction, OutcomeBindingDecision, OutcomeBindingReason,
@@ -252,10 +253,17 @@ from .task_spec import (
     TaskOutcomeKind, TaskOutcomeProposal, TaskOutcomeSnapshot,
     TaskOutcomeStatus,
     TaskSpecProjector, TaskSpecProposal, TaskSpecSnapshot,
-    MAX_AUTHORED_ACCEPTANCE_CRITERIA,
+    MAX_AUTHORED_ACCEPTANCE_CRITERIA, ProofPlanCompiler, ProofCompilation,
     REQUIRED_EFFECT_CRITERION_ID, RUNTIME_AUTHORED_CRITERION_KINDS,
-    validate_authored_reference,
+    validate_authored_criterion,
 )
+from .evidence_coverage import (
+    ESCALATED_GAP_KINDS, ProofEnforcementMode, coverage_gaps,
+)
+from .proof_projection import (
+    derive_proof_events, replay_proof_projection,
+)
+from .semantic_review import normalize_judgement
 from .session import (
     SessionChoiceOption, SessionInteractionKind, SessionInteractionRequest,
     SessionSnapshot, SessionState, standalone_session_id,
@@ -359,6 +367,9 @@ class KernelDependencies:
     completion_readiness_mode: CompletionReadinessMode = (
         CompletionReadinessMode.LEGACY_GATE
     )
+    #: How strongly the proof layer participates in the Task decision.
+    #: ``OBSERVE`` (the only mode P0/P1 use) records without intercepting.
+    proof_enforcement_mode: ProofEnforcementMode = ProofEnforcementMode.OBSERVE
     final_acceptance_policy: FinalAcceptancePolicyPort | None = None
     exploration_budget_policy: ExplorationBudgetPolicyPort | None = None
     stop_or_pivot_policy: StopOrPivotPolicyPort | None = None
@@ -542,46 +553,14 @@ def _render_workspace_patch(
 
 
 def _is_verification_command(arguments: Mapping[str, Any]) -> bool:
-    """Recognize bounded build/test/static-check argv, never arbitrary commands."""
-    raw_argv = arguments.get("argv")
-    if not isinstance(raw_argv, (list, tuple)) or not raw_argv:
-        return False
-    argv = tuple(str(item).lower() for item in raw_argv)
-    executable = Path(argv[0]).name
-    if executable.endswith(".exe"):
-        executable = executable[:-4]
-    args = argv[1:]
-    if executable.startswith("python"):
-        return len(args) >= 2 and args[0] == "-m" and args[1] in {
-            "unittest", "pytest",
-        }
-    if executable in {"pytest", "ruff"}:
-        return True
-    if executable in {"gradle", "gradlew", "gradlew.bat", "mvn"}:
-        return any(
-            marker in arg for arg in args
-            for marker in ("test", "check", "build", "verify", "lint")
-        )
-    if executable in {"npm", "pnpm", "yarn", "bun"}:
-        return any(arg in {"test", "build", "lint", "check"} for arg in args)
-    if executable == "cargo":
-        return bool(args) and args[0] in {"test", "check", "build", "clippy"}
-    if executable == "go":
-        return bool(args) and args[0] in {"test", "build", "vet"}
-    if executable in {"flutter", "dart"}:
-        return bool(args) and args[0] in {"test", "analyze", "build"}
-    if executable == "xcodebuild":
-        return any(arg in {"test", "build", "analyze"} for arg in args)
-    if executable in {"javac", "kotlinc", "rustc", "swiftc", "ninja"}:
-        return True
-    if executable == "cmake":
-        return "--build" in args
-    if executable == "make":
-        return not args or any(
-            arg in {"test", "check", "build", "lint", "all"}
-            for arg in args
-        )
-    return False
+    """Whether a tool call is a bounded build/test/lint command.
+
+    Delegates to the single recognizer shared with authoring-time validation, so
+    "what the Runtime demands" and "what the Runtime accepts" cannot drift apart
+    (see ``core/verification_command.py``).
+    """
+
+    return is_verification_request(arguments)
 
 
 def _task_spec_requires_command_verification(spec: TaskSpecSnapshot) -> bool:
@@ -644,6 +623,105 @@ def _recorded_effect_deliveries(task: TaskSnapshot) -> frozenset[ToolEffect]:
     ):
         recorded.add(ToolEffect.EXECUTE)
     return frozenset(recorded)
+
+
+#: Kinds INV-3 must never demote because a bounded, explicit escape exists
+#: instead of a vacuous success: a judged gap is closed by the judge, and an
+#: effect failure the producer declared unfixable is escalated by the readiness
+#: gate to EXHAUSTED -- a resumable stop the stall cap turns into human review.
+#: Demoting the latter would let a Task whose required side effect never
+#: happened report success.
+_JUDGED_GAP_KINDS = frozenset({
+    "TASK_SPEC_RUBRIC", "EVIDENCE_QUESTION",
+    "JUDGED_CRITERION_WITHOUT_JUDGE", "UNRESOLVED_EFFECT_FAILURE",
+})
+
+#: Coverage gaps are exempt for a *different* reason -- the coverage layer owes a
+#: bounded escalation to human review -- so they live in their own set
+#: (SPEC §12.6 D3). Merging the two would let one reason's evolution silently
+#: change the other's behaviour.
+_EXEMPT_GAP_KINDS = _JUDGED_GAP_KINDS | ESCALATED_GAP_KINDS
+
+
+def _gap_has_contract_source(gap: CompletionGap) -> bool:
+    """Whether a readiness gap names the contract/ledger fact it came from.
+
+    INV-3 may drop a required gap that nothing can close, but *what* it may drop
+    matters: a gap with no provenance is bookkeeping the Runtime created for
+    itself, while a gap that names a contract entry (or a durable ``event:`` /
+    ``tool_call:`` / ``mutation:`` reference) is a requirement somebody actually
+    made. Demoting the latter would turn "we cannot prove it yet" into "we never
+    needed it" -- the silent-requirement-loss hole AG-9 closes.
+    """
+
+    return bool((gap.evidence_reference or "").strip())
+
+
+def _readiness_event_payload(
+    decision: CompletionReadinessDecision,
+    probe: CompletionReadinessProbe,
+    *,
+    turn_id: str,
+    mode: CompletionReadinessMode,
+    forced_wrap_up: bool,
+) -> dict[str, Any]:
+    """Durable payload for ``completion.readiness_evaluated``.
+
+    SPEC §3.5 rule 6: the coverage layer gets no readiness event of its own --
+    it identifies its contribution by id on this one. The ids stay empty unless
+    the proof gate is enforcing, so OBSERVE-mode and historical Task events
+    remain comparable, and a reader can tell "a real requirement the Runtime
+    could not prove" apart from "an ordinary unfinished step".
+    """
+
+    return {
+        "turn_id": turn_id, "action": decision.action.value,
+        "raw_action": decision.action.value,
+        "reason": decision.reason,
+        "mode": mode.value,
+        "enforced": mode is CompletionReadinessMode.LEGACY_GATE,
+        "forced_wrap_up": forced_wrap_up,
+        "remaining_model_calls": probe.remaining_model_calls,
+        "remaining_tool_calls": probe.remaining_tool_calls,
+        "available_effects": sorted(
+            effect.value for effect in probe.available_effects
+        ),
+        "gap_count": len(decision.gaps),
+        "coverage_gap_ids": [
+            gap.gap_id for gap in decision.gaps
+            if gap.kind in ESCALATED_GAP_KINDS
+        ],
+        "gaps": [gap.to_data() for gap in decision.gaps],
+        "state": decision.state.to_data(),
+    }
+
+
+def _apply_inv3_demotion(
+    gaps: Sequence[CompletionGap],
+) -> tuple[list[CompletionGap], list[CompletionGap]]:
+    """Enforce INV-3 and report what was dropped.
+
+    Returns ``(gaps, violations)`` where ``violations`` are the gaps whose
+    ``required`` flag was cleared. A gap is dropped only when it has no effective
+    effect, no exemption, **and** no contract provenance -- so the deadlock guard
+    survives without ever silently deleting a real requirement.
+    """
+
+    violations = [
+        gap for gap in gaps
+        if gap.required
+        and not gap.effective_required_effects
+        and gap.kind not in _EXEMPT_GAP_KINDS
+        and not _gap_has_contract_source(gap)
+    ]
+    if not violations:
+        return list(gaps), []
+    violation_ids = {gap.gap_id for gap in violations}
+    demoted = [
+        replace(gap, required=False) if gap.gap_id in violation_ids else gap
+        for gap in gaps
+    ]
+    return demoted, violations
 
 
 def _missing_effect_deliveries(
@@ -766,10 +844,39 @@ class _PostMutationVerification:
     latest_reference: str = ""
 
 
+def _matches_declared_command(
+    arguments: Mapping[str, Any], declared: Sequence[str],
+) -> bool:
+    """Whether a recorded call is the command a criterion bound itself to.
+
+    Prefix match: the criterion declares the entry point and the model may add
+    targets (``python -m pytest tests/x``). Case-insensitive because the argv
+    compare happens on a normalized command, not a filesystem path.
+    """
+
+    if not declared:
+        return True
+    raw_argv = arguments.get("argv")
+    if not isinstance(raw_argv, (list, tuple)):
+        return False
+    argv = tuple(str(item) for item in raw_argv)
+    if len(argv) < len(declared):
+        return False
+    return all(
+        actual.casefold() == expected.casefold()
+        for actual, expected in zip(argv, declared)
+    )
+
+
 def _post_mutation_verification(
-    task: TaskSnapshot,
+    task: TaskSnapshot, declared_command: Sequence[str] = (),
 ) -> _PostMutationVerification:
-    """Read the verification contract without discarding the failure reason."""
+    """Read the verification contract without discarding the failure reason.
+
+    ``declared_command`` is the criterion's own structured binding. When set,
+    only a run of that command can close the criterion; when empty the legacy
+    recognizer decides, so historical criteria keep their behaviour.
+    """
     if not task.mutation_journal:
         return _PostMutationVerification()
     latest_mutation = max(
@@ -781,6 +888,9 @@ def _post_mutation_verification(
         if (
             execution.call.name != "core.run_command"
             or not _is_verification_command(execution.call.arguments)
+            or not _matches_declared_command(
+                execution.call.arguments, declared_command,
+            )
             or execution.updated_at < latest_mutation.created_at
             or execution.state is not ToolCommitState.COMMITTED
             or execution.result is None or not execution.result.ok
@@ -814,8 +924,17 @@ def _post_mutation_verification(
 
 def _post_mutation_verification_description(
     verification: _PostMutationVerification,
+    declared_command: Sequence[str] = (),
 ) -> str:
     """State the requirement in the vocabulary Runtime actually accepts."""
+    if declared_command:
+        return (
+            "The workspace changed but the command this criterion binds to has "
+            "not produced a successful run after the latest mutation. Run it in "
+            "foreground mode and let it exit 0: `"
+            + " ".join(str(item) for item in declared_command)
+            + "`. Only that command closes this criterion."
+        )
     return (
         "The workspace changed but no successful foreground verification "
         "command was recorded after the latest mutation. Only a recognized "
@@ -1260,6 +1379,10 @@ class Kernel:
     @property
     def completion_readiness_mode(self) -> CompletionReadinessMode:
         return self._dependencies.completion_readiness_mode
+
+    @property
+    def proof_enforcement_mode(self) -> ProofEnforcementMode:
+        return self._dependencies.proof_enforcement_mode
 
     async def create_session(
         self, title: str, session_id: str | None = None,
@@ -3179,16 +3302,53 @@ class Kernel:
         self, task: TaskSnapshot, events: tuple[RuntimeEvent, ...],
         criteria: tuple[TaskAcceptanceCriterion, ...],
     ) -> tuple[tuple[TaskAcceptanceCriterion, ...], list[dict[str, str]]]:
-        """Demote unresolvable evidence_reference criteria to rubric (advisory).
+        """Demote criteria whose verification channel cannot decide them.
 
-        An ``evidence_reference`` criterion asserts a fact that must already be
-        true; it is never work that execution can produce. A reference that no
-        event/tool_call/mutation can resolve is permanently unverifiable and
-        must not survive as a required gate.
+        Two shapes are demoted to the advisory ``rubric`` channel:
+
+        * an ``evidence_reference`` criterion asserts a fact that must already
+          be true; it is never work that execution can produce. A reference no
+          event/tool_call/mutation can resolve is permanently unverifiable and
+          must not survive as a required gate.
+        * a ``post_mutation_command`` criterion promises a *command* decides it.
+          A criterion that declares no command, or declares one that cannot
+          falsify a claim (``git status``, ``py_compile``), is asking the runtime
+          to close a gate with evidence it can never accept -- the shape behind
+          ``task-c2d21bce8ea74f0bbcac07aba4aefedf``. Demotion keeps the
+          requirement visible to a judge instead of burning the turn budget on
+          a debt nothing can pay.
+
+        Demotion happens only on the authoring path, so historical snapshots
+        with unbound command criteria keep replaying unchanged.
         """
         kept: list[TaskAcceptanceCriterion] = []
         demoted: list[dict[str, str]] = []
         for criterion in criteria:
+            if (
+                criterion.verification_kind
+                is TaskCriterionKind.POST_MUTATION_COMMAND
+            ):
+                declared = tuple(criterion.command)
+                if declared and is_verification_command(declared):
+                    kept.append(criterion)
+                    continue
+                demoted.append({
+                    "criterion_id": criterion.criterion_id,
+                    "from": TaskCriterionKind.POST_MUTATION_COMMAND.value,
+                    "to": TaskCriterionKind.RUBRIC.value,
+                    "reference": " ".join(declared),
+                    "reason": (
+                        "UNRECOGNIZED_VERIFICATION_COMMAND"
+                        if declared else "NO_DECLARED_VERIFICATION_COMMAND"
+                    ),
+                })
+                kept.append(TaskAcceptanceCriterion(
+                    criterion_id=criterion.criterion_id,
+                    description=criterion.description,
+                    verification_kind=TaskCriterionKind.RUBRIC,
+                    evidence_reference=None,
+                ))
+                continue
             if (
                 criterion.verification_kind
                 is not TaskCriterionKind.EVIDENCE_REFERENCE
@@ -3403,8 +3563,8 @@ class Kernel:
     ) -> TaskSpecSnapshot:
         """Revise one Task contract; only Replace may change its goal."""
         for item in acceptance_criteria:
-            validate_authored_reference(
-                item.verification_kind, item.evidence_reference
+            validate_authored_criterion(
+                item.verification_kind, item.evidence_reference, item.command,
             )
         if not operation_id.strip() or not writer.strip():
             raise ValueError("Task SPEC operation and writer are required")
@@ -7340,6 +7500,7 @@ class Kernel:
                 messages.append(Message(
                     f"steering-{item.inbound_sequence}-{item.text_hash[:16]}",
                     MessageRole.USER, (TextBlock(body),),
+                    scaffolding="steering",
                 ))
                 applied_ids.append(item.steering_id)
             working_memory_event: RuntimeEvent | None = None
@@ -7682,6 +7843,21 @@ class Kernel:
                 task.with_agent_checkpoint(None)
                 if clear_agent_checkpoint else task
             )
+            # The turn's durable counters live in the checkpoint being retired.
+            # Read them *before* clearing it: `turn.completed` is the only place
+            # a finished turn's tool-call count is recoverable afterwards, and a
+            # missing key would silently report zero tools for every Task.
+            final_checkpoint = (
+                task.active_agent_checkpoint
+                if isinstance(task.active_agent_checkpoint, Mapping) else {}
+            )
+            raw_tool_calls = final_checkpoint.get("tool_calls")
+            completed_tool_calls = (
+                raw_tool_calls
+                if isinstance(raw_tool_calls, int)
+                and not isinstance(raw_tool_calls, bool)
+                else 0
+            )
             llm_event = RuntimeEvent(
                 f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
                 "llm.completed", dict(llm_payload),
@@ -7715,6 +7891,7 @@ class Kernel:
                 "turn.completed", {
                     "turn_id": turn_id,
                     "model_calls": llm_payload.get("model_call"),
+                    "tool_calls": completed_tool_calls,
                 },
             ))
             session_unit = await self._session_task_result_unit(
@@ -7915,13 +8092,15 @@ class Kernel:
                     # debt, so it must not become a required gap the Turn can
                     # never close.
                     continue
-                verification = _post_mutation_verification(task)
+                verification = _post_mutation_verification(
+                    task, criterion.command,
+                )
                 if not verification.passed:
                     gaps.append(CompletionGap(
                         gap_id=gap_id, kind="TASK_SPEC_POST_MUTATION_COMMAND",
                         description=(criterion.description + ": "
                                      + _post_mutation_verification_description(
-                                         verification
+                                         verification, criterion.command,
                                      )),
                         status="MISSING", required=True,
                         recoverable=bool(execute_tools),
@@ -8121,32 +8300,20 @@ class Kernel:
         # effective effects and no exempt kind can never be closed, which is
         # exactly the dead-lock shape of task-2c8f8fbb75714516a94ab442995626b5.
         # Demote it and record the violation instead of suspending the Task
-        # forever. This function keeps returning one tuple so its existing
-        # internal and test callers stay unchanged.
-        #
-        # The exempt kinds are not demoted because a bounded, explicit escape
-        # exists instead of a vacuous success: a judged gap is closed by the
-        # judge, and an effect failure the producer declared unfixable is
-        # escalated by the readiness gate to EXHAUSTED (a resumable stop that
-        # the stall cap turns into human review). Demoting the latter would let
-        # a Task whose required side effect never happened report success.
-        _JUDGED_GAP_KINDS = frozenset({
-            "TASK_SPEC_RUBRIC", "EVIDENCE_QUESTION",
-            "JUDGED_CRITERION_WITHOUT_JUDGE", "UNRESOLVED_EFFECT_FAILURE",
-        })
-        _violations = [
-            gap for gap in gaps
-            if gap.required
-            and not gap.effective_required_effects
-            and gap.kind not in _JUDGED_GAP_KINDS
-        ]
+        # forever -- but only when it has no contract provenance: a gap that
+        # names a real requirement must stay required and take the bounded
+        # escape (EXHAUSTED -> resumable boundary -> NEEDS_REVIEW) rather than
+        # being quietly dropped.
+        # AG-11 / SPEC P2: required coverage gaps join *this* gate -- there is no
+        # second readiness channel. Under OBSERVE the proof layer only records,
+        # so this branch must stay inert; it is what keeps P0/P1 behaviour
+        # bit-identical.
+        if self.proof_enforcement_mode is not ProofEnforcementMode.OBSERVE:
+            gaps = list(gaps) + list(
+                await self._proof_coverage_gaps(task_id, visible_tools)
+            )
+        gaps, _violations = _apply_inv3_demotion(gaps)
         if _violations:
-            _violation_ids = {gap.gap_id for gap in _violations}
-            gaps = [
-                replace(gap, required=False)
-                if gap.gap_id in _violation_ids else gap
-                for gap in gaps
-            ]
             await self._append_events(task_id, ((
                 "completion.invariant_violated", {
                     "violations": [
@@ -8278,27 +8445,119 @@ class Kernel:
                 # success. Diagnostics callers wrap this in their own guard.
                 raise
         await self._append_events(task_id, ((
-            "completion.readiness_evaluated", {
-                "turn_id": turn_id, "action": decision.action.value,
-                "raw_action": decision.action.value,
-                "reason": decision.reason,
-                "mode": self.completion_readiness_mode.value,
-                "enforced": (
-                    self.completion_readiness_mode
-                    is CompletionReadinessMode.LEGACY_GATE
-                ),
-                "forced_wrap_up": forced_wrap_up,
-                "remaining_model_calls": probe.remaining_model_calls,
-                "remaining_tool_calls": probe.remaining_tool_calls,
-                "available_effects": sorted(
-                    effect.value for effect in probe.available_effects
-                ),
-                "gap_count": len(decision.gaps),
-                "gaps": [gap.to_data() for gap in decision.gaps],
-                "state": decision.state.to_data(),
-            },
+            "completion.readiness_evaluated",
+            _readiness_event_payload(
+                decision, probe, turn_id=turn_id,
+                mode=self.completion_readiness_mode,
+                forced_wrap_up=forced_wrap_up,
+            ),
         ),))
+        # P0 read-only diagnosis: record what the proof layer sees. It runs
+        # after the decision is durable and never feeds back into it.
+        await self._publish_proof_diagnostics(task_id)
         return decision
+
+    async def _proof_coverage_gaps(
+        self, task_id: str, visible_tools: Sequence[ToolSpec],
+    ) -> tuple[CompletionGap, ...]:
+        """Required coverage gaps for the readiness gate (AG-11, SPEC P2).
+
+        Coverage is computed from the persisted events **plus** the observations
+        this turn has already produced but not yet published: the readiness gate
+        decides before the diagnostic pass persists them, and a gate that judged
+        a stale projection would block every Task that had just gathered its
+        evidence.
+
+        A Task with no Proof Plan reports nothing -- historical Tasks are
+        read-only compatible and are never retroactively inferred as covered.
+        """
+
+        stored = await self._dependencies.store.load_task(task_id)
+        if stored is None:
+            return ()
+        task = TaskSnapshot.from_data(stored.data)
+        events = await self._dependencies.store.read_events(task_id)
+        specs_by_name = {spec.name: spec for spec in visible_tools}
+        task_spec = TaskSpecProjector.project(task_id, task.goal, events)
+        available = frozenset(
+            capability.value
+            for spec in visible_tools
+            for capability in spec.evidence_capabilities
+        )
+        compilation = ProofPlanCompiler.compile(
+            task_spec, available_capabilities=available,
+        )
+        pending = derive_proof_events(
+            task_spec=task_spec, compilation=compilation,
+            executions=tuple(task.tool_executions.values()),
+            specs_by_name=specs_by_name,
+            mutation_records=task.mutation_journal,
+            current=replay_proof_projection(events),
+            events=events,
+            available_capabilities=available,
+            mode=self.proof_enforcement_mode,
+        )
+        projection = replay_proof_projection(
+            tuple(events) + tuple(
+                RuntimeEvent(
+                    f"pending-proof-{index}", task_id, 10_000 + index,
+                    event_type, payload,
+                )
+                for index, (event_type, payload) in enumerate(pending, start=1)
+            )
+        )
+        if projection.plan is None:
+            return ()
+        return coverage_gaps(
+            plan=projection.plan, coverages=projection.coverages,
+            tools=tuple(visible_tools),
+        )
+
+    async def _publish_proof_diagnostics(self, task_id: str) -> None:
+        """Emit proof-layer events for one Task. Read-only, never fails a Task.
+
+        P0 records what the proof layer *sees* (plan, artifacts, evidence,
+        coverage) without letting it influence execution or terminal state.
+        A defect here is contained and reported as an event, because diagnosis
+        must never be able to break a running Task.
+        """
+
+        try:
+            await self._emit_proof_diagnostics(task_id)
+        except Exception as error:  # containment is the contract, not laziness
+            await self._append_events(task_id, ((
+                "proof.projection_failed",
+                {"error_type": type(error).__name__},
+            ),))
+
+    async def _emit_proof_diagnostics(self, task_id: str) -> None:
+        stored = await self._dependencies.store.load_task(task_id)
+        if stored is None:
+            return
+        task = TaskSnapshot.from_data(stored.data)
+        events = await self._dependencies.store.read_events(task_id)
+        specs_by_name = {spec.name: spec for spec in await self.list_tools()}
+        task_spec = TaskSpecProjector.project(task_id, task.goal, events)
+        available = frozenset(
+            capability.value
+            for spec in specs_by_name.values()
+            for capability in spec.evidence_capabilities
+        )
+        compilation = ProofPlanCompiler.compile(
+            task_spec, available_capabilities=available,
+        )
+        pending = derive_proof_events(
+            task_spec=task_spec, compilation=compilation,
+            executions=tuple(task.tool_executions.values()),
+            specs_by_name=specs_by_name,
+            mutation_records=task.mutation_journal,
+            current=replay_proof_projection(events),
+            events=events,
+            available_capabilities=available,
+            mode=self.proof_enforcement_mode,
+        )
+        if pending:
+            await self._append_events(task_id, pending)
 
     async def _inject_agent_decides_completion_diagnostics(
         self, checkpoint: AgentTurnCheckpoint,
@@ -8364,6 +8623,7 @@ class Kernel:
         return Message(
             f"completion-readiness-{uuid4().hex}", MessageRole.USER,
             (TextBlock(json.dumps(body, sort_keys=True, separators=(",", ":"))),),
+            scaffolding="completion-readiness",
         )
 
     async def _complete_agent_checkpoint(
@@ -9240,9 +9500,14 @@ class Kernel:
         )
 
     async def verify_task_acceptance(
-        self, task_id: str,
+        self, task_id: str, *, include_semantic: bool = True,
     ) -> TaskVerificationResult:
-        """Verify persisted effects without rerunning model or command side effects."""
+        """Verify persisted effects without rerunning model or command side effects.
+
+        ``include_semantic=False`` runs only the deterministic stages, so a
+        read-only diagnostic caller never pays for a judge call (SPEC §7 P0).
+        A judged criterion is then reported as undetermined, never as passed.
+        """
         stored = await self._require_stored_task(task_id)
         task = TaskSnapshot.from_data(stored.data)
         observation_mode = (
@@ -9385,6 +9650,12 @@ class Kernel:
         }),))
 
         criteria: list[AcceptanceResult] = []
+        # Judgement criteria are *deferred* so the semantic stage always runs
+        # after every deterministic criterion (SPEC §7 P2 three-stage split).
+        # Two things fall out of that order, both required by the SPEC: a Task
+        # that already fails deterministically never pays for a judge call, and
+        # a read-only diagnostic caller can reuse the deterministic stage alone.
+        deferred_semantic: list[TaskAcceptanceCriterion] = []
         if mandatory_answer_completeness:
             assert answer_result is not None
             criteria.append(answer_result)
@@ -9557,22 +9828,31 @@ class Kernel:
                             "verifier", True,
                         ),),
                     ))
-                elif command_result is None:
-                    criteria.append(AcceptanceResult(
-                        criterion.criterion_id, AcceptanceStatus.BLOCKED,
-                        (Evidence(
-                            "process_exit", criterion.description,
-                            "no post-mutation command was recorded for this change",
-                            "verifier", False,
-                        ),),
-                    ))
                 else:
+                    # Per criterion: a bound criterion is decided by its own
+                    # declared command, so two criteria with different bindings
+                    # cannot be collapsed into one shared result.
+                    verification = _post_mutation_verification(
+                        task, criterion.command,
+                    )
+                    if verification.passed:
+                        status = AcceptanceStatus.PASSED
+                        observed = "exit_code=0 after mutation"
+                    elif verification.latest_argv:
+                        status = AcceptanceStatus.FAILED
+                        observed = (
+                            "latest post-mutation command did not exit successfully"
+                        )
+                    else:
+                        status = AcceptanceStatus.BLOCKED
+                        observed = "no post-mutation command recorded"
                     criteria.append(AcceptanceResult(
-                        criterion.criterion_id, command_result.status,
-                        tuple(Evidence(
-                            item.kind, criterion.description, item.observed,
-                            item.source_step_id, item.passed, item.artifact_path,
-                        ) for item in command_result.evidence),
+                        criterion.criterion_id, status,
+                        (Evidence(
+                            "process_exit", criterion.description, observed,
+                            verification.latest_reference or "verifier",
+                            status is AcceptanceStatus.PASSED,
+                        ),),
                     ))
             elif criterion.verification_kind is TaskCriterionKind.REQUIRED_EFFECT:
                 # Completion-claim gate: the contract declares side effects, so a
@@ -9584,35 +9864,11 @@ class Kernel:
             elif criterion.verification_kind in {
                 TaskCriterionKind.RUBRIC, TaskCriterionKind.GOAL_ALIGNMENT,
             }:
-                # A judgement criterion has no machine proof, so a bounded judge
-                # evaluates it instead of the reference verifier. INV-10: with no
-                # judge wired it must NOT silently pass or vanish -- a criterion
-                # nobody can decide is BLOCKED, which routes to NEEDS_REVIEW.
-                if self._dependencies.rubric_judge is None:
-                    criteria.append(AcceptanceResult(
-                        criterion.criterion_id, AcceptanceStatus.BLOCKED,
-                        (Evidence(
-                            "rubric_unavailable", criterion.description,
-                            "no rubric judge is configured; a judged criterion "
-                            "cannot pass",
-                            "rubric-judge", False,
-                        ),),
-                    ))
-                    continue
-                judgement = await self._judge_rubric_criterion(
-                    task, events, criterion, answer_reference,
-                    shared_observation_refs,
-                )
-                passed = judgement.verdict is JudgeVerdict.SATISFIED
-                criteria.append(AcceptanceResult(
-                    criterion.criterion_id,
-                    (AcceptanceStatus.PASSED if passed
-                     else AcceptanceStatus.BLOCKED),
-                    (Evidence(
-                        "rubric", criterion.description, judgement.reason,
-                        "rubric-judge", passed,
-                    ),),
-                ))
+                # Deferred to the semantic stage below: a judgement criterion has
+                # no machine proof, and its cost must never be paid before the
+                # deterministic verdict is known.
+                deferred_semantic.append(criterion)
+                continue
             else:
                 reference = criterion.evidence_reference or ""
                 evidence = self._verify_task_spec_reference(
@@ -9627,6 +9883,75 @@ class Kernel:
 
         if mandatory_post_mutation and command_result is not None:
             criteria.append(command_result)
+
+        # Stage 3 (semantic). Runs only now, so the deterministic verdict is
+        # already known. INV-10 still holds either way: a judged criterion that
+        # was not evaluated is BLOCKED -- undetermined -- never passed.
+        deterministic_passed = all(
+            item.status is AcceptanceStatus.PASSED for item in criteria
+        )
+        for criterion in deferred_semantic:
+            if not include_semantic:
+                criteria.append(AcceptanceResult(
+                    criterion.criterion_id, AcceptanceStatus.BLOCKED,
+                    (Evidence(
+                        "rubric_deferred", criterion.description,
+                        "the semantic stage was skipped for this read-only "
+                        "call; the criterion is undetermined, not passed",
+                        "rubric-judge", False,
+                    ),),
+                ))
+                continue
+            if not deterministic_passed:
+                criteria.append(AcceptanceResult(
+                    criterion.criterion_id, AcceptanceStatus.BLOCKED,
+                    (Evidence(
+                        "rubric_not_reached", criterion.description,
+                        "the deterministic stage did not pass, so this "
+                        "judgement criterion was not evaluated; the criterion is "
+                        "undetermined, not passed",
+                        "rubric-judge", False,
+                    ),),
+                ))
+                continue
+            if self._dependencies.rubric_judge is None:
+                criteria.append(AcceptanceResult(
+                    criterion.criterion_id, AcceptanceStatus.BLOCKED,
+                    (Evidence(
+                        "rubric_unavailable", criterion.description,
+                        "no rubric judge is configured; a judged criterion "
+                        "cannot pass",
+                        "rubric-judge", False,
+                    ),),
+                ))
+                continue
+            judgement, referenced_ids = await self._judge_rubric_criterion(
+                task, events, criterion, answer_reference,
+                shared_observation_refs,
+            )
+            # SPEC §6.2: an affirmation that cites nothing it read is not a pass.
+            outcome = normalize_judgement(
+                obligation_ids=(),
+                verdict=judgement.verdict,
+                reason=judgement.reason,
+                cited_evidence_ids=judgement.cited_evidence_ids,
+                known_evidence_ids=frozenset(referenced_ids),
+            )
+            passed = outcome.satisfied
+            criteria.append(AcceptanceResult(
+                criterion.criterion_id,
+                (AcceptanceStatus.PASSED if passed
+                 else AcceptanceStatus.BLOCKED),
+                (Evidence(
+                    # The disposition (SATISFIED / NEEDS_REWORK / NEEDS_REVIEW)
+                    # is part of the audit trail: a bounded rework request and an
+                    # undecidable review are different outcomes even though both
+                    # withhold success here.
+                    f"rubric:{outcome.disposition}",
+                    criterion.description, outcome.reason,
+                    "rubric-judge", passed,
+                ),),
+            ))
 
         status = AcceptanceStatus.PASSED
         if any(item.status is AcceptanceStatus.FAILED for item in criteria):
@@ -9804,7 +10129,7 @@ class Kernel:
 
         # Reserved seam: the probe field stays for a future runtime-owned plan
         # contract, but the model's scratchpad is no longer a delivery contract.
-        # See 完成判定改造SPEC.md §5.5 / §12.2.
+        # See 任务证明闭环实施SPEC.md §2 (INV-1).
         required_plan_steps: tuple[str, ...] = ()
         readiness_events = [
             event for event in events
@@ -10074,7 +10399,7 @@ class Kernel:
         self, task: TaskSnapshot, events: tuple[RuntimeEvent, ...],
         criterion: TaskAcceptanceCriterion,
         answer_reference: str, observation_refs: tuple[str, ...],
-    ) -> RubricJudgement:
+    ) -> tuple[RubricJudgement, tuple[str, ...]]:
         """Evaluate one judgement criterion under a bounded attempt budget.
 
         A judge that keeps erroring is not retried forever; every attempt is
@@ -10107,7 +10432,7 @@ class Kernel:
             ),))
             if judgement.verdict is not JudgeVerdict.JUDGE_ERROR:
                 break
-        return judgement
+        return judgement, tuple(item.reference for item in evidence)
 
     def _rubric_evidence(
         self, task: TaskSnapshot, events: tuple[RuntimeEvent, ...],
@@ -10879,7 +11204,14 @@ class Kernel:
         A continuation resumes one Task safely; it must not make earlier blocker
         prose look like durable evidence. Tool-call messages and ToolResult
         messages remain paired and intact for protocol recovery.
+
+        When the history still holds retryable tool failures, the continuation
+        says so and asks for the retry by name. The generic "continue from
+        durable ToolResults" wording let a model answer the same way again, so
+        the Task parked, the user pressed 继续, and nothing changed
+        (``task-a20b6734f28b4870be666e7c14561e76``).
         """
+
         retained = [
             message for message in messages
             if not message.message_id.startswith("completion-readiness-")
@@ -10891,17 +11223,42 @@ class Kernel:
                 )
             )
         ]
+        payload: dict[str, Any] = {
+            "boundary": "user_continuation",
+            "instruction": (
+                "Continue the current Task from durable ToolResults and "
+                "workspace facts. Prior assistant prose is not evidence and "
+                "must not be repeated as a conclusion."
+            ),
+            "text": user_text,
+        }
+        recovery_batch = Kernel._latest_recoverable_tool_batch(messages)
+        if recovery_batch:
+            payload["instruction"] = (
+                "Continue the current Task from durable ToolResults and "
+                "workspace facts. These tool calls did not complete and are "
+                "retryable: call the same tool again with corrected arguments "
+                "now, or state concretely why it cannot be retried. Prior "
+                "assistant prose is not evidence and must not be repeated as a "
+                "conclusion."
+            )
+            payload["unresolved_tool_failures"] = [
+                {
+                    "call_id": result.call_id,
+                    "error_code": result.error_code,
+                    "message": result.message,
+                    "recovery_kind": result.effective_recovery_kind.value,
+                    "recovery_action": dict(result.recovery_action),
+                }
+                for result in recovery_batch
+            ]
         retained.append(Message(
             f"continuation-input-{input_id}", MessageRole.USER,
-            (TextBlock(json.dumps({
-                "boundary": "user_continuation",
-                "instruction": (
-                    "Continue the current Task from durable ToolResults and "
-                    "workspace facts. Prior assistant prose is not evidence and "
-                    "must not be repeated as a conclusion."
-                ),
-                "text": user_text,
-            }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))),),
+            (TextBlock(json.dumps(
+                payload, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            )),),
+            scaffolding="continuation-input",
         ))
         return tuple(retained)
 
@@ -11591,6 +11948,95 @@ class Kernel:
                 settled.append(task.task_id)
                 note_interrupting_settled(task.task_id, intent)
         return tuple(settled)
+
+    #: How a restart settles each Task state that asserts in-process work.
+    #: A state absent here is either terminal or legitimately durable across
+    #: restarts: AWAITING_APPROVAL / AWAITING_USER carry a pending action a
+    #: human still owns, and INTERRUPTING is settled by
+    #: ``reconcile_interrupting_tasks``.
+    _ORPHANED_SETTLEMENTS: Mapping[TaskState, TaskState] = {
+        # The checkpoint survives, so a resume re-runs the work.
+        TaskState.EXECUTING: TaskState.INTERRUPTED,
+        TaskState.RUNNING_WORKFLOW: TaskState.INTERRUPTED,
+        TaskState.RESUMING: TaskState.INTERRUPTED,
+        TaskState.PLANNING: TaskState.INTERRUPTED,
+        TaskState.ROUTING: TaskState.INTERRUPTED,
+        # Verification is a pure function of the ledger, so it is re-derived on
+        # the next run rather than reported as an outcome nobody produced.
+        TaskState.VERIFYING: TaskState.INTERRUPTED,
+        # Reaching FINALIZING means trusted verification already passed, and
+        # transition_task re-checks that gate; the Task only lacked its last
+        # two bookkeeping transitions.
+        TaskState.FINALIZING: TaskState.SUCCEEDED,
+        # Nothing started, so there is nothing to recover or to report as work.
+        TaskState.CREATED: TaskState.CANCELLED,
+        TaskState.INTAKE: TaskState.CANCELLED,
+        TaskState.RESOLVING_PROJECT: TaskState.CANCELLED,
+        TaskState.SELECTING_EXTENSIONS: TaskState.CANCELLED,
+    }
+
+    async def reconcile_orphaned_running_tasks(self) -> tuple[str, ...]:
+        """Settle Tasks a previous process left mid-flight.
+
+        A non-terminal Task state claims that Runtime work is happening, but the
+        work itself is process-local: after a restart there is none. The Session
+        still keeps that Task as its active one, so every later message is
+        answered "busy" (or steered into a queue nothing drains) with no error
+        and no progress -- the shape behind
+        ``task-c2d21bce8ea74f0bbcac07aba4aefedf`` and
+        ``task-fb9d5b46923345cfb2ba7653e342f2da``. This covers every such state,
+        not only the ones named "running": the second incident was a Task frozen
+        in VERIFYING because a restart killed the verifier's judge call.
+
+        Called once after adapters start and before any user input is accepted.
+        Idempotent: a settled Task is no longer in a claimed-work state.
+        """
+
+        settled: list[str] = []
+        for session in await self.list_sessions(include_archived=True):
+            for task in await self.list_session_tasks(session.session_id):
+                if await self.settle_orphaned_task(task.task_id):
+                    settled.append(task.task_id)
+        return tuple(settled)
+
+    async def settle_orphaned_task(self, task_id: str) -> bool:
+        """Settle one Task whose claimed in-process work no longer exists.
+
+        Returns whether a settlement was applied. The caller is responsible for
+        establishing that no live turn drives the Task; at start-up that is
+        true by definition, and on the input path the SDK checks its own runner
+        registry first.
+        """
+
+        stored = await self._dependencies.store.load_task(task_id)
+        if stored is None:
+            return False
+        task = TaskSnapshot.from_data(stored.data)
+        target = self._ORPHANED_SETTLEMENTS.get(task.state)
+        if target is None:
+            return False
+        try:
+            if target is TaskState.INTERRUPTED:
+                if task.state not in {
+                    TaskState.EXECUTING, TaskState.RUNNING_WORKFLOW,
+                }:
+                    # Interruption is only defined from a running state, so step
+                    # back to the state whose checkpoint a resume re-runs.
+                    await self.transition_task(
+                        task.task_id, TaskState.EXECUTING,
+                        "orphaned task returned to execution for settling",
+                    )
+                await self.interrupt_agent_turn(
+                    task.task_id, "orphaned task settled on startup",
+                )
+            else:
+                await self.transition_task(
+                    task.task_id, target,
+                    f"orphaned {task.state.value} settled on startup",
+                )
+        except (InvalidTurnState, TaskNotFound):
+            return False
+        return True
 
     async def _continue_agent_turn(
         self,
@@ -13228,7 +13674,13 @@ class Kernel:
                         )
                         if error.reason_code == "tool_call_emitted_while_disabled" else (
                             self._outcome_binding_correction(error.detail)
-                        ) if error.reason_code == "invalid_outcome_binding" else
+                        ) if error.reason_code == "invalid_outcome_binding" else (
+                            "One of your tool calls was rejected before execution: "
+                            f"{error.detail} "
+                            "Re-issue that call with every required argument filled "
+                            "in, or choose a different approach if you cannot supply "
+                            "them. Do not repeat the rejected call unchanged."
+                        ) if error.reason_code == "invalid_tool_batch" else
                         (
                             "Your previous response used an invalid tool-call envelope. "
                             "Retry the response once. For every tool call, pass exactly "
@@ -17545,7 +17997,14 @@ class Kernel:
                 "task.state_changed", {
                     "previous_state": current.state.value,
                     "next_state": interrupting.state.value,
-                    "reason": "unexpected Agent execution stop",
+                    # Truthful and machine-readable: the stop was *classified*
+                    # (recoverable, checkpoint preserved), so calling it
+                    # "unexpected" contradicted the payload right next to it and
+                    # made downstream triage guess.
+                    "reason": (
+                        f"recoverable stop: {failure_category.value}/"
+                        f"{failure_kind}/{recovery_action.value}"
+                    ),
                 },
             ),
             RuntimeEvent(

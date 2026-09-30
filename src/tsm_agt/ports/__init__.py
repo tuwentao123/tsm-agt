@@ -26,6 +26,7 @@ from .model import (
     MessageBlock,
     MessageRole,
     ModelCallPurpose,
+    SCAFFOLDING_KINDS,
     ModelProviderPort,
     ModelRequest,
     ModelResponse,
@@ -189,6 +190,9 @@ from .tool import (
     ToolRisk,
     ToolProtocol,
     ToolSpec,
+    EvidenceCapability,
+    EXPLICIT_ONLY_EVIDENCE_CAPABILITIES,
+    derive_evidence_capabilities,
 )
 
 __all__ = [
@@ -218,6 +222,9 @@ __all__ = [
     "WebEgressMode",
     "ToolEffect",
     "ToolResultAuthority",
+    "EvidenceCapability",
+    "EXPLICIT_ONLY_EVIDENCE_CAPABILITIES",
+    "derive_evidence_capabilities",
     "ToolProtocol",
     "CompletionGap",
     "CompletionReadinessAction",
@@ -247,6 +254,7 @@ __all__ = [
     "Message",
     "MessageBlock",
     "MessageRole",
+    "SCAFFOLDING_KINDS",
     "ModelProviderPort",
     "ModelRequest",
     "ModelResponse",

@@ -162,11 +162,64 @@ MessageBlock = (
 )
 
 
+#: Kinds of internal scaffolding a message may carry.
+#:
+#: A scaffolding message rides the live request like any other row, but the
+#: Runtime authors it -- not the user and not the model -- so it must never
+#: become durable conversation history. Leaving such rows unflagged is what lets
+#: a Runtime-authored "user" turn survive into a later turn and outrank the real
+#: instruction.
+#:
+#: This mirrors Hermes' ``_EPHEMERAL_SCAFFOLDING_FLAGS``
+#: (``agent/session_persistence.py:36-54``) and copies its two load-bearing
+#: choices. Markers are **named**, not one boolean, because the flags there
+#: distinguish a verification nudge from the assistant candidate it accompanies
+#: -- the same distinction is needed here. And the marker is checked through
+#: **one table and one predicate**, so a new kind of scaffolding adds an entry
+#: rather than another ``message_id.startswith(...)`` list at a call site.
+SCAFFOLDING_KINDS = frozenset({
+    #: The bounded correction the completion gate injects when a proposed final
+    #: answer is not accepted (``core/kernel.py:8593``).
+    "completion-readiness",
+    #: The prompt that re-enters the loop after a user continuation
+    #: (``core/kernel.py:11253``).
+    "continuation-input",
+    #: A user message delivered mid-turn by the steering channel
+    #: (``core/kernel.py:7500``).
+    "steering",
+})
+
+
 @dataclass(frozen=True, slots=True)
 class Message:
     message_id: str
     role: MessageRole
     content: tuple[MessageBlock, ...]
+    #: ``None`` for ordinary rows. A non-None value names the scaffolding kind
+    #: (see ``SCAFFOLDING_KINDS``) and marks this row as never-durable.
+    scaffolding: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.scaffolding is None:
+            return
+        # Fail closed on an unknown marker: a typo would otherwise mark nothing,
+        # and the row it was meant to protect would be persisted as if a user
+        # had written it.
+        if self.scaffolding not in SCAFFOLDING_KINDS:
+            raise ValueError(
+                f"unknown scaffolding kind: {self.scaffolding!r}"
+            )
+        # Every scaffolding kind in this codebase is a mid-turn user-side
+        # injection; an assistant or tool row carrying one would mean the flag
+        # was attached to the wrong row.
+        if self.role is not MessageRole.USER:
+            raise ValueError(
+                "only user messages may carry a scaffolding kind"
+            )
+
+    @property
+    def is_scaffolding(self) -> bool:
+        return self.scaffolding is not None
 
     @property
     def text(self) -> str:
@@ -175,11 +228,17 @@ class Message:
         )
 
     def to_data(self) -> dict[str, object]:
-        return {
+        # The marker is omitted when absent rather than serialized as null: this
+        # mapping is the checkpoint wire and the prompt-cache substrate, so always
+        # emitting the key would change every existing payload's bytes.
+        data: dict[str, object] = {
             "message_id": self.message_id,
             "role": self.role.value,
             "content": [block.to_data() for block in self.content],
         }
+        if self.scaffolding is not None:
+            data["scaffolding"] = self.scaffolding
+        return data
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> Message:
@@ -211,10 +270,14 @@ class Message:
                 ))
             else:
                 raise ValueError(f"unsupported message block type: {block_type}")
+        raw_scaffolding = data.get("scaffolding")
         return cls(
             message_id=str(data["message_id"]),
             role=MessageRole(str(data["role"])),
             content=tuple(blocks),
+            scaffolding=(
+                str(raw_scaffolding) if raw_scaffolding is not None else None
+            ),
         )
 
 
