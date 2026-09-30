@@ -175,7 +175,93 @@ git diff HEAD > /tmp/current.patch     # 现在应为空
 
 ---
 
-## 8. 需要你在**有伪终端**的普通终端里验证的一件事
+## 9. 用真实台账核对后的三个发现（只读副本，原库未改动）
+
+方法：用 SQLite 自己的 `backup()` API 把 `.agent/runtime.db`（447 MB）复制到 `/tmp` 再分析，
+原库全程只读。真实规模：77 Session / 687 Task / 114,840 事件。
+
+### 9.1 主导失败模式是「无法判定被写成失败」，占真实的 71%
+
+真实 687 个 Task：`SUCCEEDED 446` / `FAILED 161` / `AWAITING_USER 32` /
+`INTERRUPTED 23` / `NEEDS_REVIEW 11` / `CANCELLED 7` / **`EXECUTING 3（永久卡住）`** /
+`AWAITING_APPROVAL 2` / `CONFLICT 2`。
+
+161 个 FAILED 的收尾原因：
+
+```
+69  trusted verifier blocked
+46  SDK verifier blocked          <- 合计 115 = 71% 的真实失败
+15  SDK background execution failed
+11  model invocation failed
+11  SDK verifier failed
+ 4  max_model_calls
+ ...
+```
+
+实际事件序列是 `VERIFYING --"trusted verifier blocked"--> FAILED`（已逐条打开确认）。
+
+而 `core/turn_outcome.py` **已经判定这不是失败**：
+
+```
+derive_turn_outcome(FAILED, "SDK verifier blocked")
+  -> completed=False, failed=False, interrupted=True, exit_reason='undecidable'
+```
+
+你自己的测试注释就写着这件事（`tests/test_proof_closure.py:2372`）：
+`# The exact wording from the ledger: 69 + 46 tasks reached FAILED this way.`
+—— 与我独立从台账数出来的 69 + 46 完全一致。
+
+### 9.2 但这个修复**没有接进生产**
+
+```
+derive_turn_outcome        无生产消费者
+outcome_inconsistencies    无生产消费者   (它能报 FAILED_STATE_WITH_UNDECIDABLE_REASON)
+classify_transition_reason 无生产消费者
+finalize_turn              无生产消费者
+```
+
+四个都只被 `tests/test_proof_closure.py` 引用。所以运行时仍然把「无法判定」写成 `FAILED`，
+这就是「不知道如何完成闭环」在台账里的样子。
+
+**接线正是被销毁的那批未提交改动在做的事**：HEAD 源码里**没有任何地方生产**
+`"SDK verifier blocked"` / `"trusted verifier blocked"` 这两个字符串（只有
+`turn_outcome.py` 的识别列表里作为子串出现）。产码在 `sdk/runtime.py` / `cli.py` 里，
+而这两个文件都在丢失清单上。→ **恢复备份很可能就把这一步带回来了，不必我从头接线。**
+
+### 9.3 三个真实 Task 永久卡在 EXECUTING，且启动期 reconcile 够不到
+
+```
+task-c83385c6ba8447868cbd596f11b58cb0  EXECUTING  查下今天的nba新闻
+task-5711c97fe5244a388779fa855ee6c049  EXECUTING  帮我看下当前项目有哪几个文件夹 分别是啥功能
+task-9998de4ddd134474825800c8a01ed435  EXECUTING  必须使用可用的只读工具读取 src/tsm_agt/core/pol...
+```
+
+它们的 3 个 Session 的 `subject = 'legacy-local-subject'`，而当前身份是 `uid:501`
+（77 个 Session 里 74 个是 `uid:501`）。会话查询按 subject 过滤：
+
+```
+list_sessions(include_archived=True) -> 74   （不是 77）
+get_session(legacy_session)          -> PermissionError: session belongs to another local subject
+reconcile_orphaned_running_tasks()   -> settled 0
+settle_orphaned_task(task)           -> True   （单独调用是成功的！）
+```
+
+所以问题出在**扫描范围**，不在 settle 逻辑。这三个 Session 建于 2026-08-31，
+恰好是身份从占位符 `legacy-local-subject` 切到 `uid:501` 之前。
+
+---
+
+## 10. 一句话结论
+
+代码层面已修到全量绿、干净导出可跑、真实 socket 的模型 HTTP 往返也实测通过；
+但**「真实场景能正常用」还不能确认**，差三件事：§9.2 的接线（或等备份恢复）、
+§9.3 的扫描范围、以及本沙箱无法访问模型端点（DNS 把
+`aibrain-large-model-engine-slow.hellobike.cn` 解析到 `198.18.0.71` 黑洞，
+`danger-full-access` 下依然如此）。
+
+---
+
+## 11. 需要你在**有伪终端**的普通终端里验证的一件事
 
 ```bash
 .venv/bin/python -m pytest tests/test_cli_line_editing.py -q
