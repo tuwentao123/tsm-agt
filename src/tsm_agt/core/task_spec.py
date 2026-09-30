@@ -869,9 +869,17 @@ NOT_STRUCTURALLY_KNOWABLE = "NOT_STRUCTURALLY_KNOWABLE"
 #: Reference prefix -> predicate, for the prefixes the Runtime verifier can
 #: resolve. Anything else is permanently unverifiable by construction: the id
 #: was copied out of narrative context, not produced by an execution.
-_REFERENCE_PREDICATES: Mapping[str, ObligationPredicate] = {
-    "event:": ObligationPredicate.ARTIFACT_EXISTS,
-    "mutation:": ObligationPredicate.EFFECT_OBSERVED,
+#: How each structured ``evidence_reference`` prefix compiles (SPEC §4.3). The
+#: prefix alone decides the predicate, and with it whether the reference *is* the
+#: subject or merely names the ledger record that supplies one.
+_REFERENCE_COMPILATION: Mapping[str, tuple[ObligationPredicate, str]] = {
+    # ``event:`` asserts only that the ledger event exists, so the event is the
+    # subject and its reference is the stable locator (AG-10).
+    "event:": (ObligationPredicate.ARTIFACT_EXISTS, "locator"),
+    # A mutation's path comes from its journal record and an execution's
+    # strength from its recorded capability, so neither can declare a subject
+    # here -- the record the reference names supplies it (AG-3).
+    "mutation:": (ObligationPredicate.EFFECT_OBSERVED, "reference"),
 }
 
 #: Capability a recorded ``tool_call:`` reference must have carried for the
@@ -1014,13 +1022,18 @@ class ProofPlanCompiler:
                 required_capabilities=("EXECUTE_VERIFICATION",),
             ))
         if kind is TaskCriterionKind.WORKSPACE_INTEGRITY:
+            # SPEC §4.3: the only structured source is ``verification_kind`` --
+            # there is no path to select, so the obligation can assert no more
+            # than "the declared change left a durable effect". It must not
+            # invent an ARTIFACT_CONTENT requirement that no structured field
+            # could ever locate.
             return (_PRIORITY_DEFAULT, make_obligation(
                 contract_ref=contract_ref,
-                predicate=ObligationPredicate.ARTIFACT_EXISTS,
+                predicate=ObligationPredicate.EFFECT_OBSERVED,
                 requirement_text=criterion.description,
                 selector={"criterion": contract_ref},
                 required=True,
-                required_capabilities=("READ_ARTIFACT",),
+                required_capabilities=(EvidenceCapability.MUTATE_ARTIFACT.value,),
             ))
         if kind in {TaskCriterionKind.RUBRIC, TaskCriterionKind.GOAL_ALIGNMENT}:
             return (_PRIORITY_DEFAULT, make_obligation(
@@ -1035,14 +1048,15 @@ class ProofPlanCompiler:
 
         reference = (criterion.evidence_reference or "").strip()
         prefix = reference.split(":", 1)[0] + ":" if ":" in reference else ""
-        predicate = _REFERENCE_PREDICATES.get(prefix)
-        if predicate is not None:
+        compiled = _REFERENCE_COMPILATION.get(prefix)
+        if compiled is not None:
+            predicate, subject_key = compiled
             capability = references.get(reference, "")
             return (_PRIORITY_DEFAULT, make_obligation(
                 contract_ref=contract_ref,
                 predicate=predicate,
                 requirement_text=criterion.description,
-                selector={"reference": reference},
+                selector={subject_key: reference},
                 required=True,
                 # An observation reference is only as strong as the capability
                 # that produced it, which the caller reports per reference. Empty
