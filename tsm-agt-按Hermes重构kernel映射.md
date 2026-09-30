@@ -289,34 +289,51 @@ Hermes 有三层（工具内 per-tool cap → 落盘 + 预览 → `enforce_turn_
 
 ---
 
-## 5. 建议顺序（每刀一个 commit）
+## 5. 实际进度与顺序
 
-排序依据：被引用少、依赖单向、Hermes 有对应 topic（好照抄）。
+实际执行时**不照抄上面的排序**——`flow/replay` 只有 77 行，单独建文件不划算；
+而 `completion-readiness`（731 行 / 7 方法）被抽取脚本**正确拒绝**：它引用
+`_has_active_workspace_mutation` / `_missing_effect_deliveries` /
+`_post_mutation_verification` / `_task_spec_requires_command_verification` 四个 helper，
+这四个同时被 `verify_task_acceptance` 使用，不能随它搬。**completion 与 verify 确实
+纠缠，必须一起在第 8 刀处理。**
 
-| # | 域 | 行数 | 目标文件（`core/` 下） | 依据 | 状态 |
-|---|---|---:|---|---|---|
-| 1 | session | 2,173 | `kernel_session.py` / `SessionMixin` | Hermes 同名文件存在；`session_context.py` 已在 | ✅ 已完成 |
-| 2 | tool | 1,769 | `kernel_tool.py` / `ToolMixin` | 对应 `agent/tool_executor.py` | |
-| 3 | projection / flow | 758 | `kernel_projection.py` | 纯投影，无副作用，最安全 | |
-| 4 | workspace / mutation + process | 834 + 379 | `kernel_workspace.py` | 对应 `file_safety.py` 等 | |
-| 5 | context / prompt | 503 | `kernel_context.py` | 对应 `turn_context.py` | |
-| 6 | approval / policy + memory | 378 + 194 | `kernel_approval.py`, `kernel_memory.py` | 小 | |
-| 7 | task-lifecycle + task-spec | 544 + 351 | `kernel_task.py` | **本项目新增域** | |
-| 8 | verify / proof | 1,715 + §4.4 的 8 个文件 | 先定性再拆 | **本项目新增域**，最后做 | |
-| 9 | 剩余 turn/agent-loop + "未归类" | — | `kernel_completion.py`, … | 收尾 | |
+| # | 域 | 选定行数/方法 | 目标 | 状态 |
+|---|---|---:|---|---|
+| 1 | session | 2,173 / 40 | `kernel_session.py` / `SessionMixin` | ✅ `653f5f4` |
+| 2 | tool | 1,500 / 22 | `kernel_tool.py` / `ToolMixin` | ✅ `f3d3f18` |
+| 3 | workspace / mutation | 1,075 / 16 | `kernel_workspace.py` / `WorkspaceMixin` | ✅ `1b42605` |
+| 4 | process / background | 476 / 20 | `kernel_process.py` / `ProcessMixin` | ✅ `41aae86` |
+| 5 | projection（flow/replay + progress/scope + configuration/status） | ~400 / 11 | `kernel_projection.py` | 待做 |
+| 6 | project-onboarding | 445 / 10 | `kernel_onboarding.py` | 待做 |
+| 7 | approval + memory | 339 + 218 | `kernel_approval.py`, `kernel_memory.py` | 待做 |
+| 8 | verify / proof + completion（纠缠，一起做） | 1,397 + 731 | 先给 §4.4 的 8 个文件定性 | 待做 |
+| 9 | 剩余 turn/agent-loop + 未归类 | — | 收尾 | 待做 |
 
-每刀完成后的状态：
+当前状态：
 
 ```
-kernel.py              15,990 → 13,818 行（272 → 232 方法）
-core/kernel_session.py              2,267 行 / 40 方法
+kernel.py            15,990 → 10,445 行（272 → 194 方法，−35%）
+core/kernel_session.py     2,267 行 / 40 方法
+core/kernel_tool.py        1,960 行 / 22 方法
+core/kernel_workspace.py   1,150 行 / 16 方法
+core/kernel_process.py       558 行 / 20 方法
+class Kernel(ToolMixin, SessionMixin, WorkspaceMixin, ProcessMixin)
 ```
 
 预期终态：`kernel.py` **~1,200–1,800 行门面** + 20 个左右 `kernel_<topic>.py`。
 
+**命名约定**：兄弟文件一律 `kernel_<topic>.py`。Hermes 用不带前缀的
+`agent/session_persistence.py`，但本项目的 `core/` 已经有同名的**领域模块**
+（`session.py` / `workspace.py` / `tool.py` / `process.py`），它们不是 Mixin；
+加 `kernel_` 前缀让"Mixin 兄弟"与"领域模块"一眼可分。
+
 ---
 
-## 6. 每刀必须走的清单（含新增的第五条，全部来自真实失败）
+## 6. 每刀必须走的清单（全部来自真实失败）
+
+**整条流程已固化为 `scripts/extract_kernel_mixin.py`**（`--dry-run` 先看依赖报告再执行）。
+它把第 1–5 条写成断言，第 10 条写成报告。它是迁移工具，最后一刀完成后删除。
 
 1. **选出内聚的方法组**，不做 AST 改名。Mixin 形状下方法体**一字不改**。
 2. **装饰器感知的行区间**。`ast.FunctionDef.lineno` **不含装饰器**——装饰器在
@@ -324,8 +341,9 @@ core/kernel_session.py              2,267 行 / 40 方法
    的 `@staticmethod` 被留在原处，**粘到了下一个方法 `get_task` 上**，于是
    `self.get_task(task_id)` 变成静态调用、报 `missing 1 required positional argument`。
    搬运与删除都必须用 `min(decorator_list.lineno + [lineno])`。
+   第二刀有 5 个方法带装饰器、第三刀 4 个、第四刀 3 个——这条不是偶发。
 3. **断言方法集合守恒**：搬运前的 `Kernel` 成员名集合 == 搬运后的
-   `Kernel` ∪ `<Topic>Mixin`。第一刀实测 272 == 272，无缺无增无重名。
+   `Kernel` ∪ `<Topic>Mixin`。第 1–4 刀实测 272/232/210/194 全部 ==。
 4. **断言 MRO 与大类冲突**：`<Topic>Mixin in Kernel.__mro__`，且
    `Kernel` 自身命名空间与各 Mixin **无同名方法**（类自身命名空间优先，重名会让另一个
    定义**静默**不可达）。已固化为 `tests/architecture/test_kernel_facade.py`，并做了
@@ -334,14 +352,28 @@ core/kernel_session.py              2,267 行 / 40 方法
    （`AGENTS.md:243-244`）。注意 `sys.modules` 判据**无效**：`core/__init__.py:55`
    的 `from .kernel import Kernel` 让任何 `core/*` 导入都拖进门面；可判的是
    sibling 模块 globals 里有没有 `__module__ == 'tsm_agt.core.kernel'` 的对象。
-6. **棘轮表按搬迁重分布**：`tests/architecture/test_dependencies.py` 的
+6. **断言无未解析全局名**：用 `symtable`（解释器自己的作用域分析，别手写 walker）
+   取搬移后方法体的 global 名，逐个查是否在模块 globals 或 builtins 里。
+   这条补的是"`NameError` 只在那个分支第一次执行时才炸"的盲区。
+   只查 `is_global()`；`is_free()` 是闭包引用（`self`、推导式变量），正常。
+7. **棘轮表按搬迁重分布**：`tests/architecture/test_dependencies.py` 的
    `_TERMINAL_STATE_COUPLING_BASELINE` 量 `TaskState.<终止态>` 引用点，**只许降**。
-   纯搬迁时该表要跟着改行，判据是**列求和守恒**（第一刀 56 == 56，`kernel.py` 34→32、
-   新文件 2），不是"总数不许变"。
-7. **先跑定向测试（~0.6–3 s）再跑全量（~23–28 s）**。
-8. **禁止 source-text 测试**（`AGENTS.md:487-502`）。移动符号后若有测试挂了，先看它
+   纯搬迁时该表要跟着改行，判据是**列求和守恒**（第 1 刀 56 == 56，`kernel.py` 34→32、
+   新文件 2），不是"总数不许变"。第 2–4 刀该域无引用，表不动。
+8. **先跑定向测试（~0.6–4 s）再跑全量（~23 s）**。
+9. **禁止 source-text 测试**（`AGENTS.md:487-502`）。移动符号后若有测试挂了，先看它
    是不是在读源码——是就改成行为测试。
-9. **不给内部迁移留 re-export shim**（`AGENTS.md:250`）。
+10. **patch 缝（第 3 刀新增，唯一无法静态检查的一条）**：
+    `AGENTS.md:244-245` —— *"Patch where production reads. … a patch on the defining
+    module passes silently."*
+    方法搬走后，它从**兄弟模块**的 globals 解析导入名；测试里
+    `patch.object(kernel_module, "<name>")` 绑的是门面那份拷贝，**静默不再拦截**。
+    第 3 刀就是这么挂的：`VERIFY: ok` 全过，全量挂 2 个（`commit_prepared_workspace_deletion`
+    / `commit_prepared_workspace_mutation`），另有 1 个文件（`test_core_apply_patches.py`）
+    因为补偿路径也搬走了而同样命中。
+    **处理方式是把 patch 目标修到 production 真正读的模块**，不是"重新指向定义模块"。
+    脚本每次抽取后打印 `seam_names()` 供人工核对；真正的兜底是全量测试。
+11. **不给内部迁移留 re-export shim**（`AGENTS.md:250`）。
 
 
 ---
