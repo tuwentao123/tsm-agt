@@ -387,6 +387,20 @@ from .tool import (
 # only reports that the ANSWER route cannot serve this message.
 
 
+#: Runtime input event type -> the handler that owns it. A table rather than an
+#: if/elif ladder, so a new input kind is a row and cannot silently fall through
+#: to a neighbouring branch (Hermes ``AGENTS.md:249``). The lookup walks
+#: ``type(event).__mro__``, which keeps ``isinstance`` semantics for a subclass
+#: of a registered event.
+_INPUT_HANDLERS: Mapping[type, str] = {
+    ApprovalResolutionInput: "_handle_approval_resolution",
+    ClarificationReplyInput: "_handle_clarification_reply",
+    InterruptTaskInput: "_handle_interrupt_task",
+    CancelTaskInput: "_handle_cancel_task",
+    SessionTextInput: "_handle_session_text",
+    RuntimeTextInput: "_handle_runtime_text",
+}
+
 @dataclass(frozen=True, slots=True)
 class KernelDependencies:
     model: ModelProviderPort
@@ -1494,63 +1508,109 @@ class Kernel(ModelMixin, PolicyMixin, TaskMixin, MemoryMixin, ApprovalMixin, Pro
 
         Protocol replies are resolved directly against their pending request;
         only ``RuntimeTextInput`` may enter the ordinary-text route.
+
+        Dispatch is a **table**, not an if/elif ladder (Hermes ``AGENTS.md:249``):
+        a new input kind adds a row to ``_INPUT_HANDLERS`` plus one uniform
+        handler, and cannot silently fall through to a neighbouring branch. The
+        handlers all accept both callbacks even where only some publish progress,
+        so the table has a single signature to bind.
         """
-        if isinstance(event, ApprovalResolutionInput):
-            return await self.resolve_agent_approval(
-                event.request_id, event.decision, event.reason,
-                on_text_delta=on_text_delta, on_progress=on_progress,
-            )
-        if isinstance(event, ClarificationReplyInput):
-            return await self.resolve_agent_clarification(
-                event.request_id, event.resume_token, event.answer,
-                selected_choice=event.selected_choice,
-                on_text_delta=on_text_delta, on_progress=on_progress,
-            )
-        if isinstance(event, InterruptTaskInput):
-            return await self.interrupt_agent_turn(event.task_id, event.reason)
-        if isinstance(event, CancelTaskInput):
-            task = await self.get_task(event.task_id)
-            if task.state is TaskState.CANCELLED:
-                return task
-            # NEEDS_REVIEW is a settled handoff that a human may still abandon,
-            # so it stays cancellable. Every other terminal state keeps the
-            # existing "terminal task cannot be cancelled" semantics.
-            if (
-                task.state.is_terminal
-                and task.state is not TaskState.NEEDS_REVIEW
-            ):
-                raise InvalidTurnState(
-                    f"terminal task {event.task_id} cannot be cancelled"
+        for event_type in type(event).__mro__:
+            name = _INPUT_HANDLERS.get(event_type)
+            if name is not None:
+                return await getattr(self, name)(
+                    event, on_text_delta=on_text_delta, on_progress=on_progress,
                 )
-            # Spec §9.4: settle any unstarted batch calls before the Task
-            # settles, so no orphan execution record is left behind.
-            if task.active_agent_checkpoint is not None:
-                checkpoint = AgentTurnCheckpoint.from_data(
-                    task.active_agent_checkpoint
-                )
-                settled = await self._settle_open_batch_for_cancel(checkpoint)
-                if settled is not checkpoint:
-                    await self._save_agent_checkpoint(
-                        settled, "tool-batch-cancelled-by-user"
-                    )
-            result = await self.transition_task(
-                event.task_id, TaskState.CANCELLED, event.reason,
-                intent="cancel",
-            )
-            note_cancel_requested(event.task_id)
-            return result
-        if isinstance(event, SessionTextInput):
-            return await self.resolve_session_input(
-                event.session_id, event.text,
-                Path(event.workspace) if event.workspace else None,
-            )
-        if isinstance(event, RuntimeTextInput):
-            return await self.route_runtime_input(
-                event.task_id, event.text, event.input_id,
-                explicit_intent=event.explicit_intent,
-                fallback_intent=event.fallback_intent,
-            )
         raise TypeError(f"unsupported runtime input event: {type(event)!r}")
+
+    async def _handle_approval_resolution(
+        self, event: ApprovalResolutionInput, *,
+        on_text_delta: Callable[[str], None] | None = None,
+        on_progress: Callable[[AgentProgress], None] | None = None,
+    ):
+        return await self.resolve_agent_approval(
+            event.request_id, event.decision, event.reason,
+            on_text_delta=on_text_delta, on_progress=on_progress,
+        )
+
+    async def _handle_clarification_reply(
+        self, event: ClarificationReplyInput, *,
+        on_text_delta: Callable[[str], None] | None = None,
+        on_progress: Callable[[AgentProgress], None] | None = None,
+    ):
+        return await self.resolve_agent_clarification(
+            event.request_id, event.resume_token, event.answer,
+            selected_choice=event.selected_choice,
+            on_text_delta=on_text_delta, on_progress=on_progress,
+        )
+
+    async def _handle_interrupt_task(
+        self, event: InterruptTaskInput, *,
+        on_text_delta: Callable[[str], None] | None = None,
+        on_progress: Callable[[AgentProgress], None] | None = None,
+    ):
+        del on_text_delta, on_progress  # this route publishes neither
+        return await self.interrupt_agent_turn(event.task_id, event.reason)
+
+    async def _handle_cancel_task(
+        self, event: CancelTaskInput, *,
+        on_text_delta: Callable[[str], None] | None = None,
+        on_progress: Callable[[AgentProgress], None] | None = None,
+    ):
+        del on_text_delta, on_progress  # this route publishes neither
+        task = await self.get_task(event.task_id)
+        if task.state is TaskState.CANCELLED:
+            return task
+        # NEEDS_REVIEW is a settled handoff that a human may still abandon,
+        # so it stays cancellable. Every other terminal state keeps the
+        # existing "terminal task cannot be cancelled" semantics.
+        if (
+            task.state.is_terminal
+            and task.state is not TaskState.NEEDS_REVIEW
+        ):
+            raise InvalidTurnState(
+                f"terminal task {event.task_id} cannot be cancelled"
+            )
+        # Spec §9.4: settle any unstarted batch calls before the Task
+        # settles, so no orphan execution record is left behind.
+        if task.active_agent_checkpoint is not None:
+            checkpoint = AgentTurnCheckpoint.from_data(
+                task.active_agent_checkpoint
+            )
+            settled = await self._settle_open_batch_for_cancel(checkpoint)
+            if settled is not checkpoint:
+                await self._save_agent_checkpoint(
+                    settled, "tool-batch-cancelled-by-user"
+                )
+        result = await self.transition_task(
+            event.task_id, TaskState.CANCELLED, event.reason,
+            intent="cancel",
+        )
+        note_cancel_requested(event.task_id)
+        return result
+
+    async def _handle_session_text(
+        self, event: SessionTextInput, *,
+        on_text_delta: Callable[[str], None] | None = None,
+        on_progress: Callable[[AgentProgress], None] | None = None,
+    ):
+        del on_text_delta, on_progress  # this route publishes neither
+        return await self.resolve_session_input(
+            event.session_id, event.text,
+            Path(event.workspace) if event.workspace else None,
+        )
+
+    async def _handle_runtime_text(
+        self, event: RuntimeTextInput, *,
+        on_text_delta: Callable[[str], None] | None = None,
+        on_progress: Callable[[AgentProgress], None] | None = None,
+    ):
+        del on_text_delta, on_progress  # this route publishes neither
+        return await self.route_runtime_input(
+            event.task_id, event.text, event.input_id,
+            explicit_intent=event.explicit_intent,
+            fallback_intent=event.fallback_intent,
+        )
 
     async def _judge_input_relation(
         self, text: str, task: TaskSnapshot,
