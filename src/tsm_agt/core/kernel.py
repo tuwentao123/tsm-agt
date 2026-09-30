@@ -12140,42 +12140,9 @@ class Kernel:
             # process, or a restart without this in-process runner). Stop before
             # starting new work; the SDK never writes SUCCEEDED for a cancelled
             # Task.
-            if self.cancellation_signal(state.task_id).requested():
-                raise asyncio.CancelledError(
-                    "task cancelled at a turn boundary"
-                )
-            state.checkpoint = self._synchronize_tool_batch(replace(
-                state.checkpoint, messages=tuple(state.messages),
-                pending_tool_calls=tuple(state.pending_tool_calls),
-            ))
-            state.checkpoint = await self._cancel_open_batch_for_queued_replace(
-                state.checkpoint
-            )
-            state.messages = list(state.checkpoint.messages)
-            state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
-            state.checkpoint, replaced = await self._apply_pending_steering(
-                replace(
-                    state.checkpoint, messages=tuple(state.messages),
-                    pending_tool_calls=tuple(state.pending_tool_calls),
-                    seen_call_ids=tuple(sorted(state.seen_call_ids)),
-                    model_calls=state.model_call_count, tool_calls=state.tool_call_count,
-                    input_tokens=state.input_tokens, output_tokens=state.output_tokens,
-                ),
-                "before-tool-batch" if state.pending_tool_calls else "before-model",
-            )
-            state.messages = list(state.checkpoint.messages)
-            state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
-            if replaced:
-                state.pending_tool_calls.clear()
-                await self.plan_task_spec(state.task_id)
-                refreshed_spec = await self.get_task_spec(state.task_id)
-                state.checkpoint = replace(
-                    state.checkpoint, task_spec_revision=refreshed_spec.revision,
-                    task_spec_hash=refreshed_spec.content_hash,
-                )
-            _batch_outcome = await self._run_tool_batch(state)
-            if _batch_outcome is not None:
-                return _batch_outcome
+            _begin = await self._begin_iteration(state)
+            if _begin.action is PhaseAction.RETURN:
+                return _begin.result
 
             await self._prepare_model_call(state)
             _verdict = await self._invoke_model(state)
@@ -12189,6 +12156,50 @@ class Kernel:
                 return _final.result
             if _final.action is PhaseAction.CONTINUE:
                 continue
+    async def _begin_iteration(self, state: TurnState) -> PhaseVerdict:
+        """Loop-head hygiene: cancellation, steering and the tool batch.
+
+        Extracted from ``_continue_agent_turn``. ``OK`` means the iteration is
+        cleared to prepare its model call; ``RETURN`` carries a terminal outcome
+        the caller must return unchanged.
+        """
+        if self.cancellation_signal(state.task_id).requested():
+            raise asyncio.CancelledError(
+                "task cancelled at a turn boundary"
+            )
+        state.checkpoint = self._synchronize_tool_batch(replace(
+            state.checkpoint, messages=tuple(state.messages),
+            pending_tool_calls=tuple(state.pending_tool_calls),
+        ))
+        state.checkpoint = await self._cancel_open_batch_for_queued_replace(
+            state.checkpoint
+        )
+        state.messages = list(state.checkpoint.messages)
+        state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
+        state.checkpoint, replaced = await self._apply_pending_steering(
+            replace(
+                state.checkpoint, messages=tuple(state.messages),
+                pending_tool_calls=tuple(state.pending_tool_calls),
+                seen_call_ids=tuple(sorted(state.seen_call_ids)),
+                model_calls=state.model_call_count, tool_calls=state.tool_call_count,
+                input_tokens=state.input_tokens, output_tokens=state.output_tokens,
+            ),
+            "before-tool-batch" if state.pending_tool_calls else "before-model",
+        )
+        state.messages = list(state.checkpoint.messages)
+        state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
+        if replaced:
+            state.pending_tool_calls.clear()
+            await self.plan_task_spec(state.task_id)
+            refreshed_spec = await self.get_task_spec(state.task_id)
+            state.checkpoint = replace(
+                state.checkpoint, task_spec_revision=refreshed_spec.revision,
+                task_spec_hash=refreshed_spec.content_hash,
+            )
+        _batch_outcome = await self._run_tool_batch(state)
+        if _batch_outcome is not None:
+                        return PhaseVerdict(PhaseAction.RETURN, _batch_outcome)
+        return PhaseVerdict(PhaseAction.OK)
     async def _finish_iteration(self, state: TurnState) -> PhaseVerdict:
         """Forward to the turn-phase sibling (late import: no cycle)."""
 
