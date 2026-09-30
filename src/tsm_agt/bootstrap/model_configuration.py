@@ -38,6 +38,10 @@ MODEL_MODEL_ENV_NAMES = (
 )
 
 MODEL_OPTIONAL_ENV_NAMES = (
+    #: Reviewer model *name* only -- never a second endpoint, key or protocol
+    #: (SPEC §12.6 D5). Optional: an absent or empty value means "reuse the
+    #: primary model name", not "a model called empty".
+    "TSM_AGT_REVIEW_MODEL",
     "TSM_AGT_ANTHROPIC_VERSION",
     "TSM_AGT_MODEL_TIMEOUT_SECONDS",
     "TSM_AGT_MODEL_MAX_RETRIES",
@@ -127,6 +131,9 @@ class ModelConfiguration:
     anthropic_version: str = "2023-06-01"
     strict_tool_schema: bool = True
     streaming: bool = True
+    #: Resolved by the loader to the primary name when unset, so a caller never
+    #: has to distinguish "not configured" from "configured as the same model".
+    review_model: str = ""
 
     @property
     def effective_output_token_parameter(self) -> str:
@@ -255,6 +262,8 @@ def load_model_configuration(
         raise ValueError(
             "TSM_AGT_MODEL_STRICT_TOOL_SCHEMA must be 'true' or 'false'"
         )
+    # An override, not a required setting: load cleanly when it is absent.
+    review_model = values["TSM_AGT_REVIEW_MODEL"] or model
     raw_streaming = (values["TSM_AGT_MODEL_STREAMING"] or "true").casefold()
     if raw_streaming not in {"true", "false"}:
         raise ValueError(
@@ -274,6 +283,7 @@ def load_model_configuration(
         anthropic_version=anthropic_version,
         strict_tool_schema=(raw_strict_tool_schema == "true"),
         streaming=(raw_streaming == "true"),
+        review_model=review_model,
     )
 
 
