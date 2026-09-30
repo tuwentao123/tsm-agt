@@ -607,6 +607,39 @@ class TurnState:
     should_buffer_text: bool = False
     buffered_text: Any = None
 
+    # Produced by the model-call phase and consumed by the response phase.
+    response: Any = None
+    tool_calls: Any = None
+    accepted_batch: Any = None
+
+
+class PhaseAction(StrEnum):
+    """What the caller must do once a phase hands control back.
+
+    Mirrors Hermes' single control-flow vocabulary
+    (``agent/conversation_loop.py:1641-1678``): every phase answers with an
+    ``action`` and the loop dispatches on it, so a phase that must end the
+    iteration says so instead of breaking out of a loop it does not own.
+    """
+
+    OK = "ok"
+    CONTINUE = "continue"
+    BREAK = "break"
+    RETURN = "return"
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseVerdict:
+    """A phase's answer: what to do next, plus an optional turn result.
+
+    ``result`` is read only for ``RETURN``. Anything else a phase wants to hand
+    back belongs on ``TurnState`` -- which is what keeps this carrier from
+    growing into a parameter list.
+    """
+
+    action: PhaseAction = PhaseAction.OK
+    result: Any = None
+
 
 @dataclass(frozen=True, slots=True)
 class AgentTurnResult:

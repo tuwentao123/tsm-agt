@@ -177,6 +177,8 @@ from .agent_loop import (
     ToolBatchSnapshot, ToolBatchStatus,
     AgentTurnResult,
     AgentTurnSuspended,
+    PhaseAction,
+    PhaseVerdict,
     TurnState,
     AgentClarificationSuspended,
     AgentContinuationSuspended,
@@ -12144,244 +12146,21 @@ class Kernel:
                 return _batch_outcome
 
             await self._prepare_model_call(state)
-            try:
-                response = await self._complete_agent_model_request(
-                    state.request,
-                    state.buffered_text.append if state.should_buffer_text else on_text_delta,
-                )
-                self._notify_agent_progress(state.on_progress, AgentProgress(
-                    AgentProgressKind.MODEL_COMPLETED,
-                    model_call=state.model_call_number,
-                    max_model_calls=state.checkpoint.max_model_calls,
-                    tool_call=state.tool_call_count,
-                    max_tool_calls=state.checkpoint.max_tool_calls,
-                    elapsed_seconds=time.monotonic() - state.model_started_at,
-                    goal=state.live_goal,
-                ))
-                tool_calls = self._validate_agent_response(
-                    response.message, response.finish_reason,
-                    evidence_required_tools=frozenset(
-                        tool.name for tool in state.visible_tools
-                        if self._dependencies.require_evidence_questions
-                        and tool.requires_evidence_question
-                    ),
-                    allow_tool_calls=state.request.allow_tool_calls,
-                )
-                state.recovery_batch = self._latest_recoverable_tool_batch(state.messages)
-                duplicate_call_ids = [
-                    call.call_id for call in tool_calls if call.call_id in state.seen_call_ids
-                ]
-                if duplicate_call_ids:
-                    raise InvalidModelResponse(
-                        "tool call_id must be unique within a turn: "
-                        + ", ".join(duplicate_call_ids)
-                    )
-                tool_calls = tuple(
-                    replace(
-                        call, outcome_ref=None,
-                        outcome_binding_mode=OutcomeBindingMode.FULFILLMENT,
-                    )
-                    for call in tool_calls
-                )
-                self._validate_tool_batch_proposal(
-                    tool_calls, state.visible_tool_by_name, state.seen_call_ids
-                )
-                accepted_batch = (
-                    await self._new_tool_batch(
-                        state.task_id, response.message, tool_calls
-                    )
-                    if tool_calls else None
-                )
-                # A rejected response never consumes call IDs.  The corrected
-                # response may legitimately reuse the Provider-generated IDs.
-                state.seen_call_ids.update(call.call_id for call in tool_calls)
-            except RecoverableToolProtocolError as error:
-                state.model_call_count = state.model_call_number
-                state.protocol_recovery_attempts += 1
-                failure = ModelAttemptFailure(
-                    ModelFailureCategory.CORRECTABLE_PROTOCOL,
-                    ModelRetrySafety.SAFE_WITH_CORRECTION,
-                    error.reason_code, str(error),
-                )
-                policy = self._dependencies.model_recovery_policy
-                if policy is None:
-                    decision = None
-                else:
-                    decision = await policy.evaluate(ModelRecoveryProbe(
-                        failure, state.protocol_recovery_attempts, 2, False
-                    ))
-                recovery_action = (
-                    decision.action if decision is not None
-                    else (
-                        ModelRecoveryAction.RESAMPLE_WITH_CORRECTION
-                        if state.protocol_recovery_attempts == 1
-                        else ModelRecoveryAction.FAIL_TERMINAL
-                    )
-                )
-                recovery_reason = (
-                    decision.reason_code if decision is not None
-                    else "compatibility_protocol_recovery"
-                )
-                await self._record_model_attempt_events(
-                    state.task_id, state.turn_id, state.model_call_number, [
-                        ModelTransportProgress(
-                            "attempt_failed", state.protocol_recovery_attempts, 2,
-                            category=failure.category.value,
-                            retry_safety=failure.retry_safety.value,
-                            diagnostic_code=failure.diagnostic_code,
-                            reason=recovery_reason,
-                        ),
-                        ModelTransportProgress(
-                            "recovery_decided", state.protocol_recovery_attempts, 2,
-                            category=failure.category.value,
-                            retry_safety=failure.retry_safety.value,
-                            diagnostic_code=failure.diagnostic_code,
-                            recovery_action=recovery_action.value,
-                            reason=recovery_reason,
-                        ),
-                    ],
-                )
-                if (
-                    recovery_action
-                    is ModelRecoveryAction.RESAMPLE_WITH_CORRECTION
-                    and state.model_call_count < state.checkpoint.max_model_calls
-                ):
-                    state.protocol_correction = (
-                        (
-                            "Your previous response attempted a tool call after the "
-                            "Runtime disabled tools for finalization. Do not emit XML, "
-                            "tool_use markup, JSON tool requests, or structured tool "
-                            "calls. Answer the user's request directly now from the "
-                            "evidence already collected, and explicitly state any "
-                            "remaining uncertainty."
-                        )
-                        if error.reason_code == "tool_call_emitted_while_disabled" else (
-                            self._outcome_binding_correction(error.detail)
-                        ) if error.reason_code == "invalid_outcome_binding" else (
-                            "One of your tool calls was rejected before execution: "
-                            f"{error.detail} "
-                            "Re-issue that call with every required argument filled "
-                            "in, or choose a different approach if you cannot supply "
-                            "them. Do not repeat the rejected call unchanged."
-                        ) if error.reason_code == "invalid_tool_batch" else
-                        (
-                            "Your previous response used an invalid tool-call envelope. "
-                            "Retry the response once. For every tool call, pass exactly "
-                            "an evidence_question object with question_id and question, "
-                            "plus a tool_arguments object containing the tool's normal "
-                            "parameters. Do not repeat or describe the invalid call."
-                        )
-                    )
-                    await self._append_events(state.task_id, ((
-                        "llm.protocol_retry_requested", {
-                            "turn_id": state.turn_id,
-                            "model_call": state.model_call_number,
-                            "reason_code": error.reason_code,
-                            "retry_limit": 1,
-                        },
-                    ),))
-                    state.checkpoint = replace(
-                        state.checkpoint, messages=tuple(state.messages),
-                        pending_tool_calls=(),
-                        seen_call_ids=tuple(sorted(state.seen_call_ids)),
-                        model_calls=state.model_call_count, tool_calls=state.tool_call_count,
-                        input_tokens=state.input_tokens, output_tokens=state.output_tokens,
-                    )
-                    await self._save_agent_checkpoint(
-                        state.checkpoint, "tool-protocol-retry-requested"
-                    )
-                    continue
-                if (
-                    error.reason_code == "tool_call_emitted_while_disabled"
-                    and state.model_call_count >= state.checkpoint.max_model_calls
-                ):
-                    limit_error = AgentLoopLimitExceeded(
-                        state.turn_id, "max_model_calls", state.checkpoint.max_model_calls,
-                        model_calls=state.model_call_count, tool_calls=state.tool_call_count,
-                        last_tool_error=state.last_tool_error,
-                        max_model_calls=state.checkpoint.max_model_calls,
-                        max_tool_calls=state.checkpoint.max_tool_calls,
-                    )
-                    await self._record_agent_loop_failure(
-                        state.task_id, state.turn_id, limit_error
-                    )
-                    raise limit_error from error
-                state.checkpoint = replace(
-                    state.checkpoint, messages=tuple(state.messages),
-                    pending_tool_calls=(),
-                    seen_call_ids=tuple(sorted(state.seen_call_ids)),
-                    model_calls=state.model_call_count, tool_calls=state.tool_call_count,
-                    input_tokens=state.input_tokens, output_tokens=state.output_tokens,
-                )
-                await self._save_agent_checkpoint(
-                    state.checkpoint, "tool-protocol-recovery-exhausted"
-                )
-                await self._record_recoverable_turn_interruption(
-                    state.task_id, state.turn_id, error, state.prompt.receipt,
-                    failure_kind="tool_protocol",
-                    failure_category=ModelFailureCategory.CORRECTABLE_PROTOCOL,
-                    retry_safety=ModelRetrySafety.SAFE_WITH_CORRECTION,
-                    recovery_action=recovery_action,
-                )
-                raise ModelInvocationFailed(
-                    state.turn_id,
-                    "model did not satisfy the tool-call protocol after one "
-                    f"correction ({error.reason_code})",
-                    failure_kind="tool_protocol",
-                    failure_category=ModelFailureCategory.CORRECTABLE_PROTOCOL,
-                    retry_safety=ModelRetrySafety.SAFE_WITH_CORRECTION,
-                    recovery_action=recovery_action,
-                    diagnostic_detail=error.detail,
-                ) from error
-            except Exception as error:
-                recovery = (
-                    error if isinstance(error, ModelRecoveryExhausted) else None
-                )
-                failure_category = (
-                    recovery.failure.category if recovery is not None
-                    else ModelFailureCategory.UNKNOWN
-                )
-                retry_safety = (
-                    recovery.failure.retry_safety if recovery is not None
-                    else ModelRetrySafety.NEVER
-                )
-                recovery_action = (
-                    recovery.decision.action if recovery is not None
-                    else ModelRecoveryAction.FAIL_TERMINAL
-                )
-                failure_kind = "model_response"
-                if isinstance(error, InvalidModelResponse):
-                    await self._record_turn_failure(
-                        state.task_id, state.turn_id, error, state.prompt.receipt,
-                        failure_kind=failure_kind,
-                        failure_category=failure_category,
-                        retry_safety=retry_safety,
-                        recovery_action=recovery_action,
-                    )
-                else:
-                    await self._record_recoverable_turn_interruption(
-                        state.task_id, state.turn_id, error, state.prompt.receipt,
-                        failure_kind=failure_kind,
-                        failure_category=failure_category,
-                        retry_safety=retry_safety,
-                        recovery_action=recovery_action,
-                    )
-                raise ModelInvocationFailed(
-                    state.turn_id, str(error), failure_kind=failure_kind,
-                    failure_category=failure_category,
-                    retry_safety=retry_safety,
-                    recovery_action=recovery_action,
-                ) from error
+            _verdict = await self._invoke_model(state)
+            if _verdict.action is PhaseAction.CONTINUE:
+                continue
+            if _verdict.action is PhaseAction.RETURN:
+                return _verdict.result
 
-            state.input_tokens += response.usage.input_tokens
-            state.output_tokens += response.usage.output_tokens
+            state.input_tokens += state.response.usage.input_tokens
+            state.output_tokens += state.response.usage.output_tokens
             state.model_call_count = state.model_call_number
             state.protocol_correction = None
-            state.messages.append(response.message)
+            state.messages.append(state.response.message)
             response_checkpoint = replace(
                 state.checkpoint, messages=tuple(state.messages),
-                pending_tool_calls=tuple(tool_calls),
-                tool_batch=accepted_batch,
+                pending_tool_calls=tuple(state.tool_calls),
+                tool_batch=state.accepted_batch,
                 seen_call_ids=tuple(sorted(state.seen_call_ids)),
                 model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                 input_tokens=state.input_tokens, output_tokens=state.output_tokens,
@@ -12401,7 +12180,7 @@ class Kernel:
             )
             if (
                 state.recovery_batch
-                and not tool_calls
+                and not state.tool_calls
                 and not has_late_steering
             ):
                 recovery_gaps = tuple(CompletionGap(
@@ -12455,7 +12234,7 @@ class Kernel:
                 self.completion_readiness_mode
                 is CompletionReadinessMode.LEGACY_GATE
             )
-            if not tool_calls and not has_late_steering:
+            if not state.tool_calls and not has_late_steering:
                 readiness = await self._evaluate_completion_readiness(
                     state.task_id, state.turn_id, response_checkpoint, state.visible_tools,
                     forced_wrap_up=state.wrap_up or state.disclosure_only,
@@ -12556,7 +12335,7 @@ class Kernel:
                 renewal_events = ()
             if (
                 not state.legacy_completion_gate
-                and not tool_calls
+                and not state.tool_calls
                 and not has_late_steering
             ):
                 readiness = CompletionReadinessDecision(
@@ -12601,7 +12380,7 @@ class Kernel:
                     completion_readiness_state=exhausted_state.to_data(),
                 )
             final_response = bool(
-                not tool_calls and not has_late_steering
+                not state.tool_calls and not has_late_steering
                 and readiness.action is CompletionReadinessAction.COMPLETE
                 and not required_gaps_open
             )
@@ -12610,7 +12389,7 @@ class Kernel:
             # remains" here, so the acceptance layer is never the first to
             # discover it (INV-16).
             unmet_boundary = bool(
-                not tool_calls
+                not state.tool_calls
                 and required_gaps_open
                 and readiness.action in {
                     CompletionReadinessAction.REPORT_BLOCKED,
@@ -12634,16 +12413,16 @@ class Kernel:
                 and not exhausted_wrap_up_due
             )
             await self._commit_model_response_checkpoint(
-                response_checkpoint, response, state.prompt.receipt, state.prepared.budget,
+                response_checkpoint, state.response, state.prompt.receipt, state.prepared.budget,
                 final=final_response and not incomplete_recovery_boundary,
                 additional_events=renewal_events,
             )
             if state.should_buffer_text and (
-                tool_calls or has_late_steering or final_response
-            ) and on_text_delta is not None:
+                state.tool_calls or has_late_steering or final_response
+            ) and state.on_text_delta is not None:
                 for text_delta in state.buffered_text:
-                    on_text_delta(text_delta)
-            if not tool_calls and has_late_steering:
+                    state.on_text_delta(text_delta)
+            if not state.tool_calls and has_late_steering:
                 response_checkpoint, _ = await self._apply_pending_steering(
                     response_checkpoint, "after-model-response"
                 )
@@ -12652,10 +12431,10 @@ class Kernel:
                 state.pending_tool_calls = list(response_checkpoint.pending_tool_calls)
                 continue
 
-            if not tool_calls:
+            if not state.tool_calls:
                 if incomplete_recovery_boundary:
                     suspension = await self._suspend_incomplete_recoverable(
-                        response_checkpoint, response.message, readiness.gaps,
+                        response_checkpoint, state.response.message, readiness.gaps,
                         reason=(
                             "completion_exhausted_with_required_gaps"
                             if readiness.action is CompletionReadinessAction.EXHAUSTED
@@ -12676,7 +12455,7 @@ class Kernel:
                     if source_user_message is not None:
                         await self._record_session_task_result(
                             state.task_id, state.turn_id, source_user_message,
-                            response.message,
+                            state.response.message,
                         )
                         await self._refresh_continuation_session_identity(state.task_id)
                     return suspension
@@ -12723,15 +12502,15 @@ class Kernel:
                 return AgentTurnResult(
                     turn_id=state.turn_id,
                     task_id=state.task_id,
-                    assistant_message=response.message,
-                    finish_reason=response.finish_reason,
+                    assistant_message=state.response.message,
+                    finish_reason=state.response.finish_reason,
                     usage=ModelUsage(state.input_tokens, state.output_tokens),
                     model_calls=state.model_call_count,
                     tool_calls=state.tool_call_count,
                     messages=tuple(state.messages),
                 )
 
-            if state.tool_call_count + len(tool_calls) > state.checkpoint.max_tool_calls:
+            if state.tool_call_count + len(state.tool_calls) > state.checkpoint.max_tool_calls:
                 error = AgentLoopLimitExceeded(
                     state.turn_id, "max_tool_calls", state.checkpoint.max_tool_calls,
                     model_calls=state.model_call_count, tool_calls=state.tool_call_count,
@@ -12752,8 +12531,246 @@ class Kernel:
                 await self._record_agent_loop_failure(state.task_id, state.turn_id, error)
                 raise error
 
-            state.pending_tool_calls = list(tool_calls)
+            state.pending_tool_calls = list(state.tool_calls)
             state.checkpoint = response_checkpoint
+    async def _invoke_model(self, state: TurnState) -> PhaseVerdict:
+        """Perform this iteration's model call.
+
+        Extracted from ``_continue_agent_turn``. Answers with ``CONTINUE`` when
+        the iteration must restart before the response is consumed -- the caller
+        owns the loop, so the phase asks instead of breaking out of a loop it
+        does not own. ``OK`` means the response is on ``state`` for the next
+        phase; failures raise, exactly as before.
+        """
+        try:
+            state.response = await self._complete_agent_model_request(
+                state.request,
+                state.buffered_text.append if state.should_buffer_text else state.on_text_delta,
+            )
+            self._notify_agent_progress(state.on_progress, AgentProgress(
+                AgentProgressKind.MODEL_COMPLETED,
+                model_call=state.model_call_number,
+                max_model_calls=state.checkpoint.max_model_calls,
+                tool_call=state.tool_call_count,
+                max_tool_calls=state.checkpoint.max_tool_calls,
+                elapsed_seconds=time.monotonic() - state.model_started_at,
+                goal=state.live_goal,
+            ))
+            state.tool_calls = self._validate_agent_response(
+                state.response.message, state.response.finish_reason,
+                evidence_required_tools=frozenset(
+                    tool.name for tool in state.visible_tools
+                    if self._dependencies.require_evidence_questions
+                    and tool.requires_evidence_question
+                ),
+                allow_tool_calls=state.request.allow_tool_calls,
+            )
+            state.recovery_batch = self._latest_recoverable_tool_batch(state.messages)
+            duplicate_call_ids = [
+                call.call_id for call in state.tool_calls if call.call_id in state.seen_call_ids
+            ]
+            if duplicate_call_ids:
+                raise InvalidModelResponse(
+                    "tool call_id must be unique within a turn: "
+                    + ", ".join(duplicate_call_ids)
+                )
+            state.tool_calls = tuple(
+                replace(
+                    call, outcome_ref=None,
+                    outcome_binding_mode=OutcomeBindingMode.FULFILLMENT,
+                )
+                for call in state.tool_calls
+            )
+            self._validate_tool_batch_proposal(
+                state.tool_calls, state.visible_tool_by_name, state.seen_call_ids
+            )
+            state.accepted_batch = (
+                await self._new_tool_batch(
+                    state.task_id, state.response.message, state.tool_calls
+                )
+                if state.tool_calls else None
+            )
+            # A rejected response never consumes call IDs.  The corrected
+            # response may legitimately reuse the Provider-generated IDs.
+            state.seen_call_ids.update(call.call_id for call in state.tool_calls)
+        except RecoverableToolProtocolError as error:
+            state.model_call_count = state.model_call_number
+            state.protocol_recovery_attempts += 1
+            failure = ModelAttemptFailure(
+                ModelFailureCategory.CORRECTABLE_PROTOCOL,
+                ModelRetrySafety.SAFE_WITH_CORRECTION,
+                error.reason_code, str(error),
+            )
+            policy = self._dependencies.model_recovery_policy
+            if policy is None:
+                decision = None
+            else:
+                decision = await policy.evaluate(ModelRecoveryProbe(
+                    failure, state.protocol_recovery_attempts, 2, False
+                ))
+            recovery_action = (
+                decision.action if decision is not None
+                else (
+                    ModelRecoveryAction.RESAMPLE_WITH_CORRECTION
+                    if state.protocol_recovery_attempts == 1
+                    else ModelRecoveryAction.FAIL_TERMINAL
+                )
+            )
+            recovery_reason = (
+                decision.reason_code if decision is not None
+                else "compatibility_protocol_recovery"
+            )
+            await self._record_model_attempt_events(
+                state.task_id, state.turn_id, state.model_call_number, [
+                    ModelTransportProgress(
+                        "attempt_failed", state.protocol_recovery_attempts, 2,
+                        category=failure.category.value,
+                        retry_safety=failure.retry_safety.value,
+                        diagnostic_code=failure.diagnostic_code,
+                        reason=recovery_reason,
+                    ),
+                    ModelTransportProgress(
+                        "recovery_decided", state.protocol_recovery_attempts, 2,
+                        category=failure.category.value,
+                        retry_safety=failure.retry_safety.value,
+                        diagnostic_code=failure.diagnostic_code,
+                        recovery_action=recovery_action.value,
+                        reason=recovery_reason,
+                    ),
+                ],
+            )
+            if (
+                recovery_action
+                is ModelRecoveryAction.RESAMPLE_WITH_CORRECTION
+                and state.model_call_count < state.checkpoint.max_model_calls
+            ):
+                state.protocol_correction = (
+                    (
+                        "Your previous response attempted a tool call after the "
+                        "Runtime disabled tools for finalization. Do not emit XML, "
+                        "tool_use markup, JSON tool requests, or structured tool "
+                        "calls. Answer the user's request directly now from the "
+                        "evidence already collected, and explicitly state any "
+                        "remaining uncertainty."
+                    )
+                    if error.reason_code == "tool_call_emitted_while_disabled" else (
+                        self._outcome_binding_correction(error.detail)
+                    ) if error.reason_code == "invalid_outcome_binding" else (
+                        "One of your tool calls was rejected before execution: "
+                        f"{error.detail} "
+                        "Re-issue that call with every required argument filled "
+                        "in, or choose a different approach if you cannot supply "
+                        "them. Do not repeat the rejected call unchanged."
+                    ) if error.reason_code == "invalid_tool_batch" else
+                    (
+                        "Your previous response used an invalid tool-call envelope. "
+                        "Retry the response once. For every tool call, pass exactly "
+                        "an evidence_question object with question_id and question, "
+                        "plus a tool_arguments object containing the tool's normal "
+                        "parameters. Do not repeat or describe the invalid call."
+                    )
+                )
+                await self._append_events(state.task_id, ((
+                    "llm.protocol_retry_requested", {
+                        "turn_id": state.turn_id,
+                        "model_call": state.model_call_number,
+                        "reason_code": error.reason_code,
+                        "retry_limit": 1,
+                    },
+                ),))
+                state.checkpoint = replace(
+                    state.checkpoint, messages=tuple(state.messages),
+                    pending_tool_calls=(),
+                    seen_call_ids=tuple(sorted(state.seen_call_ids)),
+                    model_calls=state.model_call_count, tool_calls=state.tool_call_count,
+                    input_tokens=state.input_tokens, output_tokens=state.output_tokens,
+                )
+                await self._save_agent_checkpoint(
+                    state.checkpoint, "tool-protocol-retry-requested"
+                )
+                return PhaseVerdict(PhaseAction.CONTINUE)
+            if (
+                error.reason_code == "tool_call_emitted_while_disabled"
+                and state.model_call_count >= state.checkpoint.max_model_calls
+            ):
+                limit_error = AgentLoopLimitExceeded(
+                    state.turn_id, "max_model_calls", state.checkpoint.max_model_calls,
+                    model_calls=state.model_call_count, tool_calls=state.tool_call_count,
+                    last_tool_error=state.last_tool_error,
+                    max_model_calls=state.checkpoint.max_model_calls,
+                    max_tool_calls=state.checkpoint.max_tool_calls,
+                )
+                await self._record_agent_loop_failure(
+                    state.task_id, state.turn_id, limit_error
+                )
+                raise limit_error from error
+            state.checkpoint = replace(
+                state.checkpoint, messages=tuple(state.messages),
+                pending_tool_calls=(),
+                seen_call_ids=tuple(sorted(state.seen_call_ids)),
+                model_calls=state.model_call_count, tool_calls=state.tool_call_count,
+                input_tokens=state.input_tokens, output_tokens=state.output_tokens,
+            )
+            await self._save_agent_checkpoint(
+                state.checkpoint, "tool-protocol-recovery-exhausted"
+            )
+            await self._record_recoverable_turn_interruption(
+                state.task_id, state.turn_id, error, state.prompt.receipt,
+                failure_kind="tool_protocol",
+                failure_category=ModelFailureCategory.CORRECTABLE_PROTOCOL,
+                retry_safety=ModelRetrySafety.SAFE_WITH_CORRECTION,
+                recovery_action=recovery_action,
+            )
+            raise ModelInvocationFailed(
+                state.turn_id,
+                "model did not satisfy the tool-call protocol after one "
+                f"correction ({error.reason_code})",
+                failure_kind="tool_protocol",
+                failure_category=ModelFailureCategory.CORRECTABLE_PROTOCOL,
+                retry_safety=ModelRetrySafety.SAFE_WITH_CORRECTION,
+                recovery_action=recovery_action,
+                diagnostic_detail=error.detail,
+            ) from error
+        except Exception as error:
+            recovery = (
+                error if isinstance(error, ModelRecoveryExhausted) else None
+            )
+            failure_category = (
+                recovery.failure.category if recovery is not None
+                else ModelFailureCategory.UNKNOWN
+            )
+            retry_safety = (
+                recovery.failure.retry_safety if recovery is not None
+                else ModelRetrySafety.NEVER
+            )
+            recovery_action = (
+                recovery.decision.action if recovery is not None
+                else ModelRecoveryAction.FAIL_TERMINAL
+            )
+            failure_kind = "model_response"
+            if isinstance(error, InvalidModelResponse):
+                await self._record_turn_failure(
+                    state.task_id, state.turn_id, error, state.prompt.receipt,
+                    failure_kind=failure_kind,
+                    failure_category=failure_category,
+                    retry_safety=retry_safety,
+                    recovery_action=recovery_action,
+                )
+            else:
+                await self._record_recoverable_turn_interruption(
+                    state.task_id, state.turn_id, error, state.prompt.receipt,
+                    failure_kind=failure_kind,
+                    failure_category=failure_category,
+                    retry_safety=retry_safety,
+                    recovery_action=recovery_action,
+                )
+            raise ModelInvocationFailed(
+                state.turn_id, str(error), failure_kind=failure_kind,
+                failure_category=failure_category,
+                retry_safety=retry_safety,
+                recovery_action=recovery_action,
+            ) from error
+        return PhaseVerdict(PhaseAction.OK)
     async def _prepare_model_call(self, state: TurnState) -> None:
         """Resolve completion readiness, context and the prompt for one model call.
 
