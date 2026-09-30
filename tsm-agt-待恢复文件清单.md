@@ -1,38 +1,93 @@
-# 待恢复文件清单（`git reset --hard` 事故）
+# tsm-agt 恢复状态清单（`git reset --hard` 事故）
 
-> 事故：为修改三个提交信息里写错的行数，我执行了 `git reset --hard`。该命令会丢弃
-> **工作区未提交的改动**，而这个仓库在本次会话开始前有 32 个跟踪文件带着未提交改动。
-> 本文是恢复用的清单与验收步骤。
->
-> 恢复源：你自己的备份 / 编辑器本地历史。git 内的恢复途径已穷尽（无 stash、无悬空
-> blob/tree/commit 含该内容、所有分支与远程均从未提交过、`__pycache__` 已在 21:03 按
-> 还原后的源码重编）。
+> 本文替代同名旧版。旧版写于事故刚发生时，其中三条信息已经过期：
+> ①「需要恢复 29 个文件」②「验收标准是 `1456 passed`」③「HEAD 依赖 7 个未跟踪文件」。
+> 现在工作区相对 HEAD 全干净、HEAD 自包含、全量 0 失败，但**仍有东西找不回来**——
+> 第 4 节是本文最重要的一节。
 
 ---
 
-## 1. 需要恢复到工作区的 29 个文件
+## 0. 现状（一句话）
 
-这 29 个文件现在**是纯 HEAD 版本**（工作区相对 HEAD 干净），它们的既有改动已丢失。
+`HEAD` 自包含（干净导出可导入、可跑全量），全量 **1429 passed / 13 skipped / 0 failed**；
+13 个 skip 与事故前完全一致。但**事故前有 1469 个用例，现在只有 1442 个**——
+**28 个用例只存在于你的备份里**，绿色测试测不出它们的缺失（第 4 节）。
+
+---
+
+## 1. 事故与我的责任
+
+为修改三个提交信息里写错的行数，我执行了 `git reset --hard`。该命令丢弃**工作区
+未提交的改动**，而这个仓库在会话开始前有 32 个跟踪文件带着未提交改动。
+
+- git 内恢复途径已穷尽：无 stash、无含该内容的悬空 blob/tree/commit、所有分支与
+  远程均从未提交过、`__pycache__` 已在 21:03 按还原后的源码重编。
+- 后果一度是 138 个 pytest 收集错误、包不可导入。
+- 更深的根因：`git add <path>` 会**吸收该文件当时全部既有改动**，所以当时的提交
+  是半一致的（例如 `7b320b4` 提交了 `ports/__init__.py` 的引用，而 `ports/tool.py`
+  里的定义留在工作区未提交）。这是我该在动手前就想清楚的。
+- **我没有重写任何历史来掩盖它。** 全部修复都是新增提交。
+
+---
+
+## 2. 现在已验证的状态
+
+| 检查 | 命令 | 结果 |
+|---|---|---|
+| 工作区干净 | `git status --short` | 无输出 |
+| HEAD 自包含 | `git archive HEAD \| tar -x -C /tmp/x && cd /tmp/x && pytest -q` | `1429 passed, 13 skipped` |
+| 全量 | `.venv/bin/python -m pytest tests/ -q` | `1429 passed, 13 skipped, 4 warnings, 307 subtests passed` |
+| 架构约束棘轮 | `pytest tests/architecture -q` | 通过（含 `test_kernel_facade.py` 5 条门禁） |
+
+事故前实测为 `1456 passed, 13 skipped`。**13 个 skip 对上了**，这很重要：它证明
+13 个里没有任何一个是因为错误而被跳过的。
+
+---
+
+## 3. 事故后的恢复提交（全部为新增提交，无历史重写）
+
+| 提交 | 内容 |
+|---|---|
+| `3ae14a2` | 重建 5 处丢失符号 —— 138 个收集错误 → 51 个失败 |
+| `a9b6a27` | `ModelConfiguration.review_model`（SPEC §12.6 D5）—— 51 → 30 |
+| `7533619` | `ToolCall.evidence_intent` + `code.diagnostics` 的 `ENUMERATE_SCOPE` —— 30 → 26 |
+| `f5f80be` | `RubricJudgement.cited_evidence_ids` + 判官自动归属 —— 26 → 23 |
+| `c624f86` | `pending_steering` 收据 + 孤儿 Task 先 settle + rubric packet 必含 goal —— 23 → 19 |
+| `d0c5e19` | `pending_steering` 在 `to_data()` 里缺席省略（我自己的回归）—— 19 → 18 |
+| `8f9247b` | 按 SPEC §4.3 纠正 `WORKSPACE_INTEGRITY` 与 `event:`/`mutation:` 的编译 —— 18 → 10 |
+| `6c8a2dd` | 孤儿 Task 判定只做一次，不再把消息报成 `steered` |
+| `40b3c18` | 孤儿判定与 runner 注册共用 `_submit_lock`，堵住"取消正在启动的任务"竞态 |
+| `843b391` | 补回 planner prompt 丢失的三条契约句 |
+| `f98bb2f` | `local_sandbox` 恢复路径规范化语义（且不使用 `.resolve()`） |
+| `98a1dcf` | 恢复 pty 可用性守卫，5 个 pty 用例回到 skip |
+| `c45f376` | 把 9 个「HEAD 依赖但从未提交」的源文件入库 |
+| `579e36a` | 把 4 个「从未提交」的回归测试入库 |
+| `1bc4bed` | 本文入库 |
+
+---
+
+## 4. ⚠️ 绿色测试**不能**证明恢复完整：还有 28 个用例缺失
+
+这是唯一还需要你动手的一件事。
+
+| | 收集到的用例 | passed | skipped |
+|---|---|---|---|
+| 事故前 | **1469** | 1456 | 13 |
+| 现在 | **1442** | 1429 | 13 |
+| 差额 | **−27** | | |
+
+现在这 1442 里包含**我本轮新增的 1 个**用例（`test_task_being_started_is_not_settled_as_an_orphan`）。
+所以：
+
+> **1469 − (1442 − 1) = 28 个用例在事故中丢失。**
+
+它们来自 29 个丢失改动里的**测试文件**：事故把工作区版本冲回 HEAD 版本，而 HEAD
+版本比工作区版本**少**这些用例。**一个变小的测试集照样全绿**，所以 `0 failed`
+完全掩盖了这件事——这就是为什么我必须把这条单独列出来。
+
+受影响的测试文件（丢失的改动里可能新增了用例或断言）：
 
 ```
-src/tsm_agt/adapters/builtin/__init__.py
-src/tsm_agt/adapters/builtin/code_intelligence_tools.py
-src/tsm_agt/adapters/builtin/core_tools.py
-src/tsm_agt/adapters/builtin/task_spec_tools.py
-src/tsm_agt/adapters/local_sandbox/sandbox.py
-src/tsm_agt/adapters/model_rubric_judge/judge.py
-src/tsm_agt/adapters/model_task_spec_planner/planner.py
-src/tsm_agt/adapters/posix_path/path.py
-src/tsm_agt/adapters/windows_path/path.py
-src/tsm_agt/bootstrap/model_configuration.py
-src/tsm_agt/cli.py
-src/tsm_agt/core/task_runtime_projection.py
-src/tsm_agt/core/task_spec.py
-src/tsm_agt/ports/rubric_judge.py
-src/tsm_agt/ports/tool.py
-src/tsm_agt/ports/workspace_path.py
-src/tsm_agt/sdk/runtime.py
-src/tsm_agt/web/app.py
 tests/test_cli_line_editing.py
 tests/test_completion_readiness.py
 tests/test_final_acceptance.py
@@ -46,124 +101,86 @@ tests/test_task_runtime_projection.py
 tests/test_task_spec_criteria_validation.py
 ```
 
-### 不需要恢复的 3 个（既有改动已在提交里，勿覆盖）
+### 怎么用你的备份核对
 
-这三个当初被我 `git add` 时把整个文件（含既有改动）提交了，所以历史里已有；
-**从备份覆盖它们反而会回退我这几轮的改动**：
+```bash
+# 备份里的用例总数；应当是 1470（事故前 1469 + 我新增的 1）
+<python> -m pytest <备份目录>/tests --collect-only -q | tail -1
 
-| 文件 | 已在哪个提交 |
-|---|---|
-| `src/tsm_agt/bootstrap/composition.py` | `b49e714`（及后续） |
-| `tests/architecture/test_dependencies.py` | `db9e677`（棘轮表） |
-| `tests/test_completion_stall_terminal.py` | `def49cb`（`TERMINAL_AUTHORITY` import 重指） |
+# 逐文件比对用例数，差值就是缺失的用例在哪
+for f in tests/test_*.py; do
+  printf '%-52s ' "$f"
+  <python> -m pytest "$f" --collect-only -q 2>/dev/null | tail -1
+done
+```
+
+**只把测试文件从备份里取回来即可**（源码已经不需要了：源码侧的失败已全部修掉，
+且从证据重建的部分都在上面的提交里）。取回后如果出现新的失败，把失败列表发我，
+我按失败逐个定位——**只做证据驱动的判断，不猜**。
 
 ---
 
-## 2. 恢复前先做的一件事
+## 5. 源码侧：哪些是重建的、依据是什么
 
-**先备份当前状态，再覆盖。** 我这轮的全部改动都在提交里，但留个 patch 更安全：
+源码的 29 个丢失文件现在**行为**上已被测试覆盖并全绿，但「全绿」不等于「与丢失
+版本逐字相同」。重建时用的权威依据，供你审阅：
+
+| 丢失内容 | 重建依据 |
+|---|---|
+| `EvidenceCapability` 8 个成员、`(effect, result_authority)` 派生、`extra_evidence_capabilities`、冲突时启动期 fail-closed | 已删 SPEC 原文：`git show '6f2a870^:Artifact Graph与Proof Obligation任务证明闭环实施SPEC.md'` §4.3 |
+| `ProofPlanCompiler` 的判据映射（`WORKSPACE_INTEGRITY` → `EFFECT_OBSERVED`、`event:` → `ARTIFACT_EXISTS` 且 selector 用 `locator`、`mutation:` → `EFFECT_OBSERVED`、`tool_call:` 需已记录 capability） | 同一份 SPEC §4.3 第 475-484 行，逐行核对 |
+| `RuntimeTaskResult.pending_steering`、`RubricJudgement.cited_evidence_ids`、`ToolCall.evidence_intent`、`review_model` | 幸存测试里这些字段被消费的确切形状 |
+| `local_sandbox` 的路径规范化 | git 历史本身：`983b77d` 用 `.resolve()`，`a2a9c1e` 换成 `.absolute()` 而丢了语义 |
+| pty 用例的跳过守卫 | skip 数算术：13 − 8 = 5（第 3 节末） |
+
+### 完全没有测试覆盖的丢失改动 —— 这部分只能靠你的备份
+
+- **`src/tsm_agt/cli.py`**（3,905 行）
+- **`src/tsm_agt/web/app.py`**（3,843 行）
+
+这两个文件体量大、UI 性质、本仓库的测试几乎没有触达。如果备份里这两个文件与
+HEAD 有差异，**优先用备份覆盖它们**（前提是先按第 6 节备份当前状态）。
+
+---
+
+## 6. 覆盖备份前的安全动作
 
 ```bash
 cd /Users/tusima/Documents/学习/tsm-agt
-git diff > /tmp/current.patch        # 现在应为空
-git stash list                       # 应为空
-git log --oneline -1                 # 记为 BASE，恢复出问题时可以回来
+git log --oneline -1 > /tmp/BASE.txt   # 记为 BASE，出问题可回来
+git diff HEAD > /tmp/current.patch     # 现在应为空
 ```
 
-覆盖前建议先 diff 你的备份版本与当前版本，确认备份不是更早的快照
-（编辑器本地历史有时只留最近几次保存）：
+**只覆盖文件，不要 `git add` 整个目录，也不要提交。** 覆盖后：
 
 ```bash
-diff -u src/tsm_agt/ports/tool.py <你的备份>/src/tsm_agt/ports/tool.py | head -60
+.venv/bin/python -m pytest tests/ -q
 ```
-
-**只覆盖文件，不要提交。**
 
 ---
 
-## 3. 恢复后的验收（三步）
+## 7. 顺带修掉的两个结构性风险
 
-```bash
-# ① 应当恰好列出 29 个 " M"（不多不少）
-git status --short | grep '^ M' | wc -l
+1. **HEAD 曾经不是自包含的。** 已提交的 `core/kernel.py`、`core/__init__.py`、
+   `core/task_spec.py`、`core/kernel_tool.py` 直接 import 9 个从未提交过的模块，
+   一次 `git clean` 就能让整包不可导入——这正是"138 个收集错误"能发生的前提。
+   现已全部入库（`c45f376`、`579e36a`），并用干净导出验证过。
 
-# ② 包能导入了（当前这里是 ImportError: cannot import name 'EvidenceCapability'）
-.venv/bin/python -c "import tsm_agt.ports; print('ports OK')"
+2. **两个模块目前只有测试消费者，未接入生产组合**（按原样入库存档，未擅自接线，
+   因为接线需要原始设计意图）：
+   - `core/turn_finalizer.py` —— 仅被 `tests/test_proof_closure.py:2429` 引用
+   - `adapters/builtin/todo_tools.py` —— `adapters/builtin/__init__.py` 未注册它
 
-# ③ 全量绿
-.venv/bin/python -m pytest -q
-```
-
-**"恢复完成"的定义**：
-
-| 检查 | 期望 |
-|---|---|
-| ① 修改文件数 | 29 |
-| ② `import tsm_agt.ports` | 成功（3 个符号齐了：`EvidenceCapability`、`EXPLICIT_ONLY_EVIDENCE_CAPABILITIES`、`derive_evidence_capabilities`） |
-| ③ 全量测试 | `1456 passed, 13 skipped, 4 warnings` |
-
-第 ③ 条的 1456 是事故前在 `a0c844f` 上实测的数字；事故只丢工作区改动，没有改动任何提交，
-所以恢复到位后应当回到这个数字。
+   这两个是否应该接进组合，需要你确认。
 
 ---
 
-## 4. 如果 ③ 不是 1456
-
-说明备份不完整。把 `pytest` 的失败列表发我，我按失败逐个定位缺的是哪份文件的哪部分，
-**只做证据驱动的判断，不猜**。
-
-另外：被删的 28 份 SPEC 完整保存在 git 里，随时可按名取回，例如——
+## 8. 需要你在**有伪终端**的普通终端里验证的一件事
 
 ```bash
-git show '6f2a870^:Artifact Graph与Proof Obligation任务证明闭环实施SPEC.md'
+.venv/bin/python -m pytest tests/test_cli_line_editing.py -q
 ```
 
-其 §4.3 完整写明了 `EvidenceCapability` 的 8 个成员、每个成员由
-`(effect, result_authority)` 的哪个组合派生、`extra_evidence_capabilities` 字段，
-以及显式声明与派生冲突时启动期 fail-closed。这是恢复 `ports/tool.py` 那部分时的
-**权威依据**（若备份里恰好缺这一块）。
-
----
-
-## 5. 另一件必须知道的事：HEAD 依赖 7 个未跟踪文件
-
-**已提交的文件 import 了从未提交过的模块**，所以 HEAD 单独不可跑：
-
-| 未跟踪模块 | 被哪些**已提交**文件 import |
-|---|---|
-| `core/verification_command.py` | `core/kernel.py`、`core/kernel_tool.py` |
-| `core/evidence_coverage.py` | `core/kernel.py`、`core/__init__.py` |
-| `core/proof_projection.py` | `core/kernel.py`、`core/__init__.py` |
-| `core/proof_obligation.py` | `core/__init__.py` |
-| `core/artifact_graph.py` | `core/__init__.py` |
-| `core/semantic_review.py` | `core/kernel.py` |
-| `core/turn_outcome.py` | 仅被 `core/turn_finalizer.py`（也未跟踪）引用 |
-
-（`core/turn_finalizer.py` 目前只被未跟踪的 `tests/test_proof_closure.py` 引用。）
-
-### 两个后果
-
-1. **恢复时绝不能让这 13 个未跟踪文件被删除或覆盖。** 它们是 proof 栈的实体，且是
-   HEAD 能运行的前提。用 `git clean` 之类的命令会直接把它们清掉。
-   它们现在完整保存在磁盘上：
-
-   ```
-   src/tsm_agt/adapters/builtin/todo_tools.py
-   src/tsm_agt/core/artifact_graph.py
-   src/tsm_agt/core/evidence_coverage.py
-   src/tsm_agt/core/proof_obligation.py
-   src/tsm_agt/core/proof_projection.py
-   src/tsm_agt/core/semantic_review.py
-   src/tsm_agt/core/turn_finalizer.py
-   src/tsm_agt/core/turn_outcome.py
-   src/tsm_agt/core/verification_command.py
-   tests/test_orphaned_running_tasks.py
-   tests/test_proof_closure.py
-   tests/test_task_spec_planner_prompt.py
-   tests/test_todo_tools.py
-   ```
-
-2. **恢复完成、全量绿之后，建议立刻把这 13 个文件提交**（或至少复制一份到仓库外）。
-   在此之前，HEAD 在任何新克隆上都无法导入——这不是本次事故造成的，但本次事故说明
-   了这个状态的风险有多大。
-
+本沙箱禁 `/dev/ptmx`（`os.openpty()` → `PermissionError`），所以这 5 个用例在这里
+只能 skip。守卫只跳过"根本无法分配伪终端"的环境；正常终端/CI 上它们照常运行并
+断言。**如果你希望连"跳过"都不允许，那就把备份里这一份测试文件取回来。**
