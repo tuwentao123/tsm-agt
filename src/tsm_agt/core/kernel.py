@@ -12099,9 +12099,6 @@ class Kernel:
         # nothing and then goes away. Do not add a name here -- a new value
         # belongs on ``TurnState``.
         # ---------------------------------------------------------------------
-        checkpoint = state.checkpoint
-        messages = state.messages
-        pending_tool_calls = state.pending_tool_calls
 
         while True:
             # Cooperative cancellation boundary (task-cancellation-spec §7): a
@@ -12113,62 +12110,62 @@ class Kernel:
                 raise asyncio.CancelledError(
                     "task cancelled at a turn boundary"
                 )
-            checkpoint = self._synchronize_tool_batch(replace(
-                checkpoint, messages=tuple(messages),
-                pending_tool_calls=tuple(pending_tool_calls),
+            state.checkpoint = self._synchronize_tool_batch(replace(
+                state.checkpoint, messages=tuple(state.messages),
+                pending_tool_calls=tuple(state.pending_tool_calls),
             ))
-            checkpoint = await self._cancel_open_batch_for_queued_replace(
-                checkpoint
+            state.checkpoint = await self._cancel_open_batch_for_queued_replace(
+                state.checkpoint
             )
-            messages = list(checkpoint.messages)
-            pending_tool_calls = list(checkpoint.pending_tool_calls)
-            checkpoint, replaced = await self._apply_pending_steering(
+            state.messages = list(state.checkpoint.messages)
+            state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
+            state.checkpoint, replaced = await self._apply_pending_steering(
                 replace(
-                    checkpoint, messages=tuple(messages),
-                    pending_tool_calls=tuple(pending_tool_calls),
+                    state.checkpoint, messages=tuple(state.messages),
+                    pending_tool_calls=tuple(state.pending_tool_calls),
                     seen_call_ids=tuple(sorted(state.seen_call_ids)),
                     model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                     input_tokens=state.input_tokens, output_tokens=state.output_tokens,
                 ),
-                "before-tool-batch" if pending_tool_calls else "before-model",
+                "before-tool-batch" if state.pending_tool_calls else "before-model",
             )
-            messages = list(checkpoint.messages)
-            pending_tool_calls = list(checkpoint.pending_tool_calls)
+            state.messages = list(state.checkpoint.messages)
+            state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
             if replaced:
-                pending_tool_calls.clear()
+                state.pending_tool_calls.clear()
                 await self.plan_task_spec(state.task_id)
                 refreshed_spec = await self.get_task_spec(state.task_id)
-                checkpoint = replace(
-                    checkpoint, task_spec_revision=refreshed_spec.revision,
+                state.checkpoint = replace(
+                    state.checkpoint, task_spec_revision=refreshed_spec.revision,
                     task_spec_hash=refreshed_spec.content_hash,
                 )
-            while pending_tool_calls:
-                checkpoint, replaced = await self._apply_pending_steering(
+            while state.pending_tool_calls:
+                state.checkpoint, replaced = await self._apply_pending_steering(
                     replace(
-                        checkpoint, messages=tuple(messages),
-                        pending_tool_calls=tuple(pending_tool_calls),
+                        state.checkpoint, messages=tuple(state.messages),
+                        pending_tool_calls=tuple(state.pending_tool_calls),
                         seen_call_ids=tuple(sorted(state.seen_call_ids)),
                         model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                         input_tokens=state.input_tokens, output_tokens=state.output_tokens,
                     ), "before-tool",
                 )
-                messages = list(checkpoint.messages)
-                pending_tool_calls = list(checkpoint.pending_tool_calls)
+                state.messages = list(state.checkpoint.messages)
+                state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
                 if replaced:
                     break
-                call = pending_tool_calls[0]
+                call = state.pending_tool_calls[0]
                 call_spec = state.visible_tool_by_name.get(call.name)
                 frozen_call = (
-                    next((item for item in checkpoint.tool_batch.calls
+                    next((item for item in state.checkpoint.tool_batch.calls
                           if item.call_id == call.call_id), None)
-                    if checkpoint.tool_batch is not None else None
+                    if state.checkpoint.tool_batch is not None else None
                 )
                 if frozen_call is not None:
                     # Outcome bindings and normalized arguments were accepted
                     # atomically with the batch. Never reinterpret them after a
                     # previous call changes Task state.
                     call = frozen_call
-                    pending_tool_calls[0] = call
+                    state.pending_tool_calls[0] = call
                 elif call_spec is not None and call.outcome_ref is None:
                     # Resolve the Action→Outcome edge before emitting any
                     # lifecycle Event so requested/policy/approval/result all
@@ -12176,7 +12173,7 @@ class Kernel:
                     call = await self._bind_tool_call_outcome(
                         state.task_id, call, call_spec
                     )
-                    pending_tool_calls[0] = call
+                    state.pending_tool_calls[0] = call
                 elif call_spec is not None:
                     persisted = (await self.get_task(state.task_id)).tool_executions.get(
                         ToolExecutionRecord.identity(state.turn_id, call.call_id)
@@ -12189,7 +12186,7 @@ class Kernel:
                         # whose first result closed the shared Outcome early.
                         allow_closed_ref=True,
                     )
-                    pending_tool_calls[0] = call
+                    state.pending_tool_calls[0] = call
                 requires_question = (
                     self._dependencies.require_evidence_questions
                     and call_spec is not None
@@ -12205,14 +12202,14 @@ class Kernel:
                     # result authority.  A non-evidence protocol must not create a
                     # second, contradictory lifecycle for the same interaction.
                     call = replace(call, evidence_question=None)
-                    pending_tool_calls[0] = call
+                    state.pending_tool_calls[0] = call
                     question = None
                 if requires_question and question is not None:
                     question_projection = await self._bind_evidence_question(
                         state.task_id, state.turn_id, call
                     )
-                    checkpoint = replace(
-                        checkpoint,
+                    state.checkpoint = replace(
+                        state.checkpoint,
                         evidence_question_state=question_projection.to_data(),
                     )
                 task_before_action = await self.get_task(state.task_id)
@@ -12224,7 +12221,7 @@ class Kernel:
                     Path(task_before_action.workspace), call, semantic_action
                 )
                 exploration_decision = None
-                effective_tool_timeout_seconds = checkpoint.tool_timeout_seconds
+                effective_tool_timeout_seconds = state.checkpoint.tool_timeout_seconds
                 scope_decision = ProgressiveScopeDecision(
                     ProgressiveScopeAction.ALLOW, "evidence_guided",
                     "evidence_guided", current_depth=scope_probe.depth,
@@ -12235,12 +12232,12 @@ class Kernel:
                 ):
                     exploration_decision = await self._evaluate_exploration_before(
                         state.task_id, state.turn_id, call, semantic_action,
-                        checkpoint.evidence_relation_state,
-                        checkpoint.rejection_loop_state,
-                        checkpoint.evidence_inventory,
+                        state.checkpoint.evidence_relation_state,
+                        state.checkpoint.rejection_loop_state,
+                        state.checkpoint.evidence_inventory,
                     )
-                    checkpoint = replace(
-                        checkpoint,
+                    state.checkpoint = replace(
+                        state.checkpoint,
                         evidence_relation_state=(
                             exploration_decision.relation_state.to_data()
                         ),
@@ -12250,7 +12247,7 @@ class Kernel:
                     )
                     if exploration_decision.call != call:
                         call = exploration_decision.call
-                        pending_tool_calls[0] = call
+                        state.pending_tool_calls[0] = call
                         semantic_action = await self._classify_semantic_action(
                             state.task_id, state.turn_id, call
                         )
@@ -12287,7 +12284,7 @@ class Kernel:
                                 ),
                             },
                         )
-                        messages.append(Message(
+                        state.messages.append(Message(
                             message_id=f"msg-tool-{uuid4().hex}",
                             role=MessageRole.TOOL,
                             content=(ToolResultBlock(result),),
@@ -12297,21 +12294,21 @@ class Kernel:
                             ToolActionDisposition.REPLACE,
                             "exploration_route_rejected",
                         )
-                        pending_tool_calls.pop(0)
-                        checkpoint = replace(
-                            checkpoint, messages=tuple(messages),
-                            pending_tool_calls=tuple(pending_tool_calls),
+                        state.pending_tool_calls.pop(0)
+                        state.checkpoint = replace(
+                            state.checkpoint, messages=tuple(state.messages),
+                            pending_tool_calls=tuple(state.pending_tool_calls),
                             seen_call_ids=tuple(sorted(state.seen_call_ids)),
                             evidence_question_state=question_projection.to_data(),
                         )
                         await self._save_agent_checkpoint(
-                            checkpoint, "exploration-route-rejected"
+                            state.checkpoint, "exploration-route-rejected"
                         )
                         continue
                 else:
                     scope_decision = await self._evaluate_progressive_scope_before(
                         state.task_id, state.turn_id, call, semantic_action, scope_probe,
-                        checkpoint.progressive_scope_state,
+                        state.checkpoint.progressive_scope_state,
                     )
                 if (
                     self._exploration_coordinator is None
@@ -12330,7 +12327,7 @@ class Kernel:
                             ),
                             scope_reason_required=True,
                             scope_relation=scope_decision.relation,
-                        ), checkpoint.stop_or_pivot_state,
+                        ), state.checkpoint.stop_or_pivot_state,
                     )
                     await self._emit_agent_progress_projection(
                         state.task_id, state.turn_id, call, semantic_action,
@@ -12358,7 +12355,7 @@ class Kernel:
                             "next_action": pivot_decision.action.value,
                         },
                     )
-                    messages.append(Message(
+                    state.messages.append(Message(
                         message_id=f"msg-tool-{uuid4().hex}",
                         role=MessageRole.TOOL,
                         content=(ToolResultBlock(result),),
@@ -12367,38 +12364,38 @@ class Kernel:
                         state.task_id, state.turn_id, call, ToolActionDisposition.REPLACE,
                         "scope_expansion_reason_required",
                     )
-                    pending_tool_calls.pop(0)
-                    checkpoint = replace(
-                        checkpoint, messages=tuple(messages),
-                        pending_tool_calls=tuple(pending_tool_calls),
+                    state.pending_tool_calls.pop(0)
+                    state.checkpoint = replace(
+                        state.checkpoint, messages=tuple(state.messages),
+                        pending_tool_calls=tuple(state.pending_tool_calls),
                         seen_call_ids=tuple(sorted(state.seen_call_ids)),
                         stop_or_pivot_state=pivot_state,
                         evidence_question_state=question_projection.to_data(),
                     )
                     await self._save_agent_checkpoint(
-                        checkpoint, "scope-expansion-reason-required"
+                        state.checkpoint, "scope-expansion-reason-required"
                     )
                     continue
                 budget_decision = await self._evaluate_exploration_budget_before(
                     state.task_id, state.turn_id, call, semantic_action,
                     ExplorationBudgetProbe(
-                        checkpoint.max_model_calls - state.model_call_count,
-                        checkpoint.max_tool_calls - state.tool_call_count,
-                        checkpoint.max_model_calls, checkpoint.max_tool_calls,
+                        state.checkpoint.max_model_calls - state.model_call_count,
+                        state.checkpoint.max_tool_calls - state.tool_call_count,
+                        state.checkpoint.max_model_calls, state.checkpoint.max_tool_calls,
                     ),
-                    checkpoint.exploration_budget_state,
+                    state.checkpoint.exploration_budget_state,
                 )
                 if budget_decision.action is ExplorationBudgetAction.FOCUS:
                     previous_budget = ExplorationBudgetState.from_data(
-                        checkpoint.exploration_budget_state
+                        state.checkpoint.exploration_budget_state
                     )
                     entered_focus = not previous_budget.focus_mode
                     focused_budget = replace(
                         previous_budget, focus_mode=True,
                         focus_reason=budget_decision.reason,
                     )
-                    checkpoint = replace(
-                        checkpoint,
+                    state.checkpoint = replace(
+                        state.checkpoint,
                         exploration_budget_state=focused_budget.to_data(),
                     )
                     if entered_focus:
@@ -12415,9 +12412,9 @@ class Kernel:
                         self._notify_agent_progress(on_progress, AgentProgress(
                             AgentProgressKind.FOCUS,
                             model_call=state.model_call_count,
-                            max_model_calls=checkpoint.max_model_calls,
+                            max_model_calls=state.checkpoint.max_model_calls,
                             tool_call=state.tool_call_count,
-                            max_tool_calls=checkpoint.max_tool_calls,
+                            max_tool_calls=state.checkpoint.max_tool_calls,
                             goal=task_before_action.goal,
                             reason=budget_decision.reason,
                             exploration_actions=budget_decision.scored_actions,
@@ -12452,7 +12449,7 @@ class Kernel:
                                 "next_action": "NARROW_TO_DIRECT_EVIDENCE",
                             },
                         )
-                        messages.append(Message(
+                        state.messages.append(Message(
                             message_id=f"msg-tool-{uuid4().hex}",
                             role=MessageRole.TOOL,
                             content=(ToolResultBlock(result),),
@@ -12462,15 +12459,15 @@ class Kernel:
                             ToolActionDisposition.REPLACE,
                             "exploration_focus_required",
                         )
-                        pending_tool_calls.pop(0)
-                        checkpoint = replace(
-                            checkpoint, messages=tuple(messages),
-                            pending_tool_calls=tuple(pending_tool_calls),
+                        state.pending_tool_calls.pop(0)
+                        state.checkpoint = replace(
+                            state.checkpoint, messages=tuple(state.messages),
+                            pending_tool_calls=tuple(state.pending_tool_calls),
                             seen_call_ids=tuple(sorted(state.seen_call_ids)),
                             evidence_question_state=question_projection.to_data(),
                         )
                         await self._save_agent_checkpoint(
-                            checkpoint, "exploration-focus-required"
+                            state.checkpoint, "exploration-focus-required"
                         )
                         continue
                 if budget_decision.action is ExplorationBudgetAction.WRAP_UP:
@@ -12488,12 +12485,12 @@ class Kernel:
                             budget_reason=budget_decision.reason,
                             low_value_streak=budget_decision.low_value_streak,
                             remaining_model_calls=(
-                                checkpoint.max_model_calls - state.model_call_count
+                                state.checkpoint.max_model_calls - state.model_call_count
                             ),
                             remaining_tool_calls=(
-                                checkpoint.max_tool_calls - state.tool_call_count
+                                state.checkpoint.max_tool_calls - state.tool_call_count
                             ),
-                        ), checkpoint.stop_or_pivot_state,
+                        ), state.checkpoint.stop_or_pivot_state,
                     )
                     await self._emit_agent_progress_projection(
                         state.task_id, state.turn_id, call, semantic_action,
@@ -12505,10 +12502,10 @@ class Kernel:
                     )
                     if pivot_decision.action is StopOrPivotAction.CONTINUE:
                         previous_budget = ExplorationBudgetState.from_data(
-                            checkpoint.exploration_budget_state
+                            state.checkpoint.exploration_budget_state
                         )
-                        checkpoint = replace(
-                            checkpoint,
+                        state.checkpoint = replace(
+                            state.checkpoint,
                             exploration_budget_state=replace(
                                 previous_budget, low_value_streak=0
                             ).to_data(),
@@ -12533,7 +12530,7 @@ class Kernel:
                                 "reason": pivot_decision.reason,
                             },
                         )
-                        messages.append(Message(
+                        state.messages.append(Message(
                             message_id=f"msg-tool-{uuid4().hex}",
                             role=MessageRole.TOOL,
                             content=(ToolResultBlock(result),),
@@ -12543,16 +12540,16 @@ class Kernel:
                             ToolActionDisposition.REPLACE,
                             "exploration_change_method_required",
                         )
-                        pending_tool_calls.pop(0)
-                        checkpoint = replace(
-                            checkpoint, messages=tuple(messages),
-                            pending_tool_calls=tuple(pending_tool_calls),
+                        state.pending_tool_calls.pop(0)
+                        state.checkpoint = replace(
+                            state.checkpoint, messages=tuple(state.messages),
+                            pending_tool_calls=tuple(state.pending_tool_calls),
                             seen_call_ids=tuple(sorted(state.seen_call_ids)),
                             stop_or_pivot_state=pivot_state,
                             evidence_question_state=question_projection.to_data(),
                         )
                         await self._save_agent_checkpoint(
-                            checkpoint, "exploration-change-method-required"
+                            state.checkpoint, "exploration-change-method-required"
                         )
                         continue
                     else:
@@ -12573,7 +12570,7 @@ class Kernel:
                                 "reason": pivot_decision.reason,
                             },
                         )
-                        messages.append(Message(
+                        state.messages.append(Message(
                             message_id=f"msg-tool-{uuid4().hex}",
                             role=MessageRole.TOOL,
                             content=(ToolResultBlock(result),),
@@ -12582,23 +12579,23 @@ class Kernel:
                             state.task_id, state.turn_id, call, ToolActionDisposition.CANCEL,
                             "exploration_budget_wrap_up",
                         )
-                        pending_tool_calls.pop(0)
+                        state.pending_tool_calls.pop(0)
                         state.budget_wrap_up = True
                         state.budget_wrap_up_decision = budget_decision
-                        checkpoint = replace(
-                            checkpoint, messages=tuple(messages),
-                            pending_tool_calls=tuple(pending_tool_calls),
+                        state.checkpoint = replace(
+                            state.checkpoint, messages=tuple(state.messages),
+                            pending_tool_calls=tuple(state.pending_tool_calls),
                             seen_call_ids=tuple(sorted(state.seen_call_ids)),
                             stop_or_pivot_state=pivot_state,
                             evidence_question_state=question_projection.to_data(),
                         )
                         await self._save_agent_checkpoint(
-                            checkpoint, "exploration-budget-wrap-up"
+                            state.checkpoint, "exploration-budget-wrap-up"
                         )
                         continue
                 read_hits_decision = await self._evaluate_read_hits_before(
                     state.task_id, state.turn_id, call, semantic_action,
-                    checkpoint.read_hits_state,
+                    state.checkpoint.read_hits_state,
                 )
                 if read_hits_decision.action is ReadHitsAction.REQUIRE_READ:
                     pivot_decision, pivot_state = await self._decide_stop_or_pivot(
@@ -12613,7 +12610,7 @@ class Kernel:
                             ),
                             read_hits_required=True,
                             candidate_count=read_hits_decision.candidate_count,
-                        ), checkpoint.stop_or_pivot_state,
+                        ), state.checkpoint.stop_or_pivot_state,
                     )
                     await self._emit_agent_progress_projection(
                         state.task_id, state.turn_id, call, semantic_action,
@@ -12642,7 +12639,7 @@ class Kernel:
                             "next_action": pivot_decision.action.value,
                         },
                     )
-                    messages.append(Message(
+                    state.messages.append(Message(
                         message_id=f"msg-tool-{uuid4().hex}",
                         role=MessageRole.TOOL,
                         content=(ToolResultBlock(result),),
@@ -12651,25 +12648,25 @@ class Kernel:
                         state.task_id, state.turn_id, call, ToolActionDisposition.REPLACE,
                         "read_hits_required",
                     )
-                    pending_tool_calls.pop(0)
-                    checkpoint = replace(
-                        checkpoint, messages=tuple(messages),
-                        pending_tool_calls=tuple(pending_tool_calls),
+                    state.pending_tool_calls.pop(0)
+                    state.checkpoint = replace(
+                        state.checkpoint, messages=tuple(state.messages),
+                        pending_tool_calls=tuple(state.pending_tool_calls),
                         seen_call_ids=tuple(sorted(state.seen_call_ids)),
                         stop_or_pivot_state=pivot_state,
                         evidence_question_state=question_projection.to_data(),
                     )
                     await self._save_agent_checkpoint(
-                        checkpoint, "read-hits-required"
+                        state.checkpoint, "read-hits-required"
                     )
                     continue
                 artifact_probe = self._artifact_read_probe(
                     Path(task_before_action.workspace), call,
-                    checkpoint.artifact_read_state,
+                    state.checkpoint.artifact_read_state,
                 )
                 artifact_decision = await self._evaluate_artifact_read_before(
                     state.task_id, state.turn_id, call, artifact_probe,
-                    checkpoint.artifact_read_state,
+                    state.checkpoint.artifact_read_state,
                 )
                 if artifact_decision.action is ArtifactReadAction.REQUIRE_REUSE:
                     result = ToolResult(
@@ -12690,7 +12687,7 @@ class Kernel:
                             ),
                         },
                     )
-                    messages.append(Message(
+                    state.messages.append(Message(
                         message_id=f"msg-tool-{uuid4().hex}",
                         role=MessageRole.TOOL,
                         content=(ToolResultBlock(result),),
@@ -12699,15 +12696,15 @@ class Kernel:
                         state.task_id, state.turn_id, call, ToolActionDisposition.REPLACE,
                         "artifact_read_reuse_required",
                     )
-                    pending_tool_calls.pop(0)
-                    checkpoint = replace(
-                        checkpoint, messages=tuple(messages),
-                        pending_tool_calls=tuple(pending_tool_calls),
+                    state.pending_tool_calls.pop(0)
+                    state.checkpoint = replace(
+                        state.checkpoint, messages=tuple(state.messages),
+                        pending_tool_calls=tuple(state.pending_tool_calls),
                         seen_call_ids=tuple(sorted(state.seen_call_ids)),
                         evidence_question_state=question_projection.to_data(),
                     )
                     await self._save_agent_checkpoint(
-                        checkpoint, "artifact-read-reuse-required"
+                        state.checkpoint, "artifact-read-reuse-required"
                     )
                     continue
                 decision = state.plan_guard.evaluate(
@@ -12716,7 +12713,7 @@ class Kernel:
                         Path(task_before_action.workspace),
                         self._dependencies.workspace_path,
                     ),
-                    ActionProgressState.from_data(checkpoint.action_progress),
+                    ActionProgressState.from_data(state.checkpoint.action_progress),
                     semantic_action,
                 )
                 await self._append_events(state.task_id, (("plan.action_evaluated", {
@@ -12741,8 +12738,8 @@ class Kernel:
                     ),
                     "should_stop": decision.should_stop,
                 }),))
-                checkpoint = replace(
-                    checkpoint, action_progress=ActionProgressState(
+                state.checkpoint = replace(
+                    state.checkpoint, action_progress=ActionProgressState(
                         decision.action_signature, decision.relevant_state_hash,
                         decision.consecutive_no_progress,
                         False, decision.semantic_signature,
@@ -12757,15 +12754,15 @@ class Kernel:
                         plan_finished=decision.goal_slice.plan_finished,
                         consecutive_no_progress=decision.consecutive_no_progress,
                         remaining_model_calls=(
-                            checkpoint.max_model_calls - state.model_call_count
+                            state.checkpoint.max_model_calls - state.model_call_count
                         ),
                         remaining_tool_calls=(
-                            checkpoint.max_tool_calls - state.tool_call_count
+                            state.checkpoint.max_tool_calls - state.tool_call_count
                         ),
-                    ), checkpoint.stop_or_pivot_state,
+                    ), state.checkpoint.stop_or_pivot_state,
                 )
-                checkpoint = replace(
-                    checkpoint, stop_or_pivot_state=pivot_state
+                state.checkpoint = replace(
+                    state.checkpoint, stop_or_pivot_state=pivot_state
                 )
                 await self._emit_agent_progress_projection(
                     state.task_id, state.turn_id, call, semantic_action,
@@ -12779,9 +12776,9 @@ class Kernel:
                         state.task_id, state.turn_id, call, ToolActionDisposition.CANCEL,
                         "plan_no_progress_stopped",
                     )
-                    cancelled_calls = tuple(pending_tool_calls)
+                    cancelled_calls = tuple(state.pending_tool_calls)
                     for cancelled in cancelled_calls:
-                        messages.append(Message(
+                        state.messages.append(Message(
                             f"msg-tool-cancelled-{uuid4().hex}",
                             MessageRole.TOOL,
                             (ToolResultBlock(ToolResult(
@@ -12795,7 +12792,7 @@ class Kernel:
                                 meta={"runtime_guard": "NO_PROGRESS"},
                             )),),
                         ))
-                    pending_tool_calls.clear()
+                    state.pending_tool_calls.clear()
                     stop_body = json.dumps({
                         "boundary": "runtime_no_progress_stop",
                         "warning": (
@@ -12809,16 +12806,16 @@ class Kernel:
                             decision.consecutive_no_progress
                         ),
                     }, sort_keys=True, separators=(",", ":"))
-                    messages.append(Message(
+                    state.messages.append(Message(
                         f"plan-stop-{decision.action_signature[:16]}",
                         MessageRole.USER, (TextBlock(stop_body),),
                     ))
-                    checkpoint = replace(
-                        checkpoint, pending_tool_calls=(), messages=tuple(messages),
+                    state.checkpoint = replace(
+                        state.checkpoint, pending_tool_calls=(), messages=tuple(state.messages),
                         tool_batch=(
-                            checkpoint.tool_batch.with_pending(
+                            state.checkpoint.tool_batch.with_pending(
                                 (), status=ToolBatchStatus.CANCELLED
-                            ) if checkpoint.tool_batch is not None else None
+                            ) if state.checkpoint.tool_batch is not None else None
                         ),
                         evidence_question_state=question_projection.to_data(),
                     )
@@ -12834,7 +12831,7 @@ class Kernel:
                         "next_action": pivot_decision.action.value,
                     }),))
                     await self._save_agent_checkpoint(
-                        checkpoint, "plan-no-progress-stopped"
+                        state.checkpoint, "plan-no-progress-stopped"
                     )
                     break
                 next_tool_count = state.tool_call_count + 1
@@ -12852,54 +12849,54 @@ class Kernel:
                 suspension = AgentTurnCheckpoint(
                     task_id=state.task_id,
                     turn_id=state.turn_id,
-                    revision=checkpoint.revision,
-                    messages=tuple(messages),
-                    pending_tool_calls=tuple(pending_tool_calls),
+                    revision=state.checkpoint.revision,
+                    messages=tuple(state.messages),
+                    pending_tool_calls=tuple(state.pending_tool_calls),
                     tool_batch=(
-                        checkpoint.tool_batch.with_pending(
-                            tuple(pending_tool_calls),
+                        state.checkpoint.tool_batch.with_pending(
+                            tuple(state.pending_tool_calls),
                             status=ToolBatchStatus.EXECUTING,
-                        ) if checkpoint.tool_batch is not None else None
+                        ) if state.checkpoint.tool_batch is not None else None
                     ),
                     seen_call_ids=tuple(sorted(state.seen_call_ids)),
                     model_calls=state.model_call_count,
                     tool_calls=state.tool_call_count,
                     input_tokens=state.input_tokens,
                     output_tokens=state.output_tokens,
-                    max_model_calls=checkpoint.max_model_calls,
-                    max_tool_calls=checkpoint.max_tool_calls,
-                    max_output_tokens=checkpoint.max_output_tokens,
-                    tool_timeout_seconds=checkpoint.tool_timeout_seconds,
+                    max_model_calls=state.checkpoint.max_model_calls,
+                    max_tool_calls=state.checkpoint.max_tool_calls,
+                    max_output_tokens=state.checkpoint.max_output_tokens,
+                    tool_timeout_seconds=state.checkpoint.tool_timeout_seconds,
                     model_budget_renewal_count=(
-                        checkpoint.model_budget_renewal_count
+                        state.checkpoint.model_budget_renewal_count
                     ),
                     model_budget_total_granted=(
-                        checkpoint.model_budget_total_granted
+                        state.checkpoint.model_budget_total_granted
                     ),
-                    workspace_fingerprint=checkpoint.workspace_fingerprint,
-                    effective_config_hash=checkpoint.effective_config_hash,
-                    toolset_hash=checkpoint.toolset_hash,
-                    prompt_manifest_hash=checkpoint.prompt_manifest_hash,
-                    session_id=checkpoint.session_id,
-                    session_context_hash=checkpoint.session_context_hash,
-                    working_memory_hash=checkpoint.working_memory_hash,
+                    workspace_fingerprint=state.checkpoint.workspace_fingerprint,
+                    effective_config_hash=state.checkpoint.effective_config_hash,
+                    toolset_hash=state.checkpoint.toolset_hash,
+                    prompt_manifest_hash=state.checkpoint.prompt_manifest_hash,
+                    session_id=state.checkpoint.session_id,
+                    session_context_hash=state.checkpoint.session_context_hash,
+                    working_memory_hash=state.checkpoint.working_memory_hash,
                     last_steering_inbound_sequence=(
-                        checkpoint.last_steering_inbound_sequence
+                        state.checkpoint.last_steering_inbound_sequence
                     ),
-                    goal_revision=checkpoint.goal_revision,
-                    action_progress=checkpoint.action_progress,
-                    evidence_inventory=checkpoint.evidence_inventory,
-                    evidence_question_state=checkpoint.evidence_question_state,
-                    read_hits_state=checkpoint.read_hits_state,
-                    artifact_read_state=checkpoint.artifact_read_state,
-                    progressive_scope_state=checkpoint.progressive_scope_state,
-                    exploration_budget_state=checkpoint.exploration_budget_state,
-                    stop_or_pivot_state=checkpoint.stop_or_pivot_state,
-                    evidence_relation_state=checkpoint.evidence_relation_state,
-                    rejection_loop_state=checkpoint.rejection_loop_state,
-                    exploration_outcome_state=checkpoint.exploration_outcome_state,
+                    goal_revision=state.checkpoint.goal_revision,
+                    action_progress=state.checkpoint.action_progress,
+                    evidence_inventory=state.checkpoint.evidence_inventory,
+                    evidence_question_state=state.checkpoint.evidence_question_state,
+                    read_hits_state=state.checkpoint.read_hits_state,
+                    artifact_read_state=state.checkpoint.artifact_read_state,
+                    progressive_scope_state=state.checkpoint.progressive_scope_state,
+                    exploration_budget_state=state.checkpoint.exploration_budget_state,
+                    stop_or_pivot_state=state.checkpoint.stop_or_pivot_state,
+                    evidence_relation_state=state.checkpoint.evidence_relation_state,
+                    rejection_loop_state=state.checkpoint.rejection_loop_state,
+                    exploration_outcome_state=state.checkpoint.exploration_outcome_state,
                     completion_readiness_state=(
-                        checkpoint.completion_readiness_state
+                        state.checkpoint.completion_readiness_state
                     ),
                 )
                 await self._save_agent_checkpoint(
@@ -12912,9 +12909,9 @@ class Kernel:
                 self._notify_agent_progress(on_progress, AgentProgress(
                     AgentProgressKind.TOOL_STARTED,
                     model_call=state.model_call_count,
-                    max_model_calls=checkpoint.max_model_calls,
+                    max_model_calls=state.checkpoint.max_model_calls,
                     tool_call=next_tool_count,
-                    max_tool_calls=checkpoint.max_tool_calls,
+                    max_tool_calls=state.checkpoint.max_tool_calls,
                     tool_name=call.name,
                     goal=task_before_action.goal,
                     question=(question.question if question is not None else ""),
@@ -12939,7 +12936,7 @@ class Kernel:
                     return AgentTurnSuspended(
                         task_id=state.task_id,
                         turn_id=state.turn_id,
-                        revision=checkpoint.revision,
+                        revision=state.checkpoint.revision,
                         approval_request_id=request.request_id,
                         payload_hash=request.payload_hash,
                         action=request.action,
@@ -12955,7 +12952,7 @@ class Kernel:
                     request = required.request
                     return AgentClarificationSuspended(
                         task_id=state.task_id, turn_id=state.turn_id,
-                        revision=checkpoint.revision,
+                        revision=state.checkpoint.revision,
                         request_id=request.request_id,
                         question=request.question,
                         choices=tuple(
@@ -12971,7 +12968,7 @@ class Kernel:
                 evidence_inventory, evidence_delta = (
                     await self._evaluate_evidence_delta(
                         state.task_id, state.turn_id, call, result,
-                        checkpoint.evidence_inventory,
+                        state.checkpoint.evidence_inventory,
                     )
                 )
                 question_projection = await self._observe_evidence_question(
@@ -12995,27 +12992,27 @@ class Kernel:
                     )
                 read_hits_state = await self._update_read_hits_after(
                     state.task_id, state.turn_id, call, result, semantic_action,
-                    checkpoint.read_hits_state,
+                    state.checkpoint.read_hits_state,
                 )
                 artifact_read_state = await self._update_artifact_read_after(
                     state.task_id, state.turn_id, call, result, artifact_probe,
-                    checkpoint.artifact_read_state,
+                    state.checkpoint.artifact_read_state,
                 )
                 progressive_scope_state = (
                     await self._update_progressive_scope_after(
                         state.task_id, state.turn_id, call, result, semantic_action,
-                        scope_probe, checkpoint.progressive_scope_state,
+                        scope_probe, state.checkpoint.progressive_scope_state,
                     )
                 )
-                evidence_relation_state = checkpoint.evidence_relation_state
-                rejection_loop_state = checkpoint.rejection_loop_state
-                exploration_outcome_state = checkpoint.exploration_outcome_state
+                evidence_relation_state = state.checkpoint.evidence_relation_state
+                rejection_loop_state = state.checkpoint.rejection_loop_state
+                exploration_outcome_state = state.checkpoint.exploration_outcome_state
                 if self._exploration_coordinator is not None:
                     exploration_update = await self._update_exploration_after(
                         state.task_id, state.turn_id, call, result, semantic_action,
-                        evidence_delta, checkpoint.evidence_relation_state,
-                        checkpoint.rejection_loop_state,
-                        checkpoint.exploration_outcome_state,
+                        evidence_delta, state.checkpoint.evidence_relation_state,
+                        state.checkpoint.rejection_loop_state,
+                        state.checkpoint.exploration_outcome_state,
                     )
                     evidence_relation_state = (
                         exploration_update.relation_state.to_data()
@@ -13050,7 +13047,7 @@ class Kernel:
                                 and scope_probe.depth == 0
                             ),
                             scope_expanded=(scope_decision.relation == "expanded"),
-                        ), checkpoint.exploration_budget_state,
+                        ), state.checkpoint.exploration_budget_state,
                     )
                 )
                 await self._emit_agent_progress_projection(
@@ -13072,9 +13069,9 @@ class Kernel:
                 self._notify_agent_progress(on_progress, AgentProgress(
                     AgentProgressKind.TOOL_COMPLETED,
                     model_call=state.model_call_count,
-                    max_model_calls=checkpoint.max_model_calls,
+                    max_model_calls=state.checkpoint.max_model_calls,
                     tool_call=next_tool_count,
-                    max_tool_calls=checkpoint.max_tool_calls,
+                    max_tool_calls=state.checkpoint.max_tool_calls,
                     tool_name=call.name,
                     ok=result.ok,
                     error_code=result.error_code,
@@ -13121,20 +13118,20 @@ class Kernel:
                     ):
                         state.last_tool_error = f"{call.name}: {classified[1]}"
                 state.tool_call_count = next_tool_count
-                messages.append(
+                state.messages.append(
                     Message(
                         message_id=f"msg-tool-{uuid4().hex}",
                         role=MessageRole.TOOL,
                         content=(ToolResultBlock(result),),
                     )
                 )
-                pending_tool_calls.pop(0)
+                state.pending_tool_calls.pop(0)
                 after_tool = replace(
-                    suspension, messages=tuple(messages),
-                    pending_tool_calls=tuple(pending_tool_calls),
+                    suspension, messages=tuple(state.messages),
+                    pending_tool_calls=tuple(state.pending_tool_calls),
                     tool_batch=(
                         suspension.tool_batch.with_pending(
-                            tuple(pending_tool_calls)
+                            tuple(state.pending_tool_calls)
                         ) if suspension.tool_batch is not None else None
                     ),
                     tool_calls=state.tool_call_count,
@@ -13151,12 +13148,12 @@ class Kernel:
                     artifact_read_state=artifact_read_state,
                     progressive_scope_state=progressive_scope_state,
                     exploration_budget_state=exploration_budget_state,
-                    stop_or_pivot_state=checkpoint.stop_or_pivot_state,
+                    stop_or_pivot_state=state.checkpoint.stop_or_pivot_state,
                     evidence_relation_state=evidence_relation_state,
                     rejection_loop_state=rejection_loop_state,
                     exploration_outcome_state=exploration_outcome_state,
                     completion_readiness_state=(
-                        checkpoint.completion_readiness_state
+                        state.checkpoint.completion_readiness_state
                     ),
                     action_progress=(
                         ActionProgressState(
@@ -13172,17 +13169,17 @@ class Kernel:
                     ),
                 )
                 await self._save_agent_checkpoint(after_tool, "tool-result-recorded")
-                checkpoint = after_tool
+                state.checkpoint = after_tool
                 if result.error_code == "UNKNOWN_OUTCOME":
                     return await self._suspend_unknown_tool_outcome(
                         after_tool, call, result
                     )
                 continuation = await self._maybe_suspend_after_completed_unit(
-                    checkpoint, state.closed_outcomes_at_entry
+                    state.checkpoint, state.closed_outcomes_at_entry
                 )
                 if continuation is not None:
                     source_user_message = next((
-                        message for message in messages
+                        message for message in state.messages
                         if message.role is MessageRole.USER
                         and not message.message_id.startswith((
                             "project-onboarding-context-",
@@ -13202,22 +13199,22 @@ class Kernel:
                     await self._refresh_continuation_session_identity(state.task_id)
                     return continuation
 
-            checkpoint = self._synchronize_tool_batch(replace(
-                checkpoint, messages=tuple(messages),
-                pending_tool_calls=tuple(pending_tool_calls),
+            state.checkpoint = self._synchronize_tool_batch(replace(
+                state.checkpoint, messages=tuple(state.messages),
+                pending_tool_calls=tuple(state.pending_tool_calls),
             ))
-            messages = list(self._normalize_and_validate_model_boundary(
-                checkpoint.messages
+            state.messages = list(self._normalize_and_validate_model_boundary(
+                state.checkpoint.messages
             ))
-            checkpoint = replace(checkpoint, messages=tuple(messages))
+            state.checkpoint = replace(state.checkpoint, messages=tuple(state.messages))
             model_call_number = state.model_call_count + 1
-            if model_call_number > checkpoint.max_model_calls:
+            if model_call_number > state.checkpoint.max_model_calls:
                 error = AgentLoopLimitExceeded(
-                    state.turn_id, "max_model_calls", checkpoint.max_model_calls,
+                    state.turn_id, "max_model_calls", state.checkpoint.max_model_calls,
                     model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                     last_tool_error=state.last_tool_error,
-                    max_model_calls=checkpoint.max_model_calls,
-                    max_tool_calls=checkpoint.max_tool_calls,
+                    max_model_calls=state.checkpoint.max_model_calls,
+                    max_tool_calls=state.checkpoint.max_tool_calls,
                 )
                 await self._record_agent_loop_failure(state.task_id, state.turn_id, error)
                 raise error
@@ -13227,12 +13224,12 @@ class Kernel:
             # if the model emits protocol markup instead of an answer.
             wrap_up_threshold = min(
                 self._dependencies.finalization_model_calls,
-                max(1, checkpoint.max_model_calls - 1),
+                max(1, state.checkpoint.max_model_calls - 1),
             )
-            remaining_model_calls = checkpoint.max_model_calls - state.model_call_count
-            remaining_tool_calls = checkpoint.max_tool_calls - state.tool_call_count
+            remaining_model_calls = state.checkpoint.max_model_calls - state.model_call_count
+            remaining_tool_calls = state.checkpoint.max_tool_calls - state.tool_call_count
             completion_state = CompletionReadinessState.from_data(
-                checkpoint.completion_readiness_state
+                state.checkpoint.completion_readiness_state
             )
             legacy_completion_gate = (
                 self.completion_readiness_mode
@@ -13271,7 +13268,7 @@ class Kernel:
                 )
                 for gap in required_gaps
             )
-            recovery_batch = self._latest_recoverable_tool_batch(messages)
+            recovery_batch = self._latest_recoverable_tool_batch(state.messages)
             recovery_result = recovery_batch[-1] if recovery_batch else None
             # An effect-level failure produces an explicit gap even though the
             # call itself returned ok=True, so it must open the same recovery
@@ -13290,7 +13287,7 @@ class Kernel:
             if can_finish_required_work:
                 wrap_up = False
             focus_state = ExplorationBudgetState.from_data(
-                checkpoint.exploration_budget_state
+                state.checkpoint.exploration_budget_state
             )
             if disclosure_only:
                 if (
@@ -13319,9 +13316,9 @@ class Kernel:
                     )
                 self._notify_agent_progress(on_progress, AgentProgress(
                     AgentProgressKind.WRAP_UP, model_call=model_call_number,
-                    max_model_calls=checkpoint.max_model_calls,
+                    max_model_calls=state.checkpoint.max_model_calls,
                     tool_call=state.tool_call_count,
-                    max_tool_calls=checkpoint.max_tool_calls,
+                    max_tool_calls=state.checkpoint.max_tool_calls,
                     goal=(await self.get_task(state.task_id)).goal,
                     reason=(
                         "plan_no_progress" if state.no_progress_stop
@@ -13381,9 +13378,9 @@ class Kernel:
                 )
                 self._notify_agent_progress(on_progress, AgentProgress(
                     AgentProgressKind.WRAP_UP, model_call=model_call_number,
-                    max_model_calls=checkpoint.max_model_calls,
+                    max_model_calls=state.checkpoint.max_model_calls,
                     tool_call=state.tool_call_count,
-                    max_tool_calls=checkpoint.max_tool_calls,
+                    max_tool_calls=state.checkpoint.max_tool_calls,
                     goal=(await self.get_task(state.task_id)).goal,
                     reason="execution_budget_nearly_exhausted",
                 ))
@@ -13458,26 +13455,26 @@ class Kernel:
                 "project-onboarding-context-", "project-memory-context-",
                 "session-context-", "document-references-context-", "working-memory-context-",
             )
-            messages = [
-                message for message in messages
+            state.messages = [
+                message for message in state.messages
                 if not message.message_id.startswith(generated_prefixes)
             ]
-            messages.extend(await self._project_context_messages(state.task_id))
+            state.messages.extend(await self._project_context_messages(state.task_id))
             try:
                 prepared = self._dependencies.context_manager.prepare(
-                    conversation=tuple(messages), tools=model_visible_tools,
+                    conversation=tuple(state.messages), tools=model_visible_tools,
                     prompt_template=self._dependencies.prompt_template,
                     context_window=(
                         self._dependencies.model.capabilities.context_window
                     ),
-                    max_output_tokens=checkpoint.max_output_tokens,
+                    max_output_tokens=state.checkpoint.max_output_tokens,
                     runtime_instruction=runtime_instruction,
                 )
             except ContextWindowExceeded as error:
                 await self._record_turn_failure(state.task_id, state.turn_id, error)
                 raise ModelInvocationFailed(state.turn_id, str(error)) from error
             if prepared.compaction is not None:
-                messages = list(prepared.messages)
+                state.messages = list(prepared.messages)
                 await self._append_events(
                     state.task_id, (("context.compacted", {
                         "turn_id": state.turn_id,
@@ -13486,8 +13483,8 @@ class Kernel:
                     }),),
                 )
                 compacted_checkpoint = replace(
-                    checkpoint, messages=tuple(messages),
-                    pending_tool_calls=tuple(pending_tool_calls),
+                    state.checkpoint, messages=tuple(state.messages),
+                    pending_tool_calls=tuple(state.pending_tool_calls),
                     seen_call_ids=tuple(sorted(state.seen_call_ids)),
                     model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                     input_tokens=state.input_tokens, output_tokens=state.output_tokens,
@@ -13525,9 +13522,9 @@ class Kernel:
                     AgentProgressKind.MODEL_RETRY if is_retry
                     else AgentProgressKind.MODEL_TRANSPORT,
                     model_call=model_call_number,
-                    max_model_calls=checkpoint.max_model_calls,
+                    max_model_calls=state.checkpoint.max_model_calls,
                     tool_call=state.tool_call_count,
-                    max_tool_calls=checkpoint.max_tool_calls,
+                    max_tool_calls=state.checkpoint.max_tool_calls,
                     goal=live_goal,
                     reason=reason,
                     transport_attempt=update.attempt,
@@ -13543,7 +13540,7 @@ class Kernel:
             request = ModelRequest(
                 turn_id=state.turn_id,
                 messages=prompt.messages,
-                max_output_tokens=checkpoint.max_output_tokens,
+                max_output_tokens=state.checkpoint.max_output_tokens,
                 tools=model_visible_tools,
                 allow_tool_calls=not (wrap_up or disclosure_only),
                 require_evidence_questions=(
@@ -13561,9 +13558,9 @@ class Kernel:
             live_goal = (await self.get_task(state.task_id)).goal
             self._notify_agent_progress(on_progress, AgentProgress(
                 AgentProgressKind.MODEL_STARTED, model_call=model_call_number,
-                max_model_calls=checkpoint.max_model_calls,
+                max_model_calls=state.checkpoint.max_model_calls,
                 tool_call=state.tool_call_count,
-                max_tool_calls=checkpoint.max_tool_calls,
+                max_tool_calls=state.checkpoint.max_tool_calls,
                 goal=live_goal,
             ))
             buffered_text: list[str] = []
@@ -13581,9 +13578,9 @@ class Kernel:
                 self._notify_agent_progress(on_progress, AgentProgress(
                     AgentProgressKind.MODEL_COMPLETED,
                     model_call=model_call_number,
-                    max_model_calls=checkpoint.max_model_calls,
+                    max_model_calls=state.checkpoint.max_model_calls,
                     tool_call=state.tool_call_count,
-                    max_tool_calls=checkpoint.max_tool_calls,
+                    max_tool_calls=state.checkpoint.max_tool_calls,
                     elapsed_seconds=time.monotonic() - model_started_at,
                     goal=live_goal,
                 ))
@@ -13596,7 +13593,7 @@ class Kernel:
                     ),
                     allow_tool_calls=request.allow_tool_calls,
                 )
-                recovery_batch = self._latest_recoverable_tool_batch(messages)
+                recovery_batch = self._latest_recoverable_tool_batch(state.messages)
                 duplicate_call_ids = [
                     call.call_id for call in tool_calls if call.call_id in state.seen_call_ids
                 ]
@@ -13673,7 +13670,7 @@ class Kernel:
                 if (
                     recovery_action
                     is ModelRecoveryAction.RESAMPLE_WITH_CORRECTION
-                    and state.model_call_count < checkpoint.max_model_calls
+                    and state.model_call_count < state.checkpoint.max_model_calls
                 ):
                     state.protocol_correction = (
                         (
@@ -13709,41 +13706,41 @@ class Kernel:
                             "retry_limit": 1,
                         },
                     ),))
-                    checkpoint = replace(
-                        checkpoint, messages=tuple(messages),
+                    state.checkpoint = replace(
+                        state.checkpoint, messages=tuple(state.messages),
                         pending_tool_calls=(),
                         seen_call_ids=tuple(sorted(state.seen_call_ids)),
                         model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                         input_tokens=state.input_tokens, output_tokens=state.output_tokens,
                     )
                     await self._save_agent_checkpoint(
-                        checkpoint, "tool-protocol-retry-requested"
+                        state.checkpoint, "tool-protocol-retry-requested"
                     )
                     continue
                 if (
                     error.reason_code == "tool_call_emitted_while_disabled"
-                    and state.model_call_count >= checkpoint.max_model_calls
+                    and state.model_call_count >= state.checkpoint.max_model_calls
                 ):
                     limit_error = AgentLoopLimitExceeded(
-                        state.turn_id, "max_model_calls", checkpoint.max_model_calls,
+                        state.turn_id, "max_model_calls", state.checkpoint.max_model_calls,
                         model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                         last_tool_error=state.last_tool_error,
-                        max_model_calls=checkpoint.max_model_calls,
-                        max_tool_calls=checkpoint.max_tool_calls,
+                        max_model_calls=state.checkpoint.max_model_calls,
+                        max_tool_calls=state.checkpoint.max_tool_calls,
                     )
                     await self._record_agent_loop_failure(
                         state.task_id, state.turn_id, limit_error
                     )
                     raise limit_error from error
-                checkpoint = replace(
-                    checkpoint, messages=tuple(messages),
+                state.checkpoint = replace(
+                    state.checkpoint, messages=tuple(state.messages),
                     pending_tool_calls=(),
                     seen_call_ids=tuple(sorted(state.seen_call_ids)),
                     model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                     input_tokens=state.input_tokens, output_tokens=state.output_tokens,
                 )
                 await self._save_agent_checkpoint(
-                    checkpoint, "tool-protocol-recovery-exhausted"
+                    state.checkpoint, "tool-protocol-recovery-exhausted"
                 )
                 await self._record_recoverable_turn_interruption(
                     state.task_id, state.turn_id, error, prompt.receipt,
@@ -13806,9 +13803,9 @@ class Kernel:
             state.output_tokens += response.usage.output_tokens
             state.model_call_count = model_call_number
             state.protocol_correction = None
-            messages.append(response.message)
+            state.messages.append(response.message)
             response_checkpoint = replace(
-                checkpoint, messages=tuple(messages),
+                state.checkpoint, messages=tuple(state.messages),
                 pending_tool_calls=tuple(tool_calls),
                 tool_batch=accepted_batch,
                 seen_call_ids=tuple(sorted(state.seen_call_ids)),
@@ -13850,7 +13847,7 @@ class Kernel:
                 ) for tool_result in recovery_batch)
                 recovery_checkpoint = replace(
                     response_checkpoint,
-                    messages=tuple(messages[:-1]),
+                    messages=tuple(state.messages[:-1]),
                     pending_tool_calls=(), tool_batch=None,
                 )
                 blocker = self._recovery_batch_blocker_message(recovery_batch)
@@ -13859,7 +13856,7 @@ class Kernel:
                     reason="unresolved_tool_batch",
                 )
                 source_user_message = next((
-                    message for message in messages
+                    message for message in state.messages
                     if message.role is MessageRole.USER
                     and not message.message_id.startswith((
                         "project-onboarding-context-",
@@ -14076,9 +14073,9 @@ class Kernel:
                 response_checkpoint, _ = await self._apply_pending_steering(
                     response_checkpoint, "after-model-response"
                 )
-                checkpoint = response_checkpoint
-                messages = list(response_checkpoint.messages)
-                pending_tool_calls = list(response_checkpoint.pending_tool_calls)
+                state.checkpoint = response_checkpoint
+                state.messages = list(response_checkpoint.messages)
+                state.pending_tool_calls = list(response_checkpoint.pending_tool_calls)
                 continue
 
             if not tool_calls:
@@ -14092,7 +14089,7 @@ class Kernel:
                         ),
                     )
                     source_user_message = next((
-                        message for message in messages
+                        message for message in state.messages
                         if message.role is MessageRole.USER
                         and not message.message_id.startswith((
                             "project-onboarding-context-",
@@ -14111,9 +14108,9 @@ class Kernel:
                     return suspension
                 if readiness.action is not CompletionReadinessAction.COMPLETE:
                     correction = self._completion_correction_message(readiness)
-                    messages.append(correction)
+                    state.messages.append(correction)
                     response_checkpoint = replace(
-                        response_checkpoint, messages=tuple(messages),
+                        response_checkpoint, messages=tuple(state.messages),
                         pending_tool_calls=(),
                         completion_readiness_state=readiness.state.to_data(),
                     )
@@ -14134,11 +14131,11 @@ class Kernel:
                     await self._save_agent_checkpoint(
                         response_checkpoint, "completion-readiness-correction"
                     )
-                    checkpoint = response_checkpoint
-                    pending_tool_calls = []
+                    state.checkpoint = response_checkpoint
+                    state.pending_tool_calls = []
                     continue
                 source_user_message = next((
-                    message for message in messages
+                    message for message in state.messages
                     if message.role is MessageRole.USER
                     and not message.message_id.startswith((
                         "project-onboarding-context-",
@@ -14157,32 +14154,32 @@ class Kernel:
                     usage=ModelUsage(state.input_tokens, state.output_tokens),
                     model_calls=state.model_call_count,
                     tool_calls=state.tool_call_count,
-                    messages=tuple(messages),
+                    messages=tuple(state.messages),
                 )
 
-            if state.tool_call_count + len(tool_calls) > checkpoint.max_tool_calls:
+            if state.tool_call_count + len(tool_calls) > state.checkpoint.max_tool_calls:
                 error = AgentLoopLimitExceeded(
-                    state.turn_id, "max_tool_calls", checkpoint.max_tool_calls,
+                    state.turn_id, "max_tool_calls", state.checkpoint.max_tool_calls,
                     model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                     last_tool_error=state.last_tool_error,
-                    max_model_calls=checkpoint.max_model_calls,
-                    max_tool_calls=checkpoint.max_tool_calls,
+                    max_model_calls=state.checkpoint.max_model_calls,
+                    max_tool_calls=state.checkpoint.max_tool_calls,
                 )
                 await self._record_agent_loop_failure(state.task_id, state.turn_id, error)
                 raise error
-            if state.model_call_count == checkpoint.max_model_calls:
+            if state.model_call_count == state.checkpoint.max_model_calls:
                 error = AgentLoopLimitExceeded(
-                    state.turn_id, "max_model_calls", checkpoint.max_model_calls,
+                    state.turn_id, "max_model_calls", state.checkpoint.max_model_calls,
                     model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                     last_tool_error=state.last_tool_error,
-                    max_model_calls=checkpoint.max_model_calls,
-                    max_tool_calls=checkpoint.max_tool_calls,
+                    max_model_calls=state.checkpoint.max_model_calls,
+                    max_tool_calls=state.checkpoint.max_tool_calls,
                 )
                 await self._record_agent_loop_failure(state.task_id, state.turn_id, error)
                 raise error
 
-            pending_tool_calls = list(tool_calls)
-            checkpoint = response_checkpoint
+            state.pending_tool_calls = list(tool_calls)
+            state.checkpoint = response_checkpoint
 
     @staticmethod
     def _notify_agent_progress(
