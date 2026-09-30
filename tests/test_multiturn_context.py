@@ -1,45 +1,31 @@
 """Multi-turn context: what the model actually sees on the second and third turn.
 
-These are **characterization tests for a defect**, not for desired behaviour.
+**Corrected.** An earlier revision of this file asserted that a later turn could
+not see an earlier turn's user text, and marked that assertion
+``expectedFailure``. The assertion was wrong, and so was the diagnosis behind
+it: the tests drove the session with ``submit_session_text`` alone, which
+*creates* a Task but never runs it, so no model request was ever issued and the
+assertion failed for that reason rather than for missing context.
 
-The claim under test: when the session router explicitly classifies a message as
-``CONTEXTUAL`` -- documented as "a safe, isolated Task that receives ordinary
-Session context" (``core/runtime_input.py:114-116``) -- the new Task's model
-request still does not contain the previous turn's user text.
+Driving the turn properly -- ``submit_session_text`` then ``run_task`` -- shows
+that prior turns **are** carried: each turn's model request includes a
+``session-context-*`` message whose ``recent_messages`` holds the earlier user
+*and* assistant rows in order. Multi-turn text continuity works.
 
-Why that is structural rather than incidental:
+What is genuinely absent, and is characterized below, is everything that is not
+user/assistant text: tool calls and tool results never enter that projection.
+That is a deliberate safety decision recorded at ``core/kernel.py:7020-7022``
+("Never copy command argv/environment, patch bodies or arbitrary third-party
+Tool arguments into Session context"), not an oversight.
 
-* ``SessionSnapshot`` holds no transcript at all; it is a container of Task ids
-  (``core/session.py:81-95``).
-* Conversation content is re-projected every model call
-  (``core/session_context.py:582``, ``kernel.py:13437-13450``).
-* The projection is filtered by Task lineage membership, and the selector states
-  outright that "recency is never an eligibility criterion"
-  (``core/session_context.py:212-227``). A fresh Task's lineage is itself, so the
-  previous Task's rows are ineligible.
-
-A second restriction compounds this: the conversation model admitted user and
-assistant roles only, so tool calls and tool results could not survive a turn
-boundary at all. That one is now fixed -- ``SessionConversationMessage`` accepts
-``tool`` rows with their ``tool_call_id`` / ``tool_name`` pairing, and
-``ConversationMessageContractTest`` pins the new contract.
-
-Fixing the message model alone does **not** make the XFAIL tests below pass, and
-that is expected: the projector only ever reads the ``user_message`` and
-``assistant_message`` keys of a ``session.task_result_recorded`` payload
-(``core/session_context.py:614-615``), so there is no tool data in the event
-stream to project in the first place. Making these pass needs the transcript
-itself, not a wider role set.
-
-Each test below is marked ``expectedFailure`` on purpose. It asserts the
-**desired** behaviour, so it fails today; the moment the transcript work lands it
-becomes an unexpected success, and unittest reports that as a failure telling us
-to remove the marker. That is the intended signal -- do not delete these tests,
-and do not weaken them into asserting the defect.
+The lesson kept in this docstring: a characterization test that fails for the
+wrong reason looks exactly like one that fails for the right reason. Drive the
+real path before trusting either.
 """
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -122,46 +108,114 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(client.close)
         return client, model
 
-    @unittest.expectedFailure
+    async def _say(self, client, session_id: str, text: str, index: int) -> None:
+        """Submit one user message and actually run the Task it creates.
+
+        ``submit_session_text`` alone only creates the Task; without ``run_task``
+        no model request is issued and any assertion about model context is
+        vacuous.
+        """
+
+        result = await client.submit_session_text(
+            session_id, text, command_id=f"request-{index}",
+        )
+        await client.run_task(result.result["task"]["task_id"], text)
+
+    @staticmethod
+    def _session_context(requests, since: int) -> dict:
+        """The ``session-context-*`` payload from the newest request."""
+
+        for request in reversed(requests[since:]):
+            for message in request.messages:
+                if message.message_id.startswith("session-context-"):
+                    return json.loads(message.text)
+        raise AssertionError("no session-context message was projected")
+
     async def test_second_turn_sees_the_first_turn_user_text(self):
         with tempfile.TemporaryDirectory() as directory:
             client, model = await self.make_client(Path(directory))
-            session = await client.application.kernel.create_session("turn continuity")
+            session = await client.application.kernel.create_session("continuity")
 
-            await client.submit_session_text(
-                session.session_id, "the first instruction",
-                command_id="request-1",
-            )
+            await self._say(client, session.session_id, "the first instruction", 1)
             mark = len(model.requests)
-            await client.submit_session_text(
-                session.session_id, "the second instruction",
-                command_id="request-2",
-            )
+            await self._say(client, session.session_id, "the second instruction", 2)
 
             self.assertIn(
                 "the first instruction", model.text_since(mark),
-                "the second turn's model request must carry the first turn's user text",
+                "the second turn must carry the first turn's user text",
             )
 
-    @unittest.expectedFailure
-    async def test_third_turn_sees_both_earlier_user_texts(self):
+    async def test_third_turn_sees_both_earlier_turns_in_order(self):
         with tempfile.TemporaryDirectory() as directory:
             client, model = await self.make_client(Path(directory))
-            session = await client.application.kernel.create_session("turn continuity")
+            session = await client.application.kernel.create_session("continuity")
 
             for index in (1, 2):
-                await client.submit_session_text(
-                    session.session_id, f"instruction number {index}",
-                    command_id=f"request-{index}",
+                await self._say(
+                    client, session.session_id, f"instruction number {index}", index,
                 )
             mark = len(model.requests)
-            await client.submit_session_text(
-                session.session_id, "instruction number 3", command_id="request-3",
+            await self._say(client, session.session_id, "instruction number 3", 3)
+
+            user_bodies = [
+                message.get("text")
+                for message in self._session_context(model.requests, mark)[
+                    "recent_messages"
+                ]
+                if message.get("role") == "user"
+            ]
+            self.assertEqual(
+                user_bodies,
+                ["instruction number 1", "instruction number 2",
+                 "instruction number 3"],
+                "prior user turns must be replayed in order, ahead of the current one",
             )
 
-            seen = model.text_since(mark)
-            self.assertIn("instruction number 1", seen)
-            self.assertIn("instruction number 2", seen)
+    async def test_prior_assistant_turns_are_carried_too(self):
+        """Continuity is not user-only: the answering model's own earlier replies
+        are part of what a later turn must see."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            client, model = await self.make_client(Path(directory))
+            session = await client.application.kernel.create_session("continuity")
+
+            await self._say(client, session.session_id, "the first instruction", 1)
+            mark = len(model.requests)
+            await self._say(client, session.session_id, "the second instruction", 2)
+
+            roles = [
+                message.get("role")
+                for message in self._session_context(model.requests, mark)[
+                    "recent_messages"
+                ]
+            ]
+            self.assertIn("assistant", roles)
+
+    async def test_tool_rows_are_not_carried_across_turns(self):
+        """The real gap. Tool calls and results never enter the projection, by
+        the deliberate decision at ``core/kernel.py:7020-7022``: only read-only
+        navigation metadata is allowed to reach a later Turn's Session context.
+
+        This test pins today's behaviour so that changing it is a visible,
+        deliberate act rather than a side effect -- reversing it is only safe
+        once the tool boundary can bound and redact results (see
+        ``tsm-agt-工具边界能力对比.md``).
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            client, model = await self.make_client(Path(directory))
+            session = await client.application.kernel.create_session("continuity")
+
+            await self._say(client, session.session_id, "the first instruction", 1)
+            mark = len(model.requests)
+            await self._say(client, session.session_id, "the second instruction", 2)
+
+            payload = self._session_context(model.requests, mark)
+            for message in payload["recent_messages"]:
+                self.assertIn(
+                    message.get("role"), {"user", "assistant"},
+                    "only user and assistant text may cross a turn boundary today",
+                )
 
 class ConversationMessageContractTest(unittest.TestCase):
     """Tool rows must be representable, and only when they are pairable.
