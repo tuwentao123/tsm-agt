@@ -42,6 +42,7 @@ import ast
 import re
 import subprocess
 import sys
+import textwrap
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -331,11 +332,18 @@ def main(argv: list[str] | None = None) -> int:
         all_needs.update(_bare_loads(node))
 
     local_spans = {name: _method_span(node) for name, node in moved_locals.items()}
-    # Symbols the moved set needs that are NOT allowed to travel (they have users
-    # elsewhere) -- those must be given a neutral home first, as
-    # ``_is_verification_command`` was for this slice.
-    unresolved = sorted(
-        name for name in direct_needs
+    # Symbols the moved set needs that are NOT allowed to travel, because they
+    # have users outside it. These are late-imported from the facade inside the
+    # methods that read them -- ``from .kernel import X`` executed per call, which
+    # is the shape ``AGENTS.md:243-244`` prescribes. It resolves at *call* time
+    # from the facade's namespace, so it also keeps ``patch(<facade>.<name>)``
+    # working, unlike a module-level import here.
+    #
+    # Computed from ``all_needs``, not ``direct_needs``: a symbol can be reachable
+    # only through another symbol that is travelling, and missing that case leaves
+    # an unbound name in a branch nothing exercises until production.
+    stuck = sorted(
+        name for name in all_needs
         if name in nodes and name not in moved_locals
     )
 
@@ -354,15 +362,11 @@ def main(argv: list[str] | None = None) -> int:
             or "none"
         )
     )
-    if unresolved:
-        print("REFUSING: the moved methods reference these, but they have users")
-        print("outside the moved set, so they cannot travel:")
-        for name in unresolved:
+    if stuck:
+        print("late-imported from the facade inside the methods that read them:")
+        for name in stuck:
             start, end = _method_span(nodes[name])
             print(f"  {name} (defined at lines {start}-{end})")
-        print("Give each a neutral home first (a pure delegation can simply be "
-              "replaced by its target).")
-        return 2
     print("imports for the new module:")
     print(_render_imports(all_needs, origin))
     if args.dry_run:
@@ -372,15 +376,51 @@ def main(argv: list[str] | None = None) -> int:
     # --- build the sibling -----------------------------------------------------
     method_bodies = ["\n".join(lines[start - 1:end]) for start, end in ranges]
     local_bodies = [
-        "\n".join(lines[start - 1:end])
-        for _, (start, end) in sorted(local_spans.items(), key=lambda kv: kv[1][0])
+        (
+            name,
+            "\n".join(lines[start - 1:end]),
+        )
+        for name, (start, end) in sorted(
+            local_spans.items(), key=lambda kv: kv[1][0],
+        )
     ]
+
+    # A stuck symbol can be read from a travelling *module-level* definition too,
+    # not only from a travelling method: ``_required_effects_from_outcomes`` is
+    # reached through ``_runtime_authored_criteria``, which travels with the task
+    # slice. Missing that case writes a sibling whose name is unbound in the one
+    # branch nobody exercises -- which is the failure this whole script exists to
+    # prevent.
+    late_sites: dict[str, list[str]] = {}
+    for index, body in enumerate(method_bodies):
+        needed = _reads_stuck_globals(body, set(stuck), wrapped=True)
+        if needed:
+            method_bodies[index] = _insert_late_imports(body, needed)
+            late_sites[names[index]] = needed
+    for index, (owner, body) in enumerate(local_bodies):
+        needed = _reads_stuck_globals(body, set(stuck), wrapped=False)
+        if not needed:
+            continue
+        if not re.match(r"^\s*(async\s+)?def ", textwrap.dedent(body)):
+            # A travelling class would need the import inside each of its own
+            # methods that read the name, and this script only injects into
+            # functions. Refusing beats writing a file that only fails on the
+            # branch that first runs it.
+            print("REFUSING: travelling definition reads a name that cannot "
+                  "travel, and only functions can receive a late import:")
+            print(f"  {owner} needs {needed}")
+            return 2
+        local_bodies[index] = (owner, _insert_late_imports(body, needed))
+        late_sites[owner] = needed
+    for name, readers in sorted(late_sites.items()):
+        print(f"  late-import injected into {name}: {readers}")
+
     header = _sibling_header(
         args.class_name, args.summary, names, sorted(local_spans),
     )
     sections = [header, _render_imports(all_needs, origin)]
     if local_bodies:
-        sections.append("\n\n\n".join(local_bodies))
+        sections.append("\n\n\n".join(body for _, body in local_bodies))
     sections.append(
         f"class {args.class_name}:\n" + "\n\n".join(method_bodies)
     )
@@ -525,12 +565,114 @@ def _verify(
               "AGENTS.md:244-245). No check above can see this: the name still "
               "resolves, just somewhere else.")
 
+    detached = _detached_symbol_imports(module)
+    print(f"  imports of moved symbols still pointing at the facade: {detached or 'none'}")
+    if detached:
+        print("  The other half of the same problem, and the loud half: an import of "
+              "a symbol that left the facade fails at import time. Repoint it at this "
+              "sibling, because an import follows the *definition* while a patch "
+              "target follows wherever the moved body *reads* from.")
+
     ok = (
         not missing and not extra and not duplicates
-        and probe.returncode == 0 and not unresolved
+        and probe.returncode == 0 and not unresolved and not detached
     )
     print("VERIFY:", "ok" if ok else "FAILED")
     return 0 if ok else 1
+
+
+def _detached_symbol_imports(module: str) -> list[str]:
+    """Repo-wide ``from tsm_agt.core.kernel import X`` where ``X`` has left.
+
+    Asked of the real module in a subprocess rather than of the source text, so
+    re-exports and conditional definitions cannot fool it.
+    """
+
+    imported: dict[str, list[str]] = {}
+    for path in sorted(REPO.rglob("*.py")):
+        if "__pycache__" in str(path):
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module
+                and node.module.endswith("core.kernel")
+            ):
+                for alias in node.names:
+                    imported.setdefault(alias.name, []).append(
+                        f"{path.relative_to(REPO)}:{node.lineno}"
+                    )
+    if not imported:
+        return []
+    script = (
+        "import tsm_agt.core.kernel as K\n"
+        f"print('|'.join(n for n in {sorted(imported)!r} if not hasattr(K, n)))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, cwd=REPO,
+    )
+    if result.returncode != 0:
+        return [f"<could not inspect the facade: {result.stderr.strip().splitlines()[-1]}>"]
+    names = [name for name in result.stdout.strip().split("|") if name]
+    return [f"{name} (imported at {', '.join(imported[name][:3])})" for name in names]
+
+
+def _reads_stuck_globals(text: str, stuck: set[str], *, wrapped: bool) -> list[str]:
+    """Which of ``stuck`` this fragment reads as a global.
+
+    ``wrapped`` says whether ``text`` is a method body (indented, so it needs a
+    dummy class to become parseable) or a module-level definition (already valid
+    on its own). Guessing from the text was wrong for a module-level assignment
+    such as ``TERMINAL_AUTHORITY: ... = {...}``.
+    """
+
+    import symtable
+
+    source = "class _Wrapper:\n" + text if wrapped else textwrap.dedent(text)
+    table = symtable.symtable(source, "<fragment>", "exec")
+    found: set[str] = set()
+
+    def walk(node) -> None:
+        for child in node.get_children():
+            if child.get_type() == "function":
+                for symbol in child.get_symbols():
+                    if symbol.is_global() and symbol.get_name() in stuck:
+                        found.add(symbol.get_name())
+            walk(child)
+
+    walk(table)
+    return sorted(found)
+
+
+def _insert_late_imports(text: str, names: list[str]) -> str:
+    """Insert ``from .kernel import ...`` after the docstring.
+
+    After the docstring, not before: the moved body's docstring is part of the
+    verbatim original and stays first. The original indentation is restored, so
+    this works for a method body and a module-level function alike.
+    """
+
+    prefix = text[: len(text) - len(text.lstrip())]
+    dedented = textwrap.dedent(text)
+    lines = dedented.split("\n")
+    node = ast.parse(dedented).body[0]
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        raise ValueError("late imports can only be injected into a function")
+    first = node.body[0]
+    is_docstring = (
+        isinstance(first, ast.Expr)
+        and isinstance(first.value, ast.Constant)
+        and isinstance(first.value.value, str)
+    )
+    anchor = first.end_lineno if is_docstring else first.lineno
+    indent = re.match(r"\s*", lines[anchor]).group(0)
+    statements = [f"{indent}from .kernel import {name}" for name in names]
+    patched = "\n".join(lines[:anchor] + statements + lines[anchor:])
+    return textwrap.indent(patched, prefix) if prefix else patched
 
 
 def seam_names(sibling: Path, facade: Path) -> list[str]:

@@ -38,8 +38,11 @@ from tsm_agt.core.kernel import (
     _missing_effect_deliveries,
     _recorded_effect_deliveries,
     _required_effect_deliveries,
-    _runtime_authored_criteria,
 )
+# Moved to the ``TaskMixin`` sibling (``core/kernel_task.py``). A symbol *import*
+# follows the definition; a *patch target* follows wherever the moved body reads
+# it from (Hermes AGENTS.md:244-245).
+from tsm_agt.core.kernel_task import _runtime_authored_criteria
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus,
     SandboxDecision, SandboxRequest, ToolCall, ToolEffect, ToolIdempotency,

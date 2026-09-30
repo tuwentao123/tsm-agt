@@ -1,6 +1,6 @@
 """P1: NEEDS_REVIEW terminal, stall cap, and terminal authority.
 
-See 《验收判定改造实施SPEC.md》P1. The central guarantee under test is INV-4:
+See 任务证明闭环实施SPEC.md §2 (INV-4). The central guarantee under test is INV-4:
 an unclosable required gap must end the Task as NEEDS_REVIEW within a bounded
 number of continuations, never loop forever in AWAITING_USER.
 """
@@ -101,7 +101,7 @@ class NeedsReviewLifecycleTest(unittest.TestCase):
 
 class TerminalAuthorityTest(unittest.IsolatedAsyncioTestCase):
     async def test_model_authority_cannot_cancel_or_succeed(self):
-        from tsm_agt.core.kernel import TERMINAL_AUTHORITY
+        from tsm_agt.core.kernel_task import TERMINAL_AUTHORITY
         self.assertNotIn("model", TERMINAL_AUTHORITY[TaskState.SUCCEEDED])
         self.assertNotIn("model", TERMINAL_AUTHORITY[TaskState.CANCELLED])
 

@@ -168,12 +168,16 @@ if __name__ == "__main__":
 #: (the Hermes facade+siblings shape), redistribute these counts instead of
 #: leaving them behind: the moved bodies carry their ``TaskState.X`` references
 #: with them. What the ratchet forbids is a *new decision site*, so the rule for
-#: a pure move is that the column **sum is conserved**. ``kernel_session.py``'s
-#: two references came out of ``kernel.py``'s 34; the sum stayed at 56.
+#: a pure move is that the column **sum is conserved** -- 56 before and after
+#: every kernel decomposition slice so far. ``kernel_session.py``'s two
+#: references came out of ``kernel.py``'s 34; ``kernel_task.py``'s thirteen came
+#: out of the remainder (the ``TERMINAL_AUTHORITY`` transition-legality table,
+#: which travelled with ``transition_task``).
 _TERMINAL_STATE_COUPLING_BASELINE = {
     "cli.py": 7,
-    "core/kernel.py": 32,
+    "core/kernel.py": 19,
     "core/kernel_session.py": 2,
+    "core/kernel_task.py": 13,
     "core/task_runtime_projection.py": 7,
     "sdk/runtime.py": 8,
 }
