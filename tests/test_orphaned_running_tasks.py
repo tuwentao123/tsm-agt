@@ -288,6 +288,59 @@ class OrphanedActiveTaskInputTest(unittest.IsolatedAsyncioTestCase):
             self.assertIs(current.state, TaskState.EXECUTING)
 
 
+    async def test_task_being_started_is_not_settled_as_an_orphan(self) -> None:
+        """A Task with a submission in flight is not an orphan.
+
+        ``submit_task`` points the Session at the new Task before it publishes
+        the runner, and it holds ``_submit_lock`` across that span. To another
+        coroutine the window looks exactly like a Task whose process died
+        mid-flight, so the liveness read has to happen under the same lock --
+        otherwise the message cancels the work it came to join.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = await self.make_client(root)
+            kernel = client.application.kernel
+            session = await kernel.create_session("starting session")
+            task = await kernel.create_task(
+                "original goal", root, session_id=session.session_id,
+            )
+            self.assertIs(task.state, TaskState.CREATED)
+
+            runner = asyncio.create_task(asyncio.sleep(30))
+
+            async def cancel_runner() -> None:
+                runner.cancel()
+
+            self.addAsyncCleanup(cancel_runner)
+
+            async with client._submit_lock:
+                pending = asyncio.create_task(client.submit_user_input(
+                    session.session_id, "补充一句", input_id="starting-1",
+                ))
+                # Let routing reach the liveness read. Whether it gets there
+                # before or after the runner is published does not matter: the
+                # lock defers the decision either way.
+                for _ in range(50):
+                    await asyncio.sleep(0)
+                self.assertIn(task.task_id, {
+                    item.task_id
+                    for item in await kernel.list_session_tasks(
+                        session.session_id
+                    )
+                    if item.state is TaskState.CREATED
+                })
+                client._run_tasks[task.task_id] = runner
+
+            result = await pending
+            # The Task was being started, so the answer is the ordinary
+            # "still working" one -- not a settlement that cancels it.
+            self.assertEqual(result.result.get("kind"), "busy")
+            self.assertIs(
+                (await kernel.get_task(task.task_id)).state, TaskState.CREATED,
+            )
+
     async def test_message_to_orphaned_verifying_task_is_not_busy(self) -> None:
         """The fb9d5b shape on the input path, without waiting for a restart."""
 

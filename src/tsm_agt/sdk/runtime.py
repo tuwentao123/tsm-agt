@@ -542,8 +542,7 @@ class EngineeringAgentClient:
         # below decide. States that are legitimately durable across turns
         # (AWAITING_APPROVAL / AWAITING_USER) are not in the settlement table,
         # so this leaves them untouched.
-        if active is not None and not self._has_live_turn(active.task_id):
-            await self.application.kernel.settle_orphaned_task(active.task_id)
+        if active is not None and await self._settle_if_orphaned(active.task_id):
             active = await self._active_task(active.task_id)
 
         # (0) The foreground Task is between stable states: never start a second
@@ -638,6 +637,22 @@ class EngineeringAgentClient:
 
         runner = self._run_tasks.get(task_id)
         return runner is not None and not runner.done()
+
+    async def _settle_if_orphaned(self, task_id: str) -> bool:
+        """Settle ``task_id`` when nothing is running it, else leave it alone.
+
+        The liveness read happens under ``_submit_lock`` because that is the lock
+        ``submit_task`` registers a runner under. Without it, a Task whose
+        submission is mid-flight is indistinguishable from one whose process died
+        mid-flight -- the Session already points at it, but the runner is not
+        published yet -- and the message would cancel the very work it came to
+        join.
+        """
+
+        async with self._submit_lock:
+            if self._has_live_turn(task_id):
+                return False
+            return await self.application.kernel.settle_orphaned_task(task_id)
 
     async def _judge_relation(
         self, text: str, session_id: str, active: TaskSnapshot,
