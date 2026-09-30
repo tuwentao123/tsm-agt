@@ -177,6 +177,7 @@ from .agent_loop import (
     ToolBatchSnapshot, ToolBatchStatus,
     AgentTurnResult,
     AgentTurnSuspended,
+    TurnState,
     AgentClarificationSuspended,
     AgentContinuationSuspended,
     ProviderCapabilityMismatch,
@@ -12051,45 +12052,73 @@ class Kernel:
         AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended
         | AgentContinuationSuspended
     ):
-        task_id = checkpoint.task_id
-        turn_id = checkpoint.turn_id
-        await self.plan_task_spec(task_id)
-        live_spec = await self.get_task_spec(task_id)
-        closed_outcomes_at_entry = frozenset(
-            outcome.outcome_id for outcome in live_spec.outcomes
+        state = TurnState(
+            task_id=checkpoint.task_id, turn_id=checkpoint.turn_id,
+            visible_tools=visible_tools,
+            initial_tool_message=initial_tool_message,
+            recover_interrupted=recover_interrupted,
+            on_text_delta=on_text_delta, on_progress=on_progress,
+        )
+        await self.plan_task_spec(state.task_id)
+        state.live_spec = await self.get_task_spec(state.task_id)
+        state.closed_outcomes_at_entry = frozenset(
+            outcome.outcome_id for outcome in state.live_spec.outcomes
             if outcome.required and outcome.status.is_closed
         )
-        checkpoint = replace(
-            checkpoint, task_spec_revision=live_spec.revision,
-            task_spec_hash=live_spec.content_hash,
+        state.checkpoint = replace(
+            checkpoint, task_spec_revision=state.live_spec.revision,
+            task_spec_hash=state.live_spec.content_hash,
         )
-        checkpoint = await self._inject_agent_decides_completion_diagnostics(
-            checkpoint, visible_tools
+        state.checkpoint = await self._inject_agent_decides_completion_diagnostics(
+            state.checkpoint, visible_tools
         )
-        messages = list(checkpoint.messages)
+        state.messages = list(state.checkpoint.messages)
         if initial_tool_message is not None:
-            messages.append(initial_tool_message)
-        pending_tool_calls = list(checkpoint.pending_tool_calls)
-        seen_call_ids = set(checkpoint.seen_call_ids)
-        model_call_count = checkpoint.model_calls
-        tool_call_count = checkpoint.tool_calls
-        input_tokens = checkpoint.input_tokens
-        output_tokens = checkpoint.output_tokens
-        last_tool_error = next((
+            state.messages.append(initial_tool_message)
+        state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
+        state.seen_call_ids = set(state.checkpoint.seen_call_ids)
+        state.model_call_count = state.checkpoint.model_calls
+        state.tool_call_count = state.checkpoint.tool_calls
+        state.input_tokens = state.checkpoint.input_tokens
+        state.output_tokens = state.checkpoint.output_tokens
+        state.last_tool_error = next((
             f"{block.result.error_code or 'TOOL_ERROR'}"
-            for message in reversed(messages)
+            for message in reversed(state.messages)
             for block in reversed(message.content)
             if isinstance(block, ToolResultBlock) and not block.result.ok
         ), None)
-        plan_guard = PlanGuard()
-        no_progress_stop = False
-        budget_wrap_up = False
-        budget_wrap_up_decision: ExplorationBudgetDecision | None = None
-        protocol_recovery_attempts = 0
-        protocol_correction: str | None = None
-        visible_tool_by_name = {tool.name: tool for tool in visible_tools}
-        checkpoint = self._synchronize_tool_batch(checkpoint)
-        pending_tool_calls = list(checkpoint.pending_tool_calls)
+        state.plan_guard = PlanGuard()
+        state.visible_tool_by_name = {tool.name: tool for tool in visible_tools}
+        state.checkpoint = self._synchronize_tool_batch(state.checkpoint)
+        state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
+
+        # --- MIGRATION SCAFFOLDING -------------------------------------------
+        # The turn body below still reads these as bare locals. Each alias is
+        # deleted as its region is converted to ``state.<field>``; the remaining
+        # ones are exactly the fields not yet migrated, so this block shrinks to
+        # nothing and then goes away. Do not add a name here -- a new value
+        # belongs on ``TurnState``.
+        # ---------------------------------------------------------------------
+        checkpoint = state.checkpoint
+        task_id = state.task_id
+        turn_id = state.turn_id
+        live_spec = state.live_spec
+        closed_outcomes_at_entry = state.closed_outcomes_at_entry
+        messages = state.messages
+        pending_tool_calls = state.pending_tool_calls
+        seen_call_ids = state.seen_call_ids
+        model_call_count = state.model_call_count
+        tool_call_count = state.tool_call_count
+        input_tokens = state.input_tokens
+        output_tokens = state.output_tokens
+        last_tool_error = state.last_tool_error
+        plan_guard = state.plan_guard
+        no_progress_stop = state.no_progress_stop
+        budget_wrap_up = state.budget_wrap_up
+        budget_wrap_up_decision = state.budget_wrap_up_decision
+        protocol_recovery_attempts = state.protocol_recovery_attempts
+        protocol_correction = state.protocol_correction
+        visible_tool_by_name = state.visible_tool_by_name
 
         while True:
             # Cooperative cancellation boundary (task-cancellation-spec §7): a
