@@ -588,6 +588,25 @@ class TurnState:
     protocol_recovery_attempts: int = 0
     protocol_correction: Any = None
 
+    # Produced by the model-call preparation phase and consumed by the call and
+    # response phases. Each of these is an intra-iteration fact, not turn-level
+    # state: it is recomputed every time the loop goes round, which is why none
+    # of them is checkpointed.
+    model_call_number: int = 0
+    remaining_model_calls: int = 0
+    completion_state: Any = None
+    legacy_completion_gate: bool = False
+    disclosure_only: bool = False
+    wrap_up: bool = False
+    recovery_batch: Any = None
+    prompt: Any = None
+    request: Any = None
+    prepared: Any = None
+    live_goal: Any = None
+    model_started_at: float = 0.0
+    should_buffer_text: bool = False
+    buffered_text: Any = None
+
 
 @dataclass(frozen=True, slots=True)
 class AgentTurnResult:
