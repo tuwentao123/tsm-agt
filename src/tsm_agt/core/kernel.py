@@ -12107,10 +12107,6 @@ class Kernel:
         messages = state.messages
         pending_tool_calls = state.pending_tool_calls
         seen_call_ids = state.seen_call_ids
-        model_call_count = state.model_call_count
-        tool_call_count = state.tool_call_count
-        input_tokens = state.input_tokens
-        output_tokens = state.output_tokens
         last_tool_error = state.last_tool_error
         plan_guard = state.plan_guard
         no_progress_stop = state.no_progress_stop
@@ -12144,8 +12140,8 @@ class Kernel:
                     checkpoint, messages=tuple(messages),
                     pending_tool_calls=tuple(pending_tool_calls),
                     seen_call_ids=tuple(sorted(seen_call_ids)),
-                    model_calls=model_call_count, tool_calls=tool_call_count,
-                    input_tokens=input_tokens, output_tokens=output_tokens,
+                    model_calls=state.model_call_count, tool_calls=state.tool_call_count,
+                    input_tokens=state.input_tokens, output_tokens=state.output_tokens,
                 ),
                 "before-tool-batch" if pending_tool_calls else "before-model",
             )
@@ -12165,8 +12161,8 @@ class Kernel:
                         checkpoint, messages=tuple(messages),
                         pending_tool_calls=tuple(pending_tool_calls),
                         seen_call_ids=tuple(sorted(seen_call_ids)),
-                        model_calls=model_call_count, tool_calls=tool_call_count,
-                        input_tokens=input_tokens, output_tokens=output_tokens,
+                        model_calls=state.model_call_count, tool_calls=state.tool_call_count,
+                        input_tokens=state.input_tokens, output_tokens=state.output_tokens,
                     ), "before-tool",
                 )
                 messages = list(checkpoint.messages)
@@ -12399,8 +12395,8 @@ class Kernel:
                 budget_decision = await self._evaluate_exploration_budget_before(
                     task_id, turn_id, call, semantic_action,
                     ExplorationBudgetProbe(
-                        checkpoint.max_model_calls - model_call_count,
-                        checkpoint.max_tool_calls - tool_call_count,
+                        checkpoint.max_model_calls - state.model_call_count,
+                        checkpoint.max_tool_calls - state.tool_call_count,
                         checkpoint.max_model_calls, checkpoint.max_tool_calls,
                     ),
                     checkpoint.exploration_budget_state,
@@ -12431,9 +12427,9 @@ class Kernel:
                         ),))
                         self._notify_agent_progress(on_progress, AgentProgress(
                             AgentProgressKind.FOCUS,
-                            model_call=model_call_count,
+                            model_call=state.model_call_count,
                             max_model_calls=checkpoint.max_model_calls,
-                            tool_call=tool_call_count,
+                            tool_call=state.tool_call_count,
                             max_tool_calls=checkpoint.max_tool_calls,
                             goal=task_before_action.goal,
                             reason=budget_decision.reason,
@@ -12505,10 +12501,10 @@ class Kernel:
                             budget_reason=budget_decision.reason,
                             low_value_streak=budget_decision.low_value_streak,
                             remaining_model_calls=(
-                                checkpoint.max_model_calls - model_call_count
+                                checkpoint.max_model_calls - state.model_call_count
                             ),
                             remaining_tool_calls=(
-                                checkpoint.max_tool_calls - tool_call_count
+                                checkpoint.max_tool_calls - state.tool_call_count
                             ),
                         ), checkpoint.stop_or_pivot_state,
                     )
@@ -12774,10 +12770,10 @@ class Kernel:
                         plan_finished=decision.goal_slice.plan_finished,
                         consecutive_no_progress=decision.consecutive_no_progress,
                         remaining_model_calls=(
-                            checkpoint.max_model_calls - model_call_count
+                            checkpoint.max_model_calls - state.model_call_count
                         ),
                         remaining_tool_calls=(
-                            checkpoint.max_tool_calls - tool_call_count
+                            checkpoint.max_tool_calls - state.tool_call_count
                         ),
                     ), checkpoint.stop_or_pivot_state,
                 )
@@ -12854,7 +12850,7 @@ class Kernel:
                         checkpoint, "plan-no-progress-stopped"
                     )
                     break
-                next_tool_count = tool_call_count + 1
+                next_tool_count = state.tool_call_count + 1
                 await self._append_events(
                     task_id,
                     ((
@@ -12879,10 +12875,10 @@ class Kernel:
                         ) if checkpoint.tool_batch is not None else None
                     ),
                     seen_call_ids=tuple(sorted(seen_call_ids)),
-                    model_calls=model_call_count,
-                    tool_calls=tool_call_count,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
+                    model_calls=state.model_call_count,
+                    tool_calls=state.tool_call_count,
+                    input_tokens=state.input_tokens,
+                    output_tokens=state.output_tokens,
                     max_model_calls=checkpoint.max_model_calls,
                     max_tool_calls=checkpoint.max_tool_calls,
                     max_output_tokens=checkpoint.max_output_tokens,
@@ -12928,7 +12924,7 @@ class Kernel:
                 )
                 self._notify_agent_progress(on_progress, AgentProgress(
                     AgentProgressKind.TOOL_STARTED,
-                    model_call=model_call_count,
+                    model_call=state.model_call_count,
                     max_model_calls=checkpoint.max_model_calls,
                     tool_call=next_tool_count,
                     max_tool_calls=checkpoint.max_tool_calls,
@@ -13088,7 +13084,7 @@ class Kernel:
                 )
                 self._notify_agent_progress(on_progress, AgentProgress(
                     AgentProgressKind.TOOL_COMPLETED,
-                    model_call=model_call_count,
+                    model_call=state.model_call_count,
                     max_model_calls=checkpoint.max_model_calls,
                     tool_call=next_tool_count,
                     max_tool_calls=checkpoint.max_tool_calls,
@@ -13137,7 +13133,7 @@ class Kernel:
                         and classified[0] is EffectStatus.FAILED
                     ):
                         last_tool_error = f"{call.name}: {classified[1]}"
-                tool_call_count = next_tool_count
+                state.tool_call_count = next_tool_count
                 messages.append(
                     Message(
                         message_id=f"msg-tool-{uuid4().hex}",
@@ -13154,7 +13150,7 @@ class Kernel:
                             tuple(pending_tool_calls)
                         ) if suspension.tool_batch is not None else None
                     ),
-                    tool_calls=tool_call_count,
+                    tool_calls=state.tool_call_count,
                     workspace_fingerprint=workspace_fingerprint(
                         Path((await self.get_task(task_id)).workspace),
                         self._dependencies.workspace_path,
@@ -13227,11 +13223,11 @@ class Kernel:
                 checkpoint.messages
             ))
             checkpoint = replace(checkpoint, messages=tuple(messages))
-            model_call_number = model_call_count + 1
+            model_call_number = state.model_call_count + 1
             if model_call_number > checkpoint.max_model_calls:
                 error = AgentLoopLimitExceeded(
                     turn_id, "max_model_calls", checkpoint.max_model_calls,
-                    model_calls=model_call_count, tool_calls=tool_call_count,
+                    model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                     last_tool_error=last_tool_error,
                     max_model_calls=checkpoint.max_model_calls,
                     max_tool_calls=checkpoint.max_tool_calls,
@@ -13246,8 +13242,8 @@ class Kernel:
                 self._dependencies.finalization_model_calls,
                 max(1, checkpoint.max_model_calls - 1),
             )
-            remaining_model_calls = checkpoint.max_model_calls - model_call_count
-            remaining_tool_calls = checkpoint.max_tool_calls - tool_call_count
+            remaining_model_calls = checkpoint.max_model_calls - state.model_call_count
+            remaining_tool_calls = checkpoint.max_tool_calls - state.tool_call_count
             completion_state = CompletionReadinessState.from_data(
                 checkpoint.completion_readiness_state
             )
@@ -13337,7 +13333,7 @@ class Kernel:
                 self._notify_agent_progress(on_progress, AgentProgress(
                     AgentProgressKind.WRAP_UP, model_call=model_call_number,
                     max_model_calls=checkpoint.max_model_calls,
-                    tool_call=tool_call_count,
+                    tool_call=state.tool_call_count,
                     max_tool_calls=checkpoint.max_tool_calls,
                     goal=(await self.get_task(task_id)).goal,
                     reason=(
@@ -13399,7 +13395,7 @@ class Kernel:
                 self._notify_agent_progress(on_progress, AgentProgress(
                     AgentProgressKind.WRAP_UP, model_call=model_call_number,
                     max_model_calls=checkpoint.max_model_calls,
-                    tool_call=tool_call_count,
+                    tool_call=state.tool_call_count,
                     max_tool_calls=checkpoint.max_tool_calls,
                     goal=(await self.get_task(task_id)).goal,
                     reason="execution_budget_nearly_exhausted",
@@ -13506,8 +13502,8 @@ class Kernel:
                     checkpoint, messages=tuple(messages),
                     pending_tool_calls=tuple(pending_tool_calls),
                     seen_call_ids=tuple(sorted(seen_call_ids)),
-                    model_calls=model_call_count, tool_calls=tool_call_count,
-                    input_tokens=input_tokens, output_tokens=output_tokens,
+                    model_calls=state.model_call_count, tool_calls=state.tool_call_count,
+                    input_tokens=state.input_tokens, output_tokens=state.output_tokens,
                 )
                 await self._save_agent_checkpoint(
                     compacted_checkpoint, "context-compacted"
@@ -13543,7 +13539,7 @@ class Kernel:
                     else AgentProgressKind.MODEL_TRANSPORT,
                     model_call=model_call_number,
                     max_model_calls=checkpoint.max_model_calls,
-                    tool_call=tool_call_count,
+                    tool_call=state.tool_call_count,
                     max_tool_calls=checkpoint.max_tool_calls,
                     goal=live_goal,
                     reason=reason,
@@ -13579,7 +13575,7 @@ class Kernel:
             self._notify_agent_progress(on_progress, AgentProgress(
                 AgentProgressKind.MODEL_STARTED, model_call=model_call_number,
                 max_model_calls=checkpoint.max_model_calls,
-                tool_call=tool_call_count,
+                tool_call=state.tool_call_count,
                 max_tool_calls=checkpoint.max_tool_calls,
                 goal=live_goal,
             ))
@@ -13599,7 +13595,7 @@ class Kernel:
                     AgentProgressKind.MODEL_COMPLETED,
                     model_call=model_call_number,
                     max_model_calls=checkpoint.max_model_calls,
-                    tool_call=tool_call_count,
+                    tool_call=state.tool_call_count,
                     max_tool_calls=checkpoint.max_tool_calls,
                     elapsed_seconds=time.monotonic() - model_started_at,
                     goal=live_goal,
@@ -13642,7 +13638,7 @@ class Kernel:
                 # response may legitimately reuse the Provider-generated IDs.
                 seen_call_ids.update(call.call_id for call in tool_calls)
             except RecoverableToolProtocolError as error:
-                model_call_count = model_call_number
+                state.model_call_count = model_call_number
                 protocol_recovery_attempts += 1
                 failure = ModelAttemptFailure(
                     ModelFailureCategory.CORRECTABLE_PROTOCOL,
@@ -13690,7 +13686,7 @@ class Kernel:
                 if (
                     recovery_action
                     is ModelRecoveryAction.RESAMPLE_WITH_CORRECTION
-                    and model_call_count < checkpoint.max_model_calls
+                    and state.model_call_count < checkpoint.max_model_calls
                 ):
                     protocol_correction = (
                         (
@@ -13730,8 +13726,8 @@ class Kernel:
                         checkpoint, messages=tuple(messages),
                         pending_tool_calls=(),
                         seen_call_ids=tuple(sorted(seen_call_ids)),
-                        model_calls=model_call_count, tool_calls=tool_call_count,
-                        input_tokens=input_tokens, output_tokens=output_tokens,
+                        model_calls=state.model_call_count, tool_calls=state.tool_call_count,
+                        input_tokens=state.input_tokens, output_tokens=state.output_tokens,
                     )
                     await self._save_agent_checkpoint(
                         checkpoint, "tool-protocol-retry-requested"
@@ -13739,11 +13735,11 @@ class Kernel:
                     continue
                 if (
                     error.reason_code == "tool_call_emitted_while_disabled"
-                    and model_call_count >= checkpoint.max_model_calls
+                    and state.model_call_count >= checkpoint.max_model_calls
                 ):
                     limit_error = AgentLoopLimitExceeded(
                         turn_id, "max_model_calls", checkpoint.max_model_calls,
-                        model_calls=model_call_count, tool_calls=tool_call_count,
+                        model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                         last_tool_error=last_tool_error,
                         max_model_calls=checkpoint.max_model_calls,
                         max_tool_calls=checkpoint.max_tool_calls,
@@ -13756,8 +13752,8 @@ class Kernel:
                     checkpoint, messages=tuple(messages),
                     pending_tool_calls=(),
                     seen_call_ids=tuple(sorted(seen_call_ids)),
-                    model_calls=model_call_count, tool_calls=tool_call_count,
-                    input_tokens=input_tokens, output_tokens=output_tokens,
+                    model_calls=state.model_call_count, tool_calls=state.tool_call_count,
+                    input_tokens=state.input_tokens, output_tokens=state.output_tokens,
                 )
                 await self._save_agent_checkpoint(
                     checkpoint, "tool-protocol-recovery-exhausted"
@@ -13819,9 +13815,9 @@ class Kernel:
                     recovery_action=recovery_action,
                 ) from error
 
-            input_tokens += response.usage.input_tokens
-            output_tokens += response.usage.output_tokens
-            model_call_count = model_call_number
+            state.input_tokens += response.usage.input_tokens
+            state.output_tokens += response.usage.output_tokens
+            state.model_call_count = model_call_number
             protocol_correction = None
             messages.append(response.message)
             response_checkpoint = replace(
@@ -13829,8 +13825,8 @@ class Kernel:
                 pending_tool_calls=tuple(tool_calls),
                 tool_batch=accepted_batch,
                 seen_call_ids=tuple(sorted(seen_call_ids)),
-                model_calls=model_call_count, tool_calls=tool_call_count,
-                input_tokens=input_tokens, output_tokens=output_tokens,
+                model_calls=state.model_call_count, tool_calls=state.tool_call_count,
+                input_tokens=state.input_tokens, output_tokens=state.output_tokens,
             )
             # A follow-up may arrive while the provider is producing what looked
             # like the final answer.  Persist that response as an intermediate
@@ -13948,7 +13944,7 @@ class Kernel:
                 )
                 renewal = renewal_policy.evaluate(
                     current_limit=response_checkpoint.max_model_calls,
-                    consumed=model_call_count,
+                    consumed=state.model_call_count,
                     renewal_count=(
                         response_checkpoint.model_budget_renewal_count
                     ),
@@ -14171,26 +14167,26 @@ class Kernel:
                     task_id=task_id,
                     assistant_message=response.message,
                     finish_reason=response.finish_reason,
-                    usage=ModelUsage(input_tokens, output_tokens),
-                    model_calls=model_call_count,
-                    tool_calls=tool_call_count,
+                    usage=ModelUsage(state.input_tokens, state.output_tokens),
+                    model_calls=state.model_call_count,
+                    tool_calls=state.tool_call_count,
                     messages=tuple(messages),
                 )
 
-            if tool_call_count + len(tool_calls) > checkpoint.max_tool_calls:
+            if state.tool_call_count + len(tool_calls) > checkpoint.max_tool_calls:
                 error = AgentLoopLimitExceeded(
                     turn_id, "max_tool_calls", checkpoint.max_tool_calls,
-                    model_calls=model_call_count, tool_calls=tool_call_count,
+                    model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                     last_tool_error=last_tool_error,
                     max_model_calls=checkpoint.max_model_calls,
                     max_tool_calls=checkpoint.max_tool_calls,
                 )
                 await self._record_agent_loop_failure(task_id, turn_id, error)
                 raise error
-            if model_call_count == checkpoint.max_model_calls:
+            if state.model_call_count == checkpoint.max_model_calls:
                 error = AgentLoopLimitExceeded(
                     turn_id, "max_model_calls", checkpoint.max_model_calls,
-                    model_calls=model_call_count, tool_calls=tool_call_count,
+                    model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                     last_tool_error=last_tool_error,
                     max_model_calls=checkpoint.max_model_calls,
                     max_tool_calls=checkpoint.max_tool_calls,
