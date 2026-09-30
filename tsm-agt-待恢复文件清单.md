@@ -387,6 +387,58 @@ settle_orphaned_task(legacy task)    -> True （单独调用成功）
 如果你在**别的机器 / 移动硬盘 / 云端**还有一份备份，值得最后确认一次；但**继续工作
 不再需要等它**——因为 8.2 更正后可以看到，主导失败模式在当前代码里已经是对的。
 
+### 8.5 台账时间线证明：那个 bug 在真实使用中**已经消失**
+
+把 687 个 Task 按创建日切开，统计所有含 `verifier blocked` 的判定落在哪个终态，
+比任何测试都直接：
+
+| 日期 | verifier-blocked 判定的终态 |
+|---|---|
+| 09-09 ~ 09-25 | **全部 FAILED**（4/2/3/2/4/1/9/21/21/8/7/3/9/6/15） |
+| 09-27 | **NEEDS_REVIEW × 7** |
+| 09-28 | **NEEDS_REVIEW × 1** |
+
+```
+合计 123 个 verifier-blocked 判定：FAILED 115 / NEEDS_REVIEW 8
+最后一次被误报为 FAILED 的日期：2026-09-25
+```
+
+关键提交的时间点：`a2a9c1e` = 09-27 18:03（内联映射）、`fa44560` = 09-29 15:01
+（集中进内核）。**时间线完全吻合：09-25 之后再没有任何一次被误报为失败。**
+从 09-29 起收尾措辞也换成了集中化后的 `acceptance verdict blocked`。
+
+**09-30（你提出抱怨那天）的 7 个 Task，`FAILED = 0`：**
+
+```
+SUCCEEDED    '我要你分析的是tsm-agent这个项目啊…'   reason='acceptance verdict passed'
+SUCCEEDED    '查下今天的nba新闻'                   reason='human review: accept'
+NEEDS_REVIEW '1. tsm-agent 的整体架构图 …'         reason='acceptance verdict blocked'
+CANCELLED    '看下 task-6c09e062… 这个会…'         reason='cancelled: wedged task blocking the sess…'
+CANCELLED    '查下今天的nba新闻'                   reason='cancelled: wedged task blocking the sess…'
+INTERRUPTED  '看下 task-6c09e062…'                 reason='active Agent checkpoint preserved for re…'
+INTERRUPTED  '那你可以查链路数据啊…'               reason='active Agent checkpoint preserved for re…'
+```
+
+顺带证明另外两条链路在真实使用中也是通的：
+
+- **人工出口闭环**：`NEEDS_REVIEW --human review: accept--> SUCCEEDED`
+  （09-29、09-30 各一例）。
+- **兜底清理**：`cancelled: wedged EXECUTING with no live…`、
+  `cancelled: orphaned VERIFYING after a mi…`、`cancelled: wedged task blocking the sess…`
+  —— 三句都出现在真实事件里，正是 8.3 那条 settle 路径在干活。
+
+**但要如实说明两件事**：
+
+1. **`NEEDS_REVIEW` 会经常出现，这是设计而非故障。** 它是「我证明不了，交给人」
+   （`TERMINAL_STATE_BY_VERDICT[BLOCKED] = NEEDS_REVIEW`，注释
+   `"Cannot decide" is not "the work failed"`），也就是 INV-4 的有界逃生口。
+   你 09-30 最后一个任务就是如此。要让任务自己闭环，需要 planner 产出**机器可验证
+   的判据**（`workspace_integrity` / `post_mutation_command`）；靠散文 + `rubric`
+   的会去叫判官模型，更容易停在这一步。
+2. **不是所有历史失败都能归到这个 bug 上**：`SDK background execution failed`（15）、
+   `model invocation failed`（11）、`SDK verifier failed`（11）、`max_model_calls`（4）
+   另有原因，我**没有**从真实数据里确认它们在当前代码下也消失了。
+
 ---
 
 ## 9. 一句话结论
@@ -394,7 +446,7 @@ settle_orphaned_task(legacy task)    -> True （单独调用成功）
 | 维度 | 状态 |
 |---|---|
 | 代码 | 全量 `1430 passed / 13 skipped / 0 failed`；干净导出可跑；**真实 HTTP 上的完整工程闭环实测通过**（planner → 审批 → 真写文件 → 验证 → SUCCEEDED） |
-| 真实台账的主导失败模式（71%） | **当前代码已经是对的**（§8.2 更正） |
+| 真实台账的主导失败模式（71%） | **已在真实使用中消失**：最后一次误报是 2026-09-25，09-27 起 8 次全部正确落到 NEEDS_REVIEW；09-30 当天 `FAILED = 0`（§8.5） |
 | 3 个 phantom EXECUTING | 身份功能上线前的 legacy 数据，不影响当前使用；结算需你点头（§8.3） |
 | 本机可恢复源 | **无**（§8.4） |
 | 仍缺的测试用例 | 28 个（§4），只有别的备份里才有（我本轮自己新增 2 条，故现在收集数是 1443） |
