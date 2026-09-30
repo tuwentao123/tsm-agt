@@ -10,7 +10,26 @@ import unittest
 from pathlib import Path
 
 
+def _pty_available() -> bool:
+    """Whether this environment can allocate a pseudo-terminal at all.
+
+    The keyboard contract below is real, but it can only be exercised where
+    ``/dev/ptmx`` is usable. Where it is denied, every case in this class fails
+    for an environment reason while asserting nothing about the CLI, so the class
+    is skipped instead of being reported as a product failure.
+    """
+
+    try:
+        master, slave = pty.openpty()
+    except OSError:
+        return False
+    os.close(master)
+    os.close(slave)
+    return True
+
+
 @unittest.skipIf(os.name == "nt", "POSIX pseudo-terminal keyboard contract")
+@unittest.skipUnless(_pty_available(), "requires a usable pseudo-terminal")
 class CliLineEditingPtyTest(unittest.TestCase):
     project_root = Path(__file__).resolve().parents[1]
 
