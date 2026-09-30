@@ -1,0 +1,365 @@
+"""A running Task state is a ledger claim; the turn is process-local.
+
+Two shapes of the mismatch are locked here, both from
+``task-c2d21bce8ea74f0bbcac07aba4aefedf``: the process that owned the turn died
+(or its model call never returned), the Task stayed ``EXECUTING``, and every
+later Session message was steered into a queue nothing drained -- no error, no
+progress, no output.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import tempfile
+import unittest
+from pathlib import Path
+
+from tsm_agt.adapters.fixture import EchoModelProvider
+from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
+from tsm_agt.bootstrap import (
+    compose_fixture_application, compose_local_flow_query_application,
+)
+from tsm_agt.core import TaskState
+from tsm_agt.ports import AdapterDescriptor, HealthState, HealthStatus
+from tsm_agt.sdk import EngineeringAgentClient
+
+
+EXECUTION_PATH = (
+    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING, TaskState.EXECUTING,
+)
+
+
+async def advance(application, task_id: str, *states: TaskState):
+    task = await application.kernel.get_task(task_id)
+    for state in states:
+        task = await application.kernel.transition_task(
+            task_id, state, state.value,
+        )
+    return task
+
+
+class FixtureResolver:
+    descriptor = AdapterDescriptor(
+        "fixture.orphan-routing", "1.0", "SessionInputResolverPort", "1.0"
+    )
+
+    async def start(self, _context):
+        pass
+
+    async def stop(self, _deadline):
+        pass
+
+    async def health(self):
+        return HealthStatus(HealthState.HEALTHY)
+
+    async def resolve_session_input(self, _text, _context):
+        return {
+            "disposition": "CREATE_TASK", "relation": "INDEPENDENT",
+            "source_task_id": None, "input_grounding": "SELF_CONTAINED",
+            "confidence": 0.96, "reason_code": "fixture",
+            "clarification": None, "candidate_task_ids": [],
+        }
+
+
+class OrphanedRunningReconcileTest(unittest.IsolatedAsyncioTestCase):
+    async def test_running_task_is_settled_and_stays_resumable(self) -> None:
+        application = compose_fixture_application()
+        await application.registry.start_all()
+        self.addAsyncCleanup(application.registry.stop_all)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = await application.kernel.create_task("goal", root)
+            await advance(application, task.task_id, *EXECUTION_PATH)
+
+            settled = await application.kernel.reconcile_orphaned_running_tasks()
+            self.assertEqual(settled, (task.task_id,))
+
+            current = await application.kernel.get_task(task.task_id)
+            self.assertIs(current.state, TaskState.INTERRUPTED)
+            events = await application.kernel.dependencies.store.read_events(
+                task.task_id
+            )
+            interrupted = [
+                event for event in events
+                if event.event_type == "turn.interrupted"
+            ]
+            self.assertEqual(len(interrupted), 1)
+            self.assertIn(
+                "orphaned task settled on startup",
+                interrupted[0].payload["reason"],
+            )
+            # Idempotent: a settled Task is no longer in a running state.
+            self.assertEqual(
+                await application.kernel.reconcile_orphaned_running_tasks(), (),
+            )
+
+    async def test_waiting_task_is_left_alone(self) -> None:
+        application = compose_fixture_application()
+        await application.registry.start_all()
+        self.addAsyncCleanup(application.registry.stop_all)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = await application.kernel.create_task("goal", root)
+            await advance(
+                application, task.task_id,
+                *EXECUTION_PATH, TaskState.AWAITING_USER,
+            )
+
+            self.assertEqual(
+                await application.kernel.reconcile_orphaned_running_tasks(), (),
+            )
+            current = await application.kernel.get_task(task.task_id)
+            self.assertIs(current.state, TaskState.AWAITING_USER)
+
+    async def test_verifying_task_is_settled_not_left_blocking(self) -> None:
+        """The fb9d5b incident: a restart killed the verifier mid-judge."""
+
+        application = compose_fixture_application()
+        await application.registry.start_all()
+        self.addAsyncCleanup(application.registry.stop_all)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = await application.kernel.create_task("goal", root)
+            await advance(
+                application, task.task_id,
+                *EXECUTION_PATH, TaskState.VERIFYING,
+            )
+
+            settled = await application.kernel.reconcile_orphaned_running_tasks()
+            self.assertEqual(settled, (task.task_id,))
+            current = await application.kernel.get_task(task.task_id)
+            # Verification is re-derived on the next run, so the recoverable
+            # interruption is the honest outcome -- not a stuck VERIFYING that
+            # answers every later message with "busy".
+            self.assertIs(current.state, TaskState.INTERRUPTED)
+
+    async def test_finalizing_task_with_passed_verification_succeeds(self) -> None:
+        application = compose_fixture_application()
+        await application.registry.start_all()
+        self.addAsyncCleanup(application.registry.stop_all)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = await application.kernel.create_task("goal", root)
+            await advance(
+                application, task.task_id,
+                *EXECUTION_PATH, TaskState.VERIFYING,
+            )
+            # FINALIZING is only reachable behind a trusted passed verification.
+            await application.kernel._append_events(task.task_id, ((
+                "verify.completed", {"status": "passed"},
+            ),))
+            await advance(application, task.task_id, TaskState.FINALIZING)
+
+            settled = await application.kernel.reconcile_orphaned_running_tasks()
+            self.assertEqual(settled, (task.task_id,))
+            current = await application.kernel.get_task(task.task_id)
+            self.assertIs(current.state, TaskState.SUCCEEDED)
+
+    async def test_never_started_task_is_cancelled(self) -> None:
+        application = compose_fixture_application()
+        await application.registry.start_all()
+        self.addAsyncCleanup(application.registry.stop_all)
+
+        with tempfile.TemporaryDirectory() as directory:
+            task = await application.kernel.create_task(
+                "goal", Path(directory),
+            )
+            self.assertIs(task.state, TaskState.CREATED)
+
+            settled = await application.kernel.reconcile_orphaned_running_tasks()
+            self.assertEqual(settled, (task.task_id,))
+            current = await application.kernel.get_task(task.task_id)
+            self.assertIs(current.state, TaskState.CANCELLED)
+
+    def test_read_only_query_application_never_reconciles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            application = compose_local_flow_query_application(Path(directory))
+            self.assertFalse(application.reconcile_on_start)
+
+
+class OrphanedActiveTaskInputTest(unittest.IsolatedAsyncioTestCase):
+    async def make_client(self, root: Path) -> EngineeringAgentClient:
+        app = compose_fixture_application(
+            store_adapter=SQLiteRuntimeStore(root / ".agent" / "runtime.db"),
+            model_adapter=EchoModelProvider(), tool_adapters=(),
+            session_input_resolver_adapter=FixtureResolver(),
+        )
+        client = EngineeringAgentClient(root, application_factory=lambda: app)
+        await client.start()
+        self.addAsyncCleanup(client.close)
+        return client
+
+    async def make_active_task(
+        self, client: EngineeringAgentClient, root: Path,
+    ):
+        kernel = client.application.kernel
+        session = await kernel.create_session("orphan session")
+        task = await kernel.create_task(
+            "original goal", root, session_id=session.session_id,
+        )
+        await advance(client.application, task.task_id, *EXECUTION_PATH)
+        session = await kernel.get_session(session.session_id)
+        self.assertEqual(session.active_task_id, task.task_id)
+        return session, task
+
+    async def test_orphaned_running_task_is_settled_before_routing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = await self.make_client(root)
+            session, task = await self.make_active_task(client, root)
+
+            result = await client.submit_user_input(
+                session.session_id, "看下今天的nba新闻",
+                input_id="orphan-input-1",
+            )
+
+            settled = await client.application.kernel.get_task(task.task_id)
+            self.assertIs(settled.state, TaskState.INTERRUPTED)
+            # The message must not be reported as absorbed by a Task nothing is
+            # executing: settling it lets the ordinary routing decide instead.
+            self.assertNotEqual(result.result.get("kind"), "steered")
+            receipt = await client.get_task_result(task.task_id)
+            self.assertEqual(receipt.pending_steering, ())
+
+    async def test_queued_steering_is_visible_as_a_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = await self.make_client(root)
+            session, task = await self.make_active_task(client, root)
+
+            runner = asyncio.create_task(asyncio.sleep(30))
+
+            async def cancel_runner() -> None:
+                runner.cancel()
+
+            self.addAsyncCleanup(cancel_runner)
+            client._run_tasks[task.task_id] = runner
+
+            await client.submit_user_input(
+                session.session_id, "排队中的指令", input_id="receipt-1",
+            )
+
+            receipt = await client.get_task_result(task.task_id)
+            self.assertEqual(
+                [item["text"] for item in receipt.pending_steering],
+                ["排队中的指令"],
+            )
+            self.assertEqual(
+                [item["text"] for item in receipt.to_data()["pending_steering"]],
+                ["排队中的指令"],
+            )
+
+            # A queued message expires with the Task it was queued into: once it
+            # can no longer run, no safe point will drain the queue.
+            await client.cancel(
+                task.task_id, command_id="cancel-receipt",
+                reason="receipt expiry test",
+            )
+            expired = await client.get_task_result(task.task_id)
+            self.assertEqual(expired.pending_steering, ())
+
+    async def test_running_task_with_a_live_turn_is_still_steered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = await self.make_client(root)
+            session, task = await self.make_active_task(client, root)
+
+            # The liveness registry is the in-process runner map, so a stand-in
+            # that is simply not done() is exactly a live turn for this guard.
+            runner = asyncio.create_task(asyncio.sleep(30))
+
+            async def cancel_runner() -> None:
+                runner.cancel()
+
+            self.addAsyncCleanup(cancel_runner)
+            client._run_tasks[task.task_id] = runner
+
+            result = await client.submit_user_input(
+                session.session_id, "补充一句", input_id="live-input-1",
+            )
+
+            self.assertEqual(result.result.get("kind"), "steered")
+            current = await client.application.kernel.get_task(task.task_id)
+            self.assertIs(current.state, TaskState.EXECUTING)
+
+
+    async def test_message_to_orphaned_verifying_task_is_not_busy(self) -> None:
+        """The fb9d5b shape on the input path, without waiting for a restart."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = await self.make_client(root)
+            session, task = await self.make_active_task(client, root)
+            await advance(client.application, task.task_id, TaskState.VERIFYING)
+
+            result = await client.submit_user_input(
+                session.session_id, "还是不对", input_id="verifying-input-1",
+            )
+
+            self.assertNotEqual(result.result.get("kind"), "busy")
+            settled = await client.application.kernel.get_task(task.task_id)
+            self.assertIs(settled.state, TaskState.INTERRUPTED)
+
+    async def test_live_transitional_task_still_answers_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = await self.make_client(root)
+            session, task = await self.make_active_task(client, root)
+            await advance(client.application, task.task_id, TaskState.VERIFYING)
+
+            runner = asyncio.create_task(asyncio.sleep(30))
+
+            async def cancel_runner() -> None:
+                runner.cancel()
+
+            self.addAsyncCleanup(cancel_runner)
+            client._run_tasks[task.task_id] = runner
+
+            result = await client.submit_user_input(
+                session.session_id, "补充", input_id="verifying-live-1",
+            )
+
+            self.assertEqual(result.result.get("kind"), "busy")
+            current = await client.application.kernel.get_task(task.task_id)
+            self.assertIs(current.state, TaskState.VERIFYING)
+
+    async def test_restart_settles_the_task_and_accepts_new_input(self) -> None:
+        """The incident's exact shape: restart, then a message that must land."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = await self.make_client(root)
+            session, task = await self.make_active_task(first, root)
+            await first.close()
+
+            # A new process over the same ledger. Starting it reconciles the
+            # Task the previous process left claiming to be running.
+            second = await self.make_client(root)
+            settled = await second.application.kernel.get_task(task.task_id)
+            self.assertIs(settled.state, TaskState.INTERRUPTED)
+
+            result = await second.submit_user_input(
+                session.session_id, "看下今天的nba新闻",
+                input_id="restart-input-1",
+            )
+            self.assertNotEqual(result.result.get("kind"), "steered")
+            tasks = await second.application.kernel.list_session_tasks(
+                session.session_id
+            )
+            self.assertTrue(
+                any(
+                    item.task_id != task.task_id
+                    and item.state is not TaskState.INTERRUPTED
+                    for item in tasks
+                ),
+                "a new Task must be created for the message",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
