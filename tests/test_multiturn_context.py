@@ -18,9 +18,18 @@ Why that is structural rather than incidental:
   (``core/session_context.py:212-227``). A fresh Task's lineage is itself, so the
   previous Task's rows are ineligible.
 
-A third restriction compounds this: ``SessionConversationMessage`` refuses any
-role other than user/assistant (``core/session_context.py:154-155``), so tool
-calls and tool results cannot survive a turn boundary at all.
+A second restriction compounds this: the conversation model admitted user and
+assistant roles only, so tool calls and tool results could not survive a turn
+boundary at all. That one is now fixed -- ``SessionConversationMessage`` accepts
+``tool`` rows with their ``tool_call_id`` / ``tool_name`` pairing, and
+``ConversationMessageContractTest`` pins the new contract.
+
+Fixing the message model alone does **not** make the XFAIL tests below pass, and
+that is expected: the projector only ever reads the ``user_message`` and
+``assistant_message`` keys of a ``session.task_result_recorded`` payload
+(``core/session_context.py:614-615``), so there is no tool data in the event
+stream to project in the first place. Making these pass needs the transcript
+itself, not a wider role set.
 
 Each test below is marked ``expectedFailure`` on purpose. It asserts the
 **desired** behaviour, so it fails today; the moment the transcript work lands it
@@ -38,7 +47,8 @@ from pathlib import Path
 from tsm_agt.adapters.fixture import EchoModelProvider
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.ports import (
-    AdapterDescriptor, HealthState, HealthStatus, ModelRequest, ModelResponse,
+    AdapterDescriptor, HealthState, HealthStatus, MessageRole, ModelRequest,
+    ModelResponse,
 )
 from tsm_agt.sdk import EngineeringAgentClient
 
@@ -153,18 +163,79 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("instruction number 1", seen)
             self.assertIn("instruction number 2", seen)
 
-    def test_conversation_messages_reject_tool_roles(self):
-        """Tool rows cannot cross a turn boundary today: the conversation model
-        admits user and assistant only (``core/session_context.py:154-155``)."""
+class ConversationMessageContractTest(unittest.TestCase):
+    """Tool rows must be representable, and only when they are pairable.
 
+    Before this contract, ``SessionConversationMessage`` admitted user and
+    assistant only, so a tool call and its result could not cross a turn
+    boundary at all. Opening the role without the pairing rule would be worse
+    than closing it: an unpaired tool row breaks strict role alternation on the
+    wire, which is the failure mode the durable message row's
+    ``tool_call_id`` / ``tool_name`` columns exist to prevent.
+    """
+
+    def _message(self, **overrides):
         from tsm_agt.core.session_context import SessionConversationMessage
-        from tsm_agt.ports import MessageRole
+
+        fields = {
+            "message_id": "row-1", "role": MessageRole.USER, "text": "hello",
+            "task_id": "task-1", "turn_id": "turn-1", "source_event_sequence": 1,
+        }
+        fields.update(overrides)
+        return SessionConversationMessage(**fields)
+
+    def test_tool_rows_are_representable_and_pair_to_their_call(self) -> None:
+        message = self._message(
+            role=MessageRole.TOOL, text="{}",
+            tool_call_id="call-1", tool_name="core.read_file",
+        )
+
+        data = message.source_data()
+        self.assertEqual(data["role"], "tool")
+        self.assertEqual(data["tool_call_id"], "call-1")
+        self.assertEqual(data["tool_name"], "core.read_file")
+
+    def test_tool_row_may_carry_empty_text(self) -> None:
+        """A command that printed nothing is a legitimate result."""
+
+        self.assertEqual(
+            self._message(
+                role=MessageRole.TOOL, text="", tool_call_id="call-1",
+            ).text,
+            "",
+        )
+
+    def test_tool_row_without_a_call_id_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self._message(role=MessageRole.TOOL, text="{}")
+
+    def test_non_tool_row_carrying_pairing_fields_is_rejected(self) -> None:
+        for role in (MessageRole.USER, MessageRole.ASSISTANT):
+            with self.subTest(role=role):
+                with self.assertRaises(ValueError):
+                    self._message(role=role, tool_call_id="call-1")
+
+    def test_system_role_stays_out_of_the_conversation(self) -> None:
+        """The system prompt is built once and replayed verbatim, never
+        reconstructed from history (Hermes ``agent/AGENTS.md:56-62``)."""
 
         with self.assertRaises(ValueError):
-            SessionConversationMessage(
-                message_id="tool-row", role=MessageRole.TOOL, text="{}",
-                task_id="task-1", turn_id="turn-1", source_event_sequence=1,
-            )
+            self._message(role=MessageRole.SYSTEM, text="you are")
+
+    def test_absent_pairing_fields_are_omitted_from_the_hash_source(self) -> None:
+        """``source_data`` feeds ``SessionConversationProjection.hash_source``;
+        emitting null pairing fields would change every existing content hash."""
+
+        self.assertEqual(
+            set(self._message().source_data()),
+            {"message_id", "role", "text", "task_id", "turn_id",
+             "source_event_sequence"},
+        )
+
+    def test_existing_positional_construction_still_works(self) -> None:
+        message = self._message()
+        self.assertIsNone(message.tool_call_id)
+        self.assertIsNone(message.tool_name)
 
 
 if __name__ == "__main__":

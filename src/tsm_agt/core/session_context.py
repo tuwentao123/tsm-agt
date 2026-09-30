@@ -141,6 +141,22 @@ def _prompt_conclusion_summary(
     }
 
 
+#: Roles a Session conversation row may carry.
+#:
+#: ``SYSTEM`` is excluded deliberately, and this is not the same restriction that
+#: used to live here: the system prompt is built once per Session and replayed
+#: verbatim, so it must never be reconstructed from conversation history
+#: (Hermes invariant, ``agent/AGENTS.md:56-62``). Tool rows, by contrast, must
+#: survive a turn boundary or multi-turn context cannot be replayed at all --
+#: the ``messages`` table in ``hermes_state_common.py:443-474`` carries
+#: ``role='tool'`` alongside real user/assistant rows for exactly that reason.
+#:
+#: ``AWAITING``-style marker roles are not conversation content and stay out.
+_SESSION_CONVERSATION_ROLES = frozenset({
+    MessageRole.USER, MessageRole.ASSISTANT, MessageRole.TOOL,
+})
+
+
 @dataclass(frozen=True, slots=True)
 class SessionConversationMessage:
     message_id: str
@@ -149,17 +165,40 @@ class SessionConversationMessage:
     task_id: str | None
     turn_id: str | None
     source_event_sequence: int
+    #: Tool pairing, mirroring the ``tool_call_id`` / ``tool_name`` columns of the
+    #: durable message row. A tool row that cannot name the call it answers breaks
+    #: strict role alternation on the wire, so the pair is *required* exactly when
+    #: ``role`` is ``TOOL`` and *forbidden* otherwise -- an assistant or user row
+    #: carrying a pairing field is a writer bug, not degraded input.
+    tool_call_id: str | None = None
+    tool_name: str | None = None
 
     def __post_init__(self) -> None:
-        if self.role not in (MessageRole.USER, MessageRole.ASSISTANT):
-            raise ValueError("Session conversation only accepts user-visible roles")
-        if not self.message_id or not self.text:
+        if self.role not in _SESSION_CONVERSATION_ROLES:
+            raise ValueError(
+                "Session conversation accepts user, assistant and tool roles"
+            )
+        if not self.message_id:
+            raise ValueError("Session conversation message fields must not be empty")
+        # A tool result may legitimately be empty (a command that printed nothing);
+        # a user or assistant row with no text carries no information at all.
+        if not self.text and self.role is not MessageRole.TOOL:
             raise ValueError("Session conversation message fields must not be empty")
         if self.source_event_sequence < 1:
             raise ValueError("source event sequence must be positive")
+        if self.role is MessageRole.TOOL:
+            if not (self.tool_call_id or "").strip():
+                raise ValueError(
+                    "a tool message must name the call it answers"
+                )
+        elif self.tool_call_id is not None or self.tool_name is not None:
+            raise ValueError("only tool messages may carry tool pairing fields")
 
     def source_data(self) -> dict[str, Any]:
-        return {
+        # Absent pairing fields are omitted rather than serialized as null: this
+        # mapping feeds ``SessionConversationProjection.hash_source``, so always
+        # emitting them would change every existing projection's content hash.
+        data: dict[str, Any] = {
             "message_id": self.message_id,
             "role": self.role.value,
             "text": self.text,
@@ -167,6 +206,11 @@ class SessionConversationMessage:
             "turn_id": self.turn_id,
             "source_event_sequence": self.source_event_sequence,
         }
+        if self.tool_call_id is not None:
+            data["tool_call_id"] = self.tool_call_id
+        if self.tool_name is not None:
+            data["tool_name"] = self.tool_name
+        return data
 
 
 class ContextAuthority(StrEnum):
