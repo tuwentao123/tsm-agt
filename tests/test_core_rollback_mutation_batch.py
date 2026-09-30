@@ -11,7 +11,11 @@ from tsm_agt.adapters.fixture import InMemoryRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application, compose_readonly_application
 from tsm_agt.core import ApprovalDecision, ApprovalRequired, TaskState
 from tsm_agt.ports import ToolCall
-from tsm_agt.core import kernel as kernel_module
+# Patch where production reads. ``rollback_workspace_mutation_batch`` and friends
+# live on ``WorkspaceMixin`` in ``core/kernel_workspace.py`` now, so they resolve
+# this name from *that* module's globals; patching ``kernel_module`` would bind the
+# façade's copy and silently not intercept (Hermes ``AGENTS.md:244-245``).
+from tsm_agt.core import kernel_workspace as kernel_workspace_module
 
 
 def sha256(text: str) -> str:
@@ -235,7 +239,7 @@ class CoreRollbackMutationBatchTest(unittest.IsolatedAsyncioTestCase):
             self.task.task_id, "step-create-second", "second-created.txt",
             "second\n", None,
         )
-        original_commit = kernel_module.commit_prepared_workspace_deletion
+        original_commit = kernel_workspace_module.commit_prepared_workspace_deletion
         calls = 0
 
         def fail_after_delete(prepared, filesystem):
@@ -246,7 +250,7 @@ class CoreRollbackMutationBatchTest(unittest.IsolatedAsyncioTestCase):
                 raise OSError("simulated failure after atomic delete")
 
         with patch.object(
-            kernel_module, "commit_prepared_workspace_deletion",
+            kernel_workspace_module, "commit_prepared_workspace_deletion",
             side_effect=fail_after_delete,
         ):
             _request, result = await self.approve(

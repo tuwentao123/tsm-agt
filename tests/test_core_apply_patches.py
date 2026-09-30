@@ -11,7 +11,10 @@ from tsm_agt.adapters.fixture import InMemoryRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application, compose_readonly_application
 from tsm_agt.core import ApprovalDecision, ApprovalRequired, TaskState
 from tsm_agt.ports import ToolCall
-from tsm_agt.core import kernel as kernel_module
+# Patch where production reads (Hermes ``AGENTS.md:244-245``): the compensation
+# path (``_compensate_prepared_mutation``) moved to ``WorkspaceMixin`` in
+# ``core/kernel_workspace.py``, so that is the binding it now resolves.
+from tsm_agt.core import kernel_workspace as kernel_workspace_module
 
 
 def sha256(text: str) -> str:
@@ -331,7 +334,7 @@ class CoreApplyPatchesTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_error_after_second_replace_still_restores_both_files(self) -> None:
         first, second, patches = self.two_modifications()
-        original_commit = kernel_module.commit_prepared_workspace_mutation
+        original_commit = kernel_workspace_module.commit_prepared_workspace_mutation
         calls = 0
 
         def fail_after_replace(prepared, filesystem):
@@ -342,7 +345,7 @@ class CoreApplyPatchesTest(unittest.IsolatedAsyncioTestCase):
                 raise OSError("simulated failure after atomic replace")
 
         with patch.object(
-            kernel_module, "commit_prepared_workspace_mutation",
+            kernel_workspace_module, "commit_prepared_workspace_mutation",
             side_effect=fail_after_replace,
         ):
             _request, result = await self.approve(
@@ -359,7 +362,7 @@ class CoreApplyPatchesTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_compensation_conflict_is_reported_and_preserves_external_write(self) -> None:
         first, second, patches = self.two_modifications()
-        original_commit = kernel_module.commit_prepared_workspace_mutation
+        original_commit = kernel_workspace_module.commit_prepared_workspace_mutation
         calls = 0
 
         def external_change_after_replace(prepared, filesystem):
@@ -371,7 +374,7 @@ class CoreApplyPatchesTest(unittest.IsolatedAsyncioTestCase):
                 raise OSError("simulated external change after replace")
 
         with patch.object(
-            kernel_module, "commit_prepared_workspace_mutation",
+            kernel_workspace_module, "commit_prepared_workspace_mutation",
             side_effect=external_change_after_replace,
         ):
             _request, result = await self.approve(

@@ -516,12 +516,59 @@ def _verify(
     if unresolved:
         print("  (a name here would be a NameError the first time that branch runs)")
 
+    seams = seam_names(Path(module), KERNEL)
+    print(f"  patch seams that moved out of the facade: {seams or 'none'}")
+    if seams:
+        print("  A test or tool doing patch(<facade>.<name>) now binds the FACADE's "
+              "copy while the moved body reads the sibling's, so the patch silently "
+              "stops intercepting. Repoint it at the sibling module (Hermes "
+              "AGENTS.md:244-245). No check above can see this: the name still "
+              "resolves, just somewhere else.")
+
     ok = (
         not missing and not extra and not duplicates
         and probe.returncode == 0 and not unresolved
     )
     print("VERIFY:", "ok" if ok else "FAILED")
     return 0 if ok else 1
+
+
+def seam_names(sibling: Path, facade: Path) -> list[str]:
+    """Names the sibling's moved bodies read, that were also reachable on the facade.
+
+    Narrowed to names actually read as globals -- listing every import would bury
+    the two or three that matter among the shared type imports nobody patches.
+    """
+
+    import symtable
+
+    def top_level(module_path: Path) -> set[str]:
+        tree = ast.parse(module_path.read_text(encoding="utf-8"))
+        names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    names.add(alias.asname or alias.name.split(".")[0])
+        return names
+
+    text = sibling.read_text(encoding="utf-8")
+    table = symtable.symtable(text, str(sibling), "exec")
+    read: set[str] = set()
+
+    def functions(node) -> list:
+        found = []
+        for child in node.get_children():
+            if child.get_type() == "function":
+                found.append(child)
+            found.extend(functions(child))
+        return found
+
+    for function in functions(table):
+        for symbol in function.get_symbols():
+            if symbol.is_global():
+                read.add(symbol.get_name())
+
+    return sorted(read & top_level(sibling) & top_level(facade))
 
 
 def _unresolved_global_names(path: Path, dotted: str) -> list[str]:

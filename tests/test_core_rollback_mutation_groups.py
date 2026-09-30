@@ -12,7 +12,10 @@ from tsm_agt.adapters.fixture import InMemoryRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application, compose_readonly_application
 from tsm_agt.core import ApprovalDecision, ApprovalRequired, TaskState
 from tsm_agt.ports import ToolCall
-from tsm_agt.core import kernel as kernel_module
+# Patch where production reads (Hermes ``AGENTS.md:244-245``): the grouped-rollback
+# path moved to ``WorkspaceMixin`` in ``core/kernel_workspace.py``, so this is the
+# module whose globals the moved body resolves the name from.
+from tsm_agt.core import kernel_workspace as kernel_workspace_module
 
 
 def sha256(text: str) -> str:
@@ -253,7 +256,7 @@ class CoreRollbackMutationGroupsTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_error_after_second_restore_compensates_both_files(self) -> None:
         first, second, first_old, first_new, second_one = await self.histories()
-        original_commit = kernel_module.commit_prepared_workspace_mutation
+        original_commit = kernel_workspace_module.commit_prepared_workspace_mutation
         calls = 0
 
         def fail_after_restore(prepared, filesystem):
@@ -264,7 +267,7 @@ class CoreRollbackMutationGroupsTest(unittest.IsolatedAsyncioTestCase):
                 raise OSError("simulated failure after grouped restore")
 
         with patch.object(
-            kernel_module, "commit_prepared_workspace_mutation",
+            kernel_workspace_module, "commit_prepared_workspace_mutation",
             side_effect=fail_after_restore,
         ):
             _request, result = await self.approve(self.call(
