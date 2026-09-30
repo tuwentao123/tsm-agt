@@ -1,5 +1,28 @@
 # tsm-agt 会话框架重设计
 
+> ## ⚠️ 更正（2026-09-30）：本文档的**核心前提有误**
+>
+> 本文原先断言"多轮接不上"，依据是 `SessionSnapshot` 无 transcript、会话内容靠每轮重投影。**该诊断已被实测推翻。**
+>
+> 按正确路径驱动一轮（`submit_session_text` **之后必须调 `run_task`**；前者只创建 Task 不执行）后实测，第 3 轮的 `session-context-*` 消息的 `recent_messages` 依序含有：
+>
+> ```
+> user      | instruction number 1
+> assistant | instruction number 1
+> user      | instruction number 2
+> assistant | instruction number 2
+> user      | instruction number 3
+> ```
+>
+> **多轮文本连续性本来是工作的。** 先前的"现状断言"之所以失败，是因为任务从未执行、根本没发出模型请求——一个假 XFAIL。详见 `tests/test_multiturn_context.py` 的模块 docstring 与提交 `fix(test): 更正多轮上下文的错误诊断`。
+>
+> **仍然成立的部分**：
+> * 会话内容是**有界渲染**（`session-context-*` JSON 块，实测 3726 字符），受 `recent_visible_message_limit` 等上限约束——长会话会丢旧轮，但这不是"接不上"。
+> * **tool 调用与结果确实不跨轮**——但这是**刻意的安全决策**（`core/kernel.py:7020-7022`），不是疏漏。
+> * `SessionSnapshot` 确实没有一等 transcript；这影响的是**保真度与可审计性**，不是连续性。
+>
+> **下述"决定 1"的原始论证请以本节为准修正。** 决定 2/3/4/5 未受此错误影响（它们分别依据循环结构、完成判定与状态机，均独立核实过）。
+
 > 回答两件事：**(1) 当前代码还能不能重构；(2) 会话框架怎么重新设计。**
 > 所有判断都有数字或出处。已有 SPEC 的结论**优先于**我的主张（见 §6）。
 
@@ -65,9 +88,13 @@
 
 ## 3. 重设计的五个决定
 
-### 决定 1 · Session 必须有 transcript（否则多轮永远不通）
+### 决定 1 · 过渡：会话记录应成为一等公民（~~否则多轮永远不通~~）
 
-**现状**：`core/session.py:81-95` 的 `SessionSnapshot` 只有 `task_ids`/`active_task_id`/两个计数器，**一条消息都没有**；会话内容靠 `SessionContextProjector.project()` 每轮重投影（`core/session_context.py:582`）。
+> **⚠️ 理由已被推翻，见文首更正。** 多轮文本连续性**是工作的**（前序 user 与 assistant 行都被 `session-context-*` 携带且保序）。本决定**降级为保真度/可审计性改进**，不再是"多轮能否工作"的前提。
+>
+> 仍然值得做的部分：会话内容目前是有界渲染（每次模型调用重建 JSON 块）而非持久记录，所以**长会话会丢旧轮**；且 tool 行不跨轮。前者是容量问题，后者是安全问题。
+
+**现状**：`core/session.py:81-95` 的 `SessionSnapshot` 只有 `task_ids`/`active_task_id`/两个计数器，没有消息；会话内容靠 `SessionContextProjector.project()` 每轮重投影（`core/session_context.py:582`），再经 `for_prompt` 渲染进 `session-context-*`。
 
 **依据**：Hermes 的会话就是一张 `messages` 表（`hermes_state_common.py:443-474`），逐轮追加、逐轮重放；组装顺序固定 13 步（`turn_request_assembly.py:111-113`）。
 
