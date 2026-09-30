@@ -21,6 +21,7 @@ from tsm_agt.core import (
     ClarificationReplyInput, InterruptTaskInput, RuntimeTextInput,
     SessionTextInput,
     SessionAnswerRequiresTask,
+    ModelInvocationFailed,
     SessionInputDecision, SessionRouteDisposition, SessionTaskRelation,
     SessionSnapshot,
     TaskRuntimeProjection, TaskRuntimeProjector,
@@ -29,9 +30,9 @@ from tsm_agt.core import (
     canonical_hash, SteeringKind, RuntimeInputIntent,
 )
 from tsm_agt.ports import (
-    CompletionReadinessMode, ImageBlock, RuntimeCommandRecord,
-    RuntimeStorePort, SessionInputRelation, SessionInputRelationJudgement,
-    SessionInputRelationPort, TextBlock,
+    CompletionReadinessMode, ImageBlock, ModelRecoveryAction,
+    RuntimeCommandRecord, RuntimeStorePort, SessionInputRelation,
+    SessionInputRelationJudgement, SessionInputRelationPort, TextBlock,
 )
 
 
@@ -744,11 +745,20 @@ class EngineeringAgentClient:
             return await self.run_task(task_id, goal, images=images)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
+            # INV-14: a stop the Runtime already classified as resumable keeps its
+            # checkpoint and its state. Overwriting it with FAILED is what turned
+            # one exhausted protocol correction into a product failure
+            # ("task-ce19b33b..."): the work was interrupted mid-flight and can be
+            # resumed, which is not the same claim as "the work failed".
             current = await self.application.kernel.get_task(task_id)
-            if not current.state.is_terminal and current.state not in {
-                TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER,
-            }:
+            if (
+                not _is_resumable_stop(error)
+                and not current.state.is_terminal
+                and current.state not in {
+                    TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER,
+                }
+            ):
                 try:
                     await self.application.kernel.transition_task(
                         task_id, TaskState.FAILED,
@@ -1324,6 +1334,20 @@ class EngineeringAgentClient:
 
     def _store(self) -> RuntimeStorePort:
         return self.application.registry.require(RuntimeStorePort)
+
+
+def _is_resumable_stop(error: BaseException) -> bool:
+    """Whether the Runtime classified this stop as resumable rather than failed.
+
+    One predicate, not an ``isinstance`` chain at the catch-all: the decision
+    already exists on the error (``recovery_action``), and re-deriving it here is
+    how the two vocabularies drifted apart in the first place.
+    """
+
+    return (
+        isinstance(error, ModelInvocationFailed)
+        and error.recovery_action is ModelRecoveryAction.PRESERVE_AND_INTERRUPT
+    )
 
 
 def _session_decision_data(decision: SessionInputDecision) -> dict[str, Any]:

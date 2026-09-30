@@ -7,9 +7,9 @@ from datetime import datetime
 from typing import Any
 
 from tsm_agt.ports import (
-    AdapterContext, AdapterDescriptor, CodeIntelligencePort, HealthState,
-    HealthStatus, ToolCall, ToolIdempotency, ToolInvocationContext, ToolResult,
-    ToolEffect, ToolResultAuthority, ToolRisk, ToolSpec,
+    AdapterContext, AdapterDescriptor, CodeIntelligencePort, EvidenceCapability,
+    HealthState, HealthStatus, ToolCall, ToolIdempotency, ToolInvocationContext,
+    ToolResult, ToolEffect, ToolResultAuthority, ToolRisk, ToolSpec,
 )
 
 
@@ -31,6 +31,10 @@ class CodeIntelligenceToolProvider:
     def _spec(
         name: str, description: str, properties: Mapping[str, Any],
         required: tuple[str, ...] = (),
+        *,
+        #: Only a parsed relation may claim this. A name search is not a relation:
+        #: it reports matches, not what they mean to each other.
+        extra: frozenset[EvidenceCapability] = frozenset(),
     ) -> ToolSpec:
         schema: dict[str, Any] = {
             "type": "object", "properties": dict(properties),
@@ -43,6 +47,7 @@ class CodeIntelligenceToolProvider:
             is_concurrency_safe=True, idempotency=ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
+            extra_evidence_capabilities=extra,
         )
 
     _tools = (
@@ -58,6 +63,7 @@ class CodeIntelligenceToolProvider:
             "Find declarations of an exact symbol, optionally below a file or directory.",
             {"symbol": {"type": "string"}, "path": {"type": "string"},
              "limit": {"type": "integer"}}, ("symbol",),
+            extra=frozenset({EvidenceCapability.OBSERVE_RELATION}),
         ),
         _spec.__func__(
             "code.references",
@@ -66,6 +72,7 @@ class CodeIntelligenceToolProvider:
             {"symbol": {"type": "string"}, "path": {"type": "string"},
              "include_declaration": {"type": "boolean"},
              "limit": {"type": "integer"}}, ("symbol",),
+            extra=frozenset({EvidenceCapability.OBSERVE_RELATION}),
         ),
         _spec.__func__(
             "code.implementations",
@@ -73,6 +80,7 @@ class CodeIntelligenceToolProvider:
             "otherwise names an exact base symbol.",
             {"symbol": {"type": "string"}, "limit": {"type": "integer"}},
             ("symbol",),
+            extra=frozenset({EvidenceCapability.OBSERVE_RELATION}),
         ),
         _spec.__func__(
             "code.workspace_symbols",

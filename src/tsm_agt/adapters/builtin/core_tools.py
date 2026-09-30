@@ -14,6 +14,7 @@ from typing import Any
 from tsm_agt.ports import (
     AdapterContext,
     AdapterDescriptor,
+    EvidenceCapability,
     HealthState,
     HealthStatus,
     ResolvedWorkspacePath,
@@ -101,6 +102,11 @@ class CoreReadOnlyToolProvider:
             idempotency=ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
+            # Reports whether its own scope was covered (``truncated`` / ``skipped_count``); reading one file cannot
+            # certify that a scope was enumerated.
+            extra_evidence_capabilities=frozenset({
+                EvidenceCapability.ENUMERATE_SCOPE,
+            }),
         ),
         ToolSpec(
             name="core.find_files",
@@ -138,6 +144,11 @@ class CoreReadOnlyToolProvider:
             idempotency=ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
+            # Reports whether its own scope was covered (``truncated`` / ``skipped_count``); reading one file cannot
+            # certify that a scope was enumerated.
+            extra_evidence_capabilities=frozenset({
+                EvidenceCapability.ENUMERATE_SCOPE,
+            }),
         ),
         ToolSpec(
             name="core.read_file",
@@ -215,6 +226,11 @@ class CoreReadOnlyToolProvider:
             idempotency=ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
+            # Reports whether its own scope was covered (``truncated`` / ``skipped_count``); reading one file cannot
+            # certify that a scope was enumerated.
+            extra_evidence_capabilities=frozenset({
+                EvidenceCapability.ENUMERATE_SCOPE,
+            }),
         ),
         ToolSpec(
             name="core.grep_search",
@@ -252,6 +268,11 @@ class CoreReadOnlyToolProvider:
             idempotency=ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
+            # Reports whether its own scope was covered (``truncated`` / ``skipped_count``); reading one file cannot
+            # certify that a scope was enumerated.
+            extra_evidence_capabilities=frozenset({
+                EvidenceCapability.ENUMERATE_SCOPE,
+            }),
         ),
     )
 

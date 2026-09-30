@@ -60,6 +60,89 @@ class ToolResultAuthority(StrEnum):
     DERIVED = "derived"
 
 
+class EvidenceCapability(StrEnum):
+    """What a successful result is allowed to *prove*.
+
+    **Reconstructed, not restored.** The working-tree version of this file was
+    lost to an accidental ``git reset --hard`` and never existed in any commit or
+    in the object database. This definition is rebuilt from three surviving
+    sources, in this order of authority:
+
+    1. ``tests/test_proof_closure.py::EvidenceCapabilityTest`` -- a surviving test
+       that pins the derivation table case by case, the ``frozenset()`` default,
+       and the exact substrings of both fail-closed errors;
+    2. ``Artifact Graph与Proof Obligation任务证明闭环实施SPEC.md`` §4.3 (deleted in
+       ``6f2a870``, recoverable via ``git show '6f2a870^:...'``) -- the member
+       list and the ``(effect, result_authority)`` pair behind each;
+    3. the surviving consumers: ``core/evidence_coverage.py`` and
+       ``core/proof_projection.py`` (which calls
+       ``derive_evidence_capabilities(effect, result_authority)`` with two
+       positional arguments, not with a ``ToolSpec``).
+
+    One rule is a judgement call and is called out where it is applied: which
+    pairs count as "observable" for an explicit declaration. The only pair used
+    positively anywhere is ``(OBSERVE, WORKSPACE_FACT)``; the only negative case
+    is ``(UNSPECIFIED, NONE)``, so the rule is stated as "the result authority
+    must establish some fact".
+    """
+
+    #: Derived from ``(effect, result_authority)`` -- see the table below.
+    READ_ARTIFACT = "READ_ARTIFACT"
+    MUTATE_ARTIFACT = "MUTATE_ARTIFACT"
+    OBSERVE_EFFECT = "OBSERVE_EFFECT"
+    EXECUTE_VERIFICATION = "EXECUTE_VERIFICATION"
+    OBSERVE_RUNTIME = "OBSERVE_RUNTIME"
+    OBSERVE_EXTERNAL = "OBSERVE_EXTERNAL"
+    #: Not derivable from the two declared fields; a tool declares these itself.
+    #: ``ENUMERATE_SCOPE`` can report completeness (``complete`` / ``stop_reason``
+    #: / ``skipped_count``); ``OBSERVE_RELATION`` can report symbol, config or
+    #: reference relationships.
+    ENUMERATE_SCOPE = "ENUMERATE_SCOPE"
+    OBSERVE_RELATION = "OBSERVE_RELATION"
+
+
+#: Capabilities no ``(effect, result_authority)`` pair can produce. Only these may
+#: appear in ``ToolSpec.extra_evidence_capabilities``.
+EXPLICIT_ONLY_EVIDENCE_CAPABILITIES: frozenset[EvidenceCapability] = frozenset({
+    EvidenceCapability.ENUMERATE_SCOPE,
+    EvidenceCapability.OBSERVE_RELATION,
+})
+
+#: The single authority for derived capabilities. A tool that declares only
+#: ``effect`` + ``result_authority`` gets its capabilities from here, so no adapter
+#: has to maintain a second, divergent list.
+_DERIVED_EVIDENCE_CAPABILITIES: Mapping[
+    tuple[ToolEffect, ToolResultAuthority], EvidenceCapability
+] = {
+    (ToolEffect.OBSERVE, ToolResultAuthority.WORKSPACE_FACT):
+        EvidenceCapability.READ_ARTIFACT,
+    (ToolEffect.MUTATE, ToolResultAuthority.MUTATION_FACT):
+        EvidenceCapability.MUTATE_ARTIFACT,
+    (ToolEffect.OBSERVE, ToolResultAuthority.PROCESS_FACT):
+        EvidenceCapability.OBSERVE_EFFECT,
+    (ToolEffect.EXECUTE, ToolResultAuthority.PROCESS_FACT):
+        EvidenceCapability.EXECUTE_VERIFICATION,
+    (ToolEffect.OBSERVE, ToolResultAuthority.RUNTIME_FACT):
+        EvidenceCapability.OBSERVE_RUNTIME,
+    (ToolEffect.OBSERVE, ToolResultAuthority.EXTERNAL_SERVICE):
+        EvidenceCapability.OBSERVE_EXTERNAL,
+}
+
+
+def derive_evidence_capabilities(
+    effect: ToolEffect, result_authority: ToolResultAuthority,
+) -> frozenset[EvidenceCapability]:
+    """Capabilities implied by what a tool *does* and what its result *means*.
+
+    Total and deterministic: an unlisted pair yields the empty set rather than
+    guessing, which is what keeps ``UNSPECIFIED`` tools from silently acquiring
+    proof weight.
+    """
+
+    capability = _DERIVED_EVIDENCE_CAPABILITIES.get((effect, result_authority))
+    return frozenset({capability}) if capability is not None else frozenset()
+
+
 class ToolProtocol(StrEnum):
     """How the Runtime coordinates an action with its host environment."""
 
@@ -172,6 +255,10 @@ class ToolSpec:
     effect: ToolEffect = ToolEffect.UNSPECIFIED
     result_authority: ToolResultAuthority = ToolResultAuthority.UNSPECIFIED
     protocol: ToolProtocol = ToolProtocol.IMMEDIATE
+    #: Supplement for capabilities no ``(effect, result_authority)`` pair can
+    #: produce. Anything derivable here is rejected below: two lists that can
+    #: disagree is exactly the "third parallel taxonomy" this design removes.
+    extra_evidence_capabilities: frozenset[EvidenceCapability] = frozenset()
 
     def __post_init__(self) -> None:
         if (
@@ -204,6 +291,35 @@ class ToolSpec:
             raise ValueError(
                 "interaction tools must return user_intent via wait_user protocol"
             )
+        # Fail closed at construction, not at read: a declaration that contradicts
+        # the derivation must never reach a Task, and a reader who never asks for
+        # ``evidence_capabilities`` must not be able to carry it either.
+        declared = frozenset(self.extra_evidence_capabilities)
+        conflicting = declared - EXPLICIT_ONLY_EVIDENCE_CAPABILITIES
+        if conflicting:
+            raise ValueError(
+                "evidence capabilities "
+                f"{sorted(item.value for item in conflicting)} are derived from "
+                "effect + result_authority and must not be declared again; only "
+                f"{sorted(item.value for item in EXPLICIT_ONLY_EVIDENCE_CAPABILITIES)} "
+                "may be declared explicitly"
+            )
+        if declared and self.result_authority in {
+            ToolResultAuthority.UNSPECIFIED, ToolResultAuthority.NONE,
+        }:
+            raise ValueError(
+                "an explicit evidence capability requires an observable "
+                "result_authority: it claims the tool can prove something, so its "
+                f"result must establish some fact, not {self.result_authority.value!r}"
+            )
+
+    @property
+    def evidence_capabilities(self) -> frozenset[EvidenceCapability]:
+        """Everything this tool is allowed to prove: derived union declared."""
+
+        return derive_evidence_capabilities(
+            self.effect, self.result_authority,
+        ) | frozenset(self.extra_evidence_capabilities)
 
     @property
     def requires_evidence_question(self) -> bool:
