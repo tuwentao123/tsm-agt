@@ -32,9 +32,10 @@ from pathlib import Path
 
 from tsm_agt.adapters.fixture import EchoModelProvider
 from tsm_agt.bootstrap import compose_fixture_application
+from tsm_agt.core import ContextWindowManager, SessionContextProjector
 from tsm_agt.ports import (
     AdapterDescriptor, HealthState, HealthStatus, MessageRole, ModelRequest,
-    ModelResponse,
+    ModelResponse, ProviderCapabilities,
 )
 from tsm_agt.sdk import EngineeringAgentClient
 
@@ -42,15 +43,22 @@ from tsm_agt.sdk import EngineeringAgentClient
 class RecordingModelProvider(EchoModelProvider):
     """Echo model that keeps every advice request, so a test can inspect exactly
     what the model was shown -- which is the only observable that matters for a
-    context-continuity claim."""
+    context-continuity claim.
+
+    ``context_window`` is settable because the Session-history bound has two
+    independent caps and only the second one is window-driven: a small window
+    keeps the token-budget compactor in play, a large one lets the projector's own
+    count bound be the only limit. Tests need to choose.
+    """
 
     descriptor = AdapterDescriptor(
         "fixture.recording-model", "1.0", "ModelProviderPort", "1.0",
         frozenset({"text"}),
     )
 
-    def __init__(self) -> None:
+    def __init__(self, context_window: int = 4096) -> None:
         super().__init__()
+        self.capabilities = ProviderCapabilities(context_window=context_window)
         self.requests: list[ModelRequest] = []
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
@@ -97,11 +105,16 @@ class ContextualResolver:
 
 
 class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
-    async def make_client(self, root: Path):
-        model = RecordingModelProvider()
+    async def make_client(
+        self, root: Path, *, projector=None, context_manager=None,
+        context_window: int = 4096,
+    ):
+        model = RecordingModelProvider(context_window)
         app = compose_fixture_application(
             model_adapter=model, tool_adapters=(),
             session_input_resolver_adapter=ContextualResolver(),
+            session_projector=projector,
+            context_manager=context_manager,
         )
         client = EngineeringAgentClient(root, application_factory=lambda: app)
         await client.start()
@@ -216,6 +229,122 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
                     message.get("role"), {"user", "assistant"},
                     "only user and assistant text may cross a turn boundary today",
                 )
+
+    async def test_the_default_bound_plateaus_and_drops_early_turns(self):
+        """Pins the measured plateau: with the default 8-message bound the
+        projection stops growing after four round trips, and turn 1's words leave
+        the prompt entirely -- they survive only as event references in
+        ``earlier_summary``.
+
+        This is a *bound*, not a break: the same turns were verified reachable
+        above. It is pinned here so that changing it is deliberate.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            client, model = await self.make_client(Path(directory))
+            session = await client.application.kernel.create_session("plateau")
+
+            for index in range(1, 9):
+                await self._say(
+                    client, session.session_id, f"instruction number {index}", index,
+                )
+
+            payload = self._session_context(model.requests, 0)
+            bodies = [
+                message.get("text") for message in payload["recent_messages"]
+            ]
+            self.assertEqual(len(bodies), 8, "the default bound is eight messages")
+            self.assertNotIn("instruction number 1", bodies)
+            self.assertIn("instruction number 8", bodies)
+            # Fifteen rows, not sixteen: the newest Turn's own reply does not
+            # exist yet when its request is built.
+            self.assertEqual(
+                payload["earlier_summary"]["message_count"], 7,
+                "seven of the fifteen existing rows left the prompt",
+            )
+            self.assertEqual(
+                len(bodies) + payload["earlier_summary"]["message_count"], 15,
+            )
+
+    async def test_a_compacted_prompt_admits_the_messages_it_dropped(self):
+        """Two layers drop history and only one of them used to say so.
+
+        ``SessionContextProjector`` counts what it omits into
+        ``earlier_summary.message_count``. ``ContextWindowManager`` then trims the
+        already-projected list again -- and did not fold those drops into the same
+        count, so on a small provider window the payload could report
+        ``message_count: 0`` beside a prompt that had just lost eight messages.
+
+        Raising only the projector's bound puts the two layers in disagreement on
+        purpose: the projector omits nothing, the compactor drops eight.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            client, model = await self.make_client(
+                Path(directory),
+                projector=SessionContextProjector(
+                    recent_visible_message_limit=64,
+                ),
+            )
+            session = await client.application.kernel.create_session("two-layers")
+
+            for index in range(1, 9):
+                await self._say(
+                    client, session.session_id, f"instruction number {index}", index,
+                )
+
+            payload = self._session_context(model.requests, 0)
+            self.assertEqual(len(payload["recent_messages"]), 8)
+            self.assertIn("compaction", payload)
+            self.assertEqual(
+                payload["earlier_summary"]["message_count"], 7,
+                "the payload must report the messages compaction dropped, not "
+                "only the ones the projector omitted",
+            )
+
+    async def test_raising_both_bounds_keeps_early_turns_in_the_prompt(self):
+        """The payoff of the newly-configurable bounds: turning them up actually
+        keeps an early turn's words in a later turn's prompt, so "the bound is too
+        small" is fixable by configuration rather than by re-architecting.
+
+        Both knobs are needed, and the provider window is a third constraint.
+        ``ContextWindowManager`` applies ``recent_message_floor`` on top of the
+        projector's bound, so raising only the projector changes nothing on a
+        small window -- the compactor trims straight back down. And keeping the
+        history at all needs a window big enough to hold it. The two runs above
+        are the controls.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            client, model = await self.make_client(
+                Path(directory),
+                projector=SessionContextProjector(
+                    recent_visible_message_limit=64,
+                ),
+                context_manager=ContextWindowManager(
+                    recent_message_floor=64, pinned_message_ceiling=64,
+                ),
+                context_window=32768,
+            )
+            session = await client.application.kernel.create_session("raised")
+
+            for index in range(1, 9):
+                await self._say(
+                    client, session.session_id, f"instruction number {index}", index,
+                )
+
+            payload = self._session_context(model.requests, 0)
+            bodies = [
+                message.get("text") for message in payload["recent_messages"]
+            ]
+            self.assertIn("instruction number 1", bodies)
+            self.assertIn("instruction number 8", bodies)
+            self.assertNotIn("compaction", payload)
+            self.assertEqual(
+                payload["earlier_summary"]["message_count"], 0,
+                "nothing is omitted once every turn fits under the raised bound",
+            )
+
 
 class ConversationMessageContractTest(unittest.TestCase):
     """Tool rows must be representable, and only when they are pairable.

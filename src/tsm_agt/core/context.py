@@ -435,9 +435,21 @@ class ContextWindowManager:
                 ]
                 removed += len(summaries) - len(kept_summaries)
                 body["recent_task_summaries"] = kept_summaries
-            removed += len(raw_messages) - len(recent)
+            dropped_messages = max(0, len(raw_messages) - len(recent))
+            removed += dropped_messages
             if raw_messages or body.get("recent_messages"):
                 body["recent_messages"] = recent
+            if dropped_messages:
+                # ``earlier_summary`` is this payload's own account of what is NOT
+                # in the prompt, and the projector computed it one layer earlier.
+                # Without folding this layer's drops in, the field claims fewer
+                # omissions than the prompt actually has -- a reader sees
+                # ``message_count: 0`` beside a prompt that lost whole Turns.
+                earlier = body.get("earlier_summary")
+                if isinstance(earlier, dict):
+                    earlier["message_count"] = (
+                        int(earlier.get("message_count") or 0) + dropped_messages
+                    )
             historical = body.get("historical_investigation")
             if isinstance(historical, dict):
                 for key in ("resources", "questions"):

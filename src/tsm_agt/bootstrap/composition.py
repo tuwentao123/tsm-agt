@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 from collections.abc import Mapping
@@ -96,7 +96,9 @@ from tsm_agt.adapters.fixture import (
     InMemoryProjectMemoryStore,
     ToolCallingModelProvider,
 )
-from tsm_agt.core import ContextWindowManager, Kernel, KernelDependencies
+from tsm_agt.core import (
+    ContextWindowManager, Kernel, KernelDependencies, SessionContextProjector,
+)
 from tsm_agt.ports import (
     CrossProcessLockPort,
     FlowArtifactExportPort,
@@ -147,7 +149,8 @@ from .exploration_configuration import (
     ExplorationBudgetConfiguration, load_exploration_budget_configuration,
 )
 from .context_configuration import (
-    ContextConfiguration, load_context_configuration,
+    ContextConfiguration, context_window_manager, load_context_configuration,
+    session_context_projector,
 )
 from .egress_configuration import (
     WebEgressConfiguration, load_web_egress_configuration,
@@ -164,16 +167,25 @@ class Application:
     #: Non-fatal configuration problems the host should surface (for example an
     #: invalid optional-search value that degraded to the free providers).
     configuration_issues: tuple[str, ...] = ()
+    #: Whether start-up may settle crash-left Tasks. A read-only view (a replay
+    #: or inspection composition over a writer's database) must never write, so
+    #: it turns reconciliation off instead of failing on its first commit.
+    reconcile_on_start: bool = True
 
     async def start(self) -> None:
         """Start adapters, then settle crash-left Tasks (spec §6.2 plan A).
 
-        Every entry point (web, CLI, SDK) must use this instead of
-        ``registry.start_all()`` so INTERRUPTING Tasks are reconciled before any
-        user input is accepted.
+        Every writable entry point (web, CLI, SDK) must use this instead of
+        ``registry.start_all()`` so crash-left Tasks are reconciled before any
+        user input is accepted. Two shapes are settled: a Task frozen mid-cancel
+        (INTERRUPTING) and a Task whose turn died with the previous process
+        while its ledger state still says it is running.
         """
         await self.registry.start_all()
+        if not self.reconcile_on_start:
+            return
         await self.kernel.reconcile_interrupting_tasks()
+        await self.kernel.reconcile_orphaned_running_tasks()
 
 
 def _endpoint_origin(base_url: str) -> str:
@@ -263,6 +275,7 @@ def _kernel_dependencies(
     context_manager: ContextWindowManager | None = None,
     *, default_max_output_tokens: int = 1024,
     require_evidence_questions: bool = True,
+    session_projector: SessionContextProjector | None = None,
 ) -> KernelDependencies:
     classifiers = registry.all(RuntimeInputClassifierPort)
     if len(classifiers) > 1:
@@ -387,6 +400,10 @@ def _kernel_dependencies(
     return KernelDependencies(
         model=registry.require(ModelProviderPort),
         store=registry.require(RuntimeStorePort),
+        session_context_projector=(
+            session_projector
+            if session_projector is not None else SessionContextProjector()
+        ),
         sandbox=registry.require(SandboxPort),
         cross_process_lock=registry.require(CrossProcessLockPort),
         workspace_filesystem=registry.require(WorkspaceFilesystemPort),
@@ -630,6 +647,7 @@ def compose_fixture_application(
         InvestigationFlowProjectorPort | None
     ) = None,
     model_recovery_policy_adapter: ModelRecoveryPolicyPort | None = None,
+    session_projector: SessionContextProjector | None = None,
 ) -> Application:
     registry = AdapterRegistry()
     registry.register(ModelProviderPort, model_adapter or EchoModelProvider())
@@ -769,6 +787,7 @@ def compose_fixture_application(
             completion_readiness_mode=completion_readiness_mode,
         ), context_manager,
         require_evidence_questions=require_evidence_questions,
+        session_projector=session_projector,
     )
     return Application(kernel=Kernel(dependencies), registry=registry)
 
@@ -805,6 +824,9 @@ def compose_local_flow_query_application(workspace: Path) -> Application:
             RuleBasedInvestigationFlowProjector()
         ),
     )
+    # A query view must never write: reconciliation settles Tasks, and this
+    # store is deliberately read-only.
+    application = replace(application, reconcile_on_start=False)
     application.registry.register(
         FlowArtifactExportPort,
         LocalFlowArtifactExporter(
@@ -834,6 +856,42 @@ def compose_readonly_application(
     )
 
 
+def _reviewer_model_provider(
+    *,
+    base_url: str,
+    model: str,
+    review_model: str,
+    api_key: str,
+    protocol: str,
+    anthropic_version: str,
+    timeout_seconds: float,
+    output_token_parameter: str,
+    strict_tool_schema: bool,
+    streaming: bool,
+):
+    """A reviewer provider, or ``None`` to reuse the primary instance.
+
+    SPEC §12.6 D5: the reviewer may override the **model name** only -- the Base
+    URL, protocol selector and API key are the primary ones by construction, so
+    no second credential or protocol path can appear.
+
+    Returns ``None`` when no override is configured, and the caller then reuses
+    the very same provider object. Building a second instance unconditionally
+    would hand the reviewer its own retry counters and connection state, which is
+    a behaviour change nobody asked for.
+    """
+
+    if not review_model or review_model == model:
+        return None
+    return _physical_model_provider(
+        base_url=base_url, model=review_model, api_key=api_key,
+        protocol=protocol, anthropic_version=anthropic_version,
+        timeout_seconds=timeout_seconds,
+        output_token_parameter=output_token_parameter,
+        strict_tool_schema=strict_tool_schema, streaming=streaming,
+    )
+
+
 def compose_openai_compatible_readonly_application(
     *,
     base_url: str,
@@ -846,6 +904,7 @@ def compose_openai_compatible_readonly_application(
     model_max_retries: int = 2,
     model_retry_backoff_seconds: float = 1.0,
     model_output_token_parameter: str = "max_tokens",
+    review_model: str = "",
     model_protocol: str = "openai_compatible",
     model_anthropic_version: str = "2023-06-01",
     model_strict_tool_schema: bool = True,
@@ -899,11 +958,22 @@ def compose_openai_compatible_readonly_application(
     )
     # INV-10: a judged criterion must have a judge. Without this the Planner's
     # rubric criteria would have no way to pass and every judged Task would fall
+    reviewer = _reviewer_model_provider(
+        base_url=base_url, model=model, review_model=review_model,
+        api_key=api_key, protocol=model_protocol,
+        anthropic_version=model_anthropic_version,
+        timeout_seconds=model_timeout_seconds,
+        output_token_parameter=model_output_token_parameter,
+        strict_tool_schema=model_strict_tool_schema,
+        streaming=model_streaming,
+    )
     # to NEEDS_REVIEW.
     if not registry.all(RubricJudgePort):
         registry.register(
             RubricJudgePort,
-            ModelRubricJudge(registry.require(ModelProviderPort)),
+            ModelRubricJudge(
+                reviewer or registry.require(ModelProviderPort)
+            ),
         )
     registry.register(
         CheckpointCompatibilityPolicyPort,
@@ -1003,11 +1073,9 @@ def compose_openai_compatible_readonly_application(
             strict_tool_schema=model_strict_tool_schema,
             streaming=model_streaming,
         ),
-        ContextWindowManager(
-            trigger_ratio=context.compaction_ratio,
-            latency_soft_input_tokens=context.latency_soft_tokens,
-        ),
+        context_window_manager(context),
         default_max_output_tokens=8192,
+        session_projector=session_context_projector(context),
     )
     return Application(
         kernel=Kernel(dependencies), registry=registry,
@@ -1024,6 +1092,7 @@ def compose_openai_compatible_engineering_application(
     model_max_retries: int = 2,
     model_retry_backoff_seconds: float = 1.0,
     model_output_token_parameter: str = "max_tokens",
+    review_model: str = "",
     model_protocol: str = "openai_compatible",
     model_anthropic_version: str = "2023-06-01",
     model_strict_tool_schema: bool = True,
@@ -1078,11 +1147,22 @@ def compose_openai_compatible_engineering_application(
     )
     # INV-10: a judged criterion must have a judge. Without this the Planner's
     # rubric criteria would have no way to pass and every judged Task would fall
+    reviewer = _reviewer_model_provider(
+        base_url=base_url, model=model, review_model=review_model,
+        api_key=api_key, protocol=model_protocol,
+        anthropic_version=model_anthropic_version,
+        timeout_seconds=model_timeout_seconds,
+        output_token_parameter=model_output_token_parameter,
+        strict_tool_schema=model_strict_tool_schema,
+        streaming=model_streaming,
+    )
     # to NEEDS_REVIEW.
     if not registry.all(RubricJudgePort):
         registry.register(
             RubricJudgePort,
-            ModelRubricJudge(registry.require(ModelProviderPort)),
+            ModelRubricJudge(
+                reviewer or registry.require(ModelProviderPort)
+            ),
         )
     registry.register(
         CheckpointCompatibilityPolicyPort,
@@ -1182,11 +1262,9 @@ def compose_openai_compatible_engineering_application(
             strict_tool_schema=model_strict_tool_schema,
             streaming=model_streaming,
         ),
-        ContextWindowManager(
-            trigger_ratio=context.compaction_ratio,
-            latency_soft_input_tokens=context.latency_soft_tokens,
-        ),
+        context_window_manager(context),
         default_max_output_tokens=8192,
+        session_projector=session_context_projector(context),
     )
     return Application(
         Kernel(dependencies), registry, configuration_issues=search.issues,
@@ -1218,6 +1296,7 @@ def compose_openai_compatible_readonly_application_from_env(
     return compose_openai_compatible_readonly_application(
         base_url=configuration.base_url,
         model=configuration.model,
+        review_model=configuration.review_model,
         api_key=configuration.api_key,
         database_path=database_path,
         configuration_sources=model_configuration_sources(configuration),
@@ -1263,6 +1342,7 @@ def compose_openai_compatible_engineering_application_from_env(
     return compose_openai_compatible_engineering_application(
         base_url=configuration.base_url,
         model=configuration.model,
+        review_model=configuration.review_model,
         api_key=configuration.api_key,
         database_path=database_path,
         configuration_sources=model_configuration_sources(configuration),

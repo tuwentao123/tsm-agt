@@ -459,6 +459,79 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                 "env_file",
             )
 
+    async def test_session_history_bounds_enter_configuration_and_the_projector(
+        self,
+    ) -> None:
+        """The multi-turn fidelity bound is reachable from configuration.
+
+        Before this, ``SessionContextProjector``'s 8-message / 4-summary bounds
+        were frozen dataclass defaults with no construction site outside the
+        Kernel default factory, so the documented remedy for a too-small bound
+        ("raise it, do not re-architect") was not actually available.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text(
+                "TSM_AGT_MODEL_BASE_URL=http://127.0.0.1:5580\n"
+                "TSM_AGT_OPEN_MODEL=test-model\n"
+                "TSM_AGT_MODEL_API_KEY=test-secret\n"
+                "TSM_AGT_SESSION_RECENT_MESSAGES=20\n"
+                "TSM_AGT_SESSION_TASK_SUMMARIES=9\n"
+                "TSM_AGT_CONTEXT_RECENT_MESSAGE_FLOOR=20\n"
+                "TSM_AGT_MODEL=open\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                application = (
+                    compose_openai_compatible_engineering_application_from_env(
+                        env_file
+                    )
+                )
+            projector = application.kernel.dependencies.session_context_projector
+            self.assertEqual(projector.recent_visible_message_limit, 20)
+            self.assertEqual(projector.detailed_task_summary_limit, 9)
+            self.assertEqual(
+                application.kernel.dependencies.context_manager.recent_message_floor,
+                20,
+            )
+            self.assertEqual(
+                application.kernel.dependencies.configuration_metadata["sources"][
+                    "session.recent_messages"
+                ],
+                "env_file",
+            )
+
+    async def test_absent_session_bounds_keep_the_historic_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text(
+                "TSM_AGT_MODEL_BASE_URL=http://127.0.0.1:5580\n"
+                "TSM_AGT_OPEN_MODEL=test-model\n"
+                "TSM_AGT_MODEL_API_KEY=test-secret\n"
+                "TSM_AGT_MODEL=open\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                application = (
+                    compose_openai_compatible_engineering_application_from_env(
+                        env_file
+                    )
+                )
+            projector = application.kernel.dependencies.session_context_projector
+            self.assertEqual(projector.recent_visible_message_limit, 8)
+            self.assertEqual(projector.detailed_task_summary_limit, 4)
+
+    def test_non_positive_session_bounds_are_rejected(self) -> None:
+        from tsm_agt.bootstrap.context_configuration import ContextConfiguration
+
+        with self.assertRaises(ValueError):
+            ContextConfiguration(session_recent_messages=0)
+        with self.assertRaises(ValueError):
+            ContextConfiguration(session_task_summaries=0)
+        with self.assertRaises(ValueError):
+            ContextConfiguration(recent_message_floor=0)
+
     async def test_exported_environment_overrides_local_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             env_file = Path(directory) / ".env"

@@ -70,7 +70,7 @@
 | | tsm-agt | Hermes |
 |---|---|---|
 | 上下文形态 | **有界渲染**（8 条消息 + 4 条摘要，封顶） | 全量 `messages` 表逐轮重放 |
-| 旧轮怎么办 | 移出 `recent_messages`，由 `earlier_summary` 摘要代表 | 压缩时按策略剪（`context_engine.py:110 prune_tool_results_only`）+ 结构化摘要 |
+| 旧轮怎么办 | 移出 `recent_messages`，由 `earlier_summary` **代表**——注意：里面没有摘要正文，只有事件区间引用（§9.1） | 压缩时按策略剪（`context_engine.py:110 prune_tool_results_only`）+ 结构化摘要 |
 | 是否可追溯 | ✅ `source_event_sequences` 指回事件 | ✅ `messages` 行仍在表里 |
 | 权威声明 | ✅ 显式（`warning` + `authority` 字段） | 无对应概念（靠工具层审批） |
 
@@ -80,8 +80,9 @@
 
 不是"接不上"（已证伪），而是：
 
-1. **上界是否够用**——4 个往返对"长任务回顾"场景偏小。若不够，应提高 `recent_visible_message_limit` / `recent_task_summary_limit`，而不是重做架构。
-2. **摘要的保真度**——旧轮只剩摘要，摘要由 `provider-budget-managed-session-v2` 生成，其质量未评估。
+1. **上界是否够用**——4 个往返对"长任务回顾"场景偏小。上界现在**可以从配置提高**（见 §9.2），不需要重做架构。
+2. ~~**摘要的保真度**——旧轮只剩摘要，摘要由 `provider-budget-managed-session-v2` 生成，其质量未评估。~~
+   **此条前提有误，见 §9.1：没有任何摘要被生成。** 旧轮是**被删除**的，`earlier_summary` 里只有算法名、事件区间和 `message_count`，没有正文。所以不存在"摘要质量"问题，真实问题是"旧轮原文在提示里不存在"。
 3. **tool 行不跨轮**——独立的**安全**问题（`core/kernel.py:7020-7022` 的刻意决策），见 `tsm-agt-工具边界能力对比.md`。
 
 **这三条都不需要新的会话架构。** 这是本次更正在结论层面的意义。
@@ -97,10 +98,68 @@
 
 **假 XFAIL 与真 XFAIL 在输出上无法区分。** 断言模型看到了什么之前，必须先把真实路径驱动起来。已按 Hermes `AGENTS.md:104-131` 的"先验证前提"纪律更正（提交 `c522ec1` / `db151e3`）。
 
-## 8. 未核实项
+## 8. 未核实项（已核实，见 §9）
 
-1. `provider-budget-managed-session-v2` 摘要算法的实现与其保真度。
-2. `recent_visible_message_limit` / `recent_task_summary_limit` 的配置入口与默认值来源。
-3. 提高上界后的**成本**（每轮多带 4 个往返的 token 代价）。
-4. 多轮在**单任务内**（而非跨 Task）的上下文行为——本文测的是每轮新建 Task 的 `CONTEXTUAL` 场景。
-5. 摘要触发是否与上下文窗口压力联动（现在第 6 轮就封顶，看不出与窗口的关系）。
+1. ~~`provider-budget-managed-session-v2` 摘要算法的实现与其保真度。~~ → §9.1
+2. ~~`recent_visible_message_limit` / `recent_task_summary_limit` 的配置入口与默认值来源。~~ → §9.2
+3. 提高上界后的**成本**（每轮多带 4 个往返的 token 代价）。**仍未核实**——需要真实 Provider 上的 token 计量，不在本地可测范围。
+4. 多轮在**单任务内**（而非跨 Task）的上下文行为——本文测的是每轮新建 Task 的 `CONTEXTUAL` 场景。**仍未核实**。
+5. ~~摘要触发是否与上下文窗口压力联动。~~ → §9.3
+
+---
+
+## 9. 核实结论（本次）
+
+### 9.1 `provider-budget-managed-session-v2` 不生成任何摘要
+
+名字里有 "budget-managed" 和 "summary"，但**没有任何摘要文本**。`earlier_summary` 与 `compaction` 两个对象里只有：
+
+| 字段 | 内容 |
+|---|---|
+| `algorithm` | 字符串常量 `"provider-budget-managed-session-v2"` |
+| `revision` / `content_hash` | 投影版本与哈希 |
+| `source_event_sequences` / `source_event_ranges` | 被移出投影的消息出自哪些事件 |
+| `message_count` | 被移出的消息条数 |
+| `tasks` / `omitted_task_count` | 未随行的 task_index 条目 |
+
+**⇒ 旧轮的正文在提示里就是没有了**，留下的是"它们出自哪些事件"的索引，加上（结构化的）`task_index` 条目。这不是摘要，是**删除 + 事件区间引用**。
+
+§5 表格里"Hermes 压缩时按策略剪 + 结构化摘要"一栏因此也需要更正：tsm-agt 这一层**没有**结构化摘要，只有引用。
+
+### 9.2 8 条的上界原来不可配置，现在可以
+
+实测（原文 §8 第 2 项）：
+
+* 真正的字段名是 `SessionContextProjector.recent_visible_message_limit = 8` 和 `detailed_task_summary_limit = 4`（不是 `recent_task_summary_limit`）。
+* 它们只是 dataclass 默认值。`src/` 里唯一的构造点是 `KernelDependencies.session_context_projector = field(default_factory=SessionContextProjector)`；`bootstrap/`、`cli.py`、`sdk/` **都没有**传入过别的值。
+* **⇒ 提高上界在改动前需要改代码。** §6 第 1 条推荐的"提高上界"当时做不到。
+
+本次已接上配置（沿用既有 `bootstrap/context_configuration.py` 的 env/`.env` 读取与校验风格）：
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `TSM_AGT_SESSION_RECENT_MESSAGES` | 8 | `SessionContextProjector.recent_visible_message_limit` |
+| `TSM_AGT_SESSION_TASK_SUMMARIES` | 4 | `SessionContextProjector.detailed_task_summary_limit` |
+| `TSM_AGT_CONTEXT_RECENT_MESSAGE_FLOOR` | 8 | `ContextWindowManager.recent_message_floor` |
+
+默认值即改动前的硬编码值，不设置时行为完全不变。
+
+### 9.3 上界有**两层**，而且第二层才是压力下的实际约束
+
+这是本次最主要的更正。原文把"第 6 轮封顶"归给投影器的 8 条上界，**只对了一半**：
+
+| 层 | 位置 | 触发 | 上限 |
+|---|---|---|---|
+| 1 | `SessionContextProjector` | **总是** | 固定条数（8 / 4），与窗口无关 |
+| 2 | `ContextWindowManager._compact` | 估算输入 + `max_output_tokens` ≥ `trigger_tokens`（窗口 × `compaction_ratio`） | `recent_message_floor`（默认 8） |
+
+实测：把 `recent_visible_message_limit` 单独提到 64，在 fixture 的 4096 窗口下**毫无效果**——投影器放过 16 条，第二层照样砍回 8 条。要真正保住早期轮次，必须同时提高两层**并**让 Provider 窗口装得下（实测提到 32768 后，第 8 轮的提示里仍能看到第 1 轮的原文）。
+
+**⇒ §9.3 也解释了 §8 第 5 项**：确实与窗口压力联动，只不过联动的是**第二层**；第一层是固定条数，所以第 6 轮封顶与窗口大小无关。
+
+### 9.4 顺带发现的两个缺陷（本次已修其中一个）
+
+1. **`earlier_summary.message_count` 会少报。** 投影器把它的省略数写进这个字段，第二层随后又从 `recent_messages` 里砍掉一批，却没有回填。于是在小窗口下可以出现"`message_count: 0`，但提示刚刚丢了 8 条消息"——读者无法从载荷看出整轮被丢掉了。**已修**（`core/context.py`，把本层的丢弃数折进同一个计数），并有回归测试。
+2. **scoped 载荷绕过第二层。** `ContextWindowManager._compact` 只认 `recent_messages` 这个键；scoped 模式的历史在 `scoped_messages` / `background_messages`（最多 32 + 8 条），**从不被预算层裁剪**。也就是说未限定作用域的路径有 token 预算兜底，限定了作用域的路径（例如 Planner）只有第一层的固定条数。**未修**，记录在此。
+
+---
