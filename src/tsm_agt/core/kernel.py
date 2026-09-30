@@ -12102,14 +12102,8 @@ class Kernel:
         checkpoint = state.checkpoint
         task_id = state.task_id
         turn_id = state.turn_id
-        live_spec = state.live_spec
-        closed_outcomes_at_entry = state.closed_outcomes_at_entry
         messages = state.messages
         pending_tool_calls = state.pending_tool_calls
-        seen_call_ids = state.seen_call_ids
-        last_tool_error = state.last_tool_error
-        plan_guard = state.plan_guard
-        visible_tool_by_name = state.visible_tool_by_name
 
         while True:
             # Cooperative cancellation boundary (task-cancellation-spec §7): a
@@ -12134,7 +12128,7 @@ class Kernel:
                 replace(
                     checkpoint, messages=tuple(messages),
                     pending_tool_calls=tuple(pending_tool_calls),
-                    seen_call_ids=tuple(sorted(seen_call_ids)),
+                    seen_call_ids=tuple(sorted(state.seen_call_ids)),
                     model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                     input_tokens=state.input_tokens, output_tokens=state.output_tokens,
                 ),
@@ -12155,7 +12149,7 @@ class Kernel:
                     replace(
                         checkpoint, messages=tuple(messages),
                         pending_tool_calls=tuple(pending_tool_calls),
-                        seen_call_ids=tuple(sorted(seen_call_ids)),
+                        seen_call_ids=tuple(sorted(state.seen_call_ids)),
                         model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                         input_tokens=state.input_tokens, output_tokens=state.output_tokens,
                     ), "before-tool",
@@ -12165,7 +12159,7 @@ class Kernel:
                 if replaced:
                     break
                 call = pending_tool_calls[0]
-                call_spec = visible_tool_by_name.get(call.name)
+                call_spec = state.visible_tool_by_name.get(call.name)
                 frozen_call = (
                     next((item for item in checkpoint.tool_batch.calls
                           if item.call_id == call.call_id), None)
@@ -12309,7 +12303,7 @@ class Kernel:
                         checkpoint = replace(
                             checkpoint, messages=tuple(messages),
                             pending_tool_calls=tuple(pending_tool_calls),
-                            seen_call_ids=tuple(sorted(seen_call_ids)),
+                            seen_call_ids=tuple(sorted(state.seen_call_ids)),
                             evidence_question_state=question_projection.to_data(),
                         )
                         await self._save_agent_checkpoint(
@@ -12379,7 +12373,7 @@ class Kernel:
                     checkpoint = replace(
                         checkpoint, messages=tuple(messages),
                         pending_tool_calls=tuple(pending_tool_calls),
-                        seen_call_ids=tuple(sorted(seen_call_ids)),
+                        seen_call_ids=tuple(sorted(state.seen_call_ids)),
                         stop_or_pivot_state=pivot_state,
                         evidence_question_state=question_projection.to_data(),
                     )
@@ -12474,7 +12468,7 @@ class Kernel:
                         checkpoint = replace(
                             checkpoint, messages=tuple(messages),
                             pending_tool_calls=tuple(pending_tool_calls),
-                            seen_call_ids=tuple(sorted(seen_call_ids)),
+                            seen_call_ids=tuple(sorted(state.seen_call_ids)),
                             evidence_question_state=question_projection.to_data(),
                         )
                         await self._save_agent_checkpoint(
@@ -12555,7 +12549,7 @@ class Kernel:
                         checkpoint = replace(
                             checkpoint, messages=tuple(messages),
                             pending_tool_calls=tuple(pending_tool_calls),
-                            seen_call_ids=tuple(sorted(seen_call_ids)),
+                            seen_call_ids=tuple(sorted(state.seen_call_ids)),
                             stop_or_pivot_state=pivot_state,
                             evidence_question_state=question_projection.to_data(),
                         )
@@ -12596,7 +12590,7 @@ class Kernel:
                         checkpoint = replace(
                             checkpoint, messages=tuple(messages),
                             pending_tool_calls=tuple(pending_tool_calls),
-                            seen_call_ids=tuple(sorted(seen_call_ids)),
+                            seen_call_ids=tuple(sorted(state.seen_call_ids)),
                             stop_or_pivot_state=pivot_state,
                             evidence_question_state=question_projection.to_data(),
                         )
@@ -12663,7 +12657,7 @@ class Kernel:
                     checkpoint = replace(
                         checkpoint, messages=tuple(messages),
                         pending_tool_calls=tuple(pending_tool_calls),
-                        seen_call_ids=tuple(sorted(seen_call_ids)),
+                        seen_call_ids=tuple(sorted(state.seen_call_ids)),
                         stop_or_pivot_state=pivot_state,
                         evidence_question_state=question_projection.to_data(),
                     )
@@ -12711,14 +12705,14 @@ class Kernel:
                     checkpoint = replace(
                         checkpoint, messages=tuple(messages),
                         pending_tool_calls=tuple(pending_tool_calls),
-                        seen_call_ids=tuple(sorted(seen_call_ids)),
+                        seen_call_ids=tuple(sorted(state.seen_call_ids)),
                         evidence_question_state=question_projection.to_data(),
                     )
                     await self._save_agent_checkpoint(
                         checkpoint, "artifact-read-reuse-required"
                     )
                     continue
-                decision = plan_guard.evaluate(
+                decision = state.plan_guard.evaluate(
                     call, memory_before_action,
                     workspace_fingerprint(
                         Path(task_before_action.workspace),
@@ -12838,7 +12832,7 @@ class Kernel:
                         "consecutive_no_progress": (
                             decision.consecutive_no_progress
                         ),
-                        "limit": plan_guard.no_progress_limit,
+                        "limit": state.plan_guard.no_progress_limit,
                         "next_action": pivot_decision.action.value,
                     }),))
                     await self._save_agent_checkpoint(
@@ -12869,7 +12863,7 @@ class Kernel:
                             status=ToolBatchStatus.EXECUTING,
                         ) if checkpoint.tool_batch is not None else None
                     ),
-                    seen_call_ids=tuple(sorted(seen_call_ids)),
+                    seen_call_ids=tuple(sorted(state.seen_call_ids)),
                     model_calls=state.model_call_count,
                     tool_calls=state.tool_call_count,
                     input_tokens=state.input_tokens,
@@ -13107,27 +13101,27 @@ class Kernel:
                     ),
                 ))
                 if not result.ok:
-                    last_tool_error = (
+                    state.last_tool_error = (
                         f"{call.name}: {result.error_code or 'TOOL_ERROR'}"
                     )
                 else:
                     # A command that exits non-zero returns ok=True: the call
                     # ran, the effect failed. Surface it here so the model is
                     # told the real outcome instead of a silent success.
-                    live_spec = visible_tool_by_name.get(call.name)
+                    state.live_spec = state.visible_tool_by_name.get(call.name)
                     classified = (
                         classify_effect_status(
-                            live_spec.effect, live_spec.result_authority,
+                            state.live_spec.effect, state.live_spec.result_authority,
                             invocation_state=ToolCommitState.COMMITTED,
                             ok=True, data=result.data,
                         )
-                        if live_spec is not None else None
+                        if state.live_spec is not None else None
                     )
                     if (
                         classified is not None
                         and classified[0] is EffectStatus.FAILED
                     ):
-                        last_tool_error = f"{call.name}: {classified[1]}"
+                        state.last_tool_error = f"{call.name}: {classified[1]}"
                 state.tool_call_count = next_tool_count
                 messages.append(
                     Message(
@@ -13186,7 +13180,7 @@ class Kernel:
                         after_tool, call, result
                     )
                 continuation = await self._maybe_suspend_after_completed_unit(
-                    checkpoint, closed_outcomes_at_entry
+                    checkpoint, state.closed_outcomes_at_entry
                 )
                 if continuation is not None:
                     source_user_message = next((
@@ -13223,7 +13217,7 @@ class Kernel:
                 error = AgentLoopLimitExceeded(
                     turn_id, "max_model_calls", checkpoint.max_model_calls,
                     model_calls=state.model_call_count, tool_calls=state.tool_call_count,
-                    last_tool_error=last_tool_error,
+                    last_tool_error=state.last_tool_error,
                     max_model_calls=checkpoint.max_model_calls,
                     max_tool_calls=checkpoint.max_tool_calls,
                 )
@@ -13417,11 +13411,11 @@ class Kernel:
                     "recover, or verify the remaining required work, while preserving "
                     "one final model response."
                 )
-            elif last_tool_error is not None:
+            elif state.last_tool_error is not None:
                 runtime_instruction = (
                     "The latest durable ToolResult is authoritative. Do not repeat "
                     "or rely on prior assistant prose as evidence. Address the "
-                    f"current tool failure ({last_tool_error}) using its result "
+                    f"current tool failure ({state.last_tool_error}) using its result "
                     "details; inspect or retry with corrected facts when safe."
                 )
             elif focus_state.focus_mode:
@@ -13450,7 +13444,7 @@ class Kernel:
                 await self._unfinished_plan_instruction(task_id),
                 state.protocol_correction,
             )))
-            live_spec = await self.get_task_spec(task_id)
+            state.live_spec = await self.get_task_spec(task_id)
             # Tool availability is stable within a turn. Outcome completion is
             # legacy-only and is never advertised for new runtime calls.
             model_visible_tools = tuple(
@@ -13496,7 +13490,7 @@ class Kernel:
                 compacted_checkpoint = replace(
                     checkpoint, messages=tuple(messages),
                     pending_tool_calls=tuple(pending_tool_calls),
-                    seen_call_ids=tuple(sorted(seen_call_ids)),
+                    seen_call_ids=tuple(sorted(state.seen_call_ids)),
                     model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                     input_tokens=state.input_tokens, output_tokens=state.output_tokens,
                 )
@@ -13606,7 +13600,7 @@ class Kernel:
                 )
                 recovery_batch = self._latest_recoverable_tool_batch(messages)
                 duplicate_call_ids = [
-                    call.call_id for call in tool_calls if call.call_id in seen_call_ids
+                    call.call_id for call in tool_calls if call.call_id in state.seen_call_ids
                 ]
                 if duplicate_call_ids:
                     raise InvalidModelResponse(
@@ -13621,7 +13615,7 @@ class Kernel:
                     for call in tool_calls
                 )
                 self._validate_tool_batch_proposal(
-                    tool_calls, visible_tool_by_name, seen_call_ids
+                    tool_calls, state.visible_tool_by_name, state.seen_call_ids
                 )
                 accepted_batch = (
                     await self._new_tool_batch(
@@ -13631,7 +13625,7 @@ class Kernel:
                 )
                 # A rejected response never consumes call IDs.  The corrected
                 # response may legitimately reuse the Provider-generated IDs.
-                seen_call_ids.update(call.call_id for call in tool_calls)
+                state.seen_call_ids.update(call.call_id for call in tool_calls)
             except RecoverableToolProtocolError as error:
                 state.model_call_count = model_call_number
                 state.protocol_recovery_attempts += 1
@@ -13720,7 +13714,7 @@ class Kernel:
                     checkpoint = replace(
                         checkpoint, messages=tuple(messages),
                         pending_tool_calls=(),
-                        seen_call_ids=tuple(sorted(seen_call_ids)),
+                        seen_call_ids=tuple(sorted(state.seen_call_ids)),
                         model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                         input_tokens=state.input_tokens, output_tokens=state.output_tokens,
                     )
@@ -13735,7 +13729,7 @@ class Kernel:
                     limit_error = AgentLoopLimitExceeded(
                         turn_id, "max_model_calls", checkpoint.max_model_calls,
                         model_calls=state.model_call_count, tool_calls=state.tool_call_count,
-                        last_tool_error=last_tool_error,
+                        last_tool_error=state.last_tool_error,
                         max_model_calls=checkpoint.max_model_calls,
                         max_tool_calls=checkpoint.max_tool_calls,
                     )
@@ -13746,7 +13740,7 @@ class Kernel:
                 checkpoint = replace(
                     checkpoint, messages=tuple(messages),
                     pending_tool_calls=(),
-                    seen_call_ids=tuple(sorted(seen_call_ids)),
+                    seen_call_ids=tuple(sorted(state.seen_call_ids)),
                     model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                     input_tokens=state.input_tokens, output_tokens=state.output_tokens,
                 )
@@ -13819,7 +13813,7 @@ class Kernel:
                 checkpoint, messages=tuple(messages),
                 pending_tool_calls=tuple(tool_calls),
                 tool_batch=accepted_batch,
-                seen_call_ids=tuple(sorted(seen_call_ids)),
+                seen_call_ids=tuple(sorted(state.seen_call_ids)),
                 model_calls=state.model_call_count, tool_calls=state.tool_call_count,
                 input_tokens=state.input_tokens, output_tokens=state.output_tokens,
             )
@@ -14172,7 +14166,7 @@ class Kernel:
                 error = AgentLoopLimitExceeded(
                     turn_id, "max_tool_calls", checkpoint.max_tool_calls,
                     model_calls=state.model_call_count, tool_calls=state.tool_call_count,
-                    last_tool_error=last_tool_error,
+                    last_tool_error=state.last_tool_error,
                     max_model_calls=checkpoint.max_model_calls,
                     max_tool_calls=checkpoint.max_tool_calls,
                 )
@@ -14182,7 +14176,7 @@ class Kernel:
                 error = AgentLoopLimitExceeded(
                     turn_id, "max_model_calls", checkpoint.max_model_calls,
                     model_calls=state.model_call_count, tool_calls=state.tool_call_count,
-                    last_tool_error=last_tool_error,
+                    last_tool_error=state.last_tool_error,
                     max_model_calls=checkpoint.max_model_calls,
                     max_tool_calls=checkpoint.max_tool_calls,
                 )
