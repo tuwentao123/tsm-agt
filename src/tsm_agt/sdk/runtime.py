@@ -534,6 +534,18 @@ class EngineeringAgentClient:
         session = await self._ensure_session(session_id, text)
         active = await self._active_task(target_task_id or session.active_task_id)
 
+        # A non-terminal Task state is a ledger claim; the turn it claims is
+        # process-local. With no live turn behind it the Task is orphaned, so
+        # both answers on the running path are lies: "busy" refuses a message
+        # nothing is working on, and "steered" claims delivery to a queue
+        # nothing will drain. Settle it first and let the ordinary routing
+        # below decide. States that are legitimately durable across turns
+        # (AWAITING_APPROVAL / AWAITING_USER) are not in the settlement table,
+        # so this leaves them untouched.
+        if active is not None and not self._has_live_turn(active.task_id):
+            await self.application.kernel.settle_orphaned_task(active.task_id)
+            active = await self._active_task(active.task_id)
+
         # (0) The foreground Task is between stable states: never start a second
         #     one, and never steer a Task that cannot absorb steering yet.
         if active is not None and active.state in self._TRANSITIONAL_TASK_STATES:
@@ -616,6 +628,17 @@ class EngineeringAgentClient:
         except LookupError:
             return None
 
+    def _has_live_turn(self, task_id: str) -> bool:
+        """Whether this process is running ``task_id``'s turn right now.
+
+        ``settle_orphaned_task`` puts the evidence for "no live turn drives this
+        Task" on the caller, and at this layer the runner registry is that
+        evidence: a Task leaves it only when its turn has actually finished.
+        """
+
+        runner = self._run_tasks.get(task_id)
+        return runner is not None and not runner.done()
+
     async def _judge_relation(
         self, text: str, session_id: str, active: TaskSnapshot,
     ) -> SessionInputRelationJudgement:
@@ -660,18 +683,6 @@ class EngineeringAgentClient:
         relation: SessionInputRelation, reason: str,
         explicit_intent: RuntimeInputIntent,
     ) -> RuntimeCommandResult:
-        # A Task in EXECUTING with no in-process runner cannot be steered: nothing
-        # will reach a safe point to drain the queue, and reporting the message as
-        # "steered" would claim it was delivered to work that is not running.
-        # ``settle_orphaned_task``'s contract puts the evidence for "no live turn
-        # drives this Task" on the caller, and at this layer the runner registry is
-        # that evidence. Settling first lets the ordinary routing decide instead.
-        if (
-            active.state is TaskState.EXECUTING
-            and active.task_id not in self._run_tasks
-        ):
-            await self.application.kernel.settle_orphaned_task(active.task_id)
-
         # Delegate to the Kernel's live-input router so steering, approval
         # supersession and idempotency are identical across Web, CLI and SDK.
         route = await self.application.kernel.dispatch_input_event(
