@@ -12152,341 +12152,307 @@ class Kernel:
             if _verdict.action is PhaseAction.RETURN:
                 return _verdict.result
 
-            state.input_tokens += state.response.usage.input_tokens
-            state.output_tokens += state.response.usage.output_tokens
-            state.model_call_count = state.model_call_number
-            state.protocol_correction = None
-            state.messages.append(state.response.message)
-            response_checkpoint = replace(
-                state.checkpoint, messages=tuple(state.messages),
-                pending_tool_calls=tuple(state.tool_calls),
-                tool_batch=state.accepted_batch,
-                seen_call_ids=tuple(sorted(state.seen_call_ids)),
-                model_calls=state.model_call_count, tool_calls=state.tool_call_count,
-                input_tokens=state.input_tokens, output_tokens=state.output_tokens,
-            )
-            # A follow-up may arrive while the provider is producing what looked
-            # like the final answer.  Persist that response as an intermediate
-            # checkpoint, merge the inbound message, and sample again rather
-            # than acknowledging steering that the model never actually saw.
-            events_after_model = await self._dependencies.store.read_events(state.task_id)
-            steering_after_model = SteeringProjector.project(
-                state.task_id, events_after_model
-            )
-            has_late_steering = any(
-                item.inbound_sequence
-                > response_checkpoint.last_steering_inbound_sequence
-                for item in steering_after_model.pending
-            )
-            if (
-                state.recovery_batch
-                and not state.tool_calls
-                and not has_late_steering
-            ):
-                recovery_gaps = tuple(CompletionGap(
-                    gap_id=f"tool-recovery:{tool_result.call_id}",
-                    kind="TOOL_RECOVERY_REQUIRED",
-                    description=(
-                        tool_result.message
-                        or f"{tool_result.error_code or 'TOOL_FAILURE'} requires recovery"
-                    ),
-                    status=tool_result.effective_recovery_kind.value.upper(),
-                    required=True, recoverable=True,
-                    observed=json.dumps(
-                        tool_result.recovery_action,
-                        ensure_ascii=False, sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                ) for tool_result in state.recovery_batch)
-                recovery_checkpoint = replace(
-                    response_checkpoint,
-                    messages=tuple(state.messages[:-1]),
-                    pending_tool_calls=(), tool_batch=None,
-                )
-                blocker = self._recovery_batch_blocker_message(state.recovery_batch)
-                suspension = await self._suspend_incomplete_recoverable(
-                    recovery_checkpoint, blocker, recovery_gaps,
-                    reason="unresolved_tool_batch",
-                )
-                source_user_message = next((
-                    message for message in state.messages
-                    if message.role is MessageRole.USER
-                    and not message.message_id.startswith((
-                        "project-onboarding-context-",
-                        "project-memory-context-", "session-context-",
-                        "working-memory-context-", "task-spec-context-",
-                        "project-instructions-context-", "completion-readiness-",
-                    ))
-                ), None)
-                if source_user_message is not None:
-                    await self._record_session_task_result(
-                        state.task_id, state.turn_id, source_user_message, blocker
-                    )
-                    await self._refresh_continuation_session_identity(state.task_id)
-                return suspension
-            readiness = CompletionReadinessDecision(
-                CompletionReadinessAction.COMPLETE, "not_a_final_candidate",
-                CompletionReadinessState.from_data(
-                    response_checkpoint.completion_readiness_state
-                ),
-            )
-            state.legacy_completion_gate = (
-                self.completion_readiness_mode
-                is CompletionReadinessMode.LEGACY_GATE
-            )
-            if not state.tool_calls and not has_late_steering:
-                readiness = await self._evaluate_completion_readiness(
-                    state.task_id, state.turn_id, response_checkpoint, state.visible_tools,
-                    forced_wrap_up=state.wrap_up or state.disclosure_only,
-                )
-                response_checkpoint = replace(
-                    response_checkpoint,
-                    completion_readiness_state=readiness.state.to_data(),
-                )
-                renewal_events: tuple[tuple[str, Mapping[str, Any]], ...] = ()
-                renewable_action = state.legacy_completion_gate and (
-                    readiness.action in {
-                        CompletionReadinessAction.CONTINUE,
-                        CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE,
-                        # A bounded stop with recoverable work left is exactly
-                        # what the renewal budget exists for. Keyed on the
-                        # action, never on a reason string.
-                        CompletionReadinessAction.EXHAUSTED,
-                    }
-                )
-                renewable_effects = {
-                    ToolEffect.OBSERVE
-                    if tool.effect is ToolEffect.UNSPECIFIED and tool.is_read_only
-                    else tool.effect
-                    for tool in state.visible_tools
-                    if not tool.is_internal_state
-                }
-                required_recoverable_work = renewable_action and any(
-                    gap.required
-                    and gap.effective_required_effects
-                    and gap.effective_required_effects.issubset(
-                        renewable_effects
-                    )
-                    for gap in readiness.gaps
-                )
-                renewal_policy = DiminishingModelCallBudgetPolicy(
-                    increments=self._dependencies.model_call_renewal_increments,
-                    max_renewals=(
-                        self._dependencies.model_call_renewal_max_count
-                    ),
-                    absolute_limit=(
-                        self._dependencies.model_call_renewal_absolute_limit
-                    ),
-                    threshold=self._dependencies.model_call_renewal_threshold,
-                )
-                renewal = renewal_policy.evaluate(
-                    current_limit=response_checkpoint.max_model_calls,
-                    consumed=state.model_call_count,
-                    renewal_count=(
-                        response_checkpoint.model_budget_renewal_count
-                    ),
-                    required_recoverable_work=required_recoverable_work,
-                )
-                if state.legacy_completion_gate and renewal is not None:
-                    renewed_state = CompletionReadinessState(
-                        continue_attempts=0,
-                        disclosure_attempts=0,
-                        automatic_resume_attempts=renewal.renewal_count,
-                        last_action="",
-                        schema_version=readiness.state.schema_version,
-                        stalled_continuations=(
-                            readiness.state.stalled_continuations
-                        ),
-                    )
-                    response_checkpoint = replace(
-                        response_checkpoint,
-                        max_model_calls=renewal.new_limit,
-                        model_budget_renewal_count=renewal.renewal_count,
-                        model_budget_total_granted=(
-                            response_checkpoint.model_budget_total_granted
-                            + renewal.increment
-                        ),
-                        completion_readiness_state=renewed_state.to_data(),
-                    )
-                    action_before = readiness.action
-                    reason_before = readiness.reason
-                    readiness = CompletionReadinessDecision(
-                        CompletionReadinessAction.CONTINUE,
-                        "model_call_budget_renewed",
-                        renewed_state, readiness.gaps,
-                    )
-                    renewal_events = (("budget.renewed", {
-                        "turn_id": state.turn_id,
-                        "renewal_count": renewal.renewal_count,
-                        "increment": renewal.increment,
-                        "previous_max_model_calls": renewal.previous_limit,
-                        "max_model_calls": renewal.new_limit,
-                        "absolute_max_model_calls": (
-                            renewal_policy.absolute_limit
-                        ),
-                        "remaining_model_calls_before": (
-                            renewal.remaining_before
-                        ),
-                        "readiness_action_before": action_before.value,
-                        "readiness_reason": reason_before,
-                        "gap_ids": [gap.gap_id for gap in readiness.gaps],
-                    }),)
-            else:
-                renewal_events = ()
-            if (
-                not state.legacy_completion_gate
-                and not state.tool_calls
-                and not has_late_steering
-            ):
-                readiness = CompletionReadinessDecision(
-                    CompletionReadinessAction.COMPLETE,
-                    "diagnostic_only", readiness.state, readiness.gaps,
-                )
-            # INV-13 / INV-16: a required gap may never coexist with a success
-            # verdict. This is enforced here, at the consumer, so it also covers
-            # policies this Runtime does not own -- including the "no policy
-            # configured" default and any custom adapter. The diagnostic-only
-            # per-turn override above is intentionally exempt: it hands the
-            # decision to the caller and never finalises or fails the Task.
-            required_gaps_open = any(
-                gap.required for gap in readiness.gaps
-            )
-            if (
-                state.legacy_completion_gate
-                and required_gaps_open
-                and readiness.action is CompletionReadinessAction.COMPLETE
-            ):
-                await self._append_events(state.task_id, ((
-                    "completion.invariant_violated", {
-                        "turn_id": state.turn_id,
-                        "violation": "complete_with_open_required_gaps",
-                        "reason": readiness.reason,
-                        "gap_ids": [
-                            gap.gap_id for gap in readiness.gaps if gap.required
-                        ],
-                    },
-                ),))
-                exhausted_state = replace(
-                    readiness.state,
-                    last_action=CompletionReadinessAction.EXHAUSTED.value,
-                )
-                readiness = CompletionReadinessDecision(
-                    CompletionReadinessAction.EXHAUSTED,
-                    "complete_with_open_required_gaps",
-                    exhausted_state, readiness.gaps,
-                )
-                response_checkpoint = replace(
-                    response_checkpoint,
-                    completion_readiness_state=exhausted_state.to_data(),
-                )
-            final_response = bool(
-                not state.tool_calls and not has_late_steering
-                and readiness.action is CompletionReadinessAction.COMPLETE
-                and not required_gaps_open
-            )
-            # A bounded stop with requirements still open ends the turn at a
-            # resumable boundary (INV-14): the objective axis records "work
-            # remains" here, so the acceptance layer is never the first to
-            # discover it (INV-16).
-            unmet_boundary = bool(
-                not state.tool_calls
-                and required_gaps_open
-                and readiness.action in {
-                    CompletionReadinessAction.REPORT_BLOCKED,
-                    CompletionReadinessAction.EXHAUSTED,
-                }
-            )
-            # The first "stop with work open" verdict buys one wrap-up round so
-            # the user gets an honest blocker report; the second one suspends.
-            # Derived from the persisted last action, not from a counter.
-            # ``remaining_model_calls`` still counts the call just made, so a
-            # further round needs more than one left; otherwise suspend with the
-            # checkpoint already in hand.
-            exhausted_wrap_up_due = bool(
-                readiness.action is CompletionReadinessAction.EXHAUSTED
-                and state.completion_state.last_action
-                != CompletionReadinessAction.EXHAUSTED.value
-                and state.remaining_model_calls > 1
-            )
-            incomplete_recovery_boundary = bool(
-                state.legacy_completion_gate and unmet_boundary
-                and not exhausted_wrap_up_due
-            )
-            await self._commit_model_response_checkpoint(
-                response_checkpoint, state.response, state.prompt.receipt, state.prepared.budget,
-                final=final_response and not incomplete_recovery_boundary,
-                additional_events=renewal_events,
-            )
-            if state.should_buffer_text and (
-                state.tool_calls or has_late_steering or final_response
-            ) and state.on_text_delta is not None:
-                for text_delta in state.buffered_text:
-                    state.on_text_delta(text_delta)
-            if not state.tool_calls and has_late_steering:
-                response_checkpoint, _ = await self._apply_pending_steering(
-                    response_checkpoint, "after-model-response"
-                )
-                state.checkpoint = response_checkpoint
-                state.messages = list(response_checkpoint.messages)
-                state.pending_tool_calls = list(response_checkpoint.pending_tool_calls)
+            _final = await self._finish_iteration(state)
+            if _final.action is PhaseAction.RETURN:
+                return _final.result
+            if _final.action is PhaseAction.CONTINUE:
                 continue
+    async def _finish_iteration(self, state: TurnState) -> PhaseVerdict:
+        """Consume the model response and decide how this iteration ends.
 
-            if not state.tool_calls:
-                if incomplete_recovery_boundary:
-                    suspension = await self._suspend_incomplete_recoverable(
-                        response_checkpoint, state.response.message, readiness.gaps,
-                        reason=(
-                            "completion_exhausted_with_required_gaps"
-                            if readiness.action is CompletionReadinessAction.EXHAUSTED
-                            else "unmet_acceptance_criteria"
-                        ),
-                    )
-                    source_user_message = next((
-                        message for message in state.messages
-                        if message.role is MessageRole.USER
-                        and not message.message_id.startswith((
-                            "project-onboarding-context-",
-                            "project-memory-context-", "session-context-",
-                            "working-memory-context-", "task-spec-context-",
-                            "project-instructions-context-",
-                            "completion-readiness-",
-                        ))
-                    ), None)
-                    if source_user_message is not None:
-                        await self._record_session_task_result(
-                            state.task_id, state.turn_id, source_user_message,
-                            state.response.message,
-                        )
-                        await self._refresh_continuation_session_identity(state.task_id)
-                    return suspension
-                if readiness.action is not CompletionReadinessAction.COMPLETE:
-                    correction = self._completion_correction_message(readiness)
-                    state.messages.append(correction)
-                    response_checkpoint = replace(
-                        response_checkpoint, messages=tuple(state.messages),
-                        pending_tool_calls=(),
-                        completion_readiness_state=readiness.state.to_data(),
-                    )
-                    event_type = (
-                        "completion.continuation_requested"
-                        if readiness.action is CompletionReadinessAction.CONTINUE
-                        else (
-                            "completion.incomplete_recoverable_requested"
-                            if readiness.action is CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE
-                            else "completion.blocker_disclosure_requested"
-                        )
-                    )
-                    await self._append_events(state.task_id, ((event_type, {
-                        "turn_id": state.turn_id, "reason": readiness.reason,
-                        "gap_count": len(readiness.gaps),
-                        "gap_ids": [gap.gap_id for gap in readiness.gaps],
-                    }),))
-                    await self._save_agent_checkpoint(
-                        response_checkpoint, "completion-readiness-correction"
-                    )
-                    state.checkpoint = response_checkpoint
-                    state.pending_tool_calls = []
-                    continue
+        Extracted from ``_continue_agent_turn``. Its three ``return``s were the
+        turn's terminal results and its ``continue``s restarted the iteration;
+        both now travel as a ``PhaseVerdict`` so the caller owns the loop.
+        ``OK`` means the iteration is complete and the loop should go round.
+        """
+        state.input_tokens += state.response.usage.input_tokens
+        state.output_tokens += state.response.usage.output_tokens
+        state.model_call_count = state.model_call_number
+        state.protocol_correction = None
+        state.messages.append(state.response.message)
+        response_checkpoint = replace(
+            state.checkpoint, messages=tuple(state.messages),
+            pending_tool_calls=tuple(state.tool_calls),
+            tool_batch=state.accepted_batch,
+            seen_call_ids=tuple(sorted(state.seen_call_ids)),
+            model_calls=state.model_call_count, tool_calls=state.tool_call_count,
+            input_tokens=state.input_tokens, output_tokens=state.output_tokens,
+        )
+        # A follow-up may arrive while the provider is producing what looked
+        # like the final answer.  Persist that response as an intermediate
+        # checkpoint, merge the inbound message, and sample again rather
+        # than acknowledging steering that the model never actually saw.
+        events_after_model = await self._dependencies.store.read_events(state.task_id)
+        steering_after_model = SteeringProjector.project(
+            state.task_id, events_after_model
+        )
+        has_late_steering = any(
+            item.inbound_sequence
+            > response_checkpoint.last_steering_inbound_sequence
+            for item in steering_after_model.pending
+        )
+        if (
+            state.recovery_batch
+            and not state.tool_calls
+            and not has_late_steering
+        ):
+            recovery_gaps = tuple(CompletionGap(
+                gap_id=f"tool-recovery:{tool_result.call_id}",
+                kind="TOOL_RECOVERY_REQUIRED",
+                description=(
+                    tool_result.message
+                    or f"{tool_result.error_code or 'TOOL_FAILURE'} requires recovery"
+                ),
+                status=tool_result.effective_recovery_kind.value.upper(),
+                required=True, recoverable=True,
+                observed=json.dumps(
+                    tool_result.recovery_action,
+                    ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ) for tool_result in state.recovery_batch)
+            recovery_checkpoint = replace(
+                response_checkpoint,
+                messages=tuple(state.messages[:-1]),
+                pending_tool_calls=(), tool_batch=None,
+            )
+            blocker = self._recovery_batch_blocker_message(state.recovery_batch)
+            suspension = await self._suspend_incomplete_recoverable(
+                recovery_checkpoint, blocker, recovery_gaps,
+                reason="unresolved_tool_batch",
+            )
+            source_user_message = next((
+                message for message in state.messages
+                if message.role is MessageRole.USER
+                and not message.message_id.startswith((
+                    "project-onboarding-context-",
+                    "project-memory-context-", "session-context-",
+                    "working-memory-context-", "task-spec-context-",
+                    "project-instructions-context-", "completion-readiness-",
+                ))
+            ), None)
+            if source_user_message is not None:
+                await self._record_session_task_result(
+                    state.task_id, state.turn_id, source_user_message, blocker
+                )
+                await self._refresh_continuation_session_identity(state.task_id)
+            return PhaseVerdict(PhaseAction.RETURN, suspension)
+        readiness = CompletionReadinessDecision(
+            CompletionReadinessAction.COMPLETE, "not_a_final_candidate",
+            CompletionReadinessState.from_data(
+                response_checkpoint.completion_readiness_state
+            ),
+        )
+        state.legacy_completion_gate = (
+            self.completion_readiness_mode
+            is CompletionReadinessMode.LEGACY_GATE
+        )
+        if not state.tool_calls and not has_late_steering:
+            readiness = await self._evaluate_completion_readiness(
+                state.task_id, state.turn_id, response_checkpoint, state.visible_tools,
+                forced_wrap_up=state.wrap_up or state.disclosure_only,
+            )
+            response_checkpoint = replace(
+                response_checkpoint,
+                completion_readiness_state=readiness.state.to_data(),
+            )
+            renewal_events: tuple[tuple[str, Mapping[str, Any]], ...] = ()
+            renewable_action = state.legacy_completion_gate and (
+                readiness.action in {
+                    CompletionReadinessAction.CONTINUE,
+                    CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE,
+                    # A bounded stop with recoverable work left is exactly
+                    # what the renewal budget exists for. Keyed on the
+                    # action, never on a reason string.
+                    CompletionReadinessAction.EXHAUSTED,
+                }
+            )
+            renewable_effects = {
+                ToolEffect.OBSERVE
+                if tool.effect is ToolEffect.UNSPECIFIED and tool.is_read_only
+                else tool.effect
+                for tool in state.visible_tools
+                if not tool.is_internal_state
+            }
+            required_recoverable_work = renewable_action and any(
+                gap.required
+                and gap.effective_required_effects
+                and gap.effective_required_effects.issubset(
+                    renewable_effects
+                )
+                for gap in readiness.gaps
+            )
+            renewal_policy = DiminishingModelCallBudgetPolicy(
+                increments=self._dependencies.model_call_renewal_increments,
+                max_renewals=(
+                    self._dependencies.model_call_renewal_max_count
+                ),
+                absolute_limit=(
+                    self._dependencies.model_call_renewal_absolute_limit
+                ),
+                threshold=self._dependencies.model_call_renewal_threshold,
+            )
+            renewal = renewal_policy.evaluate(
+                current_limit=response_checkpoint.max_model_calls,
+                consumed=state.model_call_count,
+                renewal_count=(
+                    response_checkpoint.model_budget_renewal_count
+                ),
+                required_recoverable_work=required_recoverable_work,
+            )
+            if state.legacy_completion_gate and renewal is not None:
+                renewed_state = CompletionReadinessState(
+                    continue_attempts=0,
+                    disclosure_attempts=0,
+                    automatic_resume_attempts=renewal.renewal_count,
+                    last_action="",
+                    schema_version=readiness.state.schema_version,
+                    stalled_continuations=(
+                        readiness.state.stalled_continuations
+                    ),
+                )
+                response_checkpoint = replace(
+                    response_checkpoint,
+                    max_model_calls=renewal.new_limit,
+                    model_budget_renewal_count=renewal.renewal_count,
+                    model_budget_total_granted=(
+                        response_checkpoint.model_budget_total_granted
+                        + renewal.increment
+                    ),
+                    completion_readiness_state=renewed_state.to_data(),
+                )
+                action_before = readiness.action
+                reason_before = readiness.reason
+                readiness = CompletionReadinessDecision(
+                    CompletionReadinessAction.CONTINUE,
+                    "model_call_budget_renewed",
+                    renewed_state, readiness.gaps,
+                )
+                renewal_events = (("budget.renewed", {
+                    "turn_id": state.turn_id,
+                    "renewal_count": renewal.renewal_count,
+                    "increment": renewal.increment,
+                    "previous_max_model_calls": renewal.previous_limit,
+                    "max_model_calls": renewal.new_limit,
+                    "absolute_max_model_calls": (
+                        renewal_policy.absolute_limit
+                    ),
+                    "remaining_model_calls_before": (
+                        renewal.remaining_before
+                    ),
+                    "readiness_action_before": action_before.value,
+                    "readiness_reason": reason_before,
+                    "gap_ids": [gap.gap_id for gap in readiness.gaps],
+                }),)
+        else:
+            renewal_events = ()
+        if (
+            not state.legacy_completion_gate
+            and not state.tool_calls
+            and not has_late_steering
+        ):
+            readiness = CompletionReadinessDecision(
+                CompletionReadinessAction.COMPLETE,
+                "diagnostic_only", readiness.state, readiness.gaps,
+            )
+        # INV-13 / INV-16: a required gap may never coexist with a success
+        # verdict. This is enforced here, at the consumer, so it also covers
+        # policies this Runtime does not own -- including the "no policy
+        # configured" default and any custom adapter. The diagnostic-only
+        # per-turn override above is intentionally exempt: it hands the
+        # decision to the caller and never finalises or fails the Task.
+        required_gaps_open = any(
+            gap.required for gap in readiness.gaps
+        )
+        if (
+            state.legacy_completion_gate
+            and required_gaps_open
+            and readiness.action is CompletionReadinessAction.COMPLETE
+        ):
+            await self._append_events(state.task_id, ((
+                "completion.invariant_violated", {
+                    "turn_id": state.turn_id,
+                    "violation": "complete_with_open_required_gaps",
+                    "reason": readiness.reason,
+                    "gap_ids": [
+                        gap.gap_id for gap in readiness.gaps if gap.required
+                    ],
+                },
+            ),))
+            exhausted_state = replace(
+                readiness.state,
+                last_action=CompletionReadinessAction.EXHAUSTED.value,
+            )
+            readiness = CompletionReadinessDecision(
+                CompletionReadinessAction.EXHAUSTED,
+                "complete_with_open_required_gaps",
+                exhausted_state, readiness.gaps,
+            )
+            response_checkpoint = replace(
+                response_checkpoint,
+                completion_readiness_state=exhausted_state.to_data(),
+            )
+        final_response = bool(
+            not state.tool_calls and not has_late_steering
+            and readiness.action is CompletionReadinessAction.COMPLETE
+            and not required_gaps_open
+        )
+        # A bounded stop with requirements still open ends the turn at a
+        # resumable boundary (INV-14): the objective axis records "work
+        # remains" here, so the acceptance layer is never the first to
+        # discover it (INV-16).
+        unmet_boundary = bool(
+            not state.tool_calls
+            and required_gaps_open
+            and readiness.action in {
+                CompletionReadinessAction.REPORT_BLOCKED,
+                CompletionReadinessAction.EXHAUSTED,
+            }
+        )
+        # The first "stop with work open" verdict buys one wrap-up round so
+        # the user gets an honest blocker report; the second one suspends.
+        # Derived from the persisted last action, not from a counter.
+        # ``remaining_model_calls`` still counts the call just made, so a
+        # further round needs more than one left; otherwise suspend with the
+        # checkpoint already in hand.
+        exhausted_wrap_up_due = bool(
+            readiness.action is CompletionReadinessAction.EXHAUSTED
+            and state.completion_state.last_action
+            != CompletionReadinessAction.EXHAUSTED.value
+            and state.remaining_model_calls > 1
+        )
+        incomplete_recovery_boundary = bool(
+            state.legacy_completion_gate and unmet_boundary
+            and not exhausted_wrap_up_due
+        )
+        await self._commit_model_response_checkpoint(
+            response_checkpoint, state.response, state.prompt.receipt, state.prepared.budget,
+            final=final_response and not incomplete_recovery_boundary,
+            additional_events=renewal_events,
+        )
+        if state.should_buffer_text and (
+            state.tool_calls or has_late_steering or final_response
+        ) and state.on_text_delta is not None:
+            for text_delta in state.buffered_text:
+                state.on_text_delta(text_delta)
+        if not state.tool_calls and has_late_steering:
+            response_checkpoint, _ = await self._apply_pending_steering(
+                response_checkpoint, "after-model-response"
+            )
+            state.checkpoint = response_checkpoint
+            state.messages = list(response_checkpoint.messages)
+            state.pending_tool_calls = list(response_checkpoint.pending_tool_calls)
+            return PhaseVerdict(PhaseAction.CONTINUE)
+        if not state.tool_calls:
+            if incomplete_recovery_boundary:
+                suspension = await self._suspend_incomplete_recoverable(
+                    response_checkpoint, state.response.message, readiness.gaps,
+                    reason=(
+                        "completion_exhausted_with_required_gaps"
+                        if readiness.action is CompletionReadinessAction.EXHAUSTED
+                        else "unmet_acceptance_criteria"
+                    ),
+                )
                 source_user_message = next((
                     message for message in state.messages
                     if message.role is MessageRole.USER
@@ -12495,44 +12461,82 @@ class Kernel:
                         "project-memory-context-", "session-context-",
                         "working-memory-context-", "task-spec-context-",
                         "project-instructions-context-",
+                        "completion-readiness-",
                     ))
                 ), None)
-                if source_user_message is None:
-                    raise RuntimeError("Agent turn lost its source user message")
-                return AgentTurnResult(
-                    turn_id=state.turn_id,
-                    task_id=state.task_id,
-                    assistant_message=state.response.message,
-                    finish_reason=state.response.finish_reason,
-                    usage=ModelUsage(state.input_tokens, state.output_tokens),
-                    model_calls=state.model_call_count,
-                    tool_calls=state.tool_call_count,
-                    messages=tuple(state.messages),
+                if source_user_message is not None:
+                    await self._record_session_task_result(
+                        state.task_id, state.turn_id, source_user_message,
+                        state.response.message,
+                    )
+                    await self._refresh_continuation_session_identity(state.task_id)
+                return PhaseVerdict(PhaseAction.RETURN, suspension)
+            if readiness.action is not CompletionReadinessAction.COMPLETE:
+                correction = self._completion_correction_message(readiness)
+                state.messages.append(correction)
+                response_checkpoint = replace(
+                    response_checkpoint, messages=tuple(state.messages),
+                    pending_tool_calls=(),
+                    completion_readiness_state=readiness.state.to_data(),
                 )
+                event_type = (
+                    "completion.continuation_requested"
+                    if readiness.action is CompletionReadinessAction.CONTINUE
+                    else (
+                        "completion.incomplete_recoverable_requested"
+                        if readiness.action is CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE
+                        else "completion.blocker_disclosure_requested"
+                    )
+                )
+                await self._append_events(state.task_id, ((event_type, {
+                    "turn_id": state.turn_id, "reason": readiness.reason,
+                    "gap_count": len(readiness.gaps),
+                    "gap_ids": [gap.gap_id for gap in readiness.gaps],
+                }),))
+                await self._save_agent_checkpoint(
+                    response_checkpoint, "completion-readiness-correction"
+                )
+                state.checkpoint = response_checkpoint
+                state.pending_tool_calls = []
+                return PhaseVerdict(PhaseAction.CONTINUE)
+            source_user_message = next((
+                message for message in state.messages
+                if message.role is MessageRole.USER
+                and not message.message_id.startswith((
+                    "project-onboarding-context-",
+                    "project-memory-context-", "session-context-",
+                    "working-memory-context-", "task-spec-context-",
+                    "project-instructions-context-",
+                ))
+            ), None)
+            if source_user_message is None:
+                raise RuntimeError("Agent turn lost its source user message")
+            return PhaseVerdict(PhaseAction.RETURN, AgentTurnResult(turn_id=state.turn_id, task_id=state.task_id, assistant_message=state.response.message, finish_reason=state.response.finish_reason, usage=ModelUsage(state.input_tokens, state.output_tokens), model_calls=state.model_call_count, tool_calls=state.tool_call_count, messages=tuple(state.messages)))
 
-            if state.tool_call_count + len(state.tool_calls) > state.checkpoint.max_tool_calls:
-                error = AgentLoopLimitExceeded(
-                    state.turn_id, "max_tool_calls", state.checkpoint.max_tool_calls,
-                    model_calls=state.model_call_count, tool_calls=state.tool_call_count,
-                    last_tool_error=state.last_tool_error,
-                    max_model_calls=state.checkpoint.max_model_calls,
-                    max_tool_calls=state.checkpoint.max_tool_calls,
-                )
-                await self._record_agent_loop_failure(state.task_id, state.turn_id, error)
-                raise error
-            if state.model_call_count == state.checkpoint.max_model_calls:
-                error = AgentLoopLimitExceeded(
-                    state.turn_id, "max_model_calls", state.checkpoint.max_model_calls,
-                    model_calls=state.model_call_count, tool_calls=state.tool_call_count,
-                    last_tool_error=state.last_tool_error,
-                    max_model_calls=state.checkpoint.max_model_calls,
-                    max_tool_calls=state.checkpoint.max_tool_calls,
-                )
-                await self._record_agent_loop_failure(state.task_id, state.turn_id, error)
-                raise error
+        if state.tool_call_count + len(state.tool_calls) > state.checkpoint.max_tool_calls:
+            error = AgentLoopLimitExceeded(
+                state.turn_id, "max_tool_calls", state.checkpoint.max_tool_calls,
+                model_calls=state.model_call_count, tool_calls=state.tool_call_count,
+                last_tool_error=state.last_tool_error,
+                max_model_calls=state.checkpoint.max_model_calls,
+                max_tool_calls=state.checkpoint.max_tool_calls,
+            )
+            await self._record_agent_loop_failure(state.task_id, state.turn_id, error)
+            raise error
+        if state.model_call_count == state.checkpoint.max_model_calls:
+            error = AgentLoopLimitExceeded(
+                state.turn_id, "max_model_calls", state.checkpoint.max_model_calls,
+                model_calls=state.model_call_count, tool_calls=state.tool_call_count,
+                last_tool_error=state.last_tool_error,
+                max_model_calls=state.checkpoint.max_model_calls,
+                max_tool_calls=state.checkpoint.max_tool_calls,
+            )
+            await self._record_agent_loop_failure(state.task_id, state.turn_id, error)
+            raise error
 
-            state.pending_tool_calls = list(state.tool_calls)
-            state.checkpoint = response_checkpoint
+        state.pending_tool_calls = list(state.tool_calls)
+        state.checkpoint = response_checkpoint
+        return PhaseVerdict(PhaseAction.OK)
     async def _invoke_model(self, state: TurnState) -> PhaseVerdict:
         """Perform this iteration's model call.
 
