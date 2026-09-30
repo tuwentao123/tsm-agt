@@ -49,7 +49,7 @@ _ALLOWED_BATCH_LAUNCHERS = frozenset(
 )
 _CMD_METACHARACTERS = frozenset("&|<>^%!?\r\n")
 _TRUSTED_RUNTIME_ORIGINS = tuple(
-    Path(origin).expanduser().absolute()
+    Path(os.path.realpath(os.path.expanduser(origin)))
     for origin in (
         "~/.local/share/uv/python",
         "~/.pyenv",
@@ -158,7 +158,7 @@ class LocalWorkspaceSandbox:
                         request.cwd, executable
                     ).path
                     if not path.is_absolute()
-                    else path.expanduser().absolute()
+                    else Path(os.path.realpath(os.path.expanduser(executable)))
                 )
             except FileNotFoundError:
                 return SandboxDecision(False, "workspace executable does not exist")
@@ -197,7 +197,7 @@ class LocalWorkspaceSandbox:
         executable_name = resolved_path.name.casefold()
         if _PYTHON_NAME.fullmatch(executable_name) is None:
             return None
-        workspace_root = workspace.absolute()
+        workspace_root = self._workspace_path.normalize_workspace(workspace)
         if _path_is_relative_to(resolved_path, workspace_root):
             return None
         if not self._is_trusted_runtime_origin(resolved_path):
