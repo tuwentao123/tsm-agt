@@ -160,6 +160,6 @@
 ### 9.4 顺带发现的两个缺陷（本次已修其中一个）
 
 1. **`earlier_summary.message_count` 会少报。** 投影器把它的省略数写进这个字段，第二层随后又从 `recent_messages` 里砍掉一批，却没有回填。于是在小窗口下可以出现"`message_count: 0`，但提示刚刚丢了 8 条消息"——读者无法从载荷看出整轮被丢掉了。**已修**（`core/context.py`，把本层的丢弃数折进同一个计数），并有回归测试。
-2. **scoped 载荷绕过第二层。** `ContextWindowManager._compact` 只认 `recent_messages` 这个键；scoped 模式的历史在 `scoped_messages` / `background_messages`（最多 32 + 8 条），**从不被预算层裁剪**。也就是说未限定作用域的路径有 token 预算兜底，限定了作用域的路径（例如 Planner）只有第一层的固定条数。**未修**，记录在此。
+2. **scoped 载荷绕过第二层。** `ContextWindowManager._compact` 只认 `recent_messages` 这个键；scoped 模式的历史在 `scoped_messages` / `background_messages`（最多 32 + 8 条），**从不被预算层裁剪**。scoped 路径是活的：`_task_spec_planning_context`（INV-8，Planner 只看自己这条 lineage）显式传了 `scope` 且 `include_background=False`，此时 `recent_messages` 被置空（`session_context.py:1028-1031`），于是 `raw_messages = []`，预算层**一条都不会砍**。也就是说未限定作用域的路径有 token 预算兜底，Planner 这条路径只有第一层的固定条数。**未修**，记录在此。
 
 ---
