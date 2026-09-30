@@ -2969,7 +2969,14 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                 obligation_ids=(),
                 verdict=judgement.verdict,
                 reason=judgement.reason,
-                cited_evidence_ids=judgement.cited_evidence_ids,
+                # Auto-attribution belongs here, where the packet is known: a
+                # judge that affirms what it was handed cites what it was handed,
+                # and a second implementation of this rule inside each adapter
+                # would be the same decision maintained twice. An explicit
+                # citation still wins, so naming evidence can only add.
+                cited_evidence_ids=(
+                    judgement.cited_evidence_ids or referenced_ids
+                ),
                 known_evidence_ids=frozenset(referenced_ids),
             )
             passed = outcome.satisfied
@@ -3447,7 +3454,14 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             ([answer_reference] if answer_reference else [])
             + list(observation_refs)
         ))
-        evidence = self._rubric_evidence(task, events, references)
+        # The goal is always evidence a judge may read: a judgement criterion is
+        # by definition about *this* request, and a Task with no tool execution and
+        # no answer event would otherwise hand the judge an empty packet -- which
+        # ``normalize_judgement`` turns into "affirmed without citing evidence",
+        # i.e. an automatic NEEDS_REVIEW for a criterion nobody could judge.
+        evidence = (
+            RubricEvidence("task-goal", task.goal),
+        ) + self._rubric_evidence(task, events, references)
         attempts = max(1, self._dependencies.rubric_judge_max_attempts)
         judgement = RubricJudgement(
             criterion.criterion_id, JudgeVerdict.UNDECIDABLE,

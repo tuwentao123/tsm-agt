@@ -98,6 +98,10 @@ class RuntimeTaskResult:
     conclusion_claims: tuple[Mapping[str, Any], ...] = ()
     conclusion_validation: Mapping[str, Any] | None = None
     completion_diagnostics: Mapping[str, Any] | None = None
+    #: Steering the user queued for this Task and that the turn has not consumed
+    #: yet. It is a *receipt*, not authority: the Runtime alone decides when an
+    #: input is applied, so a caller can observe the queue without owning it.
+    pending_steering: tuple[Mapping[str, Any], ...] = ()
 
     def to_data(self) -> dict[str, Any]:
         return {
@@ -124,6 +128,7 @@ class RuntimeTaskResult:
                 dict(self.completion_diagnostics)
                 if self.completion_diagnostics is not None else None
             ),
+            "pending_steering": [dict(item) for item in self.pending_steering],
         }
 
 
@@ -650,6 +655,18 @@ class EngineeringAgentClient:
         relation: SessionInputRelation, reason: str,
         explicit_intent: RuntimeInputIntent,
     ) -> RuntimeCommandResult:
+        # A Task in EXECUTING with no in-process runner cannot be steered: nothing
+        # will reach a safe point to drain the queue, and reporting the message as
+        # "steered" would claim it was delivered to work that is not running.
+        # ``settle_orphaned_task``'s contract puts the evidence for "no live turn
+        # drives this Task" on the caller, and at this layer the runner registry is
+        # that evidence. Settling first lets the ordinary routing decide instead.
+        if (
+            active.state is TaskState.EXECUTING
+            and active.task_id not in self._run_tasks
+        ):
+            await self.application.kernel.settle_orphaned_task(active.task_id)
+
         # Delegate to the Kernel's live-input router so steering, approval
         # supersession and idempotency are identical across Web, CLI and SDK.
         route = await self.application.kernel.dispatch_input_event(
@@ -871,12 +888,26 @@ class EngineeringAgentClient:
             if cached is not None and cached.assistant_text is not None
             else await self._persisted_assistant_text(task)
         )
+        # A queued message expires with the Task it was queued into: once the Task
+        # can no longer run, no safe point will ever drain the queue, so reporting
+        # it as pending would promise a delivery that cannot happen.
+        pending_steering = (
+            ()
+            if task.state.is_terminal
+            else tuple(
+                {"text": item.text}
+                for item in (await self.application.kernel.get_steering(
+                    task_id
+                )).pending
+            )
+        )
         return RuntimeTaskResult(
             task_id, task.state.value, task.state.phase1_state.value,
             _status_for_state(task.state), stored.last_event_sequence,
             assistant_text=assistant_text,
             approval=_approval_data(task),
             clarification=(cached.clarification if cached else _clarification_data(task)),
+            pending_steering=pending_steering,
             verification=cached.verification if cached else None,
             evidence_level=cached.evidence_level if cached else None,
             projection=projection,
