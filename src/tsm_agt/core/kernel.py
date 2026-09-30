@@ -12109,11 +12109,6 @@ class Kernel:
         seen_call_ids = state.seen_call_ids
         last_tool_error = state.last_tool_error
         plan_guard = state.plan_guard
-        no_progress_stop = state.no_progress_stop
-        budget_wrap_up = state.budget_wrap_up
-        budget_wrap_up_decision = state.budget_wrap_up_decision
-        protocol_recovery_attempts = state.protocol_recovery_attempts
-        protocol_correction = state.protocol_correction
         visible_tool_by_name = state.visible_tool_by_name
 
         while True:
@@ -12596,8 +12591,8 @@ class Kernel:
                             "exploration_budget_wrap_up",
                         )
                         pending_tool_calls.pop(0)
-                        budget_wrap_up = True
-                        budget_wrap_up_decision = budget_decision
+                        state.budget_wrap_up = True
+                        state.budget_wrap_up_decision = budget_decision
                         checkpoint = replace(
                             checkpoint, messages=tuple(messages),
                             pending_tool_calls=tuple(pending_tool_calls),
@@ -12835,7 +12830,7 @@ class Kernel:
                         ),
                         evidence_question_state=question_projection.to_data(),
                     )
-                    no_progress_stop = True
+                    state.no_progress_stop = True
                     await self._append_events(task_id, (("plan.no_progress_stopped", {
                         "turn_id": turn_id,
                         "step_id": decision.goal_slice.step_id,
@@ -13052,7 +13047,7 @@ class Kernel:
                         ExplorationOutcomeAction.WRAP_UP,
                         ExplorationOutcomeAction.ASK_USER,
                     }:
-                        budget_wrap_up = True
+                        state.budget_wrap_up = True
                 exploration_budget_state, budget_update = (
                     await self._update_exploration_budget_after(
                         task_id, turn_id, call, result, semantic_action,
@@ -13263,8 +13258,8 @@ class Kernel:
             )
             wrap_up = legacy_completion_gate and (
                 remaining_model_calls <= wrap_up_threshold
-                or no_progress_stop
-                or budget_wrap_up
+                or state.no_progress_stop
+                or state.budget_wrap_up
             )
             runtime_instruction = None
             required_gaps = await self._completion_readiness_gaps(
@@ -13323,8 +13318,8 @@ class Kernel:
                         "exact blocker, what evidence was completed, and what required "
                         "fact remains unverified. Do not claim success."
                     )
-            elif no_progress_stop or budget_wrap_up:
-                if budget_wrap_up:
+            elif state.no_progress_stop or state.budget_wrap_up:
+                if state.budget_wrap_up:
                     runtime_instruction = (
                         "The evidence-aware exploration budget has reached its "
                         "soft limit. Do not call tools. Answer now from collected "
@@ -13337,52 +13332,52 @@ class Kernel:
                     max_tool_calls=checkpoint.max_tool_calls,
                     goal=(await self.get_task(task_id)).goal,
                     reason=(
-                        "plan_no_progress" if no_progress_stop
+                        "plan_no_progress" if state.no_progress_stop
                         else (
-                            budget_wrap_up_decision.reason
-                            if budget_wrap_up_decision is not None
+                            state.budget_wrap_up_decision.reason
+                            if state.budget_wrap_up_decision is not None
                             else "exploration_budget"
                         )
                     ),
                     budget_reason=(
-                        budget_wrap_up_decision.reason
-                        if budget_wrap_up_decision is not None else ""
+                        state.budget_wrap_up_decision.reason
+                        if state.budget_wrap_up_decision is not None else ""
                     ),
                     exploration_actions=(
-                        budget_wrap_up_decision.scored_actions
-                        if budget_wrap_up_decision is not None else 0
+                        state.budget_wrap_up_decision.scored_actions
+                        if state.budget_wrap_up_decision is not None else 0
                     ),
                     max_exploration_actions=(
-                        budget_wrap_up_decision.max_scored_actions
-                        if budget_wrap_up_decision is not None else 0
+                        state.budget_wrap_up_decision.max_scored_actions
+                        if state.budget_wrap_up_decision is not None else 0
                     ),
                     exploration_tool_calls=(
-                        budget_wrap_up_decision.used_tool_calls
-                        if budget_wrap_up_decision is not None else 0
+                        state.budget_wrap_up_decision.used_tool_calls
+                        if state.budget_wrap_up_decision is not None else 0
                     ),
                     max_exploration_tool_calls=(
-                        budget_wrap_up_decision.max_total_tool_calls
-                        if budget_wrap_up_decision is not None else 0
+                        state.budget_wrap_up_decision.max_total_tool_calls
+                        if state.budget_wrap_up_decision is not None else 0
                     ),
                     exploration_elapsed_seconds=(
-                        budget_wrap_up_decision.cumulative_tool_milliseconds / 1000
-                        if budget_wrap_up_decision is not None else 0
+                        state.budget_wrap_up_decision.cumulative_tool_milliseconds / 1000
+                        if state.budget_wrap_up_decision is not None else 0
                     ),
                     max_exploration_elapsed_seconds=(
-                        budget_wrap_up_decision.max_cumulative_tool_milliseconds / 1000
-                        if budget_wrap_up_decision is not None else 0
+                        state.budget_wrap_up_decision.max_cumulative_tool_milliseconds / 1000
+                        if state.budget_wrap_up_decision is not None else 0
                     ),
                     low_value_streak=(
-                        budget_wrap_up_decision.low_value_streak
-                        if budget_wrap_up_decision is not None else 0
+                        state.budget_wrap_up_decision.low_value_streak
+                        if state.budget_wrap_up_decision is not None else 0
                     ),
                     max_low_value_streak=(
-                        budget_wrap_up_decision.max_low_value_streak
-                        if budget_wrap_up_decision is not None else 0
+                        state.budget_wrap_up_decision.max_low_value_streak
+                        if state.budget_wrap_up_decision is not None else 0
                     ),
                     reserve_tool_calls=(
-                        budget_wrap_up_decision.reserve_tool_calls
-                        if budget_wrap_up_decision is not None else 0
+                        state.budget_wrap_up_decision.reserve_tool_calls
+                        if state.budget_wrap_up_decision is not None else 0
                     ),
                 ))
             elif wrap_up:
@@ -13453,7 +13448,7 @@ class Kernel:
                 _temporal_context_instruction(),
                 runtime_instruction,
                 await self._unfinished_plan_instruction(task_id),
-                protocol_correction,
+                state.protocol_correction,
             )))
             live_spec = await self.get_task_spec(task_id)
             # Tool availability is stable within a turn. Outcome completion is
@@ -13639,7 +13634,7 @@ class Kernel:
                 seen_call_ids.update(call.call_id for call in tool_calls)
             except RecoverableToolProtocolError as error:
                 state.model_call_count = model_call_number
-                protocol_recovery_attempts += 1
+                state.protocol_recovery_attempts += 1
                 failure = ModelAttemptFailure(
                     ModelFailureCategory.CORRECTABLE_PROTOCOL,
                     ModelRetrySafety.SAFE_WITH_CORRECTION,
@@ -13650,13 +13645,13 @@ class Kernel:
                     decision = None
                 else:
                     decision = await policy.evaluate(ModelRecoveryProbe(
-                        failure, protocol_recovery_attempts, 2, False
+                        failure, state.protocol_recovery_attempts, 2, False
                     ))
                 recovery_action = (
                     decision.action if decision is not None
                     else (
                         ModelRecoveryAction.RESAMPLE_WITH_CORRECTION
-                        if protocol_recovery_attempts == 1
+                        if state.protocol_recovery_attempts == 1
                         else ModelRecoveryAction.FAIL_TERMINAL
                     )
                 )
@@ -13667,14 +13662,14 @@ class Kernel:
                 await self._record_model_attempt_events(
                     task_id, turn_id, model_call_number, [
                         ModelTransportProgress(
-                            "attempt_failed", protocol_recovery_attempts, 2,
+                            "attempt_failed", state.protocol_recovery_attempts, 2,
                             category=failure.category.value,
                             retry_safety=failure.retry_safety.value,
                             diagnostic_code=failure.diagnostic_code,
                             reason=recovery_reason,
                         ),
                         ModelTransportProgress(
-                            "recovery_decided", protocol_recovery_attempts, 2,
+                            "recovery_decided", state.protocol_recovery_attempts, 2,
                             category=failure.category.value,
                             retry_safety=failure.retry_safety.value,
                             diagnostic_code=failure.diagnostic_code,
@@ -13688,7 +13683,7 @@ class Kernel:
                     is ModelRecoveryAction.RESAMPLE_WITH_CORRECTION
                     and state.model_call_count < checkpoint.max_model_calls
                 ):
-                    protocol_correction = (
+                    state.protocol_correction = (
                         (
                             "Your previous response attempted a tool call after the "
                             "Runtime disabled tools for finalization. Do not emit XML, "
@@ -13818,7 +13813,7 @@ class Kernel:
             state.input_tokens += response.usage.input_tokens
             state.output_tokens += response.usage.output_tokens
             state.model_call_count = model_call_number
-            protocol_correction = None
+            state.protocol_correction = None
             messages.append(response.message)
             response_checkpoint = replace(
                 checkpoint, messages=tuple(messages),
