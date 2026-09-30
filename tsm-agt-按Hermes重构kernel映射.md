@@ -312,30 +312,32 @@ Hermes 有三层（工具内 per-tool cap → 落盘 + 预览 → `enforce_turn_
 | 10 | task 生命周期 + SPEC 规划 | 897 / 13 + 4 符号 | `kernel_task.py` / `TaskMixin` | ✅ `def49cb` |
 | 11 | 策略 before/after 探针 + 资源目录 | 496 / 14 | `kernel_policy.py` / `PolicyMixin` | ✅ `7fe8c85` |
 | 12 | model 响应校验 / 诊断 / 失败记录 | 346 / 8 + 2 表 | `kernel_model.py` / `ModelMixin` | ✅ `3081d54` |
-| 13 | 输入路由（`dispatch_input_event` / `route_runtime_input` / …） | ~380 / 4 | `kernel_input.py` | 待做 |
-| 14 | agent-loop / turn（`run_agent_turn`、resume/suspend/clarify、取消） | 2,724 / 37 | `kernel_turn.py` | 待做 |
+| 12.5 | 输入分派：6 分支 `isinstance` 梯子 → 表 → handler | — | 纯结构改动，单独 commit | ✅ `d65ff6c` |
+| 13 | 输入路由（`dispatch_input_event` + 6 个 handler + `route_runtime_input`） | 419 / 10 + 表 | `kernel_input.py` / `InputMixin` | ✅ `10bc247` |
+| 14 | agent-loop / turn（`run_agent_turn`、resume/suspend/clarify、checkpoint、取消） | 2,724 / 37 | `kernel_turn.py` | 待做 |
 | 15 | **verify / proof + completion（纠缠，一起做）** | 2,318 / 34 + 18 个模块级函数 | 先给 §4.4 的 8 个文件定性 | 待做 |
-| 16 | 门面收尾（`__init__` / `dependencies` / `_append_events` / `_require_stored_task` / 存储键） | ~200 | 留在门面 | 待做 |
+| 16 | 门面收尾（`__init__` / `dependencies` / `_append_events` / `_require_stored_task` / 存储键 / **MRO 排序**） | ~200 | 留在门面 | 待做 |
 
-当前状态：
+当前状态（实测，`wc -l` + AST）：
 
 ```
-kernel.py            15,990 → 7,146 行（272 → 96 方法，−55%）
+kernel.py            15,990 → 6,766 行（272 → 78 方法，−58%）
 core/kernel_session.py     2,267 行 / 40 方法
-core/kernel_tool.py        1,960 行 / 22 方法
+core/kernel_tool.py        1,960 行 / 22 方法（+5 个 _Task*Control 类共 21 个方法）
 core/kernel_workspace.py   1,150 行 / 16 方法
-core/kernel_task.py        1,038 行 / 13 方法 + 4 符号
+core/kernel_task.py        1,038 行 / 13 方法 + 4 个模块级符号
 core/kernel_policy.py        564 行 / 14 方法
 core/kernel_process.py       558 行 / 20 方法
+core/kernel_input.py         504 行 / 10 方法 + _INPUT_HANDLERS 表
+core/kernel_model.py         433 行 /  8 方法
 core/kernel_memory.py        398 行 / 11 方法
 core/kernel_approval.py      396 行 /  7 方法
-core/kernel_model.py         396 行 /  8 方法
 core/kernel_onboarding.py    373 行 /  9 方法
 core/kernel_projection.py    342 行 / 11 方法
 core/kernel_progress.py      303 行 /  5 方法
 class Kernel(ModelMixin, PolicyMixin, TaskMixin, MemoryMixin, ApprovalMixin,
              ProgressMixin, OnboardingMixin, ProjectionMixin, ProcessMixin,
-             WorkspaceMixin, ToolMixin, SessionMixin)
+             WorkspaceMixin, ToolMixin, SessionMixin, InputMixin)
 ```
 
 预期终态：`kernel.py` **~1,200–1,800 行门面** + 16 个左右 `kernel_<topic>.py`。
