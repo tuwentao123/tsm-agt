@@ -23,15 +23,21 @@ class RuleBasedCompletionReadinessPolicy:
     * the gap is closable by an available effect, budget left   -> CONTINUE
     * otherwise                                                -> EXHAUSTED
 
-    It deliberately keeps **no in-turn "correction attempt" counter**. Bounding
-    how many times the Runtime may tell the model that work remains measures the
-    wrong thing: a model that keeps re-issuing a corrected tool call is making
-    progress, not stalling. What is bounded is the *resource* (the caller owns
-    ``remaining_model_calls``/``remaining_tool_calls``) and the *capability*
-    (whether any available effect can close the gap at all). Repetition of the
-    same unsatisfiable requirement across user continuations is bounded by
-    ``stalled_continuations`` in the Runtime (INV-4), so no second, in-turn
-    counter is needed.
+    Repetition is bounded by *progress*, not by sheer count: a model that keeps
+    re-issuing tool calls is iterating and keeps its CONTINUE, while a model that
+    answers with prose and never successfully calls a tool is only being asked
+    the same thing again. The count is therefore capped **only while
+    ``probe.successful_tool_calls`` is zero** -- the one case in which another
+    nudge cannot possibly help, because nothing the nudge asks for has been
+    attempted. Measurement behind the rule: such a model was told the same thing
+    **25 times in one turn** (26 model calls, 3 budget renewals) before the turn
+    gave up, and the caller's own budget (40 model calls) would have allowed
+    ~40. Hermes caps each of its nudges the same way (verify-on-stop at
+    ``max_attempts=2``, pre_verify at ``DEFAULT_MAX_VERIFY_NUDGES = 3``).
+
+    Repetition of the same unsatisfiable requirement across *user continuations*
+    is bounded separately by ``stalled_continuations`` in the Runtime (INV-4);
+    the two counters measure different things and neither replaces the other.
 
     INV-13: ``COMPLETE`` is only ever returned when the gap set is empty, so a
     "success" verdict can never ride next to an outstanding requirement.
@@ -45,10 +51,14 @@ class RuleBasedCompletionReadinessPolicy:
 
     def __init__(
         self, *, max_stalled_continuations: int = 2,
+        max_continue_attempts: int = 2,
     ) -> None:
         if max_stalled_continuations < 0:
             raise ValueError("max_stalled_continuations must not be negative")
+        if max_continue_attempts < 0:
+            raise ValueError("max_continue_attempts must not be negative")
         self.max_stalled_continuations = max_stalled_continuations
+        self.max_continue_attempts = max_continue_attempts
         self._started = False
 
     async def start(self, context: AdapterContext) -> None:
@@ -98,6 +108,17 @@ class RuleBasedCompletionReadinessPolicy:
             and probe.remaining_tool_calls > 0
             and not probe.forced_wrap_up
         ):
+            if (
+                probe.successful_tool_calls == 0
+                and state.continue_attempts >= self.max_continue_attempts
+            ):
+                # Nothing the nudge asks for has even been attempted, so asking
+                # again cannot help. End the turn; acceptance decides the state.
+                return self._terminal(
+                    CompletionReadinessAction.EXHAUSTED,
+                    "continue_nudges_exhausted_without_tool_progress",
+                    state, required,
+                )
             next_state = CompletionReadinessState(
                 state.continue_attempts + 1, state.disclosure_attempts,
                 state.automatic_resume_attempts,

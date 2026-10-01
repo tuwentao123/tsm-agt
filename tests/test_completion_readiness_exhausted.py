@@ -37,7 +37,7 @@ def _required_gap(effect: ToolEffect = ToolEffect.MUTATE) -> CompletionGap:
 
 def _probe(
     *, remaining_model_calls: int = 10, remaining_tool_calls: int = 10,
-    forced_wrap_up: bool = False,
+    forced_wrap_up: bool = False, successful_tool_calls: int = 0,
     available_effects: frozenset[ToolEffect] = frozenset(
         {ToolEffect.OBSERVE, ToolEffect.MUTATE}
     ),
@@ -51,6 +51,7 @@ def _probe(
         forced_wrap_up=forced_wrap_up,
         available_effects=available_effects,
         available_tools=("core.apply_patch",),
+        successful_tool_calls=successful_tool_calls,
     )
 
 
@@ -72,14 +73,43 @@ class CompletionReadinessGapDeterminismTest(unittest.IsolatedAsyncioTestCase):
         self.policy = RuleBasedCompletionReadinessPolicy()
         await self.policy.start(AdapterContext({}, lambda _type, _payload: None))
 
-    async def test_recoverable_gap_with_resources_keeps_continuing(self) -> None:
-        # The incident shape: the work is closable (a mutate tool is available)
-        # and the turn has budget. Arbitrary numbers of earlier corrections must
-        # NOT produce a stop -- that is iteration, not exhaustion.
-        decision = await self.policy.evaluate(_probe(), _spent_state())
+    async def test_recoverable_gap_with_tool_progress_keeps_continuing(self) -> None:
+        # The incident shape: the work is closable (a mutate tool is available),
+        # the turn has budget, and the model is actually calling tools.
+        # Arbitrary numbers of earlier corrections must NOT produce a stop --
+        # that is iteration, not exhaustion. Progress is what earns the CONTINUE,
+        # so this half of the rule is unchanged.
+        decision = await self.policy.evaluate(
+            _probe(successful_tool_calls=3), _spent_state(),
+        )
 
         self.assertIs(decision.action, CompletionReadinessAction.CONTINUE)
         self.assertEqual(decision.reason, "required_capability_is_available")
+
+    async def test_a_nudge_without_tool_progress_is_bounded(self) -> None:
+        # The other half, added after measurement: when the model has not made a
+        # single successful tool call, another nudge cannot help -- nothing it
+        # asks for has been attempted. Without this the same instruction was
+        # repeated 25 times in one turn (26 model calls, 3 budget renewals).
+        decision = await self.policy.evaluate(
+            _probe(successful_tool_calls=0), _spent_state(continue_attempts=2),
+        )
+
+        self.assertIs(decision.action, CompletionReadinessAction.EXHAUSTED)
+        self.assertEqual(
+            decision.reason,
+            "continue_nudges_exhausted_without_tool_progress",
+        )
+
+    async def test_a_nudge_without_tool_progress_is_allowed_at_first(self) -> None:
+        # The bound is a ceiling, not a refusal to nudge at all: the first
+        # attempts still happen, which is what gives the model its chance.
+        decision = await self.policy.evaluate(
+            _probe(successful_tool_calls=0),
+            _spent_state(continue_attempts=1),
+        )
+
+        self.assertIs(decision.action, CompletionReadinessAction.CONTINUE)
 
     async def test_resource_exhaustion_is_not_reported_as_complete(self) -> None:
         decision = await self.policy.evaluate(

@@ -845,9 +845,13 @@ async def _finish_iteration(
             required_recoverable_work=required_recoverable_work,
         )
         if state.legacy_completion_gate and renewal is not None:
+            # A renewal buys *capacity*, not more nudges. Resetting the
+            # correction counter here let a renewal refill the very budget the
+            # nudge is capped against, so one instruction could be repeated until
+            # the renewal sequence ran out (measured: 25 nudges, 26 calls).
             renewed_state = CompletionReadinessState(
-                continue_attempts=0,
-                disclosure_attempts=0,
+                continue_attempts=readiness.state.continue_attempts,
+                disclosure_attempts=readiness.state.disclosure_attempts,
                 automatic_resume_attempts=renewal.renewal_count,
                 last_action="",
                 schema_version=readiness.state.schema_version,
