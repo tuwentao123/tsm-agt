@@ -1,5 +1,43 @@
 # tsm-agt 不变式术语表
 
+> ## ⚠️ 本表多数条目已不再生效（2026-10，证明层删除）
+>
+> 27 份 SPEC 定义的证明/覆盖层已从代码删除，本表引用的符号多数随之消失。逐条状态如下
+> （均为实测，执行记录见 `tsm-agt-移除证明层方案.md` A.1h–A.1m）：
+>
+> | 状态 | 条目 |
+> |---|---|
+> | **已废** | AG-1 ~ AG-6、AG-10、AG-11、AG-12、AG-13、AG-14、AG-15；INV-3、INV-10、INV-16；`ProofEnforcementMode`；§4 灰度阶段 |
+> | **仍成立** | INV-4、INV-15 |
+> | **部分成立** | AG-7、AG-9、AG-16、INV-13、INV-14 |
+> | **出处已失** | §6 的 AG-16 缺陷记载（该映射已删，缺陷无从违反）；§7 的 F 表（描述 readiness 层，其 gap 产出已删） |
+>
+> **仍成立的两条（已实测）**
+>
+> * **INV-4**：`Kernel._finalize_needs_review` 仍是活的（`kernel.py:2758`、`kernel.py:3667`），
+>   stall cap 仍把任务**有界地**转入 `NEEDS_REVIEW`。真实台账里 13 个任务历史上到过该状态。
+> * **INV-15**：`PhaseAction` 现在**恰好**是 `{OK, CONTINUE, RETURN}`，且循环对三者都有处理
+>   （`tests/test_agent_loop.py::PhaseActionVocabularyTest` 钉住）。原先多出的 `BREAK` 没有任何
+>   分支处理它，是静默 no-op，已删。
+>
+> **部分成立的几条 —— 当前实际行为**
+>
+> * **AG-7**：`NEEDS_REVIEW` / 可恢复挂起仍可达（走 INV-4 那条链），但"证据冲突 / Scope 不完整"
+>   这两个触发源随覆盖层一并消失。
+> * **AG-9**：`_apply_inv3_demotion` / `_JUDGED_GAP_KINDS` / `_EXEMPT_GAP_KINDS` 已删，
+>   `UNFULFILLABLE_REQUIRED` 不再存在。**保留下来的是** `_demote_unresolvable_criteria` 的
+>   `EVIDENCE_REFERENCE` 分支：解析不了的 `evidence_reference` 仍会降级为 `rubric` —— 这是
+>   刻意的防死锁对策（事故 `task-2c8f8fbb75714516a94ab442995626b5`）。
+> * **AG-16**：`TERMINAL_STATE_BY_VERDICT`（verdict → 终态映射）已删，"映射唯一"因此**无从违反**。
+>   残留的是 CLI 退出码映射 `Kernel._exit_code_for`，`NEEDS_REVIEW → 2` 仍被测试钉住。
+> * **INV-13 / INV-14**：readiness 门仍在（`CompletionReadinessAction` 仍存在，仍记
+>   `completion.readiness_evaluated`），但它的 **gap 生产者已删**，所以"完成由 gap 集合决定"
+>   不再成立；终止权语义只剩 INV-4 那一条链。现在的完成是：**模型停止调用工具即结束回合**
+>   （与 Hermes / Codex 同形）。
+>
+> **下面这段引言的"40 处引用"计数已过期**：删除后 `src/` 里对这些记号的引用只剩历史注释与
+> `ports/rubric_judge.py` 这类**有意保留**的适配器契约。
+
 > **为什么存在这份文件**：27 份 SPEC 已按决定从仓库删除，但**代码里仍有 40 处引用这些记号**
 > （`INV-3` 7 · `INV-10` 5 · `INV-13` 5 · `INV-14` 5 · `AG-11` 3 · `P0/P1` 3 · `SPEC P2` 2 · `ProofEnforcementMode` 10）。
 > 本文只保留**记号的定义**，不保留任何 SPEC 正文、方案或实施计划。

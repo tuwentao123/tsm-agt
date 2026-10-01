@@ -1,5 +1,21 @@
 # tsm-agt 完成判定机制（M1 动作 1 / M2 的依据）
 
+> ## ⚠️ 本文整篇描述的机制已从代码中删除（2026-10，证明层删除）
+>
+> 题目里的"完成判定"指 verdict（`AcceptanceStatus`）→ Task 终态的三值判定。该机制已删除：
+> `Kernel.verify_task_acceptance`、`Kernel.finalize_acceptance`、`_evaluate_final_acceptance`、
+> `core/verification.py` 的 `TERMINAL_STATE_BY_VERDICT`、`core/turn_finalizer.py`、
+> `core/turn_outcome.py`，以及 readiness gap 生产、`ProofPlanCompiler`、
+> `artifact_graph` / `proof_obligation` / `evidence_coverage` / `proof_projection` /
+> `semantic_review` 五个模块，全部移除。
+>
+> **当前语义**：回合在**模型停止调用工具**时结束并写 `SUCCEEDED`（`Kernel.complete_task`），
+> 没有任何"先证明再完成"的门；唯一的"领域已验证"标记来自人工复核 accept
+> （`kernel_task.py:902`，`manual_verified: true`）。
+>
+> **本文仅作为历史依据保留** —— 当时的推理、事故分析与外部审计数据都在这里。
+> 执行全过程与逐批证据见 `tsm-agt-移除证明层方案.md` A.1h–A.1m。
+
 > **行号引用已失效（2026 更正中）**：本文写作时 `core/kernel.py` 尚未分解。
 > 此后轮循环已抽为 `core/turn_phases.py` / `core/turn_tool_batch.py`，
 > 并按 Hermes 门面+Mixin 形状开始分解（第 1 刀 `core/kernel_session.py`，

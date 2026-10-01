@@ -68,8 +68,8 @@
 
 | 事实 | 出处 |
 |---|---|
-| 5 套并行词汇表：`TaskState`(20) / `CompletionReadinessAction` / `AcceptanceStatus` / `CoverageStatus` / recovery actions | `tests/architecture/test_dependencies.py` 的 TerminalStateConvergenceTest 棘轮 |
-| 56 个 terminal-state 耦合点：`cli.py` 7 + `core/kernel.py` 34 + `core/task_runtime_projection.py` 7 + `sdk/runtime.py` 8 | 同上 |
+| 原"5 套并行词汇表"**已收敛**：证明层删除后 `CoverageStatus` 与 `TERMINAL_STATE_BY_VERDICT` 不再存在；`AcceptanceStatus` 仍在但**不再映射到任何终态**（只由人工复核 accept 写 `verify.completed`）。现在只有 `TaskState` 命名终态 | `tests/architecture/test_dependencies.py` 的 TerminalStateConvergenceTest 棘轮 |
+| **51 个** terminal-state 耦合点（原文 56）：`cli.py` 5 + `core/kernel.py` 11 + `core/kernel_checkpoint.py` 3 + `core/kernel_input.py` 4 + `core/kernel_session.py` 2 + `core/kernel_steering.py` 1 + `core/kernel_task.py` 13 + `core/task_runtime_projection.py` 7 + `sdk/runtime.py` 5 | 同上（棘轮只降不升，已按证明层删除后的实测收紧）|
 
 对照 Hermes：
 

@@ -1,5 +1,14 @@
 # tsm-agt 循环对齐 Hermes / Codex 的设计方案
 
+> ## ⚠️ 本文提到的终态判定机制已删除（2026-10）
+>
+> 文中 `TERMINAL_STATE_BY_VERDICT`、`finalize_acceptance`、`turn_finalizer`、
+> `AcceptanceStatus → NEEDS_REVIEW/FAILED` 映射、以及"回合结束 → 验收 → 终态"这条链
+> **已全部从代码删除**。当前完成语义是**模型停止调用工具即结束回合**（正是本文主张的
+> Hermes/Codex 形状），唯一"领域已验证"标记来自人工复核 accept。
+> 执行记录见 `tsm-agt-移除证明层方案.md` A.1h–A.1m。
+> **本文保留原文作为设计依据；文中描述的行为不再生效。**
+
 > 依据：本会话对两份源码的实测（Hermes `824f2279d`、Codex `4ef836f883`），
 > 以及 tsm-agt 真实台账（687 Task / 114,840 事件）的核对。
 > 所有 `path:line` 都是读过的，不是推断。

@@ -1,5 +1,12 @@
 # 按 Hermes 重构：kernel.py → facade 的映射与顺序
 
+> ## ⚠️ 行数与 `path:line` 已随证明层删除而变动（2026-10）
+>
+> `kernel.py` 在这份清单写就后又被删掉约 1,400 行（证明层删除：`verify_task_acceptance`
+> 等 kernel 内方法、readiness gap 生产、`_apply_inv3_demotion`、`rubric_judge` 装配，
+> 以及 5 个 `core/` 模块）。**本文所有行号、行数、方法清单都已过期**；请按方法名重新定位。
+> 执行记录见 `tsm-agt-移除证明层方案.md` A.1h–A.1m。
+
 > 目的：回答"现在能不能按 Hermes 重构框架"，并把答案压成可执行的清单。
 > 全部数字为实测：`wc -l`、AST 遍历、`ls`。
 > Hermes 源码在 `/tmp/hermes-src`（`NousResearch/hermes-agent`，`--depth 1`）。

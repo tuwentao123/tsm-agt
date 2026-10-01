@@ -84,10 +84,10 @@
 | `core/turn_outcome.py` | 206 | **形状错误，见 §6** |
 | `core/session_resources.py` | 152 | |
 | `core/session_handoff.py` | 117 | bounded handoff |
-| `core/turn_finalizer.py` | 113 | **形状错误，见 §6** |
+| ~~`core/turn_finalizer.py`~~ | ~~113~~ | **已删除**（证明层删除）|
 | `core/session_interaction.py` | 80 | |
 | `core/turn.py` | 68 | |
-| **合计** | **26,446** | 其中 kernel.py 占 **68%** |
+| **合计** | ~~**26,446**~~ | **本表已过期**：`turn_finalizer`(−113) 已删，`kernel.py` 此后又减约 1,400 行、`core/` 另有 5 个模块整删（约 2,272 行）。占比 68% 不再成立 |
 
 **"重新设计会话框架" = "拆掉 kernel.py + 重组这 15 个文件"。** 这是一个有界工程，不是无底洞。
 

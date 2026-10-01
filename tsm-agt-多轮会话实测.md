@@ -163,3 +163,63 @@
 2. **scoped 载荷绕过第二层。** `ContextWindowManager._compact` 只认 `recent_messages` 这个键；scoped 模式的历史在 `scoped_messages` / `background_messages`（最多 32 + 8 条），**从不被预算层裁剪**。scoped 路径是活的：`_task_spec_planning_context`（INV-8，Planner 只看自己这条 lineage）显式传了 `scope` 且 `include_background=False`，此时 `recent_messages` 被置空（`session_context.py:1028-1031`），于是 `raw_messages = []`，预算层**一条都不会砍**。也就是说未限定作用域的路径有 token 预算兜底，Planner 这条路径只有第一层的固定条数。**未修**，记录在此。
 
 ---
+
+## 10. 证明层删除后的复测（2026-10）
+
+> 目的：证明层删除（`tsm-agt-移除证明层方案.md` A.1h–A.1m）后，**多轮是否仍然工作**，
+> 以及**是否引入了回归**。方法与本文件相同：单会话连续 14 轮、每轮 `submit_session_text`
+> **之后** `run_task`（§7 的教训）、`CONTEXTUAL` 路由、fixture 4096 窗口。
+
+### 10.1 结论一：多轮能跑
+
+**14/14 轮 `SUCCEEDED`，每一轮都真的发出了模型调用。**
+
+| 轮 | 终态 | 模型调用 | 投影字符 | `recent_messages` | `recent_task_summaries` | `earlier_summary` |
+|---|---|---|---|---|---|---|
+| 1 | SUCCEEDED | 1 | 2351 | 1 | 0 | — |
+| 5 | SUCCEEDED | 1 | 6929 | **8（封顶）** | 3 | omit=1, mc=1 |
+| 9 | SUCCEEDED | 1 | 7037 | 8 | 3 | omit=5, mc=9 |
+| 14 | SUCCEEDED | 1 | 7185 | 8 | 3 | omit=10, mc=19 |
+
+有界渲染成立：`recent_messages` 第 5 轮封顶 8 后保持平坦；`earlier_summary` 单调增长。
+
+### 10.2 结论二：与删除前逐项一致
+
+在 `git worktree` 的 `88331b8`（删除前）上跑**同一脚本、同一场景**作对照：
+
+| | 删除前 | 删除后 |
+|---|---|---|
+| 终态 | 14 SUCCEEDED | 14 SUCCEEDED |
+| 每轮模型调用 | 1 | 1 |
+| `recent_messages` 上界 | 8（第 5 轮） | 8（第 5 轮） |
+| `recent_task_summaries` | 3 | 3 |
+| `earlier_summary` 序列 | omit 0→10 / mc 0→19 | **完全相同** |
+| 投影字符（3/6/9/10/14 轮） | 5297 / 6983 / 7061 / 7090 / 7209 | 5281 / 6959 / 7037 / 7066 / 7185 |
+
+把每次运行新生成的 UUID 过滤掉后，**整个载荷里唯一的内容差异**是：
+
+| 字段 | 删除前 | 删除后 |
+|---|---|---|
+| `verification_status` | `"passed"` | **`null`** |
+
+那 −24 字符的差额完全由它构成。这是被删的验收裁决所写的字段；消费者均已核实安全：
+
+* `session_context.py:317` —— 声明即 `str | None`
+* `session_handoff.py:92` —— `source.verification_status or "unknown"`
+* `adapters/rule_based_evidence_level/evaluator.py:44` —— `in {"failed","blocked"}`，`None` 落空
+* CLI/Web 用的是**另一个派生状态**（`task_runtime_projection.py:213`），它读 `verify.completed`
+  事件；该事件**仍在写**，但现在只剩人工复核 accept 一条路径（`kernel_task.py:902`，
+  带 `manual_verified: True`）
+
+**⇒ 现在唯一能把任务标记为"领域已验证"的是显式人工接受。**
+
+### 10.3 对本文 §2 的两处更正
+
+1. **字段名**：本文 §2 表头写 `task_summaries`，载荷里的真键是 **`recent_task_summaries`**。
+   （我第一次复测读错键，得到"恒为 0"的伪像；特此记录以免再犯。）
+2. **具体数字不可复现**：§2 记的投影字符是 6241 / 7669 / 7749 / 7780 / 7897，而**删除前后两次
+   复测**都得到约 5297 / 6983 / 7037 / 7090 / 7209。同一脚本在删除前后是一致的，所以差异
+   来自 §2 当时的场景/构建，而非本次改动。**§2 的定性结论（有界渲染、封顶、第 6 轮平坦）
+   成立并已复核；具体数字请以本节为准。**
+3. **`recent_task_summaries` 未达上限 4**：本场景稳定在 **3**（上限 4）。删除前同样是 3，
+   所以不是本次改动造成的；原因未查明，记录在此。

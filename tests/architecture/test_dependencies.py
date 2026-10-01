@@ -187,11 +187,13 @@ _TERMINAL_STATE_COUPLING_BASELINE = {
     "sdk/runtime.py": 5,
 }
 
-#: Modules allowed to name terminal states: the enum itself, the verdict mapping,
-#: and the outcome vocabulary.
+#: Modules allowed to name terminal states: the enum itself and the outcome
+#: vocabulary. ``core/verification.py`` was dropped when the verdict -> terminal
+#: mapping (``TERMINAL_STATE_BY_VERDICT``) was removed -- it no longer names a
+#: terminal state at all, so keeping it here would grant a permission nothing
+#: uses.
 _TERMINAL_STATE_AUTHORITY = {
     "core/task.py",
-    "core/verification.py",
 }
 
 

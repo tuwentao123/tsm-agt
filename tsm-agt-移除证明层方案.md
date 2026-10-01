@@ -980,3 +980,45 @@ replay 兼容风险**。
 证明层已彻底不在运行路径上：不产出、不计算、不裁决、不阻断、不装配。剩下的
 `ports/rubric_judge.py` 与 `adapters/model_rubric_judge/` 是**有意保留的适配器**（可一行重新
 注册接回），`TaskCriterionKind.POST_MUTATION_COMMAND` 是**有意保留的 replay 墓碑**。
+
+## A.1n 批 8 —— 文档同步（方案风险表里的必做项）
+
+**结果：1241 passed / 12 skipped / 0 failed。**
+
+### 7 份文档，逐份按"陈旧程度"给处置，不是套一句通用横幅
+
+| 文档 | 陈旧引用 | 处置 |
+|---|---|---|
+| `tsm-agt-完成判定机制.md` | 6 | **整篇主题即被删机制** → 横幅说明题目所指的 verdict→终态判定已不存在，并给出当前语义 |
+| `tsm-agt-不变式术语表.md` | 2（原文多处）| **查阅型文档，泛横幅不够** → 横幅 + **逐条状态表**（已废 / 仍成立 / 部分成立 / 出处已失）|
+| `tsm-agt-对齐Hermes设计方案.md` | 5 | 横幅：终态映射链已删；本文主张的 Hermes 形状**已落地** |
+| `tsm-agt-按Hermes重构kernel映射.md` | 9 | 横幅：行数/行号/方法清单全部过期（kernel 又减约 1,400 行）|
+| `tsm-agt-单轮多轮重构方案.md` | 4 | **直接改事实**：原文"5 套并行词汇表 / 56 个耦合点" → 已收敛 + 实测 51 |
+| `tsm-agt-会话框架重设计.md` | 2 | 行内标记 `turn_finalizer.py` 已删 + 合计行标注过期 |
+| `tsm-agt-多轮会话实测.md` | 0 | 新增 §10：删除后复测（见 A.1o）|
+
+### 术语表的逐条判真（这是本批最需要证据的部分）
+
+**仍成立 2 条**（实测）：`INV-4`（`_finalize_needs_review` 活于 `kernel.py:2758,3667`）、
+`INV-15`（`PhaseAction` 恰好 `{OK, CONTINUE, RETURN}`，三者都有处理，新增测试钉住）。
+
+**部分成立 4 条**（各自写明当前实际行为）：`AG-7`（NEEDS_REVIEW 仍可达，但覆盖层触发源消失）、
+`AG-9`（`_apply_inv3_demotion` 已删；保留的是 `_demote_unresolvable_criteria` 的
+`EVIDENCE_REFERENCE` 分支 —— 防死锁对策）、`AG-16`（`TERMINAL_STATE_BY_VERDICT` 已删故无从违反，
+残留 `_exit_code_for`）、`INV-13/14`（readiness 门仍在但 gap 生产者已删）。
+
+`AG-13` 单独核实后归入**已废**：枚举完整性校验随覆盖层消失，`stop_reason` / `skipped_count`
+在全域只剩 `ports/tool.py` 一句注释。
+
+### 顺带修掉一处**代码里的**过期断言
+
+`tests/architecture/test_dependencies.py` 的 `_TERMINAL_STATE_AUTHORITY` 注释写
+"the enum itself, **the verdict mapping**, and the outcome vocabulary"，并把
+`core/verification.py` 列为终态权威。实测该文件（70 行）**零** `TaskState`/`terminal` 引用 ——
+verdict 映射删掉后它不再命名任何终态，该条目是**没人在用的许可**。已从集合移除并改正注释。
+架构测试 17 passed / 45 subtests 通过。
+
+### 棘轮基线说明
+
+`_TERMINAL_STATE_COUPLING_BASELINE` 合计已从 56 收紧到 **51**（`cli.py` 7→5、`sdk/runtime.py`
+8→5，会话内已回写）。`tsm-agt-单轮多轮重构方案.md` 里仍写 56，本批改为实测值并列出各文件分解。
