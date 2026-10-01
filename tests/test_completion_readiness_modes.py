@@ -201,20 +201,6 @@ class CompletionReadinessModeTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await application.registry.stop_all()
 
-    def _unclosable_gaps(self, events) -> list[tuple]:
-        for event in events:
-            if event.event_type != "completion.readiness_evaluated":
-                continue
-            return [
-                (gap.get("kind"), gap.get("status"), gap.get("required"),
-                 gap.get("recoverable"), tuple(gap.get("candidate_tools") or ()))
-                for gap in (event.payload.get("gaps") or ())
-                if gap.get("required")
-                and not gap.get("required_effects")
-                and not (gap.get("candidate_tools") or ())
-            ]
-        return []
-
     async def test_a_blocked_question_no_longer_strands_the_turn(self) -> None:
         """The incident, fixed: a wrong guess must not park the Task.
 
@@ -231,16 +217,16 @@ class CompletionReadinessModeTest(unittest.IsolatedAsyncioTestCase):
         # AWAITING_USER, and the exit code says so.
         self.assertEqual(exit_code, 0)
         self.assertIs(current.state, TaskState.SUCCEEDED)
-        self.assertEqual(
-            self._unclosable_gaps(events),
-            [("EVIDENCE_QUESTION", "BLOCKED", True, False, ())],
-        )
-        # The blocker is still disclosed, exactly once: dropping the suspension
-        # did not silence the honest report.
-        self.assertEqual(sum(
-            event.event_type == "completion.blocker_disclosure_requested"
+        # The unprovable read is not turned into an obligation the model can
+        # never discharge, and nothing suspends the turn to ask for it.
+        self.assertFalse(any(
+            event.event_type == "continuation.requested" for event in events
+        ))
+        self.assertFalse(any(
+            event.event_type == "completion.readiness_evaluated"
+            and (event.payload.get("gaps") or ())
             for event in events
-        ), 1)
+        ))
 
     async def test_every_mode_closes_the_same_way(self) -> None:
         """The mode tunes in-turn nudges only; completion is mode-independent."""

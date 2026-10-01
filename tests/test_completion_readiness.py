@@ -408,163 +408,6 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
             "task_spec.revised", {"snapshot": spec.to_data()},
         ),))
 
-    async def test_post_mutation_correction_can_request_approved_verification(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / "changed.py"
-            target.write_text("value = 1\n", encoding="utf-8")
-            (root / "test_changed.py").write_text(
-                "import unittest\n"
-                "import changed\n\n"
-                "class ChangedTest(unittest.TestCase):\n"
-                "    def test_value(self):\n"
-                "        self.assertEqual(changed.value, 2)\n",
-                encoding="utf-8",
-            )
-            workspace_path = PosixWorkspacePath()
-            app = compose_fixture_application(
-                model_adapter=PostMutationVerificationModel(),
-                tool_adapters=(CoreProcessToolProvider(),),
-                process_adapter=LocalProcessExecutor(),
-                sandbox_adapter=LocalWorkspaceSandbox(workspace_path),
-                workspace_path_adapter=workspace_path,
-                completion_readiness_policy_adapter=(
-                    RuleBasedCompletionReadinessPolicy()
-                ),
-            )
-            await app.registry.start_all()
-            try:
-                await app.kernel.set_project_trust(
-                    root, ProjectTrustLevel.TRUSTED_BUILD
-                )
-                task = await executing_task(app, root, "ready-verify-e2e")
-                await self._require_command_verification(app, task)
-                await app.kernel.write_workspace_text(
-                    task.task_id, "change-file", target.name, "value = 2\n",
-                    hashlib.sha256(b"value = 1\n").hexdigest(),
-                )
-                suspended = await app.kernel.run_agent_turn(
-                    task.task_id, "finish and verify the change",
-                    max_model_calls=5, max_tool_calls=2,
-                )
-                self.assertIsInstance(suspended, AgentTurnSuspended)
-                assert isinstance(suspended, AgentTurnSuspended)
-                completed = await app.kernel.resolve_agent_approval(
-                    suspended.approval_request_id, ApprovalDecision.APPROVE,
-                    "approve the exact local unit test",
-                )
-                self.assertIsInstance(completed, AgentTurnResult)
-                assert isinstance(completed, AgentTurnResult)
-                self.assertEqual(
-                    completed.assistant_message.text,
-                    "Change verified successfully.",
-                )
-                events = await app.registry.require(RuntimeStorePort).read_events(
-                    task.task_id
-                )
-                self.assertGreaterEqual(sum(
-                    event.event_type == "completion.continuation_requested"
-                    for event in events
-                ), 1)
-                command_results = [
-                    event.payload["result"]
-                    for event in events if event.event_type == "tool.completed"
-                    and event.payload.get("result", {}).get("call_id")
-                    == "verify-change"
-                ]
-                self.assertEqual(command_results[-1]["data"]["exit_code"], 0)
-            finally:
-                await app.registry.stop_all()
-
-    async def test_completion_gap_renews_model_budget_before_verification(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / "changed.py"
-            target.write_text("value = 1\n", encoding="utf-8")
-            (root / "test_changed.py").write_text(
-                "import unittest\nimport changed\n\n"
-                "class ChangedTest(unittest.TestCase):\n"
-                "    def test_value(self):\n"
-                "        self.assertEqual(changed.value, 2)\n",
-                encoding="utf-8",
-            )
-            workspace_path = PosixWorkspacePath()
-            app = compose_fixture_application(
-                model_adapter=PostMutationVerificationModel(),
-                tool_adapters=(CoreProcessToolProvider(),),
-                process_adapter=LocalProcessExecutor(),
-                sandbox_adapter=LocalWorkspaceSandbox(workspace_path),
-                workspace_path_adapter=workspace_path,
-                completion_readiness_policy_adapter=(
-                    RuleBasedCompletionReadinessPolicy()
-                ),
-            )
-            # Tight deterministic limits prove renewal happens at the existing
-            # CompletionReadiness boundary rather than at a generic progress hook.
-            dependencies = app.kernel.dependencies
-            object.__setattr__(
-                dependencies, "model_call_renewal_increments", (2,)
-            )
-            object.__setattr__(
-                dependencies, "model_call_renewal_max_count", 1
-            )
-            object.__setattr__(
-                dependencies, "model_call_renewal_absolute_limit", 3
-            )
-            object.__setattr__(
-                dependencies, "model_call_renewal_threshold", 0
-            )
-            await app.registry.start_all()
-            try:
-                await app.kernel.set_project_trust(
-                    root, ProjectTrustLevel.TRUSTED_BUILD
-                )
-                task = await executing_task(app, root, "ready-renew-budget")
-                await self._require_command_verification(app, task)
-                await app.kernel.write_workspace_text(
-                    task.task_id, "change-file", target.name, "value = 2\n",
-                    hashlib.sha256(b"value = 1\n").hexdigest(),
-                )
-                suspended = await app.kernel.run_agent_turn(
-                    task.task_id, "finish and verify the change",
-                    max_model_calls=1, max_tool_calls=2,
-                )
-                self.assertIsInstance(suspended, AgentTurnSuspended)
-                saved = await app.kernel.get_task(task.task_id)
-                checkpoint = AgentTurnCheckpoint.from_data(
-                    saved.active_agent_checkpoint or {}
-                )
-                self.assertEqual(checkpoint.max_model_calls, 3)
-                self.assertEqual(checkpoint.model_budget_renewal_count, 1)
-                self.assertEqual(checkpoint.model_budget_total_granted, 2)
-                events = await app.registry.require(RuntimeStorePort).read_events(
-                    task.task_id
-                )
-                renewal = next(
-                    event for event in events
-                    if event.event_type == "budget.renewed"
-                )
-                self.assertEqual(renewal.payload["increment"], 2)
-                self.assertEqual(renewal.payload["previous_max_model_calls"], 1)
-                self.assertEqual(renewal.payload["max_model_calls"], 3)
-                self.assertFalse(any(
-                    event.event_type == "completion.automatic_resume_started"
-                    for event in events
-                ))
-                # The renewal event and renewed checkpoint are one commit unit:
-                # the following checkpoint receipt carries the same count.
-                renewal_index = events.index(renewal)
-                self.assertEqual(events[renewal_index - 1].event_type, "llm.completed")
-                self.assertEqual(events[renewal_index + 1].event_type, "checkpoint.saved")
-                self.assertEqual(
-                    events[renewal_index + 1].payload[
-                        "model_budget_renewal_count"
-                    ],
-                    1,
-                )
-            finally:
-                await app.registry.stop_all()
-
     async def test_execute_gap_continues_when_execute_capability_is_visible(self) -> None:
         policy = RuleBasedCompletionReadinessPolicy()
         await policy.start(None)  # type: ignore[arg-type]
@@ -620,54 +463,6 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await policy.stop(None)  # type: ignore[arg-type]
 
-    async def test_kernel_exposes_post_mutation_execute_recovery(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / "changed.py"
-            target.write_text("before\n", encoding="utf-8")
-            app = compose_fixture_application(
-                tool_adapters=(CoreProcessToolProvider(),),
-                completion_readiness_policy_adapter=(
-                    RuleBasedCompletionReadinessPolicy()
-                ),
-            )
-            await app.registry.start_all()
-            try:
-                task = await executing_task(app, root, "ready-mutation")
-                await self._require_command_verification(app, task)
-                await app.kernel.write_workspace_text(
-                    task.task_id, "change-file", target.name, "after\n",
-                    hashlib.sha256(b"before\n").hexdigest(),
-                )
-                tools = await app.kernel.list_tools()
-                gaps = await app.kernel._completion_readiness_gaps(
-                    task.task_id, tools
-                )
-                gap = next(
-                    item for item in gaps
-                    if item.kind == "TASK_SPEC_POST_MUTATION_COMMAND"
-                )
-                self.assertEqual(gap.required_effects, (ToolEffect.EXECUTE,))
-                self.assertEqual(gap.candidate_tools, ("core.run_command",))
-
-                checkpoint = AgentTurnCheckpoint(
-                    task.task_id, "turn-mutation", 1, (), (), (),
-                    0, 0, 0, 0, 3, 3, 512, 10.0,
-                )
-                decision = await app.kernel._evaluate_completion_readiness(
-                    task.task_id, checkpoint.turn_id, checkpoint, tools,
-                    forced_wrap_up=False,
-                )
-                self.assertEqual(
-                    decision.action, CompletionReadinessAction.CONTINUE
-                )
-                correction = app.kernel._completion_correction_message(decision)
-                self.assertNotIn("read-only", correction.text)
-                self.assertIn("normal argument validation", correction.text.lower())
-                self.assertIn("core.run_command", correction.text)
-            finally:
-                await app.registry.stop_all()
-
     async def test_mutation_only_delivery_does_not_invent_command_verification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -715,110 +510,6 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
-    async def test_all_criterion_kinds_create_readiness_gaps(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / "changed.txt"
-            target.write_text("before\n", encoding="utf-8")
-            app = compose_fixture_application(
-                tool_adapters=(CoreProcessToolProvider(),),
-                completion_readiness_policy_adapter=(
-                    RuleBasedCompletionReadinessPolicy()
-                ),
-            )
-            await app.registry.start_all()
-            try:
-                task = await executing_task(app, root, "criterion-gaps")
-                await self._set_acceptance_criteria(
-                    app, task,
-                    TaskAcceptanceCriterion(
-                        "workspace", "Workspace remains durable",
-                        TaskCriterionKind.WORKSPACE_INTEGRITY,
-                    ),
-                    TaskAcceptanceCriterion(
-                        "command", "Run verification after mutation",
-                        TaskCriterionKind.POST_MUTATION_COMMAND,
-                    ),
-                    TaskAcceptanceCriterion(
-                        "evidence", "Record a trusted event",
-                        TaskCriterionKind.EVIDENCE_REFERENCE, "event:999999",
-                    ),
-                )
-                await app.kernel.write_workspace_text(
-                    task.task_id, "change", target.name, "after\n",
-                    hashlib.sha256(b"before\n").hexdigest(),
-                )
-                target.write_text("drifted\n", encoding="utf-8")
-                gaps = await app.kernel._completion_readiness_gaps(
-                    task.task_id, await app.kernel.list_tools()
-                )
-                by_id = {gap.gap_id: gap for gap in gaps}
-                self.assertEqual(
-                    by_id["task-spec:workspace"].kind,
-                    "TASK_SPEC_WORKSPACE_INTEGRITY",
-                )
-                self.assertEqual(
-                    by_id["task-spec:command"].kind,
-                    "TASK_SPEC_POST_MUTATION_COMMAND",
-                )
-                self.assertEqual(
-                    by_id["task-spec:evidence"].kind,
-                    "TASK_SPEC_EVIDENCE",
-                )
-            finally:
-                await app.registry.stop_all()
-
-    async def test_outcome_and_acceptance_gates_remain_parallel(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(
-                tool_adapters=(CoreProcessToolProvider(),),
-                completion_readiness_policy_adapter=(
-                    RuleBasedCompletionReadinessPolicy()
-                ),
-            )
-            await app.registry.start_all()
-            try:
-                task = await executing_task(app, Path(directory), "parallel-gates")
-                current = await app.kernel.get_task_spec(task.task_id)
-                proposal = TaskSpecProposal.from_data({
-                    "schema_version": 1, "goal": task.goal,
-                    "scope": ["."], "constraints": [],
-                    "outcomes": [{
-                        "outcome_id": "verification",
-                        "description": "Run required verification",
-                        "kind": "COMMAND_RESULT",
-                        "required_effects": ["execute"], "required": True,
-                    }],
-                    "continuation_policy": {"mode": "NONE"},
-                })
-                spec = TaskSpecSnapshot.from_proposal(
-                    task.task_id, current.revision + 1, proposal,
-                    (TaskAcceptanceCriterion(
-                        "command", "Run verification after mutation",
-                        TaskCriterionKind.POST_MUTATION_COMMAND,
-                    ),),
-                )
-                await app.kernel._append_events(task.task_id, ((
-                    "task_spec.revised", {"snapshot": spec.to_data()},
-                ),))
-                # A post-mutation criterion only applies once the Task has
-                # actually changed something. Produce that change so the
-                # criterion is unmet rather than inapplicable.
-                await app.kernel.write_workspace_text(
-                    task.task_id, "change", "changed.txt", "after\n", None,
-                )
-                gaps = await app.kernel._completion_readiness_gaps(
-                    task.task_id, await app.kernel.list_tools()
-                )
-                self.assertFalse(any(
-                    gap.kind == "REQUIRED_OUTCOME_UNSATISFIED" for gap in gaps
-                ))
-                self.assertTrue(any(
-                    gap.gap_id == "task-spec:command" for gap in gaps
-                ))
-            finally:
-                await app.registry.stop_all()
-
     async def test_unmet_acceptance_criterion_ends_turn_honestly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             app = compose_fixture_application(
@@ -843,22 +534,21 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                     task.task_id, "complete the task", max_model_calls=4,
                     max_tool_calls=1,
                 )
-                # The gate nudges once for an honest report, then lets the turn
-                # finish. It never strands the turn in AWAITING_USER: the model's
-                # own blocker report is the answer.
+                # No obligation record: the turn simply ends, and the Runtime
+                # never parks the Task waiting for a proof.
                 self.assertIsInstance(result, AgentTurnResult)
-                self.assertIn("Blocked", result.assistant_message.text)
                 current = await app.kernel.get_task(task.task_id)
                 self.assertEqual(current.state, TaskState.EXECUTING)
                 events = await app.registry.require(RuntimeStorePort).read_events(
                     task.task_id
                 )
-                self.assertEqual(sum(
-                    event.event_type == "completion.blocker_disclosure_requested"
-                    for event in events
-                ), 1)
                 self.assertFalse(any(
                     event.event_type == "continuation.requested" for event in events
+                ))
+                self.assertFalse(any(
+                    event.event_type == "completion.readiness_evaluated"
+                    and (event.payload.get("gaps") or ())
+                    for event in events
                 ))
             finally:
                 await app.registry.stop_all()
@@ -1017,34 +707,6 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                     event.event_type == "completion.continuation_requested"
                     for event in events
                 ), 0)
-            finally:
-                await app.registry.stop_all()
-
-    async def test_blocked_question_requests_one_truthful_disclosure(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            model = ReadinessSequenceModel()
-            app = compose_fixture_application(
-                model_adapter=model, tool_adapters=(BlockedReadTool(),),
-                require_evidence_questions=True,
-                completion_readiness_policy_adapter=(
-                    RuleBasedCompletionReadinessPolicy()
-                ),
-            )
-            await app.registry.start_all()
-            try:
-                task = await executing_task(app, Path(directory), "ready-blocked")
-                result = await app.kernel.run_agent_turn(
-                    task.task_id, "inspect", max_model_calls=8, max_tool_calls=4
-                )
-                self.assertIn("permission denied", result.assistant_message.text)
-                self.assertFalse(model.requests[-1].allow_tool_calls)
-                events = await app.registry.require(RuntimeStorePort).read_events(
-                    task.task_id
-                )
-                self.assertEqual(sum(
-                    event.event_type == "completion.blocker_disclosure_requested"
-                    for event in events
-                ), 1)
             finally:
                 await app.registry.stop_all()
 
@@ -1504,72 +1166,6 @@ class BusinessFailureModel(EchoModelProvider):
 class UnresolvedEffectFailureTest(unittest.IsolatedAsyncioTestCase):
     """SPEC 5.2/5.3 regression: a failed effect must not be reported complete."""
 
-    async def test_nonzero_command_creates_a_required_effect_failure_gap(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            application = compose_fixture_application(
-                model_adapter=BusinessFailureModel(),
-                tool_adapters=(BusinessFailureCommandTool(),),
-                completion_readiness_policy_adapter=(
-                    RuleBasedCompletionReadinessPolicy()
-                ),
-            )
-            await application.registry.start_all()
-            try:
-                task = await executing_task(
-                    application, root, "nonzero-command"
-                )
-                await application.kernel.run_agent_turn(
-                    task.task_id, "run the command", max_model_calls=3,
-                )
-                gaps = await application.kernel._completion_readiness_gaps(
-                    task.task_id, await application.kernel.list_tools()
-                )
-                effect_gaps = [
-                    gap for gap in gaps
-                    if gap.kind == "UNRESOLVED_EFFECT_FAILURE"
-                ]
-                self.assertTrue(effect_gaps, [gap.kind for gap in gaps])
-                self.assertEqual(
-                    effect_gaps[0].required_effects, (ToolEffect.EXECUTE,),
-                )
-                self.assertEqual(
-                    effect_gaps[0].status, "failed",
-                )
-                events = await application.registry.require(
-                    RuntimeStorePort
-                ).read_events(task.task_id)
-                readiness = [
-                    event for event in events
-                    if event.event_type == "completion.readiness_evaluated"
-                ]
-                self.assertTrue(readiness)
-                # Corrections may run out and force a COMPLETE, but a forced
-                # COMPLETE must still carry the required gap so the fail-closed
-                # final acceptance turns it into a BLOCK. No clean completion
-                # (COMPLETE with no required gap) may exist.
-                clean_completions = [
-                    event for event in readiness
-                    if event.payload["action"] == "COMPLETE"
-                    and not any(
-                        gap.get("kind") == "UNRESOLVED_EFFECT_FAILURE"
-                        and gap.get("required", True)
-                        for gap in event.payload.get("gaps", [])
-                    )
-                ]
-                self.assertEqual(clean_completions, [])
-            finally:
-                await application.registry.stop_all()
-
-
-class AcceptanceGateInvariantTest(unittest.IsolatedAsyncioTestCase):
-    """P0-2 / P0-3 regression guards.
-
-    An unresolved ``evidence_reference`` criterion must be advisory (it asserts
-    an already-true fact, never work to be done), and a crashed readiness policy
-    must be fail-closed instead of fail-open.
-    """
-
     async def _set_acceptance_criteria(self, app, task, *criteria) -> None:
         current = await app.kernel.get_task_spec(task.task_id)
         spec = replace(
@@ -1579,42 +1175,6 @@ class AcceptanceGateInvariantTest(unittest.IsolatedAsyncioTestCase):
         await app.kernel._append_events(task.task_id, ((
             "task_spec.revised", {"snapshot": spec.to_data()},
         ),))
-
-    async def test_unresolved_evidence_reference_gap_is_advisory(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(tool_adapters=())
-            await app.registry.start_all()
-            try:
-                task = await executing_task(app, Path(directory), "advisory-evidence")
-                await self._set_acceptance_criteria(
-                    app, task,
-                    TaskAcceptanceCriterion(
-                        "evidence", "Record a trusted event",
-                        TaskCriterionKind.EVIDENCE_REFERENCE, "event:999999",
-                    ),
-                )
-                gaps = await app.kernel._completion_readiness_gaps(
-                    task.task_id, await app.kernel.list_tools()
-                )
-                evidence_gaps = [
-                    gap for gap in gaps if gap.gap_id == "task-spec:evidence"
-                ]
-                self.assertEqual(len(evidence_gaps), 1)
-                self.assertEqual(evidence_gaps[0].kind, "TASK_SPEC_EVIDENCE")
-                self.assertFalse(evidence_gaps[0].required)
-
-                # INV-3: every required gap must be closable (or judged).
-                for gap in gaps:
-                    if gap.required:
-                        self.assertTrue(
-                            gap.effective_required_effects
-                            or gap.kind in {
-                                "TASK_SPEC_RUBRIC", "EVIDENCE_QUESTION",
-                            },
-                            f"unclosable required gap {gap.gap_id} ({gap.kind})",
-                        )
-            finally:
-                await app.registry.stop_all()
 
     async def test_unresolved_evidence_reference_does_not_suspend_turn(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

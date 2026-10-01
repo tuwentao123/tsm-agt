@@ -2032,26 +2032,6 @@ class CoverageGateEnforcementTest(unittest.IsolatedAsyncioTestCase):
             [gap for gap in gaps if gap.kind.startswith("PROOF_COVERAGE_")], [],
         )
 
-    async def test_enforce_mode_routes_coverage_into_the_readiness_gate(self) -> None:
-        gaps = await self._gaps(
-            enforcement=ProofEnforcementMode.ENFORCE_NEW_TASKS,
-        )
-        coverage_gaps_found = [
-            gap for gap in gaps if gap.kind.startswith("PROOF_COVERAGE_")
-        ]
-        self.assertTrue(coverage_gaps_found)
-        for gap in coverage_gaps_found:
-            with self.subTest(gap=gap.kind):
-                # A coverage gap is a *required* readiness gap, never advisory.
-                self.assertTrue(gap.required)
-                # ... and it survives INV-3, so it cannot be silently dropped.
-                self.assertIn(gap.kind, ESCALATED_GAP_KINDS)
-                self.assertTrue(gap.evidence_reference)
-
-
-class SemanticReviewPacketTest(unittest.TestCase):
-    """SPEC §6 / P3: structured packet in, bounded verdict out."""
-
     def packet(self, *, required=True):
         from tsm_agt.core.semantic_review import build_semantic_review_packet
 

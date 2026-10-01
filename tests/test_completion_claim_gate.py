@@ -410,27 +410,6 @@ class DeliveryGapTest(unittest.IsolatedAsyncioTestCase):
         await app.kernel.plan_task_spec(task.task_id)
         return await app.kernel._completion_readiness_gaps(task.task_id, ())
 
-    async def test_mutate_contract_without_change_is_a_required_gap(self) -> None:
-        gaps = await self._gaps(
-            _proposal("implement", effects=["mutate"]), "gate-gap-mutate",
-        )
-        delivery = [
-            gap for gap in gaps if gap.kind == "REQUIRED_DELIVERY_UNSATISFIED"
-        ]
-        self.assertEqual(len(delivery), 1)
-        self.assertTrue(delivery[0].required)
-        self.assertEqual(delivery[0].required_effects, (ToolEffect.MUTATE,))
-
-    async def test_execute_contract_without_a_run_is_a_required_gap(self) -> None:
-        gaps = await self._gaps(
-            _proposal("run the tests", effects=["execute"]), "gate-gap-execute",
-        )
-        delivery = [
-            gap for gap in gaps if gap.kind == "REQUIRED_DELIVERY_UNSATISFIED"
-        ]
-        self.assertEqual(len(delivery), 1)
-        self.assertEqual(delivery[0].required_effects, (ToolEffect.EXECUTE,))
-
     async def test_observe_only_contract_is_not_gated(self) -> None:
         gaps = await self._gaps(
             _proposal("explain", effects=["observe"], kind="EVIDENCE"),

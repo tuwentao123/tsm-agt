@@ -146,6 +146,33 @@ async def transition_task(self, task_id, target, reason, *, authority: str = "ru
 * 已知遗留（未在本步处理）：`readiness.action` 里 `REPORT_BLOCKED` 已无人产出；
   `PhaseAction.BREAK`、`REPORT_INCOMPLETE_RECOVERABLE` 同属死值。
 
+### S2b —— 停止构造 readiness gap ✅ 已落地
+* `kernel.py::_completion_readiness_gaps` —— **四个调用点共享的唯一缝隙**
+  （`kernel._evaluate_completion_readiness`、`turn_phases` ×2、`kernel_task` ×1）——
+  整体改为 `return ()`：删掉 315 行 gap 构造（准则/证据问题/未决副作用/变更后校验
+  四条来源全在内）。
+* 效果：readiness 策略永远看到空 gap 集合 ⇒ 永远 `COMPLETE` ⇒ **nudge 与 disclosure
+  都不再产生**，模型一停就结束回合。这就是 Hermes/Codex 的语义。
+* 关闭 `completion.invariant_violated`（INV-3 demotion）诊断：它随 gap 一起消失。
+
+**实测删除面（16 条失败，全部是"预期有 gap，结果没有"）**：
+
+| 类别 | 数量 | 处置 |
+|---|---|---|
+| 纯 gap 生产规格 | 13 | **删除**：`test_completion_claim_gate` ×2、`test_completion_readiness` ×8、`test_goal_alignment` ×1、`test_post_mutation_applicability` ×1、`test_proof_closure` ×1 |
+| 以 gap 为触发、但主体另有其事 | 3 | **改写**：事故复现测试去掉 gap/disclosure 断言、保留"经生产入口闭合为 SUCCEEDED"；`unmet_acceptance_criterion` 同上；`reapplied_change` 保留 `_has_active_workspace_mutation`，去掉 gap 断言 |
+
+* 保留未动：`_task_outcome_completion_gaps`（显式 outcome 交付声明，另一条路径）、
+  `_unfinished_plan_instruction`（计划提醒，不是门）。
+* 遗留债（下一步）：
+  1. `_completion_readiness_gaps` 现在是个 8 行的空壳，其背后的 gap 机制
+     （`CompletionGap`、INV-3 demotion、`_proof_coverage_gaps`、
+     `_task_outcome_completion_gaps`）需要按附录 A 分批删除。
+  2. **renewal 机制**（`turn_phases` 的 `DiminishingModelCallBudgetPolicy` 分支）
+     原本由 gap 触发，现在已无人使用 → 可与 `DiminishingModelCallBudgetPolicy` 同批删。
+  3. 被删测试留下的孤儿夹具/导入（如 `CriterionBlockedModel`、
+     `_require_command_criterion` 的部分调用者）需在下一批清理。
+
 ### S2 —— 停止产出
 * 不再编译 obligation（`ProofPlanCompiler`）、不再构造 gap（`_completion_gaps`）、
   不再注入 readiness 诊断与 nudge（`policy`、`turn_phases` 的相关分支）。

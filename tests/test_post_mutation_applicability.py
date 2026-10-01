@@ -134,30 +134,6 @@ class PostMutationApplicabilityTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
-    async def test_change_without_verification_still_owes_a_command(self) -> None:
-        """Regression guard: a real change keeps the criterion enforceable."""
-        with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application()
-            await app.registry.start_all()
-            try:
-                task = await executing_task(app, Path(directory), "changed-unverified")
-                await self._require_command_criterion(app, task)
-                await app.kernel.write_workspace_text(
-                    task.task_id, "change", "app.py", "value = 1\n", None,
-                )
-
-                gaps = await self._gaps(app, task)
-
-                gap = next(
-                    item for item in gaps
-                    if item.gap_id == "task-spec:ac_build_or_validation"
-                )
-                self.assertEqual(gap.kind, "TASK_SPEC_POST_MUTATION_COMMAND")
-                self.assertTrue(gap.required)
-                self.assertEqual(gap.required_effects, (ToolEffect.EXECUTE,))
-            finally:
-                await app.registry.stop_all()
-
     async def test_change_without_verification_is_blocked_in_verifier(self) -> None:
         """Regression guard: the verifier must still refuse an unverified change."""
         with tempfile.TemporaryDirectory() as directory:
@@ -211,8 +187,8 @@ class PostMutationApplicabilityTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
-    async def test_reapplied_change_owes_a_command_again(self) -> None:
-        """Rolling back and changing again leaves a net change to verify."""
+    async def test_reapplied_change_is_still_an_active_mutation(self) -> None:
+        """Rolling back and changing again leaves a net change on disk."""
         with tempfile.TemporaryDirectory() as directory:
             app = compose_fixture_application()
             await app.registry.start_all()
@@ -231,10 +207,9 @@ class PostMutationApplicabilityTest(unittest.IsolatedAsyncioTestCase):
 
                 current = await app.kernel.get_task(task.task_id)
                 self.assertTrue(_has_active_workspace_mutation(current))
-                self.assertIn(
-                    "task-spec:ac_build_or_validation",
-                    {gap.gap_id for gap in await self._gaps(app, task)},
-                )
+                # The journal tracks the net effect; no obligation is raised for
+                # it, in either the rolled-back or the re-applied case.
+                self.assertEqual(list(await self._gaps(app, task)), [])
             finally:
                 await app.registry.stop_all()
 

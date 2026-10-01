@@ -243,38 +243,3 @@ class GoalAlignmentJudgingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             verification.status.value, AcceptanceStatus.BLOCKED.value
         )
-
-    async def test_readiness_gap_reports_missing_judge(self) -> None:
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        app = compose_fixture_application()
-        await app.registry.start_all()
-        self.addAsyncCleanup(app.registry.stop_all)
-        task = await _executing_task(
-            app, Path(directory.name), "no-judge-gap",
-        )
-        current = await app.kernel.get_task_spec(task.task_id)
-        spec = replace(
-            current, revision=current.revision + 1, content_hash="",
-            acceptance_criteria=(TaskAcceptanceCriterion(
-                "answer-alignment", "answer the request",
-                TaskCriterionKind.GOAL_ALIGNMENT,
-            ),),
-        )
-        await app.kernel._append_events(task.task_id, ((
-            "task_spec.revised", {"snapshot": spec.to_data()},
-        ),))
-
-        gaps = await app.kernel._completion_readiness_gaps(task.task_id, ())
-
-        matching = [
-            gap for gap in gaps
-            if gap.kind == "JUDGED_CRITERION_WITHOUT_JUDGE"
-        ]
-        self.assertEqual(len(matching), 1)
-        # INV-3 must not demote it: it is a configuration gap, not work.
-        self.assertTrue(matching[0].required)
-
-
-if __name__ == "__main__":
-    unittest.main()
