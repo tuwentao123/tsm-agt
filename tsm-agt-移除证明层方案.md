@@ -401,6 +401,52 @@ ports/evidence_guided_exploration.py  ports/evidence_level.py
 先做批 3（`verification.py` + 两个 verification_*.py + `POST_MUTATION_COMMAND`）,
 再回头收 `evidence_question.py`。
 
+## A.1c 批 3 重扫（HEAD 实测）—— 这是最大的一批，必须再切片
+
+**源码侧**（比想象小）：
+* `core/__init__.py:153` 门面导出（AcceptanceResult / AcceptanceStatus / Evidence /
+  TaskVerificationResult / TERMINAL_STATE_BY_VERDICT / terminal_state_for）
+* `kernel.py:364`、`kernel_task.py:72`
+* `verification_command`：`kernel.py:291`、`kernel_tool.py:101`、`task_spec.py:22`
+* `verification_criteria`：`kernel.py:368`
+
+**测试侧**（附录 A 的清单已过时 —— `test_final_acceptance`、`test_clarification`
+在 S1 就删了，别再找）。真实清单是 **11 个文件** import `AcceptanceStatus`：
+`test_coding_agent_e2e:19`、`test_completion_claim_gate:19`、`test_goal_alignment:16`、
+`test_goal_command_verification:11`、`test_post_mutation_applicability:20`、
+`test_production_journeys:25`、`test_proof_closure:30`、`test_real_provider_journey:17`、
+`test_task_spec:11`、`test_terminal_state_mapping:16`（+ `test_rubric_judge`、
+`test_task_spec_criteria_validation` 按附录 A 亦在此列）。
+
+**真正的体量在 `kernel.py` 里 —— 18 个方法、1176 行**：
+
+| 行数 | 位置 | 方法 |
+|---|---|---|
+| 418 | 2263 | `verify_task_acceptance` |
+| 106 | 2717 | `_evaluate_final_acceptance` |
+| 81 | 2961 | `_verify_answer_evidence_sufficiency` |
+| 78 | 2825 | `_verify_goal_command_outcome` |
+| 78 | 1319 | `_demote_unresolvable_criteria` |
+| 60 | 3142 | `_verify_task_spec_reference` |
+| 54 | 2905 | `_verify_answer_completeness` |
+| 52 | 833 | `_post_mutation_verification` |
+| 45 | 4884 | `_dispose_evidence_question` |
+| 45 | 3043 | `_judge_rubric_criterion` |
+| 37 | 4846 | `_observe_evidence_question` |
+| 31 | 2231 | `finalize_acceptance` |
+| +6 个小的 | | `_post_mutation_verification_observed/description` ×2、`_bind_evidence_question`、`_assistant_conclusion`、`get_evidence_questions`、`_task_spec_requires_command_verification` |
+
+### 批 3 的建议切片（按"能否独立变绿"）
+
+* **3a（小、自足）**：`finalize_acceptance`(31) + `terminal_state_for` +
+  `TERMINAL_STATE_BY_VERDICT` + 门面导出 + 删 `test_terminal_state_mapping.py`。
+  `finalize_acceptance` 自 S1 起零生产调用者。
+* **3b（主体）**：`verify_task_acceptance`(418) + 6 个 `_verify_*`/`_judge_*` 辅助
+  + `verification_criteria.py` + 11 个换 `AcceptanceStatus` 的测试文件。
+* **3c**：`verification_command.py` + `POST_MUTATION_COMMAND` 语义（3 个 import 点）
+  + `_post_mutation_verification*`(52+23+23) + `_task_spec_requires_command_verification`(6)。
+* **3d**：`evidence_question.py` + 4 个 `_*_evidence_question` 方法 + 10 个 import 点。
+
 ## A.2 行为调用点（必须**改接线**，不是删掉）
 
 核心内：
