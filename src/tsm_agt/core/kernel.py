@@ -558,17 +558,6 @@ class _WorkspacePathLockCoordinator:
             yield tuple(sorted(keys))
 
 
-
-
-
-def _task_spec_requires_command_verification(spec: TaskSpecSnapshot) -> bool:
-    """Derive command verification solely from the declared Task contract."""
-    return any(
-        criterion.verification_kind is TaskCriterionKind.POST_MUTATION_COMMAND
-        for criterion in spec.acceptance_criteria
-    )
-
-
 #: Effects whose delivery is a performed side effect. ``observe`` and
 #: ``interact`` are deliberately excluded: observation is governed by the
 #: evidence criteria, and asking the user is closed by the interaction flow.
