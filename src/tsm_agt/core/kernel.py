@@ -128,10 +128,7 @@ from tsm_agt.ports import (
     SessionInputRelationPort,
     SessionInputResolverPort,
     TaskSpecPlannerPort,
-    JudgeVerdict,
-    RubricEvidence,
     RubricJudgePort,
-    RubricJudgement,
     CheckpointCompatibilityAction,
     CheckpointCompatibilityDecision,
     CheckpointCompatibilityPolicyPort,
@@ -300,10 +297,6 @@ from .task_spec import (
     REQUIRED_EFFECT_CRITERION_ID, RUNTIME_AUTHORED_CRITERION_KINDS,
     validate_authored_criterion,
 )
-from .evidence_coverage import (
-    ESCALATED_GAP_KINDS, ProofEnforcementMode,
-)
-from .semantic_review import normalize_judgement
 from .session import (
     SessionChoiceOption, SessionInteractionKind, SessionInteractionRequest,
     SessionSnapshot, SessionState, standalone_session_id,
@@ -414,9 +407,6 @@ class KernelDependencies:
     completion_readiness_mode: CompletionReadinessMode = (
         CompletionReadinessMode.LEGACY_GATE
     )
-    #: How strongly the proof layer participates in the Task decision.
-    #: ``OBSERVE`` (the only mode P0/P1 use) records without intercepting.
-    proof_enforcement_mode: ProofEnforcementMode = ProofEnforcementMode.OBSERVE
     final_acceptance_policy: FinalAcceptancePolicyPort | None = None
     exploration_budget_policy: ExplorationBudgetPolicyPort | None = None
     stop_or_pivot_policy: StopOrPivotPolicyPort | None = None
@@ -612,38 +602,6 @@ def _recorded_effect_deliveries(task: TaskSnapshot) -> frozenset[ToolEffect]:
     return frozenset(recorded)
 
 
-#: Kinds INV-3 must never demote because a bounded, explicit escape exists
-#: instead of a vacuous success: a judged gap is closed by the judge, and an
-#: effect failure the producer declared unfixable is escalated by the readiness
-#: gate to EXHAUSTED -- a resumable stop the stall cap turns into human review.
-#: Demoting the latter would let a Task whose required side effect never
-#: happened report success.
-_JUDGED_GAP_KINDS = frozenset({
-    "TASK_SPEC_RUBRIC", "EVIDENCE_QUESTION",
-    "JUDGED_CRITERION_WITHOUT_JUDGE", "UNRESOLVED_EFFECT_FAILURE",
-})
-
-#: Coverage gaps are exempt for a *different* reason -- the coverage layer owes a
-#: bounded escalation to human review -- so they live in their own set
-#: (SPEC §12.6 D3). Merging the two would let one reason's evolution silently
-#: change the other's behaviour.
-_EXEMPT_GAP_KINDS = _JUDGED_GAP_KINDS | ESCALATED_GAP_KINDS
-
-
-def _gap_has_contract_source(gap: CompletionGap) -> bool:
-    """Whether a readiness gap names the contract/ledger fact it came from.
-
-    INV-3 may drop a required gap that nothing can close, but *what* it may drop
-    matters: a gap with no provenance is bookkeeping the Runtime created for
-    itself, while a gap that names a contract entry (or a durable ``event:`` /
-    ``tool_call:`` / ``mutation:`` reference) is a requirement somebody actually
-    made. Demoting the latter would turn "we cannot prove it yet" into "we never
-    needed it" -- the silent-requirement-loss hole AG-9 closes.
-    """
-
-    return bool((gap.evidence_reference or "").strip())
-
-
 def _readiness_event_payload(
     decision: CompletionReadinessDecision,
     probe: CompletionReadinessProbe,
@@ -654,11 +612,9 @@ def _readiness_event_payload(
 ) -> dict[str, Any]:
     """Durable payload for ``completion.readiness_evaluated``.
 
-    SPEC §3.5 rule 6: the coverage layer gets no readiness event of its own --
-    it identifies its contribution by id on this one. The ids stay empty unless
-    the proof gate is enforcing, so OBSERVE-mode and historical Task events
-    remain comparable, and a reader can tell "a real requirement the Runtime
-    could not prove" apart from "an ordinary unfinished step".
+    The payload records what the gate saw and what it decided. Gaps are still
+    reported verbatim: ``CompletionGap`` remains the readiness vocabulary even
+    though nothing produces one on its own any more.
     """
 
     return {
@@ -674,41 +630,9 @@ def _readiness_event_payload(
             effect.value for effect in probe.available_effects
         ),
         "gap_count": len(decision.gaps),
-        "coverage_gap_ids": [
-            gap.gap_id for gap in decision.gaps
-            if gap.kind in ESCALATED_GAP_KINDS
-        ],
         "gaps": [gap.to_data() for gap in decision.gaps],
         "state": decision.state.to_data(),
     }
-
-
-def _apply_inv3_demotion(
-    gaps: Sequence[CompletionGap],
-) -> tuple[list[CompletionGap], list[CompletionGap]]:
-    """Enforce INV-3 and report what was dropped.
-
-    Returns ``(gaps, violations)`` where ``violations`` are the gaps whose
-    ``required`` flag was cleared. A gap is dropped only when it has no effective
-    effect, no exemption, **and** no contract provenance -- so the deadlock guard
-    survives without ever silently deleting a real requirement.
-    """
-
-    violations = [
-        gap for gap in gaps
-        if gap.required
-        and not gap.effective_required_effects
-        and gap.kind not in _EXEMPT_GAP_KINDS
-        and not _gap_has_contract_source(gap)
-    ]
-    if not violations:
-        return list(gaps), []
-    violation_ids = {gap.gap_id for gap in violations}
-    demoted = [
-        replace(gap, required=False) if gap.gap_id in violation_ids else gap
-        for gap in gaps
-    ]
-    return demoted, violations
 
 
 def _missing_effect_deliveries(
@@ -1048,10 +972,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
     @property
     def completion_readiness_mode(self) -> CompletionReadinessMode:
         return self._dependencies.completion_readiness_mode
-
-    @property
-    def proof_enforcement_mode(self) -> ProofEnforcementMode:
-        return self._dependencies.proof_enforcement_mode
 
 
 

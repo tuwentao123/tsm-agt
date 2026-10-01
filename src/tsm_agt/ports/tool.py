@@ -68,16 +68,17 @@ class EvidenceCapability(StrEnum):
     in the object database. This definition is rebuilt from three surviving
     sources, in this order of authority:
 
-    1. ``tests/test_proof_closure.py::EvidenceCapabilityTest`` -- a surviving test
-       that pins the derivation table case by case, the ``frozenset()`` default,
-       and the exact substrings of both fail-closed errors;
+    1. ``tests/test_evidence_capabilities.py`` (originally
+       ``test_proof_closure.py::EvidenceCapabilityTest``) -- a surviving test that
+       pins the derivation table case by case, the ``frozenset()`` default, and
+       the exact substrings of both fail-closed errors;
     2. ``Artifact Graph与Proof Obligation任务证明闭环实施SPEC.md`` §4.3 (deleted in
        ``6f2a870``, recoverable via ``git show '6f2a870^:...'``) -- the member
        list and the ``(effect, result_authority)`` pair behind each;
-    3. the surviving consumers: ``core/evidence_coverage.py`` and
-       ``core/proof_projection.py`` (which calls
-       ``derive_evidence_capabilities(effect, result_authority)`` with two
-       positional arguments, not with a ``ToolSpec``).
+    3. the two consumers that existed at reconstruction time,
+       ``core/evidence_coverage.py`` and ``core/proof_projection.py`` -- both were
+       removed with the P0 proof layer, so ``ToolSpec.evidence_capabilities`` is
+       now the derivation table's only production reader.
 
     One rule is a judgement call and is called out where it is applied: which
     pairs count as "observable" for an explicit declaration. The only pair used

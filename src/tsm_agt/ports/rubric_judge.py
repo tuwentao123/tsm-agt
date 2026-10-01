@@ -30,9 +30,11 @@ class RubricJudgement:
     verdict: JudgeVerdict
     reason: str = ""
     #: Evidence ids the judge says it relied on. Only the first three fields are
-    #: required, so an adapter may construct this without deciding how to cite --
-    #: ``normalize_judgement`` then treats an uncited affirmation as undecidable
-    #: rather than as a pass (SPEC §6.2).
+    #: required, so an adapter may construct this without deciding how to cite.
+    #: SPEC §6.2's rule -- an affirmation that read nothing is undecidable, not a
+    #: pass -- was enforced by ``normalize_judgement``, which was removed with the
+    #: P0 proof layer; the adapter's auto-attribution is what remains. The field
+    #: itself is checkpoint wire, so it stays.
     cited_evidence_ids: tuple[str, ...] = ()
 
     @property

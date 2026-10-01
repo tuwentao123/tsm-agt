@@ -383,3 +383,59 @@ class BlockedQuestionRecoveryTest(unittest.IsolatedAsyncioTestCase):
                 if gap["status"] == "BLOCKED":
                     self.assertTrue(gap["recoverable"])
                     self.assertTrue(gap["candidate_tools"])
+
+
+class ReadinessEventPayloadTest(unittest.TestCase):
+    """The readiness event payload stays readable without the proof layer.
+
+    ``coverage_gap_ids`` existed only to mark which gaps the deleted coverage
+    layer had contributed; with no producer the key is gone. The gap list itself
+    is unchanged, because ``CompletionGap`` is still the readiness vocabulary.
+    """
+
+    def payload(self, gaps):
+        from tsm_agt.core.kernel import _readiness_event_payload
+        from tsm_agt.ports import (
+            CompletionReadinessAction, CompletionReadinessDecision,
+            CompletionReadinessMode, CompletionReadinessProbe,
+            CompletionReadinessState, ToolEffect,
+        )
+
+        probe = CompletionReadinessProbe(
+            goal="g", gaps=tuple(gaps), remaining_model_calls=5,
+            remaining_tool_calls=5, available_read_tools=(),
+            available_effects=frozenset({ToolEffect.OBSERVE}),
+        )
+        decision = CompletionReadinessDecision(
+            CompletionReadinessAction.EXHAUSTED, "coverage_not_satisfied",
+            CompletionReadinessState(), tuple(gaps),
+        )
+        return _readiness_event_payload(
+            decision, probe, turn_id="t1",
+            mode=CompletionReadinessMode.LEGACY_GATE, forced_wrap_up=False,
+        )
+
+    def ordinary_gap(self):
+        from tsm_agt.ports import CompletionGap, ToolEffect
+
+        return CompletionGap(
+            gap_id="task-spec:AC-9", kind="TASK_SPEC_WORKSPACE_INTEGRITY",
+            description="workspace differs from the journal", status="FAILED",
+            required=True, required_effects=(ToolEffect.MUTATE,),
+        )
+
+    def test_payload_reports_every_gap(self) -> None:
+        payload = self.payload((self.ordinary_gap(),))
+        self.assertEqual(payload["gap_count"], 1)
+        self.assertEqual(len(payload["gaps"]), 1)
+        self.assertEqual(payload["gaps"][0]["gap_id"], "task-spec:AC-9")
+        self.assertNotIn("coverage_gap_ids", payload)
+
+    def test_payload_reports_mode_and_enforcement(self) -> None:
+        from tsm_agt.ports import CompletionReadinessMode
+
+        payload = self.payload(())
+        self.assertEqual(payload["mode"], CompletionReadinessMode.LEGACY_GATE.value)
+        self.assertTrue(payload["enforced"])
+        self.assertEqual(payload["gap_count"], 0)
+        self.assertEqual(payload["gaps"], [])

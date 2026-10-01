@@ -620,3 +620,67 @@ S1（`final_acceptance_policy=None` + SDK/CLI 改为不调 verify/finalize）实
 **结论：S1 不能独立变绿，它与删规格是同一个原子动作。** 所以正确的第一步是
 「S1 + 上述 9 条规格的处置」，并且**逐条写明是随层删除还是规格改写**。
 （本轮已回退 S1，工作区干净、全量 1437 passed。）
+
+## A.1h 批 4 落地实测（回写，覆盖 A.1g 的三处不准）
+
+**结果：1244 passed / 12 skipped / 0 failed，26.78s。净 -4486 行（删 4923 / 增 437）。**
+
+删掉的源码模块（2272 行）：`artifact_graph.py` 339、`proof_obligation.py` 272、
+`evidence_coverage.py` 717、`proof_projection.py` 718、`semantic_review.py` 226。
+
+### 修正 1：`task_spec.py` 的编译器边界不是 928–1114
+
+A.1g 只圈了 `class ProofPlanCompiler` 本身。实测**证明专属块从第 865 行就开始**：
+
+| 行 | 内容 |
+|---|---|
+| 865 | `#: The reason a criterion could not be compiled at all.` 注释头 |
+| 867 | `NOT_STRUCTURALLY_KNOWABLE` |
+| 875 | `_REFERENCE_COMPILATION`（用 `ObligationPredicate`） |
+| 887 | `_VERIFIED_REFERENCE_CAPABILITY` |
+| 894–896 | `_PRIORITY_REQUIRED_EFFECT` / `_PRIORITY_POST_MUTATION_COMMAND` / `_PRIORITY_DEFAULT` |
+| 900 | `class CompilationRejection` |
+| 908 | `class ProofCompilation`（字段用 `ProofPlanSnapshot`/`ObligationTruncation`/`ProofObligation`） |
+| 928 | `class ProofPlanCompiler` |
+
+`_VERIFIED_REFERENCE_CAPABILITY` 是**零引用**符号，`_REFERENCE_COMPILATION` 与三个
+`_PRIORITY_*` 只被编译器读。真界 = **865–1116**，删后 `TaskSpecSnapshot` 直接接在两行
+空行后。实删 252 行（含 import 段 7 行 → `EvidenceCapability` 也随之从 import 移除）。
+**教训（第四次同类）：`class X` 的起点从来不是删除起点；配套常量/辅助类在它上方。**
+
+### 修正 2：`test_proof_closure.py` **不能整删**——6 个类测的是活代码
+
+A.1g 说"整文件删"。实测 23 个类里，**6 个零死引用或混合，钉的是 `ports` 的活契约**：
+
+| 类 | 钉什么 | 处置 |
+|---|---|---|
+| `EvidenceCapabilityTest` | `ToolSpec.evidence_capabilities` 派生表 + 两条 fail-closed 断言 | 迁入新文件 |
+| `CapabilityDeclarationContractTest` | 只读 composition 的 `ENUMERATE_SCOPE`/`OBSERVE_RELATION` 声明 | 迁入新文件 |
+| `EngineeringCapabilityContractTest` | 工程 composition 的派生能力负空间 | 迁入新文件 |
+| `ReviewerModelConfigurationTest` | `TSM_AGT_REVIEW_MODEL` 只覆盖模型名 | 并入 `test_rubric_judge.py` |
+| `ReviewerProviderWiringTest` | 无覆盖时复用同一 provider 对象 | 并入 `test_rubric_judge.py` |
+| `ReadinessEventPayloadTest` | 活的 `_readiness_event_payload`（原用死模块构造 gap） | 改写后并入 `test_completion_readiness_modes.py` |
+
+新文件 `tests/test_evidence_capabilities.py` = 11 tests / 26 subtests；
+`test_rubric_judge.py` 7 → 11 tests；`test_completion_readiness_modes.py` +2 tests。
+
+`ports/tool.py` 的 `EvidenceCapability` 本体**是活的**（`core_tools.py` 4 处、
+`code_intelligence_tools.py` 5 处自己声明 `ENUMERATE_SCOPE`/`OBSERVE_RELATION`），
+`derive_evidence_capabilities` 也是活的（`ToolSpec.evidence_capabilities` 属性在调）。
+A.1g 未涉及；只改了它们的溯源文档串（第 3 条来源已随本批消失）。
+
+### 修正 3：`_apply_inv3_demotion` 生产侧零调用
+
+A.1g 说它"活的"，实测**只有 `test_proof_closure.py:1848` 调它**。因此
+`_JUDGED_GAP_KINDS` / `_EXEMPT_GAP_KINDS` / `_gap_has_contract_source` /
+`_apply_inv3_demotion` 四者整链删除（kernel -86 行）。`_readiness_event_payload` 里
+唯一用 `ESCALATED_GAP_KINDS` 的 `coverage_gap_ids` 键**删除**（无生产读者）。
+
+### 新发现（属下一批，未在本批动）
+
+`rubric_judge` 通路**整体孤儿化**：`composition.py:945,1131` 仍强制要求注册
+`RubricJudgePort`，`kernel.py:433` 仍有 `rubric_judge` 字段与 `rubric_judge_max_attempts`，
+但 **core 里已无任何调用点**。本批只清掉它的三个死 import（`JudgeVerdict`、
+`RubricEvidence`、`RubricJudgement`，均只剩 import 行）与 `ports/rubric_judge.py` 里
+提到已删 `normalize_judgement` 的文档串。**裁剪这条通路需要动 composition 的强制注册
+断言，属独立的语义决策。**
