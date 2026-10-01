@@ -438,7 +438,7 @@ ports/evidence_guided_exploration.py  ports/evidence_level.py
 
 ### 批 3 的建议切片（按"能否独立变绿"）
 
-* **3a ✅ 已落地**（`a1b2`→见提交）：删 `Kernel.finalize_acceptance`(32 行)、
+* **3a ✅ 已落地**（`95ab0ee`）：删 `Kernel.finalize_acceptance`(32 行)、
   `terminal_state_for` + `TERMINAL_STATE_BY_VERDICT`（`verification.py` 106→71 行）、
   门面导出；`test_terminal_state_mapping.py` 只保留 `_exit_code_for` 那条
   （它是**仅存**的客户端映射，不能跟着删）。实测 `terminal_state_for` 的消费者
