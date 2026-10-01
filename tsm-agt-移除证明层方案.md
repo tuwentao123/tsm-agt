@@ -7,19 +7,32 @@
 
 ---
 
-## 0. 必须你先定的一个岔路：删掉之后，**谁写 `SUCCEEDED`？**
+## 0. `SUCCEEDED` 由谁写 —— 已查清（原为未决问题）
 
-删掉 `finalize_acceptance` 之后，今天写终态的唯一入口就没了。`TaskState.SUCCEEDED`
-必须有人写，否则任务会永远停在 `EXECUTING`（这正是今天 `OBSERVE_ONLY` /
-`AGENT_DECIDES` 两个模式的状态：**能返回结果但不闭合任务**，见 `sdk/runtime.py:1334-1337`）。
+删掉 `finalize_acceptance` 之后必须有人写终态。查 `core/task.py:103-190` 与
+`core/kernel_task.py:740-772`，今天写 `SUCCEEDED` 前面有**三道闸**：
 
-| 选项 | 做法 | 代价 |
+| # | 闸门 | 位置 | 内容 |
+|---|---|---|---|
+| 1 | 状态机 | `core/task.py:103-190` | `EXECUTING` 的合法后继里**没有** `FINALIZING`；今天唯一路径是 `EXECUTING → VERIFYING → FINALIZING → SUCCEEDED` |
+| 2 | 终态权威 | `core/kernel_task.py:740-744` | 进终态需要 `TERMINAL_AUTHORITY` 允许的 authority（**待清点**：`SUCCEEDED` 允许哪些） |
+| 3 | **通过的验证** | `core/kernel_task.py:757-772` | 若 `dependencies.final_acceptance_policy is not None`，必须存在 `verify.completed{status: passed}`，否则 `InvalidTurnState` |
+
+**闸 3 的关键点：它是 `is not None` 条件——`final_acceptance_policy = None` 就把它关掉了。**
+这是一个**依赖值**，不是代码分支。
+
+### 结论：选 **b**（我原先推荐 a，现按证据改为 b）
+
+| 选项 | 需要改什么 | 评价 |
 |---|---|---|
-| **a（推荐）** | SDK/CLI 收到 `AgentTurnResult` 时直接 `EXECUTING → FINALIZING → SUCCEEDED` | 需确认 `LEGAL_TRANSITIONS` 允许这条边（现在多半要求先过 `VERIFYING`） |
-| b | 保留 `VERIFYING` 作为**不做任何判定的空转状态** | 最小改动，但留下一个没有意义的词汇 |
-| c | 从状态机里删掉 `VERIFYING` / `FINALIZING` / `NEEDS_REVIEW` | 最彻底，改动最大；`NEEDS_REVIEW` 还挂着人工复核 API |
+| **b（推荐）** | **零状态机改动**：`final_acceptance_policy = None` 关掉闸 3；SDK/CLI 收到结果后走 `EXECUTING → VERIFYING → FINALIZING → SUCCEEDED`，但**不调用** `verify_task_acceptance` / `finalize_acceptance` | `VERIFYING`/`FINALIZING` 退化为记账跳；人工复核 API 不动 |
+| a | 给 `LEGAL_TRANSITIONS` 加一条 `EXECUTING → FINALIZING` **并且** 还要过闸 2、闸 3 | 比 b 多两处改动，收益只是省一跳 |
+| c | 删 `VERIFYING`/`FINALIZING`/`NEEDS_REVIEW` 三个状态 | 最大；`NEEDS_REVIEW` 还挂着 accept/cancel/return-for-revision |
 
-**只有你定了这个，后面的删除才有明确的落点。**
+**所以 S1 的实际大小比原方案小得多**：一个依赖值 + 两个调用点（`sdk/runtime.py`、`cli.py`）。
+
+**实施前仍需补的一件事**：闸 2 的 `TERMINAL_AUTHORITY` 里 `SUCCEEDED` 允许哪些 authority
+（`core/kernel_task.py:740` 引用），否则 S1 会在运行时被它挡下。
 
 ---
 
