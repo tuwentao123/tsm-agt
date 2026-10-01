@@ -198,6 +198,22 @@ async def transition_task(self, task_id, target, reason, *, authority: str = "ru
 `model_budget_renewal_count` / `model_budget_total_granted` 两个 checkpoint 字段
 **必须保留**（旧台账里有，删了旧任务重放会炸）。
 
+**S2c 收尾 ✅ 已落地**：删掉证明诊断流水线。
+* `_evaluate_completion_readiness` 末尾的 `_publish_proof_diagnostics` 调用移除；
+  删掉 `_publish_proof_diagnostics` + `_emit_proof_diagnostics`（46 行）。
+* 四个随之失去引用的 import 一起删：`ProofPlanCompiler`、`ProofCompilation`、
+  `derive_proof_events`、`replay_proof_projection`、`coverage_gaps`、
+  `MAX_AUTHORED_ACCEPTANCE_CRITERIA`。
+* 删除 `tests/test_proof_closure.py::KernelProofEmissionTest`（79 行，2 条）。
+
+**验证（这是本步的要害）**：全仓扫描 `ProofPlanCompiler` / `derive_proof_events` /
+`replay_proof_projection` / `coverage_gaps(` 的**调用点**，只剩 `core/__init__.py`
+的 re-export，**零生产调用**。也就是说证明层现在四件事全不做：
+不参与决定（S1）、不拦回合（S2a）、不产出 gap（S2b）、**也不算不记账（S2c）**。
+
+* 仍待处理：`proof_enforcement_mode` / `ProofEnforcementMode` 已成死配置、
+  `_completion_readiness_gaps` 空壳、renewal（见下）。
+
 ### S2 —— 停止产出
 * 不再编译 obligation（`ProofPlanCompiler`）、不再构造 gap（`_completion_gaps`）、
   不再注入 readiness 诊断与 nudge（`policy`、`turn_phases` 的相关分支）。

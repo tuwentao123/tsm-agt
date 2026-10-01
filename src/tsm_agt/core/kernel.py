@@ -298,15 +298,11 @@ from .task_spec import (
     TaskOutcomeKind, TaskOutcomeProposal, TaskOutcomeSnapshot,
     TaskOutcomeStatus,
     TaskSpecProjector, TaskSpecProposal, TaskSpecSnapshot,
-    MAX_AUTHORED_ACCEPTANCE_CRITERIA, ProofPlanCompiler, ProofCompilation,
     REQUIRED_EFFECT_CRITERION_ID, RUNTIME_AUTHORED_CRITERION_KINDS,
     validate_authored_criterion,
 )
 from .evidence_coverage import (
-    ESCALATED_GAP_KINDS, ProofEnforcementMode, coverage_gaps,
-)
-from .proof_projection import (
-    derive_proof_events, replay_proof_projection,
+    ESCALATED_GAP_KINDS, ProofEnforcementMode,
 )
 from .semantic_review import normalize_judgement
 from .session import (
@@ -2100,56 +2096,7 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                 forced_wrap_up=forced_wrap_up,
             ),
         ),))
-        # P0 read-only diagnosis: record what the proof layer sees. It runs
-        # after the decision is durable and never feeds back into it.
-        await self._publish_proof_diagnostics(task_id)
         return decision
-
-    async def _publish_proof_diagnostics(self, task_id: str) -> None:
-        """Emit proof-layer events for one Task. Read-only, never fails a Task.
-
-        P0 records what the proof layer *sees* (plan, artifacts, evidence,
-        coverage) without letting it influence execution or terminal state.
-        A defect here is contained and reported as an event, because diagnosis
-        must never be able to break a running Task.
-        """
-
-        try:
-            await self._emit_proof_diagnostics(task_id)
-        except Exception as error:  # containment is the contract, not laziness
-            await self._append_events(task_id, ((
-                "proof.projection_failed",
-                {"error_type": type(error).__name__},
-            ),))
-
-    async def _emit_proof_diagnostics(self, task_id: str) -> None:
-        stored = await self._dependencies.store.load_task(task_id)
-        if stored is None:
-            return
-        task = TaskSnapshot.from_data(stored.data)
-        events = await self._dependencies.store.read_events(task_id)
-        specs_by_name = {spec.name: spec for spec in await self.list_tools()}
-        task_spec = TaskSpecProjector.project(task_id, task.goal, events)
-        available = frozenset(
-            capability.value
-            for spec in specs_by_name.values()
-            for capability in spec.evidence_capabilities
-        )
-        compilation = ProofPlanCompiler.compile(
-            task_spec, available_capabilities=available,
-        )
-        pending = derive_proof_events(
-            task_spec=task_spec, compilation=compilation,
-            executions=tuple(task.tool_executions.values()),
-            specs_by_name=specs_by_name,
-            mutation_records=task.mutation_journal,
-            current=replay_proof_projection(events),
-            events=events,
-            available_capabilities=available,
-            mode=self.proof_enforcement_mode,
-        )
-        if pending:
-            await self._append_events(task_id, pending)
 
     async def _inject_agent_decides_completion_diagnostics(
         self, checkpoint: AgentTurnCheckpoint,
