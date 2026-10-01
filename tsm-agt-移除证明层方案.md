@@ -777,3 +777,57 @@ A.1b 把 `evidence_question.py` 列为批 2 的残余，summary 又把"批 3d = 
 附录 A 的分批是**按模块名相近**画的（`evidence_coverage` / `evidence_question` 名字像 →
 被归到一起），而不是按**依赖**画的。`evidence_coverage` 已删、`evidence_question` 全活 ——
 仅凭名字相邻推断归属，这次错了两次（3c、3d）。
+
+## A.1k 批 5 —— 收掉 `_completion_readiness_gaps` hollow 缝 + 清理空转测试
+
+**结果：1246 passed / 12 skipped / 0 failed。**（1247 → 1246：删 2 条空转测试，把 1 条
+救回成 2 条 —— −1 −1 +1）
+
+### 缝本身：**零 src 调用**
+
+`Kernel._completion_readiness_gaps` 的调用点只有 3 个测试（`test_completion_claim_gate_
+410`、`test_completion_readiness_507`、`test_post_mutation_applicability_71`），**生产代码
+一个都没有**。删它不需要动任何 src 接线。
+
+**注意别误删 `CompletionGap` 词汇**：真正活的生产者是 `_task_outcome_completion_gaps`
+（`kernel.py:1100`，被 `request_task_outcome_completion` 调用），加上 `turn_phases.py:734`
+的 recovery gap 与 `kernel_task.py:1014` 的消费端。缝只是**遗留的第二个生产者**。
+
+### 三处空转测试的实测处置
+
+| 位置 | 实测 | 处置 |
+|---|---|---|
+| `test_completion_claim_gate.py::DeliveryGapTest` | 只断言 `REQUIRED_DELIVERY_UNSATISFIED` —— 该 kind **在 src 里已无生产者**（只有 2 个测试提到）。同文件另有 15 条活测试（`DeliveryRecordTest`/`DeliveryCriterionAuthoringTest`）| 删该类 + 其 `_gaps` helper |
+| `test_completion_readiness.py::test_mutation_only_delivery_does_not_invent_command_verification` | gap 断言空转，**但意图与活分支一一对应** | **救回**（见下）|
+| `test_post_mutation_applicability.py` | 3 个测试里 `test_analysis_task...` 纯空转；另 2 个断言的是 `_has_active_workspace_mutation`（**全仓唯一覆盖**）| 修剪 + 改名（见下）|
+
+### 救回：空转测试的意图落在活的 `MISSING_VERIFICATION` 分支上
+
+活的生产者 `_task_outcome_completion_gaps` 的条件是
+`ToolEffect.EXECUTE in outcome.required_effects and task.mutation_journal`
+（`kernel.py:1206-1220`）—— 与被删测试"只欠 mutate 就不该要求命令验证"**是同一个不变量**。
+
+改为直接驱动活生产者，并补上正例：
+
+* `test_mutation_only_delivery_does_not_invent_command_verification` —— `mutate` → 无 gap
+* `test_execute_owing_delivery_does_owe_command_verification` —— `mutate+execute` → 有 gap
+
+**`MISSING_VERIFICATION` 此前零测试覆盖**，`_task_outcome_completion_gaps` /
+`request_task_outcome_completion` 也**零测试覆盖** —— 这次救回顺带补上了唯一覆盖。
+
+### 修剪 + 改名：`test_post_mutation_applicability.py` → `test_workspace_mutation_net_effect.py`
+
+该文件删掉纯空转的 `test_analysis_task_does_not_owe_a_post_mutation_command`、
+`_require_command_criterion`、`_persist_final_answer`、`_gaps` 之后，只剩
+`_has_active_workspace_mutation` 的净效应断言。文件名已误导（`post_mutation` 现在是
+replay-only 墓碑），故一并改名，并删掉因此不再使用的 `replace` /
+`RuleBasedEvidenceLevelEvaluator` / `TaskAcceptanceCriterion` / `TaskCriterionKind` /
+`ToolEffect` import。**注意：这个文件是 `_has_active_workspace_mutation` 的唯一覆盖，
+不能整删。**
+
+### 保留
+
+`test_completion_readiness.py:419,444,1020,1072,1105` 与
+`test_completion_readiness_exhausted.py:31` 里的 `POST_MUTATION_VERIFICATION` /
+`REQUIRED_DELIVERY_UNSATISFIED` 是**直接构造 `CompletionGap` 喂活的 readiness policy**，
+不经过被删的缝 —— 属正确写法，保留。

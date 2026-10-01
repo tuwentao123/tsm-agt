@@ -394,28 +394,3 @@ class DeliveryCriterionAuthoringTest(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(spec.acceptance_criteria), 30)
 
 
-class DeliveryGapTest(unittest.IsolatedAsyncioTestCase):
-    """The per-turn gate keeps working instead of wrapping up on a claim."""
-
-    async def _gaps(self, proposal, task_id):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        app = compose_fixture_application(
-            tool_adapters=(), task_spec_planner_adapter=_Planner(proposal),
-        )
-        await app.registry.start_all()
-        self.addAsyncCleanup(app.registry.stop_all)
-        task = await _executing_task(app, Path(temporary.name), task_id)
-        await app.kernel.plan_task_spec(task.task_id)
-        return await app.kernel._completion_readiness_gaps(task.task_id, ())
-
-    async def test_observe_only_contract_is_not_gated(self) -> None:
-        gaps = await self._gaps(
-            _proposal("explain", effects=["observe"], kind="EVIDENCE"),
-            "gate-gap-observe",
-        )
-        self.assertFalse(any(
-            gap.kind == "REQUIRED_DELIVERY_UNSATISFIED" for gap in gaps
-        ))
-
-

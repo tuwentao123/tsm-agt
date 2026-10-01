@@ -1827,18 +1827,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
 
 
 
-    async def _completion_readiness_gaps(
-        self, task_id: str, visible_tools: tuple[ToolSpec, ...],
-    ) -> tuple[CompletionGap, ...]:
-        """Return no completion gaps: completion has no obligation record.
-
-        Hermes and Codex carry no obligation/gap vocabulary at all -- a turn
-        ends when the model stops calling tools, and nothing has to be proven
-        first. The Runtime has already stopped building them; this seam stays
-        only until the specs that consult it are removed with their batch.
-        """
-        return ()
-
     async def _unfinished_plan_instruction(self, task_id: str) -> str | None:
         """Advisory nudge for an un-updated scratchpad plan.
 

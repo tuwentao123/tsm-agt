@@ -463,55 +463,75 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await policy.stop(None)  # type: ignore[arg-type]
 
+    async def _outcome_completion_gaps(self, *, effects, task_id):
+        """Drive the live Outcome-completion gap producer for one contract."""
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        target = root / "delivery.txt"
+        target.write_text("before\n", encoding="utf-8")
+        app = compose_fixture_application(
+            tool_adapters=(CoreProcessToolProvider(),),
+            completion_readiness_policy_adapter=(
+                RuleBasedCompletionReadinessPolicy()
+            ),
+        )
+        await app.registry.start_all()
+        self.addAsyncCleanup(app.registry.stop_all)
+        task = await executing_task(app, root, task_id)
+        current = await app.kernel.get_task_spec(task.task_id)
+        proposal = TaskSpecProposal.from_data({
+            "schema_version": 1, "goal": task.goal,
+            "scope": ["delivery.txt"], "constraints": [],
+            "outcomes": [{
+                "outcome_id": "delivery",
+                "description": "Deliver one workspace file",
+                "kind": "WORKSPACE_DELIVERY",
+                "required_effects": list(effects),
+                "required": True,
+            }],
+            "continuation_policy": {"mode": "NONE"},
+        })
+        spec = TaskSpecSnapshot.from_proposal(
+            task.task_id, current.revision + 1, proposal,
+            (TaskAcceptanceCriterion(
+                "delivery", "Deliver one workspace file",
+                TaskCriterionKind.WORKSPACE_INTEGRITY,
+            ),),
+        )
+        await app.kernel._append_events(task.task_id, ((
+            "task_spec.revised", {"snapshot": spec.to_data()},
+        ),))
+        await app.kernel.write_workspace_text(
+            task.task_id, "write-delivery", target.name, "after\n",
+            hashlib.sha256(b"before\n").hexdigest(),
+        )
+        return await app.kernel._task_outcome_completion_gaps(
+            await app.kernel.get_task(task.task_id), spec, spec.outcomes[0],
+            (), (), "test",
+        )
+
     async def test_mutation_only_delivery_does_not_invent_command_verification(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / "delivery.txt"
-            target.write_text("before\n", encoding="utf-8")
-            app = compose_fixture_application(
-                tool_adapters=(CoreProcessToolProvider(),),
-                completion_readiness_policy_adapter=(
-                    RuleBasedCompletionReadinessPolicy()
-                ),
-            )
-            await app.registry.start_all()
-            try:
-                task = await executing_task(app, root, "mutation-only")
-                current = await app.kernel.get_task_spec(task.task_id)
-                proposal = TaskSpecProposal.from_data({
-                    "schema_version": 1, "goal": task.goal,
-                    "scope": ["delivery.txt"], "constraints": [],
-                    "outcomes": [{
-                        "outcome_id": "delivery",
-                        "description": "Deliver one workspace file",
-                        "kind": "WORKSPACE_DELIVERY",
-                        "required_effects": ["mutate"],
-                        "required": True,
-                    }],
-                    "continuation_policy": {"mode": "NONE"},
-                })
-                spec = TaskSpecSnapshot.from_proposal(
-                    task.task_id, current.revision + 1, proposal,
-                    (TaskAcceptanceCriterion(
-                        "delivery", "Deliver one workspace file",
-                        TaskCriterionKind.WORKSPACE_INTEGRITY,
-                    ),),
-                )
-                await app.kernel._append_events(task.task_id, ((
-                    "task_spec.revised", {"snapshot": spec.to_data()},
-                ),))
-                await app.kernel.write_workspace_text(
-                    task.task_id, "write-delivery", target.name, "after\n",
-                    hashlib.sha256(b"before\n").hexdigest(),
-                )
-                gaps = await app.kernel._completion_readiness_gaps(
-                    task.task_id, await app.kernel.list_tools()
-                )
-                self.assertFalse(any(
-                    gap.kind == "POST_MUTATION_VERIFICATION" for gap in gaps
-                ))
-            finally:
-                await app.registry.stop_all()
+        """A contract that owes only a mutation must not owe a ``run_command``.
+
+        The live Outcome-completion producer raises ``MISSING_VERIFICATION`` only
+        when the Outcome declares ``execute`` *and* the Task holds a mutation
+        journal. This drives that producer directly, so the invariant is pinned
+        where it is actually enforced rather than in the removed readiness seam.
+        """
+        gaps = await self._outcome_completion_gaps(
+            effects=("mutate",), task_id="mutation-only",
+        )
+
+        self.assertNotIn("MISSING_VERIFICATION", {gap.kind for gap in gaps})
+
+    async def test_execute_owing_delivery_does_owe_command_verification(self) -> None:
+        """The same producer does raise the gap once the Outcome owes execute."""
+        gaps = await self._outcome_completion_gaps(
+            effects=("mutate", "execute"), task_id="execute-owing",
+        )
+
+        self.assertIn("MISSING_VERIFICATION", {gap.kind for gap in gaps})
 
     async def test_unmet_acceptance_criterion_ends_turn_honestly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
