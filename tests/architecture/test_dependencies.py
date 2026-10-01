@@ -161,8 +161,8 @@ if __name__ == "__main__":
 #: state" -- which is exactly how this codebase accumulated five competing
 #: vocabularies and 115 tasks whose ``FAILED`` contradicted their own reason.
 #:
-#: To lower a number: route that site through ``core.turn_outcome`` (the outcome
-#: vocabulary) and then update this table.
+#: To lower a number: route that site through the one transition authority
+#: and then update this table.
 #:
 #: **When a cohesive method group moves to a mixin sibling of ``core/kernel.py``
 #: (the Hermes facade+siblings shape), redistribute these counts instead of
@@ -192,7 +192,6 @@ _TERMINAL_STATE_COUPLING_BASELINE = {
 _TERMINAL_STATE_AUTHORITY = {
     "core/task.py",
     "core/verification.py",
-    "core/turn_outcome.py",
 }
 
 
@@ -228,8 +227,8 @@ class TerminalStateConvergenceTest(unittest.TestCase):
         }
         self.assertEqual(
             grew, {},
-            "terminal-state coupling grew; route it through core.turn_outcome "
-            "instead of deciding the terminal state locally",
+            "terminal-state coupling grew; route it through the single terminal "
+            "authority instead of deciding the terminal state locally",
         )
 
     def test_no_new_module_decides_terminal_states(self) -> None:
