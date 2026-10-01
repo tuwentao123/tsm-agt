@@ -240,6 +240,28 @@ async def transition_task(self, task_id, target, reason, *, authority: str = "ru
   导致所有 env/.env 预算值静默失效（4 条测试报"ValueError not raised"，很具迷惑性）。
   锚点裁剪必须连同**同一行的其他内容**一起看，不能只匹配"要删的那部分"。
 
+### S3 —— 停止持久化 acceptance_criteria ⛔ 未落地：被 schema 不变量挡住
+实测：把 `TaskSpecSnapshot.initial()` 里那条硬编码的 `workspace-integrity` 拿掉后，
+**523 条测试变红**，全部同一个原因：
+
+```
+ValueError: Task SPEC requires 1-30 acceptance criteria   (task_spec.py:1138)
+```
+
+`TaskSpecSnapshot` 的 `__post_init__` 要求准则数 **1–30**，空元组直接构造失败，
+于是**任务根本建不出来**（不是"少了个准则"，是"整个 Runtime 起不来"）。
+
+所以 S3 的第一步不是"不写准则"，而是**先把这个持久化 schema 的下界从 1 放宽到 0** ——
+这是一次 schema 变更，牵动旧事件重放与 `from_proposal` 的派生逻辑，必须单独决策，
+不能顺手改。已回退，工作区干净、全量 1404 绿。
+
+**S3 的正确拆法**（待你点头）：
+1. 放宽 `TaskSpecSnapshot` 下界 1 → 0（或区分"initial 允许空 / 修订必须有"）。
+2. 再让 `initial()` 不写准则。
+3. 确认 `TaskSpecProjector` 对**旧事件**里带 `workspace-integrity` 的 spec 仍然容忍
+   （旧台账 668/687 个任务都有这条）。
+4. 确认 planner 一定产出 ≥1 条准则，否则放宽后会冒出"零准则"的任务。
+
 ### S2 —— 停止产出
 * 不再编译 obligation（`ProofPlanCompiler`）、不再构造 gap（`_completion_gaps`）、
   不再注入 readiness 诊断与 nudge（`policy`、`turn_phases` 的相关分支）。
