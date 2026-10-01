@@ -354,6 +354,42 @@ ports/evidence_guided_exploration.py  ports/evidence_level.py
 | **6** | `ports/completion_readiness.py`、`ports/evidence_level.py` | `ports/__init__:128-134,161-165,229-235,362-365`；两个适配器；`kernel.py:21,416,422-424,438,1069-1074,2308-2560,4161-4318,5091-5112`；**`turn_phases.py:37,137-160,475,743-1045`（就绪门整段）**；`cli.py:359,593-637,2179-2203`；`sdk/runtime.py:32,1323-1337`；`composition.py:102,236-258,371-461,551-564(env),625-757` | 删 `test_completion_readiness.py`、`test_completion_readiness_exhausted.py`、`test_completion_readiness_modes.py`、`test_completion_stall_terminal.py`、`test_evidence_level.py`、`test_cli_standalone_finalization.py`；改 `test_sdk_runtime.py:12,260` |
 | **7** | 收缩 `ToolRecoveryKind`（`ports/tool.py:155-166,511,524,534-542,557,585`） | `ports/__init__:189,402`；`kernel.py:118,1757,1809,2206,4161`；`kernel_tool.py:68,475-480,561,1485-1566`；`turn_tool_batch:55,737`；`context:703`；`execution_facts:74-79,123,214-266,381`；`flow:741-743`；`kernel_checkpoint:699`；`turn_phases:297,750`；`adapters/builtin/workspace_tools.py:12,470,485` | 删 `test_tool_recovery_contract.py`；改 `test_core_apply_patch.py:12,121,155,275` |
 
+## A.1b 批 2 重扫（HEAD 实测，取代 A.1 的行号）
+
+附录 A 行号生成于本会话早期；S1/S2b/S2c/S3 之后已全部偏移。开工前重跑 AST+import 扫描，
+批 2 三个模块的**真实**消费者清单（file:line）：
+
+**`verification_criteria.py`** —— 1 个符号 `seed_acceptance_criteria`，1 个 import 点：
+`kernel.py:368`。机械可删。
+
+**`verification_command.py`** —— 2 个符号，**5 个真实调用点**：
+`kernel.py:852`(is_verification_request)、`kernel.py:1350`(is_verification_command)、
+`kernel.py:2414`(is_verification_request)、`kernel_tool.py:953`、`task_spec.py:858`。
+
+**`evidence_question.py`** —— 6 个符号，**10 个 import 点**（最重）：
+`core/__init__:157`（门面）、`kernel.py:371`、`kernel_checkpoint:48`、`kernel_input:52`、
+`kernel_memory:42`、`kernel_steering:32`、`session_resources:16`、`turn_tool_batch:33`、
+`working_memory:19`、`tests/test_working_memory.py:18`。
+
+### ⚠️ 发现：A.1 的分批顺序在批 2 处是错的
+
+`verification_command` 那 5 个调用点全部在回答**"这条命令算不算真正的测试/构建验证"**：
+`task_spec.py:858` 校验 planner 声明的 `POST_MUTATION_COMMAND` 命令是否合格，
+`kernel.py:2414` / `kernel_tool.py:953` 判断一次调用是否算"验证请求"，
+`kernel.py:852/1350` 判断它有没有解除那条义务。
+
+这些都是**证明层的语义**，而且它们**只有**在 `POST_MUTATION_COMMAND` 准则、
+`AcceptanceStatus`、`verify_task_acceptance` 还存在时才有意义 —— 也就是**批 3 的范围**。
+生产路径已经不调用 `verify_task_acceptance`（S1），所以这些判据现在是装饰性的，
+但**不能独立于批 3 删除**：先删它们会让 `task_spec.py` 放弃对声明命令的校验，
+留下一个"planner 可以声明任意命令当验证"的中间状态。
+
+**因此批 2 应拆成：**
+* **2a**：删 `verification_criteria.py`（1 符号 / 1 点，纯机械）。
+* **2b**：删 `evidence_question.py`（10 点，多为"读投影"，属改接线）。
+* **2c**：`verification_command.py` **并入批 3**（连同 `POST_MUTATION_COMMAND` 语义
+  一起处理），不要提前删。
+
 ## A.2 行为调用点（必须**改接线**，不是删掉）
 
 核心内：
