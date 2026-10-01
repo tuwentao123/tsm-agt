@@ -589,3 +589,55 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(spec.continuation_mode, TaskContinuationMode.NONE)
             finally:
                 await app.registry.stop_all()
+
+
+class PostMutationCommandTombstoneTest(unittest.TestCase):
+    """S5: the kind left the model-visible surface but stayed replayable.
+
+    ``post_mutation_command`` was dropped as an authorable verification kind --
+    no Planner or model tool offers it any more, and the Runtime no longer
+    demotes it. The enum member stays as a tombstone because event streams
+    written before the removal carry it in
+    ``snapshot.acceptance_criteria[].verification_kind``, and
+    ``TaskAcceptanceCriterion.from_data`` resolves a kind with a bare
+    ``TaskCriterionKind(...)``. Removing the member would make those streams
+    unreplayable; this test is what stops a future cleanup from doing that.
+    """
+
+    @staticmethod
+    def _schema_enum() -> list[str]:
+        return TASK_SPEC_PROPOSAL_SCHEMA_V1["properties"]["acceptance_criteria"][
+            "items"
+        ]["properties"]["verification_kind"]["enum"]
+
+    def test_absent_from_the_model_visible_schema(self) -> None:
+        self.assertNotIn("post_mutation_command", self._schema_enum())
+
+    def test_still_a_member_so_old_criteria_deserialize(self) -> None:
+        self.assertIn(
+            TaskCriterionKind.POST_MUTATION_COMMAND,
+            set(TaskCriterionKind),
+        )
+        restored = TaskAcceptanceCriterion.from_data({
+            "criterion_id": "ac_command_build_or_check",
+            "description": "the build command exits with code 0",
+            "verification_kind": "post_mutation_command",
+            "evidence_reference": None,
+        })
+
+        self.assertIs(
+            restored.verification_kind, TaskCriterionKind.POST_MUTATION_COMMAND,
+        )
+
+    def test_a_replayed_criterion_round_trips_unchanged(self) -> None:
+        """Replay must not rewrite history: the kind survives a round trip."""
+        original = TaskAcceptanceCriterion(
+            "ac_command_build_or_check",
+            "the build command exits with code 0",
+            TaskCriterionKind.POST_MUTATION_COMMAND,
+            command=("python", "-m", "pytest"),
+        )
+
+        self.assertEqual(
+            TaskAcceptanceCriterion.from_data(original.to_data()), original,
+        )

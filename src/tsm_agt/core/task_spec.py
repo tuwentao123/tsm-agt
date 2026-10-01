@@ -47,6 +47,12 @@ def _validate_outcome_dependencies(
 
 class TaskCriterionKind(StrEnum):
     WORKSPACE_INTEGRITY = "workspace_integrity"
+    #: Replay-only tombstone. No authoring path offers this kind any more -- it is
+    #: absent from ``TASK_SPEC_PROPOSAL_SCHEMA_V1``, from the Planner prompt and
+    #: from the model-facing tool description -- but event streams written before
+    #: the removal still carry ``verification_kind = "post_mutation_command"``, and
+    #: ``from_data`` resolves a kind with a bare ``TaskCriterionKind(...)``. Drop
+    #: the member and those streams stop replaying.
     POST_MUTATION_COMMAND = "post_mutation_command"
     EVIDENCE_REFERENCE = "evidence_reference"
     #: A judgement channel with no machine proof. It is advisory in the per-turn
@@ -73,6 +79,14 @@ class TaskCriterionKind(StrEnum):
 RUNTIME_AUTHORED_CRITERION_KINDS: frozenset[TaskCriterionKind] = frozenset({
     TaskCriterionKind.GOAL_ALIGNMENT,
     TaskCriterionKind.REQUIRED_EFFECT,
+})
+
+#: Kinds kept only so an existing event stream still replays. They are excluded
+#: from the model-facing proposal schema exactly like the Runtime-authored kinds,
+#: but for the opposite reason: not because the Runtime owns them, but because
+#: nothing authors them any more.
+REPLAY_ONLY_CRITERION_KINDS: frozenset[TaskCriterionKind] = frozenset({
+    TaskCriterionKind.POST_MUTATION_COMMAND,
 })
 
 #: Canonical id of the Runtime-authored delivery criterion.
@@ -696,6 +710,7 @@ TASK_SPEC_PROPOSAL_SCHEMA_V1: Mapping[str, Any] = {
                         "enum": [
                             item.value for item in TaskCriterionKind
                             if item not in RUNTIME_AUTHORED_CRITERION_KINDS
+                            and item not in REPLAY_ONLY_CRITERION_KINDS
                         ],
                     },
                     "evidence_reference": {"type": ["string", "null"]},

@@ -63,7 +63,6 @@ class ModelTaskSpecPlanner:
                     "Translate the user request into a project-neutral Task SPEC. "
                     "First define 1-30 acceptance criteria that Runtime can verify: "
                     "use workspace_integrity for durable workspace changes, "
-                    "post_mutation_command when a mutation must be command-verified, "
                     "and rubric for any judgement that cannot be machine-checked. "
                     "Do NOT invent evidence_reference at planning time: it may only "
                     "name an event:/tool_call:/mutation: reference that already "

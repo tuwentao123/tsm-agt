@@ -285,7 +285,7 @@ from .kernel_checkpoint import (
     CheckpointMixin,
 )
 from .task import LEGAL_TRANSITIONS, SUCCESS_PATH, TaskNotFound, TaskSnapshot, TaskState
-from .verification_command import is_verification_command, is_verification_request
+from .verification_command import is_verification_request
 from .task_spec import (
     TaskAcceptanceCriterion, TaskContinuationMode, TaskCriterionKind,
     OutcomeBindingAction, OutcomeBindingDecision, OutcomeBindingReason,
@@ -1227,51 +1227,19 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
     ) -> tuple[tuple[TaskAcceptanceCriterion, ...], list[dict[str, str]]]:
         """Demote criteria whose verification channel cannot decide them.
 
-        Two shapes are demoted to the advisory ``rubric`` channel:
-
-        * an ``evidence_reference`` criterion asserts a fact that must already
-          be true; it is never work that execution can produce. A reference no
-          event/tool_call/mutation can resolve is permanently unverifiable and
-          must not survive as a required gate.
-        * a ``post_mutation_command`` criterion promises a *command* decides it.
-          A criterion that declares no command, or declares one that cannot
-          falsify a claim (``git status``, ``py_compile``), is asking the runtime
-          to close a gate with evidence it can never accept -- the shape behind
-          ``task-c2d21bce8ea74f0bbcac07aba4aefedf``. Demotion keeps the
-          requirement visible to a judge instead of burning the turn budget on
-          a debt nothing can pay.
+        An ``evidence_reference`` criterion asserts a fact that must already be
+        true; it is never work that execution can produce. A reference no
+        event/tool_call/mutation can resolve is permanently unverifiable and
+        must not survive as a required gate. Demoting it keeps the requirement
+        visible to a judge instead of burning the turn budget on a debt nothing
+        can pay.
 
         Demotion happens only on the authoring path, so historical snapshots
-        with unbound command criteria keep replaying unchanged.
+        keep replaying unchanged.
         """
         kept: list[TaskAcceptanceCriterion] = []
         demoted: list[dict[str, str]] = []
         for criterion in criteria:
-            if (
-                criterion.verification_kind
-                is TaskCriterionKind.POST_MUTATION_COMMAND
-            ):
-                declared = tuple(criterion.command)
-                if declared and is_verification_command(declared):
-                    kept.append(criterion)
-                    continue
-                demoted.append({
-                    "criterion_id": criterion.criterion_id,
-                    "from": TaskCriterionKind.POST_MUTATION_COMMAND.value,
-                    "to": TaskCriterionKind.RUBRIC.value,
-                    "reference": " ".join(declared),
-                    "reason": (
-                        "UNRECOGNIZED_VERIFICATION_COMMAND"
-                        if declared else "NO_DECLARED_VERIFICATION_COMMAND"
-                    ),
-                })
-                kept.append(TaskAcceptanceCriterion(
-                    criterion_id=criterion.criterion_id,
-                    description=criterion.description,
-                    verification_kind=TaskCriterionKind.RUBRIC,
-                    evidence_reference=None,
-                ))
-                continue
             if (
                 criterion.verification_kind
                 is not TaskCriterionKind.EVIDENCE_REFERENCE

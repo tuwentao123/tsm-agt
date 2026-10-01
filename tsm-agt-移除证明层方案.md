@@ -684,3 +684,61 @@ A.1g 说它"活的"，实测**只有 `test_proof_closure.py:1848` 调它**。因
 `RubricEvidence`、`RubricJudgement`，均只剩 import 行）与 `ports/rubric_judge.py` 里
 提到已删 `normalize_judgement` 的文档串。**裁剪这条通路需要动 composition 的强制注册
 断言，属独立的语义决策。**
+
+## A.1i S5「删词汇」落地实测 —— 选 A 墓碑法（用户决策）
+
+**结果：1247 passed / 12 skipped / 0 failed，26.07s。**
+
+A.1f 说 S5"不能独立删"。实测它不是"删词汇"，而是**一次模型可见契约的收缩**，
+且撞上 hard replay 兼容。以下全部在真实 ledger（`.agent/runtime.db`，692 task /
+115119 event）上量得。
+
+### 测量：这个 kind 到底在哪儿
+
+| 位置 | 值 |
+|---|---|
+| 当前 task 快照含该 kind | **0 / 692**（落库前已被降级，3 条 `task_spec.criteria_demoted` 为证）|
+| `task_spec.revised` 事件含该 kind | **206 条 / 385 处**，路径 `snapshot.acceptance_criteria[].verification_kind` |
+| 反序列化路径 | `TaskAcceptanceCriterion.from_data` → 裸 `TaskCriterionKind(str(...))` → **未知成员 ValueError** |
+| 直接验证 | `TaskSpecSnapshot.from_data` 在 HEAD 可成功 replay 这些快照 |
+
+⇒ 删成员 = 206 条事件 replay 失败。**A.1f 没说这一层**，是本批新增的证据。
+
+### 落地（选 A：枚举留作墓碑，只删模型可见面）
+
+1. **`task_spec.py`**：`POST_MUTATION_COMMAND` 保留，加"replay-only tombstone"注释；
+   新增 `REPLAY_ONLY_CRITERION_KINDS = {POST_MUTATION_COMMAND}`；
+   `TASK_SPEC_PROPOSAL_SCHEMA_V1` 的 `verification_kind.enum` 改为同时排除
+   `RUNTIME_AUTHORED_CRITERION_KINDS` 与 `REPLAY_ONLY_CRITERION_KINDS`。
+   **模型可见枚举从 4 个降为 3 个**：`workspace_integrity / evidence_reference / rubric`。
+2. **`kernel.py`**：删 `_demote_unresolvable_criteria` 的 `POST_MUTATION_COMMAND` 分支
+   （原 1250-1274）与对应文档 bullet；import 收窄为只 `is_verification_request`。
+   **该函数保留**：它的第二个分支（`EVIDENCE_REFERENCE` 降级）是活的，且正是死锁事故
+   （`task-2c8f8fbb...`）的防死锁守卫。`_verify_task_spec_reference` 因此保留。
+3. **模型可见面文本**：`task_spec_tools.py` 工具描述、`planner.py` planner prompt 各删一句。
+4. **证据等级**：删 `EvidenceLevelSignals.passed_post_mutation_commands` —— 它**从来没有
+   写入点**（只被 `evaluator.py` 读），恒等于 +0，是纯死信号。
+5. **`verification_command.py` 保留**：两个函数里 `is_verification_request` 本来就是活的
+   （`kernel.py:761`、`kernel_tool.py:953`，工具资格判定）；`is_verification_command`
+   也仍被 `validate_authored_criterion` 调用，不是死代码。**A.1f 说"删该模块"是错的。**
+
+### 新增钉子（原测试一条都没覆盖这次改动）
+
+`tests/test_task_spec.py::PostMutationCommandTombstoneTest`（3 条）：模型可见 schema 不含该
+kind / 枚举成员仍在且可反序列化 / 含 `command` 的 criterion 往返不变。
+**改动前后测试数 1244 → 1247，证明此前无人钉住这个契约。**
+
+### 验证
+
+* `py_compile` 全通过。
+* 模型可见枚举实测 = `['workspace_integrity', 'evidence_reference', 'rubric']`。
+* **老 ledger replay 实测：206/206 事件 OK。**
+
+### 仍未处置（下一批候选）
+
+* `tests/test_post_mutation_applicability.py` 的 gap 断言**已是空转**：`_completion_readiness_gaps`
+  已 hollow（返回 `()`），所以 `assertNotIn(...)`/`assertEqual(list(...), [])` 永远不会失败。
+  该文件真正还有效的只有 `_has_active_workspace_mutation` 那两条断言。它与
+  `_completion_readiness_gaps` 这个 hollow 缝（及 6 个直接调它的 spec）同属一批。
+* `rubric_judge` 通路整体孤儿化（见 A.1h）。
+* 批 3d：`evidence_question.py` + 4 个 `_*_evidence_question` 方法 + 10 个 import 点。

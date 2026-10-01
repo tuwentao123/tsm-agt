@@ -45,7 +45,7 @@ class CoreTaskSpecToolProvider:
             "core.task_spec_update",
             "Revise scope, constraints, and acceptance criteria using the current "
             "revision. This cannot change the user goal. Use only verification kinds "
-            "the Runtime can prove: workspace_integrity, post_mutation_command, or "
+            "the Runtime can prove: workspace_integrity, or "
             "evidence_reference with an existing event:/tool_call:/mutation: reference. "
             "Use rubric for judgements that cannot be machine-checked.",
             {

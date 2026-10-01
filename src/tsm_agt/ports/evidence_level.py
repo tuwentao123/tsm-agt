@@ -24,7 +24,6 @@ class EvidenceLevelSignals:
     successful_tool_calls: int
     verification_status: str
     passed_evidence_references: int = 0
-    passed_post_mutation_commands: int = 0
     failed_criteria: int = 0
     blocked_criteria: int = 0
 

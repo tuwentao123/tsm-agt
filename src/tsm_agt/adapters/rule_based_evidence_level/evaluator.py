@@ -39,10 +39,7 @@ class RuleBasedEvidenceLevelEvaluator:
             raise RuntimeError("evidence level evaluator is not started")
         counts = {key: max(0, int(value)) for key, value in signals.evidence_counts.items()}
         total = sum(counts.values())
-        verified = (
-            max(0, signals.passed_evidence_references)
-            + max(0, signals.passed_post_mutation_commands)
-        )
+        verified = max(0, signals.passed_evidence_references)
         if (
             signals.verification_status in {"failed", "blocked"}
             or signals.failed_criteria > 0
