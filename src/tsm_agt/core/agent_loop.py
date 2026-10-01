@@ -620,11 +620,16 @@ class PhaseAction(StrEnum):
     (``agent/conversation_loop.py:1641-1678``): every phase answers with an
     ``action`` and the loop dispatches on it, so a phase that must end the
     iteration says so instead of breaking out of a loop it does not own.
+
+    Every member must be one the loop actually branches on. ``Kernel.run_agent_turn``
+    handles ``RETURN`` and ``CONTINUE`` at explicit branch points and treats ``OK``
+    as the fall-through for the rest of the iteration. There is deliberately no
+    ``BREAK``: a member the loop does not branch on is a silent no-op, and one sat
+    here that way until it was removed.
     """
 
     OK = "ok"
     CONTINUE = "continue"
-    BREAK = "break"
     RETURN = "return"
 
 

@@ -1133,3 +1133,21 @@ class TurnStateTest(unittest.TestCase):
 
         self.assertFalse(dc.fields(TurnState) and TurnState.__dataclass_params__.frozen)
         self.assertTrue(AgentTurnResult.__dataclass_params__.frozen)
+
+
+class PhaseActionVocabularyTest(unittest.TestCase):
+    """Every control-flow action must be one the loop actually branches on.
+
+    ``Kernel.run_agent_turn`` branches on ``RETURN`` and ``CONTINUE`` and treats
+    ``OK`` as the fall-through for the rest of the iteration. A member it does not
+    branch on can only ever be a silent no-op, which is what ``BREAK`` was: it sat
+    in the enum with no reader anywhere in ``src/`` or ``tests/``.
+    """
+
+    def test_members_are_exactly_the_dispatched_actions(self) -> None:
+        from tsm_agt.core.agent_loop import PhaseAction
+
+        self.assertEqual(
+            {action.value for action in PhaseAction},
+            {"ok", "continue", "return"},
+        )

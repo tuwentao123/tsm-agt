@@ -910,3 +910,73 @@ port 完整性检查，里面 `SessionInputResolverPort` 同样从不被 composi
 `test_post_mutation_applicability` 那条线在批 5 已处理。剩下的是本会话早先记录的
 `PhaseAction.BREAK` / `ReportBlocked` / `ReportIncompleteRecoverable` 死枚举值，以及
 比事故前基线仍少的测试用例（批 4/5/6 各按证据删过空转项，需重新建立基线）。
+
+## A.1m 批 7 —— 收尾：`PhaseAction.BREAK` 死值，以及重建测试基线
+
+**结果：1241 passed / 12 skipped / 0 failed，26.01s。**
+
+### `PhaseAction.BREAK` —— 实测零消费
+
+`PhaseAction` 定义在 `agent_loop.py:616`，成员四个。实测：
+
+| 值 | 消费点 |
+|---|---|
+| `OK` | 默认值 + `turn_phases.py` 3 处产出；循环里**落空**（不分支） |
+| `CONTINUE` | `kernel.py:3478,3486` 分派；`turn_phases.py:607,889,926` 产出 |
+| `RETURN` | `kernel.py:3473,3480,3484` 分派；`turn_phases.py:88,774,939` 产出 |
+| **`BREAK`** | **只有定义行本身** —— `src/` + `tests/` 全域零引用 |
+
+`Kernel.run_agent_turn` 的 `while True`（`kernel.py:3466-3487`）只分支 `RETURN` 与
+`CONTINUE`；`OK` 是落空。**`BREAK` 从来没有任何分支处理它**，是个静默 no-op。
+
+**先确认它不持久化再删**：`PhaseAction`/`PhaseVerdict` 无 `to_data`/`from_data`/
+checkpoint 路径，`"break"` 字符串在全域只出现在定义处 —— 纯内存控制流，**没有 S5 那种
+replay 兼容风险**。
+
+删除并在文档串里写明"每个成员都必须是循环真正分支的那个值，`BREAK` 曾以 no-op 的形态
+坐在这里"。
+
+**顺带撤回一条过期的待办**：summary 里的 `ReportBlocked` / `ReportIncompleteRecoverable`
+两个"死枚举值"**在全域已不存在**（`src/` + `tests/` 零命中），那条待办本身是过期的。
+
+**新增钉子** `tests/test_agent_loop.py::PhaseActionVocabularyTest`：断言成员集恰好是
+`{ok, continue, return}`。这是唯一能防住"再加一个没有分支的成员"的检查 —— 也正是当初
+`BREAK` 溜进来的方式。
+
+### 重建测试基线
+
+**旧数字作废。** "比事故前少 28 条"**不可复现**，不要再用：
+
+* 那次事故丢弃的是**未提交**工作，所以**没有任何提交包含它** —— `git log` 里查不到基线。
+* 备份根目录**不在磁盘上**（`scripts/restore_from_backup.sh` 需要外部传入；全盘搜索只找到
+  三个无关工具的备份目录），所以也无法用备份快照比对。
+* 那个 28 的来源是当时那份工作树的一次人工计数，载体已随事故消失。
+
+**新基线（HEAD = `c537b14` + 本批，命令写死以便复现）**：
+
+```
+.venv/bin/python -m pytest tests/ -q -p no:randomly
+→ 1241 passed, 12 skipped, 0 failed, 252 subtests, ~26s
+```
+
+* `--collect-only`：**1253** collected = 1241 passed + 12 skipped（自洽）
+* 源码级 `def test_` 计数 1238（差额来自参数化用例）
+* **逐文件审计：最小用例数是 1，没有任何"收集到 0 条"的空洞文件**
+* 已知的单用例文件（都是有意截断的）：`test_terminal_state_mapping.py`(1)、
+  `test_runtime_task_result.py`(1)、`test_coding_agent_e2e.py`(1) 等
+
+**本会话测试数的净变化账**（可复算）：
+
+| 批次 | 增 | 删 |
+|---|---|---|
+| 批 4 | +17（救回 6 个测活代码的类）| −120（`test_proof_closure.py` 整删）|
+| S5 | +3（墓碑契约钉子）| — |
+| 批 5 | +1（救回成 2 条）| −2（空转项）+1（原空转条）|
+| 批 6 | — | −6（接线测试 2 + config 测试 4）|
+| 批 7 | +1（`PhaseAction` 钉子）| — |
+
+### 本会话至此全部结束
+
+证明层已彻底不在运行路径上：不产出、不计算、不裁决、不阻断、不装配。剩下的
+`ports/rubric_judge.py` 与 `adapters/model_rubric_judge/` 是**有意保留的适配器**（可一行重新
+注册接回），`TaskCriterionKind.POST_MUTATION_COMMAND` 是**有意保留的 replay 墓碑**。
