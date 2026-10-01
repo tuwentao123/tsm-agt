@@ -513,12 +513,6 @@ class ExplorationBudgetCompositionTest(unittest.TestCase):
         self.assertEqual(configuration.execution_reserve_model_calls, 1)
         self.assertEqual(configuration.recovery_reserve_model_calls, 1)
         self.assertEqual(configuration.verification_reserve_model_calls, 1)
-        self.assertEqual(
-            configuration.model_call_renewal_increments, (10, 5, 3)
-        )
-        self.assertEqual(configuration.model_call_renewal_max_count, 3)
-        self.assertEqual(configuration.model_call_renewal_absolute_limit, 120)
-        self.assertEqual(configuration.model_call_renewal_threshold, 4)
         self.assertEqual(configuration.max_tool_calls, 60)
         self.assertEqual(configuration.max_actions, 60)
         self.assertEqual(configuration.max_tool_seconds, 300)
@@ -530,11 +524,7 @@ class ExplorationBudgetCompositionTest(unittest.TestCase):
                 "TSM_AGT_EXPLORATION_PROFILE=legacy\n"
                 "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS=30\n"
                 "TSM_AGT_EXPLORATION_MAX_ACTIONS=28\n"
-                "TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS=3\n"
-                "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_INCREMENTS=12,6,3\n"
-                "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_MAX_COUNT=2\n"
-                "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_ABSOLUTE_LIMIT=150\n"
-                "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_THRESHOLD=5\n",
+                "TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS=3\n",
                 encoding="utf-8",
             )
             environment = {"TSM_AGT_EXPLORATION_MAX_TOOL_CALLS": "36"}
@@ -545,12 +535,6 @@ class ExplorationBudgetCompositionTest(unittest.TestCase):
             self.assertEqual(configuration.max_actions, 28)
             self.assertEqual(configuration.finalization_model_calls, 3)
             self.assertEqual(configuration.profile, "legacy")
-            self.assertEqual(
-                configuration.model_call_renewal_increments, (12, 6, 3)
-            )
-            self.assertEqual(configuration.model_call_renewal_max_count, 2)
-            self.assertEqual(configuration.model_call_renewal_absolute_limit, 150)
-            self.assertEqual(configuration.model_call_renewal_threshold, 5)
             self.assertEqual(
                 configuration.sources["exploration_budget.profile"],
                 "env_file",
@@ -570,16 +554,6 @@ class ExplorationBudgetCompositionTest(unittest.TestCase):
                 "env_file",
             )
             self.assertEqual(configuration.agent_max_tool_calls, 120)
-
-    def test_invalid_renewal_sequence_fails_at_startup(self):
-        with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_INCREMENTS=5,10\n",
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(ValueError, "must not increase"):
-                load_exploration_budget_configuration(env_file, {})
 
     def test_invalid_budget_fails_at_startup(self):
         with tempfile.TemporaryDirectory() as directory:

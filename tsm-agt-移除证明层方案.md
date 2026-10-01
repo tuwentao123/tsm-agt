@@ -224,6 +224,22 @@ async def transition_task(self, task_id, target, reason, *, authority: str = "ru
   （含 env 覆盖用的 70 → 150）。
 * 单回合上限从"基础 40 + 续借最高 18 = 58"变为 **90**；续借仍是孤儿（B2 删）。
 
+### B2 —— 删除 renewal（已成孤儿）✅ 已落地
+* 删除：`core/budget_renewal.py`、`tests/test_budget_renewal.py`、
+  `turn_phases` 的 renewal 分支（94 行）+ import + `renewal_events` 接线、
+  `kernel.py` 的 import + 4 个依赖旋钮、`composition.py` 的 14 行旋钮读取、
+  `exploration_configuration.py` 的 6 处（字段/校验/serialization/env 映射/
+  increments 装载/返回 kwargs）。
+* 规格：`test_exploration_budget_policy` 去掉 renewal 断言与
+  `test_invalid_renewal_sequence_fails_at_startup`。
+* **保留** checkpoint 字段 `model_budget_renewal_count` /
+  `model_budget_total_granted`（`agent_loop.py`、`kernel_checkpoint.py`、
+  `kernel_model.py`、`turn_tool_batch.py`）—— 旧台账里有，删了旧任务重放会炸。
+* 教训（已计入流程）：这步我用"内容锚点裁剪"一次改了 6 个文件，其中一刀
+  `**values, model_call_renewal_increments=renewal_increments,` **把 `**values` 一起删了**，
+  导致所有 env/.env 预算值静默失效（4 条测试报"ValueError not raised"，很具迷惑性）。
+  锚点裁剪必须连同**同一行的其他内容**一起看，不能只匹配"要删的那部分"。
+
 ### S2 —— 停止产出
 * 不再编译 obligation（`ProofPlanCompiler`）、不再构造 gap（`_completion_gaps`）、
   不再注入 readiness 诊断与 nudge（`policy`、`turn_phases` 的相关分支）。

@@ -19,9 +19,6 @@ import time
 from .agent_loop import (
     AgentLoopLimitExceeded, AgentProgress, AgentProgressKind, AgentTurnResult, PhaseAction, PhaseVerdict, TurnState,
 )
-from .budget_renewal import (
-    DiminishingModelCallBudgetPolicy,
-)
 from collections.abc import (
     Mapping,
 )
@@ -794,100 +791,6 @@ async def _finish_iteration(
             response_checkpoint,
             completion_readiness_state=readiness.state.to_data(),
         )
-        renewal_events: tuple[tuple[str, Mapping[str, Any]], ...] = ()
-        renewable_action = state.legacy_completion_gate and (
-            readiness.action in {
-                CompletionReadinessAction.CONTINUE,
-                CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE,
-                # A bounded stop with recoverable work left is exactly
-                # what the renewal budget exists for. Keyed on the
-                # action, never on a reason string.
-                CompletionReadinessAction.EXHAUSTED,
-            }
-        )
-        renewable_effects = {
-            ToolEffect.OBSERVE
-            if tool.effect is ToolEffect.UNSPECIFIED and tool.is_read_only
-            else tool.effect
-            for tool in state.visible_tools
-            if not tool.is_internal_state
-        }
-        required_recoverable_work = renewable_action and any(
-            gap.required
-            and gap.effective_required_effects
-            and gap.effective_required_effects.issubset(
-                renewable_effects
-            )
-            for gap in readiness.gaps
-        )
-        renewal_policy = DiminishingModelCallBudgetPolicy(
-            increments=kernel._dependencies.model_call_renewal_increments,
-            max_renewals=(
-                kernel._dependencies.model_call_renewal_max_count
-            ),
-            absolute_limit=(
-                kernel._dependencies.model_call_renewal_absolute_limit
-            ),
-            threshold=kernel._dependencies.model_call_renewal_threshold,
-        )
-        renewal = renewal_policy.evaluate(
-            current_limit=response_checkpoint.max_model_calls,
-            consumed=state.model_call_count,
-            renewal_count=(
-                response_checkpoint.model_budget_renewal_count
-            ),
-            required_recoverable_work=required_recoverable_work,
-        )
-        if state.legacy_completion_gate and renewal is not None:
-            # A renewal buys *capacity*, not more nudges. Resetting the
-            # correction counter here let a renewal refill the very budget the
-            # nudge is capped against, so one instruction could be repeated until
-            # the renewal sequence ran out (measured: 25 nudges, 26 calls).
-            renewed_state = CompletionReadinessState(
-                continue_attempts=readiness.state.continue_attempts,
-                disclosure_attempts=readiness.state.disclosure_attempts,
-                automatic_resume_attempts=renewal.renewal_count,
-                last_action="",
-                schema_version=readiness.state.schema_version,
-                stalled_continuations=(
-                    readiness.state.stalled_continuations
-                ),
-            )
-            response_checkpoint = replace(
-                response_checkpoint,
-                max_model_calls=renewal.new_limit,
-                model_budget_renewal_count=renewal.renewal_count,
-                model_budget_total_granted=(
-                    response_checkpoint.model_budget_total_granted
-                    + renewal.increment
-                ),
-                completion_readiness_state=renewed_state.to_data(),
-            )
-            action_before = readiness.action
-            reason_before = readiness.reason
-            readiness = CompletionReadinessDecision(
-                CompletionReadinessAction.CONTINUE,
-                "model_call_budget_renewed",
-                renewed_state, readiness.gaps,
-            )
-            renewal_events = (("budget.renewed", {
-                "turn_id": state.turn_id,
-                "renewal_count": renewal.renewal_count,
-                "increment": renewal.increment,
-                "previous_max_model_calls": renewal.previous_limit,
-                "max_model_calls": renewal.new_limit,
-                "absolute_max_model_calls": (
-                    renewal_policy.absolute_limit
-                ),
-                "remaining_model_calls_before": (
-                    renewal.remaining_before
-                ),
-                "readiness_action_before": action_before.value,
-                "readiness_reason": reason_before,
-                "gap_ids": [gap.gap_id for gap in readiness.gaps],
-            }),)
-    else:
-        renewal_events = ()
     if (
         not state.legacy_completion_gate
         and not state.tool_calls
@@ -970,7 +873,6 @@ async def _finish_iteration(
     await kernel._commit_model_response_checkpoint(
         response_checkpoint, state.response, state.prompt.receipt, state.prepared.budget,
         final=final_response or incomplete_recovery_boundary,
-        additional_events=renewal_events,
     )
     if state.should_buffer_text and (
         state.tool_calls or has_late_steering or final_response

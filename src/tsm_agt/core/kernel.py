@@ -193,7 +193,6 @@ from .approval import (
     ApprovalRequired,
     utc_now,
 )
-from .budget_renewal import DiminishingModelCallBudgetPolicy
 from .workspace_access import WorkspaceAccessCapability, WorkspaceAccessGrant
 from .clarification import (
     ClarificationChoice, ClarificationKind, ClarificationNotPending, ClarificationRequest,
@@ -472,10 +471,6 @@ class KernelDependencies:
     execution_reserve_model_calls: int = 1
     recovery_reserve_model_calls: int = 1
     verification_reserve_model_calls: int = 1
-    model_call_renewal_increments: tuple[int, ...] = (10, 5, 3)
-    model_call_renewal_max_count: int = 3
-    model_call_renewal_absolute_limit: int = 58
-    model_call_renewal_threshold: int = 4
     prompt_template: PromptTemplate = field(default_factory=PromptTemplate.default)
     context_manager: ContextWindowManager = field(
         default_factory=ContextWindowManager
