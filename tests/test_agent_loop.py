@@ -634,7 +634,10 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
         return application, temp_dir, task, provider
 
     async def _install_mutation_outcome(self, application, task) -> None:
-        from tsm_agt.core import TaskSpecProposal, TaskSpecSnapshot
+        from tsm_agt.core import (
+            TaskAcceptanceCriterion, TaskCriterionKind, TaskSpecProposal,
+            TaskSpecSnapshot,
+        )
         current = await application.kernel.get_task_spec(task.task_id)
         proposal = TaskSpecProposal.from_data({
             "schema_version": 1,
@@ -652,7 +655,10 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
         })
         spec = TaskSpecSnapshot.from_proposal(
             task.task_id, current.revision + 1, proposal,
-            current.acceptance_criteria,
+            (TaskAcceptanceCriterion(
+                "workspace-effect", "The declared change left a durable effect",
+                TaskCriterionKind.WORKSPACE_INTEGRITY,
+            ),),
         )
         await application.kernel._append_events(task.task_id, ((
             "task_spec.revised", {"snapshot": spec.to_data()},

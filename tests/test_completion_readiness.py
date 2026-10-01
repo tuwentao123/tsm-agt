@@ -492,7 +492,10 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                 })
                 spec = TaskSpecSnapshot.from_proposal(
                     task.task_id, current.revision + 1, proposal,
-                    current.acceptance_criteria,
+                    (TaskAcceptanceCriterion(
+                        "delivery", "Deliver one workspace file",
+                        TaskCriterionKind.WORKSPACE_INTEGRITY,
+                    ),),
                 )
                 await app.kernel._append_events(task.task_id, ((
                     "task_spec.revised", {"snapshot": spec.to_data()},

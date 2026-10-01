@@ -1134,8 +1134,8 @@ class TaskSpecSnapshot:
             raise ValueError("Task SPEC revision must be positive")
         if len(self.goal) > 2000 or len(self.scope) > 50 or len(self.constraints) > 50:
             raise ValueError("Task SPEC exceeds its bounded limits")
-        if not self.acceptance_criteria or len(self.acceptance_criteria) > 30:
-            raise ValueError("Task SPEC requires 1-30 acceptance criteria")
+        if len(self.acceptance_criteria) > 30:
+            raise ValueError("Task SPEC supports at most 30 acceptance criteria")
         if self.schema_version not in {0, 1}:
             raise ValueError("unsupported Task SPEC schema version")
         if self.schema_version == 0 and (
@@ -1161,14 +1161,18 @@ class TaskSpecSnapshot:
 
     @classmethod
     def initial(cls, task_id: str, goal: str) -> TaskSpecSnapshot:
-        return cls(
-            task_id, 1, goal.strip(), (), (),
-            (TaskAcceptanceCriterion(
-                "workspace-integrity",
-                "Committed workspace effects still match the mutation journal",
-                TaskCriterionKind.WORKSPACE_INTEGRITY,
-            ),),
-        )
+        # A Task starts with no criteria of its own. The old hardcoded
+        # ``workspace-integrity`` criterion was a Runtime-invented obligation on
+        # a Task that had not even been planned yet -- and the proof compiler
+        # turned it into a *required* EFFECT_OBSERVED obligation demanding the
+        # MUTATE_ARTIFACT capability, so a read-only analysis Task owed a change
+        # it could never make (real ledger: task-8d1ec232a0e54910852a029dcf11b03f).
+        #
+        # An empty set here is not a loophole: every path that turns a planner
+        # proposal into a TaskSpec passes ``require_acceptance_criteria=True``
+        # (kernel_task.py / model_task_spec_planner), so a planned Task still
+        # always carries at least one authored criterion.
+        return cls(task_id, 1, goal.strip(), (), (), ())
 
     @classmethod
     def from_proposal(

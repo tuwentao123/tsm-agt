@@ -495,27 +495,6 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
             await app.registry.stop_all()
             directory.cleanup()
 
-    async def test_workspace_integrity_cannot_hide_protocol_as_final_answer(self):
-        markup = (
-            '<tool_use name="core__read_file" id="call-final">'
-            '{"path":"screen.tsx"}</tool_use>'
-        )
-        directory, app, verification = await self._verification_for_persisted_answer([
-            {"type": "text", "text": markup}
-        ])
-        try:
-            by_id = {item.criterion_id: item for item in verification.criteria}
-            self.assertEqual(
-                by_id["answer-completeness"].status, AcceptanceStatus.FAILED
-            )
-            self.assertEqual(
-                by_id["workspace-integrity"].status, AcceptanceStatus.PASSED
-            )
-            self.assertEqual(verification.status, AcceptanceStatus.FAILED)
-        finally:
-            await app.registry.stop_all()
-            directory.cleanup()
-
     async def test_pending_structured_tool_call_is_not_a_final_answer(self):
         directory, app, verification = await self._verification_for_persisted_answer([
             {

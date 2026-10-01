@@ -240,27 +240,35 @@ async def transition_task(self, task_id, target, reason, *, authority: str = "ru
   导致所有 env/.env 预算值静默失效（4 条测试报"ValueError not raised"，很具迷惑性）。
   锚点裁剪必须连同**同一行的其他内容**一起看，不能只匹配"要删的那部分"。
 
-### S3 —— 停止持久化 acceptance_criteria ⛔ 未落地：被 schema 不变量挡住
-实测：把 `TaskSpecSnapshot.initial()` 里那条硬编码的 `workspace-integrity` 拿掉后，
-**523 条测试变红**，全部同一个原因：
+### S3 —— 停止持久化 acceptance_criteria（选 A）✅ 已落地
+**先查清再动**：`workspace-integrity` 是 `TaskSpecSnapshot.initial()` 给**每个**新任务
+硬塞的准则。它的验证逻辑只是拿磁盘哈希和 mutation journal 比对，**空 journal 必然通过**
+（`kernel.py:2398-2400` 明写 "empty journal trivially satisfies it"）；但同一 Runtime 的
+`ProofPlanCompiler` 把它编译成 `EFFECT_OBSERVED` + **`required=True`** +
+`required_capabilities=(MUTATE_ARTIFACT,)`（`task_spec.py:1024-1037`）—— 一条"没改动就该
+通过"的检查变成了"必须有改动"的硬性义务。**这就是 task-8d1ec232 的死因。**
+`kernel.py:585-596` 自己还写着"bare workspace_integrity does NOT imply a required change"，
+与编译器直接矛盾。Hermes / Codex 都没有这种任务级完整性准则。
 
-```
-ValueError: Task SPEC requires 1-30 acceptance criteria   (task_spec.py:1138)
-```
+**关键取证（决定 A 是否安全）**：
+* `TaskSpecSnapshot` 过去要求 **1-30** 条准则（`task_spec.py:1137`），所以空集建不出任务
+  （初测 523 条失败全部是这个 `ValueError`，**不是**功能依赖）。
+* `TaskSpecProposal` 只有**上界**（`task_spec.py:419`），且**要求 1-30 个 outcome**，不要求准则。
+* 但凡是"把 planner 提案变成 TaskSpec"的路径，**都显式传
+  `require_acceptance_criteria=True`**：`kernel_task.py:303`、
+  `model_task_spec_planner/planner.py:170,184`。`TaskSpecSnapshot.from_proposal` 另外还有
+  一条"proposal 无准则且未给 fallback 就拒绝"（`task_spec.py:1190`）。
+  ⇒ **放宽快照下界不会产生"零准则的已规划任务"**，planner 的 ≥1 保证独立存在。
 
-`TaskSpecSnapshot` 的 `__post_init__` 要求准则数 **1–30**，空元组直接构造失败，
-于是**任务根本建不出来**（不是"少了个准则"，是"整个 Runtime 起不来"）。
-
-所以 S3 的第一步不是"不写准则"，而是**先把这个持久化 schema 的下界从 1 放宽到 0** ——
-这是一次 schema 变更，牵动旧事件重放与 `from_proposal` 的派生逻辑，必须单独决策，
-不能顺手改。已回退，工作区干净、全量 1404 绿。
-
-**S3 的正确拆法**（待你点头）：
-1. 放宽 `TaskSpecSnapshot` 下界 1 → 0（或区分"initial 允许空 / 修订必须有"）。
-2. 再让 `initial()` 不写准则。
-3. 确认 `TaskSpecProjector` 对**旧事件**里带 `workspace-integrity` 的 spec 仍然容忍
-   （旧台账 668/687 个任务都有这条）。
-4. 确认 planner 一定产出 ≥1 条准则，否则放宽后会冒出"零准则"的任务。
+**改动**：
+1. `task_spec.py:1137` 下界 1 → 0（消息改为 "supports at most 30"）。
+2. `initial()` 不再写准则，返回空集。
+3. 规格处置（3 条）：
+   * 删 `test_task_spec.py::test_workspace_integrity_cannot_hide_protocol_as_final_answer`
+     （主语已不存在）。
+   * `test_completion_readiness`、`test_agent_loop` 各一处把 fallback
+     `current.acceptance_criteria`（现在是空集）换成自己声明的准则。
+* 实测 `TaskSpecSnapshot.initial(...).acceptance_criteria == ()`。
 
 ### S2 —— 停止产出
 * 不再编译 obligation（`ProofPlanCompiler`）、不再构造 gap（`_completion_gaps`）、
