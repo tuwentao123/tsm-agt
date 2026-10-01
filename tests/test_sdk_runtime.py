@@ -18,7 +18,9 @@ from tsm_agt.ports import (
     RuntimeEvent, RuntimeUnitOfWork,
 )
 from tsm_agt.ports import (
-    ModelFailureCategory, ModelRecoveryAction, ModelRetrySafety,
+    HealthState, HealthStatus, ModelAttemptFailure, ModelFailureCategory,
+    ModelRecoveryAction, ModelRecoveryDecision, ModelRecoveryExhausted,
+    ModelRetrySafety,
 )
 from tsm_agt.sdk import EngineeringAgentClient
 from tsm_agt.sdk.runtime import _is_resumable_stop
@@ -627,3 +629,91 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _TransportFailingPlanner:
+    """A planner whose provider connection failed on every attempt."""
+
+    descriptor = AdapterDescriptor(
+        "fixture.transport-failing-planner", "1.0", "TaskSpecPlannerPort", "1.0"
+    )
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    async def start(self, context) -> None:
+        pass
+
+    async def health(self) -> HealthStatus:
+        return HealthStatus(HealthState.HEALTHY, "ready")
+
+    async def stop(self, deadline) -> None:
+        pass
+
+    async def propose_task_spec(self, goal, context):
+        raise self._error
+
+
+def _transport_exhaustion() -> ModelRecoveryExhausted:
+    return ModelRecoveryExhausted(
+        ModelAttemptFailure(
+            ModelFailureCategory.TRANSIENT_PROVIDER,
+            ModelRetrySafety.SAFE_SAME_REQUEST,
+            "connection_failed",
+            "provider connection failed: SSL: UNEXPECTED_EOF_WHILE_READING",
+        ),
+        ModelRecoveryDecision(ModelRecoveryAction.FAIL_TERMINAL, "exhausted"),
+        3,
+    )
+
+
+class PlannerTransportFailureTest(unittest.IsolatedAsyncioTestCase):
+    """A provider outage must not become a product failure.
+
+    The planner runs before any work is committed, so a gateway that dropped the
+    connection leaves nothing to report as failed: the Task stops at the
+    recoverable interruption and can be retried
+    (``task-e547187aaaac4f4b83ae9ff1d2c767b5``).
+    """
+
+    async def _run(self, error: Exception):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = compose_fixture_application(
+                task_spec_planner_adapter=_TransportFailingPlanner(error),
+                tool_adapters=(),
+            )
+            client = EngineeringAgentClient(
+                root, application_factory=lambda: application,
+                poll_interval=0.001,
+            )
+            async with client:
+                accepted = await client.submit_task(
+                    "查下今天的nba新闻", command_id="planner-failure",
+                )
+                final = await client.wait_task(accepted.task_id, timeout=5)
+                events = await application.kernel.dependencies.store.read_events(
+                    accepted.task_id
+                )
+                return final, events, application
+
+    async def test_transport_exhaustion_interrupts_instead_of_failing(self) -> None:
+        final, events, application = await self._run(_transport_exhaustion())
+        self.assertEqual(final.state, TaskState.INTERRUPTED.value)
+        planning = [
+            event for event in events
+            if event.event_type == "task_spec.planning_failed"
+        ]
+        self.assertEqual(len(planning), 1)
+        self.assertTrue(planning[0].payload["recoverable"])
+        interrupted = await application.kernel.get_task(final.task_id)
+        self.assertIsNotNone(interrupted.active_agent_checkpoint)
+
+    async def test_a_planner_bug_still_converges_to_failed(self) -> None:
+        final, events, _ = await self._run(ValueError("malformed proposal"))
+        self.assertEqual(final.state, TaskState.FAILED.value)
+        planning = [
+            event for event in events
+            if event.event_type == "task_spec.planning_failed"
+        ]
+        self.assertFalse(planning[0].payload["recoverable"])

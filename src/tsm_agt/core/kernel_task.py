@@ -46,7 +46,9 @@ from dataclasses import replace
 from pathlib import Path
 from tsm_agt.ports import (
     Message, MessageRole, RuntimeEvent, RuntimeUnitOfWork, SessionEvent,
-    SessionTaskUnitOfWork, SessionUnitOfWork, TextBlock, ToolResult
+    SessionTaskUnitOfWork, SessionUnitOfWork, TextBlock, ToolResult,
+    ModelAttemptFailed, ModelFailureCategory, ModelRecoveryAction,
+    ModelRecoveryExhausted, ModelRetrySafety,
 )
 from typing import Any
 from uuid import uuid4
@@ -376,10 +378,39 @@ class TaskMixin:
             }),))
             return candidate
         except Exception as error:
+            model_failure = isinstance(
+                error, (ModelAttemptFailed, ModelRecoveryExhausted)
+            )
             await self._append_events(task_id, (("task_spec.planning_failed", {
-                "recoverable": True, "error_type": type(error).__name__,
+                "recoverable": model_failure,
+                "error_type": type(error).__name__,
                 "message": str(error)[:1000],
             }),))
+            if model_failure:
+                # The provider failed before any planning work was committed, so
+                # there is no product failure to report: the Task stops at the
+                # recoverable interruption the Runtime already defines, with its
+                # checkpoint intact. Marking it FAILED turned a gateway hiccup
+                # into a dead Task (task-e547187aaaac4f4b83ae9ff1d2c767b5).
+                failure = getattr(error, "failure", None)
+                decision = getattr(error, "decision", None)
+                stored = await self._require_stored_task(task_id)
+                checkpoint = (
+                    TaskSnapshot.from_data(stored.data).active_agent_checkpoint or {}
+                )
+                await self._record_recoverable_turn_interruption(
+                    task_id, str(checkpoint.get("turn_id") or ""), error,
+                    failure_kind="provider",
+                    failure_category=getattr(
+                        failure, "category", ModelFailureCategory.UNKNOWN,
+                    ),
+                    retry_safety=getattr(
+                        failure, "retry_safety", ModelRetrySafety.NEVER,
+                    ),
+                    recovery_action=getattr(
+                        decision, "action", ModelRecoveryAction.FAIL_TERMINAL,
+                    ),
+                )
             raise
 
     async def revise_task_spec(

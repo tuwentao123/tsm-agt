@@ -31,6 +31,7 @@ from tsm_agt.core import (
 )
 from tsm_agt.ports import (
     CompletionReadinessMode, ImageBlock, ModelRecoveryAction,
+    ModelRecoveryExhausted, ModelRetrySafety,
     RuntimeCommandRecord, RuntimeStorePort, SessionInputRelation,
     SessionInputRelationJudgement, SessionInputRelationPort, TextBlock,
 )
@@ -1406,10 +1407,23 @@ def _is_resumable_stop(error: BaseException) -> bool:
     how the two vocabularies drifted apart in the first place.
     """
 
-    return (
-        isinstance(error, ModelInvocationFailed)
-        and error.recovery_action is ModelRecoveryAction.PRESERVE_AND_INTERRUPT
-    )
+    if isinstance(error, ModelInvocationFailed):
+        return (
+            error.recovery_action is ModelRecoveryAction.PRESERVE_AND_INTERRUPT
+        )
+    if isinstance(error, ModelRecoveryExhausted):
+        # Retries were exhausted on a failure the provider never committed, so
+        # there is no product failure to report -- a gateway that dropped the
+        # connection is not "the work failed". The Runtime already interrupted
+        # the Task with its checkpoint intact. A failure that is unsafe to
+        # repeat keeps converging to FAILED.
+        return error.failure.retry_safety in {
+            ModelRetrySafety.SAFE_SAME_REQUEST,
+            ModelRetrySafety.SAFE_RESAMPLE,
+            ModelRetrySafety.SAFE_WITH_CORRECTION,
+            ModelRetrySafety.SAFE_FALLBACK_TRANSPORT,
+        }
+    return False
 
 
 def _session_decision_data(decision: SessionInputDecision) -> dict[str, Any]:
