@@ -384,11 +384,22 @@ ports/evidence_guided_exploration.py  ports/evidence_level.py
 但**不能独立于批 3 删除**：先删它们会让 `task_spec.py` 放弃对声明命令的校验，
 留下一个"planner 可以声明任意命令当验证"的中间状态。
 
-**因此批 2 应拆成：**
-* **2a**：删 `verification_criteria.py`（1 符号 / 1 点，纯机械）。
-* **2b**：删 `evidence_question.py`（10 点，多为"读投影"，属改接线）。
-* **2c**：`verification_command.py` **并入批 3**（连同 `POST_MUTATION_COMMAND` 语义
-  一起处理），不要提前删。
+再查一层，`verification_criteria` 也一样：`seed_acceptance_criteria` 的**唯一**调用点是
+`kernel.py:2351`，而它在 `verify_task_acceptance`（def 于 `kernel.py:2263`）里面。
+删掉它就要先拆 `verify_task_acceptance` —— 同样是**批 3** 的范围。
+
+### 结论：批 2 实际只剩 `evidence_question.py`
+
+| 模块 | 归属 | 依据 |
+|---|---|---|
+| `verification_criteria.py` | **并入批 3** | 唯一调用者在 `verify_task_acceptance` 内 |
+| `verification_command.py` | **并入批 3** | 5 个调用点全在 POST_MUTATION_COMMAND / 验证语义上 |
+| `evidence_question.py` | **批 2（保留）** | 10 个 import 点，多为读投影，可独立改接线 |
+
+也就是说 A.1 把这三个模块放在同一批是**按名字相近**分的，不是按依赖分的。
+下一批应当是"**批 2 = 只删 `evidence_question.py`**"，或者干脆按依赖重排：
+先做批 3（`verification.py` + 两个 verification_*.py + `POST_MUTATION_COMMAND`）,
+再回头收 `evidence_question.py`。
 
 ## A.2 行为调用点（必须**改接线**，不是删掉）
 
