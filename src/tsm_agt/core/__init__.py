@@ -152,7 +152,6 @@ from .workspace import (
 )
 from .verification import (
     AcceptanceResult, AcceptanceStatus, Evidence, TaskVerificationResult,
-    TERMINAL_STATE_BY_VERDICT, terminal_state_for,
 )
 from .evidence_question import (
     EvidenceObservationKind, EvidenceQuestionProjector,
@@ -457,8 +456,6 @@ __all__ = [
     "WorkspacePatchConflict",
     "AcceptanceResult",
     "AcceptanceStatus",
-    "TERMINAL_STATE_BY_VERDICT",
-    "terminal_state_for",
     "Evidence",
     "TaskVerificationResult",
     "EvidenceObservationKind",

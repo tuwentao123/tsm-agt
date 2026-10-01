@@ -363,7 +363,6 @@ from .workspace import (
 )
 from .verification import (
     AcceptanceResult, AcceptanceStatus, Evidence, TaskVerificationResult,
-    terminal_state_for,
 )
 from .verification_criteria import (
     seed_acceptance_criteria,
@@ -2227,38 +2226,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         for target in SUCCESS_PATH:
             task = await self.transition_task(task_id, target, reason)
         return task
-
-    async def finalize_acceptance(
-        self, task_id: str, status: AcceptanceStatus,
-    ) -> TaskSnapshot:
-        """Move a VERIFYING Task to the one terminal state its verdict implies.
-
-        Every entry point (CLI / SDK / Web / Local API) must call this instead of
-        mapping a verdict itself. The mapping is Runtime policy: when clients map
-        for themselves, the same verdict becomes ``FAILED`` on one surface and
-        ``NEEDS_REVIEW`` on another -- which is precisely what the CLI used to do
-        for a ``BLOCKED`` verdict.
-
-        ``PASSED`` still passes through ``FINALIZING`` because that is the only
-        legal edge to ``SUCCEEDED``.
-        """
-        target = terminal_state_for(status)
-        stored = await self._require_stored_task(task_id)
-        current = TaskSnapshot.from_data(stored.data)
-        if current.state is target:
-            return current
-        if current.state.is_terminal:
-            raise InvalidTurnState(
-                f"task {task_id} is already terminal in {current.state.value}; "
-                f"cannot apply acceptance verdict {status.value}"
-            )
-        if target is TaskState.SUCCEEDED:
-            await self.transition_task(
-                task_id, TaskState.FINALIZING, "acceptance passed"
-            )
-        return await self.transition_task(
-            task_id, target, f"acceptance verdict {status.value}"
-        )
 
     async def verify_task_acceptance(
         self, task_id: str, *, include_semantic: bool = True,
