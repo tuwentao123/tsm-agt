@@ -436,6 +436,36 @@ ports/evidence_guided_exploration.py  ports/evidence_level.py
 | 31 | 2231 | `finalize_acceptance` |
 | +6 个小的 | | `_post_mutation_verification_observed/description` ×2、`_bind_evidence_question`、`_assistant_conclusion`、`get_evidence_questions`、`_task_spec_requires_command_verification` |
 
+### A.1d 批 3b 重扫（HEAD 实测）—— 比附录 A 干净得多
+
+逐个符号数调用点，结果：
+
+| 符号 | 生产调用者 | 结论 |
+|---|---|---|
+| `verify_task_acceptance`（418 行） | **0**（23 处引用全在 tests + `verification_criteria.py:1` 的 docstring） | 整段只有测试可达 |
+| `_evaluate_final_acceptance`(106) | 1 —— 在 `verify_task_acceptance` 内 | 随它一起死 |
+| `_verify_answer_evidence_sufficiency`(81) | 1 —— 同上 | 随它一起死 |
+| `_verify_goal_command_outcome`(78) | 1 —— 同上 | 随它一起死 |
+| `_verify_answer_completeness`(54) | 1 —— 同上 | 随它一起死 |
+| `_judge_rubric_criterion`(45) | 1 —— 同上 | 随它一起死 |
+| `seed_acceptance_criteria` | import + 调用点都在 `verify_task_acceptance` 内 | `verification_criteria.py` 可整删 |
+
+⇒ **删掉 `verify_task_acceptance` 就一次性清掉约 780 行 + `verification_criteria.py`。**
+
+**但有 3 个辅助方法有"外部"调用者，必须单独处理，不能跟着盲删**：
+
+| 符号 | 外部调用者 | 处理 |
+|---|---|---|
+| `_demote_unresolvable_criteria`(78) | `task_spec.py:849`、`kernel_task.py:313` | 要看这两处语义 |
+| `_verify_task_spec_reference`(60) | `kernel.py:1376`（`verify_task_acceptance` 之外） | 要看 1376 的上下文 |
+| `_task_spec_requires_command_verification`(6) | `kernel.py:2373` | 确认是否真在 `verify_task_acceptance` 内 |
+
+**所以 3b 的正确切法**：
+* **3b-1**：删 `verify_task_acceptance` + 5 个"1 ref"辅助 + `verification_criteria.py`，
+  并把 `verify` 子命令（cli）与 11 个测试文件一起处理。这是主体。
+* **3b-2**：单独处理上表 3 个有外部调用者的方法（它们牵连 `task_spec.py` /
+  `kernel_task.py` 的 criterion 派生，与 3c 的 `POST_MUTATION_COMMAND` 语义相邻）。
+
 ### 批 3 的建议切片（按"能否独立变绿"）
 
 * **3a ✅ 已落地**（`95ab0ee`）：删 `Kernel.finalize_acceptance`(32 行)、
