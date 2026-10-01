@@ -504,8 +504,10 @@ class ExplorationBudgetCompositionTest(unittest.TestCase):
         configuration = ExplorationBudgetConfiguration()
         # The ceiling has to cover a real engineering Turn: read, edit, then run
         # a build or test suite, with one model call spent interpreting each
-        # Tool result. Fifteen calls ended ordinary work as a budget failure.
-        self.assertEqual(configuration.agent_max_model_calls, 40)
+        # Tool result. Fifteen calls ended ordinary work as a budget failure, and
+        # so did forty. Hermes allows 90 iterations per parent turn; Codex has no
+        # ceiling at all and relies on compaction.
+        self.assertEqual(configuration.agent_max_model_calls, 90)
         self.assertEqual(configuration.agent_max_tool_calls, 120)
         self.assertEqual(configuration.finalization_model_calls, 2)
         self.assertEqual(configuration.execution_reserve_model_calls, 1)
@@ -515,7 +517,7 @@ class ExplorationBudgetCompositionTest(unittest.TestCase):
             configuration.model_call_renewal_increments, (10, 5, 3)
         )
         self.assertEqual(configuration.model_call_renewal_max_count, 3)
-        self.assertEqual(configuration.model_call_renewal_absolute_limit, 60)
+        self.assertEqual(configuration.model_call_renewal_absolute_limit, 120)
         self.assertEqual(configuration.model_call_renewal_threshold, 4)
         self.assertEqual(configuration.max_tool_calls, 60)
         self.assertEqual(configuration.max_actions, 60)
@@ -531,7 +533,7 @@ class ExplorationBudgetCompositionTest(unittest.TestCase):
                 "TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS=3\n"
                 "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_INCREMENTS=12,6,3\n"
                 "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_MAX_COUNT=2\n"
-                "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_ABSOLUTE_LIMIT=70\n"
+                "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_ABSOLUTE_LIMIT=150\n"
                 "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_THRESHOLD=5\n",
                 encoding="utf-8",
             )
@@ -547,7 +549,7 @@ class ExplorationBudgetCompositionTest(unittest.TestCase):
                 configuration.model_call_renewal_increments, (12, 6, 3)
             )
             self.assertEqual(configuration.model_call_renewal_max_count, 2)
-            self.assertEqual(configuration.model_call_renewal_absolute_limit, 70)
+            self.assertEqual(configuration.model_call_renewal_absolute_limit, 150)
             self.assertEqual(configuration.model_call_renewal_threshold, 5)
             self.assertEqual(
                 configuration.sources["exploration_budget.profile"],

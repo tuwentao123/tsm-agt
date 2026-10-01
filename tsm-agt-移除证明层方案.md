@@ -214,6 +214,16 @@ async def transition_task(self, task_id, target, reason, *, authority: str = "ru
 * 仍待处理：`proof_enforcement_mode` / `ProofEnforcementMode` 已成死配置、
   `_completion_readiness_gaps` 空壳、renewal（见下）。
 
+### B1 —— 预算对齐 Hermes ✅ 已落地
+* `default_max_model_calls` 40 → **90**（Hermes 父回合 90 次迭代；Codex 无上限、靠
+  compaction）。三处默认值同步：`core/kernel.py`、`bootstrap/composition.py`、
+  `bootstrap/exploration_configuration.py`。
+* `model_call_renewal_absolute_limit` 60 → **120**：校验要求它 ≥
+  `agent_max_model_calls`，不改它连配置都构建不出来（39 条测试因此变红）。
+* 规格更新：`test_exploration_budget_policy` 两条断言旧的 40/60 → 90/120
+  （含 env 覆盖用的 70 → 150）。
+* 单回合上限从"基础 40 + 续借最高 18 = 58"变为 **90**；续借仍是孤儿（B2 删）。
+
 ### S2 —— 停止产出
 * 不再编译 obligation（`ProofPlanCompiler`）、不再构造 gap（`_completion_gaps`）、
   不再注入 readiness 诊断与 nudge（`policy`、`turn_phases` 的相关分支）。

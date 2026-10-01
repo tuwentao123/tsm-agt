@@ -38,7 +38,7 @@ class ExplorationBudgetConfiguration:
     # back for interpretation. A ceiling below that turns ordinary work into a
     # budget failure, which the user can only answer by continuing - and each
     # continuation re-reads context instead of finishing the job.
-    agent_max_model_calls: int = 40
+    agent_max_model_calls: int = 90
     agent_max_tool_calls: int = 120
     finalization_model_calls: int = 2
     execution_reserve_model_calls: int = 1
@@ -46,7 +46,9 @@ class ExplorationBudgetConfiguration:
     verification_reserve_model_calls: int = 1
     model_call_renewal_increments: tuple[int, ...] = (10, 5, 3)
     model_call_renewal_max_count: int = 3
-    model_call_renewal_absolute_limit: int = 60
+    #: Must stay >= agent_max_model_calls; with the base at 90 the renewal
+    #: sequence (10,5,3) tops out at 108, so 120 leaves headroom.
+    model_call_renewal_absolute_limit: int = 120
     model_call_renewal_threshold: int = 4
     max_tool_calls: int = 60
     max_actions: int = 60

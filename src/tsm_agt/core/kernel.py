@@ -456,7 +456,11 @@ class KernelDependencies:
     tools: tuple[ToolProviderPort, ...] = ()
     runtime_adapters: tuple[RuntimeAdapter, ...] = ()
     configuration_metadata: Mapping[str, Any] = field(default_factory=dict)
-    default_max_model_calls: int = 40
+    #: Hermes allows 90 iterations per parent turn (50 per subagent) and Codex
+    #: has no ceiling at all, relying on compaction. 40 turned ordinary
+    #: engineering work into ``max_model_calls`` failures, which the user could
+    #: only answer by continuing -- and each continuation re-read context.
+    default_max_model_calls: int = 90
     default_max_tool_calls: int = 120
     default_max_output_tokens: int = 1024
     #: INV-4 bound: how many consecutive no-progress continuations are allowed

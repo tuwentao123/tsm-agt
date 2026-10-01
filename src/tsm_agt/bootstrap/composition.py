@@ -479,7 +479,7 @@ def _kernel_dependencies(
         tools=registry.all(ToolProviderPort),
         runtime_adapters=registry.runtime_adapters(),
         configuration_metadata=configuration_metadata,
-        default_max_model_calls=int(budget.get("agent_max_model_calls", 40)),
+        default_max_model_calls=int(budget.get("agent_max_model_calls", 90)),
         default_max_tool_calls=int(budget.get("agent_max_tool_calls", 120)),
         default_max_output_tokens=default_max_output_tokens,
         finalization_model_calls=int(budget.get("finalization_model_calls", 2)),
@@ -501,7 +501,7 @@ def _kernel_dependencies(
             budget.get("model_call_renewal_max_count", 3)
         ),
         model_call_renewal_absolute_limit=int(
-            budget.get("model_call_renewal_absolute_limit", 60)
+            budget.get("model_call_renewal_absolute_limit", 120)
         ),
         model_call_renewal_threshold=int(
             budget.get("model_call_renewal_threshold", 4)
