@@ -131,3 +131,78 @@ ports/evidence_guided_exploration.py  ports/evidence_level.py
 
 本轮我已经用完上下文预算，而 S4 是 15 个模块的批量删除——正是本会话三次翻车（一次挂死、
 一次误删 753 行、一次掀掉 INV-4 链）的同类动作。**方案已落盘，下一段从 S1 开始。**
+
+---
+
+# 附录 A —— 符号级消费者清单（补齐 S4/S5/S6）
+
+方法：AST 遍历 `src/` + `tests/` 全部 `.py`，解析相对导入、绝对导入（`tsm_agt.core.X`）
+与门面导入（`core/__init__.py` / `ports/__init__.py` 的 `from .X import (...)` 块），
+外加 `kernel.dependencies.<field>` / `Kernel.<method>` / `recovery_kind` 的 grep。
+行号精确，**不按名字相似推断**。
+
+## A.1 七个删除批次（依赖在前、基础在后；每批后 `import tsm_agt` 可用、测试可收集）
+
+| 批 | 删除 | 必须同批编辑 | 必须同批处理的测试 |
+|---|---|---|---|
+| **1** | `core/turn_finalizer.py`、`core/turn_outcome.py` | 无（`core/__init__` 不导出它们） | 删 `test_proof_closure.py` 中 TurnOutcome/TurnFinalizer 两个类 |
+| **2** | `core/verification_command.py`、`core/verification_criteria.py`、`core/evidence_question.py` | `core/__init__:157-161,464-469`；`kernel.py:292,373,376,857,1355,1716-3139,2752,2815`；`kernel_tool.py:101,953`；`task_spec.py:22,858`；`kernel_checkpoint:48`；`kernel_input:52,340-425`；`kernel_memory:42,72`；`kernel_steering:32,248-276`；`session_resources:16`；`turn_tool_batch:33`；`working_memory:19,301-326` | 删 `test_evidence_questions.py`；改 `test_working_memory.py`、`test_tool_scope_consistency.py:20,139` |
+| **3** | `core/verification.py` | `core/__init__:153-156,458-462`；`kernel.py:369,761-3433,2646,2664`；`kernel_task.py:72,770,903` | 删 `test_terminal_state_mapping.py`；改 **11 个** import `AcceptanceStatus` 的测试（含 `test_clarification`、`test_coding_agent_e2e`、`test_completion_claim_gate`、`test_engineering_loop_over_http`、`test_final_acceptance`、`test_goal_alignment`、`test_goal_command_verification`、`test_post_mutation_applicability`、`test_production_journeys`、`test_real_provider_journey`、`test_task_spec`）+ `test_rubric_judge`、`test_task_spec_criteria_validation` |
+| **4** | `core/artifact_graph.py`、`proof_obligation.py`、`evidence_coverage.py`、`proof_projection.py`、`semantic_review.py` | `core/__init__:162-190,196-243`；`kernel.py:301,305-311,428,650,699,706,1073,2264,2413-2515,2972,3464`；**`task_spec.py:15-20 与 ProofPlanCompiler ~875-1110`** | 删 `test_proof_closure.py`（若批 1 未删） |
+| **5** | `ports/evidence_delta.py`、`ports/evidence_guided_exploration.py`（**必须同批**：后者 import 前者） | `ports/__init__:103-110,146-160,304-309,342-356`；`ports/exploration_budget_policy.py:11,141`（**改公共 API**）；6 个适配器；`exploration_coordinator:10,99-146`；`kernel.py:21,432-435,1051-1059,5195-5288`；`kernel_policy:38,259-323`；`kernel_projection:35,146-174`；`kernel_session:1849`；`turn_tool_batch:54`；`bootstrap/composition.py:102,348-355,444-451,583-590,634-639,735-745` | 删 `test_evidence_delta.py`、`test_evidence_guided_exploration.py`；改 8 个（`test_composition:26`、`test_exploration_budget_policy:22`、`test_investigation_status:77`、`test_agent_progress_projection:207`、`test_semantic_action_kernel:189`、`test_stop_or_pivot_policy:179`、`test_tool_scope_consistency:102`、`test_post_mutation_applicability:103`） |
+| **6** | `ports/completion_readiness.py`、`ports/evidence_level.py` | `ports/__init__:128-134,161-165,229-235,362-365`；两个适配器；`kernel.py:21,416,422-424,438,1069-1074,2308-2560,4161-4318,5091-5112`；**`turn_phases.py:37,137-160,475,743-1045`（就绪门整段）**；`cli.py:359,593-637,2179-2203`；`sdk/runtime.py:32,1323-1337`；`composition.py:102,236-258,371-461,551-564(env),625-757` | 删 `test_completion_readiness.py`、`test_completion_readiness_exhausted.py`、`test_completion_readiness_modes.py`、`test_completion_stall_terminal.py`、`test_evidence_level.py`、`test_cli_standalone_finalization.py`；改 `test_sdk_runtime.py:12,260` |
+| **7** | 收缩 `ToolRecoveryKind`（`ports/tool.py:155-166,511,524,534-542,557,585`） | `ports/__init__:189,402`；`kernel.py:118,1757,1809,2206,4161`；`kernel_tool.py:68,475-480,561,1485-1566`；`turn_tool_batch:55,737`；`context:703`；`execution_facts:74-79,123,214-266,381`；`flow:741-743`；`kernel_checkpoint:699`；`turn_phases:297,750`；`adapters/builtin/workspace_tools.py:12,470,485` | 删 `test_tool_recovery_contract.py`；改 `test_core_apply_patch.py:12,121,155,275` |
+
+## A.2 行为调用点（必须**改接线**，不是删掉）
+
+核心内：
+`kernel.py` 的 `_completion_readiness_gaps`(def 1961)、`_evaluate_completion_readiness`(2308)、
+`_publish_proof_diagnostics`(2469)、`_finalize_needs_review`(1015/called 4219,5128)、
+`_apply_inv3_demotion`(706)、`_inject_agent_decides_completion_diagnostics`(2517)、
+`verify_task_acceptance`(2664)、`finalize_acceptance`(2632)、
+`1051-1059`（evidence_relation 接线）、`2206`（recovery 决策）、`2972`（rubric 判官）、`2752`（种子判据）。
+
+适配器里**做决定的实现**：
+`rule_based_completion_readiness/policy.py:85-160`、
+`structured_evidence/evaluator.py:58-121`、
+`evidence_guided/strategies.py:60-236`、
+`rule_based_evidence_level/evaluator.py:36-75`、
+`rule_based_investigation_flow/projector.py:91`、`rule_based_investigation_status/projector.py:49`、
+`rule_based_exploration_budget/policy.py:102,180`、
+`builtin/workspace_tools.py:470,485`（设置 `RETRY_AFTER_STATE_CHANGE` 的生产端）。
+
+其他决策点：`exploration_coordinator.py:99-146`、`kernel_policy.py:259-323`、
+`kernel_projection.py:146-174`、`kernel_session.py:1849`、`composition.py:551-564`（env）。
+
+## A.3 零消费符号（删起来最便宜，且说明这层有死区）
+
+`derive_edge_id`、`requirement_digest`、`version_free_selector`、`derive_obligation_id`、
+`ProofProjection`、`SemanticReviewOutcome`、`classify_transition_reason`、
+`PROOF_ENFORCEMENT_CHANGED`、`MIN_ENFORCEMENT_WINDOW`、`MIN_AUTO_ATTRIBUTION_RATE`、
+`MAX_ADVISORY_OBLIGATION_RATE`、`EnforcementReadiness`、`artifact_id_for_locator`、
+`PROOF_OBLIGATION_ADVISORY/REJECTED`、`ARTIFACT_RELATION_OBSERVED`、5 个 `*_version` 助手。
+
+**`core/turn_finalizer.py` 零 src 消费者（只有测试）**；`web/` **零消费者**
+（`web/app.py:1567` 的 `verification_status` 是无关的投影字符串）。
+
+## A.4 未核实
+
+* **删后未执行导入验证**（只读分析，未改文件）；批次安全性来自依赖图，不是运行结果。
+  风险最高的两处编辑：`task_spec.py` 的编译器移除、`turn_phases.py` 的就绪门整段。
+* `ports/exploration_budget_policy` 的 probe/state 内嵌 `EvidenceDelta`，删它会**改变该
+  port 的公共 API** 并波及 `kernel_policy` / `rule_based_exploration_budget`（字段级未穷举）。
+
+---
+
+# 附录 B —— S1 的实测波及（原评估"独立可验证"是错的）
+
+S1（`final_acceptance_policy=None` + SDK/CLI 改为不调 verify/finalize）实测：
+**全量 9 条失败，全部是"被切掉的那个权威"的规格**：
+`test_final_acceptance.py` ×5（含"BLOCKED 不得报成功"、"kernel 不能绕过验收"）、
+`test_clarification.py` ×2（"交互回答不是最终证据"、"问题不该阻塞验证"）、
+`test_terminal_state_mapping.py` ×1（"入口必须委派共享 finalizer"）、
+`test_sdk_runtime.py` ×1（"非 legacy 模式只报告验证"）。
+
+**结论：S1 不能独立变绿，它与删规格是同一个原子动作。** 所以正确的第一步是
+「S1 + 上述 9 条规格的处置」，并且**逐条写明是随层删除还是规格改写**。
+（本轮已回退 S1，工作区干净、全量 1437 passed。）
