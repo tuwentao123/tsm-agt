@@ -819,7 +819,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
-    async def test_unmet_acceptance_criterion_never_completes_agent_turn(self) -> None:
+    async def test_unmet_acceptance_criterion_ends_turn_honestly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             app = compose_fixture_application(
                 model_adapter=CriterionBlockedModel(), tool_adapters=(),
@@ -843,23 +843,23 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                     task.task_id, "complete the task", max_model_calls=4,
                     max_tool_calls=1,
                 )
-                self.assertIsInstance(result, AgentContinuationSuspended)
+                # The gate nudges once for an honest report, then lets the turn
+                # finish. It never strands the turn in AWAITING_USER: the model's
+                # own blocker report is the answer.
+                self.assertIsInstance(result, AgentTurnResult)
+                self.assertIn("Blocked", result.assistant_message.text)
                 current = await app.kernel.get_task(task.task_id)
-                self.assertEqual(current.state, TaskState.AWAITING_USER)
+                self.assertEqual(current.state, TaskState.EXECUTING)
                 events = await app.registry.require(RuntimeStorePort).read_events(
                     task.task_id
                 )
+                self.assertEqual(sum(
+                    event.event_type == "completion.blocker_disclosure_requested"
+                    for event in events
+                ), 1)
                 self.assertFalse(any(
-                    event.event_type == "turn.completed" for event in events
+                    event.event_type == "continuation.requested" for event in events
                 ))
-                continuation = next(
-                    event for event in events
-                    if event.event_type == "continuation.requested"
-                )
-                self.assertEqual(
-                    continuation.payload["reason"],
-                    "completion_exhausted_with_required_gaps",
-                )
             finally:
                 await app.registry.stop_all()
 
@@ -944,78 +944,6 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
                         self.assertNotIn(directive, prompt_text)
                 finally:
                     await app.registry.stop_all()
-
-    async def test_continuation_at_a_spent_budget_regains_capacity(self) -> None:
-        """A continuation the user is invited to give must be able to act.
-
-        Suspending at an exhausted budget and then resuming with zero capacity
-        fails on the first model call, marks the Task terminally FAILED, and
-        forces the same request to restart as a new Task that repeats work.
-        """
-        with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(
-                model_adapter=CriterionBlockedModel(), tool_adapters=(),
-            )
-            await app.registry.start_all()
-            try:
-                task = await executing_task(app, Path(directory), "spent-budget")
-                await self._set_acceptance_criteria(
-                    app, task,
-                    TaskAcceptanceCriterion(
-                        "command", "Run verification after mutation",
-                        TaskCriterionKind.POST_MUTATION_COMMAND,
-                    ),
-                )
-                # The criterion has to be genuinely unmet, not inapplicable:
-                # change the workspace without running any verification.
-                await app.kernel.write_workspace_text(
-                    task.task_id, "change", "changed.txt", "after\n", None,
-                )
-                suspended = await app.kernel.run_agent_turn(
-                    task.task_id, "complete the task", max_model_calls=1,
-                    max_tool_calls=1,
-                )
-                self.assertIsInstance(suspended, AgentContinuationSuspended)
-                checkpoint = AgentTurnCheckpoint.from_data(
-                    (await app.kernel.get_task(task.task_id))
-                    .active_agent_checkpoint or {}
-                )
-                self.assertEqual(
-                    checkpoint.pending_user_action["reason"],
-                    "completion_exhausted_with_required_gaps",
-                )
-                self.assertGreaterEqual(
-                    checkpoint.model_calls, checkpoint.max_model_calls
-                )
-
-                await app.kernel.resume_agent_continuation(
-                    task.task_id, "继续", input_id="input-spent-budget",
-                )
-
-                resumed = await app.kernel.get_task(task.task_id)
-                self.assertNotEqual(resumed.state, TaskState.FAILED)
-                resumed_checkpoint = AgentTurnCheckpoint.from_data(
-                    resumed.active_agent_checkpoint or {}
-                )
-                self.assertGreater(
-                    resumed_checkpoint.max_model_calls, checkpoint.max_model_calls
-                )
-                events = await app.registry.require(RuntimeStorePort).read_events(
-                    task.task_id
-                )
-                self.assertTrue(any(
-                    event.event_type == "continuation.resolved"
-                    and event.payload.get("capacity_replenished") is True
-                    for event in events
-                ))
-                # The anti-loop guard is what bounds repetition, not a starved
-                # budget, so the stalled count has to survive replenishment.
-                self.assertIn(
-                    "stalled_continuations",
-                    resumed_checkpoint.completion_readiness_state,
-                )
-            finally:
-                await app.registry.stop_all()
 
     async def test_forced_wrap_up_reports_gap_instead_of_opening_tools(self) -> None:
         policy = RuleBasedCompletionReadinessPolicy()

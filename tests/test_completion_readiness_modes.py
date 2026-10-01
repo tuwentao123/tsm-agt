@@ -16,9 +16,10 @@ Nothing can ever close that gap, so the Task parks in AWAITING_USER with the wor
 undone (real ledger: task-8d1ec232a0e54910852a029dcf11b03f, 2026-10-01).
 
 Hermes and Codex both avoid this shape: neither has any obligation/gap record at
-all, and Hermes' one stop gate is bounded and defaulted OFF. tsm-agt already ships
-the same policy as the two non-gating modes, so these tests pin that choosing one
-of them is what stops a wrong guess from stranding the turn.
+all, and Hermes' one stop gate is bounded and defaulted OFF -- its nudges never
+strand a turn. tsm-agt now does the same: the gate nudges at most once, then the
+turn ends with the model's own answer, in **every** readiness mode. These tests
+pin that.
 
 The model endpoint is a local OpenAI-compatible stub, so the whole loop runs
 offline while the transport, planner, tool batch and readiness evaluation are all
@@ -38,8 +39,9 @@ from tempfile import TemporaryDirectory
 from tsm_agt.bootstrap import (
     compose_openai_compatible_engineering_application,
 )
+from tsm_agt.cli import _finalize_standalone_agent_result
 from tsm_agt.core import (
-    AgentContinuationSuspended, AgentTurnResult, TaskState,
+    AgentTurnResult, TaskState,
 )
 from tsm_agt.ports import CompletionReadinessMode, RuntimeStorePort
 
@@ -183,11 +185,19 @@ class CompletionReadinessModeTest(unittest.IsolatedAsyncioTestCase):
                 result = await kernel.run_agent_turn(
                     task.task_id, GOAL, max_model_calls=8, max_tool_calls=12,
                 )
+                # Close the Task through the production one-shot entry point, not
+                # by hand: this is what the CLI/SDK do with a finished turn.
+                exit_code = (
+                    await _finalize_standalone_agent_result(
+                        application, task.task_id, result, lambda _line: None,
+                    )
+                    if isinstance(result, AgentTurnResult) else None
+                )
                 current = await kernel.get_task(task.task_id)
                 events = await application.registry.require(
                     RuntimeStorePort
                 ).read_events(task.task_id)
-                return result, current, events
+                return result, current, events, exit_code
             finally:
                 await application.registry.stop_all()
 
@@ -205,45 +215,45 @@ class CompletionReadinessModeTest(unittest.IsolatedAsyncioTestCase):
             ]
         return []
 
-    async def test_a_blocked_question_is_unclosable_by_construction(self) -> None:
-        """Characterises the shape that stranded the real Task. NOT yet fixed.
+    async def test_a_blocked_question_no_longer_strands_the_turn(self) -> None:
+        """The incident, fixed: a wrong guess must not park the Task.
 
-        A required gap with no effect and no candidate tool can never be closed,
-        so this is not a "keep trying" signal no matter which mode reads it --
-        yet in LEGACY_GATE it is treated as one, and the turn is suspended with
-        the work undone.
-
-        The fix is deliberately *not* "treat every BLOCKED question as
-        recoverable": two surviving tests pin the other half, that a failure no
-        model action can resolve must stop and be disclosed
-        (``test_completion_readiness.py::test_blocked_question_requests_one_truthful_disclosure``,
-        ``test_evidence_questions.py::test_success_and_failure_are_distinct_observations``).
-        The real rule has to tell the two apart, so this stays as the failing
-        half's witness until that rule lands.
+        The gap is still unclosable by construction and the Runtime still reports
+        it truthfully. What changed is that it no longer suspends: Hermes/Codex
+        have no equivalent stop, so the model's own answer ends the turn.
         """
 
-        result, current, events = await self._run(CompletionReadinessMode.LEGACY_GATE)
-        # The suspension types are siblings, not a hierarchy, so name the one a
-        # spent correction budget produces.
-        self.assertIsInstance(result, AgentContinuationSuspended)
-        self.assertNotIsInstance(result, AgentTurnResult)
-        self.assertIs(current.state, TaskState.AWAITING_USER)
+        result, current, events, exit_code = await self._run(
+            CompletionReadinessMode.LEGACY_GATE
+        )
+        self.assertIsInstance(result, AgentTurnResult)
+        # The whole point: the Task closes as SUCCEEDED instead of parking in
+        # AWAITING_USER, and the exit code says so.
+        self.assertEqual(exit_code, 0)
+        self.assertIs(current.state, TaskState.SUCCEEDED)
         self.assertEqual(
             self._unclosable_gaps(events),
             [("EVIDENCE_QUESTION", "BLOCKED", True, False, ())],
         )
+        # The blocker is still disclosed, exactly once: dropping the suspension
+        # did not silence the honest report.
+        self.assertEqual(sum(
+            event.event_type == "completion.blocker_disclosure_requested"
+            for event in events
+        ), 1)
 
-    async def test_the_non_gating_modes_return_instead_of_stranding(self) -> None:
-        """The remedy: report the same gap as a fact and let the Task proceed."""
+    async def test_every_mode_closes_the_same_way(self) -> None:
+        """The mode tunes in-turn nudges only; completion is mode-independent."""
 
         for mode in (
             CompletionReadinessMode.OBSERVE_ONLY,
             CompletionReadinessMode.AGENT_DECIDES,
         ):
             with self.subTest(mode=mode.value):
-                result, current, events = await self._run(mode)
+                result, current, events, exit_code = await self._run(mode)
                 self.assertIsInstance(result, AgentTurnResult)
-                self.assertIsNot(current.state, TaskState.AWAITING_USER)
+                self.assertEqual(exit_code, 0)
+                self.assertIs(current.state, TaskState.SUCCEEDED)
 
 
 if __name__ == "__main__":

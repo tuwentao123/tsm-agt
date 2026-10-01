@@ -12,7 +12,6 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from tsm_agt.adapters.fixture import EchoModelProvider
 from tsm_agt.adapters.rule_based_completion_readiness import (
     RuleBasedCompletionReadinessPolicy,
 )
@@ -21,35 +20,17 @@ from tsm_agt.core import (
     AgentContinuationSuspended,
     AgentTurnCheckpoint,
     Phase1TaskState,
-    TaskAcceptanceCriterion,
-    TaskCriterionKind,
     TaskState,
 )
 from tsm_agt.ports import (
     CompletionReadinessState,
-    FinishReason,
-    Message,
-    MessageRole,
-    ModelRequest,
-    ModelResponse,
-    ModelUsage,
     RuntimeStorePort,
     RuntimeUnitOfWork,
-    TextBlock,
 )
-
-
-class _FinalAnswerModel(EchoModelProvider):
-    """Always proposes a final answer and never calls a tool."""
-
-    async def complete(self, request: ModelRequest) -> ModelResponse:
-        return ModelResponse(
-            Message(
-                "final-answer", MessageRole.ASSISTANT,
-                (TextBlock("The task is complete."),),
-            ),
-            FinishReason.STOP, ModelUsage(1, 1),
-        )
+from tests.test_completion_readiness import (
+    ReadinessSequenceModel,
+    RecoverableReadTool,
+)
 
 
 async def _executing_task(app, root: Path, task_id: str):
@@ -62,15 +43,22 @@ async def _executing_task(app, root: Path, task_id: str):
     return task
 
 
-async def _set_acceptance_criteria(app, task, *criteria) -> None:
-    current = await app.kernel.get_task_spec(task.task_id)
-    spec = replace(
-        current, revision=current.revision + 1,
-        acceptance_criteria=tuple(criteria), content_hash="",
+def _recovery_app():
+    """The composition that still reaches a durable suspension.
+
+    The readiness gate no longer suspends -- Hermes/Codex nudge and then let the
+    turn finish -- so the surviving boundary is the unresolved tool batch: a tool
+    that reports its own call as safely retryable is handed back to the user
+    instead of being retried blind.
+    """
+    return compose_fixture_application(
+        model_adapter=ReadinessSequenceModel(),
+        tool_adapters=(RecoverableReadTool(failures=99),),
+        require_evidence_questions=True,
+        completion_readiness_policy_adapter=(
+            RuleBasedCompletionReadinessPolicy()
+        ),
     )
-    await app.kernel._append_events(task.task_id, ((
-        "task_spec.revised", {"snapshot": spec.to_data()},
-    ),))
 
 
 class NeedsReviewLifecycleTest(unittest.TestCase):
@@ -127,34 +115,18 @@ class TerminalAuthorityTest(unittest.IsolatedAsyncioTestCase):
 class StallTerminalTest(unittest.IsolatedAsyncioTestCase):
     async def _suspend_once(self, app, root: Path, task_id: str):
         task = await _executing_task(app, root, task_id)
-        # A post-mutation criterion only applies once something changed, and a
-        # tool-less model can never satisfy it: an unclosable required gap.
-        await _set_acceptance_criteria(
-            app, task,
-            TaskAcceptanceCriterion(
-                "command", "Run verification after mutation",
-                TaskCriterionKind.POST_MUTATION_COMMAND,
-            ),
+        suspended = await app.kernel.run_agent_turn(
+            task.task_id, "run the required check",
+            max_model_calls=6, max_tool_calls=3,
         )
-        await app.kernel.write_workspace_text(
-            task.task_id, "change", "changed.txt", "after\n", None,
-        )
-        result = await app.kernel.run_agent_turn(
-            task.task_id, "complete the task", max_model_calls=4, max_tool_calls=1,
-        )
-        self.assertIsInstance(result, AgentContinuationSuspended)
+        self.assertIsInstance(suspended, AgentContinuationSuspended)
         current = await app.kernel.get_task(task.task_id)
         self.assertIs(current.state, TaskState.AWAITING_USER)
         return current
 
     async def test_finalize_needs_review_from_awaiting_user(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(
-                model_adapter=_FinalAnswerModel(), tool_adapters=(),
-                completion_readiness_policy_adapter=(
-                    RuleBasedCompletionReadinessPolicy()
-                ),
-            )
+            app = _recovery_app()
             await app.registry.start_all()
             try:
                 current = await self._suspend_once(
@@ -182,12 +154,7 @@ class StallTerminalTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_resume_refuses_a_stalled_continuation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(
-                model_adapter=_FinalAnswerModel(), tool_adapters=(),
-                completion_readiness_policy_adapter=(
-                    RuleBasedCompletionReadinessPolicy()
-                ),
-            )
+            app = _recovery_app()
             await app.registry.start_all()
             try:
                 current = await self._suspend_once(app, Path(directory), "refuse")
@@ -233,12 +200,7 @@ class HumanReviewResolutionTest(unittest.IsolatedAsyncioTestCase):
         return final
 
     async def _app(self):
-        app = compose_fixture_application(
-            model_adapter=_FinalAnswerModel(), tool_adapters=(),
-            completion_readiness_policy_adapter=(
-                RuleBasedCompletionReadinessPolicy()
-            ),
-        )
+        app = _recovery_app()
         await app.registry.start_all()
         return app
 

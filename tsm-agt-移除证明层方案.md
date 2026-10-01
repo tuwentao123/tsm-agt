@@ -88,25 +88,18 @@ async def transition_task(self, task_id, target, reason, *, authority: str = "ru
 结论：**S1 与"删规格"不是同一个原子动作**——只有 1 个测试文件整体删除，其余是同批改写。
 上文"S1 不能独立变绿"的说法作废。
 
-**4. ⚠️ S1 的验收条件没有达成，而且它在 S2 的手里。** 落地后重跑事故复现测试
+**4. ✅ S1 的验收条件（修复后达成，实现在 S2a）。** 落地 S1 后重跑事故复现测试
 `tests/test_completion_readiness_modes.py::test_a_blocked_question_is_unclosable_by_construction`
-**仍然通过**——也就是说 LEGACY_GATE 下"猜错路径"的任务**依然停在 `AWAITING_USER`**。
+**仍然通过**——LEGACY_GATE 下"猜错路径"的任务**依然停在 `AWAITING_USER`**。
 
-原因：那次事故的堵点**不在终态决策**，而在**回合循环内部**。`turn_phases.py:972-1003`
-的 `incomplete_recovery_boundary`（`legacy_completion_gate and unmet_boundary and
-not exhausted_wrap_up_due`）在模型停止调用工具时，只要还有 **required gap**，就直接
+原因：那次事故的堵点**不在终态决策**，而在**回合循环内部**。`turn_phases.py` 的
+`incomplete_recovery_boundary` 在模型停止调用工具时，只要还有 **required gap**，就直接
 `_suspend_incomplete_recoverable` → 根本走不到 `AgentTurnResult`，于是也走不到
 `complete_task`。S1 删掉的是"回合结束之后"的权威；"回合能不能结束"由 S2 的范围决定。
 
-**这就是 S2 的第一件事，也是唯一真正修复事故的那件事**：让 readiness 门只做**有界
-nudge**，永不 suspension。对齐依据：Hermes 只有**一个**停止门且**默认关闭**、Codex
-连这个都没有；两家都没有 obligation/gap 记录。
-
-代价必须说清：`tests/test_completion_readiness.py` 里以 `_suspend_once` 夹子构造
-"不可闭合的 required gap 应当 suspension"的那批断言，以及 INV-14/INV-16 的
-"停在可续接边界"叙述，都是**被删层的规格**，需要与 S2 同批改写。之前两次尝试
-（整体删 `incomplete_recovery_boundary`、以及"不可闭合 ⇒ NEEDS_REVIEW"）都因为这个
-夹具而回退；这次不是"找更窄的判据"，而是**明确判定那批规格随层一起作废**。
+**S2a 已把这个堵点删掉**（见 §1 S2a）。现在同一个测试断言的是修复后的契约：
+`AgentTurnResult` + 经生产入口闭合为 `SUCCEEDED`（exit code 0）+ 那条不可闭合的 gap
+**仍然被如实记录**、blocker disclosure **仍然只发一次**。
 
 ---
 
@@ -122,8 +115,36 @@ nudge**，永不 suspension。对齐依据：Hermes 只有**一个**停止门且
   `verify.completed` 不再由生产产生。
 * **注意**：这不是"层变惰性"——policy 同时构造准则，置 `None` 会顺带削掉
   `final-evidence-integrity` 等准则的产出（详见 §0 实测修订第 2 条）。
-* 验收：~~一次"猜错路径"的任务正常结束且为 SUCCEEDED~~ → **未达成**，原因见 §0 实测修订第 4 条：
-  堵点在回合循环的 readiness suspension，属 S2。S1 实际达成的只是"终态不再需要裁决"。
+* 验收：**已达成**（在 S2a 之后，见下）。一次"猜错路径"的任务经**生产入口**
+  `cli._finalize_standalone_agent_result` 正常结束且为 `SUCCEEDED`，exit code 0；
+  真实台账那种分析任务不再挂起。
+
+### S2a —— 回合内的 suspension 出口（真正修复事故的那一步）✅ 已落地
+* `turn_phases.py`：删掉"有 required gap 且停止调工具 ⇒ `_suspend_incomplete_recoverable`"
+  那段（27 行）。**没删 nudge**：停止门仍然最多 nudge 一次（`blocker_disclosure_requested`），
+  之后**让回合结束**，把模型自己那句话当作答案。判据改成
+  `not incomplete_recovery_boundary and readiness.action is not COMPLETE`。
+* `_commit_model_response_checkpoint(final=...)`：由 `final_response and not boundary`
+  改为 `final_response or boundary`——既然回合结束，检查点就该标 final。
+* **没有**删除 `_suspend_incomplete_recoverable` 本身：`unresolved_tool_batch`
+  （`turn_phases.py` 工具批恢复失败那条）仍然用它，也就是 NEEDS_REVIEW / 人工复核
+  这条链**依然活着**。
+* 效果：Hermes/Codex 语义成立——停止门只做**有界 nudge**，永不把回合扣在
+  `AWAITING_USER`。三种 readiness 模式**行为一致**。
+* 实测删除面（8 条失败，全部是被删层的规格，不是连带损伤）：
+
+| 测试 | 处置 | 依据 |
+|---|---|---|
+| `test_completion_readiness_modes::test_a_blocked_question_is_unclosable_by_construction` | **改写**为 `test_a_blocked_question_no_longer_strands_the_turn` | 原测试自称"NOT yet fixed"；现在断言经**生产入口**闭合为 `SUCCEEDED` + gap 仍被如实记录 + disclosure 仍只发一次 |
+| `test_completion_readiness_modes::test_the_non_gating_modes_return_instead_of_stranding` | **改写**为 `test_every_mode_closes_the_same_way` | 三种模式现在同一条闭合路径 |
+| `test_completion_readiness::test_unmet_acceptance_criterion_never_completes_agent_turn` | **改写**为 `..._ends_turn_honestly` | 名字就是旧不变量；新契约是"nudge 一次 → 回合结束" |
+| `test_completion_readiness::test_continuation_at_a_spent_budget_regains_capacity` | **删除** | 整条以"在耗尽预算处 suspension 再 resume"为前提；`capacity_replenished` 仍由 `test_continue_is_bounded_then_reports_persistent_blocker` 覆盖 |
+| `test_completion_stall_terminal` 的 `_suspend_once`（牵连 5 条） | **改夹子** | 不再用 readiness 造 suspension，改用**仍然活着**的 `unresolved_tool_batch` 夹子（`_recovery_app()`）；NEEDS_REVIEW 生命周期与人工复核 accept/return/cancel 的**主题一条没丢** |
+
+* 注意：`_suspend_once` 现在搭在 `unresolved_tool_batch` 上。**那一批删除时（S2b/S4），
+  这 5 条要一起改成直接构造 NEEDS_REVIEW 状态**，不能留着悬空。
+* 已知遗留（未在本步处理）：`readiness.action` 里 `REPORT_BLOCKED` 已无人产出；
+  `PhaseAction.BREAK`、`REPORT_INCOMPLETE_RECOVERABLE` 同属死值。
 
 ### S2 —— 停止产出
 * 不再编译 obligation（`ProofPlanCompiler`）、不再构造 gap（`_completion_gaps`）、

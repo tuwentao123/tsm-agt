@@ -975,7 +975,7 @@ async def _finish_iteration(
     )
     await kernel._commit_model_response_checkpoint(
         response_checkpoint, state.response, state.prompt.receipt, state.prepared.budget,
-        final=final_response and not incomplete_recovery_boundary,
+        final=final_response or incomplete_recovery_boundary,
         additional_events=renewal_events,
     )
     if state.should_buffer_text and (
@@ -992,34 +992,15 @@ async def _finish_iteration(
         state.pending_tool_calls = list(response_checkpoint.pending_tool_calls)
         return PhaseVerdict(PhaseAction.CONTINUE)
     if not state.tool_calls:
-        if incomplete_recovery_boundary:
-            suspension = await kernel._suspend_incomplete_recoverable(
-                response_checkpoint, state.response.message, readiness.gaps,
-                reason=(
-                    "completion_exhausted_with_required_gaps"
-                    if readiness.action is CompletionReadinessAction.EXHAUSTED
-                    else "unmet_acceptance_criteria"
-                ),
-            )
-            source_user_message = next((
-                message for message in state.messages
-                if message.role is MessageRole.USER
-                and not message.message_id.startswith((
-                    "project-onboarding-context-",
-                    "project-memory-context-", "session-context-",
-                    "working-memory-context-", "task-spec-context-",
-                    "project-instructions-context-",
-                    "completion-readiness-",
-                ))
-            ), None)
-            if source_user_message is not None:
-                await kernel._record_session_task_result(
-                    state.task_id, state.turn_id, source_user_message,
-                    state.response.message,
-                )
-                await kernel._refresh_continuation_session_identity(state.task_id)
-            return PhaseVerdict(PhaseAction.RETURN, suspension)
-        if readiness.action is not CompletionReadinessAction.COMPLETE:
+        # A stop gate may nudge -- bounded, in-turn -- but it never strands the
+        # turn. When the control budget is spent, whatever the model said is the
+        # answer: the turn ends and the Task completes. Hermes and Codex have no
+        # equivalent suspension at all; their stop gates are bounded nudges that
+        # then let the turn finish.
+        if (
+            not incomplete_recovery_boundary
+            and readiness.action is not CompletionReadinessAction.COMPLETE
+        ):
             correction = kernel._completion_correction_message(readiness)
             state.messages.append(correction)
             response_checkpoint = replace(
