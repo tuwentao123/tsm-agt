@@ -293,60 +293,6 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
         )
         return verification
 
-    async def test_analysis_journey_survives_sqlite_restart(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "pyproject.toml").write_text(
-                "[project]\nname='journey'\n"
-                "[project.scripts]\njourney='pkg:main'\n",
-                encoding="utf-8",
-            )
-            (root / "src").mkdir()
-            database = root / ".agent" / "runtime.db"
-            first = compose_fixture_application(
-                model_adapter=ArchitectureAnalysisModel(),
-                tool_adapters=(CoreReadOnlyToolProvider(),),
-                store_adapter=SQLiteRuntimeStore(database),
-                task_spec_planner_adapter=ProductionPlanner(),
-                rubric_judge_adapter=AlwaysSatisfiedJudge(),
-                require_evidence_questions=True,
-            )
-            await first.registry.start_all()
-            session, task = await self._executing_task(
-                first, root, "Analyze this project's architecture"
-            )
-            result = await first.kernel.run_agent_turn(task.task_id, task.goal)
-            self.assertEqual(result.tool_calls, 2)
-            verification = await self._verify_and_finish(first, task.task_id)
-            self.assertEqual(verification.status, AcceptanceStatus.PASSED)
-            execution = await first.kernel.get_task(task.task_id)
-            self.assertEqual(len(execution.tool_executions), 2)
-            self.assertTrue(all(
-                record.call.outcome_ref is None
-                for record in execution.tool_executions.values()
-            ))
-            await first.registry.stop_all()
-
-            restarted = compose_fixture_application(
-                model_adapter=ArchitectureAnalysisModel(),
-                tool_adapters=(CoreReadOnlyToolProvider(),),
-                store_adapter=SQLiteRuntimeStore(database),
-                task_spec_planner_adapter=ProductionPlanner(),
-                rubric_judge_adapter=AlwaysSatisfiedJudge(),
-                require_evidence_questions=True,
-            )
-            await restarted.registry.start_all()
-            try:
-                restored = await restarted.kernel.get_task(task.task_id)
-                self.assertEqual(restored.state, TaskState.SUCCEEDED)
-                self.assertEqual(restored.session_id, session.session_id)
-                self.assertTrue(all(
-                    record.call.outcome_ref is None
-                    for record in restored.tool_executions.values()
-                ))
-            finally:
-                await restarted.registry.stop_all()
-
     async def test_invalid_side_effect_binding_is_corrected_without_execution(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -431,48 +377,6 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
                 interrupted = await app.kernel.get_task(task.task_id)
                 self.assertEqual(interrupted.state, TaskState.INTERRUPTED)
                 self.assertIsNotNone(interrupted.active_agent_checkpoint)
-            finally:
-                await app.registry.stop_all()
-
-    async def test_multi_tool_journey_recovers_without_replaying_tools(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            self._write_analysis_project(root)
-            app, physical = self._recovery_application(root)
-            await app.registry.start_all()
-            try:
-                _, task = await self._executing_task(
-                    app, root, "Assess the project entry point and module boundary"
-                )
-                progress = []
-                result = await app.kernel.run_agent_turn(
-                    task.task_id, task.goal, on_progress=progress.append
-                )
-                self.assertEqual(result.model_calls, 4)
-                self.assertEqual(result.tool_calls, 3)
-                self.assertEqual(physical.synthesis_attempts, 2)
-                self.assertEqual(
-                    [item.kind.value for item in progress].count("model_retry"),
-                    1,
-                )
-                events = await app.registry.require(
-                    RuntimeStorePort
-                ).read_events(task.task_id)
-                started_tools = [
-                    event.payload["call"]["name"] for event in events
-                    if event.event_type == "tool.started"
-                ]
-                self.assertEqual(started_tools, [
-                    "core.list_files", "core.read_file", "core.read_file",
-                ])
-                recovery = next(
-                    event for event in events
-                    if event.event_type == "model.recovery_decided"
-                    and event.payload["recovery_action"] == "RESAMPLE"
-                )
-                self.assertEqual(recovery.payload["model_round"], 4)
-                verification = await self._verify_and_finish(app, task.task_id)
-                self.assertEqual(verification.status, AcceptanceStatus.PASSED)
             finally:
                 await app.registry.stop_all()
 

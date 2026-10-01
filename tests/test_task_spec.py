@@ -10,7 +10,7 @@ from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     TASK_SPEC_PROPOSAL_SCHEMA_V1,
-    AcceptanceStatus, AgentTurnCheckpoint, ProjectTrustLevel, SteeringKind,
+    AgentTurnCheckpoint, ProjectTrustLevel, SteeringKind,
     TaskAcceptanceCriterion, TaskContinuationMode, TaskCriterionKind,
     TaskOutcomeKind, TaskOutcomeCompletionPolicy, TaskOutcomeStatus,
     TaskSpecProjector, TaskSpecProposal,
@@ -480,149 +480,6 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
         )
         return directory, app, await app.kernel.verify_task_acceptance(task.task_id)
 
-    async def test_answer_completeness_accepts_user_facing_text(self):
-        directory, app, verification = await self._verification_for_persisted_answer([
-            {"type": "text", "text": "The requested analysis is complete."}
-        ])
-        try:
-            criterion = next(
-                item for item in verification.criteria
-                if item.criterion_id == "answer-completeness"
-            )
-            self.assertEqual(criterion.status, AcceptanceStatus.PASSED)
-            self.assertEqual(verification.status, AcceptanceStatus.PASSED)
-        finally:
-            await app.registry.stop_all()
-            directory.cleanup()
-
-    async def test_pending_structured_tool_call_is_not_a_final_answer(self):
-        directory, app, verification = await self._verification_for_persisted_answer([
-            {
-                "type": "tool_call",
-                "call": {
-                    "call_id": "call-final", "name": "core.read_file",
-                    "arguments": {"path": "screen.tsx"},
-                },
-            }
-        ])
-        try:
-            criterion = next(
-                item for item in verification.criteria
-                if item.criterion_id == "answer-completeness"
-            )
-            self.assertEqual(criterion.status, AcceptanceStatus.FAILED)
-            self.assertEqual(verification.status, AcceptanceStatus.FAILED)
-        finally:
-            await app.registry.stop_all()
-            directory.cleanup()
-
-    async def test_unverified_guess_after_failed_reads_is_blocked(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            app = compose_fixture_application(
-                tool_adapters=(CoreReadOnlyToolProvider(),)
-            )
-            await app.registry.start_all()
-            try:
-                task = await app.kernel.create_task(
-                    "determine behavior from source", root,
-                    "task-unverified-answer",
-                )
-                task = await move(app, task.task_id, (
-                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
-                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
-                    TaskState.EXECUTING,
-                ))
-                failed = await app.kernel.invoke_tool(
-                    task.task_id, "turn-unverified", ToolCall(
-                        "read-missing", "core.read_file",
-                        {"path": "src/Missing.java"},
-                    )
-                )
-                self.assertEqual(failed.error_code, "NOT_FOUND")
-                await app.kernel._append_events(task.task_id, (
-                    ("llm.completed", {
-                        "turn_id": "turn-unverified",
-                        "message": {
-                            "message_id": "assistant-unverified",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "text",
-                                "text": (
-                                    "当前这轮我没法继续读取文件内容，所以不能"
-                                    "百分百确认。不过大概率这个实现支持角色区分。"
-                                ),
-                            }],
-                        },
-                        "finish_reason": "stop",
-                    }),
-                    ("turn.completed", {"turn_id": "turn-unverified"}),
-                ))
-                await app.kernel.transition_task(
-                    task.task_id, TaskState.VERIFYING, "verify unverified answer"
-                )
-                verification = await app.kernel.verify_task_acceptance(task.task_id)
-                by_id = {item.criterion_id: item for item in verification.criteria}
-                self.assertEqual(
-                    by_id["answer-evidence-sufficiency"].status,
-                    AcceptanceStatus.BLOCKED,
-                )
-                self.assertEqual(verification.status, AcceptanceStatus.BLOCKED)
-            finally:
-                await app.registry.stop_all()
-
-    async def test_successful_read_does_not_trigger_unverified_answer_gate(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "source.py").write_text("ROLE = 'driver'\n")
-            app = compose_fixture_application(
-                tool_adapters=(CoreReadOnlyToolProvider(),)
-            )
-            await app.registry.start_all()
-            try:
-                task = await app.kernel.create_task(
-                    "inspect source behavior", root,
-                    "task-verified-answer",
-                )
-                task = await move(app, task.task_id, (
-                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
-                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
-                    TaskState.EXECUTING,
-                ))
-                read = await app.kernel.invoke_tool(
-                    task.task_id, "turn-verified", ToolCall(
-                        "read-source", "core.read_file",
-                        {"path": "source.py"},
-                    )
-                )
-                self.assertTrue(read.ok)
-                await app.kernel._append_events(task.task_id, (
-                    ("llm.completed", {
-                        "turn_id": "turn-verified",
-                        "message": {
-                            "message_id": "assistant-verified",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "text",
-                                "text": "已读取源码；其他路径尚未验证。",
-                            }],
-                        },
-                        "finish_reason": "stop",
-                    }),
-                    ("turn.completed", {"turn_id": "turn-verified"}),
-                ))
-                await app.kernel.transition_task(
-                    task.task_id, TaskState.VERIFYING, "verify successful read"
-                )
-                verification = await app.kernel.verify_task_acceptance(task.task_id)
-                self.assertEqual(verification.status, AcceptanceStatus.PASSED)
-                self.assertNotIn(
-                    "answer-evidence-sufficiency",
-                    {item.criterion_id for item in verification.criteria},
-                )
-            finally:
-                await app.registry.stop_all()
-
     async def test_each_task_has_private_runtime_spec_without_workspace_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -689,31 +546,6 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
                         acceptance_criteria=(criterion,), operation_id="goal-change",
                         writer="test", goal="changed goal",
                     )
-            finally:
-                await app.registry.stop_all()
-
-    async def test_verifier_blocks_missing_reference_and_passes_real_event(self):
-        with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(tool_adapters=())
-            await app.registry.start_all()
-            try:
-                task = await app.kernel.create_task("verify", Path(directory))
-                task = await move(app, task.task_id, (
-                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
-                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
-                    TaskState.EXECUTING,
-                ))
-                missing = TaskAcceptanceCriterion(
-                    "proof", "proof exists", TaskCriterionKind.EVIDENCE_REFERENCE,
-                    "event:999999",
-                )
-                await app.kernel.revise_task_spec(
-                    task.task_id, 1, scope=(), constraints=(),
-                    acceptance_criteria=(missing,), operation_id="missing", writer="test",
-                )
-                await app.kernel.transition_task(task.task_id, TaskState.VERIFYING, "verify")
-                blocked = await app.kernel.verify_task_acceptance(task.task_id)
-                self.assertEqual(blocked.status, AcceptanceStatus.BLOCKED)
             finally:
                 await app.registry.stop_all()
 

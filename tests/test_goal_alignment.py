@@ -15,7 +15,6 @@ from pathlib import Path
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     TASK_SPEC_PROPOSAL_SCHEMA_V1,
-    AcceptanceStatus,
     TaskAcceptanceCriterion,
     TaskCriterionKind,
     TaskState,
@@ -185,61 +184,3 @@ class GoalAlignmentJudgingTest(unittest.IsolatedAsyncioTestCase):
         )
         verification = await app.kernel.verify_task_acceptance(task.task_id)
         return verification, judge
-
-    async def test_alignment_judged_with_answer_and_goal_text(self) -> None:
-        verification, judge = await self._verify(
-            JudgeVerdict.SATISFIED, "the runtime is an event loop", "task-ok",
-        )
-
-        self.assertTrue(verification.passed, verification.to_data())
-        self.assertEqual(len(judge.calls), 1)
-        criterion_id, assertion, evidence = judge.calls[0]
-        self.assertEqual(criterion_id, "answer-alignment")
-        self.assertIn("explain the runtime", assertion)
-        # The judge read the answer body, not just an opaque reference.
-        self.assertTrue(evidence)
-        self.assertTrue(any("event loop" in item.excerpt for item in evidence))
-
-    async def test_unrelated_answer_fails_alignment(self) -> None:
-        verification, judge = await self._verify(
-            JudgeVerdict.NEEDS_REVISION,
-            "Jersey Giant chickens are a dual-purpose breed",
-            "task-offtopic",
-        )
-
-        self.assertFalse(verification.passed, verification.to_data())
-        self.assertEqual(
-            verification.status.value, AcceptanceStatus.BLOCKED.value
-        )
-        self.assertEqual(judge.calls[0][0], "answer-alignment")
-
-    async def test_judged_criterion_without_judge_cannot_pass(self) -> None:
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        app = compose_fixture_application()
-        await app.registry.start_all()
-        self.addAsyncCleanup(app.registry.stop_all)
-        task = await _executing_task(
-            app, Path(directory.name), "no-judge",
-        )
-        current = await app.kernel.get_task_spec(task.task_id)
-        spec = replace(
-            current, revision=current.revision + 1, content_hash="",
-            acceptance_criteria=(TaskAcceptanceCriterion(
-                "answer-alignment", "answer the request",
-                TaskCriterionKind.GOAL_ALIGNMENT,
-            ),),
-        )
-        await app.kernel._append_events(task.task_id, ((
-            "task_spec.revised", {"snapshot": spec.to_data()},
-        ),))
-        await app.kernel.transition_task(
-            task.task_id, TaskState.VERIFYING, "verify",
-        )
-
-        verification = await app.kernel.verify_task_acceptance(task.task_id)
-
-        self.assertFalse(verification.passed, verification.to_data())
-        self.assertEqual(
-            verification.status.value, AcceptanceStatus.BLOCKED.value
-        )

@@ -27,7 +27,6 @@ from tsm_agt.core.proof_projection import (
     replay_proof_projection,
 )
 from tsm_agt.core.task import TaskState
-from tsm_agt.core.verification import AcceptanceStatus
 from tsm_agt.core.task_spec import (
     ProofPlanCompiler, REQUIRED_EFFECT_CRITERION_ID, TaskAcceptanceCriterion,
     TaskCriterionKind, TaskOutcomeCompletionPolicy, TaskOutcomeKind,

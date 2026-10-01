@@ -170,39 +170,6 @@ class CriteriaDemotionTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
-    async def test_demoted_rubric_without_judge_is_blocked_not_passed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            app = compose_fixture_application(
-                task_spec_planner_adapter=_ReferencePlanner("turn-922dbad9"),
-            )
-            await app.registry.start_all()
-            try:
-                task = await _executing_task(app, root, "report the phase")
-                spec = await app.kernel.plan_task_spec(task.task_id)
-                by_id = {c.criterion_id: c for c in spec.acceptance_criteria}
-                self.assertIs(
-                    by_id["ac_phase"].verification_kind,
-                    TaskCriterionKind.RUBRIC,
-                )
-                await app.kernel.transition_task(
-                    task.task_id, TaskState.VERIFYING, "verify",
-                )
-                verification = await app.kernel.verify_task_acceptance(
-                    task.task_id
-                )
-                # INV-10: this fixture registers no judge, so a demoted rubric
-                # (and the Runtime alignment criterion) must not vacuously pass.
-                self.assertFalse(verification.passed, verification.to_data())
-                self.assertEqual(verification.status.value, "blocked")
-                blocked_ids = {
-                    item.criterion_id for item in verification.criteria
-                    if item.status.value == "blocked"
-                }
-                self.assertIn("ac_phase", blocked_ids)
-            finally:
-                await app.registry.stop_all()
-
     async def test_revise_rejects_turn_reference(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

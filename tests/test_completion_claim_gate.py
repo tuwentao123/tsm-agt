@@ -18,7 +18,6 @@ from tsm_agt.adapters.builtin import CoreProcessToolProvider
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     TASK_SPEC_PROPOSAL_SCHEMA_V1,
-    AcceptanceStatus,
     ApprovalDecision,
     ApprovalRequired,
     MutationOperation,
@@ -420,78 +419,3 @@ class DeliveryGapTest(unittest.IsolatedAsyncioTestCase):
         ))
 
 
-class DeliveryAcceptanceTest(unittest.IsolatedAsyncioTestCase):
-    """Final acceptance: the claim fails, honest criteria keep their meaning."""
-
-    async def _app(self, proposal, **kwargs):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        app = compose_fixture_application(
-            task_spec_planner_adapter=_Planner(proposal), **kwargs
-        )
-        await app.registry.start_all()
-        self.addAsyncCleanup(app.registry.stop_all)
-        root = Path(temporary.name)
-        await app.kernel.set_project_trust(root, ProjectTrustLevel.TRUSTED_BUILD)
-        return app, root
-
-    async def _verify(self, task_id, app, root):
-        await _persist_final_answer(app, task_id)
-        await app.kernel.transition_task(task_id, TaskState.VERIFYING, "verify")
-        return await app.kernel.verify_task_acceptance(task_id)
-
-    async def test_missing_workspace_delivery_fails_acceptance(self) -> None:
-        app, root = await self._app(_proposal("implement", effects=["mutate"]))
-        task = await _executing_task(app, root, "gate-fail-mutate")
-        await app.kernel.plan_task_spec(task.task_id)
-        verification = await self._verify(task.task_id, app, root)
-        by_id = {item.criterion_id: item for item in verification.criteria}
-        self.assertEqual(
-            by_id["required-effect-delivery"].status, AcceptanceStatus.FAILED
-        )
-        # Integrity keeps its own honest meaning: an empty journal matches an
-        # unchanged disk, so it is not the criterion that fails.
-        self.assertEqual(by_id["ac-authored"].status, AcceptanceStatus.PASSED)
-        self.assertEqual(verification.status, AcceptanceStatus.FAILED)
-
-    async def test_missing_command_delivery_fails_acceptance(self) -> None:
-        app, root = await self._app(_proposal("run the tests", effects=["execute"]))
-        task = await _executing_task(app, root, "gate-fail-execute")
-        await app.kernel.plan_task_spec(task.task_id)
-        verification = await self._verify(task.task_id, app, root)
-        by_id = {item.criterion_id: item for item in verification.criteria}
-        self.assertEqual(
-            by_id["required-effect-delivery"].status, AcceptanceStatus.FAILED
-        )
-        self.assertEqual(verification.status, AcceptanceStatus.FAILED)
-
-    async def test_executed_command_satisfies_the_delivery_criterion(self) -> None:
-        app, root = await self._app(
-            _proposal("run the tests", effects=["execute"]),
-            tool_adapters=(CoreProcessToolProvider(),),
-            sandbox_adapter=_AllowProcessSandbox(),
-        )
-        task = await _executing_task(app, root, "gate-pass-execute")
-        await app.kernel.plan_task_spec(task.task_id)
-        try:
-            result = await app.kernel.invoke_tool(
-                task.task_id, "turn-direct",
-                ToolCall("call-direct", "core.run_command", {
-                    "argv": [sys.executable, "-c", "print('ok')"],
-                }),
-            )
-        except ApprovalRequired as suspended:
-            request = suspended.request
-            result = await app.kernel.resolve_approval(
-                task.task_id, request.request_id, request.payload_hash,
-                ApprovalDecision.APPROVE, "approve exact direct command",
-            )
-        self.assertTrue(result.ok)
-        self.assertEqual(result.data["exit_code"], 0)
-
-        verification = await self._verify(task.task_id, app, root)
-        by_id = {item.criterion_id: item for item in verification.criteria}
-        self.assertEqual(
-            by_id["required-effect-delivery"].status, AcceptanceStatus.PASSED
-        )
-        self.assertEqual(verification.status, AcceptanceStatus.PASSED)

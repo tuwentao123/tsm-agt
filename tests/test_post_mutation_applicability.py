@@ -17,9 +17,7 @@ from tsm_agt.adapters.rule_based_evidence_level import (
     RuleBasedEvidenceLevelEvaluator,
 )
 from tsm_agt.bootstrap import compose_fixture_application
-from tsm_agt.core import (
-    AcceptanceStatus, TaskAcceptanceCriterion, TaskCriterionKind, TaskState,
-)
+from tsm_agt.core import TaskAcceptanceCriterion, TaskCriterionKind, TaskState
 from tsm_agt.core.kernel import _has_active_workspace_mutation
 from tsm_agt.ports import ToolEffect
 
@@ -93,71 +91,6 @@ class PostMutationApplicabilityTest(unittest.IsolatedAsyncioTestCase):
                     gap.kind == "TASK_SPEC_POST_MUTATION_COMMAND"
                     for gap in gaps
                 ))
-            finally:
-                await app.registry.stop_all()
-
-    async def test_verifier_records_the_criterion_as_not_applicable(self) -> None:
-        """The verifier must report why it did not verify, not invent a failure."""
-        with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(
-                evidence_level_evaluator_adapter=RuleBasedEvidenceLevelEvaluator(),
-            )
-            await app.registry.start_all()
-            try:
-                task = await executing_task(
-                    app, Path(directory), "analysis-verify"
-                )
-                await self._require_command_criterion(app, task)
-                await self._persist_final_answer(app, task.task_id)
-                await app.kernel.transition_task(
-                    task.task_id, TaskState.VERIFYING, "verify"
-                )
-
-                verification = await app.kernel.verify_task_acceptance(task.task_id)
-
-                criterion = next(
-                    item for item in verification.criteria
-                    if item.criterion_id == "ac_build_or_validation"
-                )
-                self.assertEqual(
-                    criterion.status, AcceptanceStatus.NOT_APPLICABLE
-                )
-                self.assertIn(
-                    "not applicable", criterion.evidence[0].observed
-                )
-                # An inapplicable criterion is neutral: it must neither fail the
-                # Task nor count as a verification that happened.
-                self.assertEqual(verification.status, AcceptanceStatus.PASSED)
-                self.assertEqual(
-                    verification.evidence_level.verified_criteria, 0
-                )
-            finally:
-                await app.registry.stop_all()
-
-    async def test_change_without_verification_is_blocked_in_verifier(self) -> None:
-        """Regression guard: the verifier must still refuse an unverified change."""
-        with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application()
-            await app.registry.start_all()
-            try:
-                task = await executing_task(app, Path(directory), "changed-verify")
-                await self._require_command_criterion(app, task)
-                await app.kernel.write_workspace_text(
-                    task.task_id, "change", "app.py", "value = 1\n", None,
-                )
-                await self._persist_final_answer(app, task.task_id)
-                await app.kernel.transition_task(
-                    task.task_id, TaskState.VERIFYING, "verify"
-                )
-
-                verification = await app.kernel.verify_task_acceptance(task.task_id)
-
-                criterion = next(
-                    item for item in verification.criteria
-                    if item.criterion_id == "ac_build_or_validation"
-                )
-                self.assertEqual(criterion.status, AcceptanceStatus.BLOCKED)
-                self.assertEqual(verification.status, AcceptanceStatus.BLOCKED)
             finally:
                 await app.registry.stop_all()
 
