@@ -466,6 +466,37 @@ ports/evidence_guided_exploration.py  ports/evidence_level.py
 * **3b-2**：单独处理上表 3 个有外部调用者的方法（它们牵连 `task_spec.py` /
   `kernel_task.py` 的 criterion 派生，与 3c 的 `POST_MUTATION_COMMAND` 语义相邻）。
 
+### A.1e 批 3b-1 测试处置预案（实测：逐文件数"碰验收裁决的用例 / 总数"）
+
+方法：AST 逐文件统计每个 `test_*` 的**方法体**是否出现
+`verify_task_acceptance` / `AcceptanceStatus` / `TaskVerificationResult` / `AcceptanceResult`。
+下表是实测值，不是猜的。
+
+| 测试文件 | 碰裁决/总数 | 处置 |
+|---|---|---|
+| `test_goal_command_verification.py` | **4/4** | **整文件删**（整个文件就是 goal-command 裁决） |
+| `test_real_provider_journey.py` | **1/1** | **整文件删**（唯一用例断言 `reaches_verified_answer`） |
+| `test_coding_agent_e2e.py` | 4/5 | 删 4 个 `*_verify/*_verifier_*`；**保留** `test_verification_command_is_eligible_after_workspace_effects` |
+| `test_completion_claim_gate.py` | 3/21 | 删整个 `DeliveryAcceptanceTest`（3）；保留其余 18 |
+| `test_evidence_level.py` | 3/6 | 删 `EvidenceLevelKernelTest`（3）；保留 3（含 `test_cli_renderer_is_explicit`） |
+| `test_goal_alignment.py` | 2/6 | 删 `test_unrelated_answer_fails_alignment`、`test_judged_criterion_without_judge_cannot_pass`；保留 4 |
+| `test_post_mutation_applicability.py` | 2/5 | 删 `test_verifier_records_the_criterion_as_not_applicable`、`test_change_without_verification_is_blocked_in_verifier`；保留 3 |
+| `test_production_journeys.py` | 2/5 | 删 `test_analysis_journey_survives_sqlite_restart`、`test_multi_tool_journey_recovers_without_replaying_tools`；保留 3 |
+| `test_rubric_judge.py` | 1/8 | 删 `RubricAcceptanceTest.test_judge_error_is_fail_closed`；保留 7 |
+| `test_task_spec.py` | 5/21 | 删 5 个 verifier 用例（`test_answer_completeness_accepts_user_facing_text`、`test_pending_structured_tool_call_is_not_a_final_answer`、`test_unverified_guess_after_failed_reads_is_blocked`、`test_successful_read_does_not_trigger_unverified_answer_gate`、`test_verifier_blocks_missing_reference_and_passes_real_event`）；保留 16 |
+| `test_task_spec_criteria_validation.py` | 1/8 | 删 `CriteriaDemotionTest.test_demoted_rubric_without_judge_is_blocked_not_passed`；保留 7 |
+
+合计：**整删 2 个文件 + 删 27 个用例**（保留 76 个）。
+
+**每个保留用例的文件都要顺手摘掉已无用的 `AcceptanceStatus` 等 import**（11 个文件都 import 了它）。
+
+**注意 `test_proof_closure.py` 是 0/120** —— 它跟 3b 无关，那是批 4 的目标；别顺手删。
+
+**一个必须确认的点**：`test_unverified_guess_after_failed_reads_is_blocked`
+就是本次事故的**旧规格**（断言"猜错后不许成功"）。它必须随 3b-1 删除 ——
+新契约由 `test_completion_readiness_modes.py::test_a_blocked_question_no_longer_strands_the_turn`
+覆盖（回合经生产入口闭合为 SUCCEEDED）。删它**不是**丢覆盖，是换规格。
+
 ### 批 3 的建议切片（按"能否独立变绿"）
 
 * **3a ✅ 已落地**（`95ab0ee`）：删 `Kernel.finalize_acceptance`(32 行)、
