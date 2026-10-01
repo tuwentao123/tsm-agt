@@ -742,3 +742,38 @@ kind / 枚举成员仍在且可反序列化 / 含 `command` 的 criterion 往返
   `_completion_readiness_gaps` 这个 hollow 缝（及 6 个直接调它的 spec）同属一批。
 * `rubric_judge` 通路整体孤儿化（见 A.1h）。
 * 批 3d：`evidence_question.py` + 4 个 `_*_evidence_question` 方法 + 10 个 import 点。
+
+## A.1j 批 3d 重扫 —— **撤销**：`evidence_question` 不是证明层，是探索循环的核心机制
+
+A.1b 把 `evidence_question.py` 列为批 2 的残余，summary 又把"批 3d = `evidence_question.py`
++ 4 个 `_*_evidence_question` 方法 + 10 个 import 点"当作待删项。**两者都错。**
+
+实测（HEAD）：
+
+| 测量 | 值 |
+|---|---|
+| `require_evidence_questions` 在主编排工厂的默认值 | **`True`**（`composition.py:273`）|
+| `turn_tool_batch.py` 调用 `_bind/_observe/_dispose_evidence_question` | **10 处** |
+| 生产代码里 `get_evidence_questions` 调用点 | **11 处** |
+| `evidence_question.py` 内的方法数（活的投影） | 14 |
+| 依赖该词汇的 `src/` 文件 | **37** |
+| 依赖该词汇的 `tests/` 文件 | **30** |
+
+`EvidenceQuestion(question_id, question, expected_scope, scope_expansion_reason)` 描述的是
+**"这次工具调用想回答什么问题"**。它绑在 `ToolCall` 上（`ports/tool.py:367`），由两个模型
+适配器包进 `{evidence_question, tool_arguments}` 信封，由 `turn_tool_batch` 在绑定/观察/
+处置时更新，再由 `EvidenceQuestionProjection` 投影成工作记忆、检查点、会话资源与流程视图。
+
+**这跟"证明层"是两件事**：
+* 证明层 = 验收裁决（`acceptance_criteria` → proof obligation → coverage → 终端裁定）—— 已删。
+* 证据问题 = **探索循环的机制**（每次工具调用声明它要回答的问题）—— 是 tsm-agt 的核心特性，
+  与 `acceptance_criteria` 无依赖关系。
+
+⇒ **批 3d 撤销**。删它等于删功能，不是删证明层。这是本会话第二次因重扫而撤销批次
+（第一次是 3c）。
+
+### 教训（第三次复现同一模式）
+
+附录 A 的分批是**按模块名相近**画的（`evidence_coverage` / `evidence_question` 名字像 →
+被归到一起），而不是按**依赖**画的。`evidence_coverage` 已删、`evidence_question` 全活 ——
+仅凭名字相邻推断归属，这次错了两次（3c、3d）。
