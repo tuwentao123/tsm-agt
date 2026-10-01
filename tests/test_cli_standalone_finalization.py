@@ -36,7 +36,7 @@ class StandaloneFinalizationTest(unittest.IsolatedAsyncioTestCase):
         await self.application.registry.stop_all()
         self.temporary.cleanup()
 
-    async def test_final_result_runs_verifier_and_ends_task(self) -> None:
+    async def test_final_result_ends_task_without_consulting_verification(self) -> None:
         lines: list[str] = []
         result = AgentTurnResult(
             "turn-final", self.task.task_id,
@@ -57,13 +57,14 @@ class StandaloneFinalizationTest(unittest.IsolatedAsyncioTestCase):
             (await self.application.kernel.get_task(self.task.task_id)).state,
             TaskState.SUCCEEDED,
         )
-        self.assertTrue(any("verification: passed" in line for line in lines))
+        self.assertTrue(any(line.startswith("task completed:") for line in lines))
+        self.assertFalse(any("verification" in line for line in lines))
         self.assertTrue(any(line.startswith("执行状态:") for line in lines))
         self.assertTrue(any(line.startswith("领域检查:") for line in lines))
         self.assertTrue(any(line.startswith("模型结论:") for line in lines))
         self.assertTrue(any(line.startswith("引用校验:") for line in lines))
 
-    async def test_non_legacy_result_only_observes_verification(self) -> None:
+    async def test_readiness_mode_does_not_change_standalone_outcome(self) -> None:
         lines: list[str] = []
         application = compose_fixture_application(
             tool_adapters=(),
@@ -94,11 +95,9 @@ class StandaloneFinalizationTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(exit_code, 0)
             self.assertEqual(
                 (await application.kernel.get_task(task.task_id)).state,
-                TaskState.EXECUTING,
+                TaskState.SUCCEEDED,
             )
-            self.assertTrue(any(
-                line.startswith("verification observation:") for line in lines
-            ))
+            self.assertFalse(any("verification" in line for line in lines))
             self.assertTrue(any(line.startswith("执行状态:") for line in lines))
             self.assertTrue(any(line.startswith("领域检查:") for line in lines))
             self.assertTrue(any(line.startswith("模型结论:") for line in lines))

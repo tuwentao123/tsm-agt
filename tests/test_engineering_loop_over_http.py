@@ -6,7 +6,7 @@ never exercised together with the rest of the Runtime. This test keeps only the
 model endpoint local: it is an OpenAI-compatible server on 127.0.0.1, and
 everything else is production code -- the planner, the approval gate, the
 workspace sandbox, the journaled ``core.apply_patch`` mutation, the SQLite ledger,
-verification and the one terminal-state mapping.
+and the single completion path that closes the Task.
 
 That is the shape a real deployment runs, minus the vendor endpoint itself, so a
 regression in any of those seams shows up here instead of in a user's session.
@@ -26,7 +26,7 @@ from tsm_agt.bootstrap import (
     compose_openai_compatible_engineering_application,
 )
 from tsm_agt.core import (
-    AcceptanceStatus, AgentTurnResult, AgentTurnSuspended, ApprovalDecision,
+    AgentTurnResult, AgentTurnSuspended, ApprovalDecision,
     TaskState,
 )
 
@@ -209,13 +209,10 @@ class EngineeringLoopOverHttpTest(unittest.IsolatedAsyncioTestCase):
                 [item.criterion_id for item in spec.acceptance_criteria],
             )
 
-            await kernel.transition_task(
-                task.task_id, TaskState.VERIFYING, "verify the http loop",
-            )
-            verification = await kernel.verify_task_acceptance(task.task_id)
-            self.assertIs(verification.status, AcceptanceStatus.PASSED)
-            finalized = await kernel.finalize_acceptance(
-                task.task_id, verification.status,
+            # The turn ended without pending work: that IS completion. No
+            # verifier runs and no verdict is mapped.
+            finalized = await kernel.complete_task(
+                task.task_id, "http loop turn completed",
             )
             self.assertIs(finalized.state, TaskState.SUCCEEDED)
 

@@ -357,7 +357,6 @@ def _should_print_result_body(response_text_was_emitted: bool) -> bool:
     """Decide from durable display state, never a cleared token buffer."""
     return not response_text_was_emitted
 from tsm_agt.ports import (
-    CompletionReadinessMode,
     FlowArtifactExportPort, ReplayCursor, ReplayCursorStorePort,
     RuntimeStorePort, ToolCall, ModelFailureCategory, ModelRecoveryAction,
 )
@@ -588,60 +587,12 @@ async def _finalize_standalone_agent_result(
     """Give every one-shot continuation the same trusted Task ending."""
     if not isinstance(result, AgentTurnResult):
         return 0
-    task = await application.kernel.get_task(task_id)
-    if (
-        application.kernel.completion_readiness_mode
-        is not CompletionReadinessMode.LEGACY_GATE
-    ):
-        verification = await application.kernel.verify_task_acceptance(task.task_id)
-        if verbose and verification.evidence_level is not None:
-            output_fn(_render_evidence_level(verification.evidence_level))
-        if verbose:
-            for criterion in verification.criteria:
-                output_fn(
-                    f"verification criterion: {criterion.criterion_id} "
-                    f"{criterion.status.value}"
-                )
-        await _print_standalone_protocol_status(application, task_id, output_fn)
-        output_fn(
-            f"verification observation: {verification.status.value}; "
-            "Task state was not changed by completion diagnostics"
-        )
-        return 0
-    task = await application.kernel.transition_task(
-        task.task_id, TaskState.VERIFYING, "standalone verifier started"
-    )
-    verification = await application.kernel.verify_task_acceptance(task.task_id)
-    if verbose and verification.evidence_level is not None:
-        output_fn(_render_evidence_level(verification.evidence_level))
-    if verbose:
-        for criterion in verification.criteria:
-            output_fn(
-                f"verification criterion: {criterion.criterion_id} "
-                f"{criterion.status.value}"
-            )
-    if verification.passed:
-        for target in (TaskState.FINALIZING, TaskState.SUCCEEDED):
-            task = await application.kernel.transition_task(
-                task.task_id, target, f"standalone {target.value.lower()}",
-            )
-        await _print_standalone_protocol_status(application, task_id, output_fn)
-        if verbose:
-            output_fn(
-                f"verification: passed ({len(verification.criteria)} criteria)"
-            )
-        return 0
-    # Same shared mapping the SDK uses: a BLOCKED (undecided) verdict is
-    # human review, not a failure. Mapping it per client is what made the CLI
-    # disagree with the SDK.
-    task = await application.kernel.finalize_acceptance(
-        task.task_id, verification.status
+    task = await application.kernel.complete_task(
+        task_id, "standalone turn completed"
     )
     await _print_standalone_protocol_status(application, task_id, output_fn)
-    output_fn(
-        f"verification: {verification.status.value}; "
-        f"Task state {task.state.value}"
-    )
+    if verbose:
+        output_fn(f"task completed: {task.state.value}")
     return _exit_code_for(task.state)
 
 
@@ -2166,47 +2117,17 @@ async def _chat(
                 }:
                     output_fn(
                         f"[状态] Task 当前为 {task.state.value}；"
-                        "未启动最终验证。"
+                        "不再变更任务状态。"
                     )
                     session = await application.kernel.get_session(
                         session.session_id
                     )
                     continue
-                task = await application.kernel.transition_task(
-                    task.task_id, TaskState.VERIFYING,
-                    "interactive verifier started",
+                task = await application.kernel.complete_task(
+                    task.task_id, "interactive turn completed"
                 )
-                verification = await application.kernel.verify_task_acceptance(
-                    task.task_id
-                )
-                if verbose_progress and verification.evidence_level is not None:
-                    output_fn(_render_evidence_level(verification.evidence_level))
                 if verbose_progress:
-                    for criterion in verification.criteria:
-                        output_fn(
-                            f"verification criterion: {criterion.criterion_id} "
-                            f"{criterion.status.value}"
-                        )
-                if verification.passed:
-                    for target in (TaskState.FINALIZING, TaskState.SUCCEEDED):
-                        task = await application.kernel.transition_task(
-                            task.task_id, target,
-                            f"interactive {target.value.lower()}",
-                        )
-                    if verbose_progress:
-                        output_fn(
-                            f"verification: passed ({len(verification.criteria)} criteria)"
-                        )
-                else:
-                    # Shared verdict -> terminal-state mapping (AG-16): a
-                    # BLOCKED verdict is human review, not a failure.
-                    task = await application.kernel.finalize_acceptance(
-                        task.task_id, verification.status
-                    )
-                    output_fn(
-                        f"verification: {verification.status.value}; "
-                        f"Task state {task.state.value}"
-                    )
+                    output_fn(f"task completed: {task.state.value}")
                 session = await application.kernel.get_session(session.session_id)
             except AgentLoopLimitExceeded as error:
                 stop_heartbeat()

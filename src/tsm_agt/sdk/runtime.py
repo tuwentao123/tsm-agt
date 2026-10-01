@@ -30,7 +30,7 @@ from tsm_agt.core import (
     canonical_hash, SteeringKind, RuntimeInputIntent,
 )
 from tsm_agt.ports import (
-    CompletionReadinessMode, ImageBlock, ModelRecoveryAction,
+    ImageBlock, ModelRecoveryAction,
     ModelRecoveryExhausted, ModelRetrySafety,
     RuntimeCommandRecord, RuntimeStorePort, SessionInputRelation,
     SessionInputRelationJudgement, SessionInputRelationPort, TextBlock,
@@ -1319,43 +1319,15 @@ class EngineeringAgentClient:
                 },
             )
         elif isinstance(result, AgentTurnResult):
-            kernel = self.application.kernel
-            if kernel.completion_readiness_mode is CompletionReadinessMode.LEGACY_GATE:
-                await kernel.transition_task(
-                    result.task_id, TaskState.VERIFYING, "SDK verifier started"
-                )
-                verification = await kernel.verify_task_acceptance(result.task_id)
-                # One shared verdict -> terminal-state mapping (AG-16). Clients
-                # must not map for themselves: doing so is how a BLOCKED
-                # (undecided) verdict gets reported as a product failure.
-                await kernel.finalize_acceptance(
-                    result.task_id, verification.status
-                )
-            else:
-                # Diagnostics remain observable, but only an explicit caller
-                # decision may advance or fail the Task outside legacy gating.
-                verification = await kernel.verify_task_acceptance(result.task_id)
+            # The turn ended without pending tool calls: that IS completion.
+            await self.application.kernel.complete_task(
+                result.task_id, "SDK turn completed"
+            )
             base = await self.get_task_result(result.task_id)
             task_result = replace(
                 base,
                 status=_status_for_state(TaskState(base.state)),
                 assistant_text=result.assistant_message.text,
-                verification={
-                    "status": verification.status.value,
-                    "passed": verification.passed,
-                    "criteria_count": len(verification.criteria),
-                    "criteria": [
-                        {
-                            "criterion_id": item.criterion_id,
-                            "status": item.status.value,
-                        }
-                        for item in verification.criteria
-                    ],
-                },
-                evidence_level=(
-                    verification.evidence_level.to_data()
-                    if verification.evidence_level else None
-                ),
             )
         else:
             raise TypeError(f"unsupported Agent result: {type(result).__name__}")

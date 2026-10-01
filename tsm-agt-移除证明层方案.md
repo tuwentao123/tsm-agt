@@ -58,15 +58,50 @@ async def transition_task(self, task_id, target, reason, *, authority: str = "ru
 **S1 的验收**：一次"猜错路径"的分析任务**正常结束且为 `SUCCEEDED`**，不再挂起、不再
 `NEEDS_REVIEW`；`verify.completed` 事件不再产生；全量绿。
 
+### S1 实测修订（落地后回写，覆盖上文三处不准确）
+
+**1. 生产调用点是三个，不是两个。** 漏掉的是**交互式循环** `cli.py` 里
+`interactive verifier started` 那段（原 `:2127-2161`，在 `_chat` 回合结束分支内）。
+它与 `_finalize_standalone_agent_result`、`sdk/runtime.py` 是同一决策的三份拷贝。
+三个调用点现在全部收敛到一个新 API：`Kernel.complete_task(task_id, reason)`
+（`core/kernel.py`，紧邻 `finalize_acceptance`），内部就是
+`VERIFYING → FINALIZING → SUCCEEDED` 三跳，**不读任何裁决**。
+
+**2. "证明层仍然计算"是错的。** `final_acceptance_policy` 不只是闸 3 的开关，它同时是
+**准则的构造者**：`kernel.py:3138` `_evaluate_final_acceptance` 在 `policy is None` 时
+直接 `return None`，于是 `final-evidence-integrity` 这一类准则**从 `verify_task_acceptance`
+的输出里消失**。所以 S1 不是"层变惰性"，而是"层的产出被削掉一半"。这没有害处（S1 之后
+没有任何生产路径消费裁决），但必须知道——否则会以为 S1 是纯行为改动。
+
+**3. 删除面比预估小。** 初测 15 条失败里 **14 条只是注入 kwarg 被删掉的 `TypeError`**
+（`final_acceptance_policy_adapter` 不再存在），并非语义冲突。逐条处置：
+
+| 测试 | 处置 | 依据 |
+|---|---|---|
+| `test_final_acceptance.py`（整文件 9 条） | **删除** | 全部断言 `final-evidence-integrity` 等准则；准则由被删的 policy 构造，已无主语 |
+| `test_clarification.py::test_legacy_interaction_question_does_not_block_verification` | **删除** | 整条测试只为验证"老事件不阻塞验证" |
+| `test_clarification.py::test_answered_interaction_is_not_final_evidence` | **改写** 为 `test_answered_interaction_binds_no_evidence_question` | 保留交互语义断言（回答不产生 `evidence.question_bound`），去掉裁决断言 |
+| `test_terminal_state_mapping.py::test_entry_points_delegate_to_the_shared_finalizer` | **改写** 为 `..._shared_completion` | 反向守卫：入口必须调 `complete_task`，且 `cli.py`/`runtime.py` **不得**再出现 `verify_task_acceptance(` |
+| `test_sdk_runtime.py::test_non_legacy_mode_reports_verification_without_finalizing` | **改写** 为 `test_readiness_mode_does_not_gate_the_terminal_path` | 旧断言"非 LEGACY 模式不终结"已被推翻；新模式只调 nudge，不调终态 |
+| `test_terminal_state_mapping.py::FinalizeAcceptanceTest`（6 条） | **保留到批 3** | `finalize_acceptance`/`terminal_state_for` 在 S1 后仍然存在，其规格随批 3 一起删 |
+
+结论：**S1 与"删规格"不是同一个原子动作**——只有 1 个测试文件整体删除，其余是同批改写。
+上文"S1 不能独立变绿"的说法作废。
+
 ---
 
 ## 1. 删除顺序（每步独立可回退、每步全量绿）
 
-### S1 —— 切断权威（行为立即达成，层变惰性）
-* `sdk/runtime.py:1321-1337`：删 `LEGACY_GATE` 分支，改为按 §0 选定的终态路径。
-* `cli.py:588-645`：同样合一。
-* 效果：`verify_task_acceptance` / `finalize_acceptance` 不再被生产调用；证明层仍然计算、
-  仍然记录，但**不再影响任何决定**。
+### S1 —— 切断权威（行为立即达成）✅ 已落地
+* `sdk/runtime.py`、`cli.py`（**两处**：`_finalize_standalone_agent_result` 与交互式
+  回合结束分支）三处全部并入新 API `Kernel.complete_task`。
+* `bootstrap/composition.py`：注销 `FinalAcceptancePolicyPort`
+  （删 `final_acceptance_policy_adapter` 形参、两处默认注册、
+  `registry.all(FinalAcceptancePolicyPort)` 校验；`final_acceptance_policy=None`）。
+* 效果：`verify_task_acceptance` / `finalize_acceptance` 不再被生产调用；
+  `verify.completed` 不再由生产产生。
+* **注意**：这不是"层变惰性"——policy 同时构造准则，置 `None` 会顺带削掉
+  `final-evidence-integrity` 等准则的产出（详见 §0 实测修订第 2 条）。
 * 验收：一次"猜错路径"的任务**正常结束且为 SUCCEEDED**；真实台账那种分析任务不再挂起。
 
 ### S2 —— 停止产出

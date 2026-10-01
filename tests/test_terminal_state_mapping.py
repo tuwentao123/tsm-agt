@@ -60,14 +60,17 @@ class VerdictMappingTest(unittest.TestCase):
             _exit_code_for(TaskState.FAILED),
         )
 
-    def test_entry_points_delegate_to_the_shared_finalizer(self) -> None:
-        """Guards against a client re-introducing its own verdict mapping."""
+    def test_entry_points_delegate_to_the_shared_completion(self) -> None:
+        """Guards against a client re-introducing its own completion verdict."""
         cli = (_PACKAGE_ROOT / "cli.py").read_text(encoding="utf-8")
         sdk = (_PACKAGE_ROOT / "sdk" / "runtime.py").read_text(encoding="utf-8")
-        # CLI has two legacy-gate verification sites (standalone + interactive).
-        self.assertGreaterEqual(cli.count("finalize_acceptance("), 2)
-        self.assertIn("finalize_acceptance(", sdk)
-        # The exact old divergence must not come back.
+        # CLI has two turn-ending sites (standalone + interactive).
+        self.assertGreaterEqual(cli.count("complete_task("), 2)
+        self.assertIn("complete_task(", sdk)
+        # No entry point may consult acceptance before ending a Task, and the
+        # exact old divergence must not come back.
+        self.assertNotIn("verify_task_acceptance(", cli)
+        self.assertNotIn("verify_task_acceptance(", sdk)
         self.assertNotIn('f"trusted verifier {verification.status.value}"', cli)
 
 

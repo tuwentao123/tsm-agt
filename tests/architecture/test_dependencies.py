@@ -172,9 +172,11 @@ if __name__ == "__main__":
 #: every kernel decomposition slice so far. ``kernel_session.py``'s two
 #: references came out of ``kernel.py``'s 34; ``kernel_task.py``'s thirteen came
 #: out of the remainder (the ``TERMINAL_AUTHORITY`` transition-legality table,
-#: which travelled with ``transition_task``).
+#: which travelled with ``transition_task``). A *reduction* (not a move) tightens
+#: the table: removing the proof layer took ``cli.py`` 7 -> 5 and ``sdk/runtime.py``
+#: 8 -> 5, because the client entry points no longer map a verdict to a state.
 _TERMINAL_STATE_COUPLING_BASELINE = {
-    "cli.py": 7,
+    "cli.py": 5,
     "core/kernel.py": 11,
     "core/kernel_checkpoint.py": 3,
     "core/kernel_input.py": 4,
@@ -182,7 +184,7 @@ _TERMINAL_STATE_COUPLING_BASELINE = {
     "core/kernel_steering.py": 1,
     "core/kernel_task.py": 13,
     "core/task_runtime_projection.py": 7,
-    "sdk/runtime.py": 8,
+    "sdk/runtime.py": 5,
 }
 
 #: Modules allowed to name terminal states: the enum itself, the verdict mapping,

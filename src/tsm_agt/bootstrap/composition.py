@@ -32,9 +32,6 @@ from tsm_agt.adapters.rule_based_scope_consistency import (
 from tsm_agt.adapters.rule_based_completion_readiness import (
     RuleBasedCompletionReadinessPolicy,
 )
-from tsm_agt.adapters.rule_based_final_acceptance import (
-    RuleBasedFinalAcceptancePolicy,
-)
 from tsm_agt.adapters.rule_based_checkpoint_compatibility import (
     RuleBasedCheckpointCompatibilityPolicy,
 )
@@ -128,7 +125,6 @@ from tsm_agt.ports import (
     CompletionReadinessMode,
     CompletionReadinessPolicyPort,
     CheckpointCompatibilityPolicyPort,
-    FinalAcceptancePolicyPort,
     ExplorationBudgetPolicyPort,
     StopOrPivotPolicyPort,
     AgentProgressProjectorPort,
@@ -334,11 +330,6 @@ def _kernel_dependencies(
         raise ValueError(
             "at most one CompletionReadinessPolicyPort may be registered"
         )
-    final_acceptance_policies = registry.all(FinalAcceptancePolicyPort)
-    if len(final_acceptance_policies) > 1:
-        raise ValueError(
-            "at most one FinalAcceptancePolicyPort may be registered"
-        )
     budget_policies = registry.all(ExplorationBudgetPolicyPort)
     if len(budget_policies) > 1:
         raise ValueError("at most one ExplorationBudgetPolicyPort may be registered")
@@ -434,9 +425,11 @@ def _kernel_dependencies(
             if completion_readiness_policies else None
         ),
         completion_readiness_mode=completion_readiness_mode,
-        final_acceptance_policy=(
-            final_acceptance_policies[0] if final_acceptance_policies else None
-        ),
+        # Acceptance is not a completion authority (Hermes/Codex semantics): a
+        # turn that ends without pending tool calls completes the Task. Gate 3
+        # in `kernel_task.py` only demands a passed verdict when this policy is
+        # present, so `None` is the entire switch -- no state-machine change.
+        final_acceptance_policy=None,
         exploration_budget_policy=(
             budget_policies[0] if budget_policies else None
         ),
@@ -628,7 +621,6 @@ def compose_fixture_application(
     completion_readiness_mode: CompletionReadinessMode = (
         CompletionReadinessMode.LEGACY_GATE
     ),
-    final_acceptance_policy_adapter: FinalAcceptancePolicyPort | None = None,
     exploration_budget_policy_adapter: ExplorationBudgetPolicyPort | None = None,
     stop_or_pivot_policy_adapter: StopOrPivotPolicyPort | None = None,
     evidence_relation_provider_adapters: (
@@ -721,10 +713,6 @@ def compose_fixture_application(
     if completion_readiness_policy_adapter is not None:
         registry.register(
             CompletionReadinessPolicyPort, completion_readiness_policy_adapter
-        )
-    if final_acceptance_policy_adapter is not None:
-        registry.register(
-            FinalAcceptancePolicyPort, final_acceptance_policy_adapter
         )
     if exploration_budget_policy_adapter is not None:
         registry.register(
@@ -1003,9 +991,6 @@ def compose_openai_compatible_readonly_application(
     registry.register(
         CompletionReadinessPolicyPort, RuleBasedCompletionReadinessPolicy()
     )
-    registry.register(
-        FinalAcceptancePolicyPort, RuleBasedFinalAcceptancePolicy()
-    )
     exploration_profile = _register_exploration_profile(registry, budget.profile)
     registry.register(
         ExplorationBudgetPolicyPort,
@@ -1191,9 +1176,6 @@ def compose_openai_compatible_engineering_application(
     )
     registry.register(
         CompletionReadinessPolicyPort, RuleBasedCompletionReadinessPolicy()
-    )
-    registry.register(
-        FinalAcceptancePolicyPort, RuleBasedFinalAcceptancePolicy()
     )
     exploration_profile = _register_exploration_profile(registry, budget.profile)
     registry.register(

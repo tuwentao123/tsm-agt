@@ -288,7 +288,7 @@ from .kernel_steering import (
 from .kernel_checkpoint import (
     CheckpointMixin,
 )
-from .task import LEGAL_TRANSITIONS, TaskNotFound, TaskSnapshot, TaskState
+from .task import LEGAL_TRANSITIONS, SUCCESS_PATH, TaskNotFound, TaskSnapshot, TaskState
 from .verification_command import is_verification_command, is_verification_request
 from .task_spec import (
     TaskAcceptanceCriterion, TaskContinuationMode, TaskCriterionKind,
@@ -2628,6 +2628,20 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
 
 
 
+
+    async def complete_task(self, task_id: str, reason: str) -> TaskSnapshot:
+        """Close a Task whose turn ended without pending tool calls.
+
+        This is the whole completion rule (Hermes/Codex semantics): the model
+        stops calling tools, so the turn is over and the Task succeeded. No
+        verdict, no evidence, no criterion is consulted.
+
+        ``VERIFYING`` and ``FINALIZING`` are pure accounting hops here: the
+        success path lives in ``core/task.py`` next to ``LEGAL_TRANSITIONS``.
+        """
+        for target in SUCCESS_PATH:
+            task = await self.transition_task(task_id, target, reason)
+        return task
 
     async def finalize_acceptance(
         self, task_id: str, status: AcceptanceStatus,

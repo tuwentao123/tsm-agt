@@ -252,7 +252,8 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(again.result, first.result)
 
-    async def test_non_legacy_mode_reports_verification_without_finalizing(self) -> None:
+    async def test_readiness_mode_does_not_gate_the_terminal_path(self) -> None:
+        """The readiness mode only tunes in-turn nudges, never completion."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             application = compose_fixture_application(
@@ -267,21 +268,18 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     "observe completion", command_id="sdk-observe-create"
                 )
                 final = await client.wait_task(accepted.task_id, timeout=5)
-                self.assertEqual(final.state, TaskState.EXECUTING.value)
-                self.assertEqual(final.status, "running")
-                self.assertIsNotNone(final.verification)
-                self.assertTrue(final.verification["passed"])
-                self.assertIsNotNone(final.completion_diagnostics)
+                self.assertEqual(final.state, TaskState.SUCCEEDED.value)
+                self.assertIsNone(final.verification)
                 events = await application.registry.require(RuntimeStorePort).read_events(
                     final.task_id
                 )
-                self.assertFalse(any(
+                self.assertTrue(any(
                     event.event_type == "task.state_changed"
-                    and event.payload.get("next_state") in {
-                        TaskState.VERIFYING.value, TaskState.FINALIZING.value,
-                        TaskState.SUCCEEDED.value, TaskState.FAILED.value,
-                    }
+                    and event.payload.get("next_state") == TaskState.SUCCEEDED.value
                     for event in events
+                ))
+                self.assertFalse(any(
+                    event.event_type == "verify.completed" for event in events
                 ))
 
     async def test_subscribe_from_acknowledged_cursor_has_no_gap_or_duplicate(self) -> None:

@@ -189,6 +189,14 @@ LEGAL_TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = {
     }),
 }
 
+#: How a Task reaches ``SUCCEEDED``. ``LEGAL_TRANSITIONS`` has no
+#: ``EXECUTING -> FINALIZING`` edge, so the two intermediate hops are accounting
+#: only -- nothing is verified or consulted on the way. This lives next to the
+#: transition table because it is the same fact: "the one legal success path".
+SUCCESS_PATH: tuple[TaskState, ...] = (
+    TaskState.VERIFYING, TaskState.FINALIZING, TaskState.SUCCEEDED,
+)
+
 
 class InvalidTaskTransition(ValueError):
     def __init__(self, current: TaskState, target: TaskState) -> None:
