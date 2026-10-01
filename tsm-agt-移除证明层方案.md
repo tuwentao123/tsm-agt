@@ -538,6 +538,35 @@ ports/evidence_guided_exploration.py  ports/evidence_level.py
   + `_post_mutation_verification*`(52+23+23) + `_task_spec_requires_command_verification`(6)。
 * **3d**：`evidence_question.py` + 4 个 `_*_evidence_question` 方法 + 10 个 import 点。
 
+## A.1g 批 4 边界扫描（实测）—— 有界，可以一次做完
+
+**5 个模块的源码侧消费者只剩 3 个文件**：
+
+| 文件 | 引用 | 处置 |
+|---|---|---|
+| `core/__init__.py:161,167,173,177` | 5 个模块的全部门面 re-export | 删门面条目 |
+| `kernel.py:304` | `evidence_coverage` → `ESCALATED_GAP_KINDS`、`ProofEnforcementMode` | 见下 |
+| `kernel.py:306` | `semantic_review` → `normalize_judgement` | **已死**（唯一调用者 `_judge_rubric_criterion` 在 3b-1 删除）→ 删 import |
+| `task_spec.py:15,18` | `evidence_coverage` → `ProofPlanSnapshot`；`proof_obligation` → 5 个符号 | 随内嵌编译器一起删 |
+
+**`task_spec.py` 内嵌 `ProofPlanCompiler` 的边界：第 928–1114 行（187 行）**，
+它用的 `ProofPlanSnapshot`(917,991) 与 `proof_obligation` 5 个符号只服务于它。
+
+**三个跨模块符号的实测存活状态**：
+* `normalize_judgement`（semantic_review）—— **死的**，删除 import 即可。
+* `ESCALATED_GAP_KINDS`（evidence_coverage）—— **活的**，`kernel.py:630` 的
+  `_EXEMPT_GAP_KINDS` 与 `:679` 的 `_apply_inv3_demotion` 在用。但这条链服务的是
+  gap 生产（S2b 已停止产出），所以**与 `_apply_inv3_demotion` 同批删**。
+* `ProofEnforcementMode` —— **只剩死配置**：`kernel.py:419` 的依赖字段 + `:1053` 的
+  属性，已无人读。连同字段一起删。
+
+**测试侧只有一个消费者：`test_proof_closure.py`**（2400 行 / 120 条，import 了这 5 个
+模块的全部符号）。**整文件删**。
+
+⇒ 批 4 = 删 5 模块 + 删 `task_spec.py:928-1114` 的编译器 + 删 `_apply_inv3_demotion`/
+`_EXEMPT_GAP_KINDS` + 删 `proof_enforcement_mode` 字段与属性 + 清门面 + 整删
+`test_proof_closure.py`。**无语义决策**（证明层已彻底不运行），是本轮风险最低的一批。
+
 ## A.2 行为调用点（必须**改接线**，不是删掉）
 
 核心内：
