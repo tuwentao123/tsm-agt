@@ -1958,6 +1958,7 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         raise RuntimeError("unreachable final result retry state")
 
 
+
     async def _completion_readiness_gaps(
         self, task_id: str, visible_tools: tuple[ToolSpec, ...],
     ) -> tuple[CompletionGap, ...]:
@@ -1965,8 +1966,8 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
 
         Hermes and Codex carry no obligation/gap vocabulary at all -- a turn
         ends when the model stops calling tools, and nothing has to be proven
-        first. This method is kept as the one seam its four callers already
-        share, so removing the machinery behind it stays mechanical.
+        first. The Runtime has already stopped building them; this seam stays
+        only until the specs that consult it are removed with their batch.
         """
         return ()
 
@@ -2007,7 +2008,8 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         state = CompletionReadinessState.from_data(
             checkpoint.completion_readiness_state
         )
-        gaps = await self._completion_readiness_gaps(task_id, visible_tools)
+        # Completion has no obligation record (Hermes/Codex): no gaps exist.
+        gaps = ()
         available_read_tools = tuple(
             sorted(tool.name for tool in visible_tools
                    if tool.is_read_only and not tool.is_internal_state)
@@ -2102,62 +2104,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         # after the decision is durable and never feeds back into it.
         await self._publish_proof_diagnostics(task_id)
         return decision
-
-    async def _proof_coverage_gaps(
-        self, task_id: str, visible_tools: Sequence[ToolSpec],
-    ) -> tuple[CompletionGap, ...]:
-        """Required coverage gaps for the readiness gate (AG-11, SPEC P2).
-
-        Coverage is computed from the persisted events **plus** the observations
-        this turn has already produced but not yet published: the readiness gate
-        decides before the diagnostic pass persists them, and a gate that judged
-        a stale projection would block every Task that had just gathered its
-        evidence.
-
-        A Task with no Proof Plan reports nothing -- historical Tasks are
-        read-only compatible and are never retroactively inferred as covered.
-        """
-
-        stored = await self._dependencies.store.load_task(task_id)
-        if stored is None:
-            return ()
-        task = TaskSnapshot.from_data(stored.data)
-        events = await self._dependencies.store.read_events(task_id)
-        specs_by_name = {spec.name: spec for spec in visible_tools}
-        task_spec = TaskSpecProjector.project(task_id, task.goal, events)
-        available = frozenset(
-            capability.value
-            for spec in visible_tools
-            for capability in spec.evidence_capabilities
-        )
-        compilation = ProofPlanCompiler.compile(
-            task_spec, available_capabilities=available,
-        )
-        pending = derive_proof_events(
-            task_spec=task_spec, compilation=compilation,
-            executions=tuple(task.tool_executions.values()),
-            specs_by_name=specs_by_name,
-            mutation_records=task.mutation_journal,
-            current=replay_proof_projection(events),
-            events=events,
-            available_capabilities=available,
-            mode=self.proof_enforcement_mode,
-        )
-        projection = replay_proof_projection(
-            tuple(events) + tuple(
-                RuntimeEvent(
-                    f"pending-proof-{index}", task_id, 10_000 + index,
-                    event_type, payload,
-                )
-                for index, (event_type, payload) in enumerate(pending, start=1)
-            )
-        )
-        if projection.plan is None:
-            return ()
-        return coverage_gaps(
-            plan=projection.plan, coverages=projection.coverages,
-            tools=tuple(visible_tools),
-        )
 
     async def _publish_proof_diagnostics(self, task_id: str) -> None:
         """Emit proof-layer events for one Task. Read-only, never fails a Task.

@@ -157,9 +157,7 @@ async def _prepare_model_call(
         or state.budget_wrap_up
     )
     runtime_instruction = None
-    required_gaps = await kernel._completion_readiness_gaps(
-        state.task_id, state.visible_tools
-    )
+    required_gaps = ()
     available_effects_for_turn = {
         ToolEffect.OBSERVE
         if tool.effect is ToolEffect.UNSPECIFIED and tool.is_read_only
@@ -470,11 +468,7 @@ async def _prepare_model_call(
         goal=state.live_goal,
     ))
     state.buffered_text: list[str] = []
-    pre_model_gaps = (
-        await kernel._completion_readiness_gaps(state.task_id, state.visible_tools)
-        if kernel._dependencies.completion_readiness_policy is not None
-        else ()
-    )
+    pre_model_gaps = ()
     state.should_buffer_text = any(gap.required for gap in pre_model_gaps)
 
 

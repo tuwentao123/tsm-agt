@@ -906,9 +906,7 @@ class TaskMixin:
                 "criterion_count": 0,
             }))
         elif normalized == "return_for_revision":
-            gaps = await self._completion_readiness_gaps(
-                task_id, await self.list_tools()
-            )
+            gaps = ()
             unmet = "; ".join(
                 gap.description for gap in gaps if gap.required
             ) or "the remaining required work"

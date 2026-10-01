@@ -173,6 +173,31 @@ async def transition_task(self, task_id, target, reason, *, authority: str = "ru
   3. 被删测试留下的孤儿夹具/导入（如 `CriterionBlockedModel`、
      `_require_command_criterion` 的部分调用者）需在下一批清理。
 
+### S2c —— 删掉已死的产出者 ✅ 已落地（部分）
+* 用零引用扫描（对 `kernel.py` 全部私有方法 × 全仓引用数）确认**唯一**已死的方法是
+  `_proof_coverage_gaps`（55 行，含一次 `ProofPlanCompiler.compile` +
+  `derive_proof_events`）→ 删除。
+* 四个调用点不再走空壳：`kernel._evaluate_completion_readiness`、`turn_phases` ×2、
+  `kernel_task`（`return_for_revision`）改为直接 `()`。
+* **保留** `_completion_readiness_gaps` 空壳：另有 6 条规格直接调它断言"没有 gap"
+  （claim_gate / readiness / post_mutation / proof_closure）。它们与空壳同批删。
+
+**S2c 未做（下一批，必须做）**：`_publish_proof_diagnostics` 仍活在
+`_evaluate_completion_readiness` 末尾——**每一次 readiness 求值仍会跑
+`ProofPlanCompiler.compile` + `derive_proof_events` + 落 `proof.*` 事件**。
+证明层现在"只算不判"，但**还在算**，这正是"复杂且低效率"的来源。
+删它会波及 `tests/test_proof_closure.py`（2 处直接调 `_emit_proof_diagnostics`）。
+
+**S2c 未做（需要你定，不是技术问题）**：**renewal 机制已成孤儿**
+（触发条件是 gap 非空，现在恒空）。它的删除面是：`core/budget_renewal.py`、
+`turn_phases` 的 renewal 分支、4 个依赖旋钮 `model_call_renewal_*`、
+`bootstrap/exploration_configuration.py` 的配置与 3 个环境变量
+`TSM_AGT_AGENT_MODEL_CALL_RENEWAL_*`、`tests/test_budget_renewal.py`。
+**代价**：删掉后单回合模型调用上限从"最高 58（基础 40 + 续借）"降回 **40**，
+而 Hermes 是 **90**。要么先按 Hermes 把基础值提到 ~90 再删，要么保留 renewal。
+`model_budget_renewal_count` / `model_budget_total_granted` 两个 checkpoint 字段
+**必须保留**（旧台账里有，删了旧任务重放会炸）。
+
 ### S2 —— 停止产出
 * 不再编译 obligation（`ProofPlanCompiler`）、不再构造 gap（`_completion_gaps`）、
   不再注入 readiness 诊断与 nudge（`policy`、`turn_phases` 的相关分支）。
