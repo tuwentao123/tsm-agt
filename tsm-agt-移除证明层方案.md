@@ -497,6 +497,31 @@ ports/evidence_guided_exploration.py  ports/evidence_level.py
 新契约由 `test_completion_readiness_modes.py::test_a_blocked_question_no_longer_strands_the_turn`
 覆盖（回合经生产入口闭合为 SUCCEEDED）。删它**不是**丢覆盖，是换规格。
 
+### A.1f 批 3c 重扫 —— **不能独立删**：4 个调用点全是活的
+
+| 符号 | 调用点 | 性质 |
+|---|---|---|
+| `is_verification_command` | `kernel.py:1335`、`task_spec.py:858` | 校验/派生**作者声明的** `POST_MUTATION_COMMAND` 准则的命令是否合格 |
+| `is_verification_request` | `kernel.py:837`、`kernel_tool.py:953` | 判断一次调用/执行是否构成"验证请求" |
+| `_post_mutation_verification` | `kernel.py:1290`（+ 3 个测试文件） | **活的**，在准则降级/派生路径里 |
+| `_post_mutation_verification_observed` / `_description` | `kernel.py:1297` / `:1295` | 同上 |
+| `_has_active_workspace_mutation` | `kernel.py:603`（+ `test_post_mutation_applicability`） | **活的**，工作区变更判定的真实逻辑 |
+| `TaskCriterionKind.POST_MUTATION_COMMAND` | 14 处（含 `task_spec.py:57/855/1015`、3 个测试文件） | **planner 可见的 schema 词汇** |
+
+**结论**：`verification_command.py` 的每一个调用点都挂在
+`TaskCriterionKind.POST_MUTATION_COMMAND` 这个**仍然存在、且 planner 仍然可以声明**的
+准则种类上。删这个模块**等价于删掉这个准则种类**，而那属于 **S5「删词汇」**，
+不是 S4 的"删模块"。
+
+⇒ **3c 撤销，并入 S5。** 3b-2 留下的两个活方法（`_demote_unresolvable_criteria`、
+`_verify_task_spec_reference`）同理，随 `plan_task_spec` 的准则词汇一起走。
+
+**真正的下一步是批 4**：`artifact_graph` / `proof_obligation` / `evidence_coverage` /
+`proof_projection` / `semantic_review` 五个模块 —— 它们在 S2c 之后已经零生产调用
+（`ProofPlanCompiler` / `derive_proof_events` / `replay_proof_projection` /
+`coverage_gaps` 只剩 `core/__init__` 的 re-export），所以这一批是**纯删除 + 整删
+`test_proof_closure.py`（120 条）**，风险最低。
+
 ### 批 3 的建议切片（按"能否独立变绿"）
 
 * **3a ✅ 已落地**（`95ab0ee`）：删 `Kernel.finalize_acceptance`(32 行)、
