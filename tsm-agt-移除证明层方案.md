@@ -88,6 +88,26 @@ async def transition_task(self, task_id, target, reason, *, authority: str = "ru
 结论：**S1 与"删规格"不是同一个原子动作**——只有 1 个测试文件整体删除，其余是同批改写。
 上文"S1 不能独立变绿"的说法作废。
 
+**4. ⚠️ S1 的验收条件没有达成，而且它在 S2 的手里。** 落地后重跑事故复现测试
+`tests/test_completion_readiness_modes.py::test_a_blocked_question_is_unclosable_by_construction`
+**仍然通过**——也就是说 LEGACY_GATE 下"猜错路径"的任务**依然停在 `AWAITING_USER`**。
+
+原因：那次事故的堵点**不在终态决策**，而在**回合循环内部**。`turn_phases.py:972-1003`
+的 `incomplete_recovery_boundary`（`legacy_completion_gate and unmet_boundary and
+not exhausted_wrap_up_due`）在模型停止调用工具时，只要还有 **required gap**，就直接
+`_suspend_incomplete_recoverable` → 根本走不到 `AgentTurnResult`，于是也走不到
+`complete_task`。S1 删掉的是"回合结束之后"的权威；"回合能不能结束"由 S2 的范围决定。
+
+**这就是 S2 的第一件事，也是唯一真正修复事故的那件事**：让 readiness 门只做**有界
+nudge**，永不 suspension。对齐依据：Hermes 只有**一个**停止门且**默认关闭**、Codex
+连这个都没有；两家都没有 obligation/gap 记录。
+
+代价必须说清：`tests/test_completion_readiness.py` 里以 `_suspend_once` 夹子构造
+"不可闭合的 required gap 应当 suspension"的那批断言，以及 INV-14/INV-16 的
+"停在可续接边界"叙述，都是**被删层的规格**，需要与 S2 同批改写。之前两次尝试
+（整体删 `incomplete_recovery_boundary`、以及"不可闭合 ⇒ NEEDS_REVIEW"）都因为这个
+夹具而回退；这次不是"找更窄的判据"，而是**明确判定那批规格随层一起作废**。
+
 ---
 
 ## 1. 删除顺序（每步独立可回退、每步全量绿）
@@ -102,7 +122,8 @@ async def transition_task(self, task_id, target, reason, *, authority: str = "ru
   `verify.completed` 不再由生产产生。
 * **注意**：这不是"层变惰性"——policy 同时构造准则，置 `None` 会顺带削掉
   `final-evidence-integrity` 等准则的产出（详见 §0 实测修订第 2 条）。
-* 验收：一次"猜错路径"的任务**正常结束且为 SUCCEEDED**；真实台账那种分析任务不再挂起。
+* 验收：~~一次"猜错路径"的任务正常结束且为 SUCCEEDED~~ → **未达成**，原因见 §0 实测修订第 4 条：
+  堵点在回合循环的 readiness suspension，属 S2。S1 实际达成的只是"终态不再需要裁决"。
 
 ### S2 —— 停止产出
 * 不再编译 obligation（`ProofPlanCompiler`）、不再构造 gap（`_completion_gaps`）、
