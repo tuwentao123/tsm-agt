@@ -31,8 +31,32 @@
 
 **所以 S1 的实际大小比原方案小得多**：一个依赖值 + 两个调用点（`sdk/runtime.py`、`cli.py`）。
 
-**实施前仍需补的一件事**：闸 2 的 `TERMINAL_AUTHORITY` 里 `SUCCEEDED` 允许哪些 authority
-（`core/kernel_task.py:740` 引用），否则 S1 会在运行时被它挡下。
+### 闸 2 已查清 → S1 的精确步骤
+
+```python
+# core/kernel_task.py:76-79
+TERMINAL_AUTHORITY = {SUCCEEDED: {"runtime"}, FAILED: {"runtime"}, CANCELLED: {"user","runtime"}}
+# core/kernel_task.py:733-736
+async def transition_task(self, task_id, target, reason, *, authority: str = "runtime", ...)
+```
+
+`SUCCEEDED` 要求的 authority 是 `"runtime"`，而 `transition_task` 的默认值就是 `"runtime"`
+⇒ **闸 2 不需要任何改动。**
+
+**S1 = 三件事，全部精确：**
+
+1. **关闸 3**：把 `dependencies.final_acceptance_policy` 置 `None`（即不再注册该适配器）。
+   这是关掉"必须有 `verify.completed{passed}`"的那个 `is not None` 条件。
+2. **改终态路径**（两处）：
+   * `sdk/runtime.py:1321-1337`：`AgentTurnResult` 分支改为
+     `VERIFYING`（记账）→ `FINALIZING` → `SUCCEEDED`，**不调用**
+     `verify_task_acceptance` / `finalize_acceptance`。
+   * `cli.py:588-645`：同样合一（`_finalize_standalone_agent_result`）。
+3. **闸 1 不动**：`LEGAL_TRANSITIONS` 保持原样（走 `EXECUTING → VERIFYING → FINALIZING → SUCCEEDED`
+   这条已有的合法路径）。
+
+**S1 的验收**：一次"猜错路径"的分析任务**正常结束且为 `SUCCEEDED`**，不再挂起、不再
+`NEEDS_REVIEW`；`verify.completed` 事件不再产生；全量绿。
 
 ---
 
