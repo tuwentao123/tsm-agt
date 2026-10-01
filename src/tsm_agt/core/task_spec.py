@@ -55,14 +55,16 @@ class TaskCriterionKind(StrEnum):
     #: the member and those streams stop replaying.
     POST_MUTATION_COMMAND = "post_mutation_command"
     EVIDENCE_REFERENCE = "evidence_reference"
-    #: A judgement channel with no machine proof. It is advisory in the per-turn
-    #: readiness gate and is evaluated by a bounded rubric judge before final
-    #: acceptance. Added so the Planner never has to disguise a subjective
-    #: requirement as an evidence reference.
+    #: A judgement channel with no machine proof. It is recorded but never
+    #: evaluated: the Runtime composes no judge and holds no projection for one,
+    #: so a ``rubric`` criterion cannot block, pass or fail anything. It stays in
+    #: the proposal schema because it is still the honest place to put a
+    #: subjective requirement -- the alternative is the Planner disguising one as
+    #: an evidence reference.
     RUBRIC = "rubric"
     #: Runtime-authored alignment criterion for answer-bearing Tasks. The
-    #: Planner may never author it, so it is excluded from the proposal schema;
-    #: a Task that answers must be judged on whether it answered *this* request.
+    #: Planner may never author it, so it is excluded from the proposal schema.
+    #: Like ``RUBRIC`` it is recorded without a judge: nothing evaluates it.
     GOAL_ALIGNMENT = "goal_alignment"
     #: Runtime-authored delivery criterion. The contract's declared required
     #: side effects (``mutate``, ``execute``) are asserted to have left a durable

@@ -831,3 +831,82 @@ replay-only 墓碑），故一并改名，并删掉因此不再使用的 `replac
 `test_completion_readiness_exhausted.py:31` 里的 `POST_MUTATION_VERIFICATION` /
 `REQUIRED_DELIVERY_UNSATISFIED` 是**直接构造 `CompletionGap` 喂活的 readiness policy**，
 不经过被删的缝 —— 属正确写法，保留。
+
+## A.1l 批 6 —— `rubric_judge` 通路（A-full）：摘依赖 + 删装配管线，保留适配器
+
+**结果：1240 passed / 12 skipped / 0 failed。**（1246 → 1240 = 测试 −6，与预测一致。）
+净 −319 行（31 增 / 350 删）。
+
+### 先纠正我在上一轮报错的范围
+
+我报给你的 (a) 只有 4 条，**漏了一整条连带链**，而且没量就动手了。实测：
+
+`composition.py` 里两处 `reviewer = _reviewer_model_provider(...)` 的**唯一**消费者就是那个
+judge 自动注册 —— 它上面那行注释自己写着 `# INV-10: a judged criterion must have a judge`。
+所以摘掉兜底注册会一次杀死：
+
+| 死掉的东西 | 位置 | 规模 |
+|---|---|---|
+| `reviewer` 局部变量 | `composition.py:932,1110` | 2 |
+| `_reviewer_model_provider()` | `composition.py:830-868` | **39 行** |
+| `review_model` 参数 + 透传 | `composition.py:834,878,1055,1244,1290` | 5 |
+| `KernelDependencies` 4 个字段 | `kernel.py:428-436` | 9 行 |
+| `ModelConfiguration.review_model` | `model_configuration.py:136` | — |
+| `TSM_AGT_REVIEW_MODEL` 白名单 + 解析 | `model_configuration.py:44,266` | — |
+| `ModelRubricJudge` import | `composition.py:19` | — |
+
+`rubric_evidence_max_items`(435) 与 `rubric_evidence_excerpt_characters`(436) 也是孤儿 ——
+**A.1h 那次扫描漏了后者**。
+
+### 我犯的两个错，都记下来
+
+1. **范围没量就动手。** 只删了 `KernelDependencies` 的字段，漏了 `composition.py:472` 的构造
+   透传 → `KernelDependencies.__init__() got an unexpected keyword argument 'rubric_judge'`
+   → **22 个失败**。已 `git checkout` 完整退回，没有留下半成品状态。
+2. **重复了批 4 的教训。** 删 `test_goal_alignment.py` 的 `_RecordingJudge` 时，我用
+   "class 行 → 下一个 `^class` 行"整段删，**吞掉了夹在中间的模块级 `async def _executing_task`**
+   （HEAD 第 92 行）。它被 `GoalAlignmentCriterionTest` 调用 → 会 NameError。
+   **同类错误第五次。规则应当固化为：删任何块之前，先列出该行区间内的所有 `^class` 与
+   `^def`/`^async def`，确认没有夹在中间的模块级定义。**
+
+### 落地
+
+**删（管线）**：`review_model` 全链（含 `TSM_AGT_REVIEW_MODEL`）、`_reviewer_model_provider`、
+`reviewer` 局部量、`KernelDependencies` 的
+`rubric_judge`/`rubric_judge_max_attempts`/`rubric_evidence_max_items`/`rubric_evidence_excerpt_characters`、
+`rubric_judge_adapter` 参数与注册、两处自动兜底注册、`ModelRubricJudge` import。
+
+**保留（适配器）**：`ports/rubric_judge.py`、`adapters/model_rubric_judge/`、
+`test_rubric_judge.py::RubricJudgeAdapterTest`（5 条，直接构造适配器，不经 composition）。
+另外**有意保留** `composition.py` 的 `at most one RubricJudgePort` 单例检查 —— 该块是通用
+port 完整性检查，里面 `SessionInputResolverPort` 同样从不被 composition 注册，保留才一致。
+
+**修正文档串（用户要求）**：
+* `task_spec.py` 的 `RUBRIC` 注释原写"advisory in the per-turn readiness gate and is evaluated
+  by a bounded rubric judge before final acceptance" —— **两句都是假的**（gate 的 gap 生产者在
+  批 5 收了，judge 在本批摘了）。改为"记录但从不评估"。
+* `GOAL_ALIGNMENT` 注释原写"must be judged on whether it answered *this* request" —— 同样改真。
+* 两处模型可见文本（`task_spec_tools.py` 工具描述、`planner.py` planner prompt）补上
+  "recorded, not machine-evaluated"。
+
+### 测试处置（−6）
+
+| 文件 | 处置 |
+|---|---|
+| `test_rubric_judge.py::ReviewerProviderWiringTest`（2）| 删 —— 断言的 `judge._model is primary` 正是被摘的接线 |
+| `test_rubric_judge.py::ReviewerModelConfigurationTest`（4）| 删 —— 断言的 `load_model_configuration().review_model` 已不存在 |
+| `test_rubric_judge.py` 的两个**孤儿 helper**（`_executing_task`、`_set_rubric`）| 删 —— 它们拖死 `Path`/`TaskState`/`replace`/`TaskAcceptanceCriterion`/`TaskCriterionKind`/`compose_fixture_application`/`tempfile` 7 个 import。整文件重写为纯 adapter 契约测试（5 条）|
+| `test_goal_alignment.py::GoalAlignmentJudgingTest`（0 条，40 行空壳）| 删；`_RecordingJudge` 删；5 个孤儿 import 删 |
+| `test_production_journeys.py` | 删 `AlwaysSatisfiedJudge` + 2 处 `rubric_judge_adapter=`；3 条测试存活 |
+
+### 验证
+
+* `compileall` 全通过；A-full 相关符号在 `src/`+`tests/` **零残留**。
+* 模型可见枚举仍为 `['workspace_integrity', 'evidence_reference', 'rubric']`（按你的选择保留 rubric）。
+* **老 ledger replay 复验：206/206 OK。**
+
+### 仍未处置
+
+`test_post_mutation_applicability` 那条线在批 5 已处理。剩下的是本会话早先记录的
+`PhaseAction.BREAK` / `ReportBlocked` / `ReportIncompleteRecoverable` 死枚举值，以及
+比事故前基线仍少的测试用例（批 4/5/6 各按证据删过空转项，需重新建立基线）。

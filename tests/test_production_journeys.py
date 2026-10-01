@@ -71,25 +71,6 @@ class ProductionPlanner:
         return answer_spec(goal)
 
 
-class AlwaysSatisfiedJudge:
-    """INV-10: every judged criterion needs a judge to be evaluable at all."""
-
-    descriptor = AdapterDescriptor(
-        "fixture.satisfied-judge", "2.0", "RubricJudgePort", "2.0"
-    )
-
-    async def start(self, context) -> None:
-        pass
-
-    async def health(self) -> HealthStatus:
-        return HealthStatus(HealthState.HEALTHY, "ready")
-
-    async def stop(self, deadline: datetime) -> None:
-        pass
-
-    async def judge(self, criterion_id, assertion, evidence):
-        from tsm_agt.ports import JudgeVerdict, RubricJudgement
-        return RubricJudgement(criterion_id, JudgeVerdict.SATISFIED, "ok")
 
 
 class ArchitectureAnalysisModel(EchoModelProvider):
@@ -245,7 +226,6 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
             tool_adapters=(CoreReadOnlyToolProvider(),),
             store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
             task_spec_planner_adapter=ProductionPlanner(),
-            rubric_judge_adapter=AlwaysSatisfiedJudge(),
             require_evidence_questions=True,
         )
         return app, physical
@@ -307,8 +287,7 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
                 ),
                 store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
                 task_spec_planner_adapter=ProductionPlanner(),
-                rubric_judge_adapter=AlwaysSatisfiedJudge(),
-                require_evidence_questions=True,
+                    require_evidence_questions=True,
             )
             await app.registry.start_all()
             try:

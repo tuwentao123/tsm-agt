@@ -16,7 +16,6 @@ from tsm_agt.adapters.builtin import (
     NetworkToolProvider,
 )
 from tsm_agt.adapters.text_code_intelligence import TextCodeIntelligenceProvider
-from tsm_agt.adapters.model_rubric_judge import ModelRubricJudge
 from tsm_agt.adapters.structured_evidence import StructuredEvidenceDeltaEvaluator
 from tsm_agt.adapters.rule_based_semantic_action import (
     RuleBasedSemanticActionClassifier,
@@ -470,7 +469,6 @@ def _kernel_dependencies(
         task_spec_planner=(
             task_spec_planners[0] if task_spec_planners else None
         ),
-        rubric_judge=(rubric_judges[0] if rubric_judges else None),
         checkpoint_compatibility_policy=(
             checkpoint_compatibility_policies[0]
             if checkpoint_compatibility_policies else None
@@ -588,7 +586,6 @@ def compose_fixture_application(
     session_input_relation_adapter: SessionInputRelationPort | None = None,
     session_input_resolver_adapter: SessionInputResolverPort | None = None,
     task_spec_planner_adapter: TaskSpecPlannerPort | None = None,
-    rubric_judge_adapter: RubricJudgePort | None = None,
     checkpoint_compatibility_policy_adapter: (
         CheckpointCompatibilityPolicyPort | None
     ) = None,
@@ -669,8 +666,6 @@ def compose_fixture_application(
         )
     if task_spec_planner_adapter is not None:
         registry.register(TaskSpecPlannerPort, task_spec_planner_adapter)
-    if rubric_judge_adapter is not None:
-        registry.register(RubricJudgePort, rubric_judge_adapter)
     registry.register(
         CheckpointCompatibilityPolicyPort,
         checkpoint_compatibility_policy_adapter
@@ -830,42 +825,6 @@ def compose_readonly_application(
     )
 
 
-def _reviewer_model_provider(
-    *,
-    base_url: str,
-    model: str,
-    review_model: str,
-    api_key: str,
-    protocol: str,
-    anthropic_version: str,
-    timeout_seconds: float,
-    output_token_parameter: str,
-    strict_tool_schema: bool,
-    streaming: bool,
-):
-    """A reviewer provider, or ``None`` to reuse the primary instance.
-
-    SPEC §12.6 D5: the reviewer may override the **model name** only -- the Base
-    URL, protocol selector and API key are the primary ones by construction, so
-    no second credential or protocol path can appear.
-
-    Returns ``None`` when no override is configured, and the caller then reuses
-    the very same provider object. Building a second instance unconditionally
-    would hand the reviewer its own retry counters and connection state, which is
-    a behaviour change nobody asked for.
-    """
-
-    if not review_model or review_model == model:
-        return None
-    return _physical_model_provider(
-        base_url=base_url, model=review_model, api_key=api_key,
-        protocol=protocol, anthropic_version=anthropic_version,
-        timeout_seconds=timeout_seconds,
-        output_token_parameter=output_token_parameter,
-        strict_tool_schema=strict_tool_schema, streaming=streaming,
-    )
-
-
 def compose_openai_compatible_readonly_application(
     *,
     base_url: str,
@@ -878,7 +837,6 @@ def compose_openai_compatible_readonly_application(
     model_max_retries: int = 2,
     model_retry_backoff_seconds: float = 1.0,
     model_output_token_parameter: str = "max_tokens",
-    review_model: str = "",
     model_protocol: str = "openai_compatible",
     model_anthropic_version: str = "2023-06-01",
     model_strict_tool_schema: bool = True,
@@ -930,25 +888,6 @@ def compose_openai_compatible_readonly_application(
         TaskSpecPlannerPort,
         ModelTaskSpecPlanner(registry.require(ModelProviderPort)),
     )
-    # INV-10: a judged criterion must have a judge. Without this the Planner's
-    # rubric criteria would have no way to pass and every judged Task would fall
-    reviewer = _reviewer_model_provider(
-        base_url=base_url, model=model, review_model=review_model,
-        api_key=api_key, protocol=model_protocol,
-        anthropic_version=model_anthropic_version,
-        timeout_seconds=model_timeout_seconds,
-        output_token_parameter=model_output_token_parameter,
-        strict_tool_schema=model_strict_tool_schema,
-        streaming=model_streaming,
-    )
-    # to NEEDS_REVIEW.
-    if not registry.all(RubricJudgePort):
-        registry.register(
-            RubricJudgePort,
-            ModelRubricJudge(
-                reviewer or registry.require(ModelProviderPort)
-            ),
-        )
     registry.register(
         CheckpointCompatibilityPolicyPort,
         RuleBasedCheckpointCompatibilityPolicy(),
@@ -1063,7 +1002,6 @@ def compose_openai_compatible_engineering_application(
     model_max_retries: int = 2,
     model_retry_backoff_seconds: float = 1.0,
     model_output_token_parameter: str = "max_tokens",
-    review_model: str = "",
     model_protocol: str = "openai_compatible",
     model_anthropic_version: str = "2023-06-01",
     model_strict_tool_schema: bool = True,
@@ -1116,25 +1054,6 @@ def compose_openai_compatible_engineering_application(
         TaskSpecPlannerPort,
         ModelTaskSpecPlanner(registry.require(ModelProviderPort)),
     )
-    # INV-10: a judged criterion must have a judge. Without this the Planner's
-    # rubric criteria would have no way to pass and every judged Task would fall
-    reviewer = _reviewer_model_provider(
-        base_url=base_url, model=model, review_model=review_model,
-        api_key=api_key, protocol=model_protocol,
-        anthropic_version=model_anthropic_version,
-        timeout_seconds=model_timeout_seconds,
-        output_token_parameter=model_output_token_parameter,
-        strict_tool_schema=model_strict_tool_schema,
-        streaming=model_streaming,
-    )
-    # to NEEDS_REVIEW.
-    if not registry.all(RubricJudgePort):
-        registry.register(
-            RubricJudgePort,
-            ModelRubricJudge(
-                reviewer or registry.require(ModelProviderPort)
-            ),
-        )
     registry.register(
         CheckpointCompatibilityPolicyPort,
         RuleBasedCheckpointCompatibilityPolicy(),
@@ -1264,7 +1183,6 @@ def compose_openai_compatible_readonly_application_from_env(
     return compose_openai_compatible_readonly_application(
         base_url=configuration.base_url,
         model=configuration.model,
-        review_model=configuration.review_model,
         api_key=configuration.api_key,
         database_path=database_path,
         configuration_sources=model_configuration_sources(configuration),
@@ -1310,7 +1228,6 @@ def compose_openai_compatible_engineering_application_from_env(
     return compose_openai_compatible_engineering_application(
         base_url=configuration.base_url,
         model=configuration.model,
-        review_model=configuration.review_model,
         api_key=configuration.api_key,
         database_path=database_path,
         configuration_sources=model_configuration_sources(configuration),

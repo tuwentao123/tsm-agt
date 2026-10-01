@@ -128,7 +128,6 @@ from tsm_agt.ports import (
     SessionInputRelationPort,
     SessionInputResolverPort,
     TaskSpecPlannerPort,
-    RubricJudgePort,
     CheckpointCompatibilityAction,
     CheckpointCompatibilityDecision,
     CheckpointCompatibilityPolicyPort,
@@ -425,15 +424,6 @@ class KernelDependencies:
     session_input_relation: SessionInputRelationPort | None = None
     session_input_resolver: SessionInputResolverPort | None = None
     task_spec_planner: TaskSpecPlannerPort | None = None
-    #: Bounded judge for `rubric` acceptance criteria. When absent, rubric
-    #: criteria are recorded but never block (their P0 behaviour).
-    rubric_judge: RubricJudgePort | None = None
-    rubric_judge_max_attempts: int = 2
-    #: INV-10 bound: how much proof a judge may read. A judge that only receives
-    #: opaque references cannot decide anything, so the Runtime resolves them
-    #: into bounded excerpts.
-    rubric_evidence_max_items: int = 4
-    rubric_evidence_excerpt_characters: int = 800
     checkpoint_compatibility_policy: (
         CheckpointCompatibilityPolicyPort | None
     ) = None

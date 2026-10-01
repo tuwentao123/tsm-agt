@@ -1,27 +1,25 @@
-"""INV-10 / INV-11: judged criteria need a judge, and answers must be on-topic.
+"""Goal alignment is authored by the Runtime, never by the Planner.
 
-An answer-bearing Task gets a Runtime-authored ``goal_alignment`` criterion, the
-judge reads bounded evidence excerpts (never only opaque references), and a
-judged criterion with no available judge can never pass.
+An answer-bearing Task gets a Runtime-authored ``goal_alignment`` criterion, and
+that kind is excluded from the model-facing proposal schema. Nothing evaluates
+the criterion any more -- the judge that used to do so is no longer composed --
+so this file pins the authoring contract only.
 """
 
 from __future__ import annotations
 
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     TASK_SPEC_PROPOSAL_SCHEMA_V1,
-    TaskAcceptanceCriterion,
     TaskCriterionKind,
     TaskState,
 )
 from tsm_agt.ports import (
-    AdapterDescriptor, HealthState, HealthStatus, JudgeVerdict,
-    RubricEvidence, RubricJudgement,
+    AdapterDescriptor, HealthState, HealthStatus,
 )
 
 
@@ -64,29 +62,6 @@ class _SpecPlanner:
             }],
             "continuation_policy": {"mode": "NONE"},
         }
-
-
-class _RecordingJudge:
-    descriptor = AdapterDescriptor(
-        "fixture.recording-judge", "2.0", "RubricJudgePort", "2.0"
-    )
-
-    def __init__(self, verdict: JudgeVerdict = JudgeVerdict.SATISFIED) -> None:
-        self._verdict = verdict
-        self.calls: list[tuple[str, str, tuple[RubricEvidence, ...]]] = []
-
-    async def start(self, context) -> None:
-        pass
-
-    async def health(self) -> HealthStatus:
-        return HealthStatus(HealthState.HEALTHY, "ready")
-
-    async def stop(self, deadline) -> None:
-        pass
-
-    async def judge(self, criterion_id, assertion, evidence) -> RubricJudgement:
-        self.calls.append((criterion_id, assertion, tuple(evidence)))
-        return RubricJudgement(criterion_id, self._verdict, "fixture verdict")
 
 
 async def _executing_task(app, root: Path, task_id: str):
@@ -145,42 +120,3 @@ class GoalAlignmentCriterionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("rubric", enum)
 
 
-class GoalAlignmentJudgingTest(unittest.IsolatedAsyncioTestCase):
-    async def _verify(self, verdict: JudgeVerdict, answer: str, task_id: str):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        judge = _RecordingJudge(verdict)
-        app = compose_fixture_application(
-            rubric_judge_adapter=judge,
-        )
-        await app.registry.start_all()
-        self.addAsyncCleanup(app.registry.stop_all)
-        task = await _executing_task(app, Path(directory.name), task_id)
-        current = await app.kernel.get_task_spec(task.task_id)
-        spec = replace(
-            current, revision=current.revision + 1, content_hash="",
-            acceptance_criteria=(TaskAcceptanceCriterion(
-                "answer-alignment",
-                "The delivered answer directly addresses the user's current "
-                "goal: explain the runtime",
-                TaskCriterionKind.GOAL_ALIGNMENT,
-            ),),
-        )
-        await app.kernel._append_events(task.task_id, ((
-            "task_spec.revised", {"snapshot": spec.to_data()},
-        ),))
-        await app.kernel._append_events(task.task_id, ((
-            "llm.completed", {
-                "turn_id": "turn-fixture",
-                "message": {
-                    "message_id": "assistant-fixture",
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": answer}],
-                },
-            },
-        ),))
-        await app.kernel.transition_task(
-            task.task_id, TaskState.VERIFYING, "verify",
-        )
-        verification = await app.kernel.verify_task_acceptance(task.task_id)
-        return verification, judge

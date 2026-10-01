@@ -47,7 +47,8 @@ class CoreTaskSpecToolProvider:
             "revision. This cannot change the user goal. Use only verification kinds "
             "the Runtime can prove: workspace_integrity, or "
             "evidence_reference with an existing event:/tool_call:/mutation: reference. "
-            "Use rubric for judgements that cannot be machine-checked.",
+            "Use rubric for judgements that cannot be machine-checked; those are "
+            "recorded, not machine-evaluated.",
             {
                 "type": "object",
                 "properties": {
