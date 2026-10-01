@@ -2558,9 +2558,13 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             "instruction": (
                 "The proposed final answer was not accepted. Perform the "
                 "remaining required in-scope work now using an available "
-                "capability or candidate tool listed in the gaps. Normal "
-                "argument validation, policy, approval, and sandbox rules still "
-                "apply. Do not merely offer to continue later."
+                "capability or the candidate tools named in the gaps. If the "
+                "approach that just failed cannot work, take a different one -- "
+                "another tool, or different arguments -- for the same scope: a "
+                "missing path or a rejected call is not evidence that the "
+                "requirement is unprovable. Normal argument validation, policy, "
+                "approval, and sandbox rules still apply. Do not merely offer to "
+                "continue later."
                 if continue_work else
                 (
                     "Do not call tools. Report that this Turn is incomplete but "
