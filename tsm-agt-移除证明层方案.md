@@ -1152,3 +1152,78 @@ belongs to another local subject` 的来源，属设计上的主体边界，不�
 第一次改那两处断言用了 `replace_all`，但两处**缩进不同**（第二处在 `try:` 内，深一层），
 结果产生 `SyntaxError: expected 'except' or 'finally' block`。**教训：`replace_all` 只适合
 缩进相同的同形行；否则要各自带上下文替换。**
+
+## A.1r 真实场景端到端验证 —— **已跑通**（网络前提已变，此前"无法验证"作废）
+
+**起因**：用户问"现在能真实场景使用了吗"。此前所有验证都基于 fixture/桩模型，而恢复文档把
+"真实模型端点端到端"记为**唯一无法验证**项（理由是该域名被解析到 `198.18.0.71` 黑洞）。
+动手前先复核这个前提 —— **前提已经不成立**。
+
+### 网络前提复核（先查，别继承旧结论）
+
+| 检查 | 结果 |
+|---|---|
+| DNS | `aibrain-large-model-engine-slow.hellobike.cn` → **`10.33.200.42`**（不再是黑洞）|
+| TCP 443 | **通**，0.04s |
+| TLS | **通**，证书 CN `*.hello-inc.com`（上海哈啰普惠科技有限公司）|
+| `tsm-agt doctor` | **healthy**，14 adapters，模型配置完整（`OpenAI-GPT-5.1`，key 已配，0600）|
+
+### 四条真实路径，全部跑通
+
+**① 最小真实模型调用**
+`compose_openai_compatible_engineering_application_from_env(./.env)` →
+`provider.complete(...)` → 返回 `'PONG'`，6.17s，`finish_reason=stop`，
+`usage: input=12/output=11`。
+
+**② 真实单轮工具任务**（独立项目 `/tmp/tsm-real-1`，含 `README.md` + `src/calc.py`）
+提示："Read every file … state whether any file contains a bug."
+→ 3 次模型调用 / 3 次工具调用，50.8s，29,476 input / 764 output tokens。
+回答**准确**：正确列出两个文件，正确指出 `divide(a, 0)` 会抛 `ZeroDivisionError`。
+**终态 `SUCCEEDED`**，事件链完整：`completion.readiness_evaluated` → `turn.completed`
+→ `task.state_changed(SUCCEEDED)`。
+
+**③ 真实 3 轮会话**（同一 session，真实模型）
+
+| 轮 | 路由 | 结果 |
+|---|---|---|
+| 1 | `CREATE_TASK`（`no_unfinished_session_task`）| `SUCCEEDED`；答"两个简单数学函数，一个加一个除" ✓ |
+| 2 | 先 `ANSWER`(0.95) → **`session.route_self_corrected`**（"问的是本地文件 README.md，需要工作区访问，而我没有"）→ 改建任务（`task_relation: CONTEXTUAL`）| `SUCCEEDED`；答"tiny two-file demo project" ✓ |
+| 3 | `ANSWER`（confidence 1.0，`catalog_task_ids`=前两个任务）| **答 "You first asked about the file `src/calc.py`."** ✓ **跨两个任务正确回忆第 1 轮** |
+
+⇒ 第 2 条抱怨（"多轮会话运行不了"）在**真实模型**下得到正面回答；且观察到**路由自我纠正**
+（`session.route_self_corrected`）在真实运行中救回一次错误路由。
+
+**④ 真实写入路径（含审批）**（`/tmp/tsm-real-2`）
+提示："Create NOTES.md containing exactly one line 'created by tsm-agt'."
+→ planner 产出 `core.apply_patch`（R1）→ **停在审批**，磁盘未改，打印完整补丁预览 + 载荷
+hash + 回滚说明 → `tsm-agt approve <request_id> --reason '…'` → 补丁落盘 →
+**agent 自己再 `core.read_file` 回读确认** → 终态 **`SUCCEEDED`**。
+`NOTES.md` 磁盘内容精确为 `created by tsm-agt`（18 字节，无多余换行）。
+
+⇒ **planner → 工具调用 → 人工审批 → 真实落盘 → 回读自验 → 机械闭环** 全链在真实模型下成立。
+
+### 行为 B 在真实输出里得到验证
+
+真实运行的 CLI 输出**没有** `领域检查:` 行（因为状态是 `not_started`）——
+这正是批 11 的行为 B 在真实场景的表现，与 fixture 测试一致。
+
+### ⚠️ 真实场景暴露的一个缺陷（fixture 永远测不出）
+
+`core.list_files(recursive=True)` **把 Runtime 自己的状态目录当成项目内容返回**。
+实测第一个工具调用就返回了 `.agent`、`.agent/memory.db`、`.agent/runtime.db` 等条目，
+agent 随后读入并在回答里把它们当成"项目文件"逐条点评。
+
+根因（已定位到行）：
+
+* `src/tsm_agt/core/workspace.py:18` 定义了 `_EXCLUDED_DIRECTORIES`
+  = `{".git", ".agent", ".gradle", ".idea", ".venv", ".vscode", "__pycache__",
+  "node_modules", "target"}`，**并被** `workspace.py:902`（工作区快照）与
+  `onboarding.py:268` 使用；
+* 但 `src/tsm_agt/adapters/builtin/core_tools.py:648` 的 `_walk()`（`core.list_files`
+  递归路径）**只排序、不过滤**；调用处 `:342` 也只用 `_is_sensitive()` 过滤凭证文件。
+
+⇒ **两层不一致**：工作区层排除这些目录，工具层不排除。后果是 token 浪费
+（本例 29k 输入里有相当部分是本可跳过的二进制库）与回答被污染。
+
+**这是本轮唯一发现的功能性缺陷，且只有真实运行才能暴露。** 是否修（把
+`_EXCLUDED_DIRECTORIES` 接进 `_walk` / 或抽成共享常量）属行为变更，**待用户决定**。

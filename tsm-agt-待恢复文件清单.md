@@ -481,7 +481,7 @@ INTERRUPTED  '那你可以查链路数据啊…'               reason='active Ag
 | 3 个 phantom EXECUTING | 身份功能上线前的 legacy 数据，不影响当前使用；结算需你点头（§8.3） |
 | 本机可恢复源 | **无**（§8.4） |
 | 仍缺的测试用例 | 28 个（§4），只有别的备份里才有（我本轮自己新增 2 条，故现在收集数是 1443） |
-| 唯一无法验证的 | **真实模型端点的端到端**：本沙箱把 `aibrain-large-model-engine-slow.hellobike.cn` 解析到 `198.18.0.71` 黑洞，`danger-full-access` 下依然如此；而 `pypi.org` / `github.com` 的 TLS 正常 → 是沙箱网络策略，不是本项目代码 |
+| ~~唯一无法验证的~~ → **已推翻** | ~~真实模型端点的端到端~~：原记为"本沙箱把 `aibrain-large-model-engine-slow.hellobike.cn` 解析到 `198.18.0.71` 黑洞，`danger-full-access` 下依然如此"。**该前提已失效**：网络现状是 DNS 解析到 `10.33.200.42`、TCP+TLS 均通（证书 CN `*.hello-inc.com`）。**真实端到端已跑通**，见 `tsm-agt-移除证明层方案.md` A.1r：真实模型调用、单轮工具任务、3 轮会话（含跨轮回忆）、写入经审批后落盘并 `SUCCEEDED` |
 
 ---
 
