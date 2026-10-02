@@ -15,10 +15,19 @@ from enum import StrEnum
 from tsm_agt.ports import WorkspaceFilesystemPort, WorkspacePathPort
 
 
-_EXCLUDED_DIRECTORIES = frozenset(
+#: Directories no automatic walk may enter: version-control metadata, the
+#: Runtime's own state, editor caches, virtualenvs and build outputs.
+#:
+#: **One list for every walker.** Three lists that disagreed is how
+#: ``core.list_files(recursive=True)`` came to enumerate ``.agent/`` and
+#: ``.git/`` -- the tool layer had drifted to a set that omitted both, and its
+#: recursive lister applied no filter at all. Compare with ``str.casefold()``:
+#: on a case-insensitive filesystem ``.GIT`` is the same directory as ``.git``.
+EXCLUDED_DIRECTORIES = frozenset(
     {
-        ".git", ".agent", ".gradle", ".idea", ".venv", ".vscode",
-        "__pycache__", "node_modules", "target",
+        ".agent", ".cxx", ".git", ".gradle", ".idea", ".venv", ".vscode",
+        "__pycache__", "build", "dist", "node_modules", "out", "target",
+        "vendor",
     }
 )
 _SENSITIVE_NAMES = frozenset(
@@ -899,7 +908,7 @@ def capture_workspace_baseline(
     for directory, directory_names, file_names in os.walk(root, followlinks=False):
         directory_names[:] = sorted(
             name for name in directory_names
-            if name not in _EXCLUDED_DIRECTORIES
+            if name.casefold() not in EXCLUDED_DIRECTORIES
             and not path_service.is_link_like(Path(directory) / name)
         )
         for name in sorted(file_names):

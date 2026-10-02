@@ -10,6 +10,7 @@ from pathlib import Path
 from tsm_agt.adapters.builtin import CoreReadOnlyToolProvider
 from tsm_agt.adapters.posix_path import PosixWorkspacePath
 from tsm_agt.adapters.windows_path import WindowsWorkspacePath
+from tsm_agt.core.workspace import EXCLUDED_DIRECTORIES
 from tsm_agt.ports import AdapterContext, ToolCall, ToolInvocationContext
 
 
@@ -454,3 +455,114 @@ class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExcludedDirectoryPolicyTest(unittest.IsolatedAsyncioTestCase):
+    """One exclusion list for every walker.
+
+    ``core.list_files(recursive=True)`` used to return the Runtime's own state
+    (``.agent/``, including its SQLite ledger) and ``.git/`` as project entries:
+    its walker applied no filter at all, while the workspace layer skipped a list
+    the tool layer did not share. A real run showed the model reading
+    ``.agent/runtime.db`` back as project content.
+
+    Every excluded directory is given the same marker file, so a test can prove
+    the walker never *entered* it rather than merely never mentioned it.
+    """
+
+    MARKER = "exclusion-marker-8f2c"
+
+    async def asyncSetUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temp_dir.name)
+        (self.workspace / "src").mkdir()
+        (self.workspace / "src" / "app.py").write_text(
+            f"{self.MARKER}\n", encoding="utf-8"
+        )
+        for name in sorted(EXCLUDED_DIRECTORIES):
+            directory = self.workspace / name
+            directory.mkdir()
+            (directory / "inside.txt").write_text(
+                f"{self.MARKER} inside {name}\n", encoding="utf-8"
+            )
+        self.provider = CoreReadOnlyToolProvider()
+        context = AdapterContext(config={}, emit_event=lambda _type, _payload: None)
+        await self.provider.start(context)
+        self.path_service = (
+            WindowsWorkspacePath() if os.name == "nt" else PosixWorkspacePath()
+        )
+        await self.path_service.start(context)
+        self.context = ToolInvocationContext(
+            invocation_id="inv-excl",
+            task_id="task-excl",
+            turn_id="turn-excl",
+            workspace=self.workspace,
+            deadline=datetime.now(timezone.utc) + timedelta(seconds=30),
+            workspace_path=self.path_service,
+        )
+
+    async def asyncTearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_every_entry_is_lowercase(self) -> None:
+        """The walkers compare with ``str.casefold()``, so entries must be lower."""
+
+        self.assertEqual(
+            {name.casefold() for name in EXCLUDED_DIRECTORIES},
+            set(EXCLUDED_DIRECTORIES),
+        )
+
+    async def test_recursive_list_omits_every_excluded_directory(self) -> None:
+        result = await self.provider.invoke(
+            ToolCall("list-excl", "core.list_files", {"recursive": True}),
+            self.context,
+        )
+
+        self.assertTrue(result.ok)
+        paths = [entry["path"] for entry in result.data["entries"]]
+        self.assertIn("src/app.py", paths)
+        for name in sorted(EXCLUDED_DIRECTORIES):
+            self.assertNotIn(name, paths)
+            self.assertFalse(
+                any(path.startswith(f"{name}/") for path in paths),
+                f"{name}/ leaked into the recursive listing: {paths}",
+            )
+
+    async def test_find_files_does_not_report_files_inside_them(self) -> None:
+        result = await self.provider.invoke(
+            ToolCall("find-excl", "core.find_files", {"pattern": "inside.txt"}),
+            self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["matches"], [])
+
+    async def test_search_never_enters_them(self) -> None:
+        result = await self.provider.invoke(
+            ToolCall(
+                "search-excl", "core.search_text",
+                {"query": self.MARKER, "path": "."},
+            ),
+            self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            [match["path"] for match in result.data["matches"]],
+            ["src/app.py"],
+            "the marker exists only in src/app.py and inside excluded directories",
+        )
+
+    async def test_an_explicit_path_into_one_still_lists(self) -> None:
+        """The filter prunes recursion; it must not forbid targeted access."""
+
+        result = await self.provider.invoke(
+            ToolCall("list-agent", "core.list_files", {"path": ".agent"}),
+            self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            [entry["path"] for entry in result.data["entries"]],
+            [".agent/inside.txt"],
+        )

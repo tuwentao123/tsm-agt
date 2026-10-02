@@ -16,6 +16,7 @@ from tsm_agt.ports import WorkspacePathPort
 
 from .configuration import canonical_hash
 from .trust import ProjectTrustLevel
+from .workspace import EXCLUDED_DIRECTORIES
 
 
 ONBOARDING_PHASES = (
@@ -25,10 +26,6 @@ ONBOARDING_PHASES = (
     "trusted_rule_discovery",
     "summary_generation",
 )
-_EXCLUDED_DIRECTORIES = frozenset({
-    ".agent", ".git", ".gradle", ".idea", ".venv", ".vscode",
-    "build", "dist", "node_modules", "target", "vendor",
-})
 _SENSITIVE_NAMES = frozenset({
     ".env", "credentials", "credentials.json", "id_rsa", "id_ed25519",
 })
@@ -265,7 +262,7 @@ class ProjectOnboardingScanner:
         for directory, directory_names, file_names in os.walk(root, followlinks=False):
             directory_names[:] = sorted(
                 name for name in directory_names
-                if name not in _EXCLUDED_DIRECTORIES
+                if name.casefold() not in EXCLUDED_DIRECTORIES
                 and not self._paths.is_link_like(Path(directory) / name)
             )
             for name in sorted(file_names):

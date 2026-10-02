@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from tsm_agt.core.workspace import EXCLUDED_DIRECTORIES
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, WorkspacePathPort,
 )
@@ -23,10 +24,6 @@ _LANGUAGES = {
     ".rs": "rust", ".swift": "swift", ".c": "c",
     ".h": "c", ".cc": "cpp", ".cpp": "cpp", ".hpp": "cpp",
 }
-_EXCLUDED_DIRS = frozenset({
-    ".agent", ".git", ".gradle", ".idea", ".venv", "build",
-    "dist", "node_modules", "target", "vendor", "__pycache__",
-})
 _SENSITIVE_NAMES = frozenset({
     ".npmrc", ".pypirc", "credentials", "credentials.json",
     "id_ed25519", "id_rsa",
@@ -270,7 +267,7 @@ class TextCodeIntelligenceProvider:
         for directory, directory_names, file_names in os.walk(root, followlinks=False):
             directory_names[:] = sorted(
                 name for name in directory_names
-                if name.casefold() not in _EXCLUDED_DIRS
+                if name.casefold() not in EXCLUDED_DIRECTORIES
             )
             for name in sorted(file_names):
                 path = Path(directory) / name

@@ -1400,3 +1400,87 @@ pending reason   : completion_exhausted_with_required_gaps
 * `.agent/ledger-backup-20261002-231900/`（429 MB）—— 安全备份，确认无误后可删以回收空间。
 
 Web UI 启动器：`scripts/restart.sh web`（默认 127.0.0.1:8080）。
+
+## A.1v 搜索层：先读 Codex/Hermes 源码，再按 O1 统一排除策略
+
+**起因**：用户问"能否直接把 codex 或 Hermes 的搜索工具参考抄过来"。动手前先把两边源码读了。
+
+### Codex 没有搜索工具可抄
+
+`codex-rs/protocol/src/parse_command.rs`：
+
+```rust
+enum ParsedCommand { Read { .. }, ListFiles { .. }, Search { .. }, Unknown { .. } }
+```
+
+它是 **`shell` 工具 + 命令解析**（`ls`/`find`→`ListFiles`，`grep`/`rg`→`Search`，`cat`→`Read`），
+用于审批与安全判定。模型靠 shell 里的 `rg` 搜索。**把它抄过来 = 给 tsm-agt 换一个架构**
+（引入 shell 工具），远大于修排除策略这件事。⇒ **无可抄之物。**
+
+### Hermes 正是那个参照，而且排除行为**不是**靠名单
+
+`tools/file_tools.py` 定义、`tools/file_operations.py` 实现，**一个** `search_files` 工具
+（`target='content' | 'files'`），描述里明写 *"Use this instead of grep/rg/find/**ls** in
+terminal"*：
+
+* `rg --line-number --no-heading --with-filename` + `--glob` + `-l`/`-c` + `| head -n N`（带 pipefail）
+* **不加 `--hidden`** ⇒ `rg` 的默认语义生效：**跳过隐藏目录（`.git`/`.agent`）并尊重 `.gitignore`**
+* 无 `rg` 退 `grep`（内容）/`find`（文件），并给安装提示；ripgrep 是声明依赖（`hermes_cli/dep_ensure.py:37`）
+* 还主动往内部缓存目录写 `.ignore`（`tools/skills_hub.py:3175`）让搜索跳过自己
+
+⇒ **Hermes 不会读到 `.agent` 的真正原因是它在用 rg 的默认ignore语义，不是它有一份更长的名单。**
+
+### tsm-agt 的实情：**五份互相不一致的名单**
+
+| 来源 | 内容 | 缺什么 |
+|---|---|---|
+| `workspace._EXCLUDED_DIRECTORIES` | `.git .agent .gradle .idea .venv .vscode __pycache__ node_modules target` | 缺 `.cxx build dist out vendor` |
+| `onboarding._EXCLUDED_DIRECTORIES` | `… build dist vendor` | 缺 `__pycache__ .cxx out` |
+| `core_tools._GENERATED_DIRECTORY_NAMES` | `… .cxx build dist out vendor` | **缺 `.git .agent .gradle .vscode`** ← 缺陷根因 |
+| `text_code_intelligence._EXCLUDED_DIRS` | `… build dist vendor` | 缺 `.vscode .cxx out` |
+| **`core_tools._walk()`** | **无** | **全部** ← `list_files(recursive=True)` 的直接缺陷 |
+
+### 落地（用户选 O1）
+
+* `core/workspace.py` 建立**唯一公开常量** `EXCLUDED_DIRECTORIES`（五份取并集，14 项：
+  `.agent .cxx .git .gradle .idea .venv .vscode __pycache__ build dist node_modules out target vendor`）
+* 四个 walker 站点全部改用它：`workspace.py:911`、`onboarding.py:265`、`core_tools.py:653/670/710`、
+  `provider.py:274`；删掉三份局部名单（`_EXCLUDED_DIRECTORIES` ×2、`_GENERATED_DIRECTORY_NAMES`、
+  `_EXCLUDED_DIRS`）
+* **`_walk()` 补上过滤** —— 这是缺陷本体。注释写明它**只剪枝递归，不封锁显式路径**：
+  `list_files(path=".agent")` 仍能列出（定向访问保留）
+* 比较统一为 `str.casefold()`：`workspace`/`onboarding` 原先大小写敏感，在大小写不敏感文件系统上
+  `.GIT` 会漏网 —— 顺带修掉（新增测试断言名单全小写，使 casefold 比较成立）
+
+### 测试与对照
+
+新增 `tests/test_core_readonly_tools.py::ExcludedDirectoryPolicyTest` 5 条。关键在于**每个被排除目录里都放同名
+标记文件**，所以能证明"walk 根本没进去"，而不是"只是没提到"：
+
+* 递归列目录不含任何被排除目录及其子项
+* `find_files` 不返回被排除目录里的文件
+* `search_text` 只命中真实源码（标记只存在于 `src/app.py` 与被排除目录里）
+* **显式路径进入被排除目录仍能列出**（防止过度修复）
+* 名单全小写（casefold 比较成立）
+
+**对照（无修复的 HEAD，用 `PYTHONPATH` 强制换源码）**：**3 failed / 2 passed**，失败信息直接点名
+旧代码漏掉的 `.agent`、`.gradle`、`.vscode` —— 与上表分析逐一吻合。修复后 5 passed。
+
+### 真实运行验证
+
+同一个 `/tmp/tsm-real-1` 项目（含 `.agent/`）、同一类提示词：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 工具结果 | 返回 `.agent` + 7 个 `.db*` 条目 | 只返回项目文件（4 项证据）|
+| 回答里出现 `.agent` | 有（逐条点评 DB 文件）| **0 次** |
+| 输入 token | 29,476 | **16,420（−44%）** |
+| 模型调用 | 3 | 2 |
+
+### 未做（即 O2，仍待决定）
+
+* **ripgrep 支撑 + `.gitignore` 语义**：本机**没装 `rg`**，且引入外部进程会触碰"搜索工具是纯 Python R0、
+  不需审批"这一现状。要做需要单独决策。
+* **敏感文件名单**（`_SENSITIVE_NAMES` 在 workspace/onboarding/core_tools/provider/local_flow_export
+  共存 5 份）**刻意未合并**：它是"文件是否敏感"，与"目录是否该遍历"是两件事，合并可能让某条路径
+  的防护变弱。若要统一应作为独立任务（安全相关）。

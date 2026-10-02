@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from tsm_agt.core.workspace import EXCLUDED_DIRECTORIES
 from tsm_agt.ports import (
     AdapterContext,
     AdapterDescriptor,
@@ -38,12 +39,6 @@ _MAX_SEARCH_FILE_BYTES = 1_000_000
 _MAX_MATCH_TEXT_CHARS = 500
 _MAX_FIND_LIMIT = 500
 _MAX_FIND_ENTRIES = 50_000
-
-_GENERATED_DIRECTORY_NAMES = frozenset({
-    ".idea", ".venv", ".cxx",
-    "build", "dist", "node_modules", "out", "target", "vendor",
-    "__pycache__",
-})
 
 class _WorkspaceAccessError(ValueError):
     pass
@@ -647,7 +642,16 @@ class CoreReadOnlyToolProvider:
     @staticmethod
     def _walk(root: Path) -> Iterable[Path]:
         for directory, directory_names, file_names in os.walk(root, followlinks=False):
-            directory_names.sort()
+            # Prune state and generated directories before descending. Without
+            # this, ``list_files(recursive=True)`` returned ``.agent/`` -- the
+            # Runtime's own SQLite state -- and ``node_modules/`` as project
+            # entries, so the model read its own ledger and reported it as
+            # project content. The filter prunes *recursion only*: an explicit
+            # path into one of these still lists, which keeps targeted access.
+            directory_names[:] = sorted(
+                name for name in directory_names
+                if name.casefold() not in EXCLUDED_DIRECTORIES
+            )
             file_names.sort()
             current = Path(directory)
             for name in directory_names:
@@ -663,7 +667,7 @@ class CoreReadOnlyToolProvider:
         grouped_directories: dict[int, list[Path]] = {0: [], 1: [], 2: []}
         for child in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
             if child.is_dir():
-                if child.name.casefold() in _GENERATED_DIRECTORY_NAMES:
+                if child.name.casefold() in EXCLUDED_DIRECTORIES:
                     stats["generated_directories_skipped"] += 1
                     continue
                 priority, _ = CoreReadOnlyToolProvider._search_directory_priority(
@@ -703,7 +707,7 @@ class CoreReadOnlyToolProvider:
         for directory, directory_names, file_names in os.walk(root, followlinks=False):
             retained = []
             for name in sorted(directory_names):
-                if name.casefold() in _GENERATED_DIRECTORY_NAMES:
+                if name.casefold() in EXCLUDED_DIRECTORIES:
                     stats["generated_directories_skipped"] += 1
                 else:
                     retained.append(name)
