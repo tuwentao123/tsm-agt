@@ -1227,3 +1227,88 @@ agent 随后读入并在回答里把它们当成"项目文件"逐条点评。
 
 **这是本轮唯一发现的功能性缺陷，且只有真实运行才能暴露。** 是否修（把
 `_EXCLUDED_DIRECTORIES` 接进 `_walk` / 或抽成共享常量）属行为变更，**待用户决定**。
+
+## A.1s 真实用户报障：会话被"已死机制的待回动作"永久阻塞（A+B 修复）
+
+**用户报告**：在旧会话 `task-8d1ec232a0e54910852a029dcf11b03f` 里输入"看下今天的nba新闻"，
+得到 *"当前任务正在等待审批或回答，请通过对应通道回复，或使用显式命令（/new、/stop）。"*
+
+### 诊断（基于真实 ledger，不是推测）
+
+该任务的真实状态：
+
+```
+state: AWAITING_USER
+pending_user_action: {kind: "CONTINUATION",
+                      reason: "completion_exhausted_with_required_gaps",
+                      gap_ids: ["evidence-question:249158bfa15d"], ...}
+```
+
+产生它的那两段代码（`completion.blocker_disclosure_requested` 与 gap 耗尽）**已随证明层删除**。
+全仓扫描确认：`unmet_acceptance_criteria` 与 `completion_exhausted_with_required_gaps`
+在 `src/` 里**零生产者**；而 `incomplete_recoverable` / `unresolved_tool_batch` 仍是活的
+（`kernel.py:2775,3630` / `:2708`）。
+
+**35 个 `AWAITING_*` 任务的实际构成**：
+
+| 数量 | kind | reason | 生产者 |
+|---|---|---|---|
+| **16** | CONTINUATION | `unmet_acceptance_criteria` | **已删** |
+| 8 | CONTINUATION | `incomplete_recoverable` | 活 |
+| 3 | CONTINUATION | `unresolved_tool_batch` | 活 |
+| **2** | CONTINUATION | `completion_exhausted_with_required_gaps` | **已删** |
+| 3 | CLARIFICATION | — | 活 |
+| 2 | APPROVAL | — | 活 |
+| 1 | OUTCOME_RECONCILIATION | — | 活 |
+
+⇒ **18 个任务在等一个已被删除的机制**，而规则 (3)（`sdk/runtime.py:572`）仍拿它拒绝新输入
+→ 会话**永久阻塞**。这是本次重构的欠账：删了生产者，却把这些任务留在"等你回话"。
+
+### Bug A：提示让人用一个**不存在的命令**
+
+提示写"显式命令（/new、**/stop**）"。实测 `/stop` **只**存在于 Web 的 HTTP 路由
+（`app.py:3189` `POST /tasks/{id}/stop`）与这句文案里；`cli.py` 的 chat 命令表**没有**它，
+意图分类器也不识别该前缀，且 chat 循环会把所有未知 `/` 输入拦成 `unknown command`。
+
+### 修复（用户选 A+B）
+
+**A（文案说真话）**：提示改为
+`"…或使用显式命令（/new 新建任务、/resume 恢复该任务）。"`
+
+**B（路由容忍）**：新增
+`RuntimeCommandService._ORPHANED_PENDING_ACTION_REASONS = {unmet_acceptance_criteria,
+completion_exhausted_with_required_gaps}` 与 `_awaits_orphaned_action(task)`；
+规则 (3) 的条件加上 `and not self._awaits_orphaned_action(active)`。
+待回动作属于已死机制时**不再拒绝**，落到既有规则 (5) 交给会话路由；
+**任务本身不动**（`/resume` 仍能列出并恢复它）。
+
+**刻意保留的保守性**：用的是**显式死因集合**，不是"任何未知 reason 都放行"——
+未知 reason 可能是真实且仍可回答的动作，对它放行会把普通文本静默改释为新话题，正是规则 (3)
+要防的事。`AWAITING_APPROVAL` 与活 reason 的行为**不变**。
+
+### 测试与对照（含一次我自己做错的对照）
+
+新增 `tests/test_orphaned_running_tasks.py::OrphanedPendingActionInputTest` 4 条：
+死因不再拒绝 / 活 reason 仍拒绝 / 无待回动作仍拒绝 / 文案含 `/new`、`/resume` 且不含 `/stop`。
+
+**第一版对照是无效的，必须记下来**：我在 `git worktree` 的 HEAD 上跑新测试，结果"4 passed"，
+看似测试空转。实际原因是本仓库有 **editable 安装**（`.venv/.../_editable_impl_tsm_agt.pth`
+指向 repo 的 `src`），pytest 导入的是**修复后**的代码 —— 对照根本没换代码。
+
+改为强制源码后对照才有效：
+
+```bash
+cd <worktree> && PYTHONPATH=<worktree>/src <repo>/.venv/bin/python -m pytest …
+→ 2 failed, 2 passed      # 两条新测试失败，两条回归守卫通过
+```
+
+⇒ 新测试确实钉住了这两个 bug。
+
+**顺带核实更早的两个对照是有效的**：`sys.path.insert(0, <worktree>/src)` 经实测**能压过**
+editable 安装（A.1h 的 ledger 重放对照与 A.1o 的多轮对照都用的这种方式，故结论成立）。
+**教训**：pytest 下不能靠 `--rootdir`/`cwd` 切换源码，必须用 `PYTHONPATH`。
+
+### 给用户的即时绕行（改动前就能用）
+
+* `/new <目标>` —— 显式新建独立任务，绕过该拒绝；
+* `/resume` —— 列出并恢复等待中的任务。

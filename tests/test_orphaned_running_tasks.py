@@ -12,7 +12,9 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from tsm_agt.adapters.fixture import EchoModelProvider
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
@@ -412,6 +414,127 @@ class OrphanedActiveTaskInputTest(unittest.IsolatedAsyncioTestCase):
                 ),
                 "a new Task must be created for the message",
             )
+
+
+class OrphanedPendingActionInputTest(unittest.IsolatedAsyncioTestCase):
+    """A Task parked on a pending action nothing can produce must not wedge.
+
+    ``completion_exhausted_with_required_gaps`` and ``unmet_acceptance_criteria``
+    were written by machinery removed with the proof layer: no code path emits
+    them any more, so no reply can move such a Task forward. Refusing new input
+    on one (rule 3 of ``submit_user_input``) stranded the Session permanently --
+    the user's report was exactly this, on
+    ``task-8d1ec232a0e54910852a029dcf11b03f`` (``AWAITING_USER``,
+    ``reason=completion_exhausted_with_required_gaps``). 18 of the 35 parked
+    Tasks in the real ledger carry one of these two reasons.
+
+    The decision is driven through the real routing entry point with the parked
+    Task supplied directly, because fabricating a persisted checkpoint would mean
+    forging its integrity hash, and a real suspension can only ever produce the
+    *live* reasons -- which is the case these tests must contrast against.
+    """
+
+    async def _client_with_waiting_task(
+        self, root: Path, *, pending_reason: str | None, state=TaskState.AWAITING_USER,
+    ):
+        app = compose_fixture_application(
+            store_adapter=SQLiteRuntimeStore(root / ".agent" / "runtime.db"),
+            model_adapter=EchoModelProvider(), tool_adapters=(),
+            session_input_resolver_adapter=FixtureResolver(),
+        )
+        client = EngineeringAgentClient(root, application_factory=lambda: app)
+        await client.start()
+        self.addAsyncCleanup(client.close)
+        kernel = client.application.kernel
+        session = await kernel.create_session("waiting session")
+        task = await kernel.create_task("goal", root, session_id=session.session_id)
+        await advance(client.application, task.task_id, *EXECUTION_PATH, state)
+        task = await kernel.get_task(task.task_id)
+        parked = replace(
+            task,
+            active_agent_checkpoint=(
+                {"pending_user_action": {"kind": "CONTINUATION", "reason": pending_reason}}
+                if pending_reason is not None else None
+            ),
+        )
+        return client, session, parked
+
+    async def _submit_against(self, client, session_id: str, parked, input_id: str):
+        with patch.object(
+            type(client), "_active_task", new=AsyncMock(return_value=parked),
+        ):
+            return await client.submit_user_input(
+                session_id, "看下今天的nba新闻", input_id=input_id,
+            )
+
+    async def test_orphaned_reason_no_longer_refuses_plain_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client, session, parked = await self._client_with_waiting_task(
+                root, pending_reason="completion_exhausted_with_required_gaps",
+            )
+
+            result = await self._submit_against(
+                client, session.session_id, parked, "orphan-pending-1",
+            )
+
+            self.assertNotEqual(
+                result.result.get("reason_code"), "task_awaits_user_action",
+            )
+
+    async def test_a_live_pending_reason_still_refuses(self) -> None:
+        """The refusal is only dropped for reasons that cannot be produced."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client, session, parked = await self._client_with_waiting_task(
+                root, pending_reason="incomplete_recoverable",
+            )
+
+            result = await self._submit_against(
+                client, session.session_id, parked, "orphan-pending-2",
+            )
+
+            self.assertEqual(
+                result.result.get("reason_code"), "task_awaits_user_action",
+            )
+
+    async def test_a_waiting_task_without_a_pending_action_still_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client, session, parked = await self._client_with_waiting_task(
+                root, pending_reason=None,
+            )
+
+            result = await self._submit_against(
+                client, session.session_id, parked, "orphan-pending-3",
+            )
+
+            self.assertEqual(
+                result.result.get("reason_code"), "task_awaits_user_action",
+            )
+
+    async def test_the_refusal_names_commands_the_cli_actually_has(self) -> None:
+        """``/stop`` is a Web route, not a chat command.
+
+        The message used to tell CLI users to run ``/stop``, which the chat loop
+        answers with ``unknown command``. Name the commands that exist.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client, session, parked = await self._client_with_waiting_task(
+                root, pending_reason="incomplete_recoverable",
+            )
+
+            result = await self._submit_against(
+                client, session.session_id, parked, "orphan-pending-4",
+            )
+
+            clarification = result.result.get("clarification") or ""
+            self.assertIn("/new", clarification)
+            self.assertIn("/resume", clarification)
+            self.assertNotIn("/stop", clarification)
 
 
 if __name__ == "__main__":

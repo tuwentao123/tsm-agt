@@ -497,6 +497,34 @@ class EngineeringAgentClient:
         TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER,
     })
 
+    #: Pending-user-action reasons nothing can produce any more. Each one named
+    #: the producer that was removed with the proof layer, so a Task parked on
+    #: one can never be answered into progress: nothing the user types would move
+    #: it. Such a Task must not keep refusing new input (rule 3 below) -- the
+    #: Session would wedge forever, which is exactly what ``/new`` was invented to
+    #: escape. The Task itself is left untouched, so ``/resume`` still lists it.
+    #: Kept as an explicit set rather than "anything unknown": an unrecognised
+    #: reason may be a real, still-answerable action, and dropping the refusal
+    #: for it would silently reinterpret plain text as a new topic.
+    _ORPHANED_PENDING_ACTION_REASONS = frozenset({
+        # The acceptance-criteria gate (``unmet_acceptance_criteria``).
+        "unmet_acceptance_criteria",
+        # Readiness-gap exhaustion (``completion_exhausted_with_required_gaps``).
+        "completion_exhausted_with_required_gaps",
+    })
+
+    @classmethod
+    def _awaits_orphaned_action(cls, task: TaskSnapshot) -> bool:
+        """Whether ``task``'s pending user action can no longer be produced."""
+
+        checkpoint = task.active_agent_checkpoint
+        if not isinstance(checkpoint, Mapping):
+            return False
+        pending = checkpoint.get("pending_user_action")
+        if not isinstance(pending, Mapping):
+            return False
+        return pending.get("reason") in cls._ORPHANED_PENDING_ACTION_REASONS
+
     async def submit_user_input(
         self, session_id: str, text: str, *, input_id: str,
         explicit_intent: RuntimeInputIntent | None = None,
@@ -569,16 +597,23 @@ class EngineeringAgentClient:
             return await self._delegate_session_text(
                 session_id, text, input_id, image_blocks, workspace, None,
             )
-        # (3) Waiting for the user: never reinterpret plain text as a new topic.
-        if active is not None and active.state in {
-            TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER,
-        }:
+        # (3) Waiting for the user: never reinterpret plain text as a new topic --
+        #     unless the pending action can no longer be produced. Refusing then
+        #     would wedge the Session on a question nothing can answer, so the
+        #     ordinary routing below decides instead (rule 5).
+        if (
+            active is not None
+            and active.state in {
+                TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER,
+            }
+            and not self._awaits_orphaned_action(active)
+        ):
             return RuntimeCommandResult(input_id, False, UserInputResult(
                 input_id, "clarify", SessionInputRelation.UNKNOWN.value,
                 "task_awaits_user_action",
                 clarification=(
                     "当前任务正在等待审批或回答，请通过对应通道回复，"
-                    "或使用显式命令（/new、/stop）。"
+                    "或使用显式命令（/new 新建任务、/resume 恢复该任务）。"
                 ),
                 routed_task_id=active.task_id,
             ).to_data())
