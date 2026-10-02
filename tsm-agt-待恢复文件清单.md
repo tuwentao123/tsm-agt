@@ -1,5 +1,36 @@
 # tsm-agt 恢复状态清单（`git reset --hard` 事故）
 
+> ## ⚠️ 本文**仍然可行动，不要归档**（2026-10 加注）
+>
+> 本文一度被列入"事故已闭环、可归档"的候选，**这是错的**。读完全文后确认它有三件
+> **仍然需要仓库外动作**的事，以及一处**必须加注**的历史关系：
+>
+> **仍然可行动的**
+> 1. **§4 的 28 个用例**：有据可查（`1469 − (1443 − 2) = 28`）但**本机不可恢复**
+>    （§8.4 的排查表已穷尽 APFS 快照 / Time Machine / 编辑器本地历史 / 1077 个 git 对象）。
+>    取回只能靠**仓库外的备份**。⇒ `scripts/restore_from_backup.sh` **是那条取回路径的工具，
+>    因此也保留**。
+> 2. **§5 末尾**：`src/tsm_agt/cli.py` 与 `src/tsm_agt/web/app.py` 体量大、测试几乎没触达，
+>    若备份里与 HEAD 有差异应**优先用备份覆盖**。
+> 3. **§10**：5 个 pty 用例在本沙箱只能 skip，需在有伪终端的普通终端里跑一次。
+>
+> **必须加注的历史关系**
+>
+> §8.2 / §8.5 讲的那个修复（`finalize_acceptance` → `terminal_state_for`，即
+> `TERMINAL_STATE_BY_VERDICT[BLOCKED] = NEEDS_REVIEW`，让 71% 的误报失败消失）**已被后续决策
+> 整条删除** —— 用户决定按 Hermes/Codex 对齐、移除整个证明层（见
+> `tsm-agt-移除证明层方案.md` A.1h–A.1m）。`finalize_acceptance`、
+> `verify_task_acceptance`、`TERMINAL_STATE_BY_VERDICT`、`turn_finalizer`、`turn_outcome`
+> 均已不存在。
+>
+> **这不等于那个修复丢了**：现在的完成是"模型停止调用工具即结束回合"（`Kernel.complete_task`），
+> **根本没有 verdict 可被误报**，所以那个失败模式在原意义上不可能复发。`NEEDS_REVIEW` 仍可达，
+> 但只剩 stall cap 一条链（INV-4）。
+>
+> **计数已过期**：§0 / §2 / §9 里的 `1430 passed / 1443 collected / 1469` 是事故期的数字。
+> 当前基线见 `tsm-agt-移除证明层方案.md` A.1m：`1241 passed / 12 skipped / 1253 collected`
+> （skip 由 13 降为 12 的原因也已在该处说明）。
+
 > 本文替代同名旧版。旧版写于事故刚发生时，其中三条信息已经过期：
 > ①「需要恢复 29 个文件」②「验收标准是 `1456 passed`」③「HEAD 依赖 7 个未跟踪文件」。
 > 现在工作区相对 HEAD 全干净、HEAD 自包含、全量 0 失败，但**仍有东西找不回来**——
