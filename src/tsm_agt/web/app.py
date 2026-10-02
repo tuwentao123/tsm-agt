@@ -1564,7 +1564,12 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
     ? String(validation.status || '未提供') : '未提供';
   const reference = protocol.latestAnswerEventRef || '未提供';
   addProtocolItem('执行状态', executionLabel);
-  addProtocolItem('领域检查', projection?.verification_status || '未开始');
+  // Only rendered when a verdict exists: with no domain check in the Runtime,
+  // 'not_started' is the normal value and showing it reads as a stuck state.
+  const verificationStatus = projection?.verification_status;
+  if (verificationStatus && verificationStatus !== 'not_started') {
+    addProtocolItem('领域检查', verificationStatus);
+  }
   addProtocolItem('模型结论', modelConclusion);
   addProtocolItem('引用校验', `${validationStatus} · ${reference}`);
   card.appendChild(protocolSummary);

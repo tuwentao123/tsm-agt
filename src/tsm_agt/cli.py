@@ -65,6 +65,7 @@ from tsm_agt.core import (
     SteeringKind,
     TaskState,
     TaskRuntimeProjector,
+    TaskVerificationStatus,
     build_flow_export_document,
 )
 
@@ -597,7 +598,11 @@ async def _finalize_standalone_agent_result(
 
 
 async def _print_standalone_protocol_status(application, task_id: str, output_fn) -> None:
-    """Print four independent persisted result categories for one-shot CLI."""
+    """Print the persisted result categories for one-shot CLI.
+
+    Four rows normally; the domain-check row is omitted unless a verdict exists,
+    because no domain check runs any more (see the note on that branch).
+    """
     task = await application.kernel.get_task(task_id)
     store = application.registry.require(RuntimeStorePort)
     projection = TaskRuntimeProjector.project(
@@ -609,7 +614,13 @@ async def _print_standalone_protocol_status(application, task_id: str, output_fn
         f"phase={projection.phase.value}; "
         f"execution={projection.execution_status.value}"
     )
-    output_fn(f"领域检查: {projection.verification_status.value}")
+    # No domain check runs any more, so ``not_started`` is the normal value for
+    # every machine-completed Task -- printing it on every run made the row read
+    # as "something has not started yet". Report it only when a verdict exists,
+    # which today means a human accepted the result (``kernel_task.py`` writes
+    # ``verify.completed`` with ``manual_verified``).
+    if projection.verification_status is not TaskVerificationStatus.NOT_STARTED:
+        output_fn(f"领域检查: {projection.verification_status.value}")
     claims = [dict(item) for item in projection.conclusion_claims]
     output_fn(
         "模型结论: "

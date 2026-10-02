@@ -1114,3 +1114,41 @@ belongs to another local subject` 的来源，属设计上的主体边界，不�
 1. **28 个用例**：只有仓库外备份能取回。若你手头有那份备份，`restore_from_backup.sh` 是取回工具。
 2. **CLI/Web 的"领域检查"面**：`cli.py:612` 与 `web/app.py:1567` 现在对每个机器完成的任务都显示
    `not_started`（值准确，但属被删层的遗留可见面）。保留 / 改标签 / 删除 —— 产品决策。
+
+## A.1q 批 11 —— CLI/Web 的"领域检查"行改为**有值才显示**（用户决策 B）
+
+**结果：1242 passed / 12 skipped / 0 failed**（+1 条新测试）。
+
+### 先纠正这批的定性：它不是"残留垃圾面"
+
+我原先把它描述成"被删层留下的用户可见面"，读代码后发现框架不对：
+
+* 它是**被测试钉住的有意设计**：`test_cli_standalone_finalization.py:63,102`、
+  `test_web_phase1_state.py:72` 三处断言。
+* 它的**值是准确的**：`not_started` 就是"没跑过领域检查"。
+* 投影字段本身**必须保留**：`task_runtime_projection.py:241` 的 `_phase()` 在用它，
+  且人工 accept 会写 `passed`。
+
+⇒ 真正的问题不是"垃圾"，而是**信息量塌缩**：证明层删除后，每个机器完成的任务都恒为
+`not_started`，渲染出来会被读成"检查卡住没开始"。
+
+### 落地（方案 B）
+
+| 位置 | 改动 |
+|---|---|
+| `cli.py` | 仅当 `verification_status is not NOT_STARTED` 才 `output_fn("领域检查: …")`；新增 `TaskVerificationStatus` import |
+| `web/app.py` | 同样的条件（`!== 'not_started'`），并从 `|| '未开始'` 兜底改为不渲染 |
+| `cli.py` 该函数 docstring | "Print four independent persisted result categories" → 说明该行可有可无及原因 |
+| `test_cli_standalone_finalization.py` ×2 | `assertTrue(该行存在)` → `assertFalse(该行存在)`（那两个场景无 `verify.completed`）|
+
+### 补上 B 的另一半（否则只有"抑制"被覆盖）
+
+新增 `test_domain_check_row_reappears_once_a_verdict_exists`：`complete_task` 后追加一条
+`verify.completed{status: passed, manual_verified: true}`（即人工接受路径实际写的事件形状），
+断言 `领域检查: passed` **重新出现**。**两个方向都被钉住。**
+
+### 顺手记一个我自己的失误
+
+第一次改那两处断言用了 `replace_all`，但两处**缩进不同**（第二处在 `try:` 内，深一层），
+结果产生 `SyntaxError: expected 'except' or 'finally' block`。**教训：`replace_all` 只适合
+缩进相同的同形行；否则要各自带上下文替换。**

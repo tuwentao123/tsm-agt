@@ -60,7 +60,10 @@ class StandaloneFinalizationTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(line.startswith("task completed:") for line in lines))
         self.assertFalse(any("verification" in line for line in lines))
         self.assertTrue(any(line.startswith("执行状态:") for line in lines))
-        self.assertTrue(any(line.startswith("领域检查:") for line in lines))
+        # No domain check runs any more, so the row is suppressed rather than
+        # printed as "not_started": the Task completed mechanically and nothing
+        # wrote ``verify.completed``.
+        self.assertFalse(any(line.startswith("领域检查:") for line in lines))
         self.assertTrue(any(line.startswith("模型结论:") for line in lines))
         self.assertTrue(any(line.startswith("引用校验:") for line in lines))
 
@@ -99,7 +102,10 @@ class StandaloneFinalizationTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertFalse(any("verification" in line for line in lines))
             self.assertTrue(any(line.startswith("执行状态:") for line in lines))
-            self.assertTrue(any(line.startswith("领域检查:") for line in lines))
+            # No domain check runs any more, so the row is suppressed rather than
+            # printed as "not_started": the Task completed mechanically and nothing
+            # wrote ``verify.completed``.
+            self.assertFalse(any(line.startswith("领域检查:") for line in lines))
             self.assertTrue(any(line.startswith("模型结论:") for line in lines))
             self.assertTrue(any(line.startswith("引用校验:") for line in lines))
         finally:
@@ -120,6 +126,38 @@ class StandaloneFinalizationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (await self.application.kernel.get_task(self.task.task_id)).state,
             TaskState.EXECUTING,
+        )
+
+    async def test_domain_check_row_reappears_once_a_verdict_exists(self) -> None:
+        """The row is conditional, not deleted.
+
+        Suppressing ``not_started`` must not hide a real verdict. The only
+        remaining source of one is the human-review accept path, which writes
+        ``verify.completed`` with ``manual_verified`` -- so replay that event and
+        assert the row comes back.
+        """
+
+        from tsm_agt.cli import _print_standalone_protocol_status
+        from tsm_agt.core import AcceptanceStatus
+
+        await self.application.kernel.complete_task(
+            self.task.task_id, "standalone turn completed",
+        )
+        await self.application.kernel._append_events(self.task.task_id, ((
+            "verify.completed",
+            {
+                "status": AcceptanceStatus.PASSED.value,
+                "manual_verified": True, "actor": "user", "criterion_count": 0,
+            },
+        ),))
+
+        lines: list[str] = []
+        await _print_standalone_protocol_status(
+            self.application, self.task.task_id, lines.append,
+        )
+
+        self.assertTrue(
+            any(line.startswith("领域检查: passed") for line in lines), lines,
         )
 
 
