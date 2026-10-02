@@ -1362,3 +1362,41 @@ pending reason   : completion_exhausted_with_required_gaps
 * 该任务 `last_event_sequence = max(events.sequence) = 108`；
 * `runtime.db` mtime 未变；`-wal` 未增长。只有 `-shm` 的 mtime 变了（只读打开会触碰共享内存索引，
   不写入内容）。所有分析脚本走的都是副本。
+
+## A.1u 运维留痕：真实 ledger 已按用户要求清空（2026-10-02）
+
+用户要求清掉旧任务数据。**执行前的两个前提检查都很关键**：
+
+1. **有进程正在持有它**：`lsof .agent/runtime.db` 显示 PID 96171
+   （`uvicorn tsm_agt.web.app:app --port 8080`，pid 记在 `.agent/run/tsm-agt-web.pid`）。
+   在活连接下删 SQLite 文件会造成**脑裂**（进程继续写已 unlink 的 inode，新进程另建一库）。
+   **该进程当时其实已经卡死**（8080 无响应，`curl` 返回 000），所以 SIGTERM/SIGINT 都无法让它
+   走完优雅关闭，最后 `kill -9` 才退出 —— 这一点本身值得留意。
+2. **库里还存着项目信任**：`project_trust` 3 条（本仓库、`workSp/AppHitchMainH5`、
+   `workSp/HellobikeAndroidAtlasApp`），`project_onboarding` 2 条。整库删除会让你必须重新
+   `tsm-agt trust`，所以选择**只清台账、保留信任**。
+
+### 做了什么
+
+| 步骤 | 内容 |
+|---|---|
+| 停止持有者 | SIGTERM→60s 无效 → SIGINT 无效 → `kill -9 96171`；清掉陈旧 pid 文件 |
+| 一致性备份 | `sqlite3.backup()` → **`.agent/ledger-backup-20261002-231900/runtime.db`（450 MB）**，含 695 任务 / 115,213 事件 / 78 会话 / 3 条信任。放在 `.agent/` 内因为家目录被沙箱拒写、且 `.agent/` 已 gitignore（`git status` 干净）|
+| 清空 | `DELETE` 六张台账表：`runtime_events`(115,213) `session_events`(4,286) `runtime_tasks`(695) `runtime_sessions`(78) `runtime_commands`(1,148) `session_task_commands`(763) |
+| 回收 | `wal_checkpoint(TRUNCATE)` + `VACUUM`：**450.0 MB → 0.1 MB**（回收 449.9 MB；磁盘当时 98% 已用）|
+| 校验 | `PRAGMA integrity_check = ok`；`project_trust` 3 / `project_onboarding` 2 / `schema_version=2` 保留 |
+
+### 清空后验证
+
+* 新库可写：新建 session + task 成功（冒烟后已清掉，最终 0/0/0）。
+* **三条项目信任全部保留**，实测都返回 `TRUSTED_BUILD`。
+* 全量测试 `1246 passed / 12 skipped / 0 failed`。
+
+### 未动的东西（超出授权范围，留给用户决定）
+
+* `.agent/runtime/`（18 MB / 292 文件）—— 旧任务的**工作区快照与变更日志**，现已成孤儿；
+  体积小、无功能影响。
+* `.agent/memory.db`（24 KB + 4 MB WAL）—— **项目记忆**，不是任务台账。
+* `.agent/ledger-backup-20261002-231900/`（429 MB）—— 安全备份，确认无误后可删以回收空间。
+
+Web UI 启动器：`scripts/restart.sh web`（默认 127.0.0.1:8080）。
