@@ -10,6 +10,7 @@ from pathlib import Path
 from tsm_agt.adapters.builtin import CoreReadOnlyToolProvider
 from tsm_agt.adapters.posix_path import PosixWorkspacePath
 from tsm_agt.adapters.windows_path import WindowsWorkspacePath
+from tsm_agt.core.configuration import RIPGREP_ENV, ripgrep_binary
 from tsm_agt.core.workspace import EXCLUDED_DIRECTORIES
 from tsm_agt.ports import AdapterContext, ToolCall, ToolInvocationContext
 
@@ -565,4 +566,129 @@ class ExcludedDirectoryPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [entry["path"] for entry in result.data["entries"]],
             [".agent/inside.txt"],
+        )
+
+
+class RipgrepVisibilityFilterTest(unittest.IsolatedAsyncioTestCase):
+    """ripgrep contributes ``.gitignore``; the walker still contributes order.
+
+    The filter is **additive**, never a replacement: the walker keeps supplying
+    the deliberate source-root ranking and the generated-directory accounting,
+    and ripgrep only removes files the project itself ignores. With no ripgrep
+    the previous behaviour stands unchanged.
+
+    A stub ``rg`` is used instead of the real binary so the test pins *this*
+    integration -- resolving the executable, passing ``--files`` plus the
+    excluded-directory globs, parsing stdout, applying the filter -- rather than
+    re-testing ripgrep.
+    """
+
+    MARKER = "visibility-marker-3d17"
+
+    async def asyncSetUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temp_dir.name)
+        (self.workspace / ".gitignore").write_text("generated/\n", encoding="utf-8")
+        (self.workspace / "src").mkdir()
+        (self.workspace / "src" / "app.py").write_text(
+            f"{self.MARKER}\n", encoding="utf-8"
+        )
+        (self.workspace / "generated").mkdir()
+        (self.workspace / "generated" / "artifact.py").write_text(
+            f"{self.MARKER}\n", encoding="utf-8"
+        )
+        (self.workspace / "node_modules").mkdir()
+        (self.workspace / "node_modules" / "dep.py").write_text(
+            f"{self.MARKER}\n", encoding="utf-8"
+        )
+        self.provider = CoreReadOnlyToolProvider()
+        context = AdapterContext(config={}, emit_event=lambda _type, _payload: None)
+        await self.provider.start(context)
+        self.path_service = (
+            WindowsWorkspacePath() if os.name == "nt" else PosixWorkspacePath()
+        )
+        await self.path_service.start(context)
+        self.context = ToolInvocationContext(
+            invocation_id="inv-vis",
+            task_id="task-vis",
+            turn_id="turn-vis",
+            workspace=self.workspace,
+            deadline=datetime.now(timezone.utc) + timedelta(seconds=30),
+            workspace_path=self.path_service,
+        )
+
+    async def asyncTearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _use_stub(self, stdout: str) -> Path:
+        """Point the resolver at a stub that records argv and prints ``stdout``."""
+
+        argv_file = self.workspace / "argv.txt"
+        stub = self.workspace / "stub-rg.sh"
+        stub.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$@\" > '{argv_file}'\n"
+            + "".join(f"printf '%s\\n' '{line}'\n" for line in stdout.splitlines()),
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        os.environ[RIPGREP_ENV] = str(stub)
+        ripgrep_binary.cache_clear()
+        self.addCleanup(os.environ.pop, RIPGREP_ENV, None)
+        self.addCleanup(ripgrep_binary.cache_clear)
+        return argv_file
+
+    async def _search(self, **arguments):
+        return await self.provider.invoke(
+            ToolCall("vis", "core.search_text", {"query": self.MARKER, **arguments}),
+            self.context,
+        )
+
+    async def test_a_gitignored_file_disappears_when_ripgrep_says_so(self) -> None:
+        self._use_stub("src/app.py")
+
+        result = await self._search(path=".")
+
+        self.assertTrue(result.data["ripgrep_filter"])
+        self.assertEqual([m["path"] for m in result.data["matches"]], ["src/app.py"])
+
+    async def test_the_walker_prunes_known_directories_without_ripgrep(self) -> None:
+        os.environ[RIPGREP_ENV] = str(self.workspace / "missing-rg")
+        ripgrep_binary.cache_clear()
+        self.addCleanup(os.environ.pop, RIPGREP_ENV, None)
+        self.addCleanup(ripgrep_binary.cache_clear)
+
+        result = await self._search(path=".")
+
+        paths = {match["path"] for match in result.data["matches"]}
+        self.assertFalse(result.data["ripgrep_filter"])
+        self.assertIn("src/app.py", paths)
+        # node_modules is in EXCLUDED_DIRECTORIES, so the walker prunes it...
+        self.assertNotIn("node_modules/dep.py", paths)
+        # ...but ``generated/`` is only ignored by .gitignore, which needs
+        # ripgrep. Documented here so the gap this filter closes is explicit.
+        self.assertIn("generated/artifact.py", paths)
+
+    async def test_the_command_gets_files_mode_and_every_exclude_glob(self) -> None:
+        """Both policies must apply: ripgrep's own plus EXCLUDED_DIRECTORIES."""
+
+        argv_file = self._use_stub("src/app.py")
+
+        await self._search(path=".")
+
+        argv = argv_file.read_text(encoding="utf-8").split()
+        self.assertIn("--files", argv)
+        for name in sorted(EXCLUDED_DIRECTORIES):
+            self.assertIn(f"!{name}", argv)
+
+    async def test_an_explicitly_named_ignored_file_is_still_searched(self) -> None:
+        """The filter governs discovery, never targeted access."""
+
+        self._use_stub("src/app.py")
+
+        result = await self._search(path="generated/artifact.py")
+
+        self.assertEqual(
+            [m["path"] for m in result.data["matches"]],
+            ["generated/artifact.py"],
         )

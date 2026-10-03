@@ -6,11 +6,13 @@ import fnmatch
 import hashlib
 import os
 import re
+import subprocess
 from collections.abc import Iterable, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from tsm_agt.core.configuration import ripgrep_binary
 from tsm_agt.core.workspace import EXCLUDED_DIRECTORIES
 from tsm_agt.ports import (
     AdapterContext,
@@ -39,6 +41,67 @@ _MAX_SEARCH_FILE_BYTES = 1_000_000
 _MAX_MATCH_TEXT_CHARS = 500
 _MAX_FIND_LIMIT = 500
 _MAX_FIND_ENTRIES = 50_000
+
+#: Bounds for the optional ripgrep probe in ``_ripgrep_visible_files``. The
+#: binary itself comes from ``core.configuration.ripgrep_binary`` so the
+#: ``doctor`` report and this adapter cannot drift apart.
+_RIPGREP_TIMEOUT_SECONDS = 30.0
+_MAX_RIPGREP_ENTRIES = 200_000
+
+
+def _ripgrep_exclude_globs() -> tuple[str, ...]:
+    """``EXCLUDED_DIRECTORIES`` as ripgrep negations.
+
+    ``rg`` knows ``.gitignore`` and hidden paths; it does **not** know this list.
+    Without these globs the generated and state directories the walker prunes --
+    ``build``, ``dist``, ``vendor``, ``out``, ``.agent`` -- would come straight
+    back through the ripgrep path, so both policies must apply together.
+    """
+
+    return tuple(f"!{name}" for name in sorted(EXCLUDED_DIRECTORIES))
+
+
+def _ripgrep_visible_files(root: Path) -> frozenset[Path] | None:
+    """The files ripgrep would list under ``root``, or ``None`` when unavailable.
+
+    Used as a **filter, never as a source**. The in-tree walkers keep supplying
+    the order and the directory structure, because that order is a deliberate
+    ranking (source roots before docs, round-robin across monorepo roots) which
+    ripgrep's own traversal does not reproduce. ripgrep contributes exactly what
+    the walker cannot know: the project's ``.gitignore``.
+
+    ``rg --files`` is the *whole* external surface -- no caller-supplied pattern
+    or flag reaches the command line, so options that execute other programs
+    (``--pre``) cannot be reached through a tool argument.
+    """
+
+    binary = ripgrep_binary()
+    if binary is None:
+        return None
+    command = [binary, "--files"]
+    for glob in _ripgrep_exclude_globs():
+        command.extend(("--glob", glob))
+    try:
+        completed = subprocess.run(
+            command, cwd=root, capture_output=True,
+            timeout=_RIPGREP_TIMEOUT_SECONDS, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        # A missing/broken binary, an unreadable root, or an rg-level error all
+        # mean the same thing here: no filter, so the walker's result stands.
+        return None
+    text = completed.stdout.decode("utf-8", errors="surrogateescape")
+    visible: set[Path] = set()
+    for line in text.splitlines():
+        if not line:
+            continue
+        if len(visible) >= _MAX_RIPGREP_ENTRIES:
+            return None
+        visible.add(root / line)
+    return frozenset(visible)
+
 
 class _WorkspaceAccessError(ValueError):
     pass
@@ -334,6 +397,8 @@ class CoreReadOnlyToolProvider:
         if not root.is_dir():
             return self._error(call, "INVALID_PARAM", f"path is not a directory: {raw_path}")
 
+        list_stats = {"generated_directories_skipped": 0, "ripgrep_filter": False}
+        visible_files = self._ripgrep_filtered(root, list_stats)
         candidates = self._walk(root) if recursive else root.iterdir()
         entries: list[dict[str, Any]] = []
         omitted_sensitive = 0
@@ -346,6 +411,15 @@ class CoreReadOnlyToolProvider:
                     continue
             except (_WorkspaceAccessError, _SensitivePathError):
                 omitted_sensitive += 1
+                continue
+            # A directory is never filtered: ripgrep lists files, and hiding a
+            # directory because it happens to hold no visible file would make
+            # the tree look truncated rather than sparse.
+            if (
+                visible_files is not None
+                and not path.is_dir()
+                and path not in visible_files
+            ):
                 continue
             if len(entries) >= limit:
                 truncated = True
@@ -368,6 +442,7 @@ class CoreReadOnlyToolProvider:
                 **self._resolved_path_data(context, raw_path, resolved),
                 "entries": entries,
                 "omitted_sensitive": omitted_sensitive,
+                "ripgrep_filter": list_stats["ripgrep_filter"],
             },
             truncated=truncated,
             meta={"untrusted_data": True},
@@ -401,13 +476,16 @@ class CoreReadOnlyToolProvider:
 
         match_path = "/" in normalized_pattern
         expected = normalized_pattern if case_sensitive else normalized_pattern.casefold()
-        walk_stats = {"generated_directories_skipped": 0}
+        walk_stats = {"generated_directories_skipped": 0, "ripgrep_filter": False}
         matches: list[dict[str, Any]] = []
         scanned_entries = 0
         skipped_entries = 0
         truncated = False
+        visible_files = self._ripgrep_filtered(root, walk_stats)
         for path in self._walk_searchable(root, walk_stats):
             if not path.is_file():
+                continue
+            if visible_files is not None and path not in visible_files:
                 continue
             if scanned_entries >= _MAX_FIND_ENTRIES:
                 truncated = True
@@ -447,6 +525,7 @@ class CoreReadOnlyToolProvider:
                 "generated_directories_skipped": walk_stats[
                     "generated_directories_skipped"
                 ],
+                "ripgrep_filter": walk_stats["ripgrep_filter"],
             },
             truncated=truncated, meta={"untrusted_data": True},
         )
@@ -558,11 +637,17 @@ class CoreReadOnlyToolProvider:
         flags = 0 if case_sensitive else re.IGNORECASE
         pattern = re.compile(query if use_regex else re.escape(query), flags)
 
-        walk_stats = {"generated_directories_skipped": 0}
+        walk_stats = {"generated_directories_skipped": 0, "ripgrep_filter": False}
         if root.is_file():
+            # An explicitly named file is always read: the ignore filter governs
+            # discovery, never targeted access.
             files: Iterable[Path] = (root,)
         else:
-            files = self._walk_searchable(root, walk_stats)
+            visible_files = self._ripgrep_filtered(root, walk_stats)
+            files = (
+                path for path in self._walk_searchable(root, walk_stats)
+                if visible_files is None or path in visible_files
+            )
         matches: list[dict[str, Any]] = []
         scanned_files = 0
         skipped_files = 0
@@ -634,10 +719,25 @@ class CoreReadOnlyToolProvider:
                 "generated_directories_skipped": walk_stats[
                     "generated_directories_skipped"
                 ],
+                "ripgrep_filter": walk_stats["ripgrep_filter"],
             },
             truncated=truncated,
             meta={"untrusted_data": True},
         )
+
+    @staticmethod
+    def _ripgrep_filtered(
+        root: Path, stats: dict[str, int],
+    ) -> frozenset[Path] | None:
+        """Files callers may report, or ``None`` when ripgrep cannot say.
+
+        ``stats["ripgrep_filter"]`` records whether the ``.gitignore`` filter was
+        in effect, so a result says which policy produced it.
+        """
+
+        visible = _ripgrep_visible_files(root)
+        stats["ripgrep_filter"] = visible is not None
+        return visible
 
     @staticmethod
     def _walk(root: Path) -> Iterable[Path]:

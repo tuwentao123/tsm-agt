@@ -4,13 +4,39 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
+import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from typing import Any
 
 from tsm_agt.ports import AdapterDescriptor, HealthStatus, ProviderCapabilities, ToolSpec
+
+#: Overrides discovery of the optional search binary.
+RIPGREP_ENV = "TSM_AGT_RIPGREP"
+
+
+@lru_cache(maxsize=1)
+def ripgrep_binary() -> str | None:
+    """The optional ripgrep executable, or ``None``.
+
+    Resolution is an explicit override first, then ``PATH`` -- no install
+    directory is guessed, so a service whose ``PATH`` omits it can point
+    ``TSM_AGT_RIPGREP`` at the binary instead.
+
+    This lives in the shared layer rather than in the tool adapter because two
+    callers need the same answer: the adapter that runs it, and the ``doctor``
+    report that tells an operator whether it is there. Absent is a normal state,
+    not a fault.
+    """
+
+    override = os.environ.get(RIPGREP_ENV, "").strip()
+    if override:
+        return override if os.access(override, os.X_OK) else None
+    return shutil.which("rg")
 
 
 def canonical_hash(value: Any) -> str:

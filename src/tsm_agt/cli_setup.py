@@ -22,6 +22,7 @@ from tsm_agt.bootstrap.model_configuration import (
     MODEL_ENV_NAMES, MODEL_ENV_TEMPLATE, ModelConfiguration,
     inspect_model_configuration,
 )
+from tsm_agt.core.configuration import ripgrep_binary
 from tsm_agt.ports import (
     HealthState, Message, MessageRole, ModelProviderPort, ModelRequest, TextBlock,
 )
@@ -100,6 +101,7 @@ async def run_doctor(
     checks: list[DiagnosticCheck] = []
     checks.append(_python_check())
     checks.append(_platform_check())
+    checks.append(_ripgrep_check())
     checks.extend(_workspace_checks(root))
     checks.append(await _adapter_check())
 
@@ -185,6 +187,32 @@ async def run_doctor(
     else:
         _print_doctor_report(report)
     return 0 if healthy else 1
+
+
+def _ripgrep_check() -> DiagnosticCheck:
+    """Report the optional search binary.
+
+    Its absence is not a fault -- every search tool falls back to the in-tree
+    walker -- so this warns rather than fails. The walker prunes a fixed list of
+    state and generated directories; ripgrep adds the project's own
+    ``.gitignore`` on top of that, which is why a service that can see one
+    should be told it is there.
+    """
+
+    binary = ripgrep_binary()
+    if binary is None:
+        return DiagnosticCheck(
+            "ripgrep", "warn",
+            "not found; search prunes state and generated directories but "
+            "cannot see .gitignore entries",
+            # Optional: the walker covers everything except .gitignore, so a
+            # missing binary must not make the installation unhealthy.
+            required=False,
+            remedy="install ripgrep, or set TSM_AGT_RIPGREP to its path",
+        )
+    return DiagnosticCheck(
+        "ripgrep", "pass", f"{binary} (.gitignore-aware search enabled)",
+    )
 
 
 def _python_check() -> DiagnosticCheck:

@@ -1484,3 +1484,78 @@ terminal"*：
 * **敏感文件名单**（`_SENSITIVE_NAMES` 在 workspace/onboarding/core_tools/provider/local_flow_export
   共存 5 份）**刻意未合并**：它是"文件是否敏感"，与"目录是否该遍历"是两件事，合并可能让某条路径
   的防护变弱。若要统一应作为独立任务（安全相关）。
+
+## A.1w O2a 落地：ripgrep 作为**可见性过滤**（不是取数来源）+ doctor 探测
+
+**结果：1255 passed / 12 skipped / 0 failed。**
+
+### 第一版设计是错的，被测试当场否掉
+
+最初把 `rg --files` 当作**文件清单来源**（三个 handler 共用）。**强制走 rg 路径**后
+`tests/test_core_readonly_tools.py` **5 条失败** —— 因为 `_walk_searchable` 有一条**刻意的排序**
+（注释：*"Do not exhaust the alphabetically first source root in a monorepo. Round-robin lets
+codeBase/modules/packages all contribute candidates"*），而 `rg --files` 给的是它自己的遍历顺序。
+
+⇒ **用 rg 取代 walker 会破坏排序契约**（`test_workspace_search_scans_source_roots_before_docs`、
+`test_workspace_search_round_robins_multiple_source_roots` 正是钉住它的）。
+
+### 最终设计："walker 给顺序，ripgrep 给可见性"
+
+* walker 仍是**结构与顺序**的唯一来源（源码根优先、多根轮转、目录项、`generated_directories_skipped` 计数全部不变）
+* ripgrep 只**剔除 `.gitignore` 掉的文件** —— 这是 walker 原理上不知道的事
+* **两条策略必须同时生效**：命令是 `rg --files` **加** `--glob '!<EXCLUDED_DIRECTORIES>'`。
+  否则 `build/`/`dist/`/`vendor/`/`out/` 这类**既非隐藏、也没被 gitignore** 的目录会
+  **把 A.1v 的 O1 修复整个退回去**
+* 无 rg → 不启用过滤 → 行为与 O1 完全一致（不存在降级风险）
+* 显式指定路径（`search_text(path="generated/x.py")`、`list_files(path=".agent")`）**永不被过滤**：
+  过滤只作用于"自动发现"，不封锁定向访问
+* 结果新增 `ripgrep_filter: bool`，让调用方能看出这一份结果用了哪套策略
+
+**对照（两种模式各跑一遍）**：默认 57 passed / 强制 `TSM_AGT_RIPGREP=/opt/homebrew/bin/rg` 41 passed，
+**逐条一致**。
+
+### 解析器放在 `core/configuration.py`，因为架构门禁拦了我的第一版
+
+第一版把 `ripgrep_binary()` 定义在 adapter 里、`cli_setup.py` 直接 import 它 ——
+`tests/architecture/test_dependencies.py::test_only_composition_root_imports_concrete_adapters`
+立刻失败（只有 `bootstrap/composition.py` 能 import 具体 adapter）。
+
+改为把解析器放**共享层** `core/configuration.py`（`ripgrep_binary()` + `RIPGREP_ENV`）：
+adapter 与 doctor 都从那里取，**同一个实现**，且 `adapters → core`、`cli_setup → core` 都是合法方向。
+不猜绝对路径：先读 `TSM_AGT_RIPGREP`，再 `shutil.which("rg")`。
+
+### doctor 报告
+
+```
+[PASS] ripgrep: /opt/homebrew/bin/rg (.gitignore-aware search enabled)
+[WARN] ripgrep: not found; search prunes state and generated directories but
+       cannot see .gitignore entries
+       fix: install ripgrep, or set TSM_AGT_RIPGREP to its path
+```
+
+`required=False` —— 可选依赖不该让安装变成 unhealthy（第一版漏了这个参数，2 条 doctor 测试因此变红）。
+
+### 测试
+
+新增 `RipgrepVisibilityFilterTest` 4 条，用**桩 rg 脚本**而不是真 binary，所以它验证的是**我们的接线**
+（解析可执行文件、传 `--files` + 排除 glob、解析 stdout、套用过滤），不依赖本机装没装 rg：
+
+* 被 gitignore 的文件在 rg 说话时消失
+* 命令行确实带 `--files` 与**每一个** `!<EXCLUDED_DIRECTORIES>` glob（钉住"两条策略同时生效"）
+* 无 rg 时 walker 的结果照旧（并**明确断言**：`generated/` 此时仍可见 —— 把 O2a 补上的缺口写进测试）
+* 显式指定的被忽略文件仍能被搜到
+
+### 本批我自己犯的三个错（都记下）
+
+1. **按文本边界删块，连常量一起删了**：删 `#: ripgrep is optional.` 到 `def _ripgrep_exclude_globs()`
+   之间，把 `_RIPGREP_TIMEOUT_SECONDS` / `_MAX_RIPGREP_ENTRIES` 一并删除 → 运行时 `NameError`
+   （不是导入期，所以 `py_compile` 看不出来）。**又一次"删除块要先看区间内所有定义"。**
+2. **改了引用忘了加 import**：`cli_setup.py` 调 `ripgrep_binary()` 但没有 import → doctor 运行期
+   `NameError`。同样 `py_compile` 通过。
+3. **漏 `required=False`** → 2 条 doctor 测试红。
+
+### 未做的验证（环境原因，非代码）
+
+真实运行验证**跳过**：模型端点此刻严重变慢 —— TCP 连接 8s 超时、最小真实调用 **77.26s**
+（此前 6.17s，慢约 12 倍）。一次 agent 回合要 2–3 次模型调用，600s 内跑不完。
+**这不是代码挂起**：判定依据是连通性与最小调用实测。O2a 的证据由桩测试 + 双模式对照给出。
