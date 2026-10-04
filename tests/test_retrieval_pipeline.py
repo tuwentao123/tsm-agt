@@ -191,7 +191,7 @@ class FreshnessHelperTest(unittest.TestCase):
 
 class NetworkToolSearchBudgetTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        self.provider = NetworkToolProvider()
+        self.provider = NetworkToolProvider(search_mode="live")
         await self.provider.start(AdapterContext({}, lambda *_: None))
 
     async def asyncTearDown(self) -> None:
@@ -246,3 +246,49 @@ class NetworkToolSearchBudgetTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetrievalSearchModeTest(unittest.TestCase):
+    """``cached`` serves only what this process holds and opens no connection.
+
+    Counterpart to ``NetworkToolProvider.search_mode``: the pipeline is where the
+    decision is enforced, and where an outage must be kept out of the cache so a
+    later ``live`` run retries instead of serving the failure.
+    """
+
+    def test_cached_only_refuses_on_a_miss_without_running_any_provider(self):
+        pipeline = RetrievalPipeline(providers=[_FakeProvider("p", results=(_result(),))])
+
+        response = pipeline.search("q", 5, allow_egress=False)
+
+        self.assertEqual(response.provider, "cache-miss")
+        self.assertEqual(response.results, [])
+        # Empty telemetry is the proof that no provider was consulted.
+        self.assertEqual(response.telemetry, [])
+
+    def test_cached_only_serves_what_a_live_run_already_cached(self):
+        pipeline = RetrievalPipeline(providers=[_FakeProvider("p", results=(_result(),))])
+        pipeline.search("q", 5, allow_egress=True)
+
+        response = pipeline.search("q", 5, allow_egress=False)
+
+        self.assertTrue(response.cache_hit)
+        self.assertEqual(len(response.results), 1)
+
+    def test_an_outage_is_not_cached(self):
+        pipeline = RetrievalPipeline(
+            providers=[_FakeProvider("p", error=OSError("no route to host"))]
+        )
+        outage = pipeline.search("q", 5, allow_egress=True)
+
+        self.assertEqual(outage.results, [])
+        # A transient failure must not become a settled answer.
+        self.assertEqual(
+            pipeline.search("q", 5, allow_egress=False).provider, "cache-miss"
+        )
+
+    def test_a_genuine_empty_result_is_cached(self):
+        pipeline = RetrievalPipeline(providers=[_FakeProvider("p", results=())])
+        pipeline.search("q", 5, allow_egress=True)
+
+        self.assertTrue(pipeline.search("q", 5, allow_egress=False).cache_hit)

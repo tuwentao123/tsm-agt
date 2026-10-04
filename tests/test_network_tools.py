@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 from tsm_agt.adapters.builtin import NetworkToolProvider
 from tsm_agt.adapters.builtin.network_tools import (
+    _search_outage_failure,
     FetchResponse, _BingNewsRssProvider, _DuckDuckGoLiteProvider,
     _RssNewsProvider, _TavilyProvider, _WikipediaProvider,
 )
@@ -43,7 +44,9 @@ def _public_resolver(_host: str, _port: int) -> tuple[str, ...]:
 
 class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        self.provider = NetworkToolProvider()
+        # These tests exercise the provider chain, which only runs when egress is
+        # permitted. The default is ``cached`` (see WebSearchModeTest).
+        self.provider = NetworkToolProvider(search_mode="live")
         await self.provider.start(AdapterContext({}, lambda *_: None))
 
     async def asyncTearDown(self) -> None:
@@ -245,7 +248,13 @@ class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
                 None,
             )
 
-        self.assertTrue(result.ok, result.to_data())
+        # Every provider failed, so this is an outage and must not be reported as
+        # a successful search with zero results: a model reading "ok, no results"
+        # concludes the fact does not exist. Hermes reports the same case as
+        # ``success: false``.
+        self.assertFalse(result.ok, result.to_data())
+        self.assertEqual(result.error_code, "SEARCH_UNAVAILABLE")
+        self.assertTrue(result.retryable)
         self.assertEqual(result.data["provider"], "degraded-no-results")
         self.assertEqual(result.data["results"], [])
         # A timeout must stay visible in telemetry instead of being silently
@@ -253,6 +262,27 @@ class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.data["telemetry"]), 6)
         statuses = {entry["status"] for entry in result.data["telemetry"]}
         self.assertEqual(statuses, {"timeout"}, statuses)
+        # ...and the failing providers must be named in the message.
+        self.assertIn("wikipedia", result.message)
+
+    async def test_all_providers_empty_stays_a_success(self):
+        """Contrast with the outage above: answering "nothing matched" is fine."""
+
+        with patch.object(self.provider, "_load_json", return_value={}), \
+             patch(
+                 "tsm_agt.adapters.builtin.network_tools.urlopen",
+                 return_value=_Response(b""),
+             ):
+            result = await self.provider.invoke(
+                ToolCall("search-empty", "web.search", {
+                    "query": "today NBA news", "top_k": 3,
+                }),
+                None,
+            )
+
+        self.assertTrue(result.ok, result.to_data())
+        self.assertEqual(result.data["results"], [])
+        self.assertEqual(result.data["result_count"], 0)
 
     async def test_pipeline_covers_the_additional_keyless_providers(self):
         names = [provider.name for provider in self.provider._pipeline._providers]
@@ -534,3 +564,109 @@ class _Response:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WebSearchModeTest(unittest.IsolatedAsyncioTestCase):
+    """``web.search`` must not reach the network unless the host said it may.
+
+    Mirrors Codex's ``WebSearchMode``: ``cached`` is the default and performs no
+    egress, ``off`` refuses, and ``live`` is the opt-in that queries public
+    providers. The failure mapping mirrors Hermes' ``success: false`` -- an
+    outage reported as ``ok=True`` with an empty list would let a model conclude
+    that a fact does not exist when in truth nothing answered.
+    """
+
+    async def test_default_mode_is_cached_and_refuses_without_egress(self) -> None:
+        provider = NetworkToolProvider()
+        await provider.start(AdapterContext({}, lambda *_: None))
+        self.addAsyncCleanup(provider.stop, datetime.now(timezone.utc))
+
+        def _explode(*_args, **_kwargs):  # pragma: no cover - must not run
+            raise AssertionError("cached mode opened a connection")
+
+        with patch(
+            "tsm_agt.adapters.builtin.network_tools.urlopen", _explode,
+        ):
+            result = await provider.invoke(
+                ToolCall("cached-1", "web.search", {"query": "today NBA news"}),
+                None,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "SEARCH_NOT_CACHED")
+        self.assertIn("TSM_AGT_SEARCH_MODE=live", result.message)
+
+    async def test_off_mode_refuses_and_names_the_setting(self) -> None:
+        provider = NetworkToolProvider(search_mode="off")
+        await provider.start(AdapterContext({}, lambda *_: None))
+        self.addAsyncCleanup(provider.stop, datetime.now(timezone.utc))
+
+        result = await provider.invoke(
+            ToolCall("off-1", "web.search", {"query": "anything"}), None,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "SEARCH_DISABLED")
+
+    async def test_an_unknown_mode_is_rejected_at_construction(self) -> None:
+        with self.assertRaisesRegex(ValueError, "search_mode must be"):
+            NetworkToolProvider(search_mode="sometimes")
+
+    def test_a_total_outage_is_not_a_success(self) -> None:
+        failure = _search_outage_failure(
+            "c1",
+            {
+                "provider": "degraded-no-results",
+                "results": [],
+                "telemetry": [
+                    {"provider": "duckduckgo-lite", "status": "error"},
+                    {"provider": "wikipedia", "status": "timeout"},
+                ],
+            },
+            "live",
+        )
+
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure.error_code, "SEARCH_UNAVAILABLE")
+        self.assertTrue(failure.retryable)
+        # The telemetry still rides along so a caller can see who failed.
+        self.assertIn("duckduckgo-lite", str(failure.data))
+
+    def test_a_genuine_empty_result_stays_a_success(self) -> None:
+        """Every provider answered and matched nothing: that is a real answer."""
+
+        failure = _search_outage_failure(
+            "c1",
+            {
+                "provider": "degraded-no-results",
+                "results": [],
+                "telemetry": [{"provider": "bing-news-rss", "status": "empty"}],
+            },
+            "live",
+        )
+
+        self.assertIsNone(failure)
+
+    def test_results_are_never_reported_as_a_failure(self) -> None:
+        failure = _search_outage_failure(
+            "c1",
+            {
+                "provider": "bing-news-rss",
+                "results": [{"title": "t", "url": "https://e.test"}],
+                "telemetry": [],
+            },
+            "live",
+        )
+
+        self.assertIsNone(failure)
+
+    def test_a_cache_miss_names_the_setting_that_would_fix_it(self) -> None:
+        failure = _search_outage_failure(
+            "c1",
+            {"provider": "cache-miss", "results": [], "telemetry": []},
+            "cached",
+        )
+
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure.error_code, "SEARCH_NOT_CACHED")
+        self.assertIn("TSM_AGT_SEARCH_MODE=live", failure.message)

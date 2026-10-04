@@ -8,12 +8,27 @@ from pathlib import Path
 
 
 SEARCH_ENV_NAMES = (
+    "TSM_AGT_SEARCH_MODE",
     "TSM_AGT_SEARCH_TAVILY_MODE",
     "TSM_AGT_SEARCH_TAVILY_API_KEY",
 )
 
 #: Modes accepted for the optional Tavily provider.
 TAVILY_MODES = ("off", "keyless", "key")
+
+#: How far ``web.search`` may go, mirroring Codex's ``WebSearchMode``.
+#:
+#: * ``off``    -- the tool refuses; nothing is sent anywhere.
+#: * ``cached`` -- only results this process already holds; **no egress**.
+#: * ``live``   -- query the public providers.
+#:
+#: The default is ``cached``, which is Codex's default too: a client-side
+#: searcher that reaches third-party endpoints by default would make every agent
+#: run a network decision nobody approved. Unlike Codex there is no provider-side
+#: index behind it, so ``cached`` starts empty and refuses until a ``live`` run
+#: has populated it -- that refusal is deliberate and names the setting.
+DEFAULT_SEARCH_MODE = "cached"
+SEARCH_MODES = ("off", "cached", "live")
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,10 +38,13 @@ class SearchConfiguration:
     The default is ``off``: this process only scrapes public endpoints that need
     no account. ``keyless`` and ``key`` explicitly forward user queries to
     Tavily, which is an egress/privacy decision the host must make on purpose.
+    ``search_mode`` sits above that and governs whether any egress happens at
+    all.
     """
 
     tavily_mode: str = "off"
     tavily_api_key: str = ""
+    search_mode: str = DEFAULT_SEARCH_MODE
     sources: Mapping[str, str] | None = None
     #: Human-readable configuration problems. Search is an optional provider,
     #: so a bad value degrades to ``off`` and is reported instead of taking the
@@ -38,11 +56,21 @@ def load_search_configuration(
     path: Path, environment: Mapping[str, str],
 ) -> SearchConfiguration:
     values = _read_values(path.expanduser().resolve())
+    issues: list[str] = []
+    raw_search_mode, search_mode_source = _selected(
+        "TSM_AGT_SEARCH_MODE", values, environment, DEFAULT_SEARCH_MODE
+    )
+    search_mode = raw_search_mode.strip().lower()
+    if search_mode not in SEARCH_MODES:
+        issues.append(
+            f"TSM_AGT_SEARCH_MODE={raw_search_mode.strip()!r} is not one of "
+            f"{SEARCH_MODES}; search stays in {DEFAULT_SEARCH_MODE!r} mode"
+        )
+        search_mode = DEFAULT_SEARCH_MODE
     raw_mode, mode_source = _selected(
         "TSM_AGT_SEARCH_TAVILY_MODE", values, environment, "off"
     )
     mode = raw_mode.strip().lower()
-    issues: list[str] = []
     if mode not in TAVILY_MODES:
         issues.append(
             "TSM_AGT_SEARCH_TAVILY_MODE="
@@ -64,7 +92,9 @@ def load_search_configuration(
     return SearchConfiguration(
         tavily_mode=mode,
         tavily_api_key=api_key,
+        search_mode=search_mode,
         sources={
+            "search.mode": search_mode_source,
             "search.tavily_mode": mode_source,
             # Record provenance without ever exposing the secret value.
             "search.tavily_api_key": (

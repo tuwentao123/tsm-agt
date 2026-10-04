@@ -1596,3 +1596,38 @@ adapter 与 doctor 都从那里取，**同一个实现**，且 `adapters → cor
 
 **教训（本会话第 7 次同类）**：引入一个"看起来正确"的能力时，**必须把它放到真实环境形态里
 验证**（真 rg + 真 git 仓库），而不是只跑桩测试。桩测试全绿，真环境却会静默隐藏 CI/配置。
+
+## A.1y web 搜索对齐（A）：引入搜索模式 + 失败显式
+
+对比三家源码后按用户选择做 A 段（**对齐 Codex 的 `WebSearchMode` + Hermes 的 `success: false` 语义**）：
+
+| | Codex | Hermes | tsm-agt 改前 | 改后 |
+|---|---|---|---|---|
+| 执行位置 | hosted（服务端） | 客户端 | 客户端 | 客户端 |
+| 模式 | `Disabled/Cached`(**默认**)/`Indexed/Live` | 无 | 只有 Tavily 开关 | **`off`/`cached`(默认)/`live`** |
+| 默认姿态 | **不主动出网** | 按凭据挑 | **默认就抓公开端点** | **不主动出网** |
+| 全空/故障 | — | 顶层 `success: bool` | `ok=True` + 空列表 | **`ok=False` + 明确 error_code** |
+
+落地：
+* `search_configuration.py`：新增 `TSM_AGT_SEARCH_MODE`（`off`/`cached`/`live`，默认 `cached`），
+  非法值记 issue 并留在默认；`sources` 记录 `search.mode` provenance。
+* `retrieval/pipeline.py`：`search(..., allow_egress=False)` → 只读进程内缓存，未命中返回
+  新标签 `cache-miss` 且**不写缓存**（未命中不是结果）。
+* **顺带修一个 pre-existing bug**：降级/故障响应过去也会被缓存，导致 live 失败一次后**永不重试**、
+  且 `cached` 模式会把瞬时网络故障当成"已 settled 的答案"。改为**故障不缓存**；"所有 provider 都
+  应答但确实没匹配"仍会缓存（那是真结果）。
+* `network_tools.py`：`search_mode` 参数 + 构造期校验；`web.search` 分支
+  - `off` → `SEARCH_DISABLED`
+  - `cache-miss` → `SEARCH_NOT_CACHED`（消息里点名 `TSM_AGT_SEARCH_MODE=live`）
+  - 有 provider 报 error/timeout 且无结果 → `SEARCH_UNAVAILABLE`（`retryable=True`，消息列出失败后端）
+  - 全部 `empty` 且无结果 → **仍是成功**（"确实没有结果"是合法答案，不能和"搜不到"混为一谈）
+* `composition.py`：两个 `NetworkToolProvider` 站点都传 `search_mode=`。
+
+测试 +12：模式三值、默认 `cached` **且断言不得开连接**（把 `urlopen` 换成会抛的桩）、`off` 拒绝、
+非法模式构造期拒绝、四种结果映射、管线层 cached 命中/未命中/故障不缓存/真空会缓存。
+**并改掉一条钉住旧错误行为的测试**（它把全后端超时断言为 `ok=True`）—— 正是本次要修的东西。
+
+1267 passed / 12 skipped / 0 failed。
+
+**行为变化须知**：默认 `cached` 意味着**开箱即用时 `web.search` 会以 `SEARCH_NOT_CACHED` 明确拒绝**，
+直到设置 `TSM_AGT_SEARCH_MODE=live`。这是对齐 Codex 默认姿态的代价，已在错误消息里点名该设置。

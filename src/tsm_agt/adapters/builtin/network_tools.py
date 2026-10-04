@@ -109,6 +109,51 @@ _ALLOWED_FETCH_CONTENT_TYPES = frozenset({
 })
 
 
+def _search_outage_failure(
+    call_id: str, data: Mapping[str, Any], mode: str,
+) -> ToolResult | None:
+    """Turn a total search failure into ``ok=False``.
+
+    ``ok=True`` with an empty list lets a model read "no provider answered" as
+    "the fact does not exist". Hermes reports that case as ``success: false``,
+    and the mapping onto this Runtime is ``ok=False``. Three outcomes are kept
+    apart:
+
+    * ``cache-miss`` -- cached-only mode held nothing; reaching the network is
+      the caller's explicit choice.
+    * every provider errored or timed out -- an outage, and retryable.
+    * every provider answered and matched nothing -- a genuine "no results",
+      which stays a success so an empty answer is still allowed to mean empty.
+    """
+
+    if data.get("provider") == "cache-miss":
+        return ToolResult(
+            call_id, False, error_code="SEARCH_NOT_CACHED",
+            message=(
+                "web search is in cached-only mode "
+                f"(TSM_AGT_SEARCH_MODE={mode}) and this query is not cached; "
+                "set TSM_AGT_SEARCH_MODE=live to search the public web"
+            ),
+            data=data,
+        )
+    if data.get("results"):
+        return None
+    failed = sorted(
+        str(item.get("provider"))
+        for item in data.get("telemetry", ())
+        if item.get("status") in {"error", "timeout"}
+    )
+    if not failed:
+        return None
+    return ToolResult(
+        call_id, False, error_code="SEARCH_UNAVAILABLE",
+        message=(
+            "no search provider returned results; failed: " + ", ".join(failed)
+        ),
+        retryable=True, data=data,
+    )
+
+
 class _NoSearchResults(RuntimeError):
     """The provider was reachable but returned no usable public results."""
 
@@ -1027,6 +1072,7 @@ class NetworkToolProvider:
         ),
         search_tavily_mode: str = "off",
         search_tavily_api_key: str = "",
+        search_mode: str = "cached",
     ) -> None:
         """Expose public search and a bounded document fetch.
 
@@ -1042,6 +1088,13 @@ class NetworkToolProvider:
         ``search_tavily_mode`` is ``off`` (default), ``keyless``, or ``key``.
         Tavily is prepended as the primary source only when explicitly enabled,
         because it forwards the query to a third party.
+
+        ``search_mode`` is ``cached`` (default), ``off``, or ``live`` and sits
+        above every provider: ``cached`` serves only what this process already
+        holds and never opens a connection, ``off`` refuses outright, and
+        ``live`` queries the public providers. The default matches Codex's
+        ``WebSearchMode::Cached`` -- reaching third-party endpoints must be a
+        decision the host made, not a side effect of asking a question.
         """
         if search_provider_timeout_seconds <= 0:
             raise ValueError("search_provider_timeout_seconds must be positive")
@@ -1057,6 +1110,10 @@ class NetworkToolProvider:
                 "search_tavily_mode='key' requires TSM_AGT_SEARCH_TAVILY_API_KEY"
             )
         self._enable_fetch = enable_fetch
+        search_scope = (search_mode or "cached").strip().lower()
+        if search_scope not in {"off", "cached", "live"}:
+            raise ValueError("search_mode must be 'off', 'cached', or 'live'")
+        self._search_mode = search_scope
         self._egress_mode = WebEgressMode(egress_mode)
         self._fetch_transport = fetch_transport or (
             PinnedAddressWebFetchTransport()
@@ -1113,10 +1170,20 @@ class NetworkToolProvider:
             raise RuntimeError("network tools are not started")
         try:
             if call.name == "web.search":
+                if self._search_mode == "off":
+                    return ToolResult(
+                        call.call_id, False, error_code="SEARCH_DISABLED",
+                        message="web search is disabled (TSM_AGT_SEARCH_MODE=off)",
+                    )
                 data = await asyncio.to_thread(
                     self._web_search, call.arguments,
                     self._search_deadline(context),
                 )
+                failure = _search_outage_failure(
+                    call.call_id, data, self._search_mode,
+                )
+                if failure is not None:
+                    return failure
             elif call.name == "web.fetch_markdown":
                 if not self._enable_fetch:
                     return ToolResult(
@@ -1177,6 +1244,7 @@ class NetworkToolProvider:
 
         response = self._pipeline.search(
             query, top_k, deadline=deadline, freshness=freshness,
+            allow_egress=self._search_mode == "live",
         )
         if not response.results:
             degraded = response.to_dict()
