@@ -1631,3 +1631,35 @@ adapter 与 doctor 都从那里取，**同一个实现**，且 `adapters → cor
 
 **行为变化须知**：默认 `cached` 意味着**开箱即用时 `web.search` 会以 `SEARCH_NOT_CACHED` 明确拒绝**，
 直到设置 `TSM_AGT_SEARCH_MODE=live`。这是对齐 Codex 默认姿态的代价，已在错误消息里点名该设置。
+
+## A.1z browser 类能力：三家对比与 B2 的硬约束
+
+用户指出"web 应该还包括 browser 类工具"。查三家源码：
+
+| | browser 能力 |
+|---|---|
+| **Hermes** | **完整家族**：`browser_navigate` / `browser_snapshot` / `browser_click` / `browser_type` / `browser_press` / `browser_scroll` / `browser_back` / `browser_get_images` / `browser_vision`（截图）/ `browser_console` / `browser_cdp` / `browser_dialog` —— 共 12 个工具，`browser_tool.py` **4,499 行** + `browser_supervisor.py` 1,475 + `browser_cdp_tool.py` 569 + `browser_dialog_tool.py` 148。基于真实 Chrome 的 **CDP**（`agent_browser_runnable` 门禁，提示 `npx playwright install --with-deps chromium`）|
+| **Codex** | **没有**。`ToolSpec` 只有 `Function / Namespace / ToolSearch / WebSearch`；要碰浏览器只能经 **MCP**（有 `rmcp-client`）。⇒ "对齐 Codex"**不需要** browser |
+| **tsm-agt** | 只有 `web.search` / `web.fetch_markdown` / `content.summarize`，抓取是 stdlib `urllib` + HTML→文本，**不执行 JS** ⇒ **读不了任何 JS 渲染页面**（SPA 返回空壳），这正是"搜到链接但页面读不出内容"的成因 |
+
+两个家族在 Hermes 里是**互补**的，`web_tools.py:457` 写明：*"specific URL or use **browser_navigate** for the complete page"*。
+
+### 用户选 B2（给 fetch 加"渲染档"），但撞上硬约束
+
+B2 = `web.fetch_markdown` 拿不到有效内容时，委托一个**已配置的 CDP 端点**渲染后再转文本；不新增交互工具，未配置时行为不变。
+
+**约束**：CDP 是 **WebSocket** 协议。实测本仓库**没有任何 WS 实现、也没有 WS 依赖**
+（`websockets` / `wsproto` 均未安装，连传递依赖都没有；运行时依赖仍只有
+`prompt-toolkit` / `fastapi` / `uvicorn`）。所以"连 CDP"这一步必须先解决 WS。
+
+三条可选路径（待决策）：
+
+1. **手写最小 WebSocket 客户端**（stdlib `socket`/`ssl` + RFC 6455 帧：客户端掩码、帧解析、
+   分片、关闭）≈ 200–250 行 + CDP 消息关联。**零依赖**、符合本仓库取向，但新增一个协议面且
+   需要认真测试（握手、掩码、分片、大帧、关闭帧）。
+2. **声明一个可选依赖**（`websockets`，作为 `browser` extra）。代码少得多，但打破"3 个运行时依赖、
+   零 optional extra"的现状，运维多一步安装。
+3. **改委托目标：HTTP 渲染服务而非 CDP**。运维提供"收 URL、返回渲染后文本"的服务端点
+   （browserless / playwright service 之类），客户端只用 `urllib` POST —— **完全零依赖、最简单、
+   可用现有假 transport 模式测试、仍然显式 opt-in**。代价是运维要跑一个渲染服务，而不是指向
+   一个已存在的 Chrome。
