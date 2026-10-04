@@ -52,10 +52,13 @@ _MAX_RIPGREP_ENTRIES = 200_000
 def _ripgrep_exclude_globs() -> tuple[str, ...]:
     """``EXCLUDED_DIRECTORIES`` as ripgrep negations.
 
-    ``rg`` knows ``.gitignore`` and hidden paths; it does **not** know this list.
-    Without these globs the generated and state directories the walker prunes --
-    ``build``, ``dist``, ``vendor``, ``out``, ``.agent`` -- would come straight
-    back through the ripgrep path, so both policies must apply together.
+    Two jobs, which is why the command always passes them:
+
+    * ``rg`` knows ``.gitignore``, not this list -- without them ``build``,
+      ``dist``, ``vendor``, ``out`` and the state directories would come back.
+    * Because the command also passes ``--hidden`` (see below), these globs are
+      what keeps ``.git`` and ``.agent`` out; ripgrep's own hidden-skipping no
+      longer does it for us.
     """
 
     return tuple(f"!{name}" for name in sorted(EXCLUDED_DIRECTORIES))
@@ -70,6 +73,14 @@ def _ripgrep_visible_files(root: Path) -> frozenset[Path] | None:
     ripgrep's own traversal does not reproduce. ripgrep contributes exactly what
     the walker cannot know: the project's ``.gitignore``.
 
+    ``--hidden`` is required, not optional. Left off, ripgrep also drops every
+    hidden path, which for a coding agent means ``.github/workflows/``,
+    ``.eslintrc*``, ``.gitlab-ci.yml`` and ``.editorconfig`` -- exactly the files
+    a build or lint question asks about -- silently vanish from every search.
+    Passing ``--hidden`` puts ``.git`` and ``.agent`` back in scope, so the
+    negations above must accompany it; together they keep hidden *project* files
+    while still pruning hidden *state*, and ``.gitignore`` stays honoured.
+
     ``rg --files`` is the *whole* external surface -- no caller-supplied pattern
     or flag reaches the command line, so options that execute other programs
     (``--pre``) cannot be reached through a tool argument.
@@ -78,7 +89,7 @@ def _ripgrep_visible_files(root: Path) -> frozenset[Path] | None:
     binary = ripgrep_binary()
     if binary is None:
         return None
-    command = [binary, "--files"]
+    command = [binary, "--files", "--hidden"]
     for glob in _ripgrep_exclude_globs():
         command.extend(("--glob", glob))
     try:

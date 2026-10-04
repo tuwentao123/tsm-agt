@@ -1559,3 +1559,40 @@ adapter 与 doctor 都从那里取，**同一个实现**，且 `adapters → cor
 真实运行验证**跳过**：模型端点此刻严重变慢 —— TCP 连接 8s 超时、最小真实调用 **77.26s**
 （此前 6.17s，慢约 12 倍）。一次 agent 回合要 2–3 次模型调用，600s 内跑不完。
 **这不是代码挂起**：判定依据是连通性与最小调用实测。O2a 的证据由桩测试 + 双模式对照给出。
+
+## A.1x 修掉 O2a 引入的回归：必须带 `--hidden`（否则隐藏的**项目**文件全消失）
+
+用户问"搜索工具还有哪些没完成"，我在清点时用真 rg 在**真 git 仓库**上验证，发现**我自己刚引入的
+回归**：`rg --files` 不加 `--hidden` 时，ripgrep 会跳过**所有**隐藏路径，于是
+`.github/workflows/ci.yml`、`.eslintrc.json`、`.gitlab-ci.yml`、`.env.example`、`.editorconfig`
+—— 对编码 agent 恰恰是最常被问到的文件 —— 会从 `list_files` / `find_files` / `search_text`
+里**静默消失**。这比原先的 `.agent` 污染更糟。
+
+而单加 `--hidden` 又不安全：实测在真 git 仓库里 `rg --files --hidden` 会**漏出 18 个 `.git/` 条目**。
+
+**正确组合（已实测）**：`--files --hidden` **加上** `EXCLUDED_DIRECTORIES` 的全部取反 glob。
+三者同时成立：
+
+| 检查 | 结果 |
+|---|---|
+| 隐藏的**项目**文件（`.github/workflows/ci.yml`、`.eslintrc.json`）| **保留** ✓ |
+| `.git/` | **未漏出**（由 `!.git` 剪掉）✓ |
+| `.gitignore` 掉的 `generated/art.py` | **仍被忽略** ✓ |
+
+工具层端到端实测：
+
+```
+列出: ['.eslintrc.json', '.github', '.github/workflows', '.github/workflows/ci.yml',
+       '.gitignore', 'generated', 'src', 'src/app.py']
+搜索 NEEDLE: ['src/app.py']        ← generated/art.py 被过滤
+```
+
+**注意**：`.gitignore` **只在 git 仓库里生效** —— 我在非 git 目录做第一次探针时
+`generated/art.py` 照样出现。所以这个特性在非 git 工作区只贡献"隐藏文件可见性"，
+不贡献 gitignore 语义（记录在案，避免日后误判）。
+
+测试同步加固：`test_the_command_gets_files_mode_and_every_exclude_glob` 现在同时断言
+`--files`、**`--hidden`**、以及每一个 `!<EXCLUDED_DIRECTORIES>` glob —— 三者缺一都会红。
+
+**教训（本会话第 7 次同类）**：引入一个"看起来正确"的能力时，**必须把它放到真实环境形态里
+验证**（真 rg + 真 git 仓库），而不是只跑桩测试。桩测试全绿，真环境却会静默隐藏 CI/配置。

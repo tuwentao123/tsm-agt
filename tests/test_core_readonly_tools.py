@@ -670,7 +670,12 @@ class RipgrepVisibilityFilterTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("generated/artifact.py", paths)
 
     async def test_the_command_gets_files_mode_and_every_exclude_glob(self) -> None:
-        """Both policies must apply: ripgrep's own plus EXCLUDED_DIRECTORIES."""
+        """Both policies must apply: ripgrep's own plus EXCLUDED_DIRECTORIES.
+
+        ``--hidden`` is part of the contract, not a detail: without it ripgrep
+        also drops ``.github/``, ``.eslintrc*`` and ``.gitlab-ci.yml``, which are
+        ordinary project files to a coding agent.
+        """
 
         argv_file = self._use_stub("src/app.py")
 
@@ -678,6 +683,7 @@ class RipgrepVisibilityFilterTest(unittest.IsolatedAsyncioTestCase):
 
         argv = argv_file.read_text(encoding="utf-8").split()
         self.assertIn("--files", argv)
+        self.assertIn("--hidden", argv)
         for name in sorted(EXCLUDED_DIRECTORIES):
             self.assertIn(f"!{name}", argv)
 
