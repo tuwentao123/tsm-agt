@@ -102,6 +102,8 @@ _MAX_FETCH_BYTES = 20000
 # Wire limit and text limit are different budgets: a readable article is easily
 # ten times its extracted text once markup is counted. Reading more bytes than
 # the text budget keeps the fetch bounded without rejecting ordinary documents.
+_MIN_RENDERABLE_TEXT_CHARS = 200
+_RENDER_TIMEOUT_SECONDS = 20.0
 _MAX_FETCH_RESPONSE_BYTES = 512_000
 _MAX_FETCH_REDIRECTS = 3
 _ALLOWED_FETCH_CONTENT_TYPES = frozenset({
@@ -1073,6 +1075,7 @@ class NetworkToolProvider:
         search_tavily_mode: str = "off",
         search_tavily_api_key: str = "",
         search_mode: str = "cached",
+        render_url: str = "",
     ) -> None:
         """Expose public search and a bounded document fetch.
 
@@ -1114,6 +1117,9 @@ class NetworkToolProvider:
         if search_scope not in {"off", "cached", "live"}:
             raise ValueError("search_mode must be 'off', 'cached', or 'live'")
         self._search_mode = search_scope
+        #: Optional host-supplied service that returns rendered text for a URL.
+        #: Empty means "no rendering available", which is the previous behavior.
+        self._render_url = (render_url or "").strip()
         self._egress_mode = WebEgressMode(egress_mode)
         self._fetch_transport = fetch_transport or (
             PinnedAddressWebFetchTransport()
@@ -1336,11 +1342,26 @@ class NetworkToolProvider:
                 parser.close()
                 text = parser.text()
             content = html.unescape(text[:_MAX_FETCH_CHARS])
+            # A JS-rendered app before its bundle runs converts to almost
+            # nothing. When the host configured a render service, ask it for the
+            # rendered text instead of handing the model a blank page. Only HTML
+            # is retried: plain text and Markdown have no rendering step to miss.
+            rendered_by = ""
+            if (
+                self._render_url
+                and content_type == "text/html"
+                and len(content.strip()) < _MIN_RENDERABLE_TEXT_CHARS
+            ):
+                rendered = self._render_remote(current_url)
+                if rendered:
+                    content = html.unescape(rendered[:_MAX_FETCH_CHARS])
+                    rendered_by = "service"
             return {
                 "url": current_url,
                 "requested_url": requested_url,
                 "content_type": content_type,
                 "content": content,
+                "rendered_by": rendered_by,
                 "truncated": response.truncated or len(text) > _MAX_FETCH_CHARS,
                 "redirect_count": redirects,
                 "egress_mode": str(self._egress_mode),
@@ -1348,6 +1369,54 @@ class NetworkToolProvider:
                     self._egress_mode is WebEgressMode.DIRECT
                 ),
             }
+
+    def _render_remote(self, url: str) -> str | None:
+        """Ask the configured render service for a page's rendered text.
+
+        The service is operator-supplied, so it is contacted directly instead of
+        through the document transport: it is not the target being fetched, and
+        the operator already chose to trust it. Any failure -- unreachable,
+        non-2xx, unparseable, or a payload with no usable field -- degrades to
+        ``None`` so the caller keeps the thin document it already has rather than
+        turning an optional fallback into a hard error.
+        """
+
+        request = Request(
+            self._render_url,
+            data=json.dumps({"url": url}).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/html, text/plain",
+                "User-Agent": _USER_AGENT,
+            },
+        )
+        try:
+            with urlopen(request, timeout=_RENDER_TIMEOUT_SECONDS) as response:
+                if not 200 <= int(response.status) < 300:
+                    return None
+                payload = response.read(_MAX_FETCH_RESPONSE_BYTES)
+        except (HTTPError, URLError, OSError, ValueError):
+            return None
+        try:
+            decoded: Any = json.loads(payload.decode("utf-8", errors="replace"))
+        except ValueError:
+            return payload.decode("utf-8", errors="replace").strip() or None
+        if not isinstance(decoded, Mapping):
+            return None
+        for key in ("content", "text", "markdown"):
+            value = decoded.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        # A service that answers "here is the rendered HTML" still needs the same
+        # conversion the direct path uses.
+        raw_html = decoded.get("html")
+        if isinstance(raw_html, str) and raw_html.strip():
+            parser = _HTMLToTextParser()
+            parser.feed(raw_html)
+            parser.close()
+            return parser.text().strip() or None
+        return None
 
     @staticmethod
     def _decode_fetch_content(payload: bytes, content_type: str) -> str:

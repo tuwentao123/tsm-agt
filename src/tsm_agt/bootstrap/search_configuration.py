@@ -11,6 +11,7 @@ SEARCH_ENV_NAMES = (
     "TSM_AGT_SEARCH_MODE",
     "TSM_AGT_SEARCH_TAVILY_MODE",
     "TSM_AGT_SEARCH_TAVILY_API_KEY",
+    "TSM_AGT_WEB_RENDER_URL",
 )
 
 #: Modes accepted for the optional Tavily provider.
@@ -45,6 +46,9 @@ class SearchConfiguration:
     tavily_mode: str = "off"
     tavily_api_key: str = ""
     search_mode: str = DEFAULT_SEARCH_MODE
+    #: Optional host-supplied service that renders a URL to text. Empty means no
+    #: rendering: a JS-only page simply comes back thin, as it always has.
+    render_url: str = ""
     sources: Mapping[str, str] | None = None
     #: Human-readable configuration problems. Search is an optional provider,
     #: so a bad value degrades to ``off`` and is reported instead of taking the
@@ -89,12 +93,24 @@ def load_search_configuration(
             "providers"
         )
         mode = "off"
+    raw_render_url, render_source = _selected(
+        "TSM_AGT_WEB_RENDER_URL", values, environment, ""
+    )
+    render_url = raw_render_url.strip()
+    if render_url and not render_url.startswith(("http://", "https://")):
+        issues.append(
+            f"TSM_AGT_WEB_RENDER_URL={render_url!r} must be an absolute "
+            "http(s) URL; page rendering stays disabled"
+        )
+        render_url = ""
     return SearchConfiguration(
         tavily_mode=mode,
+        render_url=render_url,
         tavily_api_key=api_key,
         search_mode=search_mode,
         sources={
             "search.mode": search_mode_source,
+            "web.render_url": render_source if render_url else "unset",
             "search.tavily_mode": mode_source,
             # Record provenance without ever exposing the secret value.
             "search.tavily_api_key": (

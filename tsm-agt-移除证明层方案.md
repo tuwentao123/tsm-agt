@@ -1663,3 +1663,29 @@ B2 = `web.fetch_markdown` 拿不到有效内容时，委托一个**已配置的 
    （browserless / playwright service 之类），客户端只用 `urllib` POST —— **完全零依赖、最简单、
    可用现有假 transport 模式测试、仍然显式 opt-in**。代价是运维要跑一个渲染服务，而不是指向
    一个已存在的 Chrome。
+
+## A.2a B2 落地（路径 3：HTTP 渲染服务，非 CDP）
+
+用户选"推荐 3"：不引入 WebSocket/CDP，改为**委托一个运维提供的 HTTP 渲染服务**。
+
+* **配置**：`TSM_AGT_WEB_RENDER_URL`（须为绝对 http(s)，否则记 issue 并保持禁用）；
+  `search_configuration.py` 新增 `render_url`，`sources` 记录 `web.render_url` provenance；
+  两个 `NetworkToolProvider` 站点都传 `render_url=`。
+* **触发（三条同时满足）**：① 配了 `render_url`；② 响应是 `text/html`（纯文本/Markdown
+  没有渲染步骤可错过）；③ **直连转换后的文本 < 200 字符**（`_MIN_RENDERABLE_TEXT_CHARS`）。
+  这正是 JS 应用 bundle 未执行时得到的空壳。
+* **请求形状**：`POST` + `application/json` `{"url": ...}`；接受 `content`/`text`/`markdown`
+  任一字段；若服务返回 `{"html": ...}` 则走**同一个** `_HTMLToTextParser` 转换。
+* **失败一律降级**：不可达 / 非 2xx / 无法解析 / 无可取字段 → 返回 `None`，**保留原来那份薄文档**，
+  不把可选回退变成硬错误。
+* **未配置时行为完全不变**（默认 `render_url=""`）。
+* 结果新增 `rendered_by`（`""` 或 `"service"`），让调用方看得出这份内容是谁给的。
+
+测试 +5：未配置时**断言不得联系服务**（把 `urlopen` 换成会抛的桩）、配置且内容薄 → 替换并标
+`service`、服务返回 HTML → 走同一转换、服务失败 → 保留原文档、**内容充分时不发渲染请求**。
+
+1272 passed / 12 skipped / 0 failed。
+
+**为什么不是 CDP**：CDP 要 WebSocket，而本仓库零 WS 实现、零 WS 依赖（实测 `websockets`/`wsproto`
+都未安装，连传递依赖都没有）。为"让 JS 页面能读"而引入一个 200+ 行手写帧解析器或多一个运行时依赖，
+不划算；HTTP 委托拿到同样的能力。若日后确实要连已有 Chrome（复用登录态/调试端口），再单独评估 CDP。

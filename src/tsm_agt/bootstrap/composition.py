@@ -953,6 +953,7 @@ def compose_openai_compatible_readonly_application(
         search_tavily_mode=search.tavily_mode,
         search_tavily_api_key=search.tavily_api_key,
         search_mode=search.search_mode,
+        render_url=search.render_url,
     ))
     registry.register(ToolProviderPort, CoreMemoryToolProvider())
     registry.register(ToolProviderPort, CoreWorkingMemoryToolProvider())
@@ -1118,6 +1119,7 @@ def compose_openai_compatible_engineering_application(
         search_tavily_mode=search.tavily_mode,
         search_tavily_api_key=search.tavily_api_key,
         search_mode=search.search_mode,
+        render_url=search.render_url,
     ))
     registry.register(ToolProviderPort, CoreProcessToolProvider())
     registry.register(ToolProviderPort, CoreWorkspaceMutationToolProvider())

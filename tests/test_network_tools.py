@@ -670,3 +670,121 @@ class WebSearchModeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(failure)
         self.assertEqual(failure.error_code, "SEARCH_NOT_CACHED")
         self.assertIn("TSM_AGT_SEARCH_MODE=live", failure.message)
+
+
+class _RenderResponse:
+    """Minimal stand-in for a render service's HTTP response."""
+
+    def __init__(self, payload) -> None:
+        self._body = json.dumps(payload).encode("utf-8")
+        self.status = 200
+
+    def read(self, _limit=None) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        return False
+
+
+class PageRenderingTest(unittest.IsolatedAsyncioTestCase):
+    """A configured render service rescues content that needs JavaScript.
+
+    Three guards matter and are each pinned below: only HTML is retried, only
+    when the converted text is thin, and any service failure keeps the original
+    document. With no render URL configured the old behavior is untouched --
+    which is what keeps this an opt-in rather than a new dependency.
+    """
+
+    URL = "https://app.example.test/"
+    SHELL = (
+        b"<html><body><div id=root></div>"
+        b"<script src=/app.js></script></body></html>"
+    )
+
+    def _provider(self, body: bytes = SHELL, **kwargs) -> NetworkToolProvider:
+        transport = _FakeFetchTransport({
+            self.URL: FetchResponse(
+                200, self.URL,
+                {"Content-Type": "text/html; charset=utf-8"}, body,
+            )
+        })
+        return NetworkToolProvider(
+            fetch_transport=transport, address_resolver=_public_resolver, **kwargs
+        )
+
+    async def _fetch(self, provider) -> object:
+        await provider.start(AdapterContext({}, lambda *_: None))
+        self.addAsyncCleanup(provider.stop, datetime.now(timezone.utc))
+        return await provider.invoke(
+            ToolCall("fetch", "web.fetch_markdown", {"url": self.URL}), None,
+        )
+
+    async def test_unconfigured_never_contacts_a_render_service(self) -> None:
+        def _explode(*_args, **_kwargs):  # pragma: no cover - must not run
+            raise AssertionError("render service contacted without configuration")
+
+        with patch("tsm_agt.adapters.builtin.network_tools.urlopen", _explode):
+            result = await self._fetch(self._provider())
+
+        self.assertTrue(result.ok, result.to_data())
+        self.assertEqual(result.data["rendered_by"], "")
+
+    async def test_a_configured_service_replaces_thin_content(self) -> None:
+        provider = self._provider(render_url="https://render.example.test/")
+        rendered = "Rendered body text. " * 40
+
+        with patch(
+            "tsm_agt.adapters.builtin.network_tools.urlopen",
+            return_value=_RenderResponse({"content": rendered}),
+        ):
+            result = await self._fetch(provider)
+
+        self.assertTrue(result.ok, result.to_data())
+        self.assertEqual(result.data["rendered_by"], "service")
+        self.assertIn("Rendered body text.", result.data["content"])
+
+    async def test_a_service_returning_html_is_converted_like_a_direct_fetch(self) -> None:
+        provider = self._provider(render_url="https://render.example.test/")
+
+        with patch(
+            "tsm_agt.adapters.builtin.network_tools.urlopen",
+            return_value=_RenderResponse({
+                "html": "<html><body><p>Rendered paragraph.</p></body></html>",
+            }),
+        ):
+            result = await self._fetch(provider)
+
+        self.assertEqual(result.data["rendered_by"], "service")
+        self.assertIn("Rendered paragraph.", result.data["content"])
+        self.assertNotIn("<p>", result.data["content"])
+
+    async def test_a_failing_service_keeps_the_original_document(self) -> None:
+        provider = self._provider(render_url="https://render.example.test/")
+
+        with patch(
+            "tsm_agt.adapters.builtin.network_tools.urlopen",
+            side_effect=OSError("renderer down"),
+        ):
+            result = await self._fetch(provider)
+
+        self.assertTrue(result.ok, result.to_data())
+        self.assertEqual(result.data["rendered_by"], "")
+        self.assertEqual(result.data["content"].strip(), "")
+
+    async def test_a_rich_html_page_is_not_sent_to_the_service(self) -> None:
+        rich = ("<html><body>" + "<p>Plenty of real text.</p>" * 40 + "</body></html>")
+
+        def _explode(*_args, **_kwargs):  # pragma: no cover - must not run
+            raise AssertionError("a page with content was sent for rendering")
+
+        provider = self._provider(
+            body=rich.encode("utf-8"), render_url="https://render.example.test/",
+        )
+        with patch("tsm_agt.adapters.builtin.network_tools.urlopen", _explode):
+            result = await self._fetch(provider)
+
+        self.assertEqual(result.data["rendered_by"], "")
+        self.assertIn("Plenty of real text.", result.data["content"])
