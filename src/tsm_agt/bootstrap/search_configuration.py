@@ -23,12 +23,13 @@ TAVILY_MODES = ("off", "keyless", "key")
 #: * ``cached`` -- only results this process already holds; **no egress**.
 #: * ``live``   -- query the public providers.
 #:
-#: The default is ``cached``, which is Codex's default too: a client-side
-#: searcher that reaches third-party endpoints by default would make every agent
-#: run a network decision nobody approved. Unlike Codex there is no provider-side
-#: index behind it, so ``cached`` starts empty and refuses until a ``live`` run
-#: has populated it -- that refusal is deliberate and names the setting.
-DEFAULT_SEARCH_MODE = "cached"
+#: The default is ``live``, a deliberate departure from Codex's ``Cached``
+#: default: Codex can afford ``Cached`` because its provider indexes the web
+#: server-side, while this Runtime has no index behind the cache -- ``cached``
+#: would ship a search tool that answers nothing until something else filled the
+#: cache. ``live`` queries public endpoints that need no account; ``cached`` and
+#: ``off`` exist for hosts that want the stricter posture.
+DEFAULT_SEARCH_MODE = "live"
 SEARCH_MODES = ("off", "cached", "live")
 
 

@@ -1074,7 +1074,7 @@ class NetworkToolProvider:
         ),
         search_tavily_mode: str = "off",
         search_tavily_api_key: str = "",
-        search_mode: str = "cached",
+        search_mode: str = "live",
         render_url: str = "",
     ) -> None:
         """Expose public search and a bounded document fetch.
@@ -1092,12 +1092,14 @@ class NetworkToolProvider:
         Tavily is prepended as the primary source only when explicitly enabled,
         because it forwards the query to a third party.
 
-        ``search_mode`` is ``cached`` (default), ``off``, or ``live`` and sits
-        above every provider: ``cached`` serves only what this process already
-        holds and never opens a connection, ``off`` refuses outright, and
-        ``live`` queries the public providers. The default matches Codex's
-        ``WebSearchMode::Cached`` -- reaching third-party endpoints must be a
-        decision the host made, not a side effect of asking a question.
+        ``search_mode`` is ``live`` (default), ``cached``, or ``off`` and sits
+        above every provider: ``live`` queries the public providers, ``cached``
+        serves only what this process already holds and never opens a
+        connection, and ``off`` refuses outright. The default departs from
+        Codex's ``WebSearchMode::Cached`` on purpose: Codex's provider indexes
+        the web server-side, so its cache is never empty, while this Runtime
+        would ship a search tool that answers nothing. Hosts wanting the
+        stricter posture set ``cached`` or ``off``.
         """
         if search_provider_timeout_seconds <= 0:
             raise ValueError("search_provider_timeout_seconds must be positive")

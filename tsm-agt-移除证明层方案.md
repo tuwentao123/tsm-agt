@@ -1689,3 +1689,18 @@ B2 = `web.fetch_markdown` 拿不到有效内容时，委托一个**已配置的 
 **为什么不是 CDP**：CDP 要 WebSocket，而本仓库零 WS 实现、零 WS 依赖（实测 `websockets`/`wsproto`
 都未安装，连传递依赖都没有）。为"让 JS 页面能读"而引入一个 200+ 行手写帧解析器或多一个运行时依赖，
 不划算；HTTP 委托拿到同样的能力。若日后确实要连已有 Chrome（复用登录态/调试端口），再单独评估 CDP。
+
+## A.2b 搜索默认改为 `live`（用户决定）
+
+A.1y 把默认设成 `cached`（对齐 Codex）。用户要求"默认就能联网"，故改为 **`live`**：
+
+* `DEFAULT_SEARCH_MODE = "live"`；`NetworkToolProvider.search_mode` 默认同样为 `"live"`。
+* 文档串同步改写，并写明**为什么这里与 Codex 不同**：Codex 能用 `Cached` 是因为它的 provider
+  **服务端有索引**，缓存永不为空；本运行时缓存背后没有索引，`cached` 会交付一个"直到别的东西填过
+  缓存才有答案"的搜索工具。`cached` / `off` 仍保留给要更严格姿态的部署。
+* 测试同步：原"默认 cached 且不得开连接"改写为两条 ——
+  **`test_default_mode_queries_the_network`**（默认会联网：把全部 provider 弄失败，断言得到
+  `SEARCH_UNAVAILABLE`；若是 `cached` 默认则会是 `SEARCH_NOT_CACHED`，**用失败码证明联网已发生**）
+  与 **`test_cached_mode_refuses_without_egress`**（显式 `cached` 时仍不得开连接）。
+
+1273 passed / 12 skipped / 0 failed。

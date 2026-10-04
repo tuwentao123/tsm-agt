@@ -45,7 +45,7 @@ def _public_resolver(_host: str, _port: int) -> tuple[str, ...]:
 class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         # These tests exercise the provider chain, which only runs when egress is
-        # permitted. The default is ``cached`` (see WebSearchModeTest).
+        # permitted. The default is ``live`` (see WebSearchModeTest).
         self.provider = NetworkToolProvider(search_mode="live")
         await self.provider.start(AdapterContext({}, lambda *_: None))
 
@@ -569,15 +569,42 @@ if __name__ == "__main__":
 class WebSearchModeTest(unittest.IsolatedAsyncioTestCase):
     """``web.search`` must not reach the network unless the host said it may.
 
-    Mirrors Codex's ``WebSearchMode``: ``cached`` is the default and performs no
-    egress, ``off`` refuses, and ``live`` is the opt-in that queries public
-    providers. The failure mapping mirrors Hermes' ``success: false`` -- an
-    outage reported as ``ok=True`` with an empty list would let a model conclude
-    that a fact does not exist when in truth nothing answered.
+    Mirrors Codex's ``WebSearchMode`` with one deliberate difference: the default
+    is ``live``, because unlike Codex there is no provider-side index for
+    ``cached`` to serve from. ``cached`` (no egress) and ``off`` remain available
+    for hosts that want the stricter posture. The failure mapping mirrors Hermes'
+    ``success: false`` -- an outage reported as ``ok=True`` with an empty list
+    would let a model conclude that a fact does not exist when in truth nothing
+    answered.
     """
 
-    async def test_default_mode_is_cached_and_refuses_without_egress(self) -> None:
+    async def test_default_mode_queries_the_network(self) -> None:
+        """The default is ``live``: search works out of the box.
+
+        Proven by the failure *code*. Every provider is made to fail, so a
+        successful search is impossible either way -- but a ``cached`` default
+        would have refused with ``SEARCH_NOT_CACHED`` and opened nothing, while
+        ``SEARCH_UNAVAILABLE`` is only reachable after the providers actually ran.
+        """
+
         provider = NetworkToolProvider()
+        await provider.start(AdapterContext({}, lambda *_: None))
+        self.addAsyncCleanup(provider.stop, datetime.now(timezone.utc))
+
+        with patch(
+            "tsm_agt.adapters.builtin.network_tools.urlopen",
+            side_effect=OSError("no route to host"),
+        ):
+            result = await provider.invoke(
+                ToolCall("default-1", "web.search", {"query": "today NBA news"}),
+                None,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "SEARCH_UNAVAILABLE")
+
+    async def test_cached_mode_refuses_without_egress(self) -> None:
+        provider = NetworkToolProvider(search_mode="cached")
         await provider.start(AdapterContext({}, lambda *_: None))
         self.addAsyncCleanup(provider.stop, datetime.now(timezone.utc))
 
