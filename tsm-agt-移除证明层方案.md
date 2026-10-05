@@ -2481,3 +2481,57 @@ interpretation (NON_AUTHORITATIVE):
 planner 失败时**不中断任务，直接不带 spec 继续** —— agent 拿原始 goal + session 历史，
 这正是 Hermes 的形态（`plan_task_spec` 已经把 `planner is None` 当成"没有 spec"处理，
 所以这条路本来就被支持）。
+
+## A.11 追问："为啥模型返回的 tool call 参数不是合法 JSON"
+
+### 字面答案
+
+`adapters/openai_compatible/model.py:982-1000`：把 tool call 的 `arguments` 字符串直接交给
+`json.loads`，失败就抛 `OpenAICompatibleProviderError("tool call ... contains invalid JSON arguments")`。
+
+### 但最可能**不是模型乱吐 JSON，而是被输出上限截断了**
+
+三条已核实的事实：
+
+**1. 解析点不看 `finish_reason`。** `raw_reason` 在 `:928` 就拿到了，映射表里也有
+`"length" → FinishReason.LENGTH`（`:1070`），但 `:995-1000` 那个 `json.loads` **没有检查它**。
+所以**被 token 上限截断的 tool call，报出来的就是"contains invalid JSON arguments"** —— 归因错了。
+对比：文本侧是处理截断的（`:477` 注释、`:1154`/`:1159` 都返回 `"truncated"`）。
+
+**2. planner 的输出上限只有 1200 token**（`planner.py:165`，自 `4017adf` 起，非本会话引入）。
+而真实 spec 实测（账本里 8 份 `task_spec.revised`，统计 planner 自己写的那几个字段）：
+
+| task | ~tokens |
+|---|---|
+| task-fc076bf9… | 863 |
+| task-4c6f8c8e… | **957** |
+| task-03c23316… | 848 |
+| task-05188ca7… | 783 |
+| task-9c47b2a0… | 581 |
+| task-71a9d71e… | 598 |
+| task-08bccfac… | 608 |
+| task-12d7759… | 365 |
+
+**最大 957，已经是上限的 80%。** 再长 25% 就会撞线。
+
+**3. 重采样用的是同一个上限。** 所以若真是截断，重试**必然再次截断**
+→ 耗尽 → `ModelRecoveryExhausted` → INTERRUPTED。这正好解释了为什么它走进死胡同，
+而 14:58 那次（**agent** 路径，上限 **8192**）第一次重采样就成功了。
+
+### 无法证实的部分（诚实说明）
+
+**账本里没有记录 `finish_reason`** —— 只有那句错误消息。所以这是一个**强假设，不是测量**。
+要证实，只需在解析失败处把 `raw_reason` 一并记入事件。
+
+### 与我改动的关系
+
+1200 的上限是 `4017adf` 遗留，不是我加的。但我这次让 planner 提示词更长、并明确要求
+"两种解读会产出实质不同交付物时，把歧义写进 goal" —— **这会让 spec 变长**，
+而 spec 本来就已经贴到上限的 80%。所以"可能是我把线推过去了"是合理怀疑，不是客套。
+
+### 三个可修点（按价值）
+
+1. **解析点识别 `finish_reason == "length"`**，报诚实的错误码（如 `truncated_tool_arguments`），
+   而不是诬赖模型 JSON 非法。
+2. **截断不要原样重采样** —— 要么抬高上限重试，要么按 A.10 直接跳过 spec 继续。
+3. **抬高 planner 输出上限**（1200 → 4096）。实测最大 957，1200 太紧。
