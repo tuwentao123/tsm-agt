@@ -1793,3 +1793,120 @@ A.2c 是**确定性**的（代码判定），这一层是**提示词**约束 —
 提示词的概率应当明显更高（它上次遵守了升级工具的**相反**指令，说明它在读提示词），但**我没有在真实
 模型上验证过**：模型端点此刻很慢，且免费搜索后端在本沙箱多半不可达，跑一次真实回合的性价比太低。
 **真正的验证需要你在自己的环境里再问一次**，然后看 ledger 里有没有 `tool.requested web.search`。
+
+## A.2e 对齐 Hermes：独立的 `mandatory-tool-use` 段（用户选路线一）
+
+### 先回答用户的问题："Codex 如果不用提示词引导，那是怎么调用的"
+
+这个问题必须先答清楚，因为它决定了路线选择对不对。结论：**Codex 根本没有"调用"这一步。**
+
+Responses API 的 `tools` 里混着两类东西，区别只在**谁执行循环**：
+
+| | 客户端工具 (function) | 服务端托管工具 (hosted) |
+|---|---|---|
+| 声明 | `{"type":"function","name":...,"parameters":{...}}` | `{"type":"web_search"}` |
+| 谁生成 query | 模型写进 `arguments` | 模型（服务商内部） |
+| **谁发 HTTP** | **客户端** | **服务商** |
+| 谁的循环 | 模型停下 → 客户端执行 → 再发一轮 | 全程不离开服务商 |
+
+Codex 走托管路径时的完整报文：客户端只发 `tools: [{"type":"web_search"}]` +
+`tool_choice: "auto"`，然后等着；服务商内部模型决定搜、服务商服务器执行搜、模型读结果、
+模型写出最终答案；客户端收到的是**完成时态的报告**：
+
+```
+response.output_item.done {"id":"ws_...","type":"web_search_call","status":"completed",
+                           "action":{"type":"search","query":"weather seattle"}}
+```
+
+`web_search_call` 不是请求而是回执，所以 Codex 这边连结果都不需要（`results: None`）。
+
+**证据**：全仓 20+ 处 `WebSearchCall` 引用没有一处执行 ——
+`protocol/src/models.rs:983`（结构定义）+ `:3406`（roundtrip 测试）是解析；
+`core/src/event_mapping.rs:223` 转成 `TurnItem::WebSearch { query, action, results: None }` 给 TUI 画一行；
+`core/src/session/turn.rs:2272` 只抠出 `id` 塞进 `analytics_tool_call_ids` 埋点；
+其余全是 `match` 里的 `{ .. }` 忽略分支（history/compact/rollout/otel/telemetry），
+纯粹为了编译期穷尽性。真正自己执行的搜索是**另一个**扩展工具 `web.run`，与托管路径互斥。
+
+所以"不需要提示词"不是"没有指令"，而是**指令不在 Codex 的提示词文件里，在服务商那边**。
+客户端工具必须靠提示词，是因为模型必须**停下来把控制权交还**（`function_call` → 流结束 →
+客户端执行 → 再发一轮补 `function_call_output`）。托管工具模型从不交还控制权。
+
+**对 tsm-agt 的结论**：托管路径结构上不可用 —— 那 7 条后端链（Tavily / DDG Lite / DDG HTML /
+Bing RSS / RSS / DDG Instant / Wikipedia）是本进程里的代码，没有服务商会替你跑。
+tsm-agt 永远站在客户端工具这一侧，而这一侧**提示词是唯一能施加影响的杠杆**。
+这正是用户选路线一（对齐 Hermes）而不是"路由层确定性预取"的原因：预取是特殊补丁。
+
+### 落地：新增独立段，而不是塞进 `harness-instructions`
+
+第一次尝试是把 Hermes 的 `<mandatory_tool_use>` 表**追加进** `harness-instructions`，
+结果 **10 个测试挂掉**，已 `git checkout --` 回滚。原因见
+`tests/test_prompt_manifest.py:115-128` 的设计规则：
+
+> The rule keys off evidence form ("a document you have not read"), so it must never
+> name a content category the harness cannot judge.
+
+`harness-instructions` 里那条"外部文档要先读再断言"的规则之所以能成立，正是因为它**依据证据形态**、
+不点名任何内容类别。而 Hermes 的场景路由表**必须**点名类别（天气/新闻/版本…）。两者是矛盾的设计约束，
+塞在同一段里必然互斥。
+
+所以新开一段 `mandatory-tool-use`（`source="harness"`, `version="1.0"`），把场景→工具表映射到
+tsm-agt 自己的工具名（`core.run_command` / `core.read_file` / `core.find_files` / `core.search_text` /
+`web.search` / `web.fetch_markdown`）。两条规则各自成立、各有断言：
+
+- `harness-instructions` 保持通用（原测试不动，只改 `revision`）
+- `mandatory-tool-use` 承载场景路由（新增 `test_mandatory_tool_use_segment_routes_live_facts_to_search`）
+
+字段名改为 tsm-agt 的实际工具名，不是照抄 Hermes 的 `terminal` / `read_file` / `web_search` ——
+照抄会指向不存在的工具。
+
+### `revision 9 → 10`，以及 204 个 token 的连带影响
+
+新段 745 字符 ≈ **204 estimated tokens**，`static_system` 602 → 806。
+真实窗口（128k）下无影响，但有一批测试**故意把窗口卡得很小**来做压缩行为测试，
+于是 `ContextWindowExceeded` 全挂 —— 正好 10 个，全部同一根因。
+
+修法沿用本仓已有的先例（`test_context_compaction.py` 里 `GrowingContextModel` 上方
+"Baseline raised from 1800 to 2048" 那段注释）：**窗口涨同样的 204，恢复原来的 slack**。
+这样每个测试测的还是它原来测的那个压缩行为。`test_context_compaction.py` 里抽成常量
+`STATIC_PROMPT_GROWTH_TOKENS = 204` 并写明理由。
+
+| 位置 | 原值 | 新值 |
+|---|---|---|
+| `test_context_compaction.py` 单组压缩 | 1300 | +204 |
+| `test_context_compaction.py` 重复压缩 | 1200 ×2 | +204 |
+| `test_context_compaction.py` `GrowingContextModel` | 2048 | +204 |
+| `test_context_compaction.py` `_compact()` | 3000 ×2 | +204 |
+| `test_multiturn_context.py` 默认窗口 | 4096 | 4300 |
+| `test_working_memory.py` `WorkingMemoryModel` | 4096 | 4300 |
+
+**1278 passed / 12 skipped / 0 failed。**
+
+### 端到端确认（不是只跑单测）
+
+用 fixture 真实组一次会话，确认新段确实进了模型的请求、且顺序正确：
+
+```
+prompt-system-safety-r10
+prompt-harness-instructions-r10
+prompt-mandatory-tool-use-r10     ← 新增
+prompt-runtime-r10                ← 时态锚点
+task-spec-context-r1-...
+session-context-1-...
+```
+
+### 与 A.2d 的重叠：保留，但有话直说
+
+两层确实有重叠，但**层次不同**：
+
+- **runtime 锚点**（每次调用携带）：今天几号 + "收到的发布日期不算未来" + 时效问题要去查
+- **静态段**（策略）：把**各类**东西（算术、系统状态、文件、git、时效事实）路由到**具体工具名**
+
+Hermes 也是这两层并存。重叠约 40 token/次调用，我判断值得；如果你要削，可以只留 runtime 锚点里的
+日期部分（那需要同时改 `tests/test_temporal_instruction.py` 的 2 条 pin）。
+
+### 诚实说明：这一层仍是"提示词约束"
+
+A.2c 是确定性的（路由层代码判定），A.2d / A.2e 都是提示词约束，生效取决于模型合规。
+**我没有在真实模型上验证过**：模型端点此刻比平时慢约 12 倍，且免费搜索后端在本沙箱多半不可达。
+**真正的验证需要你在自己环境里再问一次时效性问题**，然后看 ledger 里有没有
+`tool.requested web.search`。
