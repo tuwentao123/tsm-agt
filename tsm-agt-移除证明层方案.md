@@ -2127,3 +2127,33 @@ CONTINUATION 正是交付不了。让规则 3 在这种情况下不拒绝，纯�
   已用 WAL 安全备份（`.agent/ledger-before-probe-cleanup-20261005-151546.db`，27.2 MB）
   后精确删除，session 列表已恢复为原来的 2 个。
 - `git worktree` 已清理，未留残留。
+
+### A.5 落地：按 F1 修复（`ba54064`）
+
+规则 3 现在调用新的 `_pending_action_is_undeliverable(session_id, task, workspace)`：
+
+1. 老的 `_awaits_orphaned_action`（reason 在黑名单里）仍先判；
+2. 否则按**该 Task**（不是整个 Session）解析续接
+   `resolve_session_continuation(session_id, workspace, task_id=task.task_id)`，
+   `mode ∈ {BLOCKED, EMPTY}` 即视为不可交付 → 不再拒绝纯文本。
+
+逐 Task 解析是必要的：若按 Session 解析，同一 Session 里另一个待审批的 Task 会让
+这个不可恢复的 active Task 看起来"可交付"，从而继续错误地拒绝。
+
+解析抛异常时**保持保守拒绝** —— 不拿猜测去把纯文本重新解释成新话题。
+
+账本副本实跑验证（用户报障的那句话原样输入）：
+
+```
+active before: task-9a54f8ebe6ba469c9dfdf49f317fed8f
+plain text -> kind=task   task=task-7a752fead5c04dbb8b23c9695f9021b4
+active after : task-7a752fead5c04dbb8b23c9695f9021b4
+parked task state: AWAITING_USER   ← 原样未动，/resume 仍能列出
+```
+
+新增 2 条回归测试（`tests/test_orphaned_running_tasks.py`）：
+续接 BLOCKED → 不再拒绝；续接 RESUME_CONTINUATION → 仍然拒绝。
+
+**1279 passed / 12 skipped / 0 failed。**
+
+注意：修复在 `sdk/runtime.py`，**需要重启进程才生效**（`bash scripts/restart.sh web`）。
