@@ -2282,3 +2282,69 @@ COMMAND_RESULT, or ARTIFACT_DELIVERY outcomes carrying mutate or execute effects
 
 > 另注：A.2c 的时效性路由兜底 `answer_route_overridden_needs_live_information`
 > 在账本里已触发 **6 次**，工作正常。
+
+## A.8 A.7 的根因更深一层：**INV-8 让 planner 根本看不到对话**
+
+A.7 我说"planner 被禁止用上文解释这一句"。查到底后要修正：**它根本不是被"禁止"，是看不到。**
+
+`core/kernel_task.py:185-193`：
+
+```python
+# INV-8: the Planner is scoped to this Task's own lineage and receives
+# no background at all. Another Task's conversation can therefore never
+# become this Task's goal or acceptance criterion, and recency is not an
+# eligibility rule.
+scope = ContextScope(session_id=task.session_id, task_id=task.task_id,
+                     lineage_task_ids=(task.task_id,))
+prompt_projection = ...for_prompt(..., scope=scope, include_background=False)
+```
+
+`ContextScope.allows()` 只认 `lineage_task_ids` 里的消息（`session_context.py:256-264`）。
+新 Task 在规划时刻只有一条消息 —— 用户那句話。所以 planner 拿到的
+`session.scoped_messages` **恰好只有 `"原因 直接写文档吧"` 这一条**。
+
+上一轮那句「如果你愿意…我可以…写文档」属于**另一个 Task**（`task-cbe729b7`），
+既不在 `scoped_messages`，也不在 `background_messages`（`include_background=False`）。
+**planner 结构上不可能知道"愿意"这个候选词。**
+
+而 **agent 看得到**：`llm.completed` 的 `session_history = 15132` tokens，
+`session_events` 里含「如果你愿意」的有 5 条。
+
+### 矛盾就在这里
+
+> **看不到对话的那一层（planner）负责写出权威解读；看得到对话的那一层（agent）必须服从它。**
+
+回退分支的注释（`kernel_session.py:1035-1037`）说得很清楚：
+"creates a contextual Task so the normal Agent receives the durable Session history
+and **can resolve the user's intent itself**" —— 但 planner 抢在前面把误读写成了
+`scope` + `doc_topic_reason`，agent 于是没有理由再去解析意图。
+
+而且路由其实**已经标好了** `input_grounding = CONTEXT_DEPENDENT`
+（`kernel_session.py:822`、记录于 `:1380`），但这个信号**没有透传到 task 创建/规划路径**：
+`kernel_task.py:245-271` 的 planning context 里只有 `selection`（纯计数），没有 grounding。
+
+### 参考 Hermes 的方式
+
+Hermes 的结构是「解读那一层本来就看得见对话」：
+
+- `agent/prompt_builder.py:169-172` `SESSION_SEARCH_GUIDANCE`：
+  "When the user references something from a past conversation or you suspect relevant
+  cross-session context exists, use `session_search` to recall it **before asking them
+  to repeat themselves**."
+- 单一 prompt：用户消息 + 对话 + 工具一起给模型 —— **没有"在看不到对话的情况下先定解读"的层**。
+- `tools/clarify_tool.py` 的 `clarify` 工具，配 `<act_dont_ask>`（`:405-412`）：
+  默认解读明显就直接做，只有"歧义真的会改变你要调哪个工具"时才问。
+
+tsm-agt 已经有 `core.request_input`（≈ clarify，`kernel.py:3899-3922`，≤3 choices）。
+缺的不是工具，是**顺序**。
+
+### 两条路
+
+- **(A′) 放宽 planner 的可见性**：把上一轮 user/assistant 交换也给 planner。
+  **风险高**：INV-8 本身是为修一个真缺陷而立的（`kernel_task.py:161-163`："Deriving lineage
+  from a recent-window summary instead would make the source depend on recency, which is
+  the defect being fixed"）。放宽可能把这个修好的缺陷放回来。
+- **(C′) 不看对话就别定解读**（推荐，最接近 Hermes）：在
+  `input_grounding = CONTEXT_DEPENDENT`（或 router fallback）时**不生成字面 spec**，
+  让 agent 按回退注释本来的意图去解析，需要时用 `core.request_input` 问。
+  需要把 `input_grounding` 从 session 决策透传到 task 创建/规划路径。
