@@ -2222,3 +2222,63 @@ COMMAND_RESULT, or ARTIFACT_DELIVERY outcomes carrying mutate or execute effects
   它现在花一次模型调用产出无人执法、却能把 agent 引偏（本次就引向了"不要写文件"）的东西。
 
 > 注：outcome 落账代码**没有被 A.3 的删除波及** —— 已在 `kernel_tool.py:1546-1576` 逐行确认仍在。
+
+## A.7 用户报障：把「愿意」打成「原因」，系统没有纠正
+
+任务 `task-12d775944ea04890af9436fe1787640f`，goal = **`原因 直接写文档吧`**（用户本意「愿意 直接写文档吧」，
+是回复上一个任务里模型那句「如果你愿意下一步落地，我可以…写文档」）。状态 **SUCCEEDED**。
+
+### 它实际干了什么
+
+模型把 `原因` 当成了**主题**，写了一份《关于"原因"的系统说明文档》——
+一份讲解"原因"这个概念的长文，而不是用户要的教学&面试系统文档。**零工具调用**，只在聊天里输出。
+
+### 因果链（逐层，均已核实）
+
+1. **路由器在这句话上直接失败了。** `session.input_resolved` 的
+   `reason_code = semantic_router_protocol_contextual_fallback`
+   （`kernel_session.py:1027-1042`，`failure="protocol"` → classifier 返回了 harness 解析不了的东西）。
+   回退分支的注释写明了设计意图：
+   > "creates a contextual Task so the normal Agent receives the durable Session history
+   > and **can resolve the user's intent itself**."
+   即：**这一步本来就该交给 agent 用会话历史去判断意图。**
+   账本里这个 fallback 一共出现 3 次。
+
+2. **但 planner 先跑了，而且被明确禁止用上文解释这一句。**
+   `adapters/model_task_spec_planner/planner.py:125-138` 原文：
+   > "Treat goal as the user's latest direct request."
+   > "session.scoped_messages is the only AUTHORITATIVE conversation content: only it may
+   > define the goal or an acceptance criterion."
+   > "related_task is SCOPED_BACKGROUND and working_state is NON_AUTHORITATIVE, so neither
+   > may be copied into scope or acceptance criteria."
+   > "**only the latest user request may define them**"
+
+   于是 planner 只能照字面读，并把误读**硬化成验收标准**：
+   - scope：`"理解用户当前请求仅为：请直接写一份关于"原因"的文档。"`
+   - outcome `answer_reason_doc`：kind = **ANSWER**，`required_effects: []`（**没有任何 mutate**）
+   - AC `doc_topic_reason`：`"文档内容围绕"原因"这一核心概念展开…不偏离主题到无关内容"`
+   - 又一条自造的 "无需修改本地工作空间文件"
+
+3. **agent 手上有能消歧的上下文，但 spec 压过了它。**
+   `llm.completed` 的 `context_budget`：`session_history = 15132` tokens；
+   且 `session_events` 里含「如果你愿意」的事件有 **5 条**。
+   但 spec 的 AC 要求文档必须围绕「原因」→ 模型照做。
+
+4. **下游没有任何东西拦它。** `completion.readiness_evaluated` = COMPLETE，
+   `gap_count: 0` → SUCCEEDED。和 A.6 同一个洞：证明层移除后 `gaps = ()`。
+
+### 结论
+
+**没有任何一层做错别字/意图校验。** 唯一读语义的那一层（路由器）在这句话上失败了并回退，
+而回退的本意是"交给 agent 用会话历史自己判断"，但 planner 抢在前面把你的误读写成了硬性要求。
+
+### 待决（与 A.6 同一族问题）
+
+- **(A)** router fallback / `input_grounding=CONTEXT_DEPENDENT` 时，允许 planner 用
+  `scoped_messages` **解释**（而非定义）最新请求。改动最小。
+- **(B)** 放宽 planner 那条 "only the latest user request may define them"。
+- **(C)** 删掉 planner（= A.6 的 D）。与 Hermes/Codex 一致；而且代码注释自己说意图该由 agent 解决，
+  planner 却抢先代办了 —— 这是内部矛盾。
+
+> 另注：A.2c 的时效性路由兜底 `answer_route_overridden_needs_live_information`
+> 在账本里已触发 **6 次**，工作正常。
