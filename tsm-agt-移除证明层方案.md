@@ -2157,3 +2157,68 @@ parked task state: AWAITING_USER   ← 原样未动，/resume 仍能列出
 **1279 passed / 12 skipped / 0 failed。**
 
 注意：修复在 `sdk/runtime.py`，**需要重启进程才生效**（`bash scripts/restart.sh web`）。
+
+## A.6 用户报障：`task-cbe729b7` 为什么没有文档输出
+
+### 结论：不是执行失败，是这份任务的 spec 压根没要求写文档
+
+任务状态是 **SUCCEEDED**，`tool.completed`（不是 failed），没有任何失败事件。
+
+时间线：F1 修复 `ba54064` 提交于 **15:19:08**，本任务创建于 **15:19:55**（37 秒后）。
+它带着 `task-9a54f8eb` 的 `context_handoff`（`authority=SCOPED_BACKGROUND`，
+`state=AWAITING_USER`），goal 原样继承："整理成文档了吗 教学&面试 系统文档"。
+**即：这个任务正是 F1 救活会话之后产生的**，而且模型这次
+`expected_scope="codex-rs"`（对的），搜索成功，没有再撞已删的 scope 守卫。
+
+### planner 把疑问句读成了"纯知识问题"
+
+`task_spec.revised`（rev 2）的快照：
+
+- outcomes：`outcome-docs-evidence`（`required_effects: ["observe"]`）
+  + `outcome-docs-answer`（无 effect）—— **没有任何 mutate/execute**
+- scope 明写："不对任何现有文件进行修改或新建，仅做状态与存在性确认"
+- AC `ac-no-mutation`："在任务执行过程中未对任何工作空间文件进行修改或新增"
+- `constraints: []`（空）
+
+模型完全照做：`core.find_files(path="codex-rs", pattern="**/docs/**")` 搜到
+`codex-rs/docs/bazel.md`、`codex_mcp_interface.md`、`protocol_v1.md`，
+然后回答"已有一些系统文档，但没有专门的教学&面试版总纲"，
+并**提议下一步再写**（"如果你愿意下一步落地，我可以…收敛成一份或多份 Markdown 文本"）。
+
+门禁：`completion.readiness_evaluated` = `COMPLETE` / `core_goal_has_no_known_gaps` /
+`gap_count: 0` → `VERIFYING → FINALIZING → SUCCEEDED`。
+
+### 两个具体缺陷
+
+**(a) planner 违反了自己的提示词。** `planner.py:121-124` 明写
+"Constraints may only restate a restriction the user already stated:
+**never invent a restriction**, and if a constraint would contradict the user's
+request, drop the constraint and keep the request."
+但 `ac-no-mutation` 和 scope 里那条"不修改不新建"都是用户没说过的，而且**与用户要的（写文档）相反**。
+
+分类规则本身是对的（`planner.py:73-79`："If it asks to build, fix, implement,
+**write**, modify, … it is IMPLEMENTATION work and you MUST emit WORKSPACE_DELIVERY,
+COMMAND_RESULT, or ARTIFACT_DELIVERY outcomes carrying mutate or execute effects.
+**An ANSWER outcome alone is forbidden for implementation work.**"）——
+但目标句面是疑问式"…了吗"，被归到了 "pure knowledge question that changes nothing"。
+
+**(b) spec 只广播、不执法。** spec 的两条 `required: true` outcome **全程 PENDING**，
+47 个事件里**没有任何 `task_outcome.state_changed` 事件**。原因是 outcome 只在
+工具调用带 `outcome_ref` 且 `OutcomeBindingMode.FULFILLMENT` 时才落账
+（`kernel_tool.py:1546-1576`），而这次调用没带 `outcome_ref`。
+门禁看不见也正常：证明层移除后 `gaps = ()`（`kernel.py:1855`，
+注释 "Completion has no obligation record (Hermes/Codex): no gaps exist"），
+`unmet_acceptance_criteria` 这个 gate 只剩 `sdk/runtime.py:511-512` 一处字符串。
+
+⇒ **现在 `SUCCEEDED` 的含义是"模型停下来了且没有失败"，不是"交付物做出来了"。**
+
+### 待决
+
+- **(A) 改 planner 提示词**：目标含明确交付物（文档/文件/报告）时，即使句面是疑问式
+  也按 implementation 处理；并落实"不得自造约束"。改动小，不动证明层。
+- **(B) 给完成门禁恢复 obligation 检查**（把 spec 的 outcome/AC 当真）= 把证明层加回来，用户已否决。
+- **(C) 不改**：这是 Hermes/Codex 式行为；把话说成祈使句（"整理一份教学&面试系统文档"）就走 write 分支。
+- **(D) 删掉 TaskSpecPlanner**：Hermes/Codex 都没有任务 spec / AC / outcome 这套；
+  它现在花一次模型调用产出无人执法、却能把 agent 引偏（本次就引向了"不要写文件"）的东西。
+
+> 注：outcome 落账代码**没有被 A.3 的删除波及** —— 已在 `kernel_tool.py:1546-1576` 逐行确认仍在。
