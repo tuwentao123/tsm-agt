@@ -849,7 +849,10 @@ def _temporal_context_instruction(now: datetime | None = None) -> str:
         f"({moment.tzname() or 'local'} UTC{offset}). Retrieved publish dates at "
         "or before today are current, never a future or simulated timeline; "
         "dated tool results from this turn outrank earlier conversation claims "
-        "about what is current."
+        "about what is current. A question whose answer changes over time -- "
+        "news, schedules, scores, prices, weather -- must be looked up with the "
+        "available tools; recalling it from training data is a stale answer, and "
+        "saying the data is unavailable is not an answer."
     )
 
 

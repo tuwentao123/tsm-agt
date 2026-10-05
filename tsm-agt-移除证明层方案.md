@@ -1744,3 +1744,52 @@ scored），会把普通问答无谓地变成建任务。实测 `how do I schedu
 
 测试 +2：时效性问题不再走 ANSWER（断言 disposition/relation/reason_code）、普通问题**仍**走 ANSWER
 （防止兜底过度吞并）。1275 passed / 12 skipped / 0 failed。
+
+## A.2d 用户报障续：`web.search` 就在 `visible_tools` 里，模型仍不用
+
+**报障**：`task-d82d1708dc514fdd8776101533552305`（goal = "什么时候 nba常规赛"）。
+
+### 好消息：A.2c 的路由兜底生效
+
+goal 就是原句，**task 被创建了** —— 不再走无工具的 `ANSWER` 路径。这正是 A.2c 要达成的效果。
+
+### 坏消息：模型有工具却不用
+
+```
+#10 turn.started  visible_tools=[…, "web.search", "web.fetch_markdown", "content.summarize", …]
+#16 completion.readiness_evaluated  action=COMPLETE, gap_count=0
+#18 turn.completed  model_calls=1, tool_calls=0      ← 没调用任何工具
+```
+
+回答又是**记忆里的 2024 版**，并再次让用户"打开 NBA 官网（nba.com）"。**同一个毛病，深了一层。**
+
+### 根因：时态锚点只教"怎么解读日期"，没教"去取日期"
+
+`kernel.py:_temporal_context_instruction()` 早已存在，它的 docstring 甚至**精确预言了这个失败**：
+*"Models otherwise fall back to their training prior… the answer degrades to stale recollection."*
+
+但它实际只说了两件事：① 今天是几号；② **收到的**发布日期怎么解读。模型一次都没取数据，这条指令
+**无事可做**，于是退回训练先验。
+
+### 落地：给锚点补一句"必须去查"
+
+在同一处追加（保持简短，因为它贴在每次模型调用上）：
+
+> A question whose answer changes over time -- news, schedules, scores, prices, weather --
+> **must be looked up with the available tools**; recalling it from training data is a
+> **stale answer**, and saying the data is unavailable **is not an answer**.
+
+后两个短句分别对着模型本次犯的两个错：**用记忆回答**、以及**用散文放弃**（"我没有最新数据，
+建议你打开…"）。
+
+新增 `tests/test_temporal_instruction.py` 2 条：锚点仍给日期、且**必须**含上述要求（防止将来被
+静默删掉 —— 本会话已经出过一次"删块时连带删掉别的东西"）。
+
+1277 passed / 12 skipped / 0 failed。
+
+### 诚实说明：这一层仍是"提示词约束"
+
+A.2c 是**确定性**的（代码判定），这一层是**提示词**约束 —— 能不能生效取决于模型合规。这次它遵守
+提示词的概率应当明显更高（它上次遵守了升级工具的**相反**指令，说明它在读提示词），但**我没有在真实
+模型上验证过**：模型端点此刻很慢，且免费搜索后端在本沙箱多半不可达，跑一次真实回合的性价比太低。
+**真正的验证需要你在自己的环境里再问一次**，然后看 ledger 里有没有 `tool.requested web.search`。
