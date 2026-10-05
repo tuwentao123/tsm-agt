@@ -16,7 +16,6 @@ Moved from ``core/kernel.py``:
 * ``_bind_tool_call_outcome``
 * ``_decide_legacy_tool_call_outcome``
 * ``_decide_tool_call_outcome``
-* ``_evaluate_tool_scope_consistency``
 * ``_execute_authorized_tool``
 * ``_find_tool``
 * ``_invoke_agent_tool``
@@ -30,7 +29,6 @@ Moved from ``core/kernel.py``:
 * ``_suspend_unknown_tool_outcome``
 * ``_synchronize_tool_batch``
 * ``_tool_effect_supports_outcome``
-* ``_tool_scope_relation``
 * ``_validate_tool_batch_proposal``
 * ``invoke_tool``
 * ``list_tools``
@@ -66,8 +64,7 @@ from tsm_agt.ports import (
     ToolEffect, ToolIdempotency, ToolInvocationContext,
     ToolMemoryControl, ToolProcessControl, ToolProviderPort,
     ToolRecoveryKind, ToolResult, ToolResultBlock, ToolRisk,
-    ToolScopeConsistencyAction, ToolScopeConsistencyDecision,
-    ToolScopeConsistencyProbe, ToolScopeRelation, ToolSpec,
+    ToolSpec,
     ToolTaskSpecControl, ToolWorkingMemoryControl, ToolWorkspaceControl
 )
 from uuid import uuid4
@@ -100,7 +97,6 @@ from .tool import (
 from .turn import InvalidModelResponse, InvalidTurnState
 from .verification_command import is_verification_request
 from .workspace import WorkspacePatchConflict, prepare_workspace_text_write
-from .workspace_access import WorkspaceAccessCapability
 
 
 def _render_workspace_patch(
@@ -1499,50 +1495,6 @@ class ToolMixin:
                 meta={"error_type": type(error).__name__},
             )
 
-        scope_decision = await self._evaluate_tool_scope_consistency(
-            task_id, turn_id, current_task, call, result
-        )
-        if scope_decision.action is ToolScopeConsistencyAction.REPLAN:
-            probe = scope_decision.probe
-            # The filesystem operation happened, but its result does not answer
-            # the scope the model declared. Persist it as recoverable feedback so
-            # it cannot become Evidence or resolve the Evidence Question.
-            result = ToolResult(
-                call.call_id, False,
-                data={
-                    "expected_scope": probe.expected_scope,
-                    "requested_path": probe.requested_path,
-                    "resolved_path": probe.resolved_path,
-                    "resolved_root": probe.resolved_root,
-                    "root_kind": probe.root_kind,
-                },
-                error_code="TOOL_SCOPE_MISMATCH",
-                message=(
-                    "The tool ran in a different filesystem scope than the "
-                    "Evidence Question declared. Its hits or empty result cannot "
-                    "answer that question."
-                ),
-                hint=(
-                    "Replan with the intended path. Use the historical canonical "
-                    "path when continuing prior investigation, or use the current "
-                    "workspace only when that is the intended scope. Normal "
-                    "current-Task approval still applies."
-                ),
-                retryable=True,
-                recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
-                recovery_action={
-                    "required_change": "select_intended_filesystem_scope",
-                    "same_call_safe": False,
-                },
-                meta={
-                    "recoverable_input": True,
-                    "runtime_guard": "TOOL_SCOPE_CONSISTENCY",
-                    "next_action": "REPLAN_WITH_INTENDED_SCOPE",
-                    "reason": scope_decision.reason,
-                    "original_tool_ok": result.ok,
-                },
-            )
-
         after_tool = await self._dependencies.store.load_task(task_id)
         if after_tool is None:
             raise TaskNotFound(f"task disappeared during tool invocation: {task_id}")
@@ -1645,104 +1597,6 @@ class ToolMixin:
             )
         )
         return result
-
-    async def _evaluate_tool_scope_consistency(
-        self, task_id: str, turn_id: str, task: TaskSnapshot, call: ToolCall,
-        result: ToolResult,
-    ) -> ToolScopeConsistencyDecision:
-        """Compare model-declared scope with platform-normalized tool facts.
-
-        This is a correctness guard, not a permission check. It never changes the
-        requested path or adds an approved root. Policy failure is observable and
-        fails open because Workspace/Sandbox/Approval already enforced authority.
-        """
-        policy = self._dependencies.tool_scope_consistency_policy
-        scoped_file_tools = {
-            "core.read_file", "core.list_files",
-            "core.find_files", "core.search_text",
-        }
-        expected = (
-            call.evidence_question.expected_scope.strip()
-            if call.evidence_question is not None else ""
-        )
-        data = result.data if isinstance(result.data, Mapping) else {}
-        requested = str(data.get("requested_path") or "")
-        actual_path = str(data.get("resolved_path") or "")
-        actual_root = str(data.get("resolved_root") or "")
-        root_kind = str(data.get("root_kind") or "")
-        relation = ToolScopeRelation.NOT_APPLICABLE
-        if (
-            call.name in scoped_file_tools
-            and expected and result.ok and actual_path and actual_root
-        ):
-            relation = self._tool_scope_relation(
-                Path(task.workspace), expected, actual_path, actual_root,
-                tuple(
-                    Path(grant.canonical_root)
-                    for grant in task.workspace_access_grants
-                    if grant.capability is WorkspaceAccessCapability.READ
-                ),
-            )
-        elif call.name in scoped_file_tools and expected:
-            relation = ToolScopeRelation.UNRESOLVED
-        elif call.name in scoped_file_tools and actual_path and actual_root:
-            relation = ToolScopeRelation.UNDECLARED
-        probe = ToolScopeConsistencyProbe(
-            relation, expected, requested, actual_path, actual_root, root_kind
-        )
-        if policy is None:
-            return ToolScopeConsistencyDecision(
-                ToolScopeConsistencyAction.ALLOW, "policy_not_configured", probe
-            )
-        try:
-            decision = await policy.evaluate(call, result, probe)
-        except Exception as error:
-            await self._append_events(task_id, ((
-                "tool.scope_consistency_failed", {
-                    "turn_id": turn_id, "tool_call_id": call.call_id,
-                    "tool_name": call.name,
-                    "error_type": type(error).__name__,
-                },
-            ),))
-            return ToolScopeConsistencyDecision(
-                ToolScopeConsistencyAction.ALLOW, "policy_failed", probe
-            )
-        await self._append_events(task_id, ((
-            "tool.scope_consistency_evaluated", {
-                "turn_id": turn_id, "tool_call_id": call.call_id,
-                "tool_name": call.name, "action": decision.action.value,
-                "reason": decision.reason, "relation": probe.relation.value,
-                "expected_scope": probe.expected_scope,
-                "requested_path": probe.requested_path,
-                "resolved_path": probe.resolved_path,
-                "resolved_root": probe.resolved_root,
-                "root_kind": probe.root_kind,
-            },
-        ),))
-        return decision
-
-    def _tool_scope_relation(
-        self, workspace: Path, expected_scope: str, actual_path: str,
-        actual_root: str, approved_read_roots: tuple[Path, ...] = (),
-    ) -> ToolScopeRelation:
-        declared = Path(expected_scope).expanduser()
-        try:
-            expected_path = (
-                declared
-                if declared.is_absolute()
-                else self._dependencies.workspace_path.resolve_read_path(
-                    workspace, expected_scope, approved_read_roots
-                ).path
-            )
-        except (OSError, PermissionError, ValueError):
-            return ToolScopeRelation.UNRESOLVED
-        return (
-            ToolScopeRelation.MATCH
-            if self._dependencies.workspace_path.is_same_or_descendant(
-                Path(actual_path), expected_path
-            )
-            else ToolScopeRelation.MISMATCH
-        )
 
     async def recover_tool_execution(
         self, task_id: str, turn_id: str, call_id: str, timeout_seconds: float = 30.0

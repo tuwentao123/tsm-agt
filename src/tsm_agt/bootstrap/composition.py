@@ -25,9 +25,6 @@ from tsm_agt.adapters.rule_based_artifact_read import RuleBasedArtifactReadPolic
 from tsm_agt.adapters.rule_based_progressive_scope import (
     RuleBasedProgressiveScopePolicy,
 )
-from tsm_agt.adapters.rule_based_scope_consistency import (
-    RuleBasedToolScopeConsistencyPolicy,
-)
 from tsm_agt.adapters.rule_based_completion_readiness import (
     RuleBasedCompletionReadinessPolicy,
 )
@@ -120,7 +117,6 @@ from tsm_agt.ports import (
     ReadHitsPolicyPort,
     ArtifactReadPolicyPort,
     ProgressiveScopePolicyPort,
-    ToolScopeConsistencyPolicyPort,
     CompletionReadinessMode,
     CompletionReadinessPolicyPort,
     CheckpointCompatibilityPolicyPort,
@@ -319,11 +315,6 @@ def _kernel_dependencies(
     scope_policies = registry.all(ProgressiveScopePolicyPort)
     if len(scope_policies) > 1:
         raise ValueError("at most one ProgressiveScopePolicyPort may be registered")
-    scope_consistency_policies = registry.all(ToolScopeConsistencyPolicyPort)
-    if len(scope_consistency_policies) > 1:
-        raise ValueError(
-            "at most one ToolScopeConsistencyPolicyPort may be registered"
-        )
     completion_readiness_policies = registry.all(CompletionReadinessPolicyPort)
     if len(completion_readiness_policies) > 1:
         raise ValueError(
@@ -416,9 +407,6 @@ def _kernel_dependencies(
             artifact_read_policies[0] if artifact_read_policies else None
         ),
         progressive_scope_policy=(scope_policies[0] if scope_policies else None),
-        tool_scope_consistency_policy=(
-            scope_consistency_policies[0] if scope_consistency_policies else None
-        ),
         completion_readiness_policy=(
             completion_readiness_policies[0]
             if completion_readiness_policies else None
@@ -595,9 +583,6 @@ def compose_fixture_application(
     read_hits_policy_adapter: ReadHitsPolicyPort | None = None,
     artifact_read_policy_adapter: ArtifactReadPolicyPort | None = None,
     progressive_scope_policy_adapter: ProgressiveScopePolicyPort | None = None,
-    tool_scope_consistency_policy_adapter: (
-        ToolScopeConsistencyPolicyPort | None
-    ) = None,
     completion_readiness_policy_adapter: (
         CompletionReadinessPolicyPort | None
     ) = None,
@@ -686,10 +671,6 @@ def compose_fixture_application(
     if progressive_scope_policy_adapter is not None:
         registry.register(
             ProgressiveScopePolicyPort, progressive_scope_policy_adapter
-        )
-    if tool_scope_consistency_policy_adapter is not None:
-        registry.register(
-            ToolScopeConsistencyPolicyPort, tool_scope_consistency_policy_adapter
         )
     if completion_readiness_policy_adapter is not None:
         registry.register(
@@ -911,9 +892,6 @@ def compose_openai_compatible_readonly_application(
     registry.register(ReadHitsPolicyPort, RuleBasedReadHitsPolicy())
     registry.register(ArtifactReadPolicyPort, RuleBasedArtifactReadPolicy())
     registry.register(
-        ToolScopeConsistencyPolicyPort, RuleBasedToolScopeConsistencyPolicy()
-    )
-    registry.register(
         CompletionReadinessPolicyPort, RuleBasedCompletionReadinessPolicy()
     )
     exploration_profile = _register_exploration_profile(registry, budget.profile)
@@ -1078,9 +1056,6 @@ def compose_openai_compatible_engineering_application(
     )
     registry.register(ReadHitsPolicyPort, RuleBasedReadHitsPolicy())
     registry.register(ArtifactReadPolicyPort, RuleBasedArtifactReadPolicy())
-    registry.register(
-        ToolScopeConsistencyPolicyPort, RuleBasedToolScopeConsistencyPolicy()
-    )
     registry.register(
         CompletionReadinessPolicyPort, RuleBasedCompletionReadinessPolicy()
     )

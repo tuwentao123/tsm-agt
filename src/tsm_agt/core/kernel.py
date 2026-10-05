@@ -140,11 +140,6 @@ from tsm_agt.ports import (
     ExplorationOutcomePolicyPort,
     ExplorationOutcomeState,
     ExplorationOutcomeAction,
-    ToolScopeConsistencyAction,
-    ToolScopeConsistencyDecision,
-    ToolScopeConsistencyPolicyPort,
-    ToolScopeConsistencyProbe,
-    ToolScopeRelation,
     CompletionGap,
     CompletionReadinessAction,
     CompletionReadinessDecision,
@@ -401,7 +396,6 @@ class KernelDependencies:
     read_hits_policy: ReadHitsPolicyPort | None = None
     artifact_read_policy: ArtifactReadPolicyPort | None = None
     progressive_scope_policy: ProgressiveScopePolicyPort | None = None
-    tool_scope_consistency_policy: ToolScopeConsistencyPolicyPort | None = None
     completion_readiness_policy: CompletionReadinessPolicyPort | None = None
     completion_readiness_mode: CompletionReadinessMode = (
         CompletionReadinessMode.LEGACY_GATE

@@ -121,10 +121,6 @@ from .progressive_scope_policy import (
     ProgressiveScopePolicyPort, ProgressiveScopeState, ProgressiveScopeUpdate,
     ScopeProbe, ScopeTrack,
 )
-from .tool_scope_consistency import (
-    ToolScopeConsistencyAction, ToolScopeConsistencyDecision,
-    ToolScopeConsistencyPolicyPort, ToolScopeConsistencyProbe, ToolScopeRelation,
-)
 from .completion_readiness import (
     CompletionGap, CompletionReadinessAction, CompletionReadinessDecision,
     CompletionReadinessMode, CompletionReadinessPolicyPort,
@@ -239,11 +235,6 @@ __all__ = [
     "FinalAcceptanceProbe",
     "FinalAcceptanceViolation",
     "FinalQuestionEvidence",
-    "ToolScopeConsistencyAction",
-    "ToolScopeConsistencyDecision",
-    "ToolScopeConsistencyPolicyPort",
-    "ToolScopeConsistencyProbe",
-    "ToolScopeRelation",
     "FlowArtifactExportPort",
     "FlowArtifactExportResult",
     "ReplayCursor",

@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
+from tsm_agt.adapters.builtin import CoreReadOnlyToolProvider
 from tsm_agt.adapters.fixture import EchoToolProvider
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
@@ -24,6 +25,7 @@ from tsm_agt.core import (
 )
 from tsm_agt.ports import (
     AdapterDescriptor,
+    EvidenceQuestion,
     RuntimeStorePort,
     ToolCall,
     ToolIdempotency,
@@ -795,6 +797,75 @@ class KernelToolTest(unittest.IsolatedAsyncioTestCase):
         finally:
             temp_dir.cleanup()
             await application.registry.stop_all()
+
+
+class DiscoverySearchScopeTest(unittest.IsolatedAsyncioTestCase):
+    """A discovery search must not be failed for declaring where it looked.
+
+    Regression: a real Task searched ``path="codex-rs"`` with pattern
+    ``**/docs/**`` while declaring ``expected_scope="codex-rs/docs"``. The
+    removed scope-consistency guard compared the *searched root* against the
+    declared scope, required the declaration to contain the root, and rewrote a
+    **successful** result into ``TOOL_SCOPE_MISMATCH``. The Task then stalled at
+    ``unresolved_tool_batch`` with zero new evidence. ``codex-rs/docs`` existed
+    and was the only docs directory under the searched root.
+    """
+
+    async def test_narrowed_declared_scope_does_not_fail_the_search(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            docs = workspace / "codex-rs" / "docs"
+            docs.mkdir(parents=True)
+            (docs / "teaching.md").write_text("# teaching\n", encoding="utf-8")
+            application = compose_fixture_application(
+                tool_adapters=(CoreReadOnlyToolProvider(),),
+                require_evidence_questions=True,
+            )
+            await application.registry.start_all()
+            try:
+                task = await application.kernel.create_task(
+                    "find the doc", workspace, task_id="task-discovery-scope"
+                )
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    task = await application.kernel.transition_task(
+                        task.task_id, state, f"move to {state.value}"
+                    )
+                result = await application.kernel.invoke_tool(
+                    task.task_id, "turn-1",
+                    ToolCall(
+                        "find-docs", "core.find_files",
+                        {"path": "codex-rs", "pattern": "**/docs/**", "limit": 50},
+                        EvidenceQuestion(
+                            "Q-doc-file",
+                            "does a teaching/interview system doc exist?",
+                            expected_scope="codex-rs/docs",
+                        ),
+                    ),
+                )
+
+                self.assertTrue(result.ok)
+                self.assertIsNone(result.error_code)
+                self.assertEqual(
+                    [match["path"] for match in result.data["matches"]],
+                    ["codex-rs/docs/teaching.md"],
+                )
+                events = await application.registry.require(
+                    RuntimeStorePort
+                ).read_events(task.task_id)
+                event_types = [event.event_type for event in events]
+                self.assertIn("tool.completed", event_types)
+                self.assertNotIn("tool.failed", event_types)
+                self.assertEqual(
+                    [item for item in event_types if "scope_consistency" in item],
+                    [],
+                    "the scope-consistency guard was removed on purpose",
+                )
+            finally:
+                await application.registry.stop_all()
 
 
 if __name__ == "__main__":

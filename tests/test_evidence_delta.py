@@ -103,22 +103,19 @@ class StructuredEvidenceDeltaEvaluatorTest(unittest.IsolatedAsyncioTestCase):
             "recoverable:PATH_CONTEXT_REQUIRED",
         )
 
-    async def test_recoverable_scope_mismatch_is_not_evidence_or_zero_delta(self):
+    async def test_recoverable_input_failure_is_not_evidence_or_zero_delta(self):
         call = ToolCall(
-            "wrong-scope", "core.search_text",
-            {"path": ".", "query": "Service"},
+            "missing-context", "core.read_file",
+            {"path": "services/Service.java"},
             EvidenceQuestion(
-                "E5", "Find Service in the intended repository",
-                expected_scope="/intended/repository",
+                "E5", "Read Service.java from the approved root holding it",
+                expected_scope="services/Service.java",
             ),
         )
         result = ToolResult(
             call.call_id, False,
-            data={
-                "expected_scope": "/intended/repository",
-                "resolved_root": "/actual/repository",
-            },
-            error_code="TOOL_SCOPE_MISMATCH", retryable=True,
+            data={"requested_path": "services/Service.java"},
+            error_code="PATH_CONTEXT_REQUIRED", retryable=True,
             meta={"recoverable_input": True},
         )
         evaluation = await self.evaluator.evaluate(
@@ -127,7 +124,7 @@ class StructuredEvidenceDeltaEvaluatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evaluation.delta.total_new, 0)
         self.assertEqual(evaluation.delta.consecutive_zero_delta, 2)
         self.assertEqual(
-            evaluation.delta.result_status, "recoverable:TOOL_SCOPE_MISMATCH"
+            evaluation.delta.result_status, "recoverable:PATH_CONTEXT_REQUIRED"
         )
 
 

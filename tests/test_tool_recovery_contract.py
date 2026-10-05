@@ -21,11 +21,11 @@ class ToolRecoveryContractTest(unittest.TestCase):
 
     def test_state_change_recovery_round_trips(self) -> None:
         original = ToolResult(
-            "scope", False, error_code="TOOL_SCOPE_MISMATCH",
-            message="wrong root",
+            "context", False, error_code="PATH_CONTEXT_REQUIRED",
+            message="relative path resolves under another approved root",
             recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
             recovery_action={
-                "required_change": "select_intended_filesystem_scope",
+                "required_change": "retry_with_candidate_resource_ref",
                 "same_call_safe": False,
             },
         )
