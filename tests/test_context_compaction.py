@@ -22,6 +22,14 @@ def text(message_id: str, role: MessageRole, value: str) -> Message:
     return Message(message_id, role, (TextBlock(value),))
 
 
+# Adding the ``mandatory-tool-use`` segment grew the protected static system
+# prompt by this many estimated tokens. Every window below was calibrated against
+# the prompt's size, so they grow by the same amount; each test then keeps the
+# exact slack it was measuring before, and the compaction behaviour it pins is
+# unchanged.
+STATIC_PROMPT_GROWTH_TOKENS = 204
+
+
 def tool_pair(call_id: str, payload: str) -> tuple[Message, Message]:
     call = ToolCall(call_id, "fixture.echo", {"text": payload})
     return (
@@ -53,7 +61,8 @@ class ContextWindowManagerTest(unittest.TestCase):
         conversation = self.conversation()
         prepared = manager.prepare(
             conversation=conversation, tools=(), prompt_template=self.template,
-            context_window=1300, max_output_tokens=128,
+            context_window=1300 + STATIC_PROMPT_GROWTH_TOKENS,
+            max_output_tokens=128,
         )
 
         self.assertIsNotNone(prepared.compaction)
@@ -278,7 +287,8 @@ class ContextWindowManagerTest(unittest.TestCase):
                 text("goal", MessageRole.USER, "current request"), session,
             ),
             tools=(), prompt_template=self.template,
-            context_window=3000, max_output_tokens=256,
+            context_window=3000 + STATIC_PROMPT_GROWTH_TOKENS,
+            max_output_tokens=256,
         )
 
         self.assertIsNotNone(prepared.compaction)
@@ -338,12 +348,14 @@ class ContextWindowManagerTest(unittest.TestCase):
         # exact size of the prompt template.
         first = manager.prepare(
             conversation=self.conversation(), tools=(), prompt_template=self.template,
-            context_window=1200, max_output_tokens=128,
+            context_window=1200 + STATIC_PROMPT_GROWTH_TOKENS,
+            max_output_tokens=128,
         )
         extended = first.messages + tool_pair("call-3", "new data " * 40)
         second = manager.prepare(
             conversation=extended, tools=(), prompt_template=self.template,
-            context_window=1200, max_output_tokens=128,
+            context_window=1200 + STATIC_PROMPT_GROWTH_TOKENS,
+            max_output_tokens=128,
         )
 
         summaries = [
@@ -357,7 +369,12 @@ class ContextWindowManagerTest(unittest.TestCase):
 class GrowingContextModel(EchoModelProvider):
     # Baseline raised from 1800 to 2048: every call now carries the short
     # temporal anchor, which is protected and cannot be compacted away.
-    capabilities = ProviderCapabilities(tools=True, context_window=2048)
+    # Raised again by STATIC_PROMPT_GROWTH_TOKENS for the mandatory-tool-use
+    # segment, which is likewise protected static prompt.
+    capabilities = ProviderCapabilities(
+        tools=True,
+        context_window=2048 + STATIC_PROMPT_GROWTH_TOKENS,
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -528,7 +545,8 @@ class PinnedProvenanceCompactionTest(unittest.TestCase):
                 text("goal", MessageRole.USER, "current request"), session,
             ),
             tools=(), prompt_template=self.template,
-            context_window=3000, max_output_tokens=256,
+            context_window=3000 + STATIC_PROMPT_GROWTH_TOKENS,
+            max_output_tokens=256,
         )
 
     @staticmethod

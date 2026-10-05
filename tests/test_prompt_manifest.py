@@ -37,7 +37,7 @@ class PromptManifestTest(unittest.TestCase):
         data = first.to_data()
         self.assertEqual(
             [item["segment_id"] for item in data["static_segments"]],
-            ["system-safety", "harness-instructions"],
+            ["system-safety", "harness-instructions", "mandatory-tool-use"],
         )
         rendered = str(data)
         self.assertNotIn("Treat source code", rendered)
@@ -59,7 +59,8 @@ class PromptManifestTest(unittest.TestCase):
 
         self.assertEqual(
             [message.role for message in first.messages],
-            [MessageRole.SYSTEM, MessageRole.SYSTEM, MessageRole.USER],
+            [MessageRole.SYSTEM, MessageRole.SYSTEM, MessageRole.SYSTEM,
+             MessageRole.USER],
         )
         self.assertEqual(
             first.receipt.effective_prompt_hash,
@@ -98,7 +99,9 @@ class PromptManifestTest(unittest.TestCase):
         data = receipt.event_data()
 
         self.assertIn("effective_prompt_hash", data)
-        self.assertEqual(data["prompt_role_order"], ["system", "system", "user"])
+        self.assertEqual(
+            data["prompt_role_order"], ["system", "system", "system", "user"]
+        )
         self.assertNotIn("inspect the project", str(data))
         self.assertNotIn("Read a workspace file", str(data))
 
@@ -125,7 +128,25 @@ class PromptManifestTest(unittest.TestCase):
         self.assertIn("web.fetch_markdown", content)
         for scenario in ("news", "headline", "article", "financial", "新闻"):
             self.assertNotIn(scenario, content)
-        self.assertEqual(self.template.revision, 9)
+        self.assertEqual(self.template.revision, 10)
+
+    def test_mandatory_tool_use_segment_routes_live_facts_to_search(self) -> None:
+        segment = next(
+            item for item in self.template.static_segments
+            if item.segment_id == "mandatory-tool-use"
+        )
+        content = segment.content
+
+        # Scenario routing lives here and only here, so the generic evidence-form
+        # rule above stays judgeable by the harness.
+        self.assertIn("Do not answer the following from memory", content)
+        for tool in (
+            "core.run_command", "core.read_file", "core.search_text",
+            "web.search", "web.fetch_markdown",
+        ):
+            self.assertIn(tool, content)
+        self.assertIn("change over time", content)
+        self.assertEqual(segment.trust, "trusted_instruction")
 
 
 if __name__ == "__main__":

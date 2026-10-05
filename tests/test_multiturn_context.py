@@ -49,6 +49,10 @@ class RecordingModelProvider(EchoModelProvider):
     independent caps and only the second one is window-driven: a small window
     keeps the token-budget compactor in play, a large one lets the projector's own
     count bound be the only limit. Tests need to choose.
+
+    The 4300 default is 4096 raised by the 204 estimated tokens the protected
+    static prompt gained from the ``mandatory-tool-use`` segment, so the default
+    window keeps the slack these tests were calibrated against.
     """
 
     descriptor = AdapterDescriptor(
@@ -56,7 +60,7 @@ class RecordingModelProvider(EchoModelProvider):
         frozenset({"text"}),
     )
 
-    def __init__(self, context_window: int = 4096) -> None:
+    def __init__(self, context_window: int = 4300) -> None:
         super().__init__()
         self.capabilities = ProviderCapabilities(context_window=context_window)
         self.requests: list[ModelRequest] = []
@@ -107,7 +111,7 @@ class ContextualResolver:
 class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
     async def make_client(
         self, root: Path, *, projector=None, context_manager=None,
-        context_window: int = 4096,
+        context_window: int = 4300,
     ):
         model = RecordingModelProvider(context_window)
         app = compose_fixture_application(

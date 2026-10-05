@@ -102,7 +102,7 @@ class PromptTemplate:
     def default(cls) -> PromptTemplate:
         return cls(
             manifest_id="builtin.engineering-agent",
-            revision=9,
+            revision=10,
             static_segments=(
                 PromptTemplateSegment(
                     "system-safety", "core", "1.0",
@@ -146,6 +146,21 @@ class PromptTemplate:
                     "specific in-scope read-only checks are still needed for the requested "
                     "conclusion and the runtime still permits those checks; perform them now.",
                 ),
+                PromptTemplateSegment(
+                    "mandatory-tool-use", "harness", "1.0",
+                    "Do not answer the following from memory or mental computation; "
+                    "use a tool instead. Arithmetic, hashes, encodings, and checksums, "
+                    "the current time or date, and the operating system, CPU, memory, "
+                    "disk, port, or process state belong to core.run_command. File "
+                    "contents, sizes, and line counts belong to core.read_file, "
+                    "core.find_files, or core.search_text. Git history, branches, and "
+                    "diffs belong to core.run_command. Facts that change over time -- "
+                    "weather, news, releases, prices, schedules, scores -- belong to "
+                    "web.search, and a claim that depends on what a returned document "
+                    "says belongs to web.fetch_markdown. What you remember about the "
+                    "requester describes that person, not this machine or this "
+                    "workspace, so the live system can differ from it.",
+                ),
             ),
         )
 
@@ -155,7 +170,7 @@ class PromptTemplate:
             for index, segment in enumerate(self.static_segments, start=1)
         )
         order = (
-            "system_safety", "harness_instructions",
+            "system_safety", "harness_instructions", "mandatory_tool_use",
             "trusted_project_instructions_if_present",
             "task_spec_if_present",
             "untrusted_project_onboarding_if_present",

@@ -54,7 +54,9 @@ def working_state(goal: str = "Ship the feature") -> dict[str, object]:
 
 
 class WorkingMemoryModel(EchoModelProvider):
-    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+    # 4096 raised by the 204 estimated tokens the protected static prompt gained
+    # from the ``mandatory-tool-use`` segment, preserving this window's slack.
+    capabilities = ProviderCapabilities(tools=True, context_window=4300)
     descriptor = AdapterDescriptor(
         "fixture.working-memory-model", "1.0", "ModelProviderPort", "1.0"
     )
