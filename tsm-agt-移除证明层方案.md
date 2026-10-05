@@ -1163,9 +1163,9 @@ belongs to another local subject` 的来源，属设计上的主体边界，不�
 
 | 检查 | 结果 |
 |---|---|
-| DNS | `aibrain-large-model-engine-slow.hellobike.cn` → **`10.33.200.42`**（不再是黑洞）|
+| DNS | `<model-gateway>` → **`<internal-ip>`**（不再是黑洞）|
 | TCP 443 | **通**，0.04s |
-| TLS | **通**，证书 CN `*.hello-inc.com`（上海哈啰普惠科技有限公司）|
+| TLS | **通**，证书 CN `<internal-cert-cn>`（上海哈啰普惠科技有限公司）|
 | `tsm-agt doctor` | **healthy**，14 adapters，模型配置完整（`OpenAI-GPT-5.1`，key 已配，0600）|
 
 ### 四条真实路径，全部跑通
@@ -1938,7 +1938,7 @@ A.2c 是确定性的（路由层代码判定），A.2d / A.2e 都是提示词约
 
 模型搜 `codex-rs`、声明 `codex-rs/docs` → `codex-rs` 不是 `codex-rs/docs` 的后代 → MISMATCH。
 
-**而模型的声明是对的**：`/Users/tusima/Documents/workSp/codex/codex-rs/docs` 存在，
+**而模型的声明是对的**：`~/Documents/workSp/codex/codex-rs/docs` 存在，
 且是 `codex-rs` 下**唯一**的 docs 目录，所以 `**/docs/**` 的实际命中集合就是它。
 
 这条规则对**探索式搜索是不可满足的**：它要求你在搜索之前就知道作用域在哪 —— 而搜索的

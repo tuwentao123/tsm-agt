@@ -97,7 +97,7 @@ scripts/restart.sh [start|stop|restart|status|logs] [选项]
 ## 4. 不用脚本时的手动重启
 
 ```bash
-cd /Users/tusima/Documents/学习/tsm-agt
+cd ~/Documents/学习/tsm-agt
 
 # 1) 找出占用者和实例
 lsof -nP -iTCP:8080 -sTCP:LISTEN
