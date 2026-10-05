@@ -1704,3 +1704,43 @@ A.1y 把默认设成 `cached`（对齐 Codex）。用户要求"默认就能联�
   与 **`test_cached_mode_refuses_without_egress`**（显式 `cached` 时仍不得开连接）。
 
 1273 passed / 12 skipped / 0 failed。
+
+## A.2c 用户报障：时效性问题被 ANSWER 路径用过期知识回答
+
+**报障**：`task-ee2dceb40ec64c5695a391742caa9652` 的会话里输入"什么时候 nba常规赛"，回答是 2024 年的，且"没调用联网搜索"。
+
+### 诊断（真实 ledger）
+
+**① 点名的那个 task 其实调用了搜索**：事件 `#26 tool.requested web.search {"freshness":"day","query":"NBA news October 5 2026"}` → `#32 tool.completed` → `#34 question RESOLVED`。
+
+**② 问题在会话里更新的那条输入**：
+
+```
+session.route_proposed  action=ANSWER  disposition=ANSWER
+reason_code="single_turn_question_unrelated_to_any_task"
+```
+
+`ANSWER` ⇒ **不建 task ⇒ 无工具** ⇒ 只能用自己的知识答 ⇒ 2024。回复里模型自己承认：*"我这边没有最新赛程数据，建议你：打开 NBA 官网…"*。
+
+**③ 机制与提示词其实都是对的**：`ANSWER` 路径只给一个升级工具 `session.requires_agent_task`；提示词
+（`kernel_session.py`）明确写着 *"If the request needs current files, runtime state, **network data** …
+**do not apologize in prose**: call … exactly once"*。**模型违反了它自己的契约** —— 这正是它被禁止的
+"用散文道歉"。
+
+### 落地（用户选方案 1：确定性兜底）
+
+在 `resolve_session_input` 的 ANSWER 校验之后加一道**确定性**判定（`_needs_live_information`）：
+文本含**时效性事实领域**词时，把 `ANSWER` 改写成 `CREATE_TASK + INDEPENDENT`，理由
+`answer_route_overridden_needs_live_info`。
+
+**为什么用规则而不用"再问模型一次"**：误判代价不对称 —— 多建一个不需要的 task 仍会用工具正确回答；
+漏判的代价是**一个自信的过期答案**（就是本次事故）。规则零延迟、可测、不依赖模型合规。
+
+**词表刻意收窄**：中文侧收 `新闻/赛程/比分/赛季/常规赛/季后赛/股价/汇率/天气/预报…`；
+英文侧**只保留** `news/weather/forecast/standings/stock price/exchange rate/playoff/regular season`，
+并**刻意剔除 `schedule`/`score`/`fixture`/`odds`** —— 它们在工程语境里太常见（scheduler、test fixture、
+scored），会把普通问答无谓地变成建任务。实测 `how do I schedule a task` / `the test fixture is broken` /
+`score this function` 均**不**触发。
+
+测试 +2：时效性问题不再走 ANSWER（断言 disposition/relation/reason_code）、普通问题**仍**走 ANSWER
+（防止兜底过度吞并）。1275 passed / 12 skipped / 0 failed。

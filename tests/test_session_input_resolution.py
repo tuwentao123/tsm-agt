@@ -790,6 +790,111 @@ class SessionAnswerTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
+    async def test_a_time_sensitive_question_is_never_answered_without_tools(self):
+        """The router model does not always obey its own ANSWER contract.
+
+        Its prompt already says ANSWER is only for questions needing no
+        "network data", but "什么时候 nba常规赛" came back as a 2024 answer because
+        the ANSWER route holds no tools. The override is deterministic and errs
+        toward a Task: a needless Task still answers correctly with tools in
+        hand, while a missed one is silently stale.
+        """
+
+        resolver = FixtureResolver({
+            "disposition": "ANSWER",
+            "relation": "INDEPENDENT",
+            "source_task_id": None,
+            "input_grounding": "SELF_CONTAINED",
+            "confidence": 0.96,
+            "reason_code": "single_turn_question_unrelated_to_any_task",
+            "clarification": None,
+            "candidate_task_ids": [],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+                session_input_resolver_adapter=resolver,
+            )
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("live question")
+                # A catalog entry is what lets the semantic resolver run at all.
+                history = await app.kernel.create_task(
+                    "earlier work", Path(directory),
+                    session_id=session.session_id,
+                )
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING, TaskState.VERIFYING,
+                    TaskState.FINALIZING, TaskState.SUCCEEDED,
+                ):
+                    history = await app.kernel.transition_task(
+                        history.task_id, state, state.value
+                    )
+
+                decision = await app.kernel.resolve_session_input(
+                    session.session_id, "什么时候 nba常规赛", Path(directory)
+                )
+
+                self.assertIs(
+                    decision.disposition, SessionRouteDisposition.CREATE_TASK
+                )
+                self.assertIs(
+                    decision.relation, SessionTaskRelation.INDEPENDENT
+                )
+                self.assertEqual(
+                    decision.reason_code,
+                    "answer_route_overridden_needs_live_information",
+                )
+            finally:
+                await app.registry.stop_all()
+
+    async def test_an_ordinary_question_still_uses_the_answer_route(self):
+        """The backstop must not swallow questions it is not about."""
+
+        resolver = FixtureResolver({
+            "disposition": "ANSWER",
+            "relation": "INDEPENDENT",
+            "source_task_id": None,
+            "input_grounding": "SELF_CONTAINED",
+            "confidence": 0.96,
+            "reason_code": "self_contained_question",
+            "clarification": None,
+            "candidate_task_ids": [],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+                session_input_resolver_adapter=resolver,
+            )
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("ordinary")
+                history = await app.kernel.create_task(
+                    "earlier work", Path(directory),
+                    session_id=session.session_id,
+                )
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING, TaskState.VERIFYING,
+                    TaskState.FINALIZING, TaskState.SUCCEEDED,
+                ):
+                    history = await app.kernel.transition_task(
+                        history.task_id, state, state.value
+                    )
+
+                decision = await app.kernel.resolve_session_input(
+                    session.session_id, "What is a Session?", Path(directory)
+                )
+
+                self.assertIs(
+                    decision.disposition, SessionRouteDisposition.ANSWER
+                )
+            finally:
+                await app.registry.stop_all()
+
     async def test_self_contained_answer_bypasses_task_creation(self):
         resolver = FixtureResolver({
             "disposition": "ANSWER",

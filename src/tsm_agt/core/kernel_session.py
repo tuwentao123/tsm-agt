@@ -90,6 +90,42 @@ from .workspace import (
 _SESSION_ESCALATION_TOOL = "session.requires_agent_task"
 
 
+#: Domains whose answer changes without the Runtime doing anything. Model
+#: weights stop at a training date, so a question about one of these is stale by
+#: construction -- "when is the NBA regular season" was answered from 2024
+#: knowledge because the ANSWER route holds no tools.
+#:
+#: This list deliberately errs toward catching. The mistake is asymmetric: a
+#: question routed to a Task it did not need still gets answered correctly (with
+#: tools available), while a question answered on the no-tool route gets a
+#: confidently stale fact. The router model is already told to send anything
+#: needing "network data" to CREATE_TASK; this is the deterministic backstop for
+#: when it does not comply.
+_LIVE_FACT_TERMS = (
+    # News and current events
+    "新闻", "时事", "最新消息", "头条",
+    # Sport: schedules, results, standings
+    "赛程", "比分", "战绩", "排名", "赛季", "常规赛", "季后赛", "决赛",
+    "联赛", "赛事", "比赛结果", "冠军", "积分榜",
+    # Markets and prices
+    "股价", "股票", "汇率", "金价", "油价", "房价", "行情", "报价", "赔率",
+    # Weather
+    "天气", "气温", "预报",
+    # English: kept deliberately narrow. "schedule", "score" and "fixture" are
+    # ordinary engineering words ("scheduler", "test fixture", "scored"), so
+    # matching them would turn ordinary questions into Tasks for no reason.
+    "news", "weather", "forecast", "standings", "stock price",
+    "exchange rate", "playoff", "playoffs", "regular season",
+)
+
+
+def _needs_live_information(text: str) -> bool:
+    """Whether answering ``text`` requires facts that change over time."""
+
+    lowered = text.casefold()
+    return any(term in lowered for term in _LIVE_FACT_TERMS)
+
+
 class SessionMixin:
     async def create_session(
         self, title: str, session_id: str | None = None,
@@ -839,6 +875,16 @@ class SessionMixin:
                     or confidence < 0.85
                 ):
                     raise ValueError("invalid direct Session answer")
+                if _needs_live_information(normalized):
+                    # The ANSWER route holds no tools, so a question whose answer
+                    # changes over time can only be answered from the model's
+                    # training data -- a silently stale fact, which is exactly
+                    # how "什么时候 nba常规赛" came back as 2024. Route it to a
+                    # real Task so the search and fetch tools exist.
+                    disposition = SessionRouteDisposition.CREATE_TASK
+                    relation = SessionTaskRelation.INDEPENDENT
+                    resolved_goal = normalized
+                    reason = "answer_route_overridden_needs_live_information"
             elif disposition is SessionRouteDisposition.RESUME_TASK:
                 if (
                     relation is not SessionTaskRelation.CONTINUE
