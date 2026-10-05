@@ -995,6 +995,22 @@ class OpenAICompatibleModelProvider:
             try:
                 arguments = json.loads(raw_arguments)
             except json.JSONDecodeError as error:
+                if raw_reason == "length":
+                    # The provider stopped at max_output_tokens, so these
+                    # arguments are a prefix of the JSON the model was writing.
+                    # Reporting that as a malformed tool call blamed the model
+                    # for the Runtime's own budget: a Task SPEC that outgrew its
+                    # cap was retried at the same cap until recovery exhausted
+                    # and the Task interrupted (task-ef2f8587). Same failure
+                    # class and retry safety as before -- only the diagnosis is
+                    # now true, so the ledger names the real cause.
+                    raise OpenAICompatibleProviderError(
+                        f"tool call {call_id} arguments were truncated by the "
+                        "output token limit (finish_reason=length)",
+                        reason_code="truncated_tool_arguments",
+                        category=ModelFailureCategory.INVALID_RESPONSE,
+                        retry_safety=ModelRetrySafety.SAFE_RESAMPLE,
+                    ) from error
                 raise OpenAICompatibleProviderError(
                     f"tool call {call_id} contains invalid JSON arguments"
                 ) from error

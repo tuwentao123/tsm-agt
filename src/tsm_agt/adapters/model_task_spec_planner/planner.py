@@ -162,7 +162,14 @@ class ModelTaskSpecPlanner:
                 turn_id=f"task-planner-{uuid4().hex}",
                 messages=(system, user),
                 tools=(tool,) if supports_tools else (),
-                max_output_tokens=1200,
+                # A Task SPEC is a whole contract, and it is emitted as one tool
+                # call, so this budget is the SPEC's ceiling -- not a reply's.
+                # Measured planner-authored SPECs run 365-957 tokens, so the old
+                # 1200 left the largest at 80% of the cap: one slightly bigger
+                # SPEC was cut off mid-JSON, which surfaced as "invalid JSON
+                # arguments" and was retried forever at the same cap
+                # (task-ef2f8587 interrupted on exactly that).
+                max_output_tokens=4096,
                 allow_tool_calls=supports_tools,
                 require_evidence_questions=False,
             ))

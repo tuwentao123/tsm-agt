@@ -541,6 +541,56 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call.name, "core.read_file")
         self.assertEqual(call.arguments, {"path": "README.md"})
 
+    async def test_truncated_tool_arguments_are_reported_as_truncation(
+        self,
+    ) -> None:
+        """A length-stopped tool call is a budget problem, not a model mistake.
+
+        ``task-ef2f8587`` interrupted after its Planner SPEC outgrew the output
+        cap: the arguments were cut mid-JSON, the ledger said "invalid JSON
+        arguments", and recovery resampled at the same cap until it exhausted.
+        """
+
+        provider, _ = await self._streaming_provider([
+            '{"id":"chat-tool","choices":[{"delta":{"tool_calls":[{"index":0,'
+            '"id":"call-1","function":{"name":"core__read_file",'
+            '"arguments":"{\\"path\\":\\"READM"}}]},'
+            '"finish_reason":"length"}]}',
+            "[DONE]",
+        ])
+        request = ModelRequest(
+            "turn-truncated",
+            (Message("user-1", MessageRole.USER, (TextBlock("read"),)),),
+            tools=(self._tool_spec(),),
+        )
+        with self.assertRaises(OpenAICompatibleProviderError) as caught:
+            _ = [event async for event in provider.stream_complete(request)]
+        self.assertEqual(
+            caught.exception.reason_code, "truncated_tool_arguments",
+        )
+        self.assertIn("truncated by the output token limit", str(caught.exception))
+        self.assertNotIn("invalid JSON arguments", str(caught.exception))
+
+    async def test_malformed_arguments_without_truncation_still_name_invalid_json(
+        self,
+    ) -> None:
+        provider, _ = await self._streaming_provider([
+            '{"id":"chat-tool","choices":[{"delta":{"tool_calls":[{"index":0,'
+            '"id":"call-1","function":{"name":"core__read_file",'
+            '"arguments":"{\\"path\\": }"}}]},'
+            '"finish_reason":"tool_calls"}]}',
+            "[DONE]",
+        ])
+        request = ModelRequest(
+            "turn-malformed",
+            (Message("user-1", MessageRole.USER, (TextBlock("read"),)),),
+            tools=(self._tool_spec(),),
+        )
+        with self.assertRaises(OpenAICompatibleProviderError) as caught:
+            _ = [event async for event in provider.stream_complete(request)]
+        self.assertEqual(caught.exception.reason_code, "provider_error")
+        self.assertIn("invalid JSON arguments", str(caught.exception))
+
     async def test_stream_accepts_complete_finish_without_done_and_classifies_incomplete_data(self) -> None:
         request = ModelRequest("turn-bad", (Message(
             "user-1", MessageRole.USER, (TextBlock("hello"),)

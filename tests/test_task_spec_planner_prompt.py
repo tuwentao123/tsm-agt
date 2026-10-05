@@ -120,5 +120,23 @@ class PlannerContractPromptTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("near-miss", prompt)
 
 
+    async def test_the_spec_budget_covers_a_whole_contract(self) -> None:
+        """The SPEC is emitted as one tool call, so the cap is the SPEC's ceiling.
+
+        Measured planner-authored SPECs run 365-957 tokens; the old 1200 cap left
+        the largest at 80%, and one that outgrew it was cut off mid-JSON
+        (task-ef2f8587 interrupted "invalid JSON arguments").
+        """
+
+        model = CapturingPlannerModel()
+        planner = ModelTaskSpecPlanner(model)
+        await planner.start(AdapterContext({}, lambda *_: None))
+        try:
+            await planner.propose_task_spec("query runtime.db for the chain", {})
+        finally:
+            await planner.stop(datetime.now())
+        self.assertEqual(model.requests[0].max_output_tokens, 4096)
+
+
 if __name__ == "__main__":
     unittest.main()

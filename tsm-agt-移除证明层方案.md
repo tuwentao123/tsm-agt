@@ -2535,3 +2535,34 @@ planner 失败时**不中断任务，直接不带 spec 继续** —— agent 拿
    而不是诬赖模型 JSON 非法。
 2. **截断不要原样重采样** —— 要么抬高上限重试，要么按 A.10 直接跳过 spec 继续。
 3. **抬高 planner 输出上限**（1200 → 4096）。实测最大 957，1200 太紧。
+
+### A.11 落地（按 1+3）
+
+**3. planner 输出上限 1200 → 4096**（`planner.py:165`）
+理由写在代码注释里：Task SPEC 是**整份契约、以一次 tool call 发出**，所以这个预算是 spec 的天花板，
+不是一句回复的；实测 spec 365–957 token，旧的 1200 让最大的那个已经占到 80%。
+
+**1. 解析点识别 `finish_reason == "length"`**（`openai_compatible/model.py:995-1015`）
+`json.loads` 失败时先看 `raw_reason`：若是 `"length"`，抛
+`reason_code="truncated_tool_arguments"`、消息为
+`"tool call ... arguments were truncated by the output token limit (finish_reason=length)"`；
+否则保持原来的 `"contains invalid JSON arguments"`。失败类别与 retry safety 都**没变**
+（仍是 `INVALID_RESPONSE` / `SAFE_RESAMPLE`），只把诊断改对了。
+
+已核实 `reason_code` → `ModelAttemptFailure.diagnostic_code`
+（`adapters/http_json.py:57-59`）→ `resilient_model/model.py:201` 原样上报
+→ 事件里的 `diagnostic_code`。所以以后账本会直接写 `truncated_tool_arguments`。
+
+新增 3 条测试：
+
+- 截断的 tool call（`finish_reason: "length"`）→ `reason_code == "truncated_tool_arguments"`，
+  消息含 "truncated by the output token limit"，**不再**出现 "invalid JSON arguments"；
+- 没截断但 JSON 确实坏的 → 仍报 `provider_error` / "invalid JSON arguments"（行为未变）；
+- planner 请求的 `max_output_tokens == 4096`。
+
+**1286 passed / 12 skipped / 0 failed。**
+
+**未做（原第 2 点）**：截断时"不要原样重采样"的策略改动。抬高上限后重采样已经大概率有效，
+所以先不动；如果以后仍出现 `truncated_tool_arguments` 且重试无效，再考虑按 A.10 直接跳过 spec。
+
+**需要重启进程才生效。**
