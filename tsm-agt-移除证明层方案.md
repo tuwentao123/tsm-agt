@@ -2016,3 +2016,114 @@ scope 守卫和这 8 个层是**同一物种**：都在工具执行路径上做�
 `ok=True` 的只读观察）比"合成失败让模型重试"更糟。
 
 要不要继续按同一标准处置这 8 层，是下一步的待决事项 —— 不在 A.3 的授权范围内，本次未动。
+
+## A.5 用户报障：改完之后当前会话无法继续（**这是 A.3 造成的回归**）
+
+### 现象
+
+任何纯文本输入都返回：
+
+> 当前任务正在等待审批或回答，请通过对应通道回复，或使用显式命令
+> （/new 新建任务、/resume 恢复该任务）。
+
+来源：`sdk/runtime.py:604-619`（规则 3）——当 active task 处于
+`AWAITING_APPROVAL`/`AWAITING_USER` 且 `_awaits_orphaned_action` 为假时，拒绝把纯文本
+重新解释成新话题。
+
+### 这个会话的状态
+
+当前会话 `083d0f7a-3809-40d1-82b0-75902ebe04a0` 的 active task 就是 A.3 里那个
+`task-9a54f8ebe6ba469c9dfdf49f317fed8f`，停在 `AWAITING_USER`：
+
+```
+pending_user_action = {kind: CONTINUATION, reason: "unresolved_tool_batch",
+                       gap_ids: ["tool-recovery:call_d7OqieN1b2G9BLEvXqvO8SWN"]}
+```
+
+`unresolved_tool_batch` 不在 `_ORPHANED_PENDING_ACTION_REASONS`
+（`runtime.py:509-514`，只含 `unmet_acceptance_criteria` 与
+`completion_exhausted_with_required_gaps`）里，所以规则 3 拒绝。
+
+### 真正的问题：`/resume` 也走不通（而提示词让你去用 /resume）
+
+在账本副本上实跑（fixture 组合，只读不改真库）：
+
+```
+list_session_resume_candidates -> safety=REQUIRES_VALIDATION
+                                  reason=runtime_upgrade_has_execution_state
+resolve_session_continuation   -> mode=BLOCKED
+```
+
+`resolve_session_continuation` 只把 `EXACT_RESUME / RECONCILE_REQUIRED / REBASE_REQUIRED`
+算作可恢复（`kernel_session.py:672-676`），`REQUIRES_VALIDATION` → 直接 `BLOCKED`。
+
+于是：纯文本被规则 3 拒绝（叫你去 /resume），而 /resume 报 BLOCKED（叫你去 /new）。
+只有 `/new` 能出去 —— **CLI 那条 BLOCKED 分支（`cli.py:1530-1556`）确实提示了 /new，
+但用户要先把 /resume 走一遍才看得到。**
+
+### 归因：**确实是我这次删守卫造成的**（已用证据排除误判）
+
+第一次我用 `compose_fixture_application` 去比，四个 hash 全 DIFF —— 那是**污染测量**：
+fixture 组合与生产组合的 adapter 集本来就不同，说明不了任何事。差点据此得出错误结论。
+
+正确做法：在**生产组合**（`compose_openai_compatible_engineering_application_from_env`
++ 仓库根的 `.env`）下，用 `git worktree` 分别在改动前后取配置快照，与检查点里的
+`config.snapshot`（seq 8）比对。该快照由 14:53 那次运行写入，而删守卫是 **15:10:23**
+（`c87131d`），即检查点创建时守卫还在。
+
+| hash | 改动前 `542f4e3` | 当前 `5dc93b8` | 检查点 |
+|---|---|---|---|
+| `adapter_lock_hash` | **SAME** | **DIFF** `3ae08f50…` | `75a51253…` |
+| `toolset_hash` | SAME | SAME | `a4407452…` |
+| `policy_hash` | SAME | SAME | `e9019202…` |
+| `provider_capabilities_hash` | SAME | SAME | `2802d89a…` |
+
+`adapter_lock_hash = canonical_hash(adapter_data)`（`core/configuration.py:120`），
+即**注册的 adapter 集合**。删掉 `rule_based_scope_consistency` 必然改它。
+
+改动前四个 hash 全 SAME → 无 differences → `EXACT_RESUME` → `/resume` 可用。
+改动后 `adapter_lock_hash` DIFF → 有 differences；而该 task 有
+`tool_execution_count > 0`，于是兼容性策略把它从 `REBASE_REQUIRED` 升级成
+`REQUIRES_VALIDATION`（`rule_based_checkpoint_compatibility/policy.py:108-122`）
+→ `/resume` BLOCKED。
+
+**结论：删守卫本身是对的，但我改动了 adapter 集合，从而让这个未完成检查点失效。**
+
+### 好消息：会话没有死
+
+在账本副本上实跑两条路径：
+
+```
+纯文本  -> kind=clarify  reason_code=task_awaits_user_action   （复现用户看到的消息）
+NEW_TASK-> kind=task     task=task-2f7747884e4c4d5b8950adccd37441bc
+           session.active_task_id 已切到新 task
+```
+
+即 `/new <目标>` 可以正常开新任务；被卡住的 task 原样留在账本里。
+
+### 待决：修哪一层
+
+**(F1) 让规则 3 也认“续接不可交付”（推荐）**
+`_awaits_orphaned_action` 的契约就是“用户交付不了的待办”。一个会解析成 `BLOCKED` 的
+CONTINUATION 正是交付不了。让规则 3 在这种情况下不拒绝，纯文本落到规则 5
+（`runtime.py:646-649`）走普通路由新建任务；被卡的 task **不动**，仍可被 `/resume` 列出。
+这与 `_ORPHANED_PENDING_ACTION_REASONS` docstring 写明的原则一致
+（“…must not keep refusing new input -- the Session would wedge forever”），
+区别是判据要从「reason 在黑名单里」改成「这次续接是否真的可交付」。
+
+**(F2) 只改文案**：拒绝时先判断 /resume 是否可行，不可行就直接让用户用 `/new`。
+改动最小，但**楔子还在** —— 纯文本仍被拒。
+
+**(F3) 把 `REQUIRES_VALIDATION` 加进可恢复集合**
+等于放弃“升级后不自动续接带执行状态的任务”这条保守设计，不建议。
+
+我倾向 F1：它修的是这一类楔子（此后任何改动 adapter 集合都不会再卡住会话），
+而不是只把这个 case 糊过去。**等你定。**
+
+### 另外两件已处理的事
+
+- 我在用生产组合做探针时误在真账本里建了一个 `task-probe`
+  （15:15:15，session `session-standalone-4e6a150c9a806f11819e053c`）。
+  已用 WAL 安全备份（`.agent/ledger-before-probe-cleanup-20261005-151546.db`，27.2 MB）
+  后精确删除，session 列表已恢复为原来的 2 个。
+- `git worktree` 已清理，未留残留。
