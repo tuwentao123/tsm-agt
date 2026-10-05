@@ -21,7 +21,10 @@ from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import (
     compose_fixture_application, compose_local_flow_query_application,
 )
-from tsm_agt.core import TaskState
+from tsm_agt.core import (
+    SessionContinuationDecision, SessionContinuationMode, SessionResumeSafety,
+    TaskState,
+)
 from tsm_agt.ports import AdapterDescriptor, HealthState, HealthStatus
 from tsm_agt.sdk import EngineeringAgentClient
 
@@ -494,6 +497,68 @@ class OrphanedPendingActionInputTest(unittest.IsolatedAsyncioTestCase):
             result = await self._submit_against(
                 client, session.session_id, parked, "orphan-pending-2",
             )
+
+            self.assertEqual(
+                result.result.get("reason_code"), "task_awaits_user_action",
+            )
+
+    async def test_unresumable_continuation_no_longer_refuses_plain_text(
+        self,
+    ) -> None:
+        """A continuation that can never be resumed must not wedge the Session.
+
+        The producer-removal set cannot express this one: ``unresolved_tool_batch``
+        may still be produced and is normally resumable, so it must keep the
+        refusal in general. What died here is this *Task's* checkpoint: deleting an
+        adapter changed ``adapter_lock_hash``, and a Task carrying tool-execution
+        state then resolved to ``REQUIRES_VALIDATION``, which
+        ``resolve_session_continuation`` answers with ``BLOCKED``. Rule 3 refused
+        plain text while recommending ``/resume``, and ``/resume`` answered
+        "use /new" -- so the Session was wedged for the one input a user types.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client, session, parked = await self._client_with_waiting_task(
+                root, pending_reason="unresolved_tool_batch",
+            )
+            blocked = SessionContinuationDecision(
+                SessionContinuationMode.BLOCKED, parked.task_id, "AWAITING_USER",
+                "runtime_upgrade_has_execution_state",
+                SessionResumeSafety.REQUIRES_VALIDATION,
+            )
+            with patch.object(
+                type(client.application.kernel), "resolve_session_continuation",
+                new=AsyncMock(return_value=blocked),
+            ):
+                result = await self._submit_against(
+                    client, session.session_id, parked, "unresumable-1",
+                )
+
+            self.assertNotEqual(
+                result.result.get("reason_code"), "task_awaits_user_action",
+            )
+
+    async def test_a_resumable_continuation_still_refuses(self) -> None:
+        """The contrast: a deliverable continuation keeps plain text out."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client, session, parked = await self._client_with_waiting_task(
+                root, pending_reason="unresolved_tool_batch",
+            )
+            resumable = SessionContinuationDecision(
+                SessionContinuationMode.RESUME_CONTINUATION, parked.task_id,
+                "AWAITING_USER", "safe_checkpoint_available",
+                SessionResumeSafety.EXACT_RESUME,
+            )
+            with patch.object(
+                type(client.application.kernel), "resolve_session_continuation",
+                new=AsyncMock(return_value=resumable),
+            ):
+                result = await self._submit_against(
+                    client, session.session_id, parked, "resumable-1",
+                )
 
             self.assertEqual(
                 result.result.get("reason_code"), "task_awaits_user_action",

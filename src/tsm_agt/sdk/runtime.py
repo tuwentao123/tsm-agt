@@ -22,6 +22,7 @@ from tsm_agt.core import (
     SessionTextInput,
     SessionAnswerRequiresTask,
     ModelInvocationFailed,
+    SessionContinuationMode,
     SessionInputDecision, SessionRouteDisposition, SessionTaskRelation,
     SessionSnapshot,
     TaskRuntimeProjection, TaskRuntimeProjector,
@@ -525,6 +526,39 @@ class EngineeringAgentClient:
             return False
         return pending.get("reason") in cls._ORPHANED_PENDING_ACTION_REASONS
 
+    async def _pending_action_is_undeliverable(
+        self, session_id: str, task: TaskSnapshot, workspace: Path | None,
+    ) -> bool:
+        """Whether nothing the user can type will move ``task`` forward.
+
+        Two ways a pending action dies. Its producer may have been removed, which
+        ``_awaits_orphaned_action`` names explicitly. Or its checkpoint can no
+        longer be resumed at all: an upgrade that changes the adapter lock leaves
+        a Task carrying tool-execution state at ``REQUIRES_VALIDATION``, which
+        ``resolve_session_continuation`` answers with ``BLOCKED``. Either way rule
+        3's refusal would wedge the Session on a Task no command can recover
+        except ``/new``, so ordinary routing must be allowed to take over. The
+        Task is left untouched and still lists for ``/resume``.
+
+        Resolving per-Task (not per-Session) matters: another Task in the Session
+        awaiting an approval must not make an unrecoverable active Task look
+        answerable.
+        """
+
+        if self._awaits_orphaned_action(task):
+            return True
+        try:
+            decision = await self.application.kernel.resolve_session_continuation(
+                session_id, workspace, task_id=task.task_id
+            )
+        except Exception:
+            # An unknown outcome keeps the conservative refusal: plain text is
+            # never reinterpreted as a new topic on a guess.
+            return False
+        return decision.mode in {
+            SessionContinuationMode.BLOCKED, SessionContinuationMode.EMPTY,
+        }
+
     async def submit_user_input(
         self, session_id: str, text: str, *, input_id: str,
         explicit_intent: RuntimeInputIntent | None = None,
@@ -606,7 +640,9 @@ class EngineeringAgentClient:
             and active.state in {
                 TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER,
             }
-            and not self._awaits_orphaned_action(active)
+            and not await self._pending_action_is_undeliverable(
+                session_id, active, workspace
+            )
         ):
             return RuntimeCommandResult(input_id, False, UserInputResult(
                 input_id, "clarify", SessionInputRelation.UNKNOWN.value,
