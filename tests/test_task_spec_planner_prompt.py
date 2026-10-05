@@ -101,6 +101,24 @@ class PlannerContractPromptTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("query runtime.db", prompt)
         self.assertIn("carrying the observe (or execute) effect", prompt)
 
+    async def test_the_preceding_exchange_may_interpret_but_never_author(
+        self,
+    ) -> None:
+        """A reply must be read in context, without gaining authority.
+
+        Contrast with the rule above: the failure that motivated this one was
+        the Planner reading "原因" (for 愿意) as a topic because it could not see
+        the offer it was answering.
+        """
+
+        prompt = await self._prompt()
+        self.assertIn("session.interpretation_context", prompt)
+        self.assertIn("may never define scope", prompt)
+        self.assertIn(
+            "not the meaning its words carry in isolation", prompt,
+        )
+        self.assertIn("near-miss", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

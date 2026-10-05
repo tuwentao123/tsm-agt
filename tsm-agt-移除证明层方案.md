@@ -2348,3 +2348,77 @@ tsm-agt 已经有 `core.request_input`（≈ clarify，`kernel.py:3899-3922`，�
   `input_grounding = CONTEXT_DEPENDENT`（或 router fallback）时**不生成字面 spec**，
   让 agent 按回退注释本来的意图去解析，需要时用 `core.request_input` 问。
   需要把 `input_grounding` 从 session 决策透传到 task 创建/规划路径。
+
+## A.9 按 Hermes 方式落地 1+2：planner 现在看得到紧邻的上一轮交换
+
+### 改动
+
+**1. `core/kernel_task.py` — 用 INV-8 自己的口子把上一轮拉进来**
+
+`_task_spec_planning_context` 现在先定位当前输入在 session projection 里的下标，
+再用新增的 `_preceding_exchange_ids()` 取出**紧邻本输入之前的那条 assistant 消息
++ 它回答的那条 user 消息**（最多 2 条），通过
+`ContextScope(explicit_message_ids=...)` 拉进来 —— 这正是 `ContextScope` docstring
+写明的 "explicit message/event references may pull in a single outside fact
+**without widening the boundary to a whole Task**"。
+
+`lineage_task_ids` **没有**被放宽，`include_background` 仍是 False。
+
+投影器把 scoped 消息一律标成 `AUTHORITATIVE`，所以在规划上下文里再按 `task_id` 拆开：
+
+- `session.scoped_messages` —— 只有本 Task 自己的消息（仍是 AUTHORITATIVE）
+- `session.interpretation_context` —— 拉进来的那一轮，改标 `NON_AUTHORITATIVE`，
+  并在 `authority` 表里登记
+
+**2. `adapters/model_task_spec_planner/planner.py` — 区分"解释"与"定义"**
+
+在原有的 "only the latest user request may define them" 之后补：
+
+> session.interpretation_context is the exchange immediately before this input,
+> delivered NON_AUTHORITATIVE. It may never define scope, constraints, or an
+> acceptance criterion, but you MUST read the latest request against it: a request
+> that answers a question the assistant just asked has the meaning that exchange
+> gives it, **not the meaning its words carry in isolation**. Treat a short fragment,
+> a bare reply, or a near-miss of the word the reply needs -- a homophone, a wrong
+> character, a mistyped term -- as the word the exchange requires, **and never as a
+> new topic to explain**. When the exchange still leaves two readings that would
+> produce materially different work, state the ambiguity in the goal instead of
+> silently choosing one.
+
+"定义仍然只有最新一句，解释可以用上下文" —— 这是对旧规则的**收口**，不是推翻。
+
+### 用真实账本数据验证（只读副本）
+
+对出事的那个真任务 `task-12d775944ea04890af9436fe1787640f` 直接调
+`_task_spec_planning_context`：
+
+```
+scoped (AUTHORITATIVE):
+   user      task-12d7759...  '原因 直接写文档吧'
+interpretation (NON_AUTHORITATIVE):
+   user      task-71a9d71e... '愿意 开始下一步吧'      ← 用户自己写对过的那句！
+   assistant task-71a9d71e... '先给你一句总的结论，然后分两块说：...'
+```
+
+**紧邻的那一轮里就有用户自己拼对的「愿意 开始下一步吧」。** 改之前 planner 一个字都看不到
+（INV-8 把 scope 限死在 `lineage_task_ids=(本 task,)`，且 `include_background=False`），
+所以只能把 `原因` 当主题；改之后它拿到的正是消歧所需的证据。
+
+### 测试
+
+新增 `tests/test_planner_interpretation_context.py` 3 条 + `test_task_spec_planner_prompt.py` 1 条：
+
+- 紧邻上一轮出现在 planner 上下文里、且标 NON_AUTHORITATIVE；
+- `scoped_messages` 只有本 Task 自己的请求（权威性没被稀释）；
+- 拉进来的**至多 2 条**，更早 Task 的内容不出现（INV-8 边界没被放宽）；
+- 首个输入（无上一轮）`interpretation_context` 为空。
+
+**1283 passed / 12 skipped / 0 failed。**
+
+### 未做（第 3 步）
+
+"两种解读会产出实质不同交付物时，让 agent 用 `core.request_input` 问一次"
+（Hermes 的 `clarify` + `<act_dont_ask>`）留给下一批 —— 它要动提示词段落，
+会牵动 `revision` 与几条长度 pin。
+
+**需要重启进程才生效。**

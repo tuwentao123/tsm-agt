@@ -41,7 +41,7 @@ from __future__ import annotations
 
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from tsm_agt.ports import (
@@ -57,7 +57,9 @@ from .configuration import canonical_hash
 from .document_references import extract_document_references
 from .runtime_input import SessionTaskRelation
 from .session import SessionSnapshot, standalone_session_id
-from .session_context import ContextAuthority, ContextScope
+from .session_context import (
+    ContextAuthority, ContextScope, SessionConversationMessage,
+)
 from .session_handoff import clip_text
 from .steering import SteeringKind, SteeringProjector
 from .task import TaskNotFound, TaskSnapshot, TaskState
@@ -182,14 +184,34 @@ class TaskMixin:
                         break
                 if source_task_id is not None:
                     break
+        current_request = task.goal
+        current_request_index: int | None = None
+        for index in range(len(projection.messages) - 1, -1, -1):
+            message = projection.messages[index]
+            if message.task_id == task.task_id and message.role is MessageRole.USER:
+                current_request = message.text.strip() or current_request
+                current_request_index = index
+                break
         # INV-8: the Planner is scoped to this Task's own lineage and receives
         # no background at all. Another Task's conversation can therefore never
         # become this Task's goal or acceptance criterion, and recency is not an
         # eligibility rule.
+        #
+        # A request that only reads as a reply -- "原因 直接写文档吧" answering
+        # "如果你愿意...我可以...写文档" -- still has to be interpreted by
+        # something, and a Planner shown only itself can only read it literally.
+        # The immediately preceding exchange is therefore pulled in through
+        # ContextScope's explicit-reference escape hatch: a bounded, named
+        # outside fact, never a widened lineage boundary. It stays
+        # NON_AUTHORITATIVE and is delivered under its own section, so it can
+        # resolve what the request refers to without authoring a goal.
         scope = ContextScope(
             session_id=task.session_id,
             task_id=task.task_id,
             lineage_task_ids=(task.task_id,),
+            explicit_message_ids=self._preceding_exchange_ids(
+                projection.messages, current_request_index
+            ),
         )
         prompt_projection = self._dependencies.session_context_projector.for_prompt(
             projection,
@@ -199,11 +221,6 @@ class TaskMixin:
         )
         prompt_data = dict(prompt_projection.prompt_data or {})
         related_task: Mapping[str, Any] | None = None
-        current_request = task.goal
-        for message in reversed(projection.messages):
-            if message.task_id == task.task_id and message.role is MessageRole.USER:
-                current_request = message.text.strip() or current_request
-                break
         for item in reversed(prompt_data.get("task_index", [])):
             if item.get("task_id") == task.task_id and source_task_id is None:
                 source_task_id = item.get("source_task_id")
@@ -247,17 +264,38 @@ class TaskMixin:
                     "mutations": [],
                     "authority": ContextAuthority.SCOPED_BACKGROUND.value,
                 }
+        # The projector marks every scoped message AUTHORITATIVE. The pulled-in
+        # exchange belongs to an earlier Task, so it is separated out here and
+        # re-tagged: it may resolve what the request refers to, never author the
+        # goal or an acceptance criterion.
+        scoped_messages = [
+            message for message in prompt_data.get("scoped_messages", [])
+            if message.get("task_id") == task.task_id
+        ]
+        interpretation_context = [
+            {
+                **message,
+                "authority": ContextAuthority.NON_AUTHORITATIVE.value,
+            }
+            for message in prompt_data.get("scoped_messages", [])
+            if message.get("task_id") != task.task_id
+        ]
+        authority = dict(prompt_data.get("authority", {}))
+        authority["interpretation_context"] = (
+            ContextAuthority.NON_AUTHORITATIVE.value
+        )
         planning_context = {
             "workspace": task.workspace,
             "available_tool_effects": sorted({
                 tool.effect.value for tool in await self.list_tools()
                 if not tool.is_internal_state
             }),
-            "authority": dict(prompt_data.get("authority", {})),
+            "authority": authority,
             "session": {
                 "revision": prompt_projection.revision,
                 "working_state": prompt_data.get("work_state", {}),
-                "scoped_messages": prompt_data.get("scoped_messages", []),
+                "scoped_messages": scoped_messages,
+                "interpretation_context": interpretation_context,
                 "background_messages": prompt_data.get("background_messages", []),
                 "recent_artifacts": [
                     {
@@ -280,6 +318,35 @@ class TaskMixin:
             prompt_projection.revision,
             context_hash,
         )
+
+    @staticmethod
+    def _preceding_exchange_ids(
+        messages: Sequence[SessionConversationMessage],
+        input_index: int | None,
+    ) -> tuple[str, ...]:
+        """The exchange immediately before the current input, by message id.
+
+        Bounded to one assistant message plus the user message it answered, and
+        only the turn directly before this input. That is enough to resolve a
+        reply, a fragment, or a word that only makes sense against what the
+        assistant just said -- and too little to quietly re-supply an earlier
+        Task's requirements, which is what INV-8 exists to prevent.
+        """
+
+        if input_index is None:
+            return ()
+        preceding = messages[:input_index]
+        if not preceding:
+            return ()
+        picked = [preceding[-1]]
+        if picked[0].role is not MessageRole.USER:
+            earlier_user = next((
+                message for message in reversed(preceding[:-1])
+                if message.role is MessageRole.USER
+            ), None)
+            if earlier_user is not None:
+                picked.insert(0, earlier_user)
+        return tuple(message.message_id for message in picked)
 
     async def plan_task_spec(self, task_id: str) -> TaskSpecSnapshot:
         """Ask the semantic Planner for a proposal; Runtime owns persistence."""
