@@ -1910,3 +1910,109 @@ A.2c 是确定性的（路由层代码判定），A.2d / A.2e 都是提示词约
 **我没有在真实模型上验证过**：模型端点此刻比平时慢约 12 倍，且免费搜索后端在本沙箱多半不可达。
 **真正的验证需要你在自己环境里再问一次时效性问题**，然后看 ledger 里有没有
 `tool.requested web.search`。
+
+## A.3 用户报障：任务输出 `unresolved_tool_batch` —— 删掉 scope 一致性守卫
+
+### 真实账本（`task-9a54f8ebe6ba469c9dfdf49f317fed8f`，48 个事件）
+
+目标："整理成文档了吗 教学&面试 系统文档"。链路：
+
+| seq | 事件 | 内容 |
+|---|---|---|
+| 14–16 | `model.attempt_failed` | provider 首次返回的 tool-call JSON 损坏 → `INVALID_RESPONSE` → `RESAMPLE`（已处理的瞬时错误） |
+| 21, 30 | `tool.requested` | `core.find_files(path="codex-rs", pattern="**/docs/**")`，声明 `expected_scope="codex-rs/docs"` |
+| 35 | `tool.scope_consistency_evaluated` | **`MISMATCH` / `REPLAN`** |
+| 36 | `tool.failed` | `TOOL_SCOPE_MISMATCH`，但 payload 里 `original_tool_ok: true` |
+| 37–38 | `evidence.delta_evaluated` | `new_facts: 0`；`Q-doc-file` → `OPEN`，blocking = `TOOL_SCOPE_MISMATCH` |
+| 43–44 | `model.attempt_completed` | round 2 空转（无工具调用、无答案） |
+| 45 | `continuation.requested` | `reason="unresolved_tool_batch"`，gap = `tool-recovery:call_d7Oqie…` |
+| 47 | `task.state_changed` | `EXECUTING → AWAITING_USER` |
+
+`unresolved_tool_batch` 是 `core/kernel.py:2711` 注入的 blocker（`_recovery_batch_blocker_message`）。
+
+### 根因：守卫把一个**成功**的工具结果改判成失败
+
+`core/kernel_tool.py` 的 `_tool_scope_relation` 用
+`is_same_or_descendant(resolved_path, expected_path)` 比较 —— 其中 `resolved_path`
+只是 call 的 **`path` 参数**。于是它要求"声明的作用域包含被搜索的根"。
+
+模型搜 `codex-rs`、声明 `codex-rs/docs` → `codex-rs` 不是 `codex-rs/docs` 的后代 → MISMATCH。
+
+**而模型的声明是对的**：`/Users/tusima/Documents/workSp/codex/codex-rs/docs` 存在，
+且是 `codex-rs` 下**唯一**的 docs 目录，所以 `**/docs/**` 的实际命中集合就是它。
+
+这条规则对**探索式搜索是不可满足的**：它要求你在搜索之前就知道作用域在哪 —— 而搜索的
+目的恰恰是找出作用域在哪。同时提示词只说了两句，方向还相反：
+`prompt.py:124` 与 `adapters/openai_compatible/model.py:790` 都说
+`expected_scope` 是 "the path this question is about"，
+**没有任何地方告诉模型"必须包含你搜索的 path"**。
+
+### 量化：它值不值
+
+整本账本里它的全部战绩是 `MATCH 10 | NOT_APPLICABLE 4 | MISMATCH 1` ——
+**唯一一次动作就是这次破坏**。`TOOL_SCOPE_MISMATCH` 全仓只有这一处产生。
+
+### 落地（按用户选择 A）
+
+删除：`ports/tool_scope_consistency.py`、`adapters/rule_based_scope_consistency/`、
+`core/kernel_tool.py` 的调用点与两个方法（`_evaluate_tool_scope_consistency`、
+`_tool_scope_relation`）、`Kernel` 的依赖字段、`bootstrap/composition.py` 全部接线
+（含两处默认注册与唯一性检查）、`TOOL_SCOPE_MISMATCH` 错误码、`tests/test_tool_scope_consistency.py`。
+
+删块后按老规矩 grep 了块内出现过的每个标识符：`ToolScope*` 全为 0，但漏网的
+`WorkspaceAccessCapability` 导入与两处模块 docstring 条目（`_evaluate_tool_scope_consistency`、
+`_tool_scope_relation`）已一并清掉。
+
+`expected_scope` 字段**保留**：仍被投影进 session context（`session_context.py:1295`）与
+working memory（`working_memory.py:320`），并被 checkpoint 兼容性比较
+（`kernel_checkpoint.py:273`），在 provider schema 里仍是 `required`。它现在**无人执法**，
+这是另一个待决事项，本次未动。
+
+### 回归测试（`tests/test_kernel_tools.py::DiscoverySearchScopeTest`）
+
+原样重放那个调用形状，断言：`ok=True`、`error_code is None`、命中
+`codex-rs/docs/teaching.md`、有 `tool.completed`、无 `tool.failed`、无任何
+`scope_consistency` 事件。
+
+**1277 passed / 12 skipped / 0 failed。**
+
+---
+
+## A.4 **更正**：判官层"0 次阻断"是我说错了
+
+A.3 里我说"其余整个判官层一次都没阻断过"。这句话只对**观测值**成立，不对**能力**成立 ——
+我拿"账本里出现过的 decision 值"当成了"它能不能阻断"。审计（`judge-layer-audit.md`）显示这些层
+**都是真闸门**，只是在本次账本里都走了放行分支。
+
+已核实的 9 个闸门点（全部我亲自读过源码）：
+
+| 层 | 阻断方式 | 位置 |
+|---|---|---|
+| `evidence_relation` | 合成 `EXPLORATION_ROUTE_REJECTED` + `continue`；还可**替换** call | `turn_tool_batch.py:208-253`、`:194-196` |
+| `exploration_budget` | `FOCUS`+`focus_allows_call=False` → `EXPLORATION_FOCUS_REQUIRED`；`WRAP_UP` → `EXPLORATION_BUDGET_WRAP_UP` + 置 `budget_wrap_up` | `:334/377`、`:419/460/501` |
+| `read_hits` | `REQUIRE_READ` → `READ_HITS_REQUIRED` + `continue` | `:546` → `:568-608` |
+| `artifact_read` | `REQUIRE_REUSE` → `ARTIFACT_ALREADY_READ` + `continue` | `:617` → `:655` |
+| `plan`（非 port，硬编码） | `should_stop`/`plan_finished` 喂给 stop_or_pivot | `:695-709` → `:720` |
+| `stop_or_pivot` | `terminal` → **取消整批**未执行的 call（`CANCELLED_BY_RUNTIME_POLICY`）+ `break` | `:720-741`、`:782` |
+| `exploration_outcome` | `STOP_ROUTE/WRAP_UP/ASK_USER` → 置 `budget_wrap_up`，禁掉**后续**调用 | `:980-985` |
+| `policy`（真权限，保留） | `require_approval` → 挂起整轮；`deny` → `PERMISSION_DENIED` | `kernel_tool.py:1177`、`:1251` |
+
+wrap-up 链已核实：`state.wrap_up = ... or state.budget_wrap_up`
+（`turn_phases.py:151-155`）→ `allow_tool_calls=not (state.wrap_up or ...)`（`:446`）。
+
+两点补充，也都已核实：
+
+- **这 9 层没有一个创建 `CompletionGap`** —— `kernel.py:1855` 写着 `gaps = ()`，
+  注释是 "Completion has no obligation record (Hermes/Codex): no gaps exist"，
+  这正是证明层移除生效的证据。
+- **这 9 层没有一个触发模型/provider 重试** —— 重试机制在
+  `RuleBasedModelRecoveryPolicy` / `ResilientModelProvider`（`composition.py:869-878`）。
+  合成失败只喂回普通循环，即多花一个普通模型轮。
+
+### 与 A.3 的关系
+
+scope 守卫和这 8 个层是**同一物种**：都在工具执行路径上做额外判定，都能把"本可以继续的工作"
+变成"合成的失败结果"。区别只是 scope 守卫这次真的动了手，而它动手的方式（丢弃一个
+`ok=True` 的只读观察）比"合成失败让模型重试"更糟。
+
+要不要继续按同一标准处置这 8 层，是下一步的待决事项 —— 不在 A.3 的授权范围内，本次未动。
