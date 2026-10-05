@@ -2422,3 +2422,62 @@ interpretation (NON_AUTHORITATIVE):
 会牵动 `revision` 与几条长度 pin。
 
 **需要重启进程才生效。**
+
+## A.10 用户报障：`task-ef2f8587` 为什么变成"已中断"
+
+状态 `INTERRUPTED`。**不是崩了，是刻意的可恢复中断。**
+
+### 链条
+
+1. **规划阶段**（TaskSpecPlanner）让模型调 `planner.submit_task_spec`；模型返回的 tool call
+   参数不是合法 JSON。`adapters/openai_compatible/model.py:995-999` 解析失败并抛
+   `OpenAICompatibleProviderError("tool call ... contains invalid JSON arguments")`。
+2. 归类为 `INVALID_RESPONSE` / retryable → `SAFE_RESAMPLE`，resilient provider 重采样，
+   **重试耗尽** → `ModelRecoveryExhausted`。
+3. `kernel_task.py:447-481` 捕获 → 发 `task_spec.planning_failed`；因为是 model failure，
+   按**可恢复中断**处理：`_record_recoverable_turn_interruption(...)` → `llm.failed`
+   → `recovery_action: PRESERVE_AND_INTERRUPT`。
+4. 状态 `EXECUTING → INTERRUPTING → INTERRUPTED`，reason
+   `"safe Agent checkpoint preserved for resume"`，`checkpoint_preserved: true`。
+
+**为什么是 INTERRUPTED 而不是 FAILED**：`kernel_task.py:457-461` 的注释写明了 ——
+之前把这种情况标成 FAILED 会把一次 gateway 抖动变成死任务（`task-e547187a…`），
+所以改成保留 checkpoint 的可恢复中断。
+
+### 频率（整本账本）
+
+| 现象 | 次数 | 何时 |
+|---|---|---|
+| `invalid JSON arguments` | 2 | 14:58 agent 路径（`task-9a54f8eb`，被 RESAMPLE 救回，第二次尝试成功）；17:09 planner 路径（本次） |
+| `ModelRecoveryExhausted` | **1** | 本次 |
+| `task_spec.planning_failed` | **1** | 本次 |
+
+即：**"模型偶发吐坏 JSON" 是既有现象**（14:58 早于本会话所有改动），
+但**planner 路径重试耗尽**是第一次。
+
+### 与我的改动的关系（诚实说明）
+
+进程 16:55 重启、我的提交 16:53 —— **改动是生效的**。
+但同类错误 14:58 就出现过（早于我所有改动），是模型侧问题，不能归因于我。
+不过必须说清：我这次让 planner 提示词变长、并往它的 user message 里加了新的
+`interpretation_context` 段落，**理论上无法排除**这会增加模型吐坏 JSON 的概率。
+沙箱里既不能证实也不能排除。
+
+### 真正的缺陷：planner 的一次 provider 抖动会中断整个任务
+
+- agent 路径遇到**同样**的错误可以 RESAMPLE 救回（14:58 那次就是，`model.attempt_failed`
+  → `model.recovery_decided: RESAMPLE` → attempt 2 成功）。
+- planner 路径救不回。原因：planner 自己的有界修正循环
+  （`planner.py:59` `for attempt in range(2)`）只兜**校验**失败（把修正语追加后再问一次），
+  而非法 JSON 是在 `_complete()` 里抛的 —— **在它解析之前** —— 所以那套修正根本没机会跑，
+  异常直接从 `propose_task_spec` 抛出。
+
+**planner 是"尽力而为"的规格作者**（A.6/A.7 已确认：证明层移除后它产出无人执法、
+却能误导的东西；Hermes/Codex 根本没有这一层）。让它的 provider 抖动中断整个任务，
+方向上是反的。
+
+### 待决
+
+planner 失败时**不中断任务，直接不带 spec 继续** —— agent 拿原始 goal + session 历史，
+这正是 Hermes 的形态（`plan_task_spec` 已经把 `planner is None` 当成"没有 spec"处理，
+所以这条路本来就被支持）。
