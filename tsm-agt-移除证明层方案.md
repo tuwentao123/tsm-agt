@@ -2566,3 +2566,57 @@ planner 失败时**不中断任务，直接不带 spec 继续** —— agent 拿
 所以先不动；如果以后仍出现 `truncated_tool_arguments` 且重试无效，再考虑按 A.10 直接跳过 spec。
 
 **需要重启进程才生效。**
+
+## A.12 追问：planner 的"输出上限"是什么，Codex/Hermes 有吗
+
+### 是什么
+
+`ModelRequest.max_output_tokens`（`ports/model.py:336`，默认 1024）—— 上线时映射成
+`max_tokens`（可配成 `max_completion_tokens`，`openai_compatible/model.py:734`、`:101`）。
+就是 OpenAI 兼容 API 的标准参数，不是 tsm-agt 发明的。
+
+但它在这里**还参与上下文预算**：`reserved_output_tokens`（`core/context.py:59`）
+会从 context window 里扣掉，用来决定何时压缩。所以一个数字服务两个用途，
+每个调用点都必须报一个数。
+
+**所有调用点都显式设了值**（已扫全部 `ModelRequest(` 构造点）：
+
+| 调用点 | 上限 |
+|---|---|
+| agent 回合（`turn.started` 记录） | 8192 |
+| planner（`planner.py:165`，本次由 1200 抬高） | 4096 |
+| session 回答（`kernel_session.py:1515/1563`） | 4096 |
+| rubric judge（`model_rubric_judge/judge.py:75`） | 256，且失败时返回 `JUDGE_ERROR` 不外抛 |
+
+**没有谁静默吃 1024 的默认值。**
+
+### Codex：**根本没有这个字段**
+
+`ResponsesApiRequest`（`codex-rs/codex-api/src/common.rs:252-275`）的全部字段：
+`model / instructions / input / tools / tool_choice / parallel_tool_calls / reasoning /
+store / stream / stream_options / include / service_tier / prompt_cache_key / text /
+client_metadata` —— **没有 max output tokens**。
+Codex 从不给模型输出设上限，交给服务商决定。
+
+（Codex 里 `max_output_tokens` 的那些命中全是**工具输出截断**，terminal / code_mode，
+是另一个概念。）
+
+### Hermes：有，但可选，默认不设
+
+- `agent.max_tokens` 默认 `None` = "use model default if not set"
+  （`agent_init.py:269`、`:499`），由 `config.yaml` 的 `model.max_tokens` 配置。
+- 一个例外：Anthropic/auxiliary 路径在未设时回退 **2000**（`auxiliary_client.py:1109`）。
+
+### 对比结论
+
+| | 模型输出上限 |
+|---|---|
+| **Codex** | 请求体里**没有这个字段** |
+| **Hermes** | 有，可选，默认交给模型（`None`） |
+| **tsm-agt** | **每次调用必填**，且与上下文预算绑定 |
+
+planner 的 1200 是 tsm-agt 自己的选择 —— 没有任何外部约束要求这个数，
+而它低于一份 Task SPEC 实际需要的量（实测 365–957）。
+
+**这也解释了为什么"上限截断 tool call"这类故障只在 tsm-agt 出现**：
+Codex 不设上限，压根不会有这种事。
