@@ -10,7 +10,6 @@ from pathlib import Path
 from tsm_agt.adapters.builtin import CoreReadOnlyToolProvider
 from tsm_agt.adapters.posix_path import PosixWorkspacePath
 from tsm_agt.adapters.windows_path import WindowsWorkspacePath
-from tsm_agt.core.configuration import RIPGREP_ENV, ripgrep_binary
 from tsm_agt.core.workspace import EXCLUDED_DIRECTORIES
 from tsm_agt.ports import AdapterContext, ToolCall, ToolInvocationContext
 
@@ -610,18 +609,22 @@ class ExcludedDirectoryPolicyTest(unittest.IsolatedAsyncioTestCase):
         )
 
 
-class RipgrepVisibilityFilterTest(unittest.IsolatedAsyncioTestCase):
-    """ripgrep contributes ``.gitignore``; the walker still contributes order.
 
-    The filter is **additive**, never a replacement: the walker keeps supplying
-    the deliberate source-root ranking and the generated-directory accounting,
-    and ripgrep only removes files the project itself ignores. With no ripgrep
-    the previous behaviour stands unchanged.
+class GitignoreIsNotAVisibilityFilterTest(unittest.IsolatedAsyncioTestCase):
+    """``.gitignore`` must not hide a file that exists in the selected workspace.
 
-    A stub ``rg`` is used instead of the real binary so the test pins *this*
-    integration -- resolving the executable, passing ``--files`` plus the
-    excluded-directory globs, parsing stdout, applying the filter -- rather than
-    re-testing ripgrep.
+    Real report: ``task-292644cf`` on an iOS workspace asked for ``Podfile.local``.
+    The file exists at the workspace root, but the parent repository's
+    ``.gitignore`` lists it, and the file tools used ``rg --files`` -- which
+    honours ``.gitignore`` -- as a visibility filter. ``core.search_files``
+    therefore returned zero matches, which is indistinguishable from "the file
+    does not exist", and the Agent concluded the workspace was not mounted.
+
+    Codex and Hermes both honour ``.gitignore`` for enumeration, but in both it
+    is a default of a command the model chooses and can escape (``rg -u``,
+    ``ls``, plain reads). Here it was baked into the tool, with no override and
+    no signal. Noise is pruned by ``EXCLUDED_DIRECTORIES`` instead, which is the
+    job that actually needs doing.
     """
 
     MARKER = "visibility-marker-3d17"
@@ -629,7 +632,9 @@ class RipgrepVisibilityFilterTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.workspace = Path(self.temp_dir.name)
-        (self.workspace / ".gitignore").write_text("generated/\n", encoding="utf-8")
+        (self.workspace / ".gitignore").write_text(
+            "generated/\nPodfile.local\n", encoding="utf-8"
+        )
         (self.workspace / "src").mkdir()
         (self.workspace / "src" / "app.py").write_text(
             f"{self.MARKER}\n", encoding="utf-8"
@@ -642,6 +647,7 @@ class RipgrepVisibilityFilterTest(unittest.IsolatedAsyncioTestCase):
         (self.workspace / "node_modules" / "dep.py").write_text(
             f"{self.MARKER}\n", encoding="utf-8"
         )
+        (self.workspace / "Podfile.local").write_text("platform :ios\n", encoding="utf-8")
         self.provider = CoreReadOnlyToolProvider()
         context = AdapterContext(config={}, emit_event=lambda _type, _payload: None)
         await self.provider.start(context)
@@ -650,9 +656,9 @@ class RipgrepVisibilityFilterTest(unittest.IsolatedAsyncioTestCase):
         )
         await self.path_service.start(context)
         self.context = ToolInvocationContext(
-            invocation_id="inv-vis",
-            task_id="task-vis",
-            turn_id="turn-vis",
+            invocation_id="inv-gitignore",
+            task_id="task-gitignore",
+            turn_id="turn-gitignore",
             workspace=self.workspace,
             deadline=datetime.now(timezone.utc) + timedelta(seconds=30),
             workspace_path=self.path_service,
@@ -661,81 +667,67 @@ class RipgrepVisibilityFilterTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def _use_stub(self, stdout: str) -> Path:
-        """Point the resolver at a stub that records argv and prints ``stdout``."""
-
-        argv_file = self.workspace / "argv.txt"
-        stub = self.workspace / "stub-rg.sh"
-        stub.write_text(
-            "#!/bin/sh\n"
-            f"printf '%s\\n' \"$@\" > '{argv_file}'\n"
-            + "".join(f"printf '%s\\n' '{line}'\n" for line in stdout.splitlines()),
-            encoding="utf-8",
-        )
-        stub.chmod(0o755)
-        os.environ[RIPGREP_ENV] = str(stub)
-        ripgrep_binary.cache_clear()
-        self.addCleanup(os.environ.pop, RIPGREP_ENV, None)
-        self.addCleanup(ripgrep_binary.cache_clear)
-        return argv_file
-
-    async def _search(self, **arguments):
-        return await self.provider.invoke(
-            ToolCall("vis", "core.search_text", {"query": self.MARKER, **arguments}),
+    async def test_a_gitignored_file_is_still_discoverable(self) -> None:
+        result = await self.provider.invoke(
+            ToolCall(
+                "search-ignored", "core.search_text",
+                {"query": self.MARKER, "path": "."},
+            ),
             self.context,
         )
 
-    async def test_a_gitignored_file_disappears_when_ripgrep_says_so(self) -> None:
-        self._use_stub("src/app.py")
+        self.assertTrue(result.ok)
+        paths = {match["path"] for match in result.data["matches"]}
+        self.assertIn("src/app.py", paths)
+        self.assertIn(
+            "generated/artifact.py", paths,
+            "the only thing hiding this file was .gitignore",
+        )
 
-        result = await self._search(path=".")
+    async def test_a_gitignored_file_is_found_by_name(self) -> None:
+        """The exact call the real Task made, which returned zero matches."""
 
-        self.assertTrue(result.data["ripgrep_filter"])
-        self.assertEqual([m["path"] for m in result.data["matches"]], ["src/app.py"])
+        result = await self.provider.invoke(
+            ToolCall(
+                "find-ignored", "core.find_files",
+                {"pattern": "Podfile.local", "path": "."},
+            ),
+            self.context,
+        )
 
-    async def test_the_walker_prunes_known_directories_without_ripgrep(self) -> None:
-        os.environ[RIPGREP_ENV] = str(self.workspace / "missing-rg")
-        ripgrep_binary.cache_clear()
-        self.addCleanup(os.environ.pop, RIPGREP_ENV, None)
-        self.addCleanup(ripgrep_binary.cache_clear)
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            [match["path"] for match in result.data["matches"]],
+            ["Podfile.local"],
+        )
 
-        result = await self._search(path=".")
+    async def test_a_gitignored_file_is_listed(self) -> None:
+        result = await self.provider.invoke(
+            ToolCall(
+                "list-ignored", "core.list_files",
+                {"path": ".", "recursive": True, "limit": 200},
+            ),
+            self.context,
+        )
+
+        self.assertTrue(result.ok)
+        names = {entry["path"] for entry in result.data["entries"]}
+        self.assertIn("Podfile.local", names)
+        self.assertIn("src", names)
+
+    async def test_excluded_directories_are_still_pruned(self) -> None:
+        """Dropping the ignore layer must not cost the noise pruning."""
+
+        result = await self.provider.invoke(
+            ToolCall(
+                "search-noise", "core.search_text",
+                {"query": self.MARKER, "path": "."},
+            ),
+            self.context,
+        )
 
         paths = {match["path"] for match in result.data["matches"]}
-        self.assertFalse(result.data["ripgrep_filter"])
-        self.assertIn("src/app.py", paths)
-        # node_modules is in EXCLUDED_DIRECTORIES, so the walker prunes it...
-        self.assertNotIn("node_modules/dep.py", paths)
-        # ...but ``generated/`` is only ignored by .gitignore, which needs
-        # ripgrep. Documented here so the gap this filter closes is explicit.
-        self.assertIn("generated/artifact.py", paths)
-
-    async def test_the_command_gets_files_mode_and_every_exclude_glob(self) -> None:
-        """Both policies must apply: ripgrep's own plus EXCLUDED_DIRECTORIES.
-
-        ``--hidden`` is part of the contract, not a detail: without it ripgrep
-        also drops ``.github/``, ``.eslintrc*`` and ``.gitlab-ci.yml``, which are
-        ordinary project files to a coding agent.
-        """
-
-        argv_file = self._use_stub("src/app.py")
-
-        await self._search(path=".")
-
-        argv = argv_file.read_text(encoding="utf-8").split()
-        self.assertIn("--files", argv)
-        self.assertIn("--hidden", argv)
-        for name in sorted(EXCLUDED_DIRECTORIES):
-            self.assertIn(f"!{name}", argv)
-
-    async def test_an_explicitly_named_ignored_file_is_still_searched(self) -> None:
-        """The filter governs discovery, never targeted access."""
-
-        self._use_stub("src/app.py")
-
-        result = await self._search(path="generated/artifact.py")
-
-        self.assertEqual(
-            [m["path"] for m in result.data["matches"]],
-            ["generated/artifact.py"],
+        self.assertNotIn(
+            "node_modules/dep.py", paths,
+            "EXCLUDED_DIRECTORIES, not .gitignore, is what prunes generated noise",
         )
