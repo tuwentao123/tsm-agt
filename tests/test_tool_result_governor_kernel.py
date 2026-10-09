@@ -112,10 +112,15 @@ class ToolResultGovernorKernelTest(unittest.IsolatedAsyncioTestCase):
                 "turn-1:call-1"
             ]
 
-            self.assertTrue(result.meta["result_governance"]["governor_truncated"])
+            self.assertTrue(result.meta["result_governance"]["redacted"])
             self.assertFalse(result.meta["result_governance"]["provider_truncated"])
             self.assertFalse(result.truncated)
             self.assertIsInstance(result.data, dict)
+            self.assertEqual(result.data["token"], "[REDACTED]")
+            self.assertEqual(
+                result.data["payload"], "x" * 400,
+                "the governor must not compact a payload; the tool owns its size",
+            )
             self.assertEqual(events[-1].payload["result"], result.to_data())
             self.assertEqual(execution.result, result)
             self.assertEqual(execution.state, ToolCommitState.COMMITTED)
@@ -144,7 +149,10 @@ class ToolResultGovernorKernelTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.error_code, "UNKNOWN_OUTCOME")
             self.assertEqual(execution.state, ToolCommitState.UNKNOWN_OUTCOME)
             self.assertEqual(execution.result, result)
-            self.assertTrue(result.meta["result_governance"]["governor_truncated"])
+            # Governed, but nothing to redact and nothing to compact: the
+            # synthesized failure payload carries no secret and no size limit.
+            self.assertIn("result_governance", result.meta)
+            self.assertFalse(result.meta["result_governance"]["redacted"])
             self.assertFalse(result.truncated)
         finally:
             temporary_directory.cleanup()

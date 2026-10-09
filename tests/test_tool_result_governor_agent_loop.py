@@ -128,11 +128,14 @@ class ToolResultGovernorAgentLoopTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(model.result_seen_by_model)
             observed = model.result_seen_by_model
             assert observed is not None
-            self.assertTrue(observed.meta["result_governance"]["governor_truncated"])
+            self.assertTrue(observed.meta["result_governance"]["redacted"])
             self.assertFalse(observed.truncated)
             self.assertIsInstance(observed.data, dict)
-            self.assertNotEqual(observed.data, "…")
-            self.assertIn("…", observed.data["payload"])
+            self.assertEqual(observed.data["token"], "[REDACTED]")
+            self.assertEqual(
+                observed.data["payload"], "x" * 400,
+                "the model must receive the payload, not a compacted prefix",
+            )
             self.assertTrue(observed.meta["result_governance"]["redacted"])
             self.assertNotIn("prompt-secret", json.dumps(observed.to_data()))
         finally:

@@ -57,7 +57,14 @@ class ToolResultGovernorTest(unittest.TestCase):
         self.assertEqual(governed.fact_descriptor, result.fact_descriptor)
         self.assertNotIn("secret-token", json.dumps(governed.to_data()))
 
-    def test_compacts_content_without_collapsing_containers_or_identity(self) -> None:
+    def test_does_not_compact_content_and_preserves_containers_and_identity(self) -> None:
+        """Only redaction may change a payload; size limits belong to the tool.
+
+        This governor used to collapse an over-budget list to its first and last
+        element. That turned a 31-entry workspace listing into two files
+        (``task-c4dfa243``) while ``truncated`` stayed false.
+        """
+
         matches = [
             {"path": f"src/file-{index}.py", "line": index, "text": "x" * 120}
             for index in range(4)
@@ -95,10 +102,13 @@ class ToolResultGovernorTest(unittest.TestCase):
         self.assertIsInstance(governed.data["matches"], list)
         self.assertEqual(
             [match["path"] for match in governed.data["matches"]],
-            ["src/file-0.py", "src/file-3.py"],
+            [f"src/file-{index}.py" for index in range(4)],
+            "every item survives, in order",
         )
-        self.assertEqual(summary["omitted_items"], {"data.matches": 2})
-        self.assertTrue(summary["governor_truncated"])
+        self.assertEqual(governed.message, "m" * 120)
+        self.assertEqual(governed.hint, "h" * 120)
+        self.assertNotIn("governor_truncated", summary)
+        self.assertNotIn("omitted_items", summary)
         self.assertFalse(summary["provider_truncated"])
         self.assertFalse(governed.truncated)
         self.assertEqual(governed.recovery_action, result.recovery_action)
@@ -139,7 +149,7 @@ class ToolResultGovernorTest(unittest.TestCase):
                 self.assertEqual(governed.meta["result_governance"]["profile"], profile)
                 for key in set(data) - {"content"}:
                     self.assertEqual(governed.data[key], data[key])
-                self.assertIn("…", governed.data["content"])
+                self.assertEqual(governed.data["content"], data["content"])
 
     def test_preserves_failure_and_unknown_outcome_semantics(self) -> None:
         recovery_action = {"kind": "inspect", "token": "must-not-change"}
@@ -164,7 +174,7 @@ class ToolResultGovernorTest(unittest.TestCase):
         self.assertEqual(governed.recovery_kind, ToolRecoveryKind.UNKNOWN_OUTCOME)
         self.assertIs(governed.recovery_action, recovery_action)
 
-    def test_reports_provider_and_governor_truncation_separately(self) -> None:
+    def test_reports_provider_truncation_without_claiming_its_own(self) -> None:
         result = ToolResult(
             call_id="call-1",
             ok=True,
@@ -179,6 +189,6 @@ class ToolResultGovernorTest(unittest.TestCase):
         )
 
         summary = governed.meta["result_governance"]
-        self.assertTrue(governed.truncated)
+        self.assertTrue(governed.truncated, "the tool's own flag still passes through")
         self.assertTrue(summary["provider_truncated"])
-        self.assertFalse(summary["governor_truncated"])
+        self.assertNotIn("governor_truncated", summary)

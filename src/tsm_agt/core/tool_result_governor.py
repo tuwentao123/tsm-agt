@@ -14,8 +14,6 @@ from tsm_agt.ports.tool import ToolCall, ToolResult, ToolResultAuthority, ToolSp
 
 
 _REDACTED = "[REDACTED]"
-_TRUNCATED = "…"
-_CHARS_PER_TOKEN = 4
 _SENSITIVE_KEY_PATTERN = re.compile(
     r"(?:^|[_\-.])(authorization|proxy-authorization|cookie|set-cookie|"
     r"token|access[_-]?token|refresh[_-]?token|id[_-]?token|secret|"
@@ -28,72 +26,25 @@ _GITHUB_TOKEN_PATTERN = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-
 _OPENAI_TOKEN_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b")
 _URL_PATTERN = re.compile(r"https?://[^\s\]\[\"'<>]+", re.IGNORECASE)
 
-# These locate evidence or prescribe a follow-up call. They stay visible even
-# when a provider's prose or result collection must be compacted.
-_COMMON_IDENTITY_FIELDS = frozenset(
-    {
-        "blob_sha",
-        "canonical_url",
-        "content_hash",
-        "content_type",
-        "count",
-        "document_ref",
-        "end_line",
-        "hash",
-        "line",
-        "line_count",
-        "line_end",
-        "line_start",
-        "next_page",
-        "page",
-        "path",
-        "per_page",
-        "provenance",
-        "ref",
-        "repo",
-        "requested_url",
-        "resource_ref",
-        "root",
-        "sha",
-        "sha256",
-        "source_kind",
-        "start_line",
-        "target",
-        "target_args",
-        "target_arguments",
-        "total_lines",
-        "truncated",
-        "url",
-    }
-)
-_PROFILE_IDENTITIES = {
-    "core_read_search": _COMMON_IDENTITY_FIELDS
-    | frozenset(
-        {
-            "pattern",
-            "query",
-            "search_target",
-            "skipped_entries",
-            "skipped_files",
-            "scanned_entries",
-            "scanned_files",
-        }
-    ),
-    "web_open_find": _COMMON_IDENTITY_FIELDS
-    | frozenset({"match_count", "status_code", "title"}),
-    "github_resolve_source": _COMMON_IDENTITY_FIELDS
-    | frozenset({"complete", "number", "source_kind", "tree_truncated"}),
-    "generic": _COMMON_IDENTITY_FIELDS,
-}
 
 
 class DefaultToolResultGovernor:
-    """Sanitize and compact provider results without changing execution semantics.
+    """Redact provider results; never compact them.
 
-    ``ToolSpec.max_result_tokens`` is an estimate of the model-visible content
-    budget. It applies only to ``data``, ``message``, and ``hint``; result control
-    metadata, fact descriptors, and recovery instructions are deliberately
-    excluded so a compacted result remains actionable and attributable.
+    This used to also truncate ``data``/``message``/``hint`` to
+    ``ToolSpec.max_result_tokens``. That was a second, invisible limit stacked on
+    results the tool had already bounded -- ``core.list_files`` caps at its own
+    ``limit``, ``core.read_file`` at ``_MAX_READ_CHARS``, the search tools at
+    ``_MAX_SEARCH_MATCHES``/``_MAX_SEARCH_FILES``, and ``core.process_logs`` at
+    ``max_output_bytes``. Worse, an over-budget list was collapsed to its **first
+    and last** element with ``truncated`` left untouched, so a 31-entry workspace
+    listing arrived as two files and read as a complete answer:
+    ``task-c4dfa243`` reported ``.DS_Store`` and ``脚本说明.md`` only, and the
+    Agent concluded the workspace was not mounted.
+
+    Redaction stays: stripping credentials from a result is a safety boundary, not
+    a budget. Size limits belong to the tool that produced the bytes, where they
+    are declared in the schema and reported in the result.
     """
 
     def govern(self, spec: ToolSpec, call: ToolCall, result: ToolResult) -> ToolResult:
@@ -106,67 +57,36 @@ class DefaultToolResultGovernor:
             "hint": result.hint,
         }
         original_size_bytes = len(_canonical_json(_plain_value(raw_content)).encode("utf-8"))
-        sanitized_data, data_redacted = _sanitize_value(result.data)
-        sanitized_message, message_redacted = _sanitize_value(result.message)
-        sanitized_hint, hint_redacted = _sanitize_value(result.hint)
+        governed_data, data_redacted = _sanitize_value(result.data)
+        governed_message, message_redacted = _sanitize_value(result.message)
+        governed_hint, hint_redacted = _sanitize_value(result.hint)
         sanitized_meta, meta_redacted = _sanitize_value(result.meta)
         if not isinstance(sanitized_meta, Mapping):
             sanitized_meta = {"value": sanitized_meta}
-        sanitized_meta = _mapping_without(sanitized_meta, "result_governance")
-
-        profile = _profile_for(spec.name)
-        omitted_items: dict[str, int] = {}
-        omitted_characters: dict[str, int] = {}
-        governed_data, data_truncated, _ = _truncate_value(
-            sanitized_data,
-            budget=spec.max_result_tokens * _CHARS_PER_TOKEN,
-            path="data",
-            identity_fields=_PROFILE_IDENTITIES[profile],
-            omitted_items=omitted_items,
-            omitted_characters=omitted_characters,
-        )
-        remaining_budget = max(
-            0,
-            spec.max_result_tokens * _CHARS_PER_TOKEN
-            - _content_size(governed_data),
-        )
-        governed_message, message_truncated, message_size = _truncate_value(
-            _optional_text(sanitized_message),
-            budget=remaining_budget,
-            path="message",
-            identity_fields=frozenset(),
-            omitted_items=omitted_items,
-            omitted_characters=omitted_characters,
-        )
-        governed_hint, hint_truncated, _ = _truncate_value(
-            _optional_text(sanitized_hint),
-            budget=max(0, remaining_budget - message_size),
-            path="hint",
-            identity_fields=frozenset(),
-            omitted_items=omitted_items,
-            omitted_characters=omitted_characters,
-        )
-        governor_truncated = data_truncated or message_truncated or hint_truncated
-        visible_content = {
-            "data": governed_data,
-            "message": governed_message,
-            "hint": governed_hint,
-        }
-        metadata = sanitized_meta
+        metadata = _mapping_without(sanitized_meta, "result_governance")
         if (
             spec.requires_network
             or spec.result_authority is ToolResultAuthority.EXTERNAL_SERVICE
         ):
             metadata = _mapping_updated(metadata, {"untrusted_data": True})
+        visible_content = {
+            "data": governed_data,
+            "message": governed_message,
+            "hint": governed_hint,
+        }
         metadata = _mapping_updated(
             metadata,
             {
                 "result_governance": {
+                    # Stays 2: ``turn_tool_batch`` treats a 2 as "already
+                    # governed, do not govern again".
                     "schema_version": 2,
-                    "profile": profile,
-                    "redacted": data_redacted or message_redacted or hint_redacted or meta_redacted,
+                    "profile": _profile_for(spec.name),
+                    "redacted": (
+                        data_redacted or message_redacted
+                        or hint_redacted or meta_redacted
+                    ),
                     "provider_truncated": result.truncated,
-                    "governor_truncated": governor_truncated,
                     "original_content_bytes": original_size_bytes,
                     "visible_content_bytes": len(
                         _canonical_json(visible_content).encode("utf-8")
@@ -175,19 +95,17 @@ class DefaultToolResultGovernor:
                     + hashlib.sha256(
                         _canonical_json(visible_content).encode("utf-8")
                     ).hexdigest(),
-                    "omitted_items": omitted_items,
-                    "omitted_characters": omitted_characters,
                 }
             },
         )
-        # Do not alter status, error, recovery, or fact semantics. In particular,
-        # provider ``truncated`` remains distinct from governor compaction.
+        # Do not alter status, error, recovery, or fact semantics, and do not
+        # rewrite the payload: redaction changes values only where a secret was
+        # found.
         return replace(
             result,
             data=governed_data,
             message=governed_message,
             hint=governed_hint,
-            truncated=result.truncated,
             meta=metadata,
         )
 
@@ -207,110 +125,6 @@ def _profile_for(tool_name: str) -> str:
     if tool_name.startswith("source.github.") or tool_name.startswith("github."):
         return "github_resolve_source"
     return "generic"
-
-
-def _truncate_value(
-    value: Any,
-    *,
-    budget: int,
-    path: str,
-    identity_fields: frozenset[str],
-    omitted_items: dict[str, int],
-    omitted_characters: dict[str, int],
-    unbounded: bool = False,
-) -> tuple[Any, bool, int]:
-    if unbounded:
-        return value, False, _content_size(value)
-    if value is None or isinstance(value, bool | int | float):
-        return value, False, _content_size(value)
-    if isinstance(value, str):
-        rendered_size = _content_size(value)
-        if rendered_size <= budget:
-            return value, False, rendered_size
-        compact = _head_tail(value, max(1, budget))
-        omitted_characters[path] = max(0, len(value) - len(compact.replace(_TRUNCATED, "")))
-        return compact, True, _content_size(compact)
-    if isinstance(value, Mapping):
-        items = list(value.items())
-        visible: list[tuple[Any, Any]] = []
-        truncated = False
-        remaining = budget
-        ordinary = [item for item in items if str(item[0]) not in identity_fields]
-        for key, item in items:
-            key_text = str(key)
-            child_path = f"{path}.{key_text}"
-            if key_text in identity_fields:
-                child, child_truncated, child_size = _truncate_value(
-                    item,
-                    budget=0,
-                    path=child_path,
-                    identity_fields=identity_fields,
-                    omitted_items=omitted_items,
-                    omitted_characters=omitted_characters,
-                    unbounded=True,
-                )
-            else:
-                remaining_items = len(ordinary)
-                allocation = remaining if remaining_items <= 1 else remaining // remaining_items
-                child, child_truncated, child_size = _truncate_value(
-                    item,
-                    budget=allocation,
-                    path=child_path,
-                    identity_fields=identity_fields,
-                    omitted_items=omitted_items,
-                    omitted_characters=omitted_characters,
-                )
-                remaining = max(0, remaining - child_size)
-                ordinary.pop(0)
-            visible.append((key, child))
-            truncated = truncated or child_truncated
-        rebuilt = _rebuild_mapping(value, visible)
-        return rebuilt, truncated, _content_size(rebuilt)
-    if isinstance(value, list | tuple | set | frozenset):
-        items = list(value)
-        if _content_size(value) <= budget:
-            return value, False, _content_size(value)
-        selected_indexes = list(range(len(items)))
-        if len(items) > 2:
-            selected_indexes = [0, len(items) - 1]
-            omitted_items[path] = len(items) - 2
-        visible_items: list[Any] = []
-        truncated = len(selected_indexes) != len(items)
-        remaining = budget
-        for position, index in enumerate(selected_indexes):
-            remaining_items = len(selected_indexes) - position
-            allocation = remaining if remaining_items == 1 else remaining // remaining_items
-            child, child_truncated, child_size = _truncate_value(
-                items[index],
-                budget=allocation,
-                path=f"{path}[{index}]",
-                identity_fields=identity_fields,
-                omitted_items=omitted_items,
-                omitted_characters=omitted_characters,
-            )
-            visible_items.append(child)
-            remaining = max(0, remaining - child_size)
-            truncated = truncated or child_truncated
-        rebuilt = _rebuild_sequence(value, visible_items)
-        return rebuilt, truncated, _content_size(rebuilt)
-    rendered = _sanitize_text(repr(value))[0]
-    return _truncate_value(
-        rendered,
-        budget=budget,
-        path=path,
-        identity_fields=identity_fields,
-        omitted_items=omitted_items,
-        omitted_characters=omitted_characters,
-    )
-
-
-def _head_tail(value: str, budget: int) -> str:
-    if budget <= len(_TRUNCATED):
-        return _TRUNCATED
-    visible = max(0, budget - len(_TRUNCATED))
-    head_length = visible // 2
-    tail_length = visible - head_length
-    return value[:head_length] + _TRUNCATED + value[-tail_length:]
 
 
 def _optional_text(value: Any) -> str | None:
@@ -419,10 +233,6 @@ def _redact_url_queries(value: str) -> str:
 
 def _is_sensitive_key(key: str) -> bool:
     return bool(_SENSITIVE_KEY_PATTERN.search(key))
-
-
-def _content_size(value: Any) -> int:
-    return len(_canonical_json(_plain_value(value)))
 
 
 def _plain_value(value: Any, *, seen: set[int] | None = None) -> Any:
