@@ -131,6 +131,66 @@ def validate_authored_reference(
         )
 
 
+_WORKSPACE_MUTATION_PREFIXES = (
+    "add", "build", "change", "create", "delete", "deploy", "edit",
+    "fix", "implement", "modify", "patch", "refactor", "remove", "update",
+    "写代码", "写一个", "写入", "修一下", "改一下", "做一下", "删除",
+    "实现", "新增", "添加", "修改", "调整", "修复", "重构", "部署",
+)
+_WORKSPACE_MUTATION_CUES = (
+    "改代码", "帮我改", "帮忙改", "修改", "调整", "修复", "实现", "新增",
+    "添加", "删除", "重构", "写入", "改一下", "修一下",
+)
+_EXPLANATION_PREFIXES = (
+    "why", "what", "how", "explain", "分析", "解释", "为什么", "为啥", "说明",
+)
+
+
+def classify_planner_delivery_intent(goal: str) -> dict[str, Any]:
+    """Derive the minimum delivery contract from the latest direct request."""
+    normalized = goal.strip().casefold()
+    requests_explanation = normalized.startswith(_EXPLANATION_PREFIXES)
+    if (
+        normalized.startswith(_WORKSPACE_MUTATION_PREFIXES)
+        or (
+            not requests_explanation
+            and any(cue in normalized for cue in _WORKSPACE_MUTATION_CUES)
+        )
+    ):
+        return {
+            "kind": "workspace_mutation",
+            "required_effects": [ToolEffect.MUTATE.value],
+            "authority": "runtime_current_request",
+        }
+    return {
+        "kind": "answer_or_observation",
+        "required_effects": [],
+        "authority": "runtime_current_request",
+    }
+
+
+def validate_planner_delivery_intent(
+    proposal: "TaskSpecProposal", delivery_intent: Mapping[str, Any],
+) -> None:
+    """Reject a planner contract that weakens an explicit code-change request."""
+    if delivery_intent.get("kind") != "workspace_mutation":
+        return
+    if any(
+        outcome.required
+        and outcome.kind in {
+            TaskOutcomeKind.WORKSPACE_DELIVERY,
+            TaskOutcomeKind.ARTIFACT_DELIVERY,
+        }
+        and ToolEffect.MUTATE in outcome.required_effects
+        for outcome in proposal.outcomes
+    ):
+        return
+    raise ValueError(
+        "workspace mutation request requires a required WORKSPACE_DELIVERY or "
+        "ARTIFACT_DELIVERY outcome with the mutate effect"
+    )
+
+
 class TaskOutcomeKind(StrEnum):
     """Project-neutral result shapes a Task may be required to deliver."""
 

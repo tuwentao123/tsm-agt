@@ -37,8 +37,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from tsm_agt.bootstrap import (
+    OrchestrationConfiguration,
     compose_openai_compatible_engineering_application,
 )
+from tsm_agt.core.single_loop import OrchestrationMode
 from tsm_agt.cli import _finalize_standalone_agent_result
 from tsm_agt.core import (
     AgentTurnResult, TaskState,
@@ -170,6 +172,9 @@ class CompletionReadinessModeTest(unittest.IsolatedAsyncioTestCase):
                 model_timeout_seconds=20.0, model_max_retries=0,
                 model_retry_backoff_seconds=0.0,
                 completion_readiness_mode=mode,
+                orchestration_configuration=OrchestrationConfiguration(
+                    mode=OrchestrationMode.LEGACY
+                ),
             )
             await application.registry.start_all()
             try:
@@ -341,6 +346,9 @@ class BlockedQuestionRecoveryTest(unittest.IsolatedAsyncioTestCase):
                 model_retry_backoff_seconds=0.0,
                 # The default mode: the one that used to strand the Task.
                 completion_readiness_mode=CompletionReadinessMode.LEGACY_GATE,
+                orchestration_configuration=OrchestrationConfiguration(
+                    mode=OrchestrationMode.LEGACY
+                ),
             )
             await application.registry.start_all()
             self.addAsyncCleanup(application.registry.stop_all)

@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 from collections.abc import Iterable, Mapping
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -127,13 +128,13 @@ class CoreReadOnlyToolProvider:
 
     descriptor = AdapterDescriptor(
         adapter_id="builtin.core-readonly-tools",
-        adapter_version="0.2.0",
+        adapter_version="0.3.0",
         port_name="ToolProviderPort",
         port_version="1.0",
         capabilities=frozenset(
             {
-                "core.list_files", "core.find_files",
-                "core.read_file", "core.search_text",
+                "core.list_files", "core.search_files",
+                "core.find_files", "core.read_file", "core.search_text",
                 "core.grep_search",
             }
         ),
@@ -178,20 +179,55 @@ class CoreReadOnlyToolProvider:
             }),
         ),
         ToolSpec(
+            name="core.search_files",
+            description=(
+                "Primary repository search tool. Search file contents or file names with "
+                "one explicit target. target defaults to 'content': use it for source "
+                "symbols, UI labels, DOM ids/classes, functions, configuration keys, and "
+                "error text. Use target='files' only when an exact or wildcard file name "
+                "is already known. Content results include paths, line numbers, text, and "
+                "optional context; file results include matching paths and sizes. Inspect "
+                "relevant hits with core.read_file before concluding or editing."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "target": {
+                        "type": "string",
+                        "enum": ["content", "files"],
+                        "default": "content",
+                    },
+                    "path": {"type": "string"},
+                    "file_glob": {"type": "string"},
+                    "regex": {"type": "boolean"},
+                    "case_sensitive": {"type": "boolean"},
+                    "limit": {
+                        "type": "integer", "minimum": 1,
+                        "maximum": _MAX_SEARCH_MATCHES,
+                    },
+                    "context": {
+                        "type": "integer", "minimum": 0, "maximum": 20,
+                    },
+                },
+                "required": ["pattern"],
+                "additionalProperties": False,
+            },
+            risk=ToolRisk.R0,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            idempotency=ToolIdempotency.IDEMPOTENT,
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.WORKSPACE_FACT,
+            extra_evidence_capabilities=frozenset({
+                EvidenceCapability.ENUMERATE_SCOPE,
+            }),
+        ),
+        ToolSpec(
             name="core.find_files",
             description=(
-                "Find files by name or workspace-relative path pattern without reading "
-                "their contents. Prefer this when the request already names a file, such "
-                "as settings.gradle, UserService.swift, or **/package.json; do not walk "
-                "the directory tree one level at a time with core.list_files. pattern is "
-                "required and supports *, ?, and **. A pattern without / matches the base "
-                "file name; a pattern containing / matches the relative path. path defaults "
-                "to '.', case_sensitive defaults to false, and limit is 1..500. Generated, "
-                "sensitive, escaped-symlink, and credential paths are skipped. An absolute "
-                "outside path requires explicit Task-scoped directory read approval. Success "
-                "returns the authoritative resolved path/root, ordered path/size matches, "
-                "and scan metadata. Example: "
-                "{\"pattern\": \"dialog_call_confirm.xml\", \"path\": \"modules\"}."
+                "Legacy filename-search alias retained for checkpoint compatibility. "
+                "For new work use core.search_files with target='files'."
             ),
             parameters={
                 "type": "object",
@@ -256,15 +292,8 @@ class CoreReadOnlyToolProvider:
         ToolSpec(
             name="core.search_text",
             description=(
-                "Search UTF-8 text files below a workspace-relative path. Use literal "
-                "search by default and enable regex only when pattern matching is required; "
-                "an absolute outside path requires explicit Task-scoped directory read "
-                "approval and never permits inspecting secrets. Binary, "
-                "oversized, .git, environment, credential, and key files are skipped. "
-                "Supports grep-style include/exclude globs plus before/after context lines. "
-                "query is required; path defaults to '.', regex and case_sensitive default "
-                "to false, and max_matches is 1..500. Success returns ordered path, line, "
-                "text, optional context snippets, and scan metadata."
+                "Legacy content-search alias retained for checkpoint compatibility. "
+                "For new work use core.search_files with target='content'."
             ),
             parameters={
                 "type": "object",
@@ -304,9 +333,8 @@ class CoreReadOnlyToolProvider:
         ToolSpec(
             name="core.grep_search",
             description=(
-                "Grep-style repository search with glob filtering and context lines. "
-                "This tool mirrors core.search_text while exposing a coding-agent friendly "
-                "name and parameters for code discovery workflows."
+                "Legacy grep-style content-search alias retained for checkpoint "
+                "compatibility. For new work use core.search_files with target='content'."
             ),
             parameters={
                 "type": "object",
@@ -369,6 +397,7 @@ class CoreReadOnlyToolProvider:
             raise RuntimeError("adapter is not started")
         handlers = {
             "core.list_files": self._list_files,
+            "core.search_files": self._search_files,
             "core.find_files": self._find_files,
             "core.read_file": self._read_file,
             "core.search_text": self._search_text,
@@ -459,6 +488,67 @@ class CoreReadOnlyToolProvider:
             meta={"untrusted_data": True},
         )
 
+    def _search_files(
+        self, call: ToolCall, context: ToolInvocationContext
+    ) -> ToolResult:
+        pattern = self._string_argument(call.arguments, "pattern")
+        if not pattern:
+            raise ValueError("pattern must not be empty")
+        target = self._string_argument(
+            call.arguments, "target", default="content"
+        ).casefold()
+        if target not in {"content", "files"}:
+            raise ValueError("target must be 'content' or 'files'")
+
+        if target == "files":
+            arguments: dict[str, Any] = {"pattern": pattern}
+            for key in ("path", "case_sensitive", "limit"):
+                if key in call.arguments:
+                    arguments[key] = call.arguments[key]
+            result = self._find_files(
+                replace(call, name="core.find_files", arguments=arguments),
+                context,
+            )
+            if not result.ok:
+                return result
+            return replace(
+                result,
+                hint=(
+                    "File-name matches are candidates only. Inspect a relevant hit with "
+                    "core.read_file before concluding or editing. If the identifier is "
+                    "inside source code, retry core.search_files with target='content'."
+                ),
+            )
+
+        arguments = {"query": pattern}
+        mappings = {
+            "path": "path",
+            "file_glob": "include",
+            "regex": "regex",
+            "case_sensitive": "case_sensitive",
+            "limit": "max_matches",
+        }
+        for source, destination in mappings.items():
+            if source in call.arguments:
+                arguments[destination] = call.arguments[source]
+        if "context" in call.arguments:
+            arguments["before_context"] = call.arguments["context"]
+            arguments["after_context"] = call.arguments["context"]
+        result = self._search_text(
+            replace(call, name="core.search_text", arguments=arguments),
+            context,
+        )
+        if not result.ok:
+            return result
+        return replace(
+            result,
+            hint=(
+                "Inspect relevant content matches with core.read_file before concluding "
+                "or editing. If no match answers the question, refine the pattern or "
+                "search a broader in-scope path."
+            ),
+        )
+
     def _find_files(
         self, call: ToolCall, context: ToolInvocationContext
     ) -> ToolResult:
@@ -527,6 +617,7 @@ class CoreReadOnlyToolProvider:
         return ToolResult(
             call_id=call.call_id, ok=True,
             data={
+                "search_target": "file_names_and_paths",
                 "pattern": pattern,
                 "path": self._display_path(resolved.workspace, root),
                 **self._resolved_path_data(context, raw_path, resolved),
@@ -538,7 +629,14 @@ class CoreReadOnlyToolProvider:
                 ],
                 "ripgrep_filter": walk_stats["ripgrep_filter"],
             },
-            truncated=truncated, meta={"untrusted_data": True},
+            truncated=truncated,
+            hint=(
+                "This result searched file names and paths only, not file contents. "
+                "Read a likely match before relying on it. If the unknown is a source "
+                "symbol, UI label, DOM id/class, function, configuration key, or error "
+                "text, use core.search_files with target='content' instead."
+            ),
+            meta={"untrusted_data": True},
         )
 
     def _read_file(
@@ -721,6 +819,7 @@ class CoreReadOnlyToolProvider:
             call_id=call.call_id,
             ok=True,
             data={
+                "search_target": "content",
                 "query": query,
                 "path": self._display_path(resolved.workspace, root),
                 **self._resolved_path_data(context, raw_path, resolved),

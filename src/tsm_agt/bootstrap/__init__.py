@@ -1,5 +1,6 @@
 """Application bootstrap package."""
 
+from .orchestration_configuration import OrchestrationConfiguration
 from .composition import (
     Application,
     compose_fixture_agent_application,
@@ -15,6 +16,7 @@ from .composition import (
 
 __all__ = [
     "Application",
+    "OrchestrationConfiguration",
     "compose_fixture_agent_application",
     "compose_fixture_application",
     "compose_local_flow_query_application",

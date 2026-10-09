@@ -6,8 +6,10 @@ from datetime import datetime, timezone
 from tsm_agt.core import ToolCommitState, ToolExecutionRecord
 from tsm_agt.ports import (
     EvidenceQuestion,
+    SourceArtifact,
     ToolCall,
     ToolEffect,
+    ToolFactDescriptor,
     ToolIdempotency,
     ToolProtocol,
     ToolResult,
@@ -74,6 +76,28 @@ class ToolContractTest(unittest.TestCase):
                 "question": "Does README.md identify the project's entry point?",
             },
         )
+
+    def test_source_artifact_round_trips_with_tool_fact_descriptor(self) -> None:
+        artifact = SourceArtifact(
+            source_kind="github",
+            repository="owner/repo",
+            commit_sha="a" * 40,
+            path="src/main.py",
+            blob_sha="b" * 40,
+            canonical_url=(
+                "https://github.com/owner/repo/blob/"
+                + "a" * 40
+                + "/src/main.py"
+            ),
+            content_hash="sha256:" + "c" * 64,
+        )
+
+        descriptor = ToolFactDescriptor(
+            "github_source",
+            source_artifacts=(artifact,),
+        )
+
+        self.assertEqual(ToolFactDescriptor.from_data(descriptor.to_data()), descriptor)
 
     def test_failed_result_requires_error_code(self) -> None:
         with self.assertRaisesRegex(ValueError, "error_code"):

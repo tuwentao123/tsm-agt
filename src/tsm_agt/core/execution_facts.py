@@ -3,7 +3,7 @@
 The completion layer must judge from the Runtime's own records, not from model
 prose. ``ProcessResult.succeeded`` is already recorded, but a ``ToolResult`` with
 ``ok=True`` means "the call executed", not "the effect succeeded". This module
-turns the immutable execution ledger into an explicit, inspectable verdict.
+turns the immutable execution ledger into explicit, inspectable verdicts.
 
 Design constraints:
 
@@ -16,7 +16,7 @@ Design constraints:
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -27,7 +27,7 @@ from .execution import ToolCommitState, ToolExecutionRecord
 
 
 class EffectStatus(StrEnum):
-    """Whether an effectful action actually achieved its effect."""
+    """Whether an attempted concrete tool effect actually achieved its outcome."""
 
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -42,8 +42,9 @@ class FactResolution(StrEnum):
     SUPERSEDED = "superseded"
 
 
-#: Effects that never produce an effect-level fact: reads and internal state
-#: have no delivery outcome to verify.
+#: Effects that never produce an effect-level delivery fact: reads and internal
+#: state have no side effect to verify. They still produce ``ToolExecutionFact``
+#: for the shadow projection so later contract work can reason about observation.
 _NON_EFFECTFUL = frozenset({
     ToolEffect.OBSERVE, ToolEffect.INTERNAL, ToolEffect.UNSPECIFIED,
 })
@@ -55,6 +56,41 @@ _EFFECTFUL_AUTHORITIES = frozenset({
 })
 
 _CANCELLED_CODES = frozenset({"PROCESS_CANCELLED", "CANCELLED"})
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExecutionFact:
+    """One terminal tool execution, including non-effectful observations.
+
+    The record is a shadow projection of the immutable execution ledger. It is
+    deliberately broader than :class:`ExecutionFact`: a successful workspace
+    read establishes an observable runtime fact even though it is not a
+    side-effect delivery fact and therefore cannot satisfy mutation or process
+    completion logic.
+    """
+
+    execution_id: str
+    tool_name: str
+    effect: ToolEffect
+    result_authority: ToolResultAuthority
+    invocation_status: ToolCommitState
+    effect_status: EffectStatus
+    failure_code: str = ""
+    detail: str = ""
+    recovery_kind: str = ""
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "execution_id": self.execution_id,
+            "tool_name": self.tool_name,
+            "effect": self.effect.value,
+            "result_authority": self.result_authority.value,
+            "invocation_status": self.invocation_status.value,
+            "effect_status": self.effect_status.value,
+            "failure_code": self.failure_code,
+            "detail": self.detail,
+            "recovery_kind": self.recovery_kind,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,8 +196,8 @@ def classify_effect_status(
     """Classify one execution outcome without needing a persisted record.
 
     Returns ``(status, failure_code)`` for an effectful action, or ``None`` when
-    the action has no verifiable effect. Shared by the ledger projection and by
-    the live call path so both judge identically.
+    the action has no verifiable delivery effect. Shared by the ledger projection
+    and by the live call path so both judge identically.
     """
     if effect in _NON_EFFECTFUL and authority not in _EFFECTFUL_AUTHORITIES:
         return None
@@ -191,69 +227,85 @@ def classify_effect_status(
     return (EffectStatus.SUCCEEDED, "")
 
 
-def project_execution_fact(
-    record: ToolExecutionRecord,
-    spec: ToolSpec | None = None,
-    *,
-    known_mutation_ids: frozenset[str] | None = None,
-) -> ExecutionFact | None:
-    """Derive one effect-level fact, or ``None`` when there is nothing to judge."""
-    # Prefer the semantics frozen on the record at execution time; fall back to
-    # the live ToolSpec only for executions recorded before 6.1 existed.
+def _execution_semantics(
+    record: ToolExecutionRecord, spec: ToolSpec | None,
+) -> tuple[ToolEffect, ToolResultAuthority]:
+    """Use frozen execution metadata, with a legacy ToolSpec fallback."""
     effect = record.effect
     if effect is ToolEffect.UNSPECIFIED and spec is not None:
         effect = spec.effect
     authority = record.result_authority
     if authority is ToolResultAuthority.UNSPECIFIED and spec is not None:
         authority = spec.result_authority
-    if effect in _NON_EFFECTFUL and authority not in _EFFECTFUL_AUTHORITIES:
-        return None
+    return effect, authority
 
-    def fact(
-        status: EffectStatus, *, failure_code: str = "", detail: str = "",
-        recovery_kind: str = "",
-    ) -> ExecutionFact:
-        return ExecutionFact(
+
+def project_tool_execution_fact(
+    record: ToolExecutionRecord,
+    spec: ToolSpec | None = None,
+    *,
+    known_mutation_ids: frozenset[str] | None = None,
+) -> ToolExecutionFact | None:
+    """Project any terminal execution, including successful observations.
+
+    This has no completion semantics. ``ExecutionFact`` remains the narrower
+    delivery-effect projection consumed by legacy readiness logic, while this
+    broader projection is written only as a SINGLE_LOOP shadow event in PR-A.
+    """
+    effect, authority = _execution_semantics(record, spec)
+    if record.state is ToolCommitState.CANCELLED:
+        return ToolExecutionFact(
             execution_id=record.execution_id,
             tool_name=record.call.name,
             effect=effect,
             result_authority=authority,
             invocation_status=record.state,
-            effect_status=status,
-            failure_code=failure_code,
-            detail=detail,
-            recovery_kind=recovery_kind,
+            effect_status=EffectStatus.UNKNOWN,
+            failure_code="CANCELLED",
         )
-
-    # Cancellation and unknown outcome are terminal states that may carry no
-    # result at all. They are checked before ``result is None`` so a cancelled
-    # side effect is still visible to the caller.
-    if record.state is ToolCommitState.CANCELLED:
-        return fact(EffectStatus.UNKNOWN, failure_code="CANCELLED")
     if record.state is ToolCommitState.UNKNOWN_OUTCOME:
-        return fact(
-            EffectStatus.UNKNOWN, failure_code="UNKNOWN_OUTCOME",
+        return ToolExecutionFact(
+            execution_id=record.execution_id,
+            tool_name=record.call.name,
+            effect=effect,
+            result_authority=authority,
+            invocation_status=record.state,
+            effect_status=EffectStatus.UNKNOWN,
+            failure_code="UNKNOWN_OUTCOME",
             recovery_kind="unknown_outcome",
         )
-
     result = record.result
     if result is None:
         return None
-    classified = classify_effect_status(
-        effect, authority,
-        invocation_state=record.state, ok=result.ok,
-        data=result.data, error_code=result.error_code or "",
-        known_mutation_ids=known_mutation_ids,
-    )
-    if classified is None:
-        return None
-    status, failure_code = classified
+    payload = _mapping(result.data)
+    if authority is ToolResultAuthority.PROCESS_FACT and (
+        str(payload.get("status", "")).strip().lower() == "cancelled"
+    ):
+        status = EffectStatus.UNKNOWN
+        failure_code = "PROCESS_CANCELLED"
+    elif not result.ok:
+        status = EffectStatus.FAILED
+        failure_code = result.error_code or "TOOL_ERROR"
+    elif authority is ToolResultAuthority.PROCESS_FACT and (
+        payload.get("succeeded") is False
+    ):
+        status = EffectStatus.FAILED
+        failure_code = str(payload.get("failure_code") or "PROCESS_EXIT_NON_ZERO")
+    elif (
+        authority is ToolResultAuthority.MUTATION_FACT
+        and not _has_known_mutation(payload, known_mutation_ids)
+    ):
+        status = EffectStatus.UNKNOWN
+        failure_code = "MUTATION_NOT_RECORDED"
+    else:
+        status = EffectStatus.SUCCEEDED
+        failure_code = ""
     detail = ""
     if status is not EffectStatus.SUCCEEDED:
         detail = (result.message or "")[:500] or str(
-            _mapping(result.data).get("stderr_excerpt") or ""
+            payload.get("stderr_excerpt") or ""
         )[:500]
-    return ExecutionFact(
+    return ToolExecutionFact(
         execution_id=record.execution_id,
         tool_name=record.call.name,
         effect=effect,
@@ -262,10 +314,37 @@ def project_execution_fact(
         effect_status=status,
         failure_code=failure_code,
         detail=detail,
-        recovery_kind=(
-            result.recovery_kind.value
-            if status is not EffectStatus.SUCCEEDED else ""
-        ),
+        recovery_kind=(result.recovery_kind.value if status is not EffectStatus.SUCCEEDED else ""),
+    )
+
+
+def project_execution_fact(
+    record: ToolExecutionRecord,
+    spec: ToolSpec | None = None,
+    *,
+    known_mutation_ids: frozenset[str] | None = None,
+) -> ExecutionFact | None:
+    """Derive one effect-level delivery fact, or ``None`` when none applies."""
+    execution_fact = project_tool_execution_fact(
+        record,
+        spec,
+        known_mutation_ids=known_mutation_ids,
+    )
+    if execution_fact is None or (
+        execution_fact.effect in _NON_EFFECTFUL
+        and execution_fact.result_authority not in _EFFECTFUL_AUTHORITIES
+    ):
+        return None
+    return ExecutionFact(
+        execution_id=execution_fact.execution_id,
+        tool_name=execution_fact.tool_name,
+        effect=execution_fact.effect,
+        result_authority=execution_fact.result_authority,
+        invocation_status=execution_fact.invocation_status,
+        effect_status=execution_fact.effect_status,
+        failure_code=execution_fact.failure_code,
+        detail=execution_fact.detail,
+        recovery_kind=execution_fact.recovery_kind,
     )
 
 
@@ -292,7 +371,8 @@ def project_execution_facts(
         (
             record,
             project_execution_fact(
-                record, specs_by_name.get(record.call.name),
+                record,
+                specs_by_name.get(record.call.name),
                 known_mutation_ids=known_mutation_ids,
             ),
         )
@@ -310,12 +390,11 @@ def project_execution_facts(
         fact = fact_value
         if fact.effect_status is not EffectStatus.SUCCEEDED:
             signature = signatures[index]
-            later = [
-                other for other, _ in projected[index + 1:]
-            ]
+            later = [other for other, _ in projected[index + 1:]]
             later_facts = [
                 project_execution_fact(
-                    other, specs_by_name.get(other.call.name),
+                    other,
+                    specs_by_name.get(other.call.name),
                     known_mutation_ids=known_mutation_ids,
                 )
                 for other in later
@@ -356,7 +435,8 @@ def project_unresolved_failures(
 ) -> tuple[ExecutionFact, ...]:
     """Effect failures that no later action resolved, in stable order."""
     facts = project_execution_facts(
-        executions, specs_by_name,
+        executions,
+        specs_by_name,
         known_mutation_ids=known_mutation_ids,
         include_successful=False,
     )
@@ -386,8 +466,10 @@ __all__ = [
     "EffectStatus",
     "ExecutionFact",
     "FactResolution",
+    "ToolExecutionFact",
     "classify_effect_status",
     "project_execution_fact",
     "project_execution_facts",
+    "project_tool_execution_fact",
     "project_unresolved_failures",
 ]

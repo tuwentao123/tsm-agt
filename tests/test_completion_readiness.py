@@ -8,8 +8,12 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tsm_agt.adapters.builtin import CoreProcessToolProvider
+from tsm_agt.adapters.builtin import (
+    CoreProcessToolProvider, CoreReadOnlyToolProvider,
+    CoreWorkspaceMutationToolProvider,
+)
 from tsm_agt.adapters.fixture import EchoModelProvider, EchoToolProvider
+from tsm_agt.adapters.structured_evidence import StructuredEvidenceDeltaEvaluator
 from tsm_agt.adapters.local_process import LocalProcessExecutor
 from tsm_agt.adapters.local_sandbox import LocalWorkspaceSandbox
 from tsm_agt.adapters.posix_path import PosixWorkspacePath
@@ -358,6 +362,42 @@ class PromptRecordingCriterionModel(CriterionBlockedModel):
         return await super().complete(request)
 
 
+class DeliveryReadinessModel(EchoModelProvider):
+    """Stops early, optionally after a no-match repository search."""
+
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
+
+    def __init__(self, *, search_first: bool) -> None:
+        super().__init__()
+        self.search_first = search_first
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        has_tool_result = any(
+            isinstance(block, ToolResultBlock)
+            for message in request.messages for block in message.content
+        )
+        if self.search_first and not has_tool_result:
+            return ModelResponse(
+                Message(
+                    "empty-search", MessageRole.ASSISTANT,
+                    (ToolCallBlock(ToolCall(
+                        "empty-search", "core.search_files", {
+                            "pattern": "missing-ui-label", "path": ".",
+                        }, EvidenceQuestion(
+                            "Q-empty", "Where is the requested UI implemented?",
+                            expected_scope="src",
+                        ),
+                    )),),
+                ), FinishReason.TOOL_CALL, ModelUsage(1, 1),
+            )
+        return ModelResponse(
+            Message(
+                "early-delivery-final", MessageRole.ASSISTANT,
+                (TextBlock("The requested change is complete."),),
+            ), FinishReason.STOP, ModelUsage(1, 1),
+        )
+
+
 async def executing_task(application, root: Path, task_id: str):
     task = await application.kernel.create_task(
         "collect the required fact", root, task_id=task_id
@@ -407,6 +447,104 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
         await app.kernel._append_events(task.task_id, ((
             "task_spec.revised", {"snapshot": spec.to_data()},
         ),))
+
+    async def _require_delivery(self, app, task, *effects: str) -> None:
+        current = await app.kernel.get_task_spec(task.task_id)
+        proposal = TaskSpecProposal.from_data({
+            "schema_version": 1, "goal": task.goal,
+            "scope": ["src"], "constraints": [],
+            "outcomes": [{
+                "outcome_id": "delivery",
+                "description": "Deliver the requested workspace change",
+                "kind": "WORKSPACE_DELIVERY",
+                "required_effects": list(effects), "required": True,
+            }],
+            "continuation_policy": {"mode": "NONE"},
+        })
+        spec = TaskSpecSnapshot.from_proposal(
+            task.task_id, current.revision + 1, proposal,
+            (TaskAcceptanceCriterion(
+                "workspace", "Deliver the requested workspace change",
+                TaskCriterionKind.WORKSPACE_INTEGRITY,
+            ),),
+        )
+        await app.kernel._append_events(task.task_id, ((
+            "task_spec.revised", {"snapshot": spec.to_data()},
+        ),))
+
+    async def test_empty_search_requires_refinement_before_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            model = DeliveryReadinessModel(search_first=True)
+            app = compose_legacy_fixture_application(
+                model_adapter=model, tool_adapters=(CoreReadOnlyToolProvider(),),
+                require_evidence_questions=True,
+                evidence_delta_evaluator_adapter=StructuredEvidenceDeltaEvaluator(),
+                completion_readiness_policy_adapter=(
+                    RuleBasedCompletionReadinessPolicy()
+                ),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, Path(directory), "empty-search")
+                await self._require_delivery(app, task, "mutate")
+                await app.kernel.run_agent_turn(
+                    task.task_id, "locate and update the UI",
+                    max_model_calls=4, max_tool_calls=2,
+                )
+                events = await app.registry.require(RuntimeStorePort).read_events(
+                    task.task_id
+                )
+                readiness = [
+                    event.payload for event in events
+                    if event.event_type == "completion.readiness_evaluated"
+                ]
+                empty_gap = next(
+                    gap for payload in readiness for gap in payload["gaps"]
+                    if gap["kind"] == "EMPTY_SEARCH_RESULT_REFINEMENT_REQUIRED"
+                )
+                self.assertEqual(empty_gap["required_effects"], ["observe"])
+                self.assertIn("core.search_files", empty_gap["candidate_tools"])
+                self.assertNotEqual(
+                    (await app.kernel.get_task(task.task_id)).state,
+                    TaskState.SUCCEEDED,
+                )
+            finally:
+                await app.registry.stop_all()
+
+    async def test_missing_mutation_blocks_early_final(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_legacy_fixture_application(
+                model_adapter=DeliveryReadinessModel(search_first=False),
+                tool_adapters=(CoreWorkspaceMutationToolProvider(),),
+                completion_readiness_policy_adapter=(
+                    RuleBasedCompletionReadinessPolicy()
+                ),
+            )
+            await app.registry.start_all()
+            try:
+                task = await executing_task(app, Path(directory), "missing-mutation")
+                await self._require_delivery(app, task, "mutate")
+                await app.kernel.run_agent_turn(
+                    task.task_id, "implement the requested change",
+                    max_model_calls=3, max_tool_calls=1,
+                )
+                events = await app.registry.require(RuntimeStorePort).read_events(
+                    task.task_id
+                )
+                delivery_gap = next(
+                    gap for event in events
+                    if event.event_type == "completion.readiness_evaluated"
+                    for gap in event.payload["gaps"]
+                    if gap["kind"] == "REQUIRED_DELIVERY_UNSATISFIED"
+                )
+                self.assertEqual(delivery_gap["required_effects"], ["mutate"])
+                self.assertIn("core.apply_patch", delivery_gap["candidate_tools"])
+                self.assertNotEqual(
+                    (await app.kernel.get_task(task.task_id)).state,
+                    TaskState.SUCCEEDED,
+                )
+            finally:
+                await app.registry.stop_all()
 
     async def test_execute_gap_continues_when_execute_capability_is_visible(self) -> None:
         policy = RuleBasedCompletionReadinessPolicy()
@@ -470,7 +608,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
         root = Path(temporary.name)
         target = root / "delivery.txt"
         target.write_text("before\n", encoding="utf-8")
-        app = compose_fixture_application(
+        app = compose_legacy_fixture_application(
             tool_adapters=(CoreProcessToolProvider(),),
             completion_readiness_policy_adapter=(
                 RuleBasedCompletionReadinessPolicy()
@@ -535,7 +673,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_unmet_acceptance_criterion_ends_turn_honestly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=CriterionBlockedModel(), tool_adapters=(),
             )
             await app.registry.start_all()
@@ -583,7 +721,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(mode=mode.value), tempfile.TemporaryDirectory() as directory:
                 model = PromptRecordingCriterionModel()
-                app = compose_fixture_application(
+                app = compose_legacy_fixture_application(
                     model_adapter=model, tool_adapters=(),
                     completion_readiness_policy_adapter=(
                         RuleBasedCompletionReadinessPolicy()
@@ -683,10 +821,38 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await policy.stop(None)  # type: ignore[arg-type]
 
+    async def test_truncated_search_gap_requires_a_refined_observation(self) -> None:
+        policy = RuleBasedCompletionReadinessPolicy()
+        await policy.start(None)  # type: ignore[arg-type]
+        try:
+            gap = CompletionGap(
+                "truncated-search:q1", "TRUNCATED_SEARCH_RESULT",
+                "A repository search was truncated before it could resolve Q1.",
+                "OPEN", recoverable=True, expected_scope="src",
+                required_effects=(ToolEffect.OBSERVE,),
+                candidate_tools=("core.search_files", "core.read_file"),
+                observed="SEARCH_RESULT_TRUNCATED_REFINEMENT_REQUIRED",
+            )
+            decision = await policy.evaluate(
+                CompletionReadinessProbe(
+                    goal="locate the UI", gaps=(gap,),
+                    remaining_model_calls=2, remaining_tool_calls=2,
+                    available_read_tools=("core.search_files", "core.read_file"),
+                    available_effects=frozenset({ToolEffect.OBSERVE}),
+                    available_tools=("core.search_files", "core.read_file"),
+                ),
+                CompletionReadinessState(),
+            )
+
+            self.assertEqual(decision.action, CompletionReadinessAction.CONTINUE)
+            self.assertEqual(decision.gaps, (gap,))
+        finally:
+            await policy.stop(None)  # type: ignore[arg-type]
+
     async def test_no_gap_finishes_without_extra_model_call(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             model = EchoModelProvider()
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=model, tool_adapters=(),
                 completion_readiness_policy_adapter=(
                     RuleBasedCompletionReadinessPolicy()
@@ -705,7 +871,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             model = ReadinessSequenceModel()
             tool = RecoverableReadTool(failures=1)
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=model, tool_adapters=(tool,),
                 require_evidence_questions=True,
                 completion_readiness_policy_adapter=(
@@ -737,7 +903,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             model = ReadinessSequenceModel()
             tool = RecoverableReadTool(failures=99)
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=model, tool_adapters=(tool,),
                 require_evidence_questions=True,
                 completion_readiness_policy_adapter=(
@@ -801,7 +967,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             model = BatchRecoveryModel()
             tool = BatchRecoveryTool()
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=model, tool_adapters=(tool,),
             )
             await app.registry.start_all()
@@ -886,7 +1052,7 @@ class CompletionReadinessTest(unittest.IsolatedAsyncioTestCase):
     async def test_rejected_premature_stream_text_is_not_shown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             model = StreamingReadinessModel()
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=model, tool_adapters=(RecoverableReadTool(1),),
                 require_evidence_questions=True,
                 completion_readiness_policy_adapter=(
@@ -1201,7 +1367,7 @@ class UnresolvedEffectFailureTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_unresolved_evidence_reference_does_not_suspend_turn(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=CriterionBlockedModel(), tool_adapters=(),
             )
             await app.registry.start_all()
@@ -1248,7 +1414,7 @@ class UnresolvedEffectFailureTest(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("readiness policy crashed")
 
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=CriterionBlockedModel(), tool_adapters=(),
                 completion_readiness_policy_adapter=_ExplodingPolicy(),
             )
@@ -1275,3 +1441,11 @@ class UnresolvedEffectFailureTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
+
+
+from tsm_agt.core.single_loop import OrchestrationMode
+
+
+def compose_legacy_fixture_application(*args, **kwargs):
+    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
+    return compose_fixture_application(*args, **kwargs)

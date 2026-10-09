@@ -23,8 +23,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from tsm_agt.bootstrap import (
+    OrchestrationConfiguration,
     compose_openai_compatible_engineering_application,
 )
+from tsm_agt.core.single_loop import OrchestrationMode
 from tsm_agt.core import (
     AgentTurnResult, AgentTurnSuspended, ApprovalDecision,
     TaskState,
@@ -164,6 +166,9 @@ class EngineeringLoopOverHttpTest(unittest.IsolatedAsyncioTestCase):
                 model_streaming=False, model_strict_tool_schema=False,
                 model_timeout_seconds=20.0, model_max_retries=0,
                 model_retry_backoff_seconds=0.0,
+                orchestration_configuration=OrchestrationConfiguration(
+                    mode=OrchestrationMode.LEGACY
+                ),
             )
             await application.registry.start_all()
             self.addAsyncCleanup(application.registry.stop_all)

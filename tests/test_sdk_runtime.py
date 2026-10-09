@@ -22,6 +22,12 @@ from tsm_agt.ports import (
     ModelRecoveryAction, ModelRecoveryDecision, ModelRecoveryExhausted,
     ModelRetrySafety,
 )
+from tsm_agt.core.single_loop import OrchestrationMode
+from tsm_agt.ports.evidence import (
+    ContractAuthority,
+    EvidenceRequirement,
+    TaskContract,
+)
 from tsm_agt.sdk import EngineeringAgentClient
 from tsm_agt.sdk.runtime import _is_resumable_stop
 
@@ -101,6 +107,15 @@ class FailingModel(EchoModelProvider):
         raise RuntimeError("private provider detail must not escape")
 
 
+class ContractBlockingModel(EchoModelProvider):
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        return ModelResponse(
+            Message("sdk-contract-final", MessageRole.ASSISTANT, (TextBlock("done"),)),
+            FinishReason.STOP,
+            ModelUsage(1, 1),
+        )
+
+
 class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
     async def test_runtime_input_routes_and_command_replays(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -151,6 +166,45 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(
                     "private provider detail", str(final.to_data())
                 )
+
+    async def test_user_contract_blocked_result_waits_for_contract_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = compose_fixture_application(
+                model_adapter=ContractBlockingModel(),
+                tool_adapters=(),
+            )
+            client = EngineeringAgentClient(
+                root,
+                application_factory=lambda: application,
+                poll_interval=0.001,
+            )
+            contract = TaskContract(
+                objective="verify source provenance",
+                authority=ContractAuthority.USER,
+                evidence_requirements=(EvidenceRequirement("source", "source.artifact"),),
+            )
+            async with client:
+                accepted = await client.submit_task(
+                    "answer",
+                    command_id="sdk-user-contract-blocked",
+                    evidence_contract=contract,
+                )
+                result = await client.wait_task(accepted.task_id, timeout=5)
+                events = await application.registry.require(RuntimeStorePort).read_events(
+                    accepted.task_id
+                )
+
+        self.assertEqual(result.state, TaskState.AWAITING_USER.value)
+        self.assertEqual(result.status, "awaiting_user")
+        self.assertEqual(result.clarification["kind"], "CONTRACT_BLOCKED")
+        self.assertEqual(result.clarification["missing_requirement_ids"], ["source"])
+        self.assertEqual(
+            next(event for event in events if event.event_type == "clarification.requested")
+            .payload["kind"],
+            "CONTRACT_BLOCKED",
+        )
+        self.assertNotIn("llm.completed", [event.event_type for event in events])
 
     async def test_concurrent_duplicate_submit_starts_only_one_runner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -680,6 +734,7 @@ class PlannerTransportFailureTest(unittest.IsolatedAsyncioTestCase):
             application = compose_fixture_application(
                 task_spec_planner_adapter=_TransportFailingPlanner(error),
                 tool_adapters=(),
+                orchestration_mode=OrchestrationMode.LEGACY,
             )
             client = EngineeringAgentClient(
                 root, application_factory=lambda: application,
@@ -715,3 +770,70 @@ class PlannerTransportFailureTest(unittest.IsolatedAsyncioTestCase):
             if event.event_type == "task_spec.planning_failed"
         ]
         self.assertFalse(planning[0].payload["recoverable"])
+
+
+class _IncompleteSingleLoopModel(EchoModelProvider):
+    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        del request
+        self.calls += 1
+        if self.calls == 1:
+            return ModelResponse(
+                Message(
+                    "incomplete-intent",
+                    MessageRole.ASSISTANT,
+                    (ToolCallBlock(ToolCall(
+                        "incomplete-intent",
+                        "core.turn_intent",
+                        {
+                            "intent": "MODIFY",
+                            "expected_effects": ["mutate"],
+                            "dependencies": [],
+                            "summary": "modify before responding",
+                        },
+                    )),),
+                ),
+                FinishReason.TOOL_CALL,
+                ModelUsage(1, 1),
+            )
+        return ModelResponse(
+            Message(
+                "incomplete-final", MessageRole.ASSISTANT,
+                (TextBlock("candidate output"),),
+            ),
+            FinishReason.STOP,
+            ModelUsage(1, 1),
+        )
+
+
+class SingleLoopSdkIncompleteTest(unittest.IsolatedAsyncioTestCase):
+    async def test_incomplete_turn_is_projected_without_failing_the_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = compose_fixture_application(
+                model_adapter=_IncompleteSingleLoopModel()
+            )
+            client = EngineeringAgentClient(
+                root, application_factory=lambda: application, poll_interval=0.001
+            )
+            async with client:
+                accepted = await client.submit_task(
+                    "modify", command_id="sdk-incomplete-create"
+                )
+                result = await client.wait_task(accepted.task_id, timeout=5)
+                events = await application.registry.require(
+                    RuntimeStorePort
+                ).read_events(accepted.task_id)
+
+        self.assertEqual(result.state, TaskState.EXECUTING.value)
+        self.assertEqual(result.status, "incomplete")
+        self.assertIsNone(result.assistant_text)
+        self.assertIn(
+            "turn.incomplete_boundary", [event.event_type for event in events]
+        )
+        self.assertNotIn("llm.completed", [event.event_type for event in events])

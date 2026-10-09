@@ -30,15 +30,16 @@ class RuleBasedReadHitsPolicy:
         SemanticActionFamily.SEARCH_REFERENCES,
     })
     _SEARCH_TOOLS = frozenset({
-        "core.search_text", "core.grep_search", "core.find_files",
-        "code.definition", "code.references",
+        "core.search_files", "core.search_text", "core.grep_search",
+        "core.find_files", "code.definition", "code.references",
         "code.implementations", "code.workspace_symbols",
     })
     _CONSUMER_TOOLS = frozenset({
         "core.read_file", "code.symbol_overview",
     })
     _MUTATION_TOOLS = frozenset({
-        "core.apply_patch", "core.apply_patches", "core.delete_file",
+        "core.apply_patch", "core.apply_patch_v4a", "core.apply_patches",
+        "core.delete_file",
         "core.rollback_mutation", "core.rollback_mutations",
         "core.rollback_mutation_batch", "core.rollback_mutation_groups",
     })

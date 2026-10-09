@@ -731,8 +731,9 @@ class OpenAICompatibleModelProvider:
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": provider_messages,
-            self._output_token_parameter: request.max_output_tokens,
         }
+        if request.max_output_tokens is not None:
+            payload[self._output_token_parameter] = request.max_output_tokens
         if request.tools:
             encoded_tools: list[dict[str, Any]] = []
             for tool in request.tools:
@@ -1294,7 +1295,7 @@ class OpenAICompatibleModelProvider:
         question_id = "Q-auto-" + hashlib.sha256(encoded).hexdigest()[:12]
         target = next((
             value.strip()[:160]
-            for key in ("path", "query", "symbol")
+            for key in ("path", "query", "pattern", "symbol")
             if isinstance((value := arguments.get(key)), str) and value.strip()
         ), "the requested target")
         return EvidenceQuestion(
@@ -1303,9 +1304,8 @@ class OpenAICompatibleModelProvider:
             expected_scope=(
                 str(arguments.get("path", "")).strip()
                 if tool_name in {
-                    "core.read_file", "core.list_files",
-                    "core.find_files", "core.search_text",
-                    "core.grep_search",
+                    "core.read_file", "core.list_files", "core.search_files",
+                    "core.find_files", "core.search_text", "core.grep_search",
                 } else ""
             ),
         )

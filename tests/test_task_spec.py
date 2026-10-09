@@ -18,6 +18,9 @@ from tsm_agt.core import (
     TaskExecutionFocusProjector, TaskOutcomeEligibilityCalculator,
     TaskState, canonical_hash,
 )
+from tsm_agt.core.task_spec import (
+    classify_planner_delivery_intent, validate_planner_delivery_intent,
+)
 from tsm_agt.ports import Message, MessageRole, TextBlock, ToolCall, ToolEffect
 
 
@@ -93,6 +96,37 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
             TASK_SPEC_PROPOSAL_SCHEMA_V1["properties"]["outcomes"]
             ["items"]["properties"]
         ))
+
+    def test_workspace_mutation_intent_rejects_answer_only_proposal(self):
+        proposal = TaskSpecProposal.from_data({
+            "schema_version": 1,
+            "goal": "provide generic styling advice",
+            "scope": ["give a CSS example"],
+            "constraints": [],
+            "acceptance_criteria": [{
+                "criterion_id": "answer", "description": "give CSS",
+                "verification_kind": "rubric",
+            }],
+            "outcomes": [{
+                "outcome_id": "answer", "description": "give CSS",
+                "kind": "ANSWER", "required_effects": [], "required": True,
+            }],
+            "continuation_policy": {"mode": "NONE"},
+        })
+
+        with self.assertRaisesRegex(ValueError, "workspace mutation request"):
+            validate_planner_delivery_intent(
+                proposal,
+                classify_planner_delivery_intent(
+                    "cancel按钮调整到输入框左上方"
+                ),
+            )
+
+    def test_delivery_intent_does_not_treat_ordinary_execution_as_a_mutation(self):
+        self.assertEqual(
+            classify_planner_delivery_intent("执行文档中仍未完成的工作")["kind"],
+            "answer_or_observation",
+        )
 
     def test_planner_requires_acceptance_criteria(self):
         data = self._delivery_proposal().to_data()

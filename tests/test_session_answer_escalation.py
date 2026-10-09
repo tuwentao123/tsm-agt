@@ -119,7 +119,7 @@ class LengthThenStopModel(EchoModelProvider):
 
 class SessionAnswerEscalationTest(unittest.IsolatedAsyncioTestCase):
     async def make_client(self, root: Path, model, *, resolver=None):
-        app = compose_fixture_application(
+        app = compose_legacy_fixture_application(
             model_adapter=model, tool_adapters=(),
             session_input_resolver_adapter=resolver,
         )
@@ -285,3 +285,11 @@ class SessionAnswerEscalationTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from tsm_agt.core.single_loop import OrchestrationMode
+
+
+def compose_legacy_fixture_application(*args, **kwargs):
+    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
+    return compose_fixture_application(*args, **kwargs)

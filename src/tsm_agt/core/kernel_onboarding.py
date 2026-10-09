@@ -29,14 +29,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from tsm_agt.ports import (
     Message, MessageRole, RuntimeEvent, RuntimeUnitOfWork,
-    StoredProjectOnboarding, StoredProjectTrust, TextBlock
+    StoredProjectOnboarding, StoredProjectTrust, TextBlock, ToolSpec
 )
+from tsm_agt.ports.evidence import TaskContract
 from uuid import uuid4
 from .configuration import canonical_hash
+from .task_contract import TaskContractProjector
 from .onboarding import (
     OnboardingCheckpoint, ProjectOnboardingScanner,
     ProjectOnboardingSnapshot
@@ -316,7 +319,7 @@ class OnboardingMixin:
         )
 
     async def _project_context_messages(self, task_id: str) -> tuple[Message, ...]:
-        instructions, task_spec, onboarding, memory, session, document_references, working_memory = (
+        instructions, task_spec, onboarding, memory, session, document_references, working_memory, contract = (
             await asyncio.gather(
             self._project_instructions_context_message(task_id),
             self._task_spec_context_message(task_id),
@@ -325,13 +328,55 @@ class OnboardingMixin:
             self._session_context_message(task_id),
             self._document_reference_context_message(task_id),
             self._working_memory_context_message(task_id),
+            self._task_contract_context_message(task_id),
         ))
         return tuple(
             message for message in (
                 instructions, task_spec, onboarding, memory, session,
-                document_references, working_memory
+                document_references, working_memory, contract
             )
             if message is not None
+        )
+
+    async def _task_contract_context_message(self, task_id: str) -> Message | None:
+        """Project only the latest explicit ACTIVE contract into model context."""
+        events = await self._dependencies.store.read_events(task_id)
+        contract = TaskContractProjector.project(events)
+        if contract is None or not contract.is_mandatory:
+            return None
+        tools = await self.list_tools()
+        satisfiers = {
+            requirement.requirement_id: sorted(
+                tool.name
+                for tool in tools
+                if requirement.kind in tool.evidence_capability_ids
+            )
+            for requirement in contract.evidence_requirements
+        }
+        body = json.dumps(
+            {
+                "type": "task_contract",
+                "authority": contract.authority.value,
+                "objective": contract.objective,
+                "guidance": dict(contract.guidance),
+                "evidence_requirements": [
+                    requirement.to_data()
+                    for requirement in contract.evidence_requirements
+                ],
+                "visible_satisfiers": satisfiers,
+                "instruction": (
+                    "This is a user-authoritative completion contract. Satisfy every "
+                    "evidence requirement with tools before giving a final response."
+                ),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return Message(
+            f"task-contract-context-{canonical_hash(body)[:16]}",
+            MessageRole.USER,
+            (TextBlock(body),),
         )
 
     async def _project_instructions_context_message(

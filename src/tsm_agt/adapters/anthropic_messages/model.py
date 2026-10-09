@@ -588,15 +588,15 @@ class AnthropicMessagesModelProvider:
     def _automatic_evidence_question(call_id: str, tool_name: str, arguments: Mapping[str, Any]) -> EvidenceQuestion:
         encoded = json.dumps({"call_id": call_id, "tool": tool_name, "arguments": arguments}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
         question_id = "Q-auto-" + hashlib.sha256(encoded).hexdigest()[:12]
-        target = next((str(arguments[key]).strip()[:160] for key in ("path", "query", "symbol") if isinstance(arguments.get(key), str) and str(arguments[key]).strip()), "the requested target")
+        target = next((str(arguments[key]).strip()[:160] for key in ("path", "query", "pattern", "symbol") if isinstance(arguments.get(key), str) and str(arguments[key]).strip()), "the requested target")
         return EvidenceQuestion(
             question_id,
             f"What evidence does {tool_name} return for {target}?",
             expected_scope=(
                 str(arguments.get("path", "")).strip()
                 if tool_name in {
-                    "core.read_file", "core.list_files", "core.find_files",
-                    "core.search_text", "core.grep_search",
+                    "core.read_file", "core.list_files", "core.search_files",
+                    "core.find_files", "core.search_text", "core.grep_search",
                 }
                 else ""
             ),

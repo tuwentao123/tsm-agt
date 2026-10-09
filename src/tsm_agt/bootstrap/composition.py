@@ -10,12 +10,14 @@ from collections.abc import Mapping
 from tsm_agt.adapters import AdapterRegistry
 from tsm_agt.adapters.builtin import (
     CoreProcessToolProvider, CoreReadOnlyToolProvider,
+    RuntimeInspectionToolProvider,
     CoreWorkspaceMutationToolProvider, CoreMemoryToolProvider,
     CodeIntelligenceToolProvider, CoreInteractionToolProvider,
-    CoreWorkingMemoryToolProvider, CoreTaskSpecToolProvider,
-    NetworkToolProvider,
+    CoreTodoToolProvider, CoreTurnIntentToolProvider,
+    CoreWorkingMemoryToolProvider, CoreTaskSpecToolProvider, NetworkToolProvider,
 )
 from tsm_agt.adapters.text_code_intelligence import TextCodeIntelligenceProvider
+from tsm_agt.adapters.github_source import GitHubSourceToolProvider
 from tsm_agt.adapters.structured_evidence import StructuredEvidenceDeltaEvaluator
 from tsm_agt.adapters.rule_based_semantic_action import (
     RuleBasedSemanticActionClassifier,
@@ -43,6 +45,7 @@ from tsm_agt.adapters.rule_based_agent_progress import RuleBasedAgentProgressPro
 from tsm_agt.adapters.adaptive_tool_presentation import (
     AdaptiveToolArgumentPresenter,
 )
+from tsm_agt.adapters.rule_based_evidence_gate import RuleBasedEvidenceGate
 from tsm_agt.adapters.rule_based_evidence_level import (
     RuleBasedEvidenceLevelEvaluator,
 )
@@ -92,6 +95,7 @@ from tsm_agt.adapters.fixture import (
 from tsm_agt.core import (
     ContextWindowManager, Kernel, KernelDependencies, SessionContextProjector,
 )
+from tsm_agt.core.single_loop import OrchestrationMode
 from tsm_agt.ports import (
     CrossProcessLockPort,
     FlowArtifactExportPort,
@@ -112,6 +116,7 @@ from tsm_agt.ports import (
     SessionInputResolverPort,
     TaskSpecPlannerPort,
     RubricJudgePort,
+    EvidenceGatePort,
     EvidenceDeltaEvaluatorPort,
     SemanticActionClassifierPort,
     ReadHitsPolicyPort,
@@ -136,6 +141,10 @@ from .model_configuration import (
     load_model_configuration,
     model_configuration_sources,
 )
+from .orchestration_configuration import (
+    OrchestrationConfiguration,
+    load_orchestration_configuration,
+)
 from .exploration_configuration import (
     ExplorationBudgetConfiguration, load_exploration_budget_configuration,
 )
@@ -148,6 +157,9 @@ from .egress_configuration import (
 )
 from .search_configuration import (
     SearchConfiguration, load_search_configuration,
+)
+from tsm_agt.adapters.github_source.configuration import (
+    GitHubSourceConfiguration, load_github_source_configuration,
 )
 
 
@@ -224,6 +236,7 @@ def _configuration_metadata(
     sources: Mapping[str, str] | None = None,
     exploration_budget: ExplorationBudgetConfiguration | None = None,
     context_configuration: ContextConfiguration | None = None,
+    orchestration_configuration: OrchestrationConfiguration | None = None,
     completion_readiness_mode: CompletionReadinessMode = (
         CompletionReadinessMode.LEGACY_GATE
     ),
@@ -248,10 +261,19 @@ def _configuration_metadata(
         "completion_readiness": {
             "mode": completion_readiness_mode.value,
         },
+        "orchestration": (
+            orchestration_configuration or OrchestrationConfiguration()
+        ).snapshot_data(),
         "sources": dict(sources or {}),
     }
     result["sources"].setdefault(
         "completion_readiness.mode", "composition"
+    )
+    result["sources"].update(
+        (orchestration_configuration or OrchestrationConfiguration()).sources or {
+            "orchestration.mode": "composition",
+            "orchestration.single_loop_allow_fallback": "composition",
+        }
     )
     if exploration_budget is not None:
         result["exploration_budget"] = exploration_budget.snapshot_data()
@@ -296,6 +318,12 @@ def _kernel_dependencies(
         raise ValueError(
             "at most one CheckpointCompatibilityPolicyPort may be registered"
         )
+    evidence_gates = registry.all(EvidenceGatePort)
+    if not evidence_gates:
+        registry.register(EvidenceGatePort, RuleBasedEvidenceGate())
+        evidence_gates = registry.all(EvidenceGatePort)
+    if len(evidence_gates) > 1:
+        raise ValueError("at most one EvidenceGatePort may be registered")
     evidence_evaluators = registry.all(EvidenceDeltaEvaluatorPort)
     if len(evidence_evaluators) > 1:
         raise ValueError(
@@ -378,6 +406,28 @@ def _kernel_dependencies(
             "completion readiness mode must be LEGACY_GATE, OBSERVE_ONLY, or "
             "AGENT_DECIDES"
         ) from error
+    raw_orchestration = configuration_metadata.get("orchestration", {})
+    orchestration = (
+        dict(raw_orchestration)
+        if isinstance(raw_orchestration, Mapping) else {}
+    )
+    mode_by_value = {
+        "legacy": OrchestrationMode.LEGACY,
+        "single_loop": OrchestrationMode.SINGLE_LOOP,
+    }
+    try:
+        orchestration_mode = mode_by_value[
+            str(orchestration.get("mode", "single_loop")).casefold()
+        ]
+    except KeyError as error:
+        raise ValueError(
+            "orchestration mode must be legacy or single_loop"
+        ) from error
+    single_loop_allow_fallback = orchestration.get(
+        "single_loop_allow_fallback", False
+    )
+    if single_loop_allow_fallback is not False:
+        raise ValueError("single_loop_allow_fallback must be false")
     return KernelDependencies(
         model=registry.require(ModelProviderPort),
         store=registry.require(RuntimeStorePort),
@@ -397,6 +447,7 @@ def _kernel_dependencies(
         evidence_delta_evaluator=(
             evidence_evaluators[0] if evidence_evaluators else None
         ),
+        evidence_gate=evidence_gates[0],
         semantic_action_classifier=(
             semantic_classifiers[0] if semantic_classifiers else None
         ),
@@ -465,6 +516,8 @@ def _kernel_dependencies(
         tools=registry.all(ToolProviderPort),
         runtime_adapters=registry.runtime_adapters(),
         configuration_metadata=configuration_metadata,
+        orchestration_mode=orchestration_mode,
+        single_loop_allow_fallback=False,
         default_max_model_calls=int(budget.get("agent_max_model_calls", 90)),
         default_max_tool_calls=int(budget.get("agent_max_tool_calls", 120)),
         default_max_output_tokens=default_max_output_tokens,
@@ -570,6 +623,7 @@ def compose_fixture_application(
     project_memory_adapter: ProjectMemoryPort | None = None,
     context_manager: ContextWindowManager | None = None,
     enable_working_memory: bool = False,
+    enable_runtime_inspection: bool = False,
     runtime_input_classifier_adapter: RuntimeInputClassifierPort | None = None,
     session_input_relation_adapter: SessionInputRelationPort | None = None,
     session_input_resolver_adapter: SessionInputResolverPort | None = None,
@@ -579,6 +633,7 @@ def compose_fixture_application(
     ) = None,
     require_evidence_questions: bool = False,
     evidence_delta_evaluator_adapter: EvidenceDeltaEvaluatorPort | None = None,
+    evidence_gate_adapter: EvidenceGatePort | None = None,
     semantic_action_classifier_adapter: SemanticActionClassifierPort | None = None,
     read_hits_policy_adapter: ReadHitsPolicyPort | None = None,
     artifact_read_policy_adapter: ArtifactReadPolicyPort | None = None,
@@ -589,6 +644,7 @@ def compose_fixture_application(
     completion_readiness_mode: CompletionReadinessMode = (
         CompletionReadinessMode.LEGACY_GATE
     ),
+    orchestration_mode: OrchestrationMode = OrchestrationMode.SINGLE_LOOP,
     exploration_budget_policy_adapter: ExplorationBudgetPolicyPort | None = None,
     stop_or_pivot_policy_adapter: StopOrPivotPolicyPort | None = None,
     evidence_relation_provider_adapters: (
@@ -660,6 +716,8 @@ def compose_fixture_application(
         registry.register(
             EvidenceDeltaEvaluatorPort, evidence_delta_evaluator_adapter
         )
+    if evidence_gate_adapter is not None:
+        registry.register(EvidenceGatePort, evidence_gate_adapter)
     if semantic_action_classifier_adapter is not None:
         registry.register(
             SemanticActionClassifierPort, semantic_action_classifier_adapter
@@ -718,10 +776,18 @@ def compose_fixture_application(
     selected_tools = (EchoToolProvider(),) if tool_adapters is None else tool_adapters
     for tool_adapter in selected_tools:
         registry.register(ToolProviderPort, tool_adapter)
+    if tool_adapters is None:
+        registry.register(ToolProviderPort, CoreTurnIntentToolProvider())
+    if enable_runtime_inspection:
+        registry.register(
+            ToolProviderPort,
+            RuntimeInspectionToolProvider(registry.require(RuntimeStorePort)),
+        )
 
     selected_model = registry.require(ModelProviderPort)
     if selected_model.capabilities.tools and enable_working_memory:
         registry.register(ToolProviderPort, CoreWorkingMemoryToolProvider())
+        registry.register(ToolProviderPort, CoreTodoToolProvider())
         registry.register(ToolProviderPort, CoreTaskSpecToolProvider())
     if selected_model.capabilities.tools:
         registry.register(ToolProviderPort, CoreInteractionToolProvider())
@@ -735,6 +801,9 @@ def compose_fixture_application(
                 "model.credentials_configured": "harness_default",
             },
             completion_readiness_mode=completion_readiness_mode,
+            orchestration_configuration=OrchestrationConfiguration(
+                mode=orchestration_mode
+            ),
         ), context_manager,
         require_evidence_questions=require_evidence_questions,
         session_projector=session_projector,
@@ -802,7 +871,11 @@ def compose_readonly_application(
 
     return compose_fixture_application(
         model_adapter=model_adapter,
-        tool_adapters=(CoreReadOnlyToolProvider(),),
+        tool_adapters=(
+            CoreReadOnlyToolProvider(),
+            CoreTurnIntentToolProvider(),
+        ),
+        enable_runtime_inspection=True,
     )
 
 
@@ -825,6 +898,8 @@ def compose_openai_compatible_readonly_application(
     context_configuration: ContextConfiguration | None = None,
     web_egress_configuration: WebEgressConfiguration | None = None,
     search_configuration: SearchConfiguration | None = None,
+    github_source_configuration: GitHubSourceConfiguration | None = None,
+    orchestration_configuration: OrchestrationConfiguration | None = None,
     completion_readiness_mode: CompletionReadinessMode = (
         CompletionReadinessMode.LEGACY_GATE
     ),
@@ -836,6 +911,7 @@ def compose_openai_compatible_readonly_application(
     context = context_configuration or ContextConfiguration()
     egress = web_egress_configuration or WebEgressConfiguration()
     search = search_configuration or SearchConfiguration()
+    github_source = github_source_configuration or GitHubSourceConfiguration()
     physical_model = _physical_model_provider(
         base_url=base_url,
         model=model,
@@ -926,15 +1002,29 @@ def compose_openai_compatible_readonly_application(
         / "memory.db"
     ))
     registry.register(ToolProviderPort, CoreReadOnlyToolProvider())
+    registry.register(
+        ToolProviderPort,
+        RuntimeInspectionToolProvider(registry.require(RuntimeStorePort)),
+    )
     registry.register(ToolProviderPort, NetworkToolProvider(
         enable_fetch=True, egress_mode=egress.mode,
         search_tavily_mode=search.tavily_mode,
         search_tavily_api_key=search.tavily_api_key,
         search_mode=search.search_mode,
         render_url=search.render_url,
+        document_cache_max_entries=search.document_cache_max_entries,
+        document_cache_max_bytes=search.document_cache_max_bytes,
+        reference_cache_max_entries=search.reference_cache_max_entries,
+        document_cache_ttl_seconds=search.document_cache_ttl_seconds,
     ))
+    if github_source.enabled:
+        registry.register(
+            ToolProviderPort, GitHubSourceToolProvider(github_source)
+        )
     registry.register(ToolProviderPort, CoreMemoryToolProvider())
     registry.register(ToolProviderPort, CoreWorkingMemoryToolProvider())
+    registry.register(ToolProviderPort, CoreTodoToolProvider())
+    registry.register(ToolProviderPort, CoreTurnIntentToolProvider())
     registry.register(ToolProviderPort, CoreTaskSpecToolProvider())
     registry.register(
         ToolProviderPort, CodeIntelligenceToolProvider(code_intelligence)
@@ -949,14 +1039,18 @@ def compose_openai_compatible_readonly_application(
             ),
             model=model, base_url=base_url,
             credentials_configured=bool(api_key),
-            sources=configuration_sources or {
-                "model.provider": "composition",
-                "model.model": "argument",
-                "model.endpoint_origin": "argument",
-                "model.credentials_configured": "argument",
+            sources={
+                **(configuration_sources or {
+                    "model.provider": "composition",
+                    "model.model": "argument",
+                    "model.endpoint_origin": "argument",
+                    "model.credentials_configured": "argument",
+                }),
+                **(github_source.sources or {}),
             },
             exploration_budget=budget,
             context_configuration=context,
+            orchestration_configuration=orchestration_configuration,
             completion_readiness_mode=completion_readiness_mode,
             output_token_parameter=model_output_token_parameter,
             model_protocol=model_protocol,
@@ -969,7 +1063,7 @@ def compose_openai_compatible_readonly_application(
     )
     return Application(
         kernel=Kernel(dependencies), registry=registry,
-        configuration_issues=search.issues,
+        configuration_issues=search.issues + github_source.issues,
     )
 
 
@@ -989,6 +1083,8 @@ def compose_openai_compatible_engineering_application(
     context_configuration: ContextConfiguration | None = None,
     web_egress_configuration: WebEgressConfiguration | None = None,
     search_configuration: SearchConfiguration | None = None,
+    github_source_configuration: GitHubSourceConfiguration | None = None,
+    orchestration_configuration: OrchestrationConfiguration | None = None,
     completion_readiness_mode: CompletionReadinessMode = (
         CompletionReadinessMode.LEGACY_GATE
     ),
@@ -1000,6 +1096,7 @@ def compose_openai_compatible_engineering_application(
     context = context_configuration or ContextConfiguration()
     egress = web_egress_configuration or WebEgressConfiguration()
     search = search_configuration or SearchConfiguration()
+    github_source = github_source_configuration or GitHubSourceConfiguration()
     workspace_path = _platform_workspace_path()
     physical_model = _physical_model_provider(
         base_url=base_url,
@@ -1089,17 +1186,27 @@ def compose_openai_compatible_engineering_application(
         / "memory.db"
     ))
     registry.register(ToolProviderPort, CoreReadOnlyToolProvider())
+    registry.register(
+        ToolProviderPort,
+        RuntimeInspectionToolProvider(registry.require(RuntimeStorePort)),
+    )
     registry.register(ToolProviderPort, NetworkToolProvider(
         enable_fetch=True, egress_mode=egress.mode,
         search_tavily_mode=search.tavily_mode,
         search_tavily_api_key=search.tavily_api_key,
         search_mode=search.search_mode,
         render_url=search.render_url,
+        document_cache_max_entries=search.document_cache_max_entries,
+        document_cache_max_bytes=search.document_cache_max_bytes,
+        reference_cache_max_entries=search.reference_cache_max_entries,
+        document_cache_ttl_seconds=search.document_cache_ttl_seconds,
     ))
     registry.register(ToolProviderPort, CoreProcessToolProvider())
     registry.register(ToolProviderPort, CoreWorkspaceMutationToolProvider())
     registry.register(ToolProviderPort, CoreMemoryToolProvider())
     registry.register(ToolProviderPort, CoreWorkingMemoryToolProvider())
+    registry.register(ToolProviderPort, CoreTodoToolProvider())
+    registry.register(ToolProviderPort, CoreTurnIntentToolProvider())
     registry.register(ToolProviderPort, CoreTaskSpecToolProvider())
     registry.register(
         ToolProviderPort, CodeIntelligenceToolProvider(code_intelligence)
@@ -1114,14 +1221,18 @@ def compose_openai_compatible_engineering_application(
             ),
             model=model, base_url=base_url,
             credentials_configured=bool(api_key),
-            sources=configuration_sources or {
-                "model.provider": "composition",
-                "model.model": "argument",
-                "model.endpoint_origin": "argument",
-                "model.credentials_configured": "argument",
+            sources={
+                **(configuration_sources or {
+                    "model.provider": "composition",
+                    "model.model": "argument",
+                    "model.endpoint_origin": "argument",
+                    "model.credentials_configured": "argument",
+                }),
+                **(github_source.sources or {}),
             },
             exploration_budget=budget,
             context_configuration=context,
+            orchestration_configuration=orchestration_configuration,
             completion_readiness_mode=completion_readiness_mode,
             output_token_parameter=model_output_token_parameter,
             model_protocol=model_protocol,
@@ -1133,7 +1244,8 @@ def compose_openai_compatible_engineering_application(
         session_projector=session_context_projector(context),
     )
     return Application(
-        Kernel(dependencies), registry, configuration_issues=search.issues,
+        Kernel(dependencies), registry,
+        configuration_issues=search.issues + github_source.issues,
     )
 
 
@@ -1158,6 +1270,12 @@ def compose_openai_compatible_readonly_application_from_env(
     search = load_search_configuration(
         env_file or Path.cwd() / ".env", os.environ
     )
+    github_source = load_github_source_configuration(
+        env_file or Path.cwd() / ".env", os.environ
+    )
+    orchestration = load_orchestration_configuration(
+        selected_env_file, os.environ
+    )
     completion_readiness_mode = _completion_readiness_mode_from_env(os.environ)
     return compose_openai_compatible_readonly_application(
         base_url=configuration.base_url,
@@ -1179,6 +1297,8 @@ def compose_openai_compatible_readonly_application_from_env(
         context_configuration=context,
         web_egress_configuration=egress,
         search_configuration=search,
+        github_source_configuration=github_source,
+        orchestration_configuration=orchestration,
         completion_readiness_mode=completion_readiness_mode,
     )
 
@@ -1203,6 +1323,12 @@ def compose_openai_compatible_engineering_application_from_env(
     search = load_search_configuration(
         env_file or Path.cwd() / ".env", os.environ
     )
+    github_source = load_github_source_configuration(
+        env_file or Path.cwd() / ".env", os.environ
+    )
+    orchestration = load_orchestration_configuration(
+        selected_env_file, os.environ
+    )
     completion_readiness_mode = _completion_readiness_mode_from_env(os.environ)
     return compose_openai_compatible_engineering_application(
         base_url=configuration.base_url,
@@ -1224,5 +1350,7 @@ def compose_openai_compatible_engineering_application_from_env(
         context_configuration=context,
         web_egress_configuration=egress,
         search_configuration=search,
+        github_source_configuration=github_source,
+        orchestration_configuration=orchestration,
         completion_readiness_mode=completion_readiness_mode,
     )

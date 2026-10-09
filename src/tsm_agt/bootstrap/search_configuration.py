@@ -12,7 +12,16 @@ SEARCH_ENV_NAMES = (
     "TSM_AGT_SEARCH_TAVILY_MODE",
     "TSM_AGT_SEARCH_TAVILY_API_KEY",
     "TSM_AGT_WEB_RENDER_URL",
+    "TSM_AGT_WEB_DOCUMENT_CACHE_MAX_ENTRIES",
+    "TSM_AGT_WEB_DOCUMENT_CACHE_MAX_BYTES",
+    "TSM_AGT_WEB_REFERENCE_CACHE_MAX_ENTRIES",
+    "TSM_AGT_WEB_DOCUMENT_CACHE_TTL_SECONDS",
 )
+
+DEFAULT_DOCUMENT_CACHE_MAX_ENTRIES = 32
+DEFAULT_DOCUMENT_CACHE_MAX_BYTES = 1_000_000
+DEFAULT_REFERENCE_CACHE_MAX_ENTRIES = 128
+DEFAULT_DOCUMENT_CACHE_TTL_SECONDS = 600.0
 
 #: Modes accepted for the optional Tavily provider.
 TAVILY_MODES = ("off", "keyless", "key")
@@ -50,6 +59,10 @@ class SearchConfiguration:
     #: Optional host-supplied service that renders a URL to text. Empty means no
     #: rendering: a JS-only page simply comes back thin, as it always has.
     render_url: str = ""
+    document_cache_max_entries: int = DEFAULT_DOCUMENT_CACHE_MAX_ENTRIES
+    document_cache_max_bytes: int = DEFAULT_DOCUMENT_CACHE_MAX_BYTES
+    reference_cache_max_entries: int = DEFAULT_REFERENCE_CACHE_MAX_ENTRIES
+    document_cache_ttl_seconds: float = DEFAULT_DOCUMENT_CACHE_TTL_SECONDS
     sources: Mapping[str, str] | None = None
     #: Human-readable configuration problems. Search is an optional provider,
     #: so a bad value degrades to ``off`` and is reported instead of taking the
@@ -104,14 +117,38 @@ def load_search_configuration(
             "http(s) URL; page rendering stays disabled"
         )
         render_url = ""
+    document_cache_max_entries, document_cache_entries_source = _positive_int(
+        "TSM_AGT_WEB_DOCUMENT_CACHE_MAX_ENTRIES", values, environment,
+        DEFAULT_DOCUMENT_CACHE_MAX_ENTRIES, issues,
+    )
+    document_cache_max_bytes, document_cache_bytes_source = _positive_int(
+        "TSM_AGT_WEB_DOCUMENT_CACHE_MAX_BYTES", values, environment,
+        DEFAULT_DOCUMENT_CACHE_MAX_BYTES, issues,
+    )
+    reference_cache_max_entries, reference_cache_entries_source = _positive_int(
+        "TSM_AGT_WEB_REFERENCE_CACHE_MAX_ENTRIES", values, environment,
+        DEFAULT_REFERENCE_CACHE_MAX_ENTRIES, issues,
+    )
+    document_cache_ttl_seconds, document_cache_ttl_source = _positive_float(
+        "TSM_AGT_WEB_DOCUMENT_CACHE_TTL_SECONDS", values, environment,
+        DEFAULT_DOCUMENT_CACHE_TTL_SECONDS, issues,
+    )
     return SearchConfiguration(
         tavily_mode=mode,
         render_url=render_url,
         tavily_api_key=api_key,
         search_mode=search_mode,
+        document_cache_max_entries=document_cache_max_entries,
+        document_cache_max_bytes=document_cache_max_bytes,
+        reference_cache_max_entries=reference_cache_max_entries,
+        document_cache_ttl_seconds=document_cache_ttl_seconds,
         sources={
             "search.mode": search_mode_source,
             "web.render_url": render_source if render_url else "unset",
+            "web.document_cache_max_entries": document_cache_entries_source,
+            "web.document_cache_max_bytes": document_cache_bytes_source,
+            "web.reference_cache_max_entries": reference_cache_entries_source,
+            "web.document_cache_ttl_seconds": document_cache_ttl_source,
             "search.tavily_mode": mode_source,
             # Record provenance without ever exposing the secret value.
             "search.tavily_api_key": (
@@ -133,6 +170,36 @@ def _selected(
     if from_file:
         return from_file, "env_file"
     return default, "default"
+
+
+def _positive_int(
+    name: str, file_values: Mapping[str, str], environment: Mapping[str, str],
+    default: int, issues: list[str],
+) -> tuple[int, str]:
+    raw, source = _selected(name, file_values, environment, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        issues.append(f"{name}={raw.strip()!r} must be a positive integer; using {default}")
+        return default, "default"
+    return value, source
+
+
+def _positive_float(
+    name: str, file_values: Mapping[str, str], environment: Mapping[str, str],
+    default: float, issues: list[str],
+) -> tuple[float, str]:
+    raw, source = _selected(name, file_values, environment, str(default))
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if value <= 0:
+        issues.append(f"{name}={raw.strip()!r} must be a positive number; using {default}")
+        return default, "default"
+    return value, source
 
 
 def _unquoted(value: str) -> str:

@@ -44,6 +44,10 @@ class EvidenceQuestionLifecycleTest(unittest.TestCase):
         self.assertEqual(
             success.observation_kind, EvidenceObservationKind.EMPTY_RESULT
         )
+        self.assertEqual(
+            success.blocking_reason,
+            "SEARCH_RESULT_EMPTY_REFINEMENT_REQUIRED",
+        )
         failed, failure = self.bound.observe(
             self.call, ToolResult(
                 self.call.call_id, False, error_code="PERMISSION_DENIED"
@@ -52,6 +56,35 @@ class EvidenceQuestionLifecycleTest(unittest.TestCase):
         self.assertEqual(failure.status, EvidenceQuestionStatus.BLOCKED)
         self.assertEqual(failure.blocking_reason, "PERMISSION_DENIED")
         self.assertNotEqual(succeeded.to_data(), failed.to_data())
+
+    def test_truncated_search_stays_open_for_refinement(self) -> None:
+        delta = EvidenceDelta(
+            "Q1", (EvidenceItem(
+                "new_paths", "partial-hash", "path:src/partial.py"
+            ),), "ok", 1,
+        )
+        projection, record = self.bound.observe(
+            ToolCall(
+                "call-truncated", "core.search_files",
+                {"pattern": "cancel", "target": "content"}, self.question,
+            ),
+            ToolResult(
+                "call-truncated", True,
+                {"matches": [{"path": "src/partial.py", "line": 1}]},
+                truncated=True,
+            ),
+            delta, event_sequence=2,
+        )
+
+        self.assertEqual(record.status, EvidenceQuestionStatus.OPEN)
+        self.assertEqual(
+            record.observation_kind, EvidenceObservationKind.TRUNCATED_RESULT
+        )
+        self.assertEqual(
+            record.blocking_reason,
+            "SEARCH_RESULT_TRUNCATED_REFINEMENT_REQUIRED",
+        )
+        self.assertEqual(projection.get("Q1"), record)
 
     def test_recoverable_failure_stays_open_and_redirect_drops_it(self) -> None:
         recoverable, record = self.bound.observe(
@@ -153,7 +186,7 @@ class EvidenceQuestionKernelTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_bound_question_is_persisted_before_tool_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            application = compose_fixture_application(
+            application = compose_legacy_fixture_application(
                 model_adapter=EvidenceQuestionModel(),
                 require_evidence_questions=True,
             )
@@ -207,7 +240,7 @@ class EvidenceQuestionKernelTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_unbound_model_tool_call_is_rejected_before_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            application = compose_fixture_application(
+            application = compose_legacy_fixture_application(
                 model_adapter=EvidenceQuestionModel(bind_question=False),
                 require_evidence_questions=True,
             )
@@ -230,3 +263,11 @@ class EvidenceQuestionKernelTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from tsm_agt.core.single_loop import OrchestrationMode
+
+
+def compose_legacy_fixture_application(*args, **kwargs):
+    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
+    return compose_fixture_application(*args, **kwargs)

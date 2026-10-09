@@ -50,6 +50,9 @@ from tsm_agt.ports import (
     ModelAttemptFailed, ModelFailureCategory, ModelRecoveryAction,
     ModelRecoveryExhausted, ModelRetrySafety,
 )
+from tsm_agt.ports.evidence import (
+    ContractAuthority, ContractPhase, TaskContract,
+)
 from typing import Any
 from uuid import uuid4
 from .agent_loop import AgentContinuationSuspended, AgentTurnCheckpoint
@@ -61,6 +64,12 @@ from .session_context import (
     ContextAuthority, ContextScope, SessionConversationMessage,
 )
 from .session_handoff import clip_text
+from .single_loop import (
+    OrchestrationMode,
+    TaskBindingKind,
+    TaskOrchestrationMetadata,
+    TaskOrchestrationProjector,
+)
 from .steering import SteeringKind, SteeringProjector
 from .task import TaskNotFound, TaskSnapshot, TaskState
 from .task_spec import (
@@ -68,7 +77,8 @@ from .task_spec import (
     RUNTIME_AUTHORED_CRITERION_KINDS, TaskAcceptanceCriterion,
     TaskCriterionKind, TaskExecutionFocus, TaskExecutionFocusProjector,
     TaskOutcomeKind, TaskSpecProjector, TaskSpecProposal,
-    TaskSpecSnapshot, validate_authored_criterion
+    TaskSpecSnapshot, classify_planner_delivery_intent,
+    validate_authored_criterion, validate_planner_delivery_intent,
 )
 from .turn import InvalidTurnState
 from .verification import AcceptanceStatus
@@ -192,6 +202,14 @@ class TaskMixin:
                 current_request = message.text.strip() or current_request
                 current_request_index = index
                 break
+        delivery_intent = classify_planner_delivery_intent(current_request)
+        interpretation_ids = (
+            ()
+            if delivery_intent["kind"] == "workspace_mutation"
+            else self._preceding_exchange_ids(
+                projection.messages, current_request_index
+            )
+        )
         # INV-8: the Planner is scoped to this Task's own lineage and receives
         # no background at all. Another Task's conversation can therefore never
         # become this Task's goal or acceptance criterion, and recency is not an
@@ -199,19 +217,17 @@ class TaskMixin:
         #
         # A request that only reads as a reply -- "原因 直接写文档吧" answering
         # "如果你愿意...我可以...写文档" -- still has to be interpreted by
-        # something, and a Planner shown only itself can only read it literally.
-        # The immediately preceding exchange is therefore pulled in through
-        # ContextScope's explicit-reference escape hatch: a bounded, named
-        # outside fact, never a widened lineage boundary. It stays
+        # something. Explicit workspace-mutation requests are already
+        # self-contained and must not inherit an assistant's prior limitation;
+        # only other requests receive the immediately preceding exchange through
+        # ContextScope's explicit-reference escape hatch. It stays
         # NON_AUTHORITATIVE and is delivered under its own section, so it can
         # resolve what the request refers to without authoring a goal.
         scope = ContextScope(
             session_id=task.session_id,
             task_id=task.task_id,
             lineage_task_ids=(task.task_id,),
-            explicit_message_ids=self._preceding_exchange_ids(
-                projection.messages, current_request_index
-            ),
+            explicit_message_ids=interpretation_ids,
         )
         prompt_projection = self._dependencies.session_context_projector.for_prompt(
             projection,
@@ -284,8 +300,33 @@ class TaskMixin:
         authority["interpretation_context"] = (
             ContextAuthority.NON_AUTHORITATIVE.value
         )
+        onboarding_facts: list[dict[str, Any]] = []
+        onboarding_stale = True
+        try:
+            onboarding, onboarding_stale = await self.get_project_onboarding(
+                task.task_id, include_stale=True
+            )
+            onboarding_facts = [
+                {
+                    "category": fact.category,
+                    "value": fact.value,
+                    "sources": [source.to_data() for source in fact.sources],
+                }
+                for fact in onboarding.facts
+                if fact.category in {
+                    "entry_candidate", "source_boundary", "technology",
+                }
+            ][:40]
+        except LookupError:
+            pass
         planning_context = {
             "workspace": task.workspace,
+            "delivery_intent": delivery_intent,
+            "project_onboarding": {
+                "authority": "source_linked_observation",
+                "static_snapshot_stale": onboarding_stale,
+                "facts": onboarding_facts,
+            },
             "available_tool_effects": sorted({
                 tool.effect.value for tool in await self.list_tools()
                 if not tool.is_internal_state
@@ -369,6 +410,9 @@ class TaskMixin:
             proposal = TaskSpecProposal.from_data(
                 raw, require_acceptance_criteria=True
             )
+            validate_planner_delivery_intent(
+                proposal, planning_context.get("delivery_intent", {}),
+            )
             # Any evidence_reference the Runtime cannot resolve right now --
             # malformed like ``turn-...`` or simply not present -- is demoted to
             # rubric (advisory). Demotion, not a hard failure: a Planner that
@@ -436,12 +480,17 @@ class TaskMixin:
             )
             await self._append_events(task_id, (("task_spec.revised", {
                 "writer": "task-spec-planner",
+                "orchestration_mode": "LEGACY",
                 "revision": candidate.revision,
                 "content_hash": candidate.content_hash,
                 "snapshot": candidate.to_data(),
                 "planning_session_revision": planning_session_revision,
                 "planning_context_hash": planning_context_hash,
+                "prompt_projection_hash": planning_context_hash,
                 "current_request_hash": canonical_hash(current_request),
+                "current_input_ref": (
+                    "task-input:" + canonical_hash(current_request)
+                ),
             }),))
             return candidate
         except Exception as error:
@@ -571,6 +620,7 @@ class TaskMixin:
         task_relation: SessionTaskRelation = SessionTaskRelation.INDEPENDENT,
         original_user_text: str | None = None,
         context_handoff: Mapping[str, Any] | None = None,
+        evidence_contract: TaskContract | None = None,
     ) -> TaskSnapshot:
         """Create one Task and attach it to its Session.
 
@@ -583,6 +633,9 @@ class TaskMixin:
         normalized_goal = goal.strip()
         if not normalized_goal:
             raise ValueError("task goal must not be empty")
+        provided_contract_data = (
+            evidence_contract.to_data() if evidence_contract is not None else None
+        )
         if command_id is not None:
             if not command_id.strip():
                 raise ValueError("command_id must not be empty")
@@ -600,9 +653,21 @@ class TaskMixin:
                 requested_workspace = self._dependencies.workspace_path.normalize_workspace(
                     workspace
                 )
+                prior_events = await self._dependencies.store.read_events(prior_task_id)
+                created = next(
+                    (
+                        event for event in reversed(prior_events)
+                        if event.event_type == "task.created"
+                    ),
+                    None,
+                )
+                prior_contract = (
+                    created.payload.get("evidence_contract") if created is not None else None
+                )
                 if (
                     prior_task.goal != normalized_goal
                     or prior_workspace != requested_workspace
+                    or canonical_hash(prior_contract) != canonical_hash(provided_contract_data)
                 ):
                     raise ValueError("command_id was reused with different Task input")
                 return prior_task
@@ -611,6 +676,30 @@ class TaskMixin:
         )
 
         identity = task_id or f"task-{uuid4().hex}"
+        contract_data = provided_contract_data
+        initial_contract: TaskContract
+        initial_contract_event: str
+        if evidence_contract is None:
+            initial_contract = TaskContract(
+                contract_id=f"contract-{uuid4().hex}",
+                revision=1,
+                objective=normalized_goal,
+                authority=ContractAuthority.MODEL_DRAFT,
+                phase=ContractPhase.DRAFT,
+                guidance={"draft_source": "deterministic_goal_metadata"},
+            )
+            initial_contract_event = "contract.drafted"
+        else:
+            initial_contract = replace(
+                evidence_contract,
+                contract_id=(
+                    evidence_contract.contract_id or f"contract-{uuid4().hex}"
+                ),
+                revision=1,
+                authority=ContractAuthority.USER_EXPLICIT,
+                phase=ContractPhase.ACTIVE,
+            )
+            initial_contract_event = "contract.created_by_user"
         session_identity = session_id or standalone_session_id(identity)
         session_stored = await self._dependencies.store.load_session(session_identity)
         if session_stored is None:
@@ -660,10 +749,11 @@ class TaskMixin:
         recorded_input = (original_user_text or "").strip()
         if recorded_input:
             attached_payload["user_text"] = recorded_input
-        session_events += (SessionEvent(
+        attached_event = SessionEvent(
             f"sevt-{uuid4().hex}", session_identity, attach_sequence,
             "session.task_attached", attached_payload,
-        ),)
+        )
+        session_events += (attached_event,)
         if source_task_id is not None:
             session_events += (SessionEvent(
                 f"sevt-{uuid4().hex}", session_identity, attach_sequence + 1,
@@ -715,6 +805,14 @@ class TaskMixin:
             if document_references and "web.fetch_markdown" not in visible_tool_names
             else None
         )
+        orchestration_metadata = TaskOrchestrationMetadata(
+            schema_version=1,
+            orchestration_mode=self._dependencies.orchestration_mode,
+            root_goal=normalized_goal,
+            root_input_event_ref=f"session-event:{attached_event.event_id}",
+            latest_input_event_ref=f"session-event:{attached_event.event_id}",
+            binding_kind=TaskBindingKind.NEW,
+        )
         event = RuntimeEvent(
             event_id=f"evt-{uuid4().hex}",
             task_id=snapshot.task_id,
@@ -722,7 +820,9 @@ class TaskMixin:
             event_type="task.created",
             payload={
                 "goal": snapshot.goal, "workspace": snapshot.workspace,
+                "evidence_contract": contract_data,
                 "session_id": session_identity,
+                "single_loop": orchestration_metadata.to_data(),
                 "source_task_id": source_task_id,
                 "task_relation": task_relation.value,
                 # INV-9: a derived Task's source facts are persisted separately
@@ -750,13 +850,25 @@ class TaskMixin:
                 },
             },
         )
+        contract_event = RuntimeEvent(
+            event_id=f"evt-{uuid4().hex}",
+            task_id=snapshot.task_id,
+            sequence=2,
+            event_type=initial_contract_event,
+            payload={
+                "command_id": command_id or f"task-create-contract-{identity}",
+                "request_hash": canonical_hash(initial_contract.to_data()),
+                "content_hash": canonical_hash(initial_contract.to_data()),
+                "snapshot": initial_contract.to_data(),
+            },
+        )
         await self._dependencies.store.commit_session_and_task(SessionTaskUnitOfWork(
             SessionUnitOfWork(
                 session_identity, session_version, session.to_data(), session_events
             ),
             RuntimeUnitOfWork(
                 snapshot.task_id, 0, snapshot.to_data(),
-                (event,),
+                (event, contract_event),
             ),
             command_id or f"command-create-task-{uuid4().hex}",
         ))
@@ -796,6 +908,23 @@ class TaskMixin:
         if stored is None:
             raise TaskNotFound(f"task not found: {task_id}")
         return TaskSnapshot.from_data(stored.data)
+
+    async def get_task_orchestration_metadata(
+        self, task_id: str,
+    ) -> TaskOrchestrationMetadata:
+        """Project the Task's creation-time execution identity from its ledger."""
+        task = await self.get_task(task_id)
+        events = await self._dependencies.store.read_events(task_id)
+        return TaskOrchestrationProjector.project(task_id, task.goal, events)
+
+    async def require_legacy_task_orchestration(self, task_id: str) -> None:
+        """Prevent a fixed single-loop Task from entering the legacy runner."""
+        metadata = await self.get_task_orchestration_metadata(task_id)
+        if metadata.orchestration_mode is not OrchestrationMode.LEGACY:
+            raise InvalidTurnState(
+                f"task {task_id} is fixed to {metadata.orchestration_mode.value}; "
+                "the legacy Agent loop cannot run or resume it"
+            )
 
     async def transition_task(
         self, task_id: str, target: TaskState, reason: str, *,

@@ -68,6 +68,11 @@ from tsm_agt.core import (
     TaskVerificationStatus,
     build_flow_export_document,
 )
+from tsm_agt.core.single_loop import (
+    OrchestrationMode,
+    TaskBindingDecision,
+    TaskBindingKind,
+)
 
 
 def _render_evidence_level(assessment) -> str:
@@ -766,7 +771,9 @@ def _compact_tool_presentation(progress: AgentProgress) -> str:
             dict(progress.operation_arguments), ensure_ascii=False,
             sort_keys=True, separators=(",", ":"),
         )
-    if progress.tool_name in {"core.apply_patch", "core.apply_patches"}:
+    if progress.tool_name in {
+        "core.apply_patch", "core.apply_patch_v4a", "core.apply_patches",
+    }:
         return rendered
     compact = " ".join(rendered.split())
     return compact if len(compact) <= 360 else compact[:359] + "…"
@@ -1224,9 +1231,70 @@ async def _chat(
             route_source_task_id = None
             route_relation = SessionTaskRelation.INDEPENDENT
             route_goal = prompt
+            original_user_text = (
+                prompt
+                if application.kernel.dependencies.orchestration_mode
+                is OrchestrationMode.SINGLE_LOOP
+                else None
+            )
             session_answer_text: str | None = None
             session = await application.kernel.get_session(session.session_id)
-            if explicit_resume_task is None and not explicit_new_task:
+            if (
+                application.kernel.dependencies.orchestration_mode
+                is OrchestrationMode.SINGLE_LOOP
+                and session.pending_interaction is None
+            ):
+                binding = await application.kernel.dispatch_input_event(
+                    SessionTextInput(
+                        session.session_id,
+                        prompt,
+                        f"input-{uuid4().hex}",
+                        str(root),
+                        explicit_resume_task,
+                        explicit_new_task,
+                    )
+                )
+                if not isinstance(binding, TaskBindingDecision):
+                    raise RuntimeError("single-loop session binding returned an invalid result")
+                if binding.binding_kind in {
+                    TaskBindingKind.EXPLICIT_CONTINUATION,
+                    TaskBindingKind.EXPLICIT_REFERENCE,
+                    TaskBindingKind.ACTIVE_CONTINUATION,
+                }:
+                    assert binding.task_id is not None
+                    explicit_resume_task = binding.task_id
+                    output_fn(f"[会话] 已绑定到 Task {binding.task_id}，正在继续。")
+                elif binding.binding_kind is TaskBindingKind.CHOICE_REQUIRED:
+                    candidates = await application.kernel.list_session_resume_candidates(
+                        session.session_id, root
+                    )
+                    interaction = await application.kernel.request_session_task_choice(
+                        session.session_id,
+                        candidates,
+                        "存在多个活跃 Task，请选择要继续的 Task。",
+                        source="single-loop-binding",
+                    )
+                    for option, candidate in zip(
+                        interaction.options, candidates, strict=True
+                    ):
+                        output_fn(
+                            f"{option.ordinal}. {candidate.task_id} "
+                            f"[{candidate.task_state}] {candidate.goal}"
+                        )
+                    output_fn("请输入编号、完整 Task ID，或 /resume <task_id>。")
+                    continue
+                elif binding.binding_kind in {
+                    TaskBindingKind.USER_INTERACTION,
+                    TaskBindingKind.QUEUED_AFTER_APPROVAL,
+                }:
+                    output_fn("当前 Task 正在等待受控交互，请使用对应的审批或澄清入口。")
+                    continue
+            if (
+                application.kernel.dependencies.orchestration_mode
+                is OrchestrationMode.LEGACY
+                and explicit_resume_task is None
+                and not explicit_new_task
+            ):
                 local_choice = (
                     await application.kernel.resolve_pending_session_choice(
                         session.session_id, prompt
@@ -1563,6 +1631,7 @@ async def _chat(
                     ),
                     source_task_id=route_source_task_id,
                     task_relation=route_relation,
+                    original_user_text=original_user_text,
                 )
                 if queued_follow_up is not None:
                     await application.kernel.mark_session_follow_up_dispatched(

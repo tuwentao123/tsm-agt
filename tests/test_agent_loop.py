@@ -384,7 +384,7 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
     async def test_new_direction_supersedes_pending_approval_without_approving_it(self):
         model = RiskyToolCallingModel()
         provider = RiskyToolProvider()
-        application = compose_fixture_application(
+        application = compose_legacy_fixture_application(
             model_adapter=model, tool_adapters=(provider,),
         )
         await application.registry.start_all()
@@ -451,7 +451,7 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_outcome_stops_batch_until_explicit_reconciliation(self):
         model = TwoUnsafeCallsThenFinishModel()
         provider = SlowUnsafeToolProvider()
-        application = compose_fixture_application(
+        application = compose_legacy_fixture_application(
             model_adapter=model, tool_adapters=(provider,),
         )
         await application.registry.start_all()
@@ -541,7 +541,7 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
         database = Path(temp_dir.name) / "runtime.db"
         first_model = TwoUnsafeCallsThenFinishModel()
         first_provider = SlowUnsafeToolProvider()
-        first = compose_fixture_application(
+        first = compose_legacy_fixture_application(
             model_adapter=first_model, tool_adapters=(first_provider,),
             store_adapter=SQLiteRuntimeStore(database),
         )
@@ -570,7 +570,7 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
 
         second_model = TwoUnsafeCallsThenFinishModel()
         second_provider = SlowUnsafeToolProvider()
-        second = compose_fixture_application(
+        second = compose_legacy_fixture_application(
             model_adapter=second_model, tool_adapters=(second_provider,),
             store_adapter=SQLiteRuntimeStore(database),
         )
@@ -594,7 +594,7 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
             temp_dir.cleanup()
 
     async def _create_executing_task(self, model):
-        application = compose_fixture_application(model_adapter=model)
+        application = compose_legacy_fixture_application(model_adapter=model)
         await application.registry.start_all()
         temp_dir = tempfile.TemporaryDirectory()
         task = await application.kernel.create_task(
@@ -614,7 +614,7 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
 
     async def _create_risky_agent(self, *, store=None, model=None):
         provider = RiskyToolProvider()
-        application = compose_fixture_application(
+        application = compose_legacy_fixture_application(
             model_adapter=model or RiskyToolCallingModel(),
             tool_adapters=(provider,),
             store_adapter=store,
@@ -733,7 +733,7 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
             await first.registry.stop_all()
 
         second_provider = RiskyToolProvider()
-        second = compose_fixture_application(
+        second = compose_legacy_fixture_application(
             model_adapter=RiskyToolCallingModel(),
             tool_adapters=(second_provider,),
             store_adapter=SQLiteRuntimeStore(database),
@@ -769,7 +769,7 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
             await first.registry.stop_all()
 
         second_provider = RiskyToolProvider()
-        second = compose_fixture_application(
+        second = compose_legacy_fixture_application(
             model_adapter=OutcomeRiskyToolCallingModel(),
             tool_adapters=(second_provider,),
             store_adapter=SQLiteRuntimeStore(database),
@@ -1151,3 +1151,11 @@ class PhaseActionVocabularyTest(unittest.TestCase):
             {action.value for action in PhaseAction},
             {"ok", "continue", "return"},
         )
+
+
+from tsm_agt.core.single_loop import OrchestrationMode
+
+
+def compose_legacy_fixture_application(*args, **kwargs):
+    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
+    return compose_fixture_application(*args, **kwargs)

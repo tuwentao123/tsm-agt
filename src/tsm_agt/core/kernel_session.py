@@ -40,6 +40,12 @@ from .approval import (
 from .configuration import (
     canonical_hash,
 )
+from .single_loop import TaskBindingDecision, TaskBindingKind
+from .single_loop.binder import (
+    TaskBindingRequest,
+    TaskBindingTask,
+    bind_task_input,
+)
 from .execution import (
     ToolCommitState,
 )
@@ -71,7 +77,7 @@ from .task import (
     TaskNotFound, TaskSnapshot, TaskState,
 )
 from .task_spec import (
-    TaskSpecSnapshot,
+    TaskSpecSnapshot, classify_planner_delivery_intent,
 )
 from .turn import (
     InvalidModelResponse, SessionAnswerRequiresTask,
@@ -718,7 +724,13 @@ class SessionMixin:
             blocked.safety if blocked else None, candidates,
         )
     async def resolve_session_input(
-        self, session_id: str, text: str, workspace: Path | None = None,
+        self,
+        session_id: str,
+        text: str,
+        workspace: Path | None = None,
+        *,
+        shadow_explicit_task_id: str | None = None,
+        shadow_new_task_requested: bool = False,
     ) -> SessionInputDecision:
         """Resolve input with a semantic proposal and deterministic validation.
 
@@ -746,7 +758,11 @@ class SessionMixin:
                 task_catalog=(),
             )
             await self._record_session_input_decision(
-                session_id, normalized, decision
+                session_id,
+                normalized,
+                decision,
+                shadow_explicit_task_id=shadow_explicit_task_id,
+                shadow_new_task_requested=shadow_new_task_requested,
             )
             return decision
         if resolver is None:
@@ -758,7 +774,11 @@ class SessionMixin:
                 candidates=candidates, task_catalog=catalog,
             )
             await self._record_session_input_decision(
-                session_id, normalized, decision
+                session_id,
+                normalized,
+                decision,
+                shadow_explicit_task_id=shadow_explicit_task_id,
+                shadow_new_task_requested=shadow_new_task_requested,
             )
             return decision
         recent_messages = [
@@ -875,7 +895,20 @@ class SessionMixin:
                     or confidence < 0.85
                 ):
                     raise ValueError("invalid direct Session answer")
-                if _needs_live_information(normalized):
+                if classify_planner_delivery_intent(normalized)["kind"] == (
+                    "workspace_mutation"
+                ):
+                    # The direct-answer route has no tools, so an explicit
+                    # workspace edit cannot safely be satisfied here. The
+                    # deterministic override is intentionally conservative:
+                    # an unnecessary Task can still answer correctly with
+                    # tools, while a missed mutation request becomes plausible
+                    # prose with no durable change.
+                    disposition = SessionRouteDisposition.CREATE_TASK
+                    relation = SessionTaskRelation.INDEPENDENT
+                    resolved_goal = normalized
+                    reason = "answer_route_overridden_workspace_mutation"
+                elif _needs_live_information(normalized):
                     # The ANSWER route holds no tools, so a question whose answer
                     # changes over time can only be answered from the model's
                     # training data -- a silently stale fact, which is exactly
@@ -1015,7 +1048,12 @@ class SessionMixin:
                 candidates, catalog, candidate_task_ids,
             )
             await self._record_session_input_decision(
-                session_id, normalized, decision
+                session_id,
+                normalized,
+                decision,
+                prompt_projection_hash=canonical_hash(context),
+                shadow_explicit_task_id=shadow_explicit_task_id,
+                shadow_new_task_requested=shadow_new_task_requested,
             )
             return decision
         except Exception as error:
@@ -1049,7 +1087,11 @@ class SessionMixin:
                 candidates=candidates, task_catalog=catalog,
             )
             await self._record_session_input_decision(
-                session_id, normalized, decision
+                session_id,
+                normalized,
+                decision,
+                shadow_explicit_task_id=shadow_explicit_task_id,
+                shadow_new_task_requested=shadow_new_task_requested,
             )
             return decision
     async def _session_task_catalog(
@@ -1347,8 +1389,45 @@ class SessionMixin:
             except ValueError as error:
                 if "version conflict" not in str(error) or attempt == 2:
                     raise
+    async def bind_session_input(
+        self,
+        session_id: str,
+        *,
+        current_input_event_ref: str,
+        explicit_task_id: str | None = None,
+        new_task_requested: bool = False,
+        continuation_requested: bool = False,
+        selected_interaction_task_id: str | None = None,
+        approval_resolution_task_id: str | None = None,
+    ) -> TaskBindingDecision:
+        """Compute the deterministic binding without changing legacy routing."""
+        tasks = await self.list_session_tasks(session_id)
+        return bind_task_input(TaskBindingRequest(
+            current_input_event_ref=current_input_event_ref,
+            tasks=tuple(
+                TaskBindingTask(
+                    task.task_id,
+                    task.state.value,
+                    has_unfinished_work=not task.state.is_terminal,
+                )
+                for task in tasks
+            ),
+            explicit_task_id=explicit_task_id,
+            new_task_requested=new_task_requested,
+            continuation_requested=continuation_requested,
+            selected_interaction_task_id=selected_interaction_task_id,
+            approval_resolution_task_id=approval_resolution_task_id,
+        ))
+
     async def _record_session_input_decision(
-        self, session_id: str, text: str, decision: SessionInputDecision,
+        self,
+        session_id: str,
+        text: str,
+        decision: SessionInputDecision,
+        *,
+        prompt_projection_hash: str = "",
+        shadow_explicit_task_id: str | None = None,
+        shadow_new_task_requested: bool = False,
     ) -> None:
         """Audit Session routing, keeping the audit events plaintext-free.
 
@@ -1365,6 +1444,9 @@ class SessionMixin:
             self._authorize_session(session)
             base_sequence = stored.last_event_sequence
             shared = {
+                    "orchestration_mode": "LEGACY",
+                    "current_input_ref": "input:" + canonical_hash(text),
+                    "prompt_projection_hash": prompt_projection_hash,
                     "text_hash": canonical_hash(text),
                     "action": decision.action.value,
                     "task_id": decision.task_id,
@@ -1384,6 +1466,48 @@ class SessionMixin:
                         item.task_id for item in decision.task_catalog
                     ],
             }
+            continuation_requested = text.strip().casefold() in {
+                "继续",
+                "直接改",
+                "直接修改",
+                "按刚才方案实施",
+                "continue",
+            }
+            binding = await self.bind_session_input(
+                session_id,
+                current_input_event_ref=shared["current_input_ref"],
+                explicit_task_id=shadow_explicit_task_id,
+                new_task_requested=shadow_new_task_requested,
+                continuation_requested=continuation_requested,
+            )
+            legacy_binding_kind = {
+                SessionRouteDisposition.CREATE_TASK: TaskBindingKind.NEW.value,
+                SessionRouteDisposition.CLARIFY: TaskBindingKind.CHOICE_REQUIRED.value,
+                SessionRouteDisposition.RESUME_TASK: (
+                    TaskBindingKind.ACTIVE_CONTINUATION.value
+                ),
+            }.get(decision.disposition)
+            matches_legacy = legacy_binding_kind == binding.binding_kind.value
+            difference_reason = (
+                None
+                if matches_legacy
+                else (
+                    "legacy_answer_has_no_task_binding"
+                    if legacy_binding_kind is None
+                    else "binding_kind_mismatch"
+                )
+            )
+            shadow = {
+                **binding.to_data(),
+                "legacy_matches": matches_legacy,
+                "difference_reason": difference_reason,
+                "legacy_decision": {
+                    "disposition": decision.disposition.value,
+                    "relation": decision.relation.value,
+                    "task_id": decision.task_id,
+                    "source_task_id": decision.source_task_id,
+                },
+            }
             events = (
                 SessionEvent(
                     f"sevt-{uuid4().hex}", session_id, base_sequence + 1,
@@ -1400,6 +1524,10 @@ class SessionMixin:
                     f"sevt-{uuid4().hex}", session_id, base_sequence + 3,
                     "session.input_resolved", shared,
                 ),
+                SessionEvent(
+                    f"sevt-{uuid4().hex}", session_id, base_sequence + 4,
+                    "session.single_loop_binding_shadow", shadow,
+                ),
             )
             if decision.disposition is SessionRouteDisposition.CLARIFY:
                 # A clarification creates no Task, so nothing else would ever
@@ -1407,7 +1535,7 @@ class SessionMixin:
                 # and the message that triggered it. This is a conversation
                 # record, kept separate from the hash-only audit events above.
                 events += (SessionEvent(
-                    f"sevt-{uuid4().hex}", session_id, base_sequence + 4,
+                    f"sevt-{uuid4().hex}", session_id, base_sequence + 5,
                     "session.clarification_requested", {
                         "user_text": text.strip(),
                         "clarification": decision.clarification or "",
@@ -2048,11 +2176,10 @@ class SessionMixin:
             # Turn. Never copy command argv/environment, patch bodies or arbitrary
             # third-party Tool arguments into Session context.
             safe_keys = (
-                ("path", "query", "pattern")
+                ("path", "query", "pattern", "target", "file_glob")
                 if execution.call.name in {
-                    "core.list_files", "core.find_files",
-                    "core.read_file", "core.search_text",
-                    "core.grep_search",
+                    "core.list_files", "core.search_files", "core.find_files",
+                    "core.read_file", "core.search_text", "core.grep_search",
                 } else ()
             )
             for key in safe_keys:

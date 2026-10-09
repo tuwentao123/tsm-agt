@@ -109,10 +109,16 @@ class CapabilityDeclarationContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tools)
         for name, spec in tools.items():
             with self.subTest(tool=name):
+                if spec.is_internal_state:
+                    self.assertFalse(spec.evidence_capabilities)
+                    continue
                 # Derived from effect + result_authority -- no per-tool rule.
-                self.assertIn(
-                    EvidenceCapability.READ_ARTIFACT, spec.evidence_capabilities,
+                expected = (
+                    EvidenceCapability.OBSERVE_RUNTIME
+                    if spec.result_authority is ToolResultAuthority.RUNTIME_FACT
+                    else EvidenceCapability.READ_ARTIFACT
                 )
+                self.assertIn(expected, spec.evidence_capabilities)
 
     async def test_only_truncation_reporting_tools_claim_enumeration(self) -> None:
         tools = await self._tools()
@@ -122,8 +128,8 @@ class CapabilityDeclarationContractTest(unittest.IsolatedAsyncioTestCase):
             "reading one file cannot certify that a scope was enumerated",
         )
         for name in (
-            "core.list_files", "core.find_files", "core.search_text",
-            "core.grep_search",
+            "core.list_files", "core.search_files", "core.find_files",
+            "core.search_text", "core.grep_search",
         ):
             with self.subTest(tool=name):
                 self.assertIn(
@@ -243,8 +249,8 @@ class EngineeringCapabilityContractTest(unittest.IsolatedAsyncioTestCase):
                 if EvidenceCapability.ENUMERATE_SCOPE in spec.evidence_capabilities
             }
             self.assertEqual(enumeration_claims, {
-                "core.list_files", "core.find_files", "core.search_text",
-                "core.grep_search", "code.diagnostics",
+                "core.list_files", "core.search_files", "core.find_files",
+                "core.search_text", "core.grep_search", "code.diagnostics",
             })
             # A web search is bounded by result count and is not a defensible
             # enumeration of its scope, so it must not claim one.

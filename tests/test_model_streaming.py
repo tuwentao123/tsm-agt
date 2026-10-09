@@ -247,7 +247,7 @@ class ModelStreamingTest(unittest.IsolatedAsyncioTestCase):
                     await application.kernel.run_agent_turn(
                         task.task_id, "recover me", on_text_delta=deltas.append
                     )
-                self.assertEqual(deltas, ["partial"])
+                self.assertEqual(deltas, [])
                 interrupted = await application.kernel.interrupt_agent_turn(
                     task.task_id
                 )

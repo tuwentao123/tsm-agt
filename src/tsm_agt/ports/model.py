@@ -333,7 +333,11 @@ class ModelTransportProgress:
 class ModelRequest:
     turn_id: str
     messages: tuple[Message, ...]
-    max_output_tokens: int = 1024
+    #: Wire-level output ceiling (``max_tokens`` / ``max_completion_tokens``).
+    #: ``None`` sends nothing, leaving the ceiling to the provider -- what Codex
+    #: does always and Hermes does when unset. This is NOT the context budget's
+    #: output reservation: see ``ContextBudget.reserved_output_tokens``.
+    max_output_tokens: int | None = None
     tools: tuple[ToolSpec, ...] = ()
     allow_tool_calls: bool = True
     require_evidence_questions: bool = False

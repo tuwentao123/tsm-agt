@@ -11,6 +11,10 @@ from tsm_agt.core import (
     SessionResumeCandidate, SessionResumeSafety,
     SessionRouteDisposition, SessionTaskRelation, TaskState,
 )
+from tsm_agt.core.single_loop import (
+    OrchestrationMode,
+    TaskBindingKind,
+)
 from tsm_agt.ports import AdapterDescriptor, HealthState, HealthStatus
 from tsm_agt.sdk import EngineeringAgentClient
 
@@ -56,6 +60,7 @@ class SessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
         app = compose_fixture_application(
             model_adapter=EchoModelProvider(), tool_adapters=(),
             session_input_resolver_adapter=resolver,
+            orchestration_mode=OrchestrationMode.LEGACY,
         )
         client = EngineeringAgentClient(root, application_factory=lambda: app)
         await client.start()
@@ -371,3 +376,44 @@ class SessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SingleLoopSessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_default_session_ingress_uses_binder_without_legacy_router_or_planner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=()
+            )
+            client = EngineeringAgentClient(root, application_factory=lambda: app)
+            await client.start()
+            self.addAsyncCleanup(client.close)
+            session = await client.application.kernel.create_session("single loop")
+            kernel = client.application.kernel
+            with patch.object(
+                kernel,
+                "resolve_session_input",
+                AsyncMock(side_effect=AssertionError("legacy router was called")),
+            ) as router, patch.object(
+                kernel,
+                "plan_task_spec",
+                AsyncMock(side_effect=AssertionError("legacy planner was called")),
+            ) as planner:
+                result = await client.submit_session_text(
+                    session.session_id,
+                    "implement the single loop ingress",
+                    command_id="single-loop-session-text",
+                )
+                task_id = result.result["task"]["task_id"]
+                await client.wait_task(task_id)
+
+            task = await kernel.get_task(task_id)
+            metadata = await kernel.get_task_orchestration_metadata(task_id)
+
+        router.assert_not_awaited()
+        planner.assert_not_awaited()
+        self.assertEqual(result.result["decision"]["binding_kind"], TaskBindingKind.NEW.value)
+        self.assertEqual(task.goal, "implement the single loop ingress")
+        self.assertEqual(metadata.root_goal, "implement the single loop ingress")
+        self.assertTrue(metadata.root_input_event_ref.startswith("session-event:"))
+        self.assertEqual(metadata.orchestration_mode, OrchestrationMode.SINGLE_LOOP)

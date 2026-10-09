@@ -44,7 +44,8 @@ class RuleBasedSemanticActionClassifier:
         ".conf", ".properties", ".xml",
     })
     _MUTATION_TOOLS = frozenset({
-        "core.apply_patch", "core.apply_patches", "core.delete_file",
+        "core.apply_patch", "core.apply_patch_v4a", "core.apply_patches",
+        "core.delete_file",
         "core.rollback_mutation", "core.rollback_mutations",
         "core.rollback_mutation_batch", "core.rollback_mutation_groups",
     })
@@ -99,7 +100,10 @@ class RuleBasedSemanticActionClassifier:
         if name == "core.list_files":
             return (SemanticActionFamily.INSPECT_PROJECT_STRUCTURE, "structure",
                     "project-structure", 0.98)
-        if name in {"core.search_text", "core.grep_search", "core.find_files"}:
+        if name in {
+            "core.search_files", "core.search_text", "core.grep_search",
+            "core.find_files",
+        }:
             raw_query = arguments.get(
                 "query", arguments.get("pattern", "")
             )
@@ -109,6 +113,10 @@ class RuleBasedSemanticActionClassifier:
             elif (
                 self._contains(question, self._DEFINITION_HINTS)
                 or name == "core.find_files"
+                or (
+                    name == "core.search_files"
+                    and arguments.get("target", "content") == "files"
+                )
                 or self._looks_like_declaration(str(raw_query))
             ):
                 family = SemanticActionFamily.SEARCH_DEFINITION

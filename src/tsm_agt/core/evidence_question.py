@@ -29,6 +29,7 @@ class EvidenceObservationKind(StrEnum):
     NON_EMPTY_RESULT = "NON_EMPTY_RESULT"
     EMPTY_RESULT = "EMPTY_RESULT"
     STRUCTURED_RESULT = "STRUCTURED_RESULT"
+    TRUNCATED_RESULT = "TRUNCATED_RESULT"
     RECOVERABLE_FAILURE = "RECOVERABLE_FAILURE"
     FAILURE = "FAILURE"
     DROPPED_BY_GOAL_REPLACEMENT = "DROPPED_BY_GOAL_REPLACEMENT"
@@ -226,12 +227,27 @@ class EvidenceQuestionProjection:
             reason = result.error_code or "TOOL_FAILED"
         else:
             reason = None
-            if call.name == "core.read_file":
+            if (
+                result.truncated
+                and call.name in {
+                    "core.search_files", "core.find_files",
+                    "core.search_text", "core.grep_search",
+                }
+            ):
+                status = EvidenceQuestionStatus.OPEN
+                kind = EvidenceObservationKind.TRUNCATED_RESULT
+                reason = "SEARCH_RESULT_TRUNCATED_REFINEMENT_REQUIRED"
+            elif call.name == "core.read_file":
                 status = EvidenceQuestionStatus.RESOLVED
                 kind = EvidenceObservationKind.ARTIFACT_READ
             elif delta is not None and delta.counts.get("new_exclusions", 0):
+                # A no-match result is durable negative evidence about this exact
+                # query. It does not by itself prove that a broader delivery goal
+                # has no implementation; completion readiness decides whether the
+                # Task must refine it before stopping.
                 status = EvidenceQuestionStatus.RESOLVED
                 kind = EvidenceObservationKind.EMPTY_RESULT
+                reason = "SEARCH_RESULT_EMPTY_REFINEMENT_REQUIRED"
             elif delta is not None and delta.total_new:
                 status = EvidenceQuestionStatus.RESOLVED
                 kind = EvidenceObservationKind.NON_EMPTY_RESULT

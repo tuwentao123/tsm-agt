@@ -11,6 +11,7 @@ this sibling at module level.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 import json
 import time
@@ -37,7 +38,10 @@ from .execution import (
     ToolCommitState, ToolExecutionRecord,
 )
 from .execution_facts import (
-    EffectStatus, classify_effect_status,
+    EffectStatus,
+    classify_effect_status,
+    project_execution_fact,
+    project_tool_execution_fact,
 )
 from .exploration_coordinator import (
     ExplorationCoordinatorAction,
@@ -52,7 +56,13 @@ from .trust import (
     workspace_fingerprint,
 )
 from tsm_agt.ports import (
-    ArtifactReadAction, ExplorationBudgetAction, ExplorationBudgetObservation, ExplorationBudgetProbe, ExplorationBudgetState, ExplorationOutcomeAction, Message, MessageRole, ProgressiveScopeAction, ProgressiveScopeDecision, ReadHitsAction, StopOrPivotAction, StopOrPivotSignals, TextBlock, ToolRecoveryKind, ToolResult, ToolResultBlock,
+    ArtifactReadAction, ExplorationBudgetAction, ExplorationBudgetObservation, ExplorationBudgetProbe, ExplorationBudgetState, ExplorationOutcomeAction, Message, MessageRole, ProgressiveScopeAction, ProgressiveScopeDecision, ReadHitsAction, StopOrPivotAction, StopOrPivotSignals, TextBlock, ToolCall, ToolRecoveryKind, ToolResult, ToolResultBlock,
+)
+from .single_loop.task_projection import (
+    TaskOrchestrationProjector,
+)
+from .single_loop.types import (
+    OrchestrationMode,
 )
 from .turn import (
     InvalidModelResponse,
@@ -60,6 +70,90 @@ from .turn import (
 from uuid import (
     uuid4,
 )
+
+
+def _govern_runtime_result(
+    kernel: Any,
+    state: TurnState,
+    call: ToolCall,
+    result: ToolResult,
+) -> ToolResult:
+    """Apply the per-tool model-content budget to loop-owned guard feedback."""
+    governance = result.meta.get("result_governance")
+    if isinstance(governance, Mapping) and governance.get("schema_version") == 2:
+        return result
+    spec = state.visible_tool_by_name.get(call.name)
+    if spec is None:
+        return result
+    return kernel._dependencies.tool_result_governor.govern(spec, call, result)
+
+
+async def _emit_execution_effect_shadow(
+    kernel: Any,
+    state: TurnState,
+    call: ToolCall,
+) -> None:
+    """Persist a SINGLE_LOOP-only, non-authoritative execution projection.
+
+    The execution ledger and ``tool.completed`` / ``tool.failed`` lifecycle event
+    are already committed when this runs. This event deliberately has no Task
+    projection or completion reader in PR-A; it is audit data for validating the
+    new fact model before it becomes contract authority.
+    """
+    task = await kernel.get_task(state.task_id)
+    events = await kernel._dependencies.store.read_events(state.task_id)
+    metadata = TaskOrchestrationProjector.project(
+        state.task_id,
+        task.goal,
+        events,
+    )
+    if metadata.orchestration_mode is not OrchestrationMode.SINGLE_LOOP:
+        return
+    execution_id = ToolExecutionRecord.identity(state.turn_id, call.call_id)
+    execution = task.tool_executions.get(execution_id)
+    if execution is None or any(
+        event.event_type == "execution.effect_shadow_projected"
+        and event.payload.get("execution_id") == execution_id
+        for event in events
+    ):
+        return
+    spec = state.visible_tool_by_name.get(execution.call.name)
+    mutation_ids = frozenset(
+        mutation.mutation_id for mutation in task.mutation_journal
+    )
+    execution_fact = project_tool_execution_fact(
+        execution,
+        spec,
+        known_mutation_ids=mutation_ids,
+    )
+    if execution_fact is None:
+        return
+    effect_fact = project_execution_fact(
+        execution,
+        spec,
+        known_mutation_ids=mutation_ids,
+    )
+    await kernel._append_events(
+        state.task_id,
+        ((
+            "execution.effect_shadow_projected",
+            {
+                "projection_version": 1,
+                "turn_id": state.turn_id,
+                "tool_call_id": call.call_id,
+                "execution_id": execution_id,
+                "source_event_type": (
+                    "tool.completed"
+                    if execution.result is not None and execution.result.ok
+                    else "tool.failed"
+                ),
+                "execution_fact": execution_fact.to_data(),
+                "effect_fact": (
+                    effect_fact.to_data() if effect_fact is not None else None
+                ),
+            },
+        ),),
+    )
 
 
 async def run_tool_batch(
@@ -233,7 +327,7 @@ async def run_tool_batch(
                 state.messages.append(Message(
                     message_id=f"msg-tool-{uuid4().hex}",
                     role=MessageRole.TOOL,
-                    content=(ToolResultBlock(result),),
+                    content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
                 ))
                 question_projection = await kernel._dispose_evidence_question(
                     state.task_id, state.turn_id, call,
@@ -304,7 +398,7 @@ async def run_tool_batch(
             state.messages.append(Message(
                 message_id=f"msg-tool-{uuid4().hex}",
                 role=MessageRole.TOOL,
-                content=(ToolResultBlock(result),),
+                content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
             ))
             question_projection = await kernel._dispose_evidence_question(
                 state.task_id, state.turn_id, call, ToolActionDisposition.REPLACE,
@@ -398,7 +492,7 @@ async def run_tool_batch(
                 state.messages.append(Message(
                     message_id=f"msg-tool-{uuid4().hex}",
                     role=MessageRole.TOOL,
-                    content=(ToolResultBlock(result),),
+                    content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
                 ))
                 question_projection = await kernel._dispose_evidence_question(
                     state.task_id, state.turn_id, call,
@@ -479,7 +573,7 @@ async def run_tool_batch(
                 state.messages.append(Message(
                     message_id=f"msg-tool-{uuid4().hex}",
                     role=MessageRole.TOOL,
-                    content=(ToolResultBlock(result),),
+                    content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
                 ))
                 question_projection = await kernel._dispose_evidence_question(
                     state.task_id, state.turn_id, call,
@@ -519,7 +613,7 @@ async def run_tool_batch(
                 state.messages.append(Message(
                     message_id=f"msg-tool-{uuid4().hex}",
                     role=MessageRole.TOOL,
-                    content=(ToolResultBlock(result),),
+                    content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
                 ))
                 question_projection = await kernel._dispose_evidence_question(
                     state.task_id, state.turn_id, call, ToolActionDisposition.CANCEL,
@@ -588,7 +682,7 @@ async def run_tool_batch(
             state.messages.append(Message(
                 message_id=f"msg-tool-{uuid4().hex}",
                 role=MessageRole.TOOL,
-                content=(ToolResultBlock(result),),
+                content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
             ))
             question_projection = await kernel._dispose_evidence_question(
                 state.task_id, state.turn_id, call, ToolActionDisposition.REPLACE,
@@ -636,7 +730,7 @@ async def run_tool_batch(
             state.messages.append(Message(
                 message_id=f"msg-tool-{uuid4().hex}",
                 role=MessageRole.TOOL,
-                content=(ToolResultBlock(result),),
+                content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
             ))
             question_projection = await kernel._dispose_evidence_question(
                 state.task_id, state.turn_id, call, ToolActionDisposition.REPLACE,
@@ -908,6 +1002,7 @@ async def run_tool_batch(
                 reason=request.reason, required=request.required,
                 resume_token=required.resume_token,
             )
+        await _emit_execution_effect_shadow(kernel, state, call)
         tool_elapsed_milliseconds = max(
             0, int((time.monotonic() - tool_started_at) * 1000)
         )
@@ -1068,7 +1163,7 @@ async def run_tool_batch(
             Message(
                 message_id=f"msg-tool-{uuid4().hex}",
                 role=MessageRole.TOOL,
-                content=(ToolResultBlock(result),),
+                content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
             )
         )
         state.pending_tool_calls.pop(0)
@@ -1130,7 +1225,7 @@ async def run_tool_batch(
                 and not message.message_id.startswith((
                     "project-onboarding-context-",
                     "project-memory-context-", "session-context-",
-                    "working-memory-context-", "task-spec-context-",
+                    "working-memory-context-", "task-spec-context-", "task-contract-context-",
                     "project-instructions-context-",
                 ))
             ), None)

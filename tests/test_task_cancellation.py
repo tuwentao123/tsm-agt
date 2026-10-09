@@ -58,7 +58,7 @@ async def _state_changes(app, task_id: str):
 
 class CancelCommandTest(unittest.IsolatedAsyncioTestCase):
     async def _app(self):
-        app = compose_fixture_application(tool_adapters=())
+        app = compose_legacy_fixture_application(tool_adapters=())
         await app.registry.start_all()
         return app
 
@@ -148,7 +148,7 @@ class CancelCommandTest(unittest.IsolatedAsyncioTestCase):
 class InterruptIntentTest(unittest.IsolatedAsyncioTestCase):
     async def test_interrupt_records_interrupt_intent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(tool_adapters=())
+            app = compose_legacy_fixture_application(tool_adapters=())
             await app.registry.start_all()
             try:
                 task = await _executing_task(app, Path(directory), "interrupt-intent")
@@ -189,7 +189,7 @@ class InterruptingReconciliationTest(unittest.IsolatedAsyncioTestCase):
         )
         for intent, expected in cases:
             with self.subTest(intent=intent), tempfile.TemporaryDirectory() as directory:
-                app = compose_fixture_application(tool_adapters=())
+                app = compose_legacy_fixture_application(tool_adapters=())
                 await app.registry.start_all()
                 try:
                     task = await self._interrupting(
@@ -207,7 +207,7 @@ class InterruptingReconciliationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_reconciliation_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(tool_adapters=())
+            app = compose_legacy_fixture_application(tool_adapters=())
             await app.registry.start_all()
             try:
                 task = await self._interrupting(
@@ -227,7 +227,7 @@ class CancellationMetricsTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_increments_requested_metric(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(tool_adapters=())
+            app = compose_legacy_fixture_application(tool_adapters=())
             await app.registry.start_all()
             try:
                 task = await _executing_task(app, Path(directory), "metric-cancel")
@@ -243,7 +243,7 @@ class CancellationMetricsTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_reconcile_increments_settled_metric(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(tool_adapters=())
+            app = compose_legacy_fixture_application(tool_adapters=())
             await app.registry.start_all()
             try:
                 task = await _executing_task(app, Path(directory), "metric-settle")
@@ -265,7 +265,7 @@ class PendingBatchCancelTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_settles_unstarted_batch_calls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(tool_adapters=())
+            app = compose_legacy_fixture_application(tool_adapters=())
             await app.registry.start_all()
             try:
                 task = await _executing_task(app, Path(directory), "cancel-batch")
@@ -335,7 +335,7 @@ class CancelInteractionMatrixTest(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_while_awaiting_approval(self) -> None:
         """§12 #4: cancelling during AWAITING_APPROVAL settles the Task."""
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(tool_adapters=())
+            app = compose_legacy_fixture_application(tool_adapters=())
             await app.registry.start_all()
             try:
                 task = await _executing_task(app, Path(directory), "cancel-approval")
@@ -363,7 +363,7 @@ class CancelInteractionMatrixTest(unittest.IsolatedAsyncioTestCase):
     async def test_budget_exhaustion_never_cancels(self) -> None:
         """§12 #11: a spent budget is not a cancel."""
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=_ToolCallingModel(), tool_adapters=(),
             )
             await app.registry.start_all()
@@ -384,7 +384,7 @@ class ScopeWiringTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_terminal_transition_closes_task_scope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(tool_adapters=())
+            app = compose_legacy_fixture_application(tool_adapters=())
             await app.registry.start_all()
             try:
                 task = await _executing_task(app, Path(directory), "scope-close")
@@ -406,7 +406,7 @@ class ScopeWiringTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_scope_metrics_track_open_and_close(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(tool_adapters=())
+            app = compose_legacy_fixture_application(tool_adapters=())
             await app.registry.start_all()
             try:
                 task = await _executing_task(app, Path(directory), "scope-metric")
@@ -458,7 +458,7 @@ class CancellationSignalTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_requested_tracks_durable_cancel(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(tool_adapters=())
+            app = compose_legacy_fixture_application(tool_adapters=())
             await app.registry.start_all()
             try:
                 task = await _executing_task(app, Path(directory), "signal-read")
@@ -473,7 +473,7 @@ class CancellationSignalTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_request_writes_durable_cancel(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(tool_adapters=())
+            app = compose_legacy_fixture_application(tool_adapters=())
             await app.registry.start_all()
             try:
                 task = await _executing_task(app, Path(directory), "signal-write")
@@ -494,3 +494,11 @@ class CancellationSignalTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from tsm_agt.core.single_loop import OrchestrationMode
+
+
+def compose_legacy_fixture_application(*args, **kwargs):
+    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
+    return compose_fixture_application(*args, **kwargs)

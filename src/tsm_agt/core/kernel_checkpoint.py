@@ -377,6 +377,7 @@ class CheckpointMixin:
                 "project-instructions-context-", "task-spec-context-",
                 "project-onboarding-context-", "project-memory-context-",
                 "session-context-", "document-references-context-", "working-memory-context-",
+                "task-contract-context-",
             )
             messages = [
                 message for message in messages
@@ -607,7 +608,7 @@ class CheckpointMixin:
         generated_prefixes = (
             "project-instructions-context-", "task-spec-context-",
             "project-onboarding-context-", "project-memory-context-",
-            "session-context-", "working-memory-context-",
+            "session-context-", "working-memory-context-", "task-contract-context-",
         )
         messages = tuple(
             message for message in checkpoint.messages

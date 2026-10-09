@@ -666,10 +666,18 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                 events = await app.kernel.dependencies.store.read_session_events(
                     session.session_id
                 )
-                resolved = events[-1]
-                self.assertEqual(resolved.event_type, "session.input_resolved")
+                resolved = next(
+                    event
+                    for event in reversed(events)
+                    if event.event_type == "session.input_resolved"
+                )
                 self.assertNotIn("any ordinary input", str(resolved.payload))
                 self.assertIn("text_hash", resolved.payload)
+                self.assertEqual(resolved.payload["orchestration_mode"], "LEGACY")
+                self.assertTrue(
+                    resolved.payload["current_input_ref"].startswith("input:")
+                )
+                self.assertEqual(resolved.payload["prompt_projection_hash"], "")
             finally:
                 await app.registry.stop_all()
 
@@ -846,6 +854,58 @@ class SessionAnswerTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     decision.reason_code,
                     "answer_route_overridden_needs_live_information",
+                )
+            finally:
+                await app.registry.stop_all()
+
+    async def test_workspace_mutation_request_is_never_answered_without_tools(self):
+        resolver = FixtureResolver({
+            "disposition": "ANSWER",
+            "relation": "INDEPENDENT",
+            "source_task_id": None,
+            "input_grounding": "SELF_CONTAINED",
+            "confidence": 0.96,
+            "reason_code": "self_contained_repeat_of_prior_goal_answered",
+            "clarification": None,
+            "candidate_task_ids": [],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            app = compose_fixture_application(
+                model_adapter=EchoModelProvider(), tool_adapters=(),
+                session_input_resolver_adapter=resolver,
+            )
+            await app.registry.start_all()
+            try:
+                session = await app.kernel.create_session("workspace mutation")
+                history = await app.kernel.create_task(
+                    "earlier work", Path(directory),
+                    session_id=session.session_id,
+                )
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
+                    TaskState.EXECUTING, TaskState.VERIFYING,
+                    TaskState.FINALIZING, TaskState.SUCCEEDED,
+                ):
+                    history = await app.kernel.transition_task(
+                        history.task_id, state, state.value
+                    )
+
+                decision = await app.kernel.resolve_session_input(
+                    session.session_id,
+                    "cancel按钮调整到输入框左上方，按钮改小一点",
+                    Path(directory),
+                )
+
+                self.assertIs(
+                    decision.disposition, SessionRouteDisposition.CREATE_TASK
+                )
+                self.assertIs(
+                    decision.relation, SessionTaskRelation.INDEPENDENT
+                )
+                self.assertEqual(
+                    decision.reason_code,
+                    "answer_route_overridden_workspace_mutation",
                 )
             finally:
                 await app.registry.stop_all()

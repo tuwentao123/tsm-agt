@@ -132,7 +132,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         """An old completed-unit boundary uses the normal safe rebase path."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            application = compose_fixture_application(
+            application = compose_legacy_fixture_application(
                 model_adapter=EchoModelProvider(), tool_adapters=(),
             )
             await application.registry.start_all()
@@ -230,7 +230,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         database = root / "runtime.db"
         first_model = RestartableToolModel(block_after_tool=True)
         first_tool = CountingEchoTool()
-        first = compose_fixture_application(
+        first = compose_legacy_fixture_application(
             model_adapter=first_model, tool_adapters=(first_tool,),
             store_adapter=SQLiteRuntimeStore(database),
         )
@@ -250,7 +250,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
 
         second_model = RestartableToolModel()
         second_tool = CountingEchoTool()
-        second = compose_fixture_application(
+        second = compose_legacy_fixture_application(
             model_adapter=second_model, tool_adapters=(second_tool,),
             store_adapter=SQLiteRuntimeStore(database),
         )
@@ -281,7 +281,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         database = root / "runtime.db"
         first_model = EvidenceCheckpointModel(block_after_tool=True)
         first_tool = CountingEchoTool()
-        first = compose_fixture_application(
+        first = compose_legacy_fixture_application(
             model_adapter=first_model, tool_adapters=(first_tool,),
             store_adapter=SQLiteRuntimeStore(database),
             require_evidence_questions=True,
@@ -335,7 +335,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
 
         second_model = EvidenceCheckpointModel()
         second_tool = CountingEchoTool()
-        second = compose_fixture_application(
+        second = compose_legacy_fixture_application(
             model_adapter=second_model, tool_adapters=(second_tool,),
             store_adapter=SQLiteRuntimeStore(database),
             require_evidence_questions=True,
@@ -394,7 +394,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         root = Path(temporary.name)
         database = root / "runtime.db"
         first_model = RestartableToolModel(block_after_tool=True)
-        first = compose_fixture_application(
+        first = compose_legacy_fixture_application(
             model_adapter=first_model, tool_adapters=(CountingEchoTool(),),
             store_adapter=SQLiteRuntimeStore(database),
         )
@@ -456,7 +456,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("pending_tool_calls", suspended_encoded)
         await first.registry.stop_all()
 
-        restarted = compose_fixture_application(
+        restarted = compose_legacy_fixture_application(
             model_adapter=RestartableToolModel(),
             tool_adapters=(CountingEchoTool(),),
             store_adapter=SQLiteRuntimeStore(database),
@@ -483,7 +483,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         root = Path(temporary.name)
         database = root / "runtime.db"
         first_model = RestartableToolModel(block_first=True)
-        first = compose_fixture_application(
+        first = compose_legacy_fixture_application(
             model_adapter=first_model, store_adapter=SQLiteRuntimeStore(database),
         )
         await first.registry.start_all()
@@ -497,7 +497,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
             await running
         await first.registry.stop_all()
 
-        second = compose_fixture_application(
+        second = compose_legacy_fixture_application(
             model_adapter=RestartableToolModel(),
             store_adapter=SQLiteRuntimeStore(database),
         )
@@ -515,7 +515,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         root = Path(temporary.name)
         database = root / "runtime.db"
         first_model = RestartableToolModel(block_first=True)
-        first = compose_fixture_application(
+        first = compose_legacy_fixture_application(
             model_adapter=first_model, store_adapter=SQLiteRuntimeStore(database),
         )
         await first.registry.start_all()
@@ -543,7 +543,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(stranded.active_agent_checkpoint)
         await first.registry.stop_all()
 
-        second = compose_fixture_application(
+        second = compose_legacy_fixture_application(
             model_adapter=RestartableToolModel(),
             store_adapter=SQLiteRuntimeStore(database),
         )
@@ -568,7 +568,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = RestartableToolModel(block_first=True)
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=model, tool_adapters=()
             )
             await app.registry.start_all()
@@ -623,7 +623,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
     async def test_multiple_interrupted_tasks_require_explicit_selection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=RestartableToolModel(), tool_adapters=()
             )
             await app.registry.start_all()
@@ -680,7 +680,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         root = Path(temporary.name)
         database = root / "runtime.db"
         first_model = RestartableToolModel(block_first=True)
-        first = compose_fixture_application(
+        first = compose_legacy_fixture_application(
             model_adapter=first_model, tool_adapters=(),
             store_adapter=SQLiteRuntimeStore(database),
         )
@@ -698,7 +698,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
             task.session_id, root
         )
         await first.registry.stop_all()
-        second = compose_fixture_application(
+        second = compose_legacy_fixture_application(
             model_adapter=RestartableToolModel(), tool_adapters=(),
             store_adapter=SQLiteRuntimeStore(database),
         )
@@ -718,7 +718,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         root = Path(temporary.name)
         database = root / "runtime.db"
         first_model = RestartableToolModel(block_first=True)
-        first = compose_fixture_application(
+        first = compose_legacy_fixture_application(
             model_adapter=first_model, tool_adapters=(),
             store_adapter=SQLiteRuntimeStore(database),
         )
@@ -734,7 +734,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         await first.kernel.interrupt_agent_turn(task.task_id, "runtime upgrade")
         await first.registry.stop_all()
 
-        second = compose_fixture_application(
+        second = compose_legacy_fixture_application(
             model_adapter=UpgradedRestartableModel(), tool_adapters=(),
             store_adapter=SQLiteRuntimeStore(database),
         )
@@ -779,7 +779,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         root = Path(temporary.name)
         database = root / "runtime.db"
         model = RestartableToolModel(block_first=True)
-        first = compose_fixture_application(
+        first = compose_legacy_fixture_application(
             model_adapter=model, store_adapter=SQLiteRuntimeStore(database),
         )
         await first.registry.start_all()
@@ -792,7 +792,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         await first.registry.stop_all()
         (root / "package.json").write_text('{"changed":true}', encoding="utf-8")
 
-        second = compose_fixture_application(
+        second = compose_legacy_fixture_application(
             model_adapter=RestartableToolModel(),
             store_adapter=SQLiteRuntimeStore(database),
         )
@@ -938,3 +938,11 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from tsm_agt.core.single_loop import OrchestrationMode
+
+
+def compose_legacy_fixture_application(*args, **kwargs):
+    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
+    return compose_fixture_application(*args, **kwargs)

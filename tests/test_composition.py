@@ -10,6 +10,7 @@ from unittest.mock import patch
 from tsm_agt.adapters.anthropic_messages import AnthropicMessagesModelProvider
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import (
+    OrchestrationConfiguration,
     compose_local_flow_query_application,
     compose_openai_compatible_engineering_application,
     compose_fixture_application,
@@ -23,6 +24,7 @@ from tsm_agt.bootstrap.exploration_configuration import (
 from tsm_agt.core import (
     ApprovalDecision, ApprovalRequired, ProjectTrustLevel, TaskState,
 )
+from tsm_agt.core.single_loop import OrchestrationMode
 from tsm_agt.ports import (
     CrossProcessLockPort,
     EvidenceDeltaEvaluatorPort,
@@ -110,7 +112,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 application.registry.all(RuntimeInputClassifierPort), ()
             )
-            self.assertEqual(len(application.registry.all(ToolProviderPort)), 1)
+            self.assertEqual(len(application.registry.all(ToolProviderPort)), 2)
             for port in (
                 ModelProviderPort,
                 ProcessExecutorPort,
@@ -120,9 +122,11 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                 WorkspaceFilesystemPort,
                 WorkspacePathPort,
                 LocalIdentityPort,
-                ToolProviderPort,
             ):
                 health = await application.registry.require(port).health()
+                self.assertEqual(health.state, "healthy")
+            for provider in application.registry.all(ToolProviderPort):
+                health = await provider.health()
                 self.assertEqual(health.state, "healthy")
         finally:
             await application.registry.stop_all()
@@ -143,8 +147,12 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [tool.name for tool in await application.kernel.list_tools()],
                 [
-                    "core.list_files", "core.find_files",
+                    "core.list_files", "core.search_files",
+                    "core.find_files",
                     "core.read_file", "core.search_text", "core.grep_search",
+                    "core.turn_intent",
+                    "runtime.inspect_task", "runtime.list_task_events",
+                    "runtime.inspect_session", "runtime.search_history",
                 ],
             )
         finally:
@@ -211,13 +219,17 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [tool.name for tool in await application.kernel.list_tools()],
                 [
-                    "core.list_files", "core.find_files",
+                    "core.list_files", "core.search_files",
+                    "core.find_files",
                     "core.read_file", "core.search_text", "core.grep_search",
-                    "web.search", "web.fetch_markdown", "content.summarize",
+                    "runtime.inspect_task", "runtime.list_task_events",
+                    "runtime.inspect_session", "runtime.search_history",
+                    "web.search", "web.fetch_markdown", "web.open",
+                    "web.find_in_page", "source.github.resolve", "content.summarize",
                     "core.run_command",
                     "core.process_status", "core.process_logs",
                     "core.process_stop", "core.apply_patch",
-                    "core.apply_patches", "core.delete_file",
+                    "core.apply_patch_v4a", "core.apply_patches", "core.delete_file",
                     "core.rollback_mutation",
                     "core.rollback_mutations",
                     "core.rollback_mutation_batch",
@@ -225,7 +237,8 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                     "core.memory_list", "core.memory_remember",
                     "core.memory_verify", "core.memory_forget",
                     "core.working_memory_read",
-                    "core.working_memory_update",
+                    "core.working_memory_update", "core.todo_list",
+                    "core.turn_intent",
                     "core.task_spec_read",
                     "core.task_spec_update",
                     "code.symbol_overview", "code.definition",
@@ -591,7 +604,114 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                 metadata["sources"]["exploration_budget.max_tool_calls"],
                 "env_file",
             )
+    def test_fixture_defaults_to_single_loop_orchestration(self) -> None:
+        application = compose_fixture_application()
+
+        self.assertEqual(
+            application.kernel.dependencies.orchestration_mode,
+            OrchestrationMode.SINGLE_LOOP,
+        )
+
+    def test_fixture_can_select_legacy_orchestration(self) -> None:
+        application = compose_fixture_application(
+            orchestration_mode=OrchestrationMode.LEGACY
+        )
+
+        self.assertEqual(
+            application.kernel.dependencies.orchestration_mode,
+            OrchestrationMode.LEGACY,
+        )
+
+    def test_fixture_can_select_single_loop_orchestration(self) -> None:
+        application = compose_fixture_application(
+            orchestration_mode=OrchestrationMode.SINGLE_LOOP
+        )
+
+        self.assertEqual(
+            application.kernel.dependencies.orchestration_mode,
+            OrchestrationMode.SINGLE_LOOP,
+        )
+        self.assertEqual(
+            application.kernel.dependencies.configuration_metadata[
+                "orchestration"
+            ],
+            {
+                "mode": "single_loop",
+                "single_loop_allow_fallback": False,
+            },
+        )
+
+    def test_orchestration_configuration_rejects_fallback(self) -> None:
+        self.assertEqual(
+            OrchestrationConfiguration(mode="single_loop").mode,
+            OrchestrationMode.SINGLE_LOOP,
+        )
+        with self.assertRaisesRegex(ValueError, "must be false"):
+            OrchestrationConfiguration(single_loop_allow_fallback=True)
+
+    async def test_env_orchestration_configuration_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text(
+                "TSM_AGT_MODEL_BASE_URL=https://models.example.test/v1\n"
+                "TSM_AGT_MODEL=open\n"
+                "TSM_AGT_OPEN_MODEL=test-model\n"
+                "TSM_AGT_MODEL_API_KEY=test-secret\n"
+                "TSM_AGT_ORCHESTRATION_MODE=single_loop\n"
+                "TSM_AGT_SINGLE_LOOP_ALLOW_FALLBACK=false\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                application = compose_openai_compatible_engineering_application_from_env(
+                    env_file
+                )
+
+        self.assertEqual(
+            application.kernel.dependencies.orchestration_mode,
+            OrchestrationMode.SINGLE_LOOP,
+        )
+        self.assertEqual(
+            application.kernel.dependencies.configuration_metadata[
+                "sources"
+            ]["orchestration.mode"],
+            "env_file",
+        )
+        self.assertEqual(
+            application.kernel.dependencies.configuration_metadata[
+                "sources"
+            ]["orchestration.single_loop_allow_fallback"],
+            "env_file",
+        )
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrchestrationEnvironmentOverrideTest(unittest.TestCase):
+    def test_explicit_legacy_environment_overrides_single_loop_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text(
+                "TSM_AGT_MODEL_BASE_URL=https://models.example.test/v1\n"
+                "TSM_AGT_MODEL=open\n"
+                "TSM_AGT_OPEN_MODEL=test-model\n"
+                "TSM_AGT_MODEL_API_KEY=test-secret\n"
+                "TSM_AGT_ORCHESTRATION_MODE=legacy\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                application = compose_openai_compatible_engineering_application_from_env(
+                    env_file
+                )
+
+        self.assertEqual(
+            application.kernel.dependencies.orchestration_mode,
+            OrchestrationMode.LEGACY,
+        )
+        self.assertEqual(
+            application.kernel.dependencies.configuration_metadata["sources"][
+                "orchestration.mode"
+            ],
+            "env_file",
+        )

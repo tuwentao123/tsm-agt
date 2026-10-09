@@ -14,6 +14,7 @@ from tsm_agt.adapters.builtin.network_tools import (
     FetchResponse, _BingNewsRssProvider, _DuckDuckGoLiteProvider,
     _RssNewsProvider, _TavilyProvider, _WikipediaProvider,
 )
+from tsm_agt.retrieval.schemas import RetrievalResult, RetrievalSearchResponse
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import CoreToolPolicy, PolicyAction, ProjectTrustLevel, TaskState
 from tsm_agt.ports import (
@@ -57,7 +58,10 @@ class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
         tools = await self.provider.list_tools()
         self.assertEqual(
             [tool.name for tool in tools],
-            ["web.search", "web.fetch_markdown", "content.summarize"],
+            [
+                "web.search", "web.fetch_markdown", "web.open",
+                "web.find_in_page", "source.github.resolve", "content.summarize",
+            ],
         )
         fetch = tools[1]
         self.assertTrue(fetch.requires_network)
@@ -90,6 +94,9 @@ class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.data["content"], "# Spec\\n\\n- Keep this Markdown intact.\\n")
         self.assertEqual(result.data["content_type"], "text/markdown")
         self.assertEqual(transport.calls, ["https://docs.example.test/spec.md"])
+        fact, = result.evidence_facts
+        self.assertEqual(fact.kind, "web.document")
+        self.assertTrue(fact.complete)
         self.assertTrue(result.meta["untrusted_data"])
 
     async def test_fetch_converts_html_without_script_or_style_content(self):
@@ -815,3 +822,339 @@ class PageRenderingTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.data["rendered_by"], "")
         self.assertIn("Plenty of real text.", result.data["content"])
+
+
+class WebOpenAndFindTest(unittest.IsolatedAsyncioTestCase):
+    URL = "https://docs.example.test/spec.md"
+
+    @staticmethod
+    def _context(task_id: str, turn_id: str):
+        return type("_Context", (), {"task_id": task_id, "turn_id": turn_id})()
+
+    async def _provider(self, responses, **kwargs):
+        provider = NetworkToolProvider(
+            fetch_transport=_FakeFetchTransport(responses),
+            address_resolver=_public_resolver,
+            **kwargs,
+        )
+        await provider.start(AdapterContext({}, lambda *_: None))
+        self.addAsyncCleanup(provider.stop, datetime.now(timezone.utc))
+        return provider
+
+    async def test_open_from_search_ref_reuses_bounded_fetch_and_returns_provenance(self):
+        provider = await self._provider({
+            self.URL: FetchResponse(
+                200, self.URL, {"Content-Type": "text/markdown"},
+                b"# Spec\n\nSearchable content.\n",
+            ),
+        })
+        context = self._context("task-a", "turn-a")
+        ref_id = provider._store_reference(("task-a", "turn-a"), self.URL)
+
+        result = await provider.invoke(
+            ToolCall("open-ref", "web.open", {"ref_id": ref_id}), context,
+        )
+
+        self.assertTrue(result.ok, result.to_data())
+        self.assertEqual(result.data["canonical_url"], self.URL)
+        self.assertTrue(result.data["document_ref"].startswith("webdoc:"))
+        self.assertTrue(result.data["content_hash"].startswith("sha256:"))
+        self.assertEqual(len(result.data["content_hash"]), 71)
+        self.assertEqual(result.data["redirect_chain"], [self.URL])
+        self.assertTrue(result.data["fetched_at"])
+        self.assertEqual(result.data["provenance"]["source"], "web.fetch_markdown")
+        self.assertEqual(result.fact_descriptor.authority, "external_web_document")
+        self.assertEqual(result.fact_descriptor.scope, ("task:task-a", "turn:turn-a"))
+
+    async def test_find_only_reads_the_opened_document_and_bounds_matches(self):
+        provider = await self._provider({
+            self.URL: FetchResponse(
+                200, self.URL, {"Content-Type": "text/plain"},
+                b"Alpha one\nalpha two\nalpha three\n",
+            ),
+        })
+        context = self._context("task-a", "turn-a")
+        opened = await provider.invoke(
+            ToolCall("open-url", "web.open", {"url": self.URL}), context,
+        )
+        self.assertTrue(opened.ok, opened.to_data())
+
+        found = await provider.invoke(
+            ToolCall("find", "web.find_in_page", {
+                "document_ref": opened.data["document_ref"],
+                "pattern": "alpha",
+                "max_matches": 2,
+            }), context,
+        )
+
+        self.assertTrue(found.ok, found.to_data())
+        self.assertEqual(found.data["match_count"], 3)
+        self.assertEqual(found.data["returned_count"], 2)
+        self.assertTrue(found.data["truncated"])
+        self.assertEqual([item["line"] for item in found.data["matches"]], [1, 2])
+        self.assertEqual([item["ordinal"] for item in found.data["matches"]], [1, 2])
+        self.assertEqual([item["offset"] for item in found.data["matches"]], [0, 10])
+        self.assertEqual([item["snippet"] for item in found.data["matches"]], [
+            "Alpha one", "alpha two",
+        ])
+        self.assertEqual(provider._fetch_transport.calls, [self.URL])
+        self.assertEqual(found.data["content_hash"], opened.data["content_hash"])
+        self.assertEqual(found.fact_descriptor.artifact_refs[0], opened.data["document_ref"])
+
+    async def test_refs_and_documents_do_not_cross_task_or_turn_scopes(self):
+        provider = await self._provider({
+            self.URL: FetchResponse(
+                200, self.URL, {"Content-Type": "text/plain"}, b"isolated\n",
+            ),
+        })
+        first_context = self._context("task-a", "turn-a")
+        second_context = self._context("task-a", "turn-b")
+        ref_id = provider._store_reference(("task-a", "turn-a"), self.URL)
+        opened = await provider.invoke(
+            ToolCall("open", "web.open", {"ref_id": ref_id}), first_context,
+        )
+        self.assertTrue(opened.ok, opened.to_data())
+
+        wrong_ref = await provider.invoke(
+            ToolCall("open-other", "web.open", {"ref_id": ref_id}), second_context,
+        )
+        wrong_document = await provider.invoke(
+            ToolCall("find-other", "web.find_in_page", {
+                "document_ref": opened.data["document_ref"], "pattern": "isolated",
+            }), second_context,
+        )
+
+        self.assertFalse(wrong_ref.ok)
+        self.assertEqual(wrong_ref.error_code, "SEARCH_REF_NOT_FOUND")
+        self.assertFalse(wrong_document.ok)
+        self.assertEqual(wrong_document.error_code, "DOCUMENT_REF_NOT_FOUND")
+
+    async def test_document_cache_evicts_by_entry_bound_and_stop_clears_state(self):
+        first = "https://docs.example.test/first"
+        second = "https://docs.example.test/second"
+        provider = await self._provider({
+            first: FetchResponse(200, first, {"Content-Type": "text/plain"}, b"first"),
+            second: FetchResponse(200, second, {"Content-Type": "text/plain"}, b"second"),
+        }, document_cache_max_entries=1)
+        context = self._context("task-a", "turn-a")
+        opened_first = await provider.invoke(
+            ToolCall("open-first", "web.open", {"url": first}), context,
+        )
+        await provider.invoke(ToolCall("open-second", "web.open", {"url": second}), context)
+        evicted = await provider.invoke(
+            ToolCall("find-first", "web.find_in_page", {
+                "document_ref": opened_first.data["document_ref"], "pattern": "first",
+            }), context,
+        )
+
+        self.assertFalse(evicted.ok)
+        self.assertEqual(evicted.error_code, "DOCUMENT_REF_NOT_FOUND")
+        await provider.stop(datetime.now(timezone.utc))
+        self.assertEqual(provider._document_cache, {})
+        self.assertEqual(provider._reference_cache, {})
+
+    async def test_document_cache_ttl_expires_without_a_network_refetch(self):
+        provider = await self._provider({
+            self.URL: FetchResponse(
+                200, self.URL, {"Content-Type": "text/plain"}, b"expired",
+            ),
+        }, document_cache_ttl_seconds=0.5)
+        context = self._context("task-a", "turn-a")
+        opened = await provider.invoke(
+            ToolCall("open", "web.open", {"url": self.URL}), context,
+        )
+        key = (("task-a", "turn-a"), opened.data["document_ref"])
+        object.__setattr__(provider._document_cache[key], "stored_at", 0.0)
+        expired = await provider.invoke(
+            ToolCall("find", "web.find_in_page", {
+                "document_ref": opened.data["document_ref"],
+                "pattern": "expired",
+            }), context,
+        )
+
+        self.assertTrue(opened.ok, opened.to_data())
+        self.assertFalse(expired.ok)
+        self.assertEqual(expired.error_code, "DOCUMENT_REF_NOT_FOUND")
+        self.assertEqual(provider._fetch_transport.calls, [self.URL])
+
+    async def test_search_results_receive_stable_scoped_refs(self):
+        provider = await self._provider({})
+        provider._pipeline.search = Mock(return_value=RetrievalSearchResponse(
+            query="spec", provider="fixture", telemetry=[], cache_hit=False,
+            results=[RetrievalResult(
+                title="Spec", url=self.URL, snippet="result", provider="fixture",
+            )],
+        ))
+        context = self._context("task-a", "turn-a")
+        first = await provider.invoke(
+            ToolCall("search-1", "web.search", {"query": "spec"}), context,
+        )
+        second = await provider.invoke(
+            ToolCall("search-2", "web.search", {"query": "spec"}), context,
+        )
+
+        self.assertTrue(first.ok, first.to_data())
+        self.assertEqual(
+            first.data["results"][0]["ref_id"], second.data["results"][0]["ref_id"],
+        )
+
+
+class GitHubSourceResolveTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _context(task_id: str, turn_id: str):
+        return type("_Context", (), {"task_id": task_id, "turn_id": turn_id})()
+
+    async def _provider(self, **kwargs):
+        provider = NetworkToolProvider(
+            fetch_transport=_FakeFetchTransport({}),
+            address_resolver=_public_resolver,
+            **kwargs,
+        )
+        await provider.start(AdapterContext({}, lambda *_: None))
+        self.addAsyncCleanup(provider.stop, datetime.now(timezone.utc))
+        return provider
+
+    async def test_resolves_supported_github_urls_to_canonical_targets(self):
+        provider = await self._provider()
+        context = self._context("task-a", "turn-a")
+        cases = [
+            (
+                "https://github.com/owner/repo/",
+                "repository", None, None, None,
+                "source.github.list_tree", {"repo": "owner/repo", "ref": "HEAD"},
+            ),
+            (
+                "https://github.com/owner/repo/blob/" + "A" * 40 + "/src/a.py",
+                "blob", "a" * 40, "src/a.py", None,
+                "source.github.get_file",
+                {"repo": "owner/repo", "ref": "a" * 40, "path": "src/a.py"},
+            ),
+            (
+                "https://github.com/owner/repo/tree/main/src",
+                "tree", "main", "src", None,
+                "source.github.list_tree",
+                {"repo": "owner/repo", "ref": "main", "path": "src"},
+            ),
+            (
+                "https://github.com/owner/repo/issues/42",
+                "issue", None, None, 42, "source.github.get_issue",
+                {"repo": "owner/repo", "number": 42},
+            ),
+            (
+                "https://github.com/owner/repo/pull/7",
+                "pull", None, None, 7, "source.github.get_pull_request",
+                {"repo": "owner/repo", "number": 7},
+            ),
+        ]
+
+        for index, (
+            url, kind, ref, path, number, target_tool, target_arguments,
+        ) in enumerate(cases):
+            with self.subTest(url=url):
+                result = await provider.invoke(
+                    ToolCall(f"resolve-{index}", "source.github.resolve", {"url": url}),
+                    context,
+                )
+                self.assertTrue(result.ok, result.to_data())
+                self.assertEqual(result.data["repo"], "owner/repo")
+                self.assertEqual(result.data["kind"], kind)
+                self.assertEqual(result.data["ref"], ref)
+                self.assertEqual(result.data["path"], path)
+                self.assertEqual(result.data["number"], number)
+                self.assertEqual(result.data["target_tool"], target_tool)
+                self.assertEqual(result.data["target_arguments"], target_arguments)
+                self.assertEqual(
+                    result.data["ref_is_pinned"], bool(ref and len(ref) == 40)
+                )
+                self.assertEqual(
+                    result.data["provenance"]["source"], "source.github.resolve"
+                )
+                self.assertFalse(result.data["provenance"]["network_egress"])
+                self.assertEqual(
+                    result.fact_descriptor.authority, "derived_github_url"
+                )
+                self.assertEqual(
+                    result.fact_descriptor.scope[:2],
+                    ("task:task-a", "turn:turn-a"),
+                )
+                self.assertEqual(
+                    result.fact_descriptor.artifact_refs,
+                    (result.data["canonical_url"],),
+                )
+
+        self.assertEqual(provider._fetch_transport.calls, [])
+
+    async def test_search_ref_uses_current_scope_and_ttl_without_egress(self):
+        provider = await self._provider(document_cache_ttl_seconds=0.5)
+        url = "https://github.com/owner/repo/blob/main/src/a.py"
+        first_context = self._context("task-a", "turn-a")
+        ref_id = provider._store_reference(("task-a", "turn-a"), url)
+
+        resolved = await provider.invoke(
+            ToolCall("resolve-ref", "source.github.resolve", {"search_ref": ref_id}),
+            first_context,
+        )
+        wrong_scope = await provider.invoke(
+            ToolCall("resolve-other", "source.github.resolve", {"search_ref": ref_id}),
+            self._context("task-a", "turn-b"),
+        )
+        key = (("task-a", "turn-a"), ref_id)
+        object.__setattr__(provider._reference_cache[key], "stored_at", 0.0)
+        expired = await provider.invoke(
+            ToolCall("resolve-expired", "source.github.resolve", {"search_ref": ref_id}),
+            first_context,
+        )
+
+        self.assertTrue(resolved.ok, resolved.to_data())
+        self.assertEqual(resolved.data["provenance"]["input_kind"], "search_ref")
+        self.assertEqual(resolved.data["provenance"]["search_ref"], ref_id)
+        self.assertFalse(wrong_scope.ok)
+        self.assertEqual(wrong_scope.error_code, "SEARCH_REF_NOT_FOUND")
+        self.assertFalse(expired.ok)
+        self.assertEqual(expired.error_code, "SEARCH_REF_NOT_FOUND")
+        self.assertEqual(provider._fetch_transport.calls, [])
+
+    async def test_rejects_invalid_urls_and_never_egresses(self):
+        provider = await self._provider()
+        context = self._context("task-a", "turn-a")
+        invalid_urls = [
+            "http://github.com/owner/repo",
+            "https://evil.example/owner/repo",
+            "https://user@github.com/owner/repo",
+            "https://github.com:443/owner/repo",
+            "https://github.com/owner/repo?tab=readme",
+            "https://github.com/owner/repo#readme",
+            "https://github.com/owner/repo/blob/main/%2e%2e/secret.py",
+            "https://github.com/owner/../repo",
+            "https://github.com/owner/repo/blob/main",
+            "https://github.com/owner/repo/commit/abc",
+        ]
+        with patch("tsm_agt.adapters.builtin.network_tools.urlopen", side_effect=AssertionError):
+            for index, url in enumerate(invalid_urls):
+                with self.subTest(url=url):
+                    result = await provider.invoke(
+                        ToolCall(f"bad-{index}", "source.github.resolve", {"url": url}),
+                        context,
+                    )
+                    self.assertFalse(result.ok)
+                    self.assertEqual(result.error_code, "INVALID_GITHUB_URL")
+            ambiguous = await provider.invoke(
+                ToolCall(
+                    "ambiguous", "source.github.resolve",
+                    {"url": "https://github.com/owner/repo/tree/refs/heads/main"},
+                ),
+                context,
+            )
+            both = await provider.invoke(
+                ToolCall(
+                    "both", "source.github.resolve",
+                    {"url": "https://github.com/owner/repo", "search_ref": "search:x"},
+                ),
+                context,
+            )
+
+        self.assertFalse(ambiguous.ok)
+        self.assertEqual(ambiguous.error_code, "AMBIGUOUS_GITHUB_REF_PATH")
+        self.assertFalse(both.ok)
+        self.assertEqual(both.error_code, "INVALID_PARAM")
+        self.assertEqual(provider._fetch_transport.calls, [])

@@ -42,6 +42,7 @@ from tsm_agt.core.kernel import (
 # follows the definition; a *patch target* follows wherever the moved body reads
 # it from (Hermes AGENTS.md:244-245).
 from tsm_agt.core.kernel_task import _runtime_authored_criteria
+from tsm_agt.core.single_loop import OrchestrationMode
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus,
     SandboxDecision, SandboxRequest, ToolCall, ToolEffect, ToolIdempotency,
@@ -264,11 +265,15 @@ class DeliveryCriterionAuthoringTest(unittest.IsolatedAsyncioTestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         app = compose_fixture_application(
-            task_spec_planner_adapter=_Planner(proposal), **kwargs
+            task_spec_planner_adapter=_Planner(proposal),
+            orchestration_mode=OrchestrationMode.LEGACY,
+            **kwargs,
         )
         await app.registry.start_all()
         self.addAsyncCleanup(app.registry.stop_all)
-        task = await _executing_task(app, Path(temporary.name), task_id)
+        task = await _executing_task(
+            app, Path(temporary.name), task_id, goal=str(proposal["goal"])
+        )
         spec = await app.kernel.plan_task_spec(task.task_id)
         return app, task, spec
 

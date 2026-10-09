@@ -89,7 +89,7 @@ class ClarificationProtocolTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_pauses_and_resumes_same_turn_with_bound_answer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            application = compose_fixture_application(
+            application = compose_legacy_fixture_application(
                 model_adapter=ClarifyingModel(), tool_adapters=()
             )
             await application.registry.start_all()
@@ -146,7 +146,7 @@ class ClarificationProtocolTest(unittest.IsolatedAsyncioTestCase):
     async def test_answered_interaction_binds_no_evidence_question(self) -> None:
         """A clarification answer ends the turn; it is not durable evidence."""
         with tempfile.TemporaryDirectory() as directory:
-            application = compose_fixture_application(
+            application = compose_legacy_fixture_application(
                 model_adapter=ClarifyingModel(), tool_adapters=(),
                 require_evidence_questions=True,
             )
@@ -178,7 +178,7 @@ class ClarificationProtocolTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = root / "runtime.db"
-            first = compose_fixture_application(
+            first = compose_legacy_fixture_application(
                 model_adapter=ClarifyingModel(), tool_adapters=(),
                 store_adapter=SQLiteRuntimeStore(database),
             )
@@ -188,7 +188,7 @@ class ClarificationProtocolTest(unittest.IsolatedAsyncioTestCase):
             assert isinstance(suspended, AgentClarificationSuspended)
             await first.registry.stop_all()
 
-            second = compose_fixture_application(
+            second = compose_legacy_fixture_application(
                 model_adapter=ClarifyingModel(), tool_adapters=(),
                 store_adapter=SQLiteRuntimeStore(database),
             )
@@ -204,7 +204,7 @@ class ClarificationProtocolTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_chat_answers_before_creating_another_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            application = compose_fixture_application(
+            application = compose_legacy_fixture_application(
                 model_adapter=ClarifyingModel(), tool_adapters=()
             )
             output: list[str] = []
@@ -239,3 +239,11 @@ class ClarificationProtocolTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from tsm_agt.core.single_loop import OrchestrationMode
+
+
+def compose_legacy_fixture_application(*args, **kwargs):
+    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
+    return compose_fixture_application(*args, **kwargs)

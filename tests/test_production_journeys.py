@@ -220,7 +220,7 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
         resilient = ResilientModelProvider(
             physical, policy, max_provider_attempts=2
         )
-        app = compose_fixture_application(
+        app = compose_legacy_fixture_application(
             model_adapter=resilient,
             model_recovery_policy_adapter=policy,
             tool_adapters=(CoreReadOnlyToolProvider(),),
@@ -279,7 +279,7 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
             marker = root / "marker.txt"
             marker.write_text("unchanged\n", encoding="utf-8")
             model = CorrectingOutcomeModel()
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=model,
                 tool_adapters=(
                     CoreReadOnlyToolProvider(),
@@ -317,7 +317,7 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = CorrectingOutcomeModel(always_invalid=True)
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=model,
                 tool_adapters=(
                     CoreReadOnlyToolProvider(),
@@ -418,3 +418,11 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from tsm_agt.core.single_loop import OrchestrationMode
+
+
+def compose_legacy_fixture_application(*args, **kwargs):
+    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
+    return compose_fixture_application(*args, **kwargs)

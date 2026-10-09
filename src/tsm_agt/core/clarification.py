@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
@@ -18,6 +18,7 @@ class ClarificationKind(StrEnum):
 
     QUESTION = "QUESTION"
     OUTCOME_RECONCILIATION = "OUTCOME_RECONCILIATION"
+    CONTRACT_BLOCKED = "CONTRACT_BLOCKED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +53,7 @@ class ClarificationRequest:
     expires_at: datetime
     kind: ClarificationKind = ClarificationKind.QUESTION
     execution_id: str | None = None
+    payload: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.request_id.strip() or not self.question.strip():
@@ -62,6 +64,8 @@ class ClarificationRequest:
             raise ValueError("clarification supports at most 3 choices")
         if self.expires_at <= self.created_at:
             raise ValueError("clarification expiry must follow creation")
+        if not isinstance(self.payload, Mapping):
+            raise ValueError("clarification payload must be an object")
         if (
             self.kind is ClarificationKind.OUTCOME_RECONCILIATION
             and not (self.execution_id or "").strip()
@@ -107,6 +111,7 @@ class ClarificationRequest:
             "expires_at": self.expires_at.isoformat(),
             "kind": self.kind.value,
             "execution_id": self.execution_id,
+            "payload": dict(self.payload),
         }
 
     @classmethod
@@ -134,6 +139,10 @@ class ClarificationRequest:
             execution_id=(
                 str(data["execution_id"])
                 if data.get("execution_id") is not None else None
+            ),
+            payload=(
+                dict(data["payload"])
+                if isinstance(data.get("payload"), Mapping) else {}
             ),
         )
         stored_mode = data.get("input_mode")

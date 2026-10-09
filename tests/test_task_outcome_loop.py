@@ -15,6 +15,7 @@ from tsm_agt.core import (
     TaskSpecSnapshot, TaskState,
 )
 from tsm_agt.core.configuration import canonical_hash
+from tsm_agt.core.single_loop import OrchestrationMode
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, FinishReason, HealthState, HealthStatus,
     Message, MessageRole, ModelRequest, ModelResponse, ModelUsage,
@@ -113,6 +114,7 @@ class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
         app = compose_fixture_application(
             model_adapter=model or EchoModelProvider(),
             tool_adapters=tools or (CoreReadOnlyToolProvider(),),
+            orchestration_mode=OrchestrationMode.LEGACY,
         )
         await app.registry.start_all()
         task = await app.kernel.create_task("inspect workspace", root)
@@ -189,6 +191,7 @@ class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
             first = compose_fixture_application(
                 model_adapter=EchoModelProvider(), tool_adapters=(slow,),
                 store_adapter=SQLiteRuntimeStore(database),
+                orchestration_mode=OrchestrationMode.LEGACY,
             )
             await first.registry.start_all()
             task = await first.kernel.create_task("observe slowly", root)
@@ -212,6 +215,7 @@ class TaskOutcomeLoopTest(unittest.IsolatedAsyncioTestCase):
                 model_adapter=EchoModelProvider(),
                 tool_adapters=(EffectToolProvider(ToolEffect.OBSERVE),),
                 store_adapter=SQLiteRuntimeStore(database),
+                orchestration_mode=OrchestrationMode.LEGACY,
             )
             await second.registry.start_all()
             try:

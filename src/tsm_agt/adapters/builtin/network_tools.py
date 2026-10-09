@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import http.client
 import ipaddress
@@ -10,8 +11,10 @@ import json
 import re
 import socket
 import ssl
+import threading
 import time
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,12 +33,14 @@ from tsm_agt.ports import (
     ToolEffect,
     ToolIdempotency,
     ToolInvocationContext,
+    ToolFactDescriptor,
     ToolResult,
     ToolResultAuthority,
     ToolRisk,
     ToolSpec,
     WebEgressMode,
 )
+from tsm_agt.ports.evidence import EvidenceFact
 from tsm_agt.retrieval.pipeline import RetrievalPipeline
 from tsm_agt.retrieval.providers import (
     DEFAULT_PROVIDER_TIMEOUT_SECONDS, RetrievalProvider,
@@ -109,6 +114,16 @@ _MAX_FETCH_REDIRECTS = 3
 _ALLOWED_FETCH_CONTENT_TYPES = frozenset({
     "text/html", "text/markdown", "text/plain", "text/x-markdown",
 })
+_MAX_DOCUMENT_CACHE_ENTRIES = 32
+_MAX_DOCUMENT_CACHE_BYTES = 1_000_000
+_MAX_REFERENCE_CACHE_ENTRIES = 128
+_DOCUMENT_CACHE_TTL_SECONDS = 600.0
+_MAX_FIND_MATCHES = 20
+_MAX_FIND_PATTERN_CHARS = 512
+_MAX_FIND_CONTEXT_CHARS = 240
+_GITHUB_REPOSITORY_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")
+_GITHUB_REF_SEGMENT = re.compile(r"^[A-Za-z0-9._-]+$")
+_GITHUB_SHA = re.compile(r"^[0-9a-f]{40,64}$", re.IGNORECASE)
 
 
 def _search_outage_failure(
@@ -173,6 +188,36 @@ class _FetchTarget:
 
     url: str
     pinned_address: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _WebDocument:
+    """One bounded document that only its Task/turn scope may read."""
+
+    scope: tuple[str, str]
+    document_ref: str
+    canonical_url: str
+    requested_url: str
+    content_type: str
+    content: str
+    content_hash: str
+    truncated: bool
+    provenance: Mapping[str, Any]
+    stored_at: float
+
+    @property
+    def size_bytes(self) -> int:
+        return len(self.content.encode("utf-8"))
+
+
+@dataclass(frozen=True, slots=True)
+class _WebReference:
+    """A Task/turn scoped reference to one search-result URL."""
+
+    scope: tuple[str, str]
+    ref_id: str
+    url: str
+    stored_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -979,7 +1024,10 @@ class NetworkToolProvider:
         adapter_version="0.1.0",
         port_name="ToolProviderPort",
         port_version="1.0",
-        capabilities=frozenset({"web.search", "web.fetch_markdown", "content.summarize"}),
+        capabilities=frozenset({
+            "web.search", "web.fetch_markdown", "web.open",
+            "web.find_in_page", "content.summarize", "source.github.resolve",
+        }),
     )
 
     _tools = (
@@ -1017,6 +1065,7 @@ class NetworkToolProvider:
             rollback="read-only public search request; no remote mutation",
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.EXTERNAL_SERVICE,
+            evidence_capability_ids=frozenset({"web.discovery"}),
         ),
         ToolSpec(
             name="web.fetch_markdown",
@@ -1039,6 +1088,88 @@ class NetworkToolProvider:
             rollback="read-only bounded public document request; no remote mutation",
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.EXTERNAL_SERVICE,
+            evidence_capability_ids=frozenset({"web.document"}),
+        ),
+        ToolSpec(
+            name="web.open",
+            description=(
+                "Open one public HTTP(S) document from a current Task/turn "
+                "search-result ref_id or an explicit URL. The fetched document "
+                "is bounded and can then be searched with web.find_in_page."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "ref_id": {"type": "string", "minLength": 1},
+                    "url": {"type": "string", "format": "uri"},
+                },
+                "additionalProperties": False,
+            },
+            risk=ToolRisk.R0,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            idempotency=ToolIdempotency.IDEMPOTENT,
+            requires_network=True,
+            data_transmission="public search-result reference or user-selected public HTTP(S) URL",
+            rollback="read-only bounded public document request; no remote mutation",
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.EXTERNAL_SERVICE,
+            evidence_capability_ids=frozenset({"web.document"}),
+        ),
+        ToolSpec(
+            name="web.find_in_page",
+            description=(
+                "Find plain-text matches only in a document_ref opened during "
+                "the current Task and turn; this tool never makes a network request."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "document_ref": {"type": "string", "minLength": 1},
+                    "pattern": {"type": "string", "minLength": 1},
+                    "max_matches": {"type": "integer", "minimum": 1, "maximum": _MAX_FIND_MATCHES},
+                },
+                "required": ["document_ref", "pattern"],
+                "additionalProperties": False,
+            },
+            risk=ToolRisk.R0,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            idempotency=ToolIdempotency.IDEMPOTENT,
+            requires_network=False,
+            data_transmission="none",
+            rollback="reads an already-opened bounded document only; no remote mutation",
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.DERIVED,
+        ),
+        ToolSpec(
+            name="source.github.resolve",
+            description=(
+                "Resolve one HTTPS github.com repository URL or current Task/turn "
+                "search_ref into a canonical local GitHub source-tool target. "
+                "This parses locally and never makes a network request."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "format": "uri"},
+                    "search_ref": {"type": "string", "minLength": 1},
+                },
+                "oneOf": [
+                    {"required": ["url"]},
+                    {"required": ["search_ref"]},
+                ],
+                "additionalProperties": False,
+            },
+            risk=ToolRisk.R0,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            idempotency=ToolIdempotency.IDEMPOTENT,
+            requires_network=False,
+            data_transmission="none",
+            rollback="local URL parsing only; no remote mutation or request",
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.DERIVED,
         ),
         ToolSpec(
             name="content.summarize",
@@ -1076,6 +1207,10 @@ class NetworkToolProvider:
         search_tavily_api_key: str = "",
         search_mode: str = "live",
         render_url: str = "",
+        document_cache_max_entries: int = _MAX_DOCUMENT_CACHE_ENTRIES,
+        document_cache_max_bytes: int = _MAX_DOCUMENT_CACHE_BYTES,
+        reference_cache_max_entries: int = _MAX_REFERENCE_CACHE_ENTRIES,
+        document_cache_ttl_seconds: float = _DOCUMENT_CACHE_TTL_SECONDS,
     ) -> None:
         """Expose public search and a bounded document fetch.
 
@@ -1105,6 +1240,14 @@ class NetworkToolProvider:
             raise ValueError("search_provider_timeout_seconds must be positive")
         if search_fallback_deadline_seconds <= 0:
             raise ValueError("search_fallback_deadline_seconds must be positive")
+        if document_cache_max_entries <= 0:
+            raise ValueError("document_cache_max_entries must be positive")
+        if document_cache_max_bytes <= 0:
+            raise ValueError("document_cache_max_bytes must be positive")
+        if reference_cache_max_entries <= 0:
+            raise ValueError("reference_cache_max_entries must be positive")
+        if document_cache_ttl_seconds <= 0:
+            raise ValueError("document_cache_ttl_seconds must be positive")
         mode = (search_tavily_mode or "off").strip().lower()
         if mode not in {"off", "keyless", "key"}:
             raise ValueError(
@@ -1129,6 +1272,14 @@ class NetworkToolProvider:
             else UrllibWebFetchTransport()
         )
         self._address_resolver = address_resolver or _resolve_public_addresses
+        self._document_cache_max_entries = document_cache_max_entries
+        self._document_cache_max_bytes = document_cache_max_bytes
+        self._reference_cache_max_entries = reference_cache_max_entries
+        self._document_cache_ttl_seconds = document_cache_ttl_seconds
+        self._document_cache: OrderedDict[tuple[tuple[str, str], str], _WebDocument] = OrderedDict()
+        self._reference_cache: OrderedDict[tuple[tuple[str, str], str], _WebReference] = OrderedDict()
+        self._document_cache_bytes = 0
+        self._cache_lock = threading.RLock()
         self._started = False
         self._search_fallback_deadline_seconds = (
             search_fallback_deadline_seconds
@@ -1165,18 +1316,24 @@ class NetworkToolProvider:
         )
 
     async def stop(self, deadline: datetime) -> None:
+        with self._cache_lock:
+            self._document_cache.clear()
+            self._reference_cache.clear()
+            self._document_cache_bytes = 0
         self._started = False
 
     async def list_tools(self) -> tuple[ToolSpec, ...]:
         return tuple(
             tool for tool in self._tools
-            if self._enable_fetch or tool.name != "web.fetch_markdown"
+            if self._enable_fetch
+            or tool.name not in {"web.fetch_markdown", "web.open", "web.find_in_page"}
         )
 
     async def invoke(self, call: ToolCall, context: ToolInvocationContext) -> ToolResult:
         if not self._started:
             raise RuntimeError("network tools are not started")
         try:
+            scope = self._scope_for(context)
             if call.name == "web.search":
                 if self._search_mode == "off":
                     return ToolResult(
@@ -1187,11 +1344,13 @@ class NetworkToolProvider:
                     self._web_search, call.arguments,
                     self._search_deadline(context),
                 )
+                data = self._attach_search_refs(data, scope)
                 failure = _search_outage_failure(
                     call.call_id, data, self._search_mode,
                 )
                 if failure is not None:
                     return failure
+                fact_descriptor = self._fact_descriptor(scope, data)
             elif call.name == "web.fetch_markdown":
                 if not self._enable_fetch:
                     return ToolResult(
@@ -1199,13 +1358,42 @@ class NetworkToolProvider:
                         message="web.fetch_markdown is disabled for this provider",
                     )
                 data = await asyncio.to_thread(
-                    self._fetch_markdown, call.arguments
+                    self._fetch_document, call.arguments, scope
                 )
+                fact_descriptor = self._fact_descriptor(scope, data)
+            elif call.name == "web.open":
+                if not self._enable_fetch:
+                    return ToolResult(
+                        call.call_id, False, error_code="CAPABILITY_DISABLED",
+                        message="web.open is disabled for this provider",
+                    )
+                data = await asyncio.to_thread(
+                    self._open_document, call.arguments, scope
+                )
+                fact_descriptor = self._fact_descriptor(scope, data)
+            elif call.name == "web.find_in_page":
+                if not self._enable_fetch:
+                    return ToolResult(
+                        call.call_id, False, error_code="CAPABILITY_DISABLED",
+                        message="web.find_in_page is disabled for this provider",
+                    )
+                data = await asyncio.to_thread(
+                    self._find_in_page, call.arguments, scope
+                )
+                fact_descriptor = self._fact_descriptor(scope, data)
+            elif call.name == "source.github.resolve":
+                data = self._resolve_github_source(call.arguments, scope)
+                fact_descriptor = self._github_fact_descriptor(scope, data)
             elif call.name == "content.summarize":
                 data = self._summarize(call.arguments)
+                fact_descriptor = None
             else:
                 return ToolResult(call.call_id, False, error_code="NOT_FOUND", message=f"unknown network tool: {call.name}")
-            return ToolResult(call.call_id, True, data=data, meta={"untrusted_data": True})
+            return ToolResult(
+                call.call_id, True, data=data, truncated=bool(data.get("truncated", False)),
+                meta={"untrusted_data": True}, fact_descriptor=fact_descriptor,
+                evidence_facts=self._evidence_facts(call, data),
+            )
         except _FetchFailure as error:
             return ToolResult(
                 call.call_id, False, error_code=error.code, message=str(error),
@@ -1220,6 +1408,48 @@ class NetworkToolProvider:
             )
         except (OSError, TimeoutError, URLError) as error:
             return ToolResult(call.call_id, False, error_code="NETWORK_ERROR", message=str(error), retryable=True)
+
+    @staticmethod
+    def _evidence_facts(
+        call: ToolCall, data: Mapping[str, Any],
+    ) -> tuple[EvidenceFact, ...]:
+        complete = not bool(data.get("truncated", False))
+        if call.name == "web.search":
+            results = data.get("results", [])
+            candidates = [
+                {
+                    "url": item.get("url"),
+                    "title": item.get("title"),
+                }
+                for item in results
+                if isinstance(item, Mapping)
+            ] if isinstance(results, list) else []
+            return (EvidenceFact(
+                fact_id=f"{call.call_id}:web.discovery",
+                kind="web.discovery",
+                execution_ref=f"tool_call:{call.call_id}",
+                attributes={"query": call.arguments.get("query", ""), "candidates": candidates},
+                provenance={"provider": "builtin.network-tools"},
+                complete=complete,
+            ),)
+        if call.name in {"web.fetch_markdown", "web.open"}:
+            canonical_url = data.get("canonical_url")
+            content_hash = data.get("content_hash")
+            if not isinstance(canonical_url, str) or not canonical_url or not isinstance(content_hash, str) or not content_hash:
+                return ()
+            return (EvidenceFact(
+                fact_id=f"{call.call_id}:web.document",
+                kind="web.document",
+                execution_ref=f"tool_call:{call.call_id}",
+                attributes={
+                    "canonical_url": canonical_url,
+                    "content_hash": content_hash,
+                    "complete": complete,
+                },
+                provenance=dict(data.get("provenance", {})) if isinstance(data.get("provenance"), Mapping) else {},
+                complete=complete,
+            ),)
+        return ()
 
     def _search_deadline(
         self, context: ToolInvocationContext | None,
@@ -1254,14 +1484,29 @@ class NetworkToolProvider:
             query, top_k, deadline=deadline, freshness=freshness,
             allow_egress=self._search_mode == "live",
         )
-        if not response.results:
-            degraded = response.to_dict()
-            degraded["message"] = (
+        response_data = response.to_dict()
+        if not response_data["results"]:
+            response_data["message"] = (
                 "public search providers returned no usable results"
             )
-            return degraded
+        return response_data
 
-        return response.to_dict()
+    def _attach_search_refs(
+        self, response_data: Mapping[str, Any], scope: tuple[str, str],
+    ) -> Mapping[str, Any]:
+        data = dict(response_data)
+        results = data.get("results")
+        if not isinstance(results, list):
+            return data
+        scoped_results: list[dict[str, Any]] = []
+        for result in results:
+            item = dict(result)
+            url = item.get("url")
+            if isinstance(url, str) and url:
+                item["ref_id"] = self._store_reference(scope, url)
+            scoped_results.append(item)
+        data["results"] = scoped_results
+        return data
 
     @staticmethod
     def _freshness(arguments: Mapping[str, Any]) -> str:
@@ -1279,12 +1524,408 @@ class NetworkToolProvider:
     def egress_mode(self) -> WebEgressMode:
         return self._egress_mode
 
+    @staticmethod
+    def _scope_for(context: ToolInvocationContext | None) -> tuple[str, str]:
+        if context is None:
+            return ("direct", "provider")
+        return (context.task_id, context.turn_id)
+
+    @staticmethod
+    def _reference_id(scope: tuple[str, str], url: str) -> str:
+        digest = hashlib.sha256(
+            "\x00".join((*scope, url)).encode("utf-8")
+        ).hexdigest()
+        return f"search:{digest[:24]}"
+
+    @staticmethod
+    def _document_id(scope: tuple[str, str], canonical_url: str) -> str:
+        digest = hashlib.sha256(
+            "\x00".join((*scope, canonical_url)).encode("utf-8")
+        ).hexdigest()
+        return f"webdoc:{digest[:24]}"
+
+    def _expire_cache(self, now: float) -> None:
+        expired_documents = [
+            key for key, document in self._document_cache.items()
+            if now - document.stored_at > self._document_cache_ttl_seconds
+        ]
+        for key in expired_documents:
+            document = self._document_cache.pop(key)
+            self._document_cache_bytes -= document.size_bytes
+        expired_references = [
+            key for key, reference in self._reference_cache.items()
+            if now - reference.stored_at > self._document_cache_ttl_seconds
+        ]
+        for key in expired_references:
+            self._reference_cache.pop(key)
+
+    def _store_reference(self, scope: tuple[str, str], url: str) -> str:
+        now = time.monotonic()
+        ref_id = self._reference_id(scope, url)
+        key = (scope, ref_id)
+        with self._cache_lock:
+            self._expire_cache(now)
+            self._reference_cache[key] = _WebReference(scope, ref_id, url, now)
+            self._reference_cache.move_to_end(key)
+            while len(self._reference_cache) > self._reference_cache_max_entries:
+                self._reference_cache.popitem(last=False)
+        return ref_id
+
+    def _reference_url(self, scope: tuple[str, str], ref_id: str) -> str:
+        with self._cache_lock:
+            self._expire_cache(time.monotonic())
+            reference = self._reference_cache.get((scope, ref_id))
+            if reference is None:
+                raise _FetchFailure(
+                    "SEARCH_REF_NOT_FOUND",
+                    "search result ref_id is unknown or expired for this Task and turn; search again",
+                )
+            self._reference_cache.move_to_end((scope, ref_id))
+            return reference.url
+
+    def _resolve_github_source(
+        self, arguments: Mapping[str, Any], scope: tuple[str, str],
+    ) -> Mapping[str, Any]:
+        has_url = arguments.get("url") is not None
+        has_search_ref = arguments.get("search_ref") is not None
+        if has_url == has_search_ref:
+            raise ValueError(
+                "source.github.resolve requires exactly one of url or search_ref"
+            )
+        search_ref = None
+        if has_search_ref:
+            search_ref = self._required_string(arguments, "search_ref")
+            url = self._reference_url(scope, search_ref)
+            input_kind = "search_ref"
+        else:
+            url = self._required_string(arguments, "url")
+            input_kind = "url"
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+        except ValueError as error:
+            raise _FetchFailure("INVALID_GITHUB_URL", "GitHub URL has an invalid port") from error
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname is None
+            or parsed.hostname.casefold() != "github.com"
+            or port is not None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise _FetchFailure(
+                "INVALID_GITHUB_URL",
+                "source.github.resolve accepts only HTTPS github.com URLs without auth, port, query, or fragment",
+            )
+        segments = parsed.path.split("/")[1:]
+        if segments and not segments[-1]:
+            segments.pop()
+        if not segments or any(not segment for segment in segments):
+            raise _FetchFailure("INVALID_GITHUB_URL", "GitHub URL has an invalid path")
+        if any(
+            unquote(segment) != segment
+            or segment in {".", ".."}
+            or "\\" in segment
+            for segment in segments
+        ):
+            raise _FetchFailure(
+                "INVALID_GITHUB_URL",
+                "GitHub URL must not contain encoded or traversing path segments",
+            )
+        if len(segments) < 2 or any(
+            _GITHUB_REPOSITORY_SEGMENT.fullmatch(segment) is None
+            or segment in {".", ".."}
+            for segment in segments[:2]
+        ):
+            raise _FetchFailure(
+                "INVALID_GITHUB_URL", "GitHub URL has an invalid owner or repository"
+            )
+        repo = "/".join(segments[:2])
+        if len(segments) == 2:
+            kind = "repository"
+            ref = None
+            path = None
+            number = None
+            target_tool = "source.github.list_tree"
+            target_arguments: dict[str, Any] = {"repo": repo, "ref": "HEAD"}
+            canonical_url = f"https://github.com/{repo}"
+        else:
+            resource = segments[2]
+            if resource in {"blob", "tree"}:
+                if len(segments) < 4:
+                    raise _FetchFailure(
+                        "INVALID_GITHUB_URL",
+                        f"GitHub {resource} URL must include a ref",
+                    )
+                if segments[3] == "refs" and len(segments) > 4:
+                    raise _FetchFailure(
+                        "AMBIGUOUS_GITHUB_REF_PATH",
+                        "GitHub URL uses a slash ref, which cannot be resolved without a network request",
+                    )
+                ref = segments[3]
+                if _GITHUB_REF_SEGMENT.fullmatch(ref) is None:
+                    raise _FetchFailure(
+                        "INVALID_GITHUB_URL", "GitHub URL has an invalid ref"
+                    )
+                if _GITHUB_SHA.fullmatch(ref):
+                    ref = ref.lower()
+                path_segments = segments[4:]
+                if resource == "blob" and not path_segments:
+                    raise _FetchFailure(
+                        "INVALID_GITHUB_URL", "GitHub blob URL must include a file path"
+                    )
+                if any(
+                    segment in {".", ".."} or "\\" in segment
+                    for segment in path_segments
+                ):
+                    raise _FetchFailure(
+                        "INVALID_GITHUB_URL", "GitHub URL has an invalid repository path"
+                    )
+                kind = resource
+                path = "/".join(path_segments) or None
+                number = None
+                target_tool = (
+                    "source.github.get_file"
+                    if kind == "blob"
+                    else "source.github.list_tree"
+                )
+                target_arguments = {"repo": repo, "ref": ref}
+                if path is not None:
+                    target_arguments["path"] = path
+                canonical_url = f"https://github.com/{repo}/{kind}/{ref}"
+                if path is not None:
+                    canonical_url = f"{canonical_url}/{path}"
+            elif resource in {"issues", "pull"} and len(segments) == 4:
+                raw_number = segments[3]
+                if not raw_number.isdecimal() or int(raw_number) < 1:
+                    raise _FetchFailure(
+                        "INVALID_GITHUB_URL", "GitHub issue or pull number must be positive"
+                    )
+                kind = "issue" if resource == "issues" else "pull"
+                ref = None
+                path = None
+                number = int(raw_number)
+                target_tool = (
+                    "source.github.get_issue"
+                    if kind == "issue"
+                    else "source.github.get_pull_request"
+                )
+                target_arguments = {"repo": repo, "number": number}
+                canonical_url = f"https://github.com/{repo}/{resource}/{number}"
+            else:
+                raise _FetchFailure(
+                    "INVALID_GITHUB_URL", "GitHub URL kind is not supported"
+                )
+        ref_is_pinned = bool(ref and _GITHUB_SHA.fullmatch(ref))
+        result = {
+            "canonical_url": canonical_url,
+            "repo": repo,
+            "kind": kind,
+            "ref": ref,
+            "path": path,
+            "number": number,
+            "target_tool": target_tool,
+            "target_arguments": target_arguments,
+            "ref_is_pinned": ref_is_pinned,
+            "provenance": {
+                "source": "source.github.resolve",
+                "input_kind": input_kind,
+                "search_ref": search_ref,
+                "network_egress": False,
+            },
+        }
+        result["content_hash"] = "sha256:" + hashlib.sha256(
+            json.dumps(result, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return result
+
+    @staticmethod
+    def _github_fact_descriptor(
+        scope: tuple[str, str], data: Mapping[str, Any],
+    ) -> ToolFactDescriptor:
+        repo = str(data["repo"])
+        ref = data.get("ref")
+        fact_scope = [f"task:{scope[0]}", f"turn:{scope[1]}", f"repo:{repo}"]
+        if isinstance(ref, str) and ref:
+            fact_scope.append(f"ref:{ref}")
+        return ToolFactDescriptor(
+            authority="derived_github_url",
+            scope=tuple(fact_scope),
+            artifact_refs=(str(data["canonical_url"]),),
+            content_hash=str(data["content_hash"]),
+        )
+
+    def _store_document(
+        self, scope: tuple[str, str], fetched: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        canonical_url = str(fetched["url"])
+        content = str(fetched["content"])
+        document_ref = self._document_id(scope, canonical_url)
+        content_hash = "sha256:" + hashlib.sha256(
+            content.encode("utf-8")
+        ).hexdigest()
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        provenance = {
+            "source": "web.fetch_markdown",
+            "requested_url": str(fetched["requested_url"]),
+            "canonical_url": canonical_url,
+            "fetched_at": fetched_at,
+            "egress_mode": str(fetched["egress_mode"]),
+            "redirect_count": int(fetched["redirect_count"]),
+        }
+        document = _WebDocument(
+            scope=scope,
+            document_ref=document_ref,
+            canonical_url=canonical_url,
+            requested_url=str(fetched["requested_url"]),
+            content_type=str(fetched["content_type"]),
+            content=content,
+            content_hash=content_hash,
+            truncated=bool(fetched["truncated"]),
+            provenance=provenance,
+            stored_at=time.monotonic(),
+        )
+        key = (scope, document_ref)
+        with self._cache_lock:
+            self._expire_cache(document.stored_at)
+            replaced = self._document_cache.pop(key, None)
+            if replaced is not None:
+                self._document_cache_bytes -= replaced.size_bytes
+            self._document_cache[key] = document
+            self._document_cache_bytes += document.size_bytes
+            while (
+                len(self._document_cache) > self._document_cache_max_entries
+                or self._document_cache_bytes > self._document_cache_max_bytes
+            ):
+                _, evicted = self._document_cache.popitem(last=False)
+                self._document_cache_bytes -= evicted.size_bytes
+        return {
+            **dict(fetched),
+            "canonical_url": canonical_url,
+            "document_ref": document_ref,
+            "content_hash": content_hash,
+            "fetched_at": fetched_at,
+            "provenance": provenance,
+        }
+
+    def _fetch_document(
+        self, arguments: Mapping[str, Any], scope: tuple[str, str],
+    ) -> Mapping[str, Any]:
+        return self._store_document(scope, self._fetch_markdown(arguments))
+
+    def _open_document(
+        self, arguments: Mapping[str, Any], scope: tuple[str, str],
+    ) -> Mapping[str, Any]:
+        url = arguments.get("url")
+        ref_id = arguments.get("ref_id")
+        if (url is None) == (ref_id is None):
+            raise ValueError("web.open requires exactly one of url or ref_id")
+        if ref_id is not None:
+            if not isinstance(ref_id, str) or not ref_id.strip():
+                raise ValueError("ref_id must be a non-empty string")
+            url = self._reference_url(scope, ref_id.strip())
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError("url must be a non-empty string")
+        return self._fetch_document({"url": url}, scope)
+
+    def _find_in_page(
+        self, arguments: Mapping[str, Any], scope: tuple[str, str],
+    ) -> Mapping[str, Any]:
+        document_ref = self._required_string(arguments, "document_ref")
+        pattern = self._required_string(arguments, "pattern")
+        if len(pattern) > _MAX_FIND_PATTERN_CHARS:
+            raise ValueError(
+                f"pattern must contain at most {_MAX_FIND_PATTERN_CHARS} characters"
+            )
+        max_matches = int(arguments.get("max_matches", 10))
+        if not 1 <= max_matches <= _MAX_FIND_MATCHES:
+            raise ValueError(f"max_matches must be between 1 and {_MAX_FIND_MATCHES}")
+        key = (scope, document_ref)
+        with self._cache_lock:
+            self._expire_cache(time.monotonic())
+            document = self._document_cache.get(key)
+            if document is None:
+                raise _FetchFailure(
+                    "DOCUMENT_REF_NOT_FOUND",
+                    "document_ref is unknown or expired for this Task and turn; open the document first",
+                )
+            self._document_cache.move_to_end(key)
+        normalized_pattern = pattern.casefold()
+        matches: list[dict[str, Any]] = []
+        total = 0
+        content_offset = 0
+        for line_number, raw_line in enumerate(
+            document.content.splitlines(keepends=True), start=1,
+        ):
+            line = raw_line.rstrip("\r\n")
+            start = 0
+            folded_line = line.casefold()
+            while (index := folded_line.find(normalized_pattern, start)) != -1:
+                total += 1
+                if len(matches) < max_matches:
+                    left = max(0, index - _MAX_FIND_CONTEXT_CHARS // 2)
+                    right = min(
+                        len(line), index + len(pattern) + _MAX_FIND_CONTEXT_CHARS // 2,
+                    )
+                    matches.append({
+                        "ordinal": total,
+                        "offset": content_offset + index,
+                        "snippet": line[left:right],
+                        "line": line_number,
+                        "start": index,
+                        "end": index + len(pattern),
+                        "text": line[left:right],
+                    })
+                start = index + max(1, len(pattern))
+            content_offset += len(raw_line)
+        return {
+            "document_ref": document.document_ref,
+            "canonical_url": document.canonical_url,
+            "content_hash": document.content_hash,
+            "document_truncated": document.truncated,
+            "provenance": dict(document.provenance),
+            "pattern": pattern,
+            "matches": matches,
+            "match_count": total,
+            "returned_count": len(matches),
+            "truncated": total > len(matches),
+        }
+
+    @staticmethod
+    def _fact_descriptor(
+        scope: tuple[str, str], data: Mapping[str, Any],
+    ) -> ToolFactDescriptor:
+        artifact_refs = tuple(
+            str(value) for value in (
+                data.get("document_ref"), data.get("canonical_url"),
+            ) if isinstance(value, str) and value
+        )
+        observed_at = None
+        provenance = data.get("provenance")
+        if isinstance(provenance, Mapping):
+            value = provenance.get("fetched_at")
+            observed_at = str(value) if isinstance(value, str) and value else None
+        content_hash = data.get("content_hash")
+        return ToolFactDescriptor(
+            authority="external_web_document",
+            scope=(f"task:{scope[0]}", f"turn:{scope[1]}"),
+            artifact_refs=artifact_refs,
+            observed_at=observed_at,
+            content_hash=(
+                str(content_hash)
+                if isinstance(content_hash, str) and content_hash else None
+            ),
+        )
+
     def _fetch_markdown(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         requested_url = self._required_string(arguments, "url")
         target = _validate_fetch_url(
             requested_url, self._address_resolver, mode=self._egress_mode
         )
         current_url = target.url
+        redirect_chain = [current_url]
         redirects = 0
         while True:
             response = self._fetch_transport.fetch(
@@ -1316,6 +1957,7 @@ class NetworkToolProvider:
                     mode=self._egress_mode,
                 )
                 current_url = target.url
+                redirect_chain.append(current_url)
                 redirects += 1
                 continue
             if not 200 <= response.status_code < 300:
@@ -1366,6 +2008,7 @@ class NetworkToolProvider:
                 "rendered_by": rendered_by,
                 "truncated": response.truncated or len(text) > _MAX_FETCH_CHARS,
                 "redirect_count": redirects,
+                "redirect_chain": redirect_chain,
                 "egress_mode": str(self._egress_mode),
                 "address_validated_in_process": (
                     self._egress_mode is WebEgressMode.DIRECT

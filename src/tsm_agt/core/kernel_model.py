@@ -83,8 +83,15 @@ class ModelMixin:
         additional_events: tuple[tuple[str, Mapping[str, Any]], ...] = (),
     ) -> None:
         response_diagnostics = self._response_diagnostics(response)
+        user_message = self._source_user_message(checkpoint.messages)
         llm_payload = {
             "turn_id": checkpoint.turn_id,
+            "orchestration_mode": "LEGACY",
+            "current_input_ref": (
+                f"message:{user_message.message_id}"
+                if user_message is not None else ""
+            ),
+            "prompt_projection_hash": checkpoint.session_context_hash,
             "model_call": checkpoint.model_calls,
             "message": response.message.to_data(),
             "finish_reason": response.finish_reason.value,
@@ -97,7 +104,6 @@ class ModelMixin:
             **prompt_receipt.event_data(),
         }
         if final:
-            user_message = self._source_user_message(checkpoint.messages)
             if user_message is None:
                 raise RuntimeError("Agent turn lost its source user message")
             await self._commit_final_agent_result(

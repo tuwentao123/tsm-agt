@@ -22,12 +22,11 @@ def text(message_id: str, role: MessageRole, value: str) -> Message:
     return Message(message_id, role, (TextBlock(value),))
 
 
-# Adding the ``mandatory-tool-use`` segment grew the protected static system
-# prompt by this many estimated tokens. Every window below was calibrated against
-# the prompt's size, so they grow by the same amount; each test then keeps the
-# exact slack it was measuring before, and the compaction behaviour it pins is
-# unchanged.
-STATIC_PROMPT_GROWTH_TOKENS = 204
+# Adding the ``mandatory-tool-use`` segment, explicit content-vs-filename
+# search guidance, and V4A patch guidance grew the protected static system prompt
+# by this many estimated tokens. Every window below is calibrated against the
+# prompt's size, so each test keeps the exact slack it was measuring before.
+STATIC_PROMPT_GROWTH_TOKENS = 324
 
 
 def tool_pair(call_id: str, payload: str) -> tuple[Message, Message]:
@@ -371,9 +370,11 @@ class GrowingContextModel(EchoModelProvider):
     # temporal anchor, which is protected and cannot be compacted away.
     # Raised again by STATIC_PROMPT_GROWTH_TOKENS for the mandatory-tool-use
     # segment, which is likewise protected static prompt.
+    # Keep 152 tokens of additional slack for the internal turn-intent schema
+    # and its durable ToolResult protocol, which are visible every agent call.
     capabilities = ProviderCapabilities(
         tools=True,
-        context_window=2048 + STATIC_PROMPT_GROWTH_TOKENS,
+        context_window=2200 + STATIC_PROMPT_GROWTH_TOKENS,
     )
 
     def __init__(self) -> None:
@@ -464,7 +465,24 @@ class ContextCompactionKernelTest(unittest.IsolatedAsyncioTestCase):
             compacted = [
                 event for event in events if event.event_type == "context.compacted"
             ]
+            shadows = [
+                event for event in events
+                if event.event_type == "context.single_loop_shadow_projected"
+            ]
+            shadow_compactions = [
+                event for event in events
+                if event.event_type == "context.single_loop_shadow_compacted"
+            ]
             self.assertGreaterEqual(len(compacted), 1)
+            self.assertGreaterEqual(len(shadows), 1)
+            self.assertEqual(len(shadow_compactions), len(compacted))
+            self.assertLess(shadows[0].sequence, compacted[0].sequence)
+            self.assertLess(compacted[0].sequence, shadow_compactions[0].sequence)
+            for event in shadows + shadow_compactions:
+                encoded = json.dumps(event.payload)
+                self.assertNotIn("large untrusted observation", encoded)
+                self.assertFalse(event.payload["assistant_body_persisted"])
+                self.assertFalse(event.payload["prompt_body_persisted"])
             for event in compacted:
                 encoded = json.dumps(event.payload)
                 self.assertNotIn("large untrusted observation", encoded)

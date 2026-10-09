@@ -21,6 +21,7 @@ from uuid import uuid4
 from tsm_agt.ports import (
     ProcessEnvironmentPolicy,
     CrossProcessLockPort,
+    EvidenceGatePort,
     EvidenceDeltaEvaluatorPort,
     EvidenceDelta,
     EvidenceInventory,
@@ -115,6 +116,7 @@ from tsm_agt.ports import (
     ToolProviderPort,
     ToolResult,
     ToolResultBlock,
+    ToolResultGovernorPort,
     ToolRecoveryKind,
     ToolRisk,
     ToolSpec,
@@ -263,6 +265,9 @@ from .kernel_memory import (
 from .kernel_task import (
     TaskMixin,
 )
+from .task_contract import (
+    ContractMixin,
+)
 from .kernel_policy import (
     PolicyMixin,
 )
@@ -352,12 +357,14 @@ from .verification import (
     AcceptanceResult, AcceptanceStatus, Evidence, TaskVerificationResult,
 )
 from .evidence_question import (
-    EvidenceQuestionProjector, EvidenceQuestionProjection,
-    EvidenceQuestionStatus, ToolActionDisposition,
+    EvidenceObservationKind, EvidenceQuestionProjector,
+    EvidenceQuestionProjection, EvidenceQuestionStatus, ToolActionDisposition,
 )
 from .session_resources import (
     SessionQuestionReference, SessionResourceKind, SessionResourceReference,
 )
+from .single_loop import OrchestrationMode
+from .tool_result_governor import DefaultToolResultGovernor
 from .turn import (
     InvalidModelResponse, InvalidTurnState, ModelInvocationFailed,
     SessionAnswerRequiresTask, TurnResult,
@@ -392,6 +399,7 @@ class KernelDependencies:
     project_memory: ProjectMemoryPort
     model_recovery_policy: ModelRecoveryPolicyPort | None = None
     evidence_delta_evaluator: EvidenceDeltaEvaluatorPort | None = None
+    evidence_gate: EvidenceGatePort | None = None
     semantic_action_classifier: SemanticActionClassifierPort | None = None
     read_hits_policy: ReadHitsPolicyPort | None = None
     artifact_read_policy: ArtifactReadPolicyPort | None = None
@@ -423,8 +431,13 @@ class KernelDependencies:
     ) = None
     process_executor: ProcessExecutorPort | None = None
     tools: tuple[ToolProviderPort, ...] = ()
+    tool_result_governor: ToolResultGovernorPort = field(
+        default_factory=DefaultToolResultGovernor
+    )
     runtime_adapters: tuple[RuntimeAdapter, ...] = ()
     configuration_metadata: Mapping[str, Any] = field(default_factory=dict)
+    orchestration_mode: OrchestrationMode = OrchestrationMode.LEGACY
+    single_loop_allow_fallback: bool = False
     #: Hermes allows 90 iterations per parent turn (50 per subagent) and Codex
     #: has no ceiling at all, relying on compaction. 40 turned ordinary
     #: engineering work into ``max_model_calls`` failures, which the user could
@@ -922,7 +935,7 @@ def _goal_matches_command_argv(
 #: Used when the code is unknown: one retry with an explicitly correct envelope.
 
 
-class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin, TaskMixin, MemoryMixin, ApprovalMixin, ProgressMixin, OnboardingMixin, ProjectionMixin, ProcessMixin, WorkspaceMixin, ToolMixin, SessionMixin):
+class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin, TaskMixin, ContractMixin, MemoryMixin, ApprovalMixin, ProgressMixin, OnboardingMixin, ProjectionMixin, ProcessMixin, WorkspaceMixin, ToolMixin, SessionMixin):
     def __init__(self, dependencies: KernelDependencies) -> None:
         self._dependencies = dependencies
         self._tool_policy = CoreToolPolicy()
@@ -1694,6 +1707,7 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         generated_prefixes = (
             "project-onboarding-context-", "project-memory-context-",
             "session-context-", "working-memory-context-", "task-spec-context-",
+            "task-contract-context-",
             "project-instructions-context-", "completion-readiness-",
         )
         return next((
@@ -1851,8 +1865,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         state = CompletionReadinessState.from_data(
             checkpoint.completion_readiness_state
         )
-        # Completion has no obligation record (Hermes/Codex): no gaps exist.
-        gaps = ()
         available_read_tools = tuple(
             sorted(tool.name for tool in visible_tools
                    if tool.is_read_only and not tool.is_internal_state)
@@ -1872,6 +1884,88 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             tool.name for tool in visible_tools if not tool.is_internal_state
         ))
         task = await self.get_task(task_id)
+        spec = await self.get_task_spec(task_id)
+        questions = await self.get_evidence_questions(task_id)
+        refinement_tools = tuple(
+            tool_name for tool_name in ("core.search_files", "core.read_file")
+            if tool_name in available_tools
+        )
+        missing_delivery_effects = _missing_effect_deliveries(task, spec)
+        has_artifact_read = any(
+            record.observation_kind is EvidenceObservationKind.ARTIFACT_READ
+            for record in questions.records
+        )
+        empty_search_gaps = tuple(
+            CompletionGap(
+                gap_id=f"empty-search:{record.question_ref}",
+                kind="EMPTY_SEARCH_RESULT_REFINEMENT_REQUIRED",
+                description=(
+                    "A repository search only established that its exact query "
+                    "did not match; refine the search or inspect a candidate before "
+                    f"delivering the required workspace change: {record.question}"
+                )[:1000],
+                status="MISSING",
+                recoverable=True,
+                expected_scope=record.expected_scope,
+                required_effects=(ToolEffect.OBSERVE,),
+                candidate_tools=refinement_tools,
+                observed=record.blocking_reason or (
+                    "SEARCH_RESULT_EMPTY_REFINEMENT_REQUIRED"
+                ),
+            )
+            for record in questions.records
+            if (
+                record.observation_kind is EvidenceObservationKind.EMPTY_RESULT
+                and not has_artifact_read
+            )
+        )
+        truncated_search_gaps = tuple(
+            CompletionGap(
+                gap_id=f"truncated-search:{record.question_ref}",
+                kind="TRUNCATED_SEARCH_RESULT",
+                description=(
+                    "A repository search was truncated before it could resolve: "
+                    f"{record.question}"
+                )[:1000],
+                status=record.status.value,
+                recoverable=True,
+                expected_scope=record.expected_scope,
+                required_effects=(ToolEffect.OBSERVE,),
+                candidate_tools=refinement_tools,
+                observed=record.blocking_reason or "",
+            )
+            for record in questions.records
+            if (
+                record.status is EvidenceQuestionStatus.OPEN
+                and record.observation_kind
+                is EvidenceObservationKind.TRUNCATED_RESULT
+            )
+        )
+        gaps = truncated_search_gaps
+        if missing_delivery_effects:
+            if empty_search_gaps:
+                # Require a usable code observation before presenting mutation
+                # tools as the next recovery. A literal no-match is not enough
+                # evidence to edit a workspace safely.
+                gaps += empty_search_gaps
+            else:
+                gaps += (CompletionGap(
+                    gap_id="task-spec:required-effect-delivery",
+                    kind="REQUIRED_DELIVERY_UNSATISFIED",
+                    description=(
+                        "The Task contract requires durable delivery effects that "
+                        "have not been performed: "
+                        + ", ".join(
+                            effect.value for effect in missing_delivery_effects
+                        )
+                    ),
+                    status="MISSING",
+                    recoverable=True,
+                    required_effects=missing_delivery_effects,
+                    candidate_tools=_effect_candidate_tools(
+                        visible_tools, frozenset(missing_delivery_effects)
+                    ),
+                ),)
         inventory = EvidenceInventory.from_data(checkpoint.evidence_inventory)
         specs_by_name = {tool.name: tool for tool in visible_tools}
         execution_facts = project_execution_facts(
@@ -2172,6 +2266,8 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             event_type="turn.started",
             payload={
                 "turn_id": turn_id,
+                "orchestration_mode": "LEGACY",
+                "current_input_ref": f"message:{user_message.message_id}",
                 "input_role": user_message.role.value,
                 "input_character_count": len(normalized_text),
                 "max_output_tokens": max_output_tokens,
@@ -2238,6 +2334,11 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             assistant_message=response.message,
             llm_payload={
                 "turn_id": turn_id,
+                "orchestration_mode": "LEGACY",
+                "current_input_ref": f"message:{user_message.message_id}",
+                "prompt_projection_hash": canonical_hash(
+                    [message.to_data() for message in prepared.messages]
+                ),
                 "message": response.message.to_data(),
                 "finish_reason": response.finish_reason.value,
                 "usage": response.usage.to_data(),
@@ -2356,6 +2457,25 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         if tool_timeout_seconds <= 0:
             raise ValueError("tool_timeout_seconds must be positive")
 
+        metadata = await self.get_task_orchestration_metadata(task_id)
+        if metadata.orchestration_mode is OrchestrationMode.SINGLE_LOOP:
+            from .single_loop.loop import SingleAgentLoop
+
+            return await SingleAgentLoop(self).run(
+                task_id,
+                normalized_text,
+                user_blocks,
+                max_model_calls=max_model_calls,
+                max_tool_calls=max_tool_calls,
+                max_output_tokens=max_output_tokens,
+                tool_timeout_seconds=tool_timeout_seconds,
+                on_text_delta=on_text_delta,
+                on_progress=on_progress,
+            )
+        if metadata.orchestration_mode is not OrchestrationMode.LEGACY:
+            raise InvalidTurnState(
+                f"unsupported orchestration mode: {metadata.orchestration_mode.value}"
+            )
         stored = await self._dependencies.store.load_task(task_id)
         if stored is None:
             raise TaskNotFound(f"task not found: {task_id}")
@@ -2384,6 +2504,8 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                     "turn.started",
                     {
                         "turn_id": turn_id,
+                        "orchestration_mode": "LEGACY",
+                        "current_input_ref": f"message:{user_message.message_id}",
                         "input_role": user_message.role.value,
                         "input_character_count": len(normalized_text),
                         "max_model_calls": max_model_calls,
@@ -2431,6 +2553,13 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         on_text_delta: Callable[[str], None] | None = None,
         on_progress: Callable[[AgentProgress], None] | None = None,
     ) -> AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended:
+        metadata = await self.get_task_orchestration_metadata(task_id)
+        if metadata.orchestration_mode is OrchestrationMode.LEGACY:
+            await self.require_legacy_task_orchestration(task_id)
+        elif metadata.orchestration_mode is not OrchestrationMode.SINGLE_LOOP:
+            raise InvalidTurnState(
+                f"unsupported orchestration mode: {metadata.orchestration_mode.value}"
+            )
         # Spec §5.1: a resume starts a new in-process scope generation.
         await self._close_cancellation_scope(task_id)
         await self.recover_workspace_transactions(task_id)
@@ -2575,6 +2704,16 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             return await self._suspend_unknown_tool_outcome(
                 blocked_checkpoint, approved_call, result
             )
+        if metadata.orchestration_mode is OrchestrationMode.SINGLE_LOOP:
+            from .single_loop.loop import SingleAgentLoop
+
+            return await SingleAgentLoop(self).continue_after_approval(
+                resumed,
+                visible_tools,
+                tool_message,
+                on_text_delta=on_text_delta,
+                on_progress=on_progress,
+            )
         return await self._continue_agent_turn(
             resumed, visible_tools, initial_tool_message=tool_message,
             on_text_delta=on_text_delta,
@@ -2586,7 +2725,16 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         on_text_delta: Callable[[str], None] | None = None,
         on_progress: Callable[[AgentProgress], None] | None = None,
     ) -> AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended:
-        """Resume an interrupted Agent loop without granting new authority."""
+        metadata = await self.get_task_orchestration_metadata(task_id)
+        if metadata.orchestration_mode is OrchestrationMode.SINGLE_LOOP:
+            from .single_loop.loop import SingleAgentLoop
+
+            return await SingleAgentLoop(self).resume_checkpoint(
+                task_id,
+                on_text_delta=on_text_delta,
+                on_progress=on_progress,
+            )
+        await self.require_legacy_task_orchestration(task_id)
         # Spec §5.1: a resume starts a new in-process scope generation.
         await self._close_cancellation_scope(task_id)
         await self.recover_workspace_transactions(task_id)
@@ -2722,11 +2870,12 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         | AgentContinuationSuspended
     ):
         """Resume a model-selected completed-unit boundary without authority."""
-        # Spec §5.1: a resume starts a new in-process scope generation.
-        await self._close_cancellation_scope(task_id)
         normalized = user_text.strip()
         if not normalized or not input_id.strip():
             raise ValueError("continuation input and input_id are required")
+        await self.require_legacy_task_orchestration(task_id)
+        # Spec §5.1: a resume starts a new in-process scope generation.
+        await self._close_cancellation_scope(task_id)
         stored = await self._require_stored_task(task_id)
         task = TaskSnapshot.from_data(stored.data)
         if task.state is not TaskState.AWAITING_USER:
@@ -2947,6 +3096,7 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                 f"clarification is not pending: {request_id}"
             )
         task = TaskSnapshot.from_data(stored.data)
+        await self.require_legacy_task_orchestration(task.task_id)
         request = task.pending_clarification
         if task.state is not TaskState.AWAITING_USER or request is None:
             raise ClarificationNotPending(
@@ -3420,6 +3570,7 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended
         | AgentContinuationSuspended
     ):
+        await self.require_legacy_task_orchestration(checkpoint.task_id)
         state = TurnState(
             task_id=checkpoint.task_id, turn_id=checkpoint.turn_id,
             visible_tools=visible_tools,

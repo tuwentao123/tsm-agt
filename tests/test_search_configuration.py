@@ -118,3 +118,34 @@ class SearchConfigurationWiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DocumentCacheConfigurationTest(unittest.TestCase):
+    def test_document_cache_settings_load_with_environment_precedence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text(
+                "TSM_AGT_WEB_DOCUMENT_CACHE_MAX_ENTRIES=7\n"
+                "TSM_AGT_WEB_DOCUMENT_CACHE_MAX_BYTES=8192\n"
+                "TSM_AGT_WEB_REFERENCE_CACHE_MAX_ENTRIES=11\n"
+                "TSM_AGT_WEB_DOCUMENT_CACHE_TTL_SECONDS=42.5\n",
+                encoding="utf-8",
+            )
+            configuration = load_search_configuration(
+                path, {"TSM_AGT_WEB_DOCUMENT_CACHE_MAX_ENTRIES": "9"},
+            )
+        self.assertEqual(configuration.document_cache_max_entries, 9)
+        self.assertEqual(configuration.document_cache_max_bytes, 8192)
+        self.assertEqual(configuration.reference_cache_max_entries, 11)
+        self.assertEqual(configuration.document_cache_ttl_seconds, 42.5)
+        self.assertEqual(
+            configuration.sources["web.document_cache_max_entries"], "environment",
+        )
+
+    def test_invalid_document_cache_values_fall_back_without_startup_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text("TSM_AGT_WEB_DOCUMENT_CACHE_MAX_ENTRIES=0\n", encoding="utf-8")
+            configuration = load_search_configuration(path, {})
+        self.assertEqual(configuration.document_cache_max_entries, 32)
+        self.assertIn("TSM_AGT_WEB_DOCUMENT_CACHE_MAX_ENTRIES", configuration.issues[0])

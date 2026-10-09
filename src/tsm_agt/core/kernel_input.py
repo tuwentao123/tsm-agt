@@ -49,6 +49,7 @@ from .agent_loop import (
 )
 from .cancellation import note_cancel_requested
 from .configuration import canonical_hash
+from .single_loop import OrchestrationMode, TaskBindingDecision
 from .evidence_question import (
     EvidenceQuestionProjector, ToolActionDisposition
 )
@@ -81,7 +82,7 @@ class InputMixin:
         on_text_delta: Callable[[str], None] | None = None,
         on_progress: Callable[[AgentProgress], None] | None = None,
     ) -> (
-        RuntimeInputRoute | SessionInputDecision | TaskSnapshot
+        RuntimeInputRoute | SessionInputDecision | TaskBindingDecision | TaskSnapshot
         | AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended
     ):
         """Route typed input before any semantic interpretation.
@@ -175,9 +176,19 @@ class InputMixin:
         on_progress: Callable[[AgentProgress], None] | None = None,
     ):
         del on_text_delta, on_progress  # this route publishes neither
+        if self._dependencies.orchestration_mode is OrchestrationMode.SINGLE_LOOP:
+            return await self.bind_session_input(
+                event.session_id,
+                current_input_event_ref=f"input:{event.input_id}",
+                explicit_task_id=event.shadow_explicit_task_id,
+                new_task_requested=event.shadow_new_task_requested,
+            )
         return await self.resolve_session_input(
-            event.session_id, event.text,
+            event.session_id,
+            event.text,
             Path(event.workspace) if event.workspace else None,
+            shadow_explicit_task_id=event.shadow_explicit_task_id,
+            shadow_new_task_requested=event.shadow_new_task_requested,
         )
 
     async def _handle_runtime_text(

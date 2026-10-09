@@ -258,6 +258,22 @@ class RuleBasedExplorationBudgetPolicy:
         """Allow bounded evidence completion, not a new broad investigation."""
         if action is None:
             return False
+        if call.name == "core.search_files":
+            target = call.arguments.get("target", "content")
+            if target == "files":
+                pattern = call.arguments.get("pattern")
+                limit = call.arguments.get("limit", 20)
+                return (
+                    isinstance(pattern, str)
+                    and bool(pattern.strip())
+                    and pattern.strip() not in {"*", "**/*"}
+                    and isinstance(limit, int) and 0 < limit <= 20
+                )
+            path = call.arguments.get("path")
+            if not isinstance(path, str) or path.strip() in {"", "."}:
+                return False
+            raw_limit = call.arguments.get("limit", 20)
+            return isinstance(raw_limit, int) and 0 < raw_limit <= 20
         if call.name in {"core.search_text", "core.grep_search"}:
             path = call.arguments.get("path")
             if not isinstance(path, str) or path.strip() in {"", "."}:

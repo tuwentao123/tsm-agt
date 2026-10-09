@@ -288,6 +288,31 @@ class SessionRestoreEndpointTest(unittest.IsolatedAsyncioTestCase):
                 {"request_id": "approval-1", "action": "core.apply_patch"}
                 if waiting_approval else None
             ),
+            todo_list={
+                "revision": 3,
+                "todos": [{
+                    "id": "implement", "content": "Implement the feature",
+                    "status": "in_progress",
+                    "completion_criteria": "Feature is verified",
+                }],
+                "summary": {
+                    "total": 1, "pending": 0, "in_progress": 1,
+                    "completed": 0, "blocked": 0,
+                },
+            },
+            single_loop={
+                "orchestration_mode": "SINGLE_LOOP",
+                "root_goal": "new goal",
+                "binding": {"kind": "ACTIVE_CONTINUATION"},
+                "turn_intent": {"intent": "INVESTIGATE"},
+                "open_obligations": [{"question_ref": "Q1", "status": "OPEN"}],
+                "accepted_evidence": [{"evidence_id": "e1"}],
+                "incomplete_boundary": {
+                    "turn_id": "turn-1",
+                    "reason": "completion_gaps_unrecoverable",
+                    "gaps": [{"code": "NET_MUTATION_MISSING", "detail": "Mutation is still required."}],
+                },
+            },
         )
         return _FakeRuntimeServer(_FakeKernel(sessions, tasks, projection), result)
 
@@ -329,6 +354,23 @@ class SessionRestoreEndpointTest(unittest.IsolatedAsyncioTestCase):
             ["task-old", "task-new"],
         )
         self.assertEqual(payload["tasks"][1]["progress_cursor"], 7)
+        self.assertEqual(payload["tasks"][1]["todo_list"]["revision"], 3)
+        self.assertEqual(
+            payload["tasks"][1]["todo_list"]["todos"][0]["status"],
+            "in_progress",
+        )
+        self.assertEqual(
+            payload["tasks"][1]["single_loop"]["orchestration_mode"],
+            "SINGLE_LOOP",
+        )
+        self.assertEqual(
+            payload["tasks"][1]["single_loop"]["binding"]["kind"],
+            "ACTIVE_CONTINUATION",
+        )
+        self.assertEqual(
+            payload["tasks"][1]["single_loop"]["incomplete_boundary"]["gaps"][0]["code"],
+            "NET_MUTATION_MISSING",
+        )
         self.assertEqual(
             [item["attached_sequence"] for item in payload["tasks"]],
             [1, 4],
@@ -406,6 +448,9 @@ class StreamResilienceUiTest(unittest.TestCase):
         # running, so a retry plus a durable catch-up is the contract.
         self.assertIn("MAX_STREAM_RETRIES", html)
         self.assertIn("const reconcile = async () =>", html)
+        self.assertIn("progress.tool_name === 'core.todo_list'", html)
+        self.assertIn("progress.ok === true", html)
+        self.assertIn("current.task.todoList = state.todo_list || null", html)
         self.assertIn("setTimeout(connect,", html)
         self.assertIn("任务仍在后台运行", html)
 
@@ -416,6 +461,7 @@ class StreamResilienceUiTest(unittest.TestCase):
         self.assertIn("async function loadSessions()", html)
         self.assertIn("await loadSessions();", html)
         self.assertIn("ensureConversationLoaded(", html)
+        self.assertIn("todoList: task.todo_list || null", html)
         self.assertIn("const activeTask = tasksById.get(data.active_task_id)", html)
         self.assertIn("followTask(activeTask.task_id, conversationId)", html)
         self.assertIn("['PREPARING', 'RUNNING'].includes", html)
@@ -444,6 +490,18 @@ class _StreamClient:
         return RuntimeTaskResult(
             task_id=task_id, state="SUCCEEDED", phase1_state="DONE",
             status="completed", cursor=12,
+            single_loop={
+                "orchestration_mode": "SINGLE_LOOP",
+                "binding": {"kind": "NEW"},
+                "turn_intent": None,
+                "open_obligations": [],
+                "accepted_evidence": [],
+                "incomplete_boundary": {
+                    "turn_id": "turn-stream",
+                    "reason": "completion_gaps_unrecoverable",
+                    "gaps": [{"code": "NET_MUTATION_MISSING", "detail": "Mutation is still required."}],
+                },
+            },
         )
 
 
@@ -472,6 +530,11 @@ class StreamCursorProtocolTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("id: 9\n", chunk)
             self.assertIn('"sequence": 9', chunk)
             self.assertEqual(server._client.afters[0], 8)
+            final = await anext(response.body_iterator)
+            if isinstance(final, bytes):
+                final = final.decode("utf-8")
+            self.assertIn('"single_loop"', final)
+            self.assertIn('"orchestration_mode": "SINGLE_LOOP"', final)
             await response.body_iterator.aclose()
         finally:
             web_app.runtime_server = previous
@@ -533,3 +596,11 @@ class TaskCardIsolationUiTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LegacyTaskModeDisplayTest(unittest.TestCase):
+    def test_legacy_task_without_single_loop_metadata_displays_legacy_mode(self) -> None:
+        self.assertIn(
+            "return taskSingleLoop(task)?.orchestration_mode || 'LEGACY';",
+            web_app.INDEX_HTML,
+        )

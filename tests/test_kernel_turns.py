@@ -184,6 +184,18 @@ class KernelTurnTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("input", events[-3].payload)
             self.assertNotIn("input_content_hash", events[-3].payload)
             self.assertEqual(events[-3].payload["input_role"], "user")
+            self.assertEqual(events[-3].payload["orchestration_mode"], "LEGACY")
+            self.assertTrue(
+                events[-3].payload["current_input_ref"].startswith("message:")
+            )
+            self.assertEqual(
+                events[-2].payload["orchestration_mode"], "LEGACY"
+            )
+            self.assertEqual(
+                events[-2].payload["current_input_ref"],
+                events[-3].payload["current_input_ref"],
+            )
+            self.assertIn("prompt_projection_hash", events[-2].payload)
             self.assertIn("effective_prompt_hash", events[-2].payload)
             self.assertIn("prompt_manifest_hash", events[-2].payload)
             diagnostics = events[-2].payload["response_diagnostics"]
@@ -267,7 +279,10 @@ class KernelTurnTest(unittest.IsolatedAsyncioTestCase):
                 event for event in session_events
                 if event.event_type == "session.task_result_recorded"
             )
-            self.assertEqual(recorded.payload["answer_event_ref"], events[-3].event_id)
+            answer = next(
+                event for event in events if event.event_type == "llm.completed"
+            )
+            self.assertEqual(recorded.payload["answer_event_ref"], answer.event_id)
             self.assertEqual(
                 recorded.payload["conclusion_validation"], validation.payload["validation"]
             )

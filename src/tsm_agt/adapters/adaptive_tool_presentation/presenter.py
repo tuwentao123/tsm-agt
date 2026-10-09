@@ -64,7 +64,9 @@ class AdaptiveToolArgumentPresenter:
     def present(
         self, tool_name: str, arguments: Mapping[str, Any]
     ) -> ToolArgumentPresentation:
-        if tool_name in {"core.apply_patch", "core.apply_patches"}:
+        if tool_name in {
+            "core.apply_patch", "core.apply_patch_v4a", "core.apply_patches",
+        }:
             patches = self._patches(tool_name, arguments)
             if patches:
                 return self._present_patches(patches)
@@ -74,7 +76,7 @@ class AdaptiveToolArgumentPresenter:
     def _patches(
         tool_name: str, arguments: Mapping[str, Any]
     ) -> tuple[Mapping[str, Any], ...]:
-        if tool_name == "core.apply_patch":
+        if tool_name in {"core.apply_patch", "core.apply_patch_v4a"}:
             return (arguments,) if isinstance(arguments.get("edits"), Sequence) else ()
         raw = arguments.get("patches")
         if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):

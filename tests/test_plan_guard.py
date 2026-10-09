@@ -188,7 +188,7 @@ class PlanGuardKernelTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             model = RepeatingModel()
             tool = CountingReadTool()
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=model, tool_adapters=(tool,)
             )
             await app.registry.start_all()
@@ -235,3 +235,11 @@ class PlanGuardKernelTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from tsm_agt.core.single_loop import OrchestrationMode
+
+
+def compose_legacy_fixture_application(*args, **kwargs):
+    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
+    return compose_fixture_application(*args, **kwargs)

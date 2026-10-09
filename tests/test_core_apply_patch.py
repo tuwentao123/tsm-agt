@@ -50,6 +50,13 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
             "path": path, "expected_hash": expected_hash, "edits": edits,
         })
 
+    def v4a_call(
+        self, call_id: str, expected_hash: str, patch: str,
+    ) -> ToolCall:
+        return ToolCall(call_id, "core.apply_patch_v4a", {
+            "expected_hash": expected_hash, "patch": patch,
+        })
+
     async def approve(self, call: ToolCall, turn_id: str = "turn-patch"):
         with self.assertRaises(ApprovalRequired) as caught:
             await self.application.kernel.invoke_tool(
@@ -87,6 +94,67 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.data, journal[0].to_data())
         self.assertNotIn("content", result.data)
         self.assertEqual(journal[0].step_id, request.invocation_id)
+
+    async def test_v4a_patch_applies_a_multiline_update(self) -> None:
+        target = self.workspace / "app.py"
+        before = "title = 'old'\nbody = 'keep'\n"
+        target.write_text(before, encoding="utf-8")
+        patch = """*** Begin Patch
+*** Update File: app.py
+@@
+-title = 'old'
++title = 'new'
+*** End Patch"""
+
+        result = await self.approve(
+            self.v4a_call("call-v4a", sha256(before), patch), "turn-v4a"
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["patch_format"], "v4a")
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), "title = 'new'\nbody = 'keep'\n"
+        )
+
+    async def test_literal_newline_escape_gets_a_specific_recovery_hint(self) -> None:
+        target = self.workspace / "multiline.html"
+        content = "<div>\n  <button>cancel</button>\n</div>\n"
+        target.write_text(content, encoding="utf-8")
+
+        result = await self.approve(
+            self.call(
+                "call-literal-newline", target.name, sha256(content),
+                [{"old_text": r"<div>\n  <button>cancel</button>\n</div>",
+                  "new_text": "updated"}],
+            ),
+            "turn-literal-newline",
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "PATCH_LITERAL_NEWLINE_ESCAPE")
+        self.assertEqual(
+            result.recovery_action["required_change"],
+            "reissue_v4a_with_actual_newlines",
+        )
+        self.assertEqual(target.read_text(encoding="utf-8"), content)
+
+    async def test_v4a_literal_newline_escape_is_rejected_without_write(self) -> None:
+        target = self.workspace / "literal-v4a.txt"
+        content = "before\n"
+        target.write_text(content, encoding="utf-8")
+        escaped_patch = (
+            "*** Begin Patch\\n*** Update File: literal-v4a.txt\\n@@\\n"
+            "-before\\n+after\\n*** End Patch"
+        )
+
+        result = await self.approve(
+            self.v4a_call("call-v4a-literal", sha256(content), escaped_patch),
+            "turn-v4a-literal",
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "PATCH_LITERAL_NEWLINE_ESCAPE")
+        self.assertEqual(target.read_text(encoding="utf-8"), content)
 
     async def test_creates_file_with_null_hash_and_empty_old_text(self) -> None:
         result = await self.approve(self.call(

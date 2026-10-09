@@ -17,6 +17,7 @@ from tsm_agt.core import (
     ModelInvocationFailed, ProjectTrustLevel, SessionResumeCandidate,
     SessionResumeSafety, TaskState,
 )
+from tsm_agt.core.single_loop import OrchestrationMode
 from tsm_agt.ports import RuntimeStorePort
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, FinishReason, HealthState, HealthStatus,
@@ -147,6 +148,11 @@ class FailFirstNChatModel(EchoModelProvider):
 
 
 class RecordingChatModel(EchoModelProvider):
+    # The full Session history plus the V4A patch tool schema must fit before
+    # the model is invoked; reserve output tokens still leave this fixture room
+    # to exercise semantic routing rather than context-window rejection.
+    capabilities = ProviderCapabilities(tools=True, context_window=4500)
+
     def __init__(self) -> None:
         super().__init__()
         self.requests: list[ModelRequest] = []
@@ -241,6 +247,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             application = compose_fixture_application(
                 model_adapter=model, tool_adapters=(tool,),
                 session_input_resolver_adapter=resolver,
+                orchestration_mode=OrchestrationMode.LEGACY,
                 runtime_input_classifier_adapter=FailingRuntimeInputClassifier(),
                 store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
             )
@@ -327,6 +334,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             application = compose_fixture_application(
                 model_adapter=model, tool_adapters=(tool,),
                 session_input_resolver_adapter=resolver,
+                orchestration_mode=OrchestrationMode.LEGACY,
                 runtime_input_classifier_adapter=FailingRuntimeInputClassifier(),
                 store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
             )
@@ -399,6 +407,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             application = compose_fixture_application(
                 model_adapter=model, tool_adapters=(),
                 session_input_resolver_adapter=resolver,
+                orchestration_mode=OrchestrationMode.LEGACY,
                 store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
             )
             await application.registry.start_all()
@@ -465,6 +474,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             application = compose_fixture_application(
                 model_adapter=model, tool_adapters=(),
                 session_input_resolver_adapter=resolver,
+                orchestration_mode=OrchestrationMode.LEGACY,
                 store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
             )
             await application.registry.start_all()
@@ -616,6 +626,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             application = compose_fixture_application(
                 model_adapter=model, tool_adapters=(),
                 session_input_resolver_adapter=resolver,
+                orchestration_mode=OrchestrationMode.LEGACY,
             )
             output: list[str] = []
             result = await _chat(
@@ -693,6 +704,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             application = compose_fixture_application(
                 model_adapter=model, tool_adapters=(),
                 session_input_resolver_adapter=resolver,
+                orchestration_mode=OrchestrationMode.LEGACY,
             )
             output: list[str] = []
             await _chat(
@@ -739,6 +751,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             application = compose_fixture_application(
                 model_adapter=model, tool_adapters=(),
                 session_input_resolver_adapter=resolver,
+                orchestration_mode=OrchestrationMode.LEGACY,
             )
             output: list[str] = []
             await _chat(
@@ -825,7 +838,9 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             model = RecordingChatModel()
             application = compose_fixture_application(
-                model_adapter=model, tool_adapters=()
+                model_adapter=model,
+                tool_adapters=(),
+                orchestration_mode=OrchestrationMode.LEGACY,
             )
             output: list[str] = []
             await _chat(
@@ -901,6 +916,7 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
             application = compose_fixture_application(
                 model_adapter=model, tool_adapters=(),
                 session_input_resolver_adapter=resolver,
+                orchestration_mode=OrchestrationMode.LEGACY,
             )
             prompts = [
                 "分析当前工程能力",
@@ -947,7 +963,9 @@ class InteractiveChatCliTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             application = compose_fixture_application(
-                model_adapter=EchoModelProvider(), tool_adapters=(),
+                model_adapter=EchoModelProvider(),
+                tool_adapters=(),
+                orchestration_mode=OrchestrationMode.LEGACY,
             )
             await application.registry.start_all()
             session = await application.kernel.create_session("legacy menu")
@@ -1220,8 +1238,10 @@ class SessionAnswerCliTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             application = compose_fixture_application(
-                model_adapter=SessionAnswerModel(), tool_adapters=(),
+                model_adapter=SessionAnswerModel(),
+                tool_adapters=(),
                 session_input_resolver_adapter=AnsweringSessionInputResolver(),
+                orchestration_mode=OrchestrationMode.LEGACY,
             )
             await application.registry.start_all()
             try:

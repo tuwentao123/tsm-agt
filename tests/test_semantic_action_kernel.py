@@ -70,7 +70,7 @@ class SearchTool:
 class SemanticActionKernelTest(unittest.IsolatedAsyncioTestCase):
     async def test_kernel_persists_redacted_semantic_action_before_tool(self):
         with tempfile.TemporaryDirectory() as directory:
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=OneSearchModel(), tool_adapters=(SearchTool(),),
                 require_evidence_questions=True,
                 semantic_action_classifier_adapter=RuleBasedSemanticActionClassifier(),
@@ -183,7 +183,7 @@ class SemanticNoProgressKernelTest(unittest.IsolatedAsyncioTestCase):
     async def test_changed_scopes_same_semantic_action_stop_after_three_zero_deltas(self):
         with tempfile.TemporaryDirectory() as directory:
             tool = EmptySearchTool()
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=ScopedSearchModel(), tool_adapters=(tool,),
                 require_evidence_questions=True,
                 evidence_delta_evaluator_adapter=StructuredEvidenceDeltaEvaluator(),
@@ -229,3 +229,11 @@ class SemanticNoProgressKernelTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from tsm_agt.core.single_loop import OrchestrationMode
+
+
+def compose_legacy_fixture_application(*args, **kwargs):
+    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
+    return compose_fixture_application(*args, **kwargs)

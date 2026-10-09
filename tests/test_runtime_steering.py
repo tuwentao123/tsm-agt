@@ -139,7 +139,7 @@ class RuntimeSteeringKernelTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = FinalMidFlightModel()
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=model, tool_adapters=()
             )
             await app.registry.start_all()
@@ -181,7 +181,7 @@ class RuntimeSteeringKernelTest(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             model = MidFlightModel()
             tool = CountingTool()
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=model, tool_adapters=(tool,)
             )
             await app.registry.start_all()
@@ -223,7 +223,7 @@ class RuntimeSteeringKernelTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = CapturingModel()
-            app = compose_fixture_application(model_adapter=model, tool_adapters=())
+            app = compose_legacy_fixture_application(model_adapter=model, tool_adapters=())
             await app.registry.start_all()
             try:
                 task = await executing_task(app, root)
@@ -258,7 +258,7 @@ class RuntimeSteeringKernelTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = PendingToolModel()
-            app = compose_fixture_application(model_adapter=model, tool_adapters=())
+            app = compose_legacy_fixture_application(model_adapter=model, tool_adapters=())
             await app.registry.start_all()
             try:
                 task = await executing_task(app, root, "replace-task")
@@ -314,7 +314,7 @@ class RuntimeSteeringKernelTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = root / "runtime.db"
-            first = compose_fixture_application(
+            first = compose_legacy_fixture_application(
                 model_adapter=CapturingModel(), tool_adapters=(),
                 store_adapter=SQLiteRuntimeStore(database),
             )
@@ -334,7 +334,7 @@ class RuntimeSteeringKernelTest(unittest.IsolatedAsyncioTestCase):
                     )
             finally:
                 await first.registry.stop_all()
-            second = compose_fixture_application(
+            second = compose_legacy_fixture_application(
                 model_adapter=CapturingModel(), tool_adapters=(),
                 store_adapter=SQLiteRuntimeStore(database),
             )
@@ -350,7 +350,7 @@ class RuntimeSteeringSdkTest(unittest.IsolatedAsyncioTestCase):
     async def test_sdk_commands_are_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=CapturingModel(), tool_adapters=()
             )
             client = EngineeringAgentClient(root, application_factory=lambda: app)
@@ -375,3 +375,11 @@ class RuntimeSteeringSdkTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from tsm_agt.core.single_loop import OrchestrationMode
+
+
+def compose_legacy_fixture_application(*args, **kwargs):
+    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
+    return compose_fixture_application(*args, **kwargs)

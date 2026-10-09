@@ -659,6 +659,17 @@ class AgentTurnResult:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentTurnIncomplete:
+    """A completion claim could not be repaired inside the current turn budget."""
+
+    task_id: str
+    turn_id: str
+    revision: int
+    reason: str
+    gaps: tuple[Mapping[str, Any], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class AgentTurnSuspended:
     task_id: str
     turn_id: str

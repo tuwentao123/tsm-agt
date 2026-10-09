@@ -104,8 +104,8 @@ class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
 
         result = await self.provider.invoke(
             ToolCall(
-                "find-known", "core.find_files",
-                {"pattern": "dialog_call_confirm.xml"},
+                "find-known", "core.search_files",
+                {"pattern": "dialog_call_confirm.xml", "target": "files"},
             ),
             self.context,
         )
@@ -117,6 +117,44 @@ class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertGreaterEqual(
             result.data["generated_directories_skipped"], 1
+        )
+        self.assertEqual(result.data["search_target"], "file_names_and_paths")
+        self.assertIn("File-name matches are candidates", result.hint)
+        self.assertIn("target='content'", result.hint)
+
+    async def test_search_files_defaults_to_content_and_switches_to_file_names(self) -> None:
+        src = self.workspace / "src"
+        src.mkdir(exist_ok=True)
+        (src / "ui.py").write_text(
+            "button_id = 'cancel-btn'\n", encoding="utf-8"
+        )
+        (src / "cancel_helpers.py").write_text("pass\n", encoding="utf-8")
+
+        content = await self.provider.invoke(
+            ToolCall(
+                "search-content", "core.search_files",
+                {"pattern": "cancel-btn", "path": "src"},
+            ),
+            self.context,
+        )
+        files = await self.provider.invoke(
+            ToolCall(
+                "search-files", "core.search_files",
+                {"pattern": "*cancel*", "target": "files", "path": "src"},
+            ),
+            self.context,
+        )
+
+        self.assertTrue(content.ok)
+        self.assertEqual(content.data["search_target"], "content")
+        self.assertEqual(
+            [item["path"] for item in content.data["matches"]], ["src/ui.py"]
+        )
+        self.assertTrue(files.ok)
+        self.assertEqual(files.data["search_target"], "file_names_and_paths")
+        self.assertEqual(
+            [item["path"] for item in files.data["matches"]],
+            ["src/cancel_helpers.py"],
         )
 
     async def test_find_files_supports_relative_path_glob(self) -> None:
@@ -302,28 +340,31 @@ class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
         literal = await self.provider.invoke(
             ToolCall(
                 "call-1",
-                "core.search_text",
-                {"query": "kernel", "path": "."},
+                "core.search_files",
+                {"pattern": "kernel", "path": "."},
             ),
             self.context,
         )
         regex = await self.provider.invoke(
             ToolCall(
                 "call-2",
-                "core.search_text",
+                "core.search_files",
                 {
-                    "query": "class\\s+Kernel",
+                    "pattern": "class\\s+Kernel",
+                    "target": "content",
                     "path": "src",
                     "regex": True,
                     "case_sensitive": True,
-                    "max_matches": 1,
+                    "limit": 1,
                 },
             ),
             self.context,
         )
 
         self.assertTrue(literal.ok)
+        self.assertEqual(literal.data["search_target"], "content")
         self.assertEqual(len(literal.data["matches"]), 2)
+        self.assertIn("core.read_file", literal.hint)
         self.assertTrue(regex.ok)
         self.assertEqual(regex.data["matches"][0]["path"], "src/app.py")
         self.assertTrue(regex.truncated)

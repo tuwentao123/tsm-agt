@@ -44,6 +44,18 @@ class _FakeRuntimeServer:
                 }],
                 "conclusion_validation": {"status": "valid"},
             },
+            todo_list={
+                "revision": 2,
+                "todos": [{
+                    "id": "inspect", "content": "Inspect the project",
+                    "status": "completed",
+                    "completion_criteria": "Project structure is known",
+                }],
+                "summary": {
+                    "total": 1, "pending": 0, "in_progress": 0,
+                    "completed": 1, "blocked": 0,
+                },
+            },
             latest_answer_event_ref="evt-web-answer",
             conclusion_claims=({
                 "claim_id": "claim-web", "summary": "web projection",
@@ -69,9 +81,36 @@ class WebPhase1StateTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["latest_answer_event_ref"], "evt-web-answer")
         self.assertEqual(response["conclusion_claims"][0]["claim_id"], "claim-web")
         self.assertEqual(response["conclusion_validation"]["status"], "valid")
+        self.assertEqual(response["todo_list"]["revision"], 2)
+        self.assertEqual(
+            response["todo_list"]["todos"][0]["status"], "completed"
+        )
         for label in ("执行状态", "领域检查", "模型结论", "引用校验"):
             self.assertIn(label, web_app.INDEX_HTML)
         self.assertIn("applyTaskProtocol", web_app.INDEX_HTML)
+        self.assertIn("function renderTodoPanel(todoList)", web_app.INDEX_HTML)
+        self.assertIn("renderTodoPanel(task.todoList)", web_app.INDEX_HTML)
+
+    async def test_ui_projects_incomplete_boundary_without_success_presentation(
+        self,
+    ) -> None:
+        html = web_app.INDEX_HTML
+
+        self.assertIn("任务暂未完成", html)
+        self.assertIn("当前无法安全声明任务已完成，已保留本次进度和已获取的证据。", html)
+        self.assertIn("另有 ${gaps.length - 3} 项未完成", html)
+        self.assertIn("继续排查", html)
+        self.assertIn("提供信息", html)
+        self.assertIn("新建任务", html)
+        self.assertIn("需要你的确认后才能继续", html)
+        self.assertIn("查看并确认", html)
+        self.assertIn("singleLoop: task.single_loop || null", html)
+        self.assertIn("taskOrchestrationMode(task)", html)
+        self.assertIn("renderSingleLoopCompletion(task)", html)
+        self.assertIn("completion.committed_delta", html)
+        self.assertIn("completion.divergences", html)
+        self.assertIn("completion-value", html)
+        self.assertIn("task-card-state.incomplete", html)
 
 
 class WorkspaceDirectoryPickerTest(unittest.IsolatedAsyncioTestCase):

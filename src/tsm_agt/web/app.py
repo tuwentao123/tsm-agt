@@ -22,6 +22,7 @@ from tsm_agt.core import (
 )
 from tsm_agt.local_api import LocalEventApiServer
 from tsm_agt.ports import ImageBlock
+from tsm_agt.ports.evidence import TaskContract
 
 app = FastAPI(title="tsm-agt-web")
 WEBUI_VERSION = "deepseek-cn-v20260921-session-timeline-order"
@@ -159,6 +160,18 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .task-summary-item{background:#f8fafc;border:1px solid #d9e1ec;border-radius:10px;padding:8px 10px;min-height:0}
 .task-summary-label{font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:.06em}
 .task-summary-value{margin-top:3px;font-size:13px;font-weight:700;color:#111827;line-height:1.2}
+.todo-panel{display:flex;flex-direction:column;gap:9px;padding:11px 12px;border:1px solid #d9e1ec;border-radius:12px;background:#fff}
+.todo-panel-header{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.todo-panel-title{font-size:12px;font-weight:700;color:#111827}
+.todo-panel-summary{font-size:11px;color:#64748b}
+.todo-list{display:flex;flex-direction:column;gap:7px}
+.todo-item{display:grid;grid-template-columns:18px minmax(0,1fr);gap:8px;align-items:start;padding:7px 8px;border-radius:9px;background:#f8fafc;border:1px solid #e2e8f0}
+.todo-marker{width:16px;height:16px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:1px solid #94a3b8;color:#64748b;font-size:10px;font-weight:700;margin-top:1px}
+.todo-item.in_progress{border-color:#93c5fd;background:#eff6ff}.todo-item.in_progress .todo-marker{border-color:#3b82f6;background:#3b82f6;color:#fff}
+.todo-item.completed .todo-marker{border-color:#22c55e;background:#22c55e;color:#fff}.todo-item.completed .todo-content{text-decoration:line-through;color:#94a3b8}
+.todo-item.blocked{border-color:#fca5a5;background:#fff1f2}.todo-item.blocked .todo-marker{border-color:#ef4444;background:#ef4444;color:#fff}
+.todo-content{font-size:12px;color:#334155;line-height:1.45;word-break:break-word}
+.todo-criteria{margin-top:2px;font-size:10px;color:#94a3b8;line-height:1.35}
 .task-panel{display:none}
 .task-panel.active{display:flex;flex-direction:column;gap:8px}
 .task-collapse-toggle{display:flex;align-items:center;justify-content:center;gap:6px;padding:8px 12px;border-radius:10px;border:1px solid #d9e1ec;background:#f8fafc;color:#475569;font-size:12px;font-weight:600;cursor:pointer;transition:all .15s ease}
@@ -183,7 +196,9 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .task-card-header{display:flex;justify-content:space-between;gap:12px;align-items:center}
 .task-card-title{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .task-card-state{font-size:12px;color:var(--muted);flex:none}
-.task-card-state.running{color:#8ab4f8}.task-card-state.waiting{color:#f0c674}.task-card-state.failed{color:#f4837a}.task-card-state.done{color:#81c995}
+.task-card-state.running{color:#8ab4f8}.task-card-state.waiting{color:#f0c674}.task-card-state.incomplete{color:#c68a00}.task-card-state.failed{color:#f4837a}.task-card-state.done{color:#81c995}
+.incomplete-boundary{border:1px solid #f1d18a;background:#fffaf0;border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px}.incomplete-title{font-weight:700;color:#7c5200}.incomplete-copy,.incomplete-gap{font-size:12px;color:#6b5a36}.incomplete-actions{display:flex;flex-wrap:wrap;gap:8px}.incomplete-actions button{border:1px solid #d9b95c;padding:6px 10px;background:#fff;color:#6b4b00}.incomplete-actions button.primary{background:#9a6700;color:#fff;border-color:#9a6700}
+.completion-panel{display:flex;flex-direction:column;gap:6px;padding:10px 12px;border:1px solid #d9e1ec;border-radius:12px;background:#f8fafc}.completion-title{font-size:12px;font-weight:700;color:#1e293b}.completion-summary,.completion-item{font-size:11px;line-height:1.45;color:#475569;word-break:break-word}.completion-item{display:grid;grid-template-columns:108px minmax(0,1fr);gap:8px}.completion-label{font-weight:600;color:#334155}.completion-value{color:#64748b}
 .task-progress{display:flex;flex-direction:column;gap:3px;border-top:1px solid var(--border);padding-top:7px}
 .task-progress-line{font-size:12px;color:var(--muted);white-space:pre-wrap;word-break:break-word}
 .task-progress-line.markdown-progress{padding:0;border:none;background:transparent;white-space:normal;color:#475569;font-size:14px;line-height:1.68}
@@ -305,11 +320,12 @@ textarea:focus{border-color:#91caff;background:#ffffff;box-shadow:0 0 0 3px rgba
 textarea::placeholder{color:#94a3b8}
 .composer-actions{display:flex;flex-direction:column;align-items:flex-start;justify-content:flex-start;gap:8px;flex-shrink:0;min-height:40px}
 .composer-action-buttons{display:flex;align-items:center;gap:10px}
-.send-btn,.cancel-btn{display:inline-flex;align-items:center;justify-content:center;min-height:40px;color:#fff;padding:9px 16px;border-radius:8px;font-weight:600;letter-spacing:.01em;transition:background .2s ease,box-shadow .2s ease}
-.send-btn{background:linear-gradient(135deg,#4096ff,#1677ff);box-shadow:0 6px 14px rgba(22,119,255,.16)}
-.cancel-btn{background:linear-gradient(135deg,#ff7875,#cf1322);box-shadow:0 6px 14px rgba(207,19,34,.24)}
+.send-btn,.cancel-btn{display:inline-flex;align-items:center;justify-content:center;min-height:32px;color:#fff;padding:6px 12px;border-radius:6px;font-weight:600;letter-spacing:.01em;transition:background .2s ease,box-shadow .2s ease,border-color .2s ease}
+.send-btn{background:linear-gradient(135deg,#4096ff,#1677ff);box-shadow:0 4px 10px rgba(22,119,255,.16)}
+/* Softer cancel button: slightly smaller, lighter background and non-solid border */
+.cancel-btn{background:linear-gradient(135deg,#ffd1cc,#ff7875);border:1px solid rgba(255,120,117,.6);color:#8c1f1a;box-shadow:0 3px 8px rgba(207,19,34,.18)}
 .cancel-btn.hidden{display:none}
-.send-btn:disabled,.cancel-btn:disabled{background:#3a4560;box-shadow:none;cursor:not-allowed}
+.send-btn:disabled,.cancel-btn:disabled{background:#3a4560;box-shadow:none;cursor:not-allowed;border-color:transparent}
 .preview-list{display:flex;gap:8px;overflow:auto}
 .preview-item{position:relative;flex:none}
 .preview-item img{width:40px;height:40px;object-fit:cover;border-radius:6px;display:block;border:1px solid var(--border);cursor:pointer;transition:transform .16s ease,box-shadow .16s ease}
@@ -392,23 +408,17 @@ textarea::placeholder{color:#94a3b8}
           <img id=\"image-preview-target\" src=\"\" alt=\"图片预览\" />
         </div>
       </div>
-      <div class=\"composer-box\">
-        <div class=\"composer-meta\">
-          <div>
-            <div class=\"composer-title\">当前任务</div>
-          </div>
+      <!-- 输入区域整体改为单行紧凑布局：输入框在左，图片按钮与发送按钮在右侧同一行垂直居中 -->
+      <div class=\"composer-input-row\" style=\"display:flex;align-items:center;gap:8px;padding:8px 12px;\">
+        <button id=\"cancel-btn\" class=\"cancel-btn hidden\" onclick=\"handleCancelAction()\" style=\"margin-right:8px;\">取消</button>
+        <div class=\"textarea-wrap\" style=\"flex:1;min-height:auto;\">
+          <textarea id=\"prompt\" placeholder=\"描述你希望完成的任务、修复的问题或需要分析的内容…\" onpaste=\"handlePaste(event)\" style=\"min-height:40px;resize:vertical;\"></textarea>
         </div>
-        <div class=\"composer-input-row\">
-          <div class=\"textarea-wrap\">
-            <textarea id=\"prompt\" placeholder=\"描述你希望完成的任务、修复的问题或需要分析的内容…\" onpaste=\"handlePaste(event)\"></textarea>
-          </div>
-          <div class=\"composer-actions\">
-            <button id=\"cancel-btn\" class=\"cancel-btn hidden\" onclick=\"handleCancelAction()\">cancel</button>
-            <div class=\"composer-action-buttons\">
-              <button class=\"icon-btn\" onclick=\"document.getElementById('image-input').click()\" title=\"上传图片\">＋ 图片</button>
-              <input id=\"image-input\" type=\"file\" accept=\"image/*\" multiple onchange=\"handleImages(event)\" style=\"display:none\" />
-              <button id=\"send-btn\" class=\"send-btn\" onclick=\"runTask()\">发送</button>
-            </div>
+        <div class=\"composer-actions\" style=\"display:flex;align-items:center;margin-top:0;\">
+          <div class=\"composer-action-buttons\" style=\"display:flex;align-items:center;gap:8px;\">
+            <button class=\"icon-btn\" onclick=\"document.getElementById('image-input').click()\" title=\"上传图片\">＋ 图片</button>
+            <input id=\"image-input\" type=\"file\" accept=\"image/*\" multiple onchange=\"handleImages(event)\" style=\"display:none\" />
+            <button id=\"send-btn\" class=\"send-btn\" onclick=\"runTask()\">发送</button>
           </div>
         </div>
       </div>
@@ -1173,6 +1183,7 @@ function renderTracePane(conversation) {
 const 风险文案 = { R0: '无副作用', R1: '低风险', R2: '需授权', R3: '高风险' };
 
 function taskStateClass(task) {
+  if (isTaskIncomplete(task)) return 'incomplete';
   const state = task?.projection?.display_status || task?.phase1State;
   if (state === 'completed' || state === 'DONE') return 'done';
   if (state === 'failed' || state === 'cancelled' || state === 'FAILED' || state === 'CANCELLED') return 'failed';
@@ -1235,7 +1246,53 @@ function taskProjection(task) {
   return task?.projection || null;
 }
 
+function taskSingleLoop(task) {
+  return task?.singleLoop || null;
+}
+
+function taskIncompleteBoundary(task) {
+  const boundary = taskSingleLoop(task)?.incomplete_boundary;
+  return boundary && typeof boundary === 'object' ? boundary : null;
+}
+
+function isTaskIncomplete(task) {
+  return Boolean(taskIncompleteBoundary(task));
+}
+
+function taskOrchestrationMode(task) {
+  return taskSingleLoop(task)?.orchestration_mode || 'LEGACY';
+}
+
+function incompleteGapDescription(gap) {
+  return String(gap?.description || gap?.detail || gap?.kind || gap?.code || '').trim();
+}
+
+function incompleteNeedsApproval(task) {
+  const gaps = taskIncompleteBoundary(task)?.gaps;
+  if (!Array.isArray(gaps) || gaps.length !== 1) return false;
+  const kind = String(gaps[0]?.kind || gaps[0]?.code || '').toUpperCase();
+  return kind.includes('APPROVAL') || kind.includes('USER_DECISION');
+}
+
+function focusIncompleteInput() {
+  const prompt = document.getElementById('prompt');
+  if (!prompt) return;
+  prompt.placeholder = '例如：文件路径、报错信息、task-id，或你希望我优先处理的部分';
+  prompt.focus();
+}
+
+function openIncompleteApproval(taskId) {
+  const approval = document.querySelector(`[data-incomplete-approval-task="${taskId}"]`);
+  approval?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function startIndependentTask() {
+  createConversation();
+  focusIncompleteInput();
+}
+
 function taskDisplayLabel(task) {
+  if (isTaskIncomplete(task)) return '任务暂未完成';
   const projection = taskProjection(task);
   if (projection) {
     return {
@@ -1497,6 +1554,168 @@ function isMarkdownProgress(text) {
     });
 }
 
+function renderTodoPanel(todoList) {
+  const todos = Array.isArray(todoList?.todos) ? todoList.todos : [];
+  if (todos.length === 0) return null;
+  const panel = document.createElement('section');
+  panel.className = 'todo-panel';
+  const header = document.createElement('div');
+  header.className = 'todo-panel-header';
+  const title = document.createElement('div');
+  title.className = 'todo-panel-title';
+  title.textContent = '执行步骤';
+  const summary = document.createElement('div');
+  summary.className = 'todo-panel-summary';
+  const completed = Number(todoList.summary?.completed || 0);
+  const total = Number(todoList.summary?.total || todos.length);
+  summary.textContent = `${completed}/${total} 已完成 · rev ${Number(todoList.revision || 0)}`;
+  header.append(title, summary);
+  panel.appendChild(header);
+
+  const list = document.createElement('div');
+  list.className = 'todo-list';
+  const markers = {
+    pending: '○', in_progress: '▶', completed: '✓', blocked: '!',
+  };
+  todos.forEach((todo) => {
+    const status = ['pending', 'in_progress', 'completed', 'blocked'].includes(
+      String(todo?.status),
+    ) ? String(todo.status) : 'pending';
+    const item = document.createElement('div');
+    item.className = `todo-item ${status}`;
+    const marker = document.createElement('div');
+    marker.className = 'todo-marker';
+    marker.textContent = markers[status];
+    const body = document.createElement('div');
+    const content = document.createElement('div');
+    content.className = 'todo-content';
+    content.textContent = String(todo?.content || todo?.id || '未命名步骤');
+    body.appendChild(content);
+    const criteriaText = String(todo?.completion_criteria || '').trim();
+    if (criteriaText && criteriaText !== content.textContent) {
+      const criteria = document.createElement('div');
+      criteria.className = 'todo-criteria';
+      criteria.textContent = `完成条件：${criteriaText}`;
+      body.appendChild(criteria);
+    }
+    item.append(marker, body);
+    list.appendChild(item);
+  });
+  panel.appendChild(list);
+  return panel;
+}
+
+function renderSingleLoopCompletion(task) {
+  const completion = taskSingleLoop(task)?.completion;
+  if (!completion || typeof completion !== 'object') return null;
+  const panel = document.createElement('section');
+  panel.className = 'completion-panel';
+  const title = document.createElement('div');
+  title.className = 'completion-title';
+  title.textContent = '完成契约';
+  panel.appendChild(title);
+  const summary = document.createElement('div');
+  summary.className = 'completion-summary';
+  const outcome = String(completion.outcome || 'UNKNOWN');
+  summary.textContent = `结果：${outcome} · completion diagnostics`;
+  panel.appendChild(summary);
+  const formatValue = (value) => {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      return String(value);
+    }
+    if (Array.isArray(value)) return `${value.length} 项`;
+    if (typeof value === 'object') {
+      return Object.entries(value).slice(0, 8).map(([key, item]) => (
+        `${key}=${typeof item === 'object' ? '[对象]' : String(item)}`
+      )).join(' · ');
+    }
+    return '';
+  };
+  const appendField = (label, value) => {
+    const values = Array.isArray(value) ? value.slice(0, 12) : [value];
+    const rendered = values.map(formatValue).filter(Boolean);
+    if (rendered.length === 0) return;
+    const item = document.createElement('div');
+    item.className = 'completion-item';
+    const field = document.createElement('span');
+    field.className = 'completion-label';
+    field.textContent = label;
+    const detail = document.createElement('span');
+    detail.className = 'completion-value';
+    detail.textContent = rendered.join('；');
+    item.append(field, detail);
+    panel.appendChild(item);
+  };
+  appendField('effects', completion.effects);
+  appendField('committed delta', completion.committed_delta);
+  appendField('gaps', completion.gaps);
+  appendField('divergences', completion.divergences);
+  return panel;
+}
+
+function renderContractCard(task, conversationId) {
+  const contract = task.contract;
+  if (!contract || !['DRAFT', 'ACTIVE'].includes(contract.phase)) return null;
+  const panel = document.createElement('section');
+  panel.className = 'task-panel contract-card';
+  const title = document.createElement('strong');
+  title.textContent = contract.phase === 'DRAFT' ? '完成标准草案' : '已启用完成标准';
+  const summary = document.createElement('div');
+  summary.className = 'task-progress-line';
+  summary.textContent = contract.objective;
+  panel.append(title, summary);
+  const requirements = Array.isArray(contract.evidence_requirements)
+    ? contract.evidence_requirements : [];
+  if (requirements.length) {
+    const details = document.createElement('div');
+    details.className = 'task-progress-line';
+    details.textContent = `验证方式：${requirements.map((item) => item.kind).join('、')}`;
+    panel.appendChild(details);
+  }
+  const actions = document.createElement('div');
+  actions.className = 'approval-actions';
+  const request = async (path, method, body) => {
+    const response = await fetch(path, {
+      method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const card = taskMessage(conversationId, task.taskId);
+    if (card) card.task.contract = (await response.json()).result || null;
+    renderMessages();
+  };
+  if (contract.phase === 'DRAFT') {
+    const accept = document.createElement('button');
+    accept.className = 'approval-btn approve';
+    accept.textContent = '接受合同';
+    accept.onclick = () => request(`/tasks/${task.taskId}/contract/accept`, 'POST', {
+      contract_id: contract.contract_id, expected_revision: contract.revision,
+      command_id: crypto.randomUUID(),
+    }).catch((error) => showError(error.message));
+    actions.appendChild(accept);
+  }
+  const edit = document.createElement('button');
+  edit.textContent = '编辑目标';
+  edit.onclick = () => {
+    const objective = window.prompt('完成目标', contract.objective);
+    if (!objective || !objective.trim()) return;
+    request(`/tasks/${task.taskId}/contract`, 'PUT', {
+      expected_revision: contract.revision, command_id: crypto.randomUUID(),
+      contract: { ...contract, objective: objective.trim() },
+    }).catch((error) => showError(error.message));
+  };
+  actions.appendChild(edit);
+  const clear = document.createElement('button');
+  clear.textContent = contract.phase === 'DRAFT' ? '按普通任务执行' : '清除合同';
+  clear.onclick = () => request(`/tasks/${task.taskId}/contract`, 'DELETE', {
+    contract_id: contract.contract_id, expected_revision: contract.revision,
+    command_id: crypto.randomUUID(),
+  }).catch((error) => showError(error.message));
+  actions.appendChild(clear);
+  panel.appendChild(actions);
+  return panel;
+}
+
 function renderTaskCard(element, message, conversationId, mode = 'conversation') {
   const task = message.task || {};
   const card = document.createElement('div');
@@ -1505,7 +1724,9 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
   header.className = 'task-card-header';
   const title = document.createElement('div');
   title.className = 'task-card-title';
-  title.textContent = task.goal || `任务 ${String(task.taskId || '').slice(0, 8)}`;
+  title.textContent = isTaskIncomplete(task)
+    ? '任务暂未完成'
+    : task.goal || `任务 ${String(task.taskId || '').slice(0, 8)}`;
   const state = document.createElement('div');
   state.className = `task-card-state ${taskStateClass(task)}`;
   state.textContent = taskDisplayLabel(task);
@@ -1522,6 +1743,65 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
   `;
   card.appendChild(meta);
 
+  const incompleteBoundary = taskIncompleteBoundary(task);
+  if (incompleteBoundary) {
+    const boundary = document.createElement('section');
+    boundary.className = 'incomplete-boundary';
+    const description = document.createElement('div');
+    description.className = 'incomplete-copy';
+    description.textContent = '当前无法安全声明任务已完成，已保留本次进度和已获取的证据。';
+    boundary.appendChild(description);
+    const gaps = Array.isArray(incompleteBoundary.gaps)
+      ? incompleteBoundary.gaps : [];
+    gaps.slice(0, 3).forEach((gap) => {
+      const text = incompleteGapDescription(gap);
+      if (!text) return;
+      const item = document.createElement('div');
+      item.className = 'incomplete-gap';
+      item.textContent = `还需要：${text}`;
+      boundary.appendChild(item);
+    });
+    if (gaps.length > 3) {
+      const remaining = document.createElement('div');
+      remaining.className = 'incomplete-gap';
+      remaining.textContent = `另有 ${gaps.length - 3} 项未完成`;
+      boundary.appendChild(remaining);
+    }
+    const actions = document.createElement('div');
+    actions.className = 'incomplete-actions';
+    const pendingApproval = incompleteNeedsApproval(task);
+    const primary = document.createElement('button');
+    primary.className = 'primary';
+    primary.textContent = pendingApproval ? '查看并确认' : '继续排查';
+    primary.onclick = () => {
+      if (pendingApproval) {
+        openIncompleteApproval(task.taskId);
+      } else {
+        resumeContinuation(task.taskId, conversationId);
+      }
+    };
+    actions.appendChild(primary);
+    if (pendingApproval) {
+      const notice = document.createElement('div');
+      notice.className = 'incomplete-copy';
+      notice.textContent = '需要你的确认后才能继续';
+      boundary.appendChild(notice);
+    } else {
+      const provide = document.createElement('button');
+      provide.textContent = '提供信息';
+      provide.onclick = focusIncompleteInput;
+      const create = document.createElement('button');
+      create.textContent = '新建任务';
+      create.onclick = startIndependentTask;
+      actions.append(provide, create);
+    }
+    boundary.appendChild(actions);
+    card.appendChild(boundary);
+  }
+
+  const completionPanel = renderSingleLoopCompletion(task);
+  if (completionPanel) card.appendChild(completionPanel);
+
   const summary = document.createElement('div');
   summary.className = 'task-card-summary';
   const progressCount = (task.progress || []).length;
@@ -1530,6 +1810,7 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
   const executionLabel = taskExecutionLabel(task);
   summary.innerHTML = `
     <div class='task-summary-item'><div class='task-summary-label'>当前阶段</div><div class='task-summary-value'>${displayLabel}</div></div>
+    <div class='task-summary-item'><div class='task-summary-label'>编排模式</div><div class='task-summary-value'>${taskOrchestrationMode(task)}</div></div>
     <div class='task-summary-item'><div class='task-summary-label'>持久流程事件</div><div class='task-summary-value'>${traceCursor || progressCount}</div></div>
     <div class='task-summary-item'><div class='task-summary-label'>执行状态</div><div class='task-summary-value'>${executionLabel}</div></div>
   `;
@@ -1573,6 +1854,11 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
   addProtocolItem('模型结论', modelConclusion);
   addProtocolItem('引用校验', `${validationStatus} · ${reference}`);
   card.appendChild(protocolSummary);
+
+  const todoPanel = renderTodoPanel(task.todoList);
+  if (todoPanel) card.appendChild(todoPanel);
+  const contractPanel = renderContractCard(task, conversationId);
+  if (contractPanel) card.appendChild(contractPanel);
 
   const progress = document.createElement('div');
   progress.className = `task-progress task-panel ${mode === 'conversation' ? 'active' : ''}`;
@@ -1665,6 +1951,7 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
   if (task.waiting?.kind === 'APPROVAL' && task.waiting.approval) {
     const approval = document.createElement('div');
     approval.className = 'message approval';
+    approval.dataset.incompleteApprovalTask = task.taskId;
     const approvalRequest = task.waiting.approval;
     const resolution = task.approvalResolution;
     renderApprovalCard(approval, {
@@ -1718,6 +2005,9 @@ function upsertTaskCard(conversationId, rawTask) {
         phase1State: rawTask.phase1_state || 'PREPARING',
         status: rawTask.status || 'running',
         projection: rawTask.projection || null,
+        singleLoop: rawTask.single_loop || null,
+        contract: rawTask.contract || null,
+        todoList: rawTask.todo_list || null,
         traceCursor: Number(rawTask.projection?.trace_cursor || rawTask.progress_cursor || 0),
         cursor: Number(rawTask.progress_cursor || 0),
         progress: [], waiting: rawTask.waiting || null,
@@ -1734,6 +2024,15 @@ function upsertTaskCard(conversationId, rawTask) {
       Number(message.task.cursor || 0), Number(rawTask.progress_cursor || 0),
     );
     message.task.waiting = rawTask.waiting ?? message.task.waiting;
+    if (Object.prototype.hasOwnProperty.call(rawTask, 'single_loop')) {
+      message.task.singleLoop = rawTask.single_loop;
+    }
+    if (Object.prototype.hasOwnProperty.call(rawTask, 'contract')) {
+      message.task.contract = rawTask.contract;
+    }
+    if (Object.prototype.hasOwnProperty.call(rawTask, 'todo_list')) {
+      message.task.todoList = rawTask.todo_list;
+    }
     applyTaskProjection(message.task, rawTask.projection);
     applyTaskProtocol(message.task, rawTask);
   }
@@ -2295,6 +2594,7 @@ async function runTask() {
       status: task.status || 'running',
       progress_cursor: 0,
       projection: task.projection || null,
+      single_loop: task.single_loop || null,
       waiting: task.approval
         ? { kind: 'APPROVAL', approval: task.approval }
         : task.status === 'awaiting_user'
@@ -2364,6 +2664,7 @@ function renderFinalResult(taskId, state, conversationId) {
   if (card) {
     applyTaskProjection(card.task, state.projection);
     applyTaskProtocol(card.task, state);
+    card.task.singleLoop = state.single_loop || null;
     card.task.phase1State = state.phase1_state || card.task.phase1State;
     card.task.status = state.status || card.task.status;
     card.task.waiting = null;
@@ -2425,6 +2726,9 @@ function followTask(taskId, conversationId) {
     if (current) {
       applyTaskProjection(current.task, state.projection);
       applyTaskProtocol(current.task, state);
+      current.task.todoList = state.todo_list || null;
+      current.task.singleLoop = state.single_loop || null;
+      current.task.contract = state.contract || null;
       if (!state.projection) {
         current.task.phase1State = state.phase1_state;
         current.task.status = state.status;
@@ -2487,6 +2791,8 @@ function followTask(taskId, conversationId) {
         if (currentCard) {
           applyTaskProjection(currentCard.task, payload.projection);
           applyTaskProtocol(currentCard.task, payload);
+          currentCard.task.singleLoop = payload.single_loop || null;
+          currentCard.task.contract = payload.contract || null;
           if (!payload.projection) currentCard.task.phase1State = 'WAITING';
           currentCard.task.waiting = payload.waiting;
         }
@@ -2508,6 +2814,14 @@ function followTask(taskId, conversationId) {
         return;
       }
       appendTaskProgress(taskId, payload, conversationId);
+      const progress = payload.progress || {};
+      if (
+        progress.kind === 'tool_completed'
+        && progress.tool_name === 'core.todo_list'
+        && progress.ok === true
+      ) {
+        reconcile().catch((error) => console.error(error));
+      }
     };
     source.onerror = async () => {
       source.close();
@@ -2610,6 +2924,8 @@ async function ensureConversationLoaded(conversationId) {
           role: 'task', content: '', task: {
             taskId: task.task_id, goal: task.goal,
             projection: task.projection || null,
+            singleLoop: task.single_loop || null,
+            todoList: task.todo_list || null,
             phase1State: task.phase1_state, status: task.status,
             cursor: Number(task.progress_cursor || 0), progress: [],
             waiting: task.waiting || null,
@@ -3341,6 +3657,16 @@ async def create_task(payload: dict) -> dict:
 
     goal = str(payload.get("goal", ""))
     image_blocks = _normalize_image_blocks(payload.get("images"))
+    raw_contract = payload.get("evidence_contract")
+    if raw_contract is not None and not isinstance(raw_contract, dict):
+        raise HTTPException(status_code=400, detail="evidence_contract must be an object")
+    try:
+        evidence_contract = (
+            TaskContract.from_data(raw_contract)
+            if isinstance(raw_contract, dict) else None
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
     if image_blocks:
         # Record only the count; base64 payloads must never enter the goal.
@@ -3355,6 +3681,7 @@ async def create_task(payload: dict) -> dict:
             session_id=session_id,
             images=tuple(image_blocks),
             workspace=Path(workspace_path),
+            evidence_contract=evidence_contract,
         ))
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
@@ -3447,6 +3774,10 @@ async def get_session(session_id: str) -> dict:
             "waiting": _waiting_payload(result),
             "assistant_text": result.assistant_text,
             "projection": dict(result.projection) if result.projection else None,
+            "single_loop": dict(result.single_loop) if result.single_loop else None,
+            "todo_list": (
+                dict(result.todo_list) if result.todo_list is not None else None
+            ),
             "is_active": task_id == snapshot.active_task_id,
         })
     latest = task_items[-1] if task_items else None
@@ -3528,6 +3859,99 @@ async def resolve_approval(payload: dict) -> JSONResponse:
         },
         status_code=202,
     )
+
+
+@app.get("/tasks/{task_id}/contract")
+async def get_task_contract(task_id: str) -> dict:
+    if runtime_server is None:
+        raise HTTPException(status_code=503, detail=runtime_error or "runtime unavailable")
+    contract = runtime_server._call(runtime_server._client.get_contract(task_id))
+    return {"contract": contract}
+
+
+def _contract_payload(payload: dict) -> tuple[TaskContract, int, str]:
+    raw = payload.get("contract")
+    expected_revision = payload.get("expected_revision")
+    command_id = str(payload.get("command_id", "")).strip()
+    if not isinstance(raw, dict) or not isinstance(expected_revision, int) or not command_id:
+        raise HTTPException(
+            status_code=400,
+            detail="contract, expected_revision, and command_id are required",
+        )
+    try:
+        return TaskContract.from_data(raw), expected_revision, command_id
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.post("/tasks/{task_id}/contracts/drafts")
+async def draft_task_contract(task_id: str, payload: dict) -> dict:
+    if runtime_server is None:
+        raise HTTPException(status_code=503, detail=runtime_error or "runtime unavailable")
+    contract, expected_revision, command_id = _contract_payload(payload)
+    try:
+        result = runtime_server._call(runtime_server._client.draft_contract(
+            task_id, contract, expected_revision=expected_revision, command_id=command_id,
+        ))
+    except (LookupError, ValueError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return result.to_data()
+
+
+@app.post("/tasks/{task_id}/contract/accept")
+async def accept_task_contract(task_id: str, payload: dict) -> dict:
+    if runtime_server is None:
+        raise HTTPException(status_code=503, detail=runtime_error or "runtime unavailable")
+    contract_id = str(payload.get("contract_id", "")).strip()
+    command_id = str(payload.get("command_id", "")).strip()
+    expected_revision = payload.get("expected_revision")
+    if not contract_id or not command_id or not isinstance(expected_revision, int):
+        raise HTTPException(
+            status_code=400,
+            detail="contract_id, expected_revision, and command_id are required",
+        )
+    try:
+        result = runtime_server._call(runtime_server._client.accept_contract(
+            task_id, contract_id, expected_revision=expected_revision, command_id=command_id,
+        ))
+    except (LookupError, ValueError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return result.to_data()
+
+
+@app.put("/tasks/{task_id}/contract")
+async def update_task_contract(task_id: str, payload: dict) -> dict:
+    if runtime_server is None:
+        raise HTTPException(status_code=503, detail=runtime_error or "runtime unavailable")
+    contract, expected_revision, command_id = _contract_payload(payload)
+    try:
+        result = runtime_server._call(runtime_server._client.update_contract(
+            task_id, contract, expected_revision=expected_revision, command_id=command_id,
+        ))
+    except (LookupError, ValueError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return result.to_data()
+
+
+@app.delete("/tasks/{task_id}/contract")
+async def clear_task_contract(task_id: str, payload: dict) -> dict:
+    if runtime_server is None:
+        raise HTTPException(status_code=503, detail=runtime_error or "runtime unavailable")
+    contract_id = str(payload.get("contract_id", "")).strip()
+    command_id = str(payload.get("command_id", "")).strip()
+    expected_revision = payload.get("expected_revision")
+    if not contract_id or not command_id or not isinstance(expected_revision, int):
+        raise HTTPException(
+            status_code=400,
+            detail="contract_id, expected_revision, and command_id are required",
+        )
+    try:
+        result = runtime_server._call(runtime_server._client.clear_contract(
+            task_id, contract_id, expected_revision=expected_revision, command_id=command_id,
+        ))
+    except (LookupError, ValueError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return result.to_data()
 
 
 @app.get("/tasks/{task_id}")
@@ -3647,6 +4071,8 @@ async def stream(
                             "task_id": task_id,
                             "waiting": waiting,
                             "projection": result.projection,
+                            "single_loop": result.single_loop,
+                            "contract": result.contract,
                             "latest_answer_event_ref": result.latest_answer_event_ref,
                             "conclusion_claims": [
                                 dict(item) for item in result.conclusion_claims
@@ -3678,6 +4104,8 @@ async def stream(
                             "task_id": task_id,
                             "final": True,
                             "projection": result.projection,
+                            "single_loop": result.single_loop,
+                            "contract": result.contract,
                             "latest_answer_event_ref": result.latest_answer_event_ref,
                             "conclusion_claims": [
                                 dict(item) for item in result.conclusion_claims

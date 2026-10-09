@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from tsm_agt.core import WorkspaceMutationConflict, WorkspacePatchConflict
+from .v4a_patch import V4APatchSyntaxError, parse_v4a_update_patch
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ToolCall,
     ToolEffect, ToolIdempotency, ToolInvocationContext, ToolRecoveryKind,
@@ -25,7 +26,8 @@ class CoreWorkspaceMutationToolProvider:
         port_version="1.0",
         capabilities=frozenset(
             {
-                "core.apply_patch", "core.apply_patches", "core.delete_file",
+                "core.apply_patch", "core.apply_patch_v4a", "core.apply_patches",
+                "core.delete_file",
                 "core.rollback_mutation", "core.rollback_mutations",
                 "core.rollback_mutation_batch", "core.rollback_mutation_groups",
             }
@@ -65,6 +67,34 @@ class CoreWorkspaceMutationToolProvider:
                 },
             },
             "required": ["path", "expected_hash", "edits"],
+            "additionalProperties": False,
+        },
+        risk=ToolRisk.R1,
+        is_read_only=False,
+        is_concurrency_safe=False,
+        idempotency=ToolIdempotency.NON_IDEMPOTENT,
+        rollback="restore the journaled backup only if the current hash still matches the Agent result",
+        effect=ToolEffect.MUTATE,
+        result_authority=ToolResultAuthority.MUTATION_FACT,
+    )
+    _v4a_patch_spec = ToolSpec(
+        name="core.apply_patch_v4a",
+        description=(
+            "Apply one multi-line workspace update using strict Codex/V4A patch text. "
+            "Read the file first and pass its sha256 as expected_hash. patch must use "
+            "actual newline characters and this exact shape: *** Begin Patch, *** Update "
+            "File: path, one or more @@ hunks with lines prefixed by space/-/+, then "
+            "*** End Patch. Only one Update File block is supported. This R1 action "
+            "requires approval and is journaled. Prefer this over core.apply_patch for "
+            "multi-line HTML, CSS, or code edits."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "patch": {"type": "string"},
+                "expected_hash": {"type": "string"},
+            },
+            "required": ["patch", "expected_hash"],
             "additionalProperties": False,
         },
         risk=ToolRisk.R1,
@@ -300,7 +330,8 @@ class CoreWorkspaceMutationToolProvider:
 
     async def list_tools(self) -> tuple[ToolSpec, ...]:
         return (
-            self._patch_spec, self._patch_many_spec, self._delete_spec,
+            self._patch_spec, self._v4a_patch_spec, self._patch_many_spec,
+            self._delete_spec,
             self._rollback_spec,
             self._rollback_many_spec, self._rollback_batch_spec,
             self._rollback_groups_spec,
@@ -312,7 +343,8 @@ class CoreWorkspaceMutationToolProvider:
         if not self._started:
             raise RuntimeError("adapter is not started")
         if call.name not in {
-            self._patch_spec.name, self._patch_many_spec.name, self._delete_spec.name,
+            self._patch_spec.name, self._v4a_patch_spec.name,
+            self._patch_many_spec.name, self._delete_spec.name,
             self._rollback_spec.name, self._rollback_many_spec.name,
             self._rollback_batch_spec.name, self._rollback_groups_spec.name,
         }:
@@ -434,6 +466,23 @@ class CoreWorkspaceMutationToolProvider:
                     raise TypeError("mutation_id must be a non-empty string")
                 data = await control.rollback_mutation(mutation_id)
                 return ToolResult(call.call_id, True, data=dict(data))
+            if call.name == self._v4a_patch_spec.name:
+                raw_patch = call.arguments.get("patch")
+                if not isinstance(raw_patch, str) or not raw_patch.strip():
+                    raise TypeError("patch must be a non-empty string")
+                expected_hash = call.arguments.get("expected_hash")
+                self._validate_expected_hash(expected_hash)
+                if expected_hash is None:
+                    raise TypeError(
+                        "core.apply_patch_v4a expected_hash must be a lowercase SHA-256 string"
+                    )
+                parsed = parse_v4a_update_patch(raw_patch)
+                data = await control.apply_patch(
+                    parsed.path, expected_hash, parsed.edits
+                )
+                return ToolResult(call.call_id, True, data={
+                    **dict(data), "patch_format": "v4a",
+                })
             path = call.arguments.get("path")
             if not isinstance(path, str) or not path.strip():
                 raise TypeError("path must be a non-empty string")
@@ -453,23 +502,49 @@ class CoreWorkspaceMutationToolProvider:
             return self._error(call, "PERMISSION_DENIED", str(error))
         except FileNotFoundError as error:
             return self._error(call, "NOT_FOUND", str(error))
+        except V4APatchSyntaxError as error:
+            if "literal \\n" in str(error):
+                return ToolResult(
+                    call.call_id, False,
+                    error_code="PATCH_LITERAL_NEWLINE_ESCAPE",
+                    message=str(error),
+                    hint=(
+                        "Patch text contains literal \\n instead of actual newline "
+                        "characters. Reissue core.apply_patch_v4a with a real multi-line "
+                        "patch; do not double-escape line breaks in JSON."
+                    ),
+                    recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+                    recovery_action={
+                        "required_change": "reissue_v4a_with_actual_newlines",
+                        "same_call_safe": False,
+                    },
+                )
+            return self._error(call, "PATCH_INVALID_V4A", str(error))
         except WorkspacePatchConflict as error:
-            # The caller's quoted old_text does not match the file that is
-            # actually there. Nothing is stale on disk, so the fix is to re-read
-            # the file and re-issue the edit: a correctable input error, not a
-            # terminal failure. The error carries a typed reason, so the Agent
-            # loop never has to parse human text.
+            literal_newline_escape = "literal \\n" in error.reason
             return ToolResult(
-                call.call_id, False, error_code="PATCH_CONFLICT",
+                call.call_id,
+                False,
+                error_code=(
+                    "PATCH_LITERAL_NEWLINE_ESCAPE"
+                    if literal_newline_escape else "PATCH_CONFLICT"
+                ),
                 message=str(error),
                 hint=(
+                    "old_text contains literal \\n instead of actual newline characters. "
+                    "Reissue a real multi-line core.apply_patch_v4a patch, or submit "
+                    "actual newlines in old_text; do not double-escape line breaks."
+                    if literal_newline_escape else
                     "Read the current file content, locate the exact text, and "
                     "re-issue core.apply_patch with an old_text that occurs "
                     "exactly once."
                 ),
                 recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
                 recovery_action={
-                    "required_change": "re_read_file_then_retry",
+                    "required_change": (
+                        "reissue_v4a_with_actual_newlines"
+                        if literal_newline_escape else "re_read_file_then_retry"
+                    ),
                     "resource": error.path,
                     "edit_index": error.index,
                     "reason": error.reason,

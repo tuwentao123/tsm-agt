@@ -75,8 +75,8 @@ class ApprovalMixin:
     ) -> Path | None:
         """Return the narrow external directory that needs Task approval."""
         if call.name not in {
-            "core.read_file", "core.list_files",
-            "core.find_files", "core.search_text",
+            "core.read_file", "core.list_files", "core.search_files",
+            "core.find_files", "core.search_text", "core.grep_search",
         }:
             return None
         raw_path = call.arguments.get("path", ".")
@@ -238,8 +238,8 @@ class ApprovalMixin:
             policy_mismatch = (
                 policy_mismatch or not selected_spec.is_read_only
                 or request.call.name not in {
-                    "core.read_file", "core.list_files",
-                    "core.find_files", "core.search_text",
+                    "core.read_file", "core.list_files", "core.search_files",
+                    "core.find_files", "core.search_text", "core.grep_search",
                 }
                 or root is None
                 or str(root) != request.workspace_access_root

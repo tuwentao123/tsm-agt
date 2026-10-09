@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tsm_agt.adapters.fixture import InMemoryRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     InvalidTaskTransition,
@@ -12,6 +13,7 @@ from tsm_agt.core import (
     TaskState,
 )
 from tsm_agt.core.configuration import canonical_hash
+from tsm_agt.core.single_loop import OrchestrationMode
 from tsm_agt.core.session_context import (
     SessionContextProjector,
     SessionConversationMessage,
@@ -19,8 +21,14 @@ from tsm_agt.core.session_context import (
     SessionTaskSummary,
     SessionWorkingState,
 )
+from tsm_agt.ports.evidence import (
+    ContractAuthority,
+    EvidenceRequirement,
+    TaskContract,
+)
 from tsm_agt.ports import MessageRole
 from tsm_agt.ports import RuntimeStorePort
+from tsm_agt.core.turn import InvalidTurnState
 
 
 class KernelTaskTest(unittest.IsolatedAsyncioTestCase):
@@ -54,6 +62,136 @@ class KernelTaskTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(events[1].payload["previous_state"], "CREATED")
         self.assertEqual(events[1].payload["next_state"], "INTAKE")
+
+    async def test_create_command_rejects_contract_content_change(self) -> None:
+        first = TaskContract(
+            objective="verify source",
+            authority=ContractAuthority.USER,
+            evidence_requirements=(EvidenceRequirement("source", "source.artifact"),),
+        )
+        second = TaskContract(
+            objective="verify source",
+            authority=ContractAuthority.USER,
+            evidence_requirements=(EvidenceRequirement("source", "source.artifact", 2),),
+        )
+        await self.application.kernel.create_task(
+            "answer",
+            Path(self.temp_dir.name),
+            command_id="create-contract-idempotency",
+            evidence_contract=first,
+        )
+
+        with self.assertRaisesRegex(ValueError, "different Task input"):
+            await self.application.kernel.create_task(
+                "answer",
+                Path(self.temp_dir.name),
+                command_id="create-contract-idempotency",
+                evidence_contract=second,
+            )
+
+    async def test_new_task_persists_single_loop_orchestration_metadata(self) -> None:
+        task = await self.application.kernel.create_task(
+            "fix failing tests", Path(self.temp_dir.name), task_id="task-legacy"
+        )
+
+        metadata = await self.application.kernel.get_task_orchestration_metadata(
+            task.task_id
+        )
+        event = (await self.application.registry.require(
+            RuntimeStorePort
+        ).read_events(task.task_id))[0]
+
+        self.assertEqual(
+            metadata.orchestration_mode, OrchestrationMode.SINGLE_LOOP
+        )
+        self.assertEqual(metadata.root_goal, "fix failing tests")
+        self.assertEqual(
+            event.payload["single_loop"], metadata.to_data()
+        )
+        self.assertTrue(metadata.root_input_event_ref.startswith("session-event:"))
+        self.assertEqual(
+            metadata.root_input_event_ref, metadata.latest_input_event_ref
+        )
+
+    async def test_task_mode_is_fixed_across_composition_and_legacy_runner(self) -> None:
+        store = InMemoryRuntimeStore()
+        original = compose_fixture_application(
+            store_adapter=store,
+            orchestration_mode=OrchestrationMode.LEGACY,
+        )
+        await original.registry.start_all()
+        try:
+            task = await original.kernel.create_task(
+                "answer", Path(self.temp_dir.name), task_id="task-fixed-mode"
+            )
+        finally:
+            await original.registry.stop_all()
+
+        reopened = compose_fixture_application(
+            store_adapter=store,
+            tool_adapters=(),
+            orchestration_mode=OrchestrationMode.SINGLE_LOOP,
+        )
+        await reopened.registry.start_all()
+        try:
+            metadata = await reopened.kernel.get_task_orchestration_metadata(
+                task.task_id
+            )
+            self.assertEqual(metadata.orchestration_mode, OrchestrationMode.LEGACY)
+            for state in (
+                TaskState.INTAKE,
+                TaskState.RESOLVING_PROJECT,
+                TaskState.SELECTING_EXTENSIONS,
+                TaskState.ROUTING,
+                TaskState.EXECUTING,
+            ):
+                await reopened.kernel.transition_task(task.task_id, state, state.value)
+            await reopened.kernel.run_agent_turn(task.task_id, "answer")
+            events = await store.read_events(task.task_id)
+            self.assertEqual(
+                [
+                    event.payload["orchestration_mode"]
+                    for event in events
+                    if event.event_type == "turn.started"
+                ],
+                [OrchestrationMode.LEGACY.value],
+            )
+        finally:
+            await reopened.registry.stop_all()
+
+    async def test_single_loop_task_runs_the_single_loop(self) -> None:
+        application = compose_fixture_application(
+            tool_adapters=(),
+            orchestration_mode=OrchestrationMode.SINGLE_LOOP,
+        )
+        await application.registry.start_all()
+        try:
+            task = await application.kernel.create_task(
+                "answer", Path(self.temp_dir.name), task_id="task-single-loop"
+            )
+            for state in (
+                TaskState.INTAKE,
+                TaskState.RESOLVING_PROJECT,
+                TaskState.SELECTING_EXTENSIONS,
+                TaskState.ROUTING,
+                TaskState.EXECUTING,
+            ):
+                task = await application.kernel.transition_task(
+                    task.task_id, state, state.value
+                )
+            result = await application.kernel.run_agent_turn(task.task_id, "answer")
+            events = await application.registry.require(RuntimeStorePort).read_events(
+                task.task_id
+            )
+            self.assertEqual(result.assistant_message.role.value, "assistant")
+            self.assertEqual(
+                next(event for event in events if event.event_type == "turn.started").payload[
+                    "orchestration_mode"
+                ],
+                OrchestrationMode.SINGLE_LOOP.value,
+            )
+        finally:
+            await application.registry.stop_all()
 
     async def test_illegal_transition_does_not_write_state_or_event(self) -> None:
         await self.application.kernel.create_task(
@@ -194,3 +332,52 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LegacyTaskCompatibilityTest(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_task_can_roll_back_after_default_composition_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = InMemoryRuntimeStore()
+            legacy = compose_fixture_application(
+                store_adapter=store,
+                orchestration_mode=OrchestrationMode.LEGACY,
+            )
+            await legacy.registry.start_all()
+            try:
+                task = await legacy.kernel.create_task(
+                    "preserve rollback compatibility",
+                    workspace,
+                    task_id="task-legacy-rollback",
+                )
+                for state in (
+                    TaskState.INTAKE,
+                    TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS,
+                    TaskState.ROUTING,
+                    TaskState.EXECUTING,
+                ):
+                    task = await legacy.kernel.transition_task(
+                        task.task_id, state, state.value
+                    )
+                mutation = await legacy.kernel.write_workspace_text(
+                    task.task_id, "write", "legacy.txt", "legacy\n", None
+                )
+            finally:
+                await legacy.registry.stop_all()
+
+            reopened = compose_fixture_application(store_adapter=store)
+            await reopened.registry.start_all()
+            try:
+                metadata = await reopened.kernel.get_task_orchestration_metadata(
+                    task.task_id
+                )
+                rollback = await reopened.kernel.rollback_workspace_mutation(
+                    task.task_id, "rollback", mutation.mutation_id
+                )
+            finally:
+                await reopened.registry.stop_all()
+
+        self.assertEqual(metadata.orchestration_mode, OrchestrationMode.LEGACY)
+        self.assertEqual(rollback.reverts_mutation_id, mutation.mutation_id)
+        self.assertFalse((workspace / "legacy.txt").exists())

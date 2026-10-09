@@ -1269,9 +1269,8 @@ class SessionContextProjector:
     ) -> dict[str, Any]:
         call = execution.call
         safe_tool = call.name in {
-            "core.list_files", "core.find_files",
-            "core.read_file", "core.search_text",
-            "core.grep_search",
+            "core.list_files", "core.search_files", "core.find_files",
+            "core.read_file", "core.search_text", "core.grep_search",
         }
         call_data: dict[str, Any] = {
             "call_id": call.call_id, "tool": call.name,
@@ -1279,9 +1278,9 @@ class SessionContextProjector:
         if safe_tool:
             arguments: dict[str, Any] = {}
             for key in (
-                "path", "query", "pattern", "start_line",
-                "max_lines", "recursive", "regex",
-                "case_sensitive", "max_matches", "limit",
+                "path", "query", "pattern", "target", "file_glob",
+                "start_line", "max_lines", "recursive", "regex",
+                "case_sensitive", "max_matches", "limit", "context",
             ):
                 value = call.arguments.get(key)
                 if isinstance(value, (str, int, float, bool)):
@@ -1349,7 +1348,9 @@ class SessionContextProjector:
                             value[:1000] if isinstance(value, str) else value
                         )
                 text = raw.get("text")
-                if isinstance(text, str) and tool_name in {"core.search_text", "core.grep_search"}:
+                if isinstance(text, str) and tool_name in {
+                    "core.search_files", "core.search_text", "core.grep_search",
+                }:
                     item["text"] = text[:200]
                 if item:
                     items.append(item)

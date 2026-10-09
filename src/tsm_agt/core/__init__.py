@@ -7,6 +7,7 @@ from .agent_loop import (
     AgentTurnCheckpoint,
     ToolBatchSnapshot, ToolBatchStatus,
     AgentTurnResult,
+    AgentTurnIncomplete,
     TurnState,
     AgentTurnSuspended,
     AgentClarificationSuspended,
@@ -25,6 +26,23 @@ from .prompt import (
     PromptAssembly, PromptAssemblyReceipt, PromptManifest, PromptTemplate,
     PromptTemplateSegment,
 )
+from .single_loop import (
+    ActiveContextProjection,
+    CompletionClaim,
+    CompletionGap,
+    CompletionValidation,
+    IntentDependency,
+    IntentDependencyKind,
+    IntentSource,
+    OrchestrationMode,
+    SingleAgentLoop,
+    TaskBindingDecision,
+    TaskBindingKind,
+    TaskOrchestrationMetadata,
+    TurnIntent,
+    TurnIntentKind,
+)
+from .single_loop.task_projection import TaskOrchestrationProjector
 from .task_runtime_projection import (
     TaskDisplayStatus, TaskExecutionStatus, TaskRuntimeFailure,
     TaskRuntimePhase, TaskRuntimeProjection, TaskRuntimeProjector,

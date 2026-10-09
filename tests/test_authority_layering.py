@@ -221,6 +221,42 @@ class BackgroundLeakIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     created.payload["context_handoff"]["authority"],
                     "SCOPED_BACKGROUND",
                 )
+                revised = next(
+                    event for event in events
+                    if event.event_type == "task_spec.revised"
+                )
+                self.assertEqual(
+                    revised.payload["orchestration_mode"], "LEGACY"
+                )
+                self.assertEqual(
+                    revised.payload["prompt_projection_hash"],
+                    revised.payload["planning_context_hash"],
+                )
+                self.assertTrue(
+                    revised.payload["current_input_ref"].startswith("task-input:")
+                )
+            finally:
+                await application.registry.stop_all()
+
+
+class PlannerIntentValidationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_kernel_rejects_answer_only_for_workspace_mutation_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            application = compose_fixture_application(
+                task_spec_planner_adapter=_LeakPlanner((
+                    _criterion("advice", "provide a generic CSS example"),
+                )),
+            )
+            await application.registry.start_all()
+            try:
+                task = await application.kernel.create_task(
+                    "修改当前项目 UI", Path(directory), task_id="task-mutate",
+                    original_user_text="修改当前项目 UI",
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "workspace mutation request"
+                ):
+                    await application.kernel.plan_task_spec(task.task_id)
             finally:
                 await application.registry.stop_all()
 

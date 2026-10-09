@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .adapter import RuntimeAdapter
+from .evidence import EvidenceFact
 from .process import BackgroundProcessStartResult, ProcessCommandResult
 from .workspace_path import WorkspacePathPort
 
@@ -260,6 +261,9 @@ class ToolSpec:
     #: produce. Anything derivable here is rejected below: two lists that can
     #: disagree is exactly the "third parallel taxonomy" this design removes.
     extra_evidence_capabilities: frozenset[EvidenceCapability] = frozenset()
+    #: Explicit typed-evidence kinds this provider may normalize from success.
+    #: These IDs are consumed by EvidenceGate, never inferred from ToolEffect.
+    evidence_capability_ids: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if (
@@ -313,6 +317,8 @@ class ToolSpec:
                 "result_authority: it claims the tool can prove something, so its "
                 f"result must establish some fact, not {self.result_authority.value!r}"
             )
+        if any(not capability.strip() for capability in self.evidence_capability_ids):
+            raise ValueError("evidence capability ids must not contain empty values")
 
     @property
     def evidence_capabilities(self) -> frozenset[EvidenceCapability]:
@@ -356,6 +362,7 @@ class ToolSpec:
             "effect": self.effect.value,
             "result_authority": self.result_authority.value,
             "protocol": self.protocol.value,
+            "evidence_capability_ids": sorted(self.evidence_capability_ids),
         }
 
 
@@ -435,6 +442,64 @@ class ToolCall:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceArtifact:
+    """An immutable source file that can support implementation-level claims."""
+
+    source_kind: str
+    repository: str
+    commit_sha: str
+    path: str
+    blob_sha: str
+    canonical_url: str
+    content_hash: str
+
+    def __post_init__(self) -> None:
+        if self.source_kind != "github":
+            raise ValueError("source artifact kind must be github")
+        repository_parts = self.repository.split("/")
+        if len(repository_parts) != 2 or any(not part.strip() for part in repository_parts):
+            raise ValueError("source artifact repository must be owner/repository")
+        for name in ("commit_sha", "blob_sha"):
+            value = getattr(self, name)
+            if len(value) != 40 or any(char not in "0123456789abcdef" for char in value):
+                raise ValueError(f"source artifact {name} must be a lowercase 40-character SHA")
+        if not self.path or self.path.startswith("/") or "\\" in self.path or any(
+            part in {"", ".", ".."} for part in self.path.split("/")
+        ):
+            raise ValueError("source artifact path must be a relative non-traversing path")
+        expected_prefix = f"https://github.com/{self.repository}/blob/{self.commit_sha}/"
+        if not self.canonical_url.startswith(expected_prefix):
+            raise ValueError("source artifact URL must be a canonical GitHub blob URL")
+        if len(self.content_hash) != 71 or not self.content_hash.startswith("sha256:") or any(
+            char not in "0123456789abcdef" for char in self.content_hash[7:]
+        ):
+            raise ValueError("source artifact content_hash must be a sha256 digest")
+
+    def to_data(self) -> dict[str, str]:
+        return {
+            "source_kind": self.source_kind,
+            "repository": self.repository,
+            "commit_sha": self.commit_sha,
+            "path": self.path,
+            "blob_sha": self.blob_sha,
+            "canonical_url": self.canonical_url,
+            "content_hash": self.content_hash,
+        }
+
+    @classmethod
+    def from_data(cls, data: Mapping[str, Any]) -> SourceArtifact:
+        return cls(
+            source_kind=str(data.get("source_kind", "")),
+            repository=str(data.get("repository", "")),
+            commit_sha=str(data.get("commit_sha", "")),
+            path=str(data.get("path", "")),
+            blob_sha=str(data.get("blob_sha", "")),
+            canonical_url=str(data.get("canonical_url", "")),
+            content_hash=str(data.get("content_hash", "")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ToolFactDescriptor:
     """A normalized description of facts observable from a tool result.
 
@@ -447,6 +512,7 @@ class ToolFactDescriptor:
     artifact_refs: tuple[str, ...] = ()
     observed_at: str | None = None
     content_hash: str | None = None
+    source_artifacts: tuple[SourceArtifact, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.authority, str) or not self.authority.strip():
@@ -455,6 +521,8 @@ class ToolFactDescriptor:
             values = getattr(self, name)
             if any(not isinstance(value, str) or not value.strip() for value in values):
                 raise ValueError(f"tool fact {name} must contain non-empty strings")
+        if len(set(self.source_artifacts)) != len(self.source_artifacts):
+            raise ValueError("tool fact source_artifacts must be unique")
         for name in ("observed_at", "content_hash"):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
@@ -465,6 +533,7 @@ class ToolFactDescriptor:
             "authority": self.authority,
             "scope": list(self.scope),
             "artifact_refs": list(self.artifact_refs),
+            "source_artifacts": [artifact.to_data() for artifact in self.source_artifacts],
         }
         if self.observed_at is not None:
             data["observed_at"] = self.observed_at
@@ -491,10 +560,16 @@ class ToolFactDescriptor:
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"tool fact {name} must be a non-empty string when present")
             return value
+        raw_artifacts = data.get("source_artifacts", [])
+        if not isinstance(raw_artifacts, list) or not all(
+            isinstance(item, Mapping) for item in raw_artifacts
+        ):
+            raise ValueError("tool fact source_artifacts must be an object list")
         return cls(
             authority=authority,
             scope=strings("scope"),
             artifact_refs=strings("artifact_refs"),
+            source_artifacts=tuple(SourceArtifact.from_data(item) for item in raw_artifacts),
             observed_at=optional_string("observed_at"),
             content_hash=optional_string("content_hash"),
         )
@@ -514,6 +589,7 @@ class ToolResult:
     truncated: bool = False
     meta: Mapping[str, Any] = field(default_factory=dict)
     fact_descriptor: ToolFactDescriptor | None = None
+    evidence_facts: tuple[EvidenceFact, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.call_id.strip():
@@ -530,6 +606,12 @@ class ToolResult:
             self.fact_descriptor, ToolFactDescriptor
         ):
             raise ValueError("tool result fact_descriptor must be ToolFactDescriptor")
+        if not self.ok and self.evidence_facts:
+            raise ValueError("failed tool result cannot contain evidence facts")
+        if any(not isinstance(fact, EvidenceFact) for fact in self.evidence_facts):
+            raise ValueError("tool result evidence_facts must contain EvidenceFact values")
+        if self.truncated and any(fact.complete for fact in self.evidence_facts):
+            raise ValueError("truncated tool result cannot contain complete evidence facts")
 
     @property
     def effective_recovery_kind(self) -> ToolRecoveryKind:
@@ -560,6 +642,8 @@ class ToolResult:
                 result["recovery_action"] = dict(self.recovery_action)
         if self.fact_descriptor is not None:
             result["fact_descriptor"] = self.fact_descriptor.to_data()
+        if self.evidence_facts:
+            result["evidence_facts"] = [fact.to_data() for fact in self.evidence_facts]
         return result
 
     @classmethod
@@ -573,6 +657,11 @@ class ToolResult:
         raw_fact_descriptor = data.get("fact_descriptor")
         if raw_fact_descriptor is not None and not isinstance(raw_fact_descriptor, Mapping):
             raise ValueError("tool result fact_descriptor must be an object")
+        raw_evidence_facts = data.get("evidence_facts", [])
+        if not isinstance(raw_evidence_facts, list) or not all(
+            isinstance(item, Mapping) for item in raw_evidence_facts
+        ):
+            raise ValueError("tool result evidence_facts must be an object list")
         return cls(
             call_id=str(data["call_id"]),
             ok=bool(data["ok"]),
@@ -593,7 +682,18 @@ class ToolResult:
                 ToolFactDescriptor.from_data(raw_fact_descriptor)
                 if isinstance(raw_fact_descriptor, Mapping) else None
             ),
+            evidence_facts=tuple(
+                EvidenceFact.from_data(item) for item in raw_evidence_facts
+            ),
         )
+
+
+class ToolResultGovernorPort(Protocol):
+    """Pure boundary that sanitizes and bounds provider-supplied tool results."""
+
+    def govern(
+        self, spec: ToolSpec, call: ToolCall, result: ToolResult
+    ) -> ToolResult: ...
 
 
 class ToolProcessControl(Protocol):
@@ -708,6 +808,18 @@ class ToolTaskSpecControl(Protocol):
     ) -> Mapping[str, Any]: ...
 
 
+class ToolTurnIntentControl(Protocol):
+    """Persist model-declared intent attempts for the invocation's active turn."""
+
+    async def declare(self, intent: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    async def record_attempt(
+        self,
+        call_id: str,
+        arguments: Mapping[str, Any],
+    ) -> Mapping[str, Any]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class ToolInvocationContext:
     invocation_id: str
@@ -725,6 +837,7 @@ class ToolInvocationContext:
     memory_control: ToolMemoryControl | None = None
     working_memory_control: ToolWorkingMemoryControl | None = None
     task_spec_control: ToolTaskSpecControl | None = None
+    turn_intent_control: ToolTurnIntentControl | None = None
     workspace_path: WorkspacePathPort | None = None
     additional_read_roots: tuple[Path, ...] = ()
     resource_paths: Mapping[str, str] = field(default_factory=dict)

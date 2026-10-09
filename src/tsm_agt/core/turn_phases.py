@@ -28,6 +28,8 @@ from .context import (
 from dataclasses import (
     replace,
 )
+from .evidence_question import EvidenceQuestionProjector
+from .single_loop.context_projection import ActiveContextProjector
 from .steering import (
     SteeringProjector,
 )
@@ -355,12 +357,39 @@ async def _prepare_model_call(
         "project-instructions-context-", "task-spec-context-",
         "project-onboarding-context-", "project-memory-context-",
         "session-context-", "document-references-context-", "working-memory-context-",
+        "task-contract-context-",
     )
     state.messages = [
         message for message in state.messages
         if not message.message_id.startswith(generated_prefixes)
     ]
     state.messages.extend(await kernel._project_context_messages(state.task_id))
+    task = await kernel.get_task(state.task_id)
+    task_events = await kernel._dependencies.store.read_events(state.task_id)
+    working_memory = kernel._dependencies.working_memory_projector.project(
+        state.task_id, task.goal, task_events
+    )
+    evidence_questions = EvidenceQuestionProjector.project(
+        state.task_id, task_events
+    )
+    effective_working_memory = (
+        kernel._dependencies.effective_working_memory_projector.project(
+            working_memory, evidence_questions
+        )
+    )
+    session_prompt = await kernel.get_session_prompt_projection(
+        task.session_id, exclude_task_id=state.task_id
+    )
+    context_shadow = ActiveContextProjector.project(
+        task, state.checkpoint, effective_working_memory, evidence_questions,
+        session_prompt, task_events, model_call=state.model_call_number,
+    )
+    await kernel._append_events(
+        state.task_id, ((
+            "context.single_loop_shadow_projected",
+            context_shadow.event_payload(),
+        ),),
+    )
     try:
         state.prepared = kernel._dependencies.context_manager.prepare(
             conversation=tuple(state.messages), tools=model_visible_tools,
@@ -382,6 +411,14 @@ async def _prepare_model_call(
                 "model_call": state.model_call_number,
                 **state.prepared.compaction.event_data(),
             }),),
+        )
+        await kernel._append_events(
+            state.task_id, ((
+                "context.single_loop_shadow_compacted",
+                context_shadow.compaction_event_payload(
+                    state.prepared.compaction.event_data()
+                ),
+            ),),
         )
         compacted_checkpoint = replace(
             state.checkpoint, messages=tuple(state.messages),
@@ -762,7 +799,7 @@ async def _finish_iteration(
             and not message.message_id.startswith((
                 "project-onboarding-context-",
                 "project-memory-context-", "session-context-",
-                "working-memory-context-", "task-spec-context-",
+                "working-memory-context-", "task-spec-context-", "task-contract-context-",
                 "project-instructions-context-", "completion-readiness-",
             ))
         ), None)
@@ -930,7 +967,7 @@ async def _finish_iteration(
             and not message.message_id.startswith((
                 "project-onboarding-context-",
                 "project-memory-context-", "session-context-",
-                "working-memory-context-", "task-spec-context-",
+                "working-memory-context-", "task-spec-context-", "task-contract-context-",
                 "project-instructions-context-",
             ))
         ), None)

@@ -249,7 +249,10 @@ class KernelToolTest(unittest.IsolatedAsyncioTestCase):
                 ToolCall("call-1", "fixture.echo", {"text": "hello"}),
             )
 
-            self.assertEqual([tool.name for tool in tools], ["fixture.echo"])
+            self.assertEqual(
+                [tool.name for tool in tools],
+                ["fixture.echo", "core.turn_intent"],
+            )
             self.assertTrue(result.ok)
             self.assertEqual(result.data, {"text": "hello"})
             store = application.registry.require(RuntimeStorePort)

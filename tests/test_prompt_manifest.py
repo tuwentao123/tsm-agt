@@ -126,9 +126,19 @@ class PromptManifestTest(unittest.TestCase):
         # it must never name a content category the harness cannot judge.
         self.assertIn("a document you have not read", content)
         self.assertIn("web.fetch_markdown", content)
+        self.assertIn("ui labels", content)
+        self.assertIn("core.search_files with target='content'", content)
+        self.assertIn("a file-name match proves only", content)
+        self.assertIn("core.apply_patch_v4a", content)
+        self.assertIn("for code behavior", content)
+        self.assertIn("only a lead", content)
+        self.assertIn("relevant caller", content)
+        self.assertIn("say what is unverified", content)
+        self.assertIn("literal \\n", content)
+        self.assertEqual(segment.version, "2.5")
         for scenario in ("news", "headline", "article", "financial", "新闻"):
             self.assertNotIn(scenario, content)
-        self.assertEqual(self.template.revision, 10)
+        self.assertEqual(self.template.revision, 15)
 
     def test_mandatory_tool_use_segment_routes_live_facts_to_search(self) -> None:
         segment = next(
@@ -141,7 +151,7 @@ class PromptManifestTest(unittest.TestCase):
         # rule above stays judgeable by the harness.
         self.assertIn("Do not answer the following from memory", content)
         for tool in (
-            "core.run_command", "core.read_file", "core.search_text",
+            "core.run_command", "core.read_file", "core.search_files",
             "web.search", "web.fetch_markdown",
         ):
             self.assertIn(tool, content)

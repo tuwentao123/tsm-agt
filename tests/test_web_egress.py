@@ -38,11 +38,13 @@ def _markdown(url: str) -> FetchResponse:
     )
 
 
-async def _fetch(provider: NetworkToolProvider, url: str):
+async def _fetch(
+    provider: NetworkToolProvider, url: str, tool_name: str = "web.fetch_markdown",
+):
     await provider.start(AdapterContext({}, lambda *_: None))
     try:
         return await provider.invoke(
-            ToolCall("fetch", "web.fetch_markdown", {"url": url}), None,
+            ToolCall("fetch", tool_name, {"url": url}), None,
         )
     finally:
         from datetime import datetime
@@ -137,6 +139,22 @@ class WebEgressValidationTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(first.pinned_address, "93.184.216.34")
         self.assertEqual(caught.exception.code, "URL_NOT_ALLOWED")
+    async def test_open_reuses_direct_egress_validation_and_pinning(self) -> None:
+        transport = _RecordingTransport(_markdown("https://docs.example.test/open"))
+        provider = NetworkToolProvider(
+            fetch_transport=transport,
+            address_resolver=lambda *_: ("93.184.216.34",),
+        )
+
+        result = await _fetch(
+            provider, "https://docs.example.test/open", tool_name="web.open",
+        )
+
+        self.assertTrue(result.ok, result.to_data())
+        self.assertEqual(
+            transport.calls, [("https://docs.example.test/open", "93.184.216.34")],
+        )
+        self.assertTrue(result.data["address_validated_in_process"])
 
 
 class WebFetchTransportContractTest(unittest.TestCase):

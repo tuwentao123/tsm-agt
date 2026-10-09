@@ -63,6 +63,57 @@ class CapturingPlannerModel(EchoModelProvider):
         )
 
 
+def _answer_only_proposal() -> dict:
+    return {
+        **_proposal(),
+        "goal": "provide generic UI advice",
+        "outcomes": [{
+            "outcome_id": "answer",
+            "description": "provide general HTML and CSS examples",
+            "kind": "ANSWER",
+            "required_effects": [],
+            "required": True,
+        }],
+    }
+
+
+def _workspace_delivery_proposal() -> dict:
+    return {
+        **_proposal(),
+        "goal": "modify the current workspace UI",
+        "outcomes": [{
+            "outcome_id": "workspace-ui-change",
+            "description": "modify the identified UI source file",
+            "kind": "WORKSPACE_DELIVERY",
+            "required_effects": ["observe", "mutate"],
+            "required": True,
+        }, {
+            "outcome_id": "answer",
+            "description": "describe the workspace UI change",
+            "kind": "ANSWER",
+            "required_effects": [],
+            "required": True,
+            "depends_on": ["workspace-ui-change"],
+        }],
+    }
+
+
+class CorrectingPlannerModel(CapturingPlannerModel):
+    async def complete(self, request):
+        self.requests.append(request)
+        proposal = (
+            _answer_only_proposal()
+            if len(self.requests) == 1 else _workspace_delivery_proposal()
+        )
+        return ModelResponse(
+            Message(
+                f"planner-proposal-{len(self.requests)}", MessageRole.ASSISTANT,
+                (TextBlock(json.dumps(proposal)),),
+            ),
+            FinishReason.STOP,
+        )
+
+
 class PlannerContractPromptTest(unittest.IsolatedAsyncioTestCase):
     async def _prompt(self) -> str:
         model = CapturingPlannerModel()
@@ -113,12 +164,48 @@ class PlannerContractPromptTest(unittest.IsolatedAsyncioTestCase):
 
         prompt = await self._prompt()
         self.assertIn("session.interpretation_context", prompt)
+        self.assertIn("runtime_context.delivery_intent", prompt)
+        self.assertIn("runtime_context.project_onboarding", prompt)
         self.assertIn("may never define scope", prompt)
         self.assertIn(
             "not the meaning its words carry in isolation", prompt,
         )
         self.assertIn("near-miss", prompt)
 
+
+    async def test_workspace_mutation_intent_rejects_answer_only_then_retries(self) -> None:
+        model = CorrectingPlannerModel()
+        planner = ModelTaskSpecPlanner(model)
+        await planner.start(AdapterContext({}, lambda *_: None))
+        try:
+            proposal = await planner.propose_task_spec(
+                "调整当前项目 UI", {
+                    "delivery_intent": {"kind": "workspace_mutation"},
+                    "project_onboarding": {
+                        "facts": [{
+                            "category": "entry_candidate",
+                            "value": "src/tsm_agt/web/app.py",
+                            "sources": [],
+                        }],
+                    },
+                },
+            )
+        finally:
+            await planner.stop(datetime.now())
+
+        self.assertEqual(len(model.requests), 2)
+        self.assertTrue(any(
+            item["kind"] == "WORKSPACE_DELIVERY"
+            and "mutate" in item["required_effects"]
+            for item in proposal["outcomes"]
+        ))
+        retry_prompt = "\n".join(
+            block.text
+            for message in model.requests[1].messages
+            for block in message.content
+            if isinstance(block, TextBlock)
+        )
+        self.assertIn("workspace mutation request requires", retry_prompt)
 
     async def test_the_spec_budget_covers_a_whole_contract(self) -> None:
         """The SPEC is emitted as one tool call, so the cap is the SPEC's ceiling.

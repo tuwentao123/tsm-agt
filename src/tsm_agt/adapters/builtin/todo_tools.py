@@ -1,30 +1,8 @@
-"""Todo list tool: in-memory, revisioned task list for multi-step work.
-
-Ported from Hermes ``tools/todo_tool.py`` (323 lines, ``a4301a3``-era checkout) with the
-store kept **verbatim** because it is pure logic with zero Hermes dependencies -- the only
-module-level import there is ``tools.registry``.  What is Hermes' and what is ours:
-
-* **Hermes, unchanged**: ``TodoStore`` semantics -- monotonic revision, replace-vs-merge by
-  id, duplicate-id collapse keeping the last position, dangling-parent removal plus cycle
-  breaking, "lift ``in_progress`` ahead of any earlier ``pending`` placeholder" ordering,
-  head-truncation of oversized content, and ``format_for_injection`` (which keeps only
-  active items and any ancestor of an active descendant).
-* **本项目新增，非 Hermes**: the ``ToolProviderPort`` shell (descriptor / ``list_tools`` /
-  ``invoke``), the ``core.todo_list`` dotted name, and the evidence metadata Hermes does
-  not carry.  Hermes' ``registry.register()`` has no risk/effect/authority fields at all,
-  so ``effect=INTERNAL`` + ``result_authority=RUNTIME_FACT`` are declared here to place the
-  tool inside tsm-agt's evidence stack instead of beside it.
-
-State lives in this adapter, bucketed per ``ToolInvocationContext.task_id``.  That is
-deliberate: the tool must not add a Kernel capability or touch the turn loop, so it cannot
-be a new authority for anything the Runtime already owns.  ``is_concurrency_safe=False``
-declares that one task's list must not be mutated concurrently; the contract is published
-to the Runtime rather than hidden behind an internal lock.
-"""
+"""Task-scoped todo tool backed by the durable Working Memory plan."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
@@ -34,175 +12,21 @@ from tsm_agt.ports import (
     ToolResultAuthority, ToolRisk, ToolSpec,
 )
 
-VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
-# The list is re-read after every compression (``format_for_injection``), so unbounded
-# content/count would defeat the compression it rides through.  Caps apply equally to
-# model-authored items and caller-replayed history.
-MAX_TODO_CONTENT_CHARS = 4000
-MAX_TODO_ITEMS = 256
-_TRUNCATION_MARKER = "… [truncated]"
-# Persisted as ordinary message content; the compressor keys on this stable header to tell
-# the synthetic post-compaction row from a real user message.
-TODO_INJECTION_HEADER = "[Your active task list was preserved across context compression]"
-_STATUS_MARKERS = {"completed": "[x]", "in_progress": "[>]", "pending": "[ ]", "cancelled": "[~]"}
-_ACTIVE_STATUSES = {"pending", "in_progress"}
-
-
-class TodoStore:
-    """In-memory todo list, one per Task.  List position is priority; items are
-    ``{id, content, status, parent?}`` -- ``parent`` nests a subtask."""
-
-    def __init__(self) -> None:
-        self._items: list[dict[str, str]] = []
-        self._revision = 0
-
-    def _fresh_items(self, todos: list[dict[str, Any]]) -> list[dict[str, str]]:
-        """Validate, dedupe and order a whole new list (replace / restore)."""
-        return self._normalize_order([self._validate(t) for t in self._dedupe_by_id(todos)])
-
-    def write(self, todos: list[dict[str, Any]], merge: bool = False) -> list[dict[str, str]]:
-        """Replace the list (default) or merge by id; returns the full list after writing."""
-        before = self.read()
-        if merge:
-            self._merge(todos)
-        else:
-            self._items = self._fresh_items(todos)
-        del self._items[MAX_TODO_ITEMS:]  # keep the priority head; replays can't grow unbounded
-        self._sanitize_parents(self._items)
-        if self._items != before:
-            self._revision += 1
-        return self.read()
-
-    def _merge(self, todos: list[dict[str, Any]]) -> None:
-        """Update existing items only in the fields provided; append new ones (validated)."""
-        existing = {item["id"]: item for item in self._items}
-        for t in self._dedupe_by_id(todos):
-            item_id = str(t.get("id", "")).strip()
-            if not item_id:
-                continue  # can't merge without an id
-            cur = existing.get(item_id)
-            if cur is None:
-                validated = self._validate(t)
-                existing[validated["id"]] = validated
-                self._items.append(validated)
-                continue
-            if t.get("content"):
-                cur["content"] = self._cap_content(str(t["content"]).strip())
-            if t.get("status") and str(t["status"]).strip().lower() in VALID_STATUSES:
-                cur["status"] = str(t["status"]).strip().lower()
-            if "parent" in t:
-                parent = str(t["parent"] or "").strip()
-                if parent:
-                    cur["parent"] = parent
-                else:
-                    cur.pop("parent", None)
-        # Rebuild preserving original order for existing items (first occurrence wins).
-        rebuilt = {item["id"]: existing.get(item["id"], item) for item in self._items}
-        self._items = self._normalize_order(list(rebuilt.values()))
-
-    def read(self) -> list[dict[str, str]]:
-        return [item.copy() for item in self._items]
-
-    def has_items(self) -> bool:
-        return bool(self._items)
-
-    def snapshot(self) -> dict[str, Any]:
-        """Full state clients can reconcile atomically."""
-        return {"todos": self.read(), "revision": self._revision}
-
-    def format_for_injection(self) -> str | None:
-        """Render the list for post-compression injection, or None if nothing active.  Only
-        pending/in_progress items are injected -- finished ones make the model re-do work
-        after compression.  A parent is kept (with its real status marker) when any
-        descendant is active so subtasks keep context."""
-        if not self._items:
-            return None
-        children: dict[str, list[dict[str, str]]] = {}
-        for item in self._items:
-            if item.get("parent"):
-                children.setdefault(item["parent"], []).append(item)
-
-        def render(item: dict[str, str], depth: int, out: list[str]) -> bool:
-            kid_lines: list[str] = []
-            has_active_kid = False
-            for kid in children.get(item["id"], []):
-                has_active_kid |= render(kid, depth + 1, kid_lines)
-            keep = item["status"] in _ACTIVE_STATUSES or has_active_kid
-            if keep:
-                marker = _STATUS_MARKERS.get(item["status"], "[?]")
-                out.append(f"{'  ' * depth}- {marker} {item['id']}. "
-                           f"{item['content']} ({item['status']})")
-                out.extend(kid_lines)
-            return keep
-
-        lines = [TODO_INJECTION_HEADER]
-        for item in self._items:
-            if not item.get("parent"):
-                render(item, 0, lines)
-        return "\n".join(lines) if len(lines) > 1 else None
-
-    @staticmethod
-    def _cap_content(content: str) -> str:
-        """Truncate to MAX_TODO_CONTENT_CHARS keeping the head (the actionable part) + marker."""
-        if len(content) > MAX_TODO_CONTENT_CHARS:
-            return content[:MAX_TODO_CONTENT_CHARS - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
-        return content
-
-    @staticmethod
-    def _validate(item: dict[str, Any]) -> dict[str, str]:
-        """Normalize one item to ``{id, content, status, parent?}`` (placeholders when missing)."""
-        if not isinstance(item, dict):
-            return {"id": "?", "content": "(invalid item)", "status": "pending"}
-        item_id = str(item.get("id", "")).strip() or "?"
-        content = str(item.get("content", "")).strip()
-        status = str(item.get("status", "pending")).strip().lower()
-        result = {"id": item_id,
-                  "content": TodoStore._cap_content(content) if content else "(no description)",
-                  "status": status if status in VALID_STATUSES else "pending"}
-        parent = str(item.get("parent") or "").strip()
-        if parent and parent != item_id:
-            result["parent"] = parent
-        return result
-
-    @staticmethod
-    def _sanitize_parents(items: list[dict[str, str]]) -> None:
-        """Drop dangling parent refs and break cycles in place (such items become roots)."""
-        by_id = {item["id"]: item for item in items}
-        for item in items:
-            if item.get("parent") and item["parent"] not in by_id:
-                item.pop("parent", None)
-        for item in items:
-            seen, node = {item["id"]}, item
-            while node.get("parent"):
-                if node["parent"] in seen:
-                    item.pop("parent", None)
-                    break
-                seen.add(node["parent"])
-                node = by_id[node["parent"]]
-
-    @staticmethod
-    def _dedupe_by_id(todos: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Collapse duplicate ids, keeping the last occurrence in its position."""
-        last_index: dict[str, int] = {}
-        for i, item in enumerate(todos):  # non-dicts get a synthetic key; _validate handles them
-            key = str(item.get("id", "")).strip() if isinstance(item, dict) else f"__invalid_{i}"
-            last_index[key or "?"] = i
-        return [todos[i] for i in sorted(last_index.values())]
-
-    @staticmethod
-    def _normalize_order(items: list[dict[str, str]]) -> list[dict[str, str]]:
-        """Lift the in_progress step ahead of any earlier pending placeholder.  Nested lists
-        keep authored order -- reordering would tear a subtask from its siblings."""
-        statuses = [item["status"] for item in items]
-        if any(item.get("parent") for item in items) or "in_progress" not in statuses:
-            return items
-        active_index = statuses.index("in_progress")
-        if "pending" not in statuses[:active_index]:
-            return items
-        normalized = items.copy()
-        normalized.insert(statuses.index("pending"), normalized.pop(active_index))
-        return normalized
-
+MAX_TODO_ITEMS = 30
+_VALID_STATUSES = {"pending", "in_progress", "completed", "blocked"}
+_STATUS_TO_WORKING_MEMORY = {
+    "pending": "PENDING",
+    "in_progress": "IN_PROGRESS",
+    "completed": "COMPLETED",
+    "blocked": "BLOCKED",
+}
+_STATUS_FROM_WORKING_MEMORY = {
+    value: key for key, value in _STATUS_TO_WORKING_MEMORY.items()
+}
+_AUTHORED_STATE_FIELDS = (
+    "goal", "constraints", "facts", "decisions", "hypotheses",
+    "open_questions", "completed_work", "remaining_work", "evidence",
+)
 
 _TODO_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -218,13 +42,15 @@ _TODO_SCHEMA: dict[str, Any] = {
                     "content": {"type": "string", "description": "Task description"},
                     "status": {
                         "type": "string",
-                        "enum": ["pending", "in_progress", "completed", "cancelled"],
+                        "enum": [
+                            "pending", "in_progress", "completed", "blocked",
+                        ],
                     },
-                    "parent": {
+                    "completion_criteria": {
                         "type": "string",
                         "description": (
-                            "Optional id of another item, making this a nested subtask. "
-                            "Omit for top-level."
+                            "Observable condition that proves this item is complete. "
+                            "Defaults to content when omitted."
                         ),
                     },
                 },
@@ -235,36 +61,184 @@ _TODO_SCHEMA: dict[str, Any] = {
         "merge": {
             "type": "boolean",
             "description": (
-                "true: update existing items by id, add new ones. "
-                "false (default): replace the entire list with a fresh plan."
+                "true: update existing items by id and append new ones; "
+                "false: replace the complete list"
             ),
             "default": False,
+        },
+        "expected_revision": {
+            "type": "integer",
+            "description": (
+                "Current revision returned by this tool. Required when todos is present."
+            ),
+        },
+        "operation_id": {
+            "type": "string",
+            "description": (
+                "Stable id for this logical update. Required when todos is present."
+            ),
         },
     },
     "required": [],
     "additionalProperties": False,
 }
 
-# Behavioral guidance is baked into the (static, cached) description; item shape and merge
-# semantics live ONLY in the parameter schema.  Kept verbatim from Hermes' TODO_SCHEMA,
-# including "Mark an item completed only after the work is verified done, never based on
-# intent" -- that line is why this description is worth porting rather than paraphrasing.
 _TODO_DESCRIPTION = (
-    "Track a task list for multi-step work (3+ steps). Use for complex tasks "
-    "with 3+ steps or when the user provides multiple tasks. "
-    "For 'all N items' tasks, enumerate every instance as its own checklist "
-    "item so none are silently dropped. "
-    "Call with no parameters to read the current list.\n"
-    "List order is priority. Only ONE item in_progress at a time. "
-    "Break large phases into subtasks via parent. "
-    "Mark an item completed only after the work is verified done, never "
-    "based on intent. If something fails, cancel it and add a revised "
-    "item. Always returns the full current list."
+    "Track progress for complex multi-step work. Use this tool when the task has "
+    "3 or more concrete steps, the user requests multiple independent changes, "
+    "work spans multiple files or subsystems, or progress must survive interruption "
+    "or restart. Do not use it for explanations, simple searches, single-command "
+    "tasks, or one small localized change. Call with no parameters to read the "
+    "current list. Before a write, read the current list and pass its revision as "
+    "expected_revision plus a stable operation_id. List order is priority and only "
+    "one item may be in_progress. Mark an item completed only after verification. "
+    "If work cannot continue, mark it blocked and add a recovery item. Every call "
+    "returns the complete current list."
 )
 
 
+def _todo_from_plan_step(raw: Mapping[str, Any]) -> dict[str, str]:
+    status = str(raw.get("status", ""))
+    try:
+        todo_status = _STATUS_FROM_WORKING_MEMORY[status]
+    except KeyError as error:
+        raise ValueError(f"unknown Working Memory plan status: {status}") from error
+    return {
+        "id": str(raw.get("step_id", "")),
+        "content": str(raw.get("description", "")),
+        "status": todo_status,
+        "completion_criteria": str(raw.get("completion_criteria", "")),
+    }
+
+
+def _todos_from_state(state: Mapping[str, Any]) -> list[dict[str, str]]:
+    raw_plan = state.get("plan", [])
+    if not isinstance(raw_plan, Sequence) or isinstance(raw_plan, (str, bytes)):
+        raise ValueError("working memory plan must be an array")
+    todos: list[dict[str, str]] = []
+    for raw_step in raw_plan:
+        if not isinstance(raw_step, Mapping):
+            raise ValueError("working memory plan items must be objects")
+        todos.append(_todo_from_plan_step(raw_step))
+    return todos
+
+
+def _normalize_todo(raw: Mapping[str, Any], *, partial: bool) -> dict[str, str]:
+    allowed = {"id", "content", "status", "completion_criteria"}
+    unknown = set(raw) - allowed
+    if unknown:
+        raise ValueError(f"unknown todo fields: {', '.join(sorted(unknown))}")
+    item_id = str(raw.get("id", "")).strip()
+    if not item_id:
+        raise ValueError("todo id must not be empty")
+    normalized = {"id": item_id}
+    if "content" in raw:
+        content = str(raw["content"]).strip()
+        if not content:
+            raise ValueError(f"todo {item_id!r} content must not be empty")
+        normalized["content"] = content
+    elif not partial:
+        raise ValueError(f"todo {item_id!r} requires content")
+    if "status" in raw:
+        status = str(raw["status"]).strip().lower()
+        if status not in _VALID_STATUSES:
+            raise ValueError(f"todo {item_id!r} has invalid status {status!r}")
+        normalized["status"] = status
+    elif not partial:
+        raise ValueError(f"todo {item_id!r} requires status")
+    if "completion_criteria" in raw:
+        completion_criteria = str(raw["completion_criteria"]).strip()
+        if not completion_criteria:
+            raise ValueError(
+                f"todo {item_id!r} completion_criteria must not be empty"
+            )
+        normalized["completion_criteria"] = completion_criteria
+    return normalized
+
+
+def _replace_todos(raw_todos: Sequence[Any]) -> list[dict[str, str]]:
+    if len(raw_todos) > MAX_TODO_ITEMS:
+        raise ValueError(f"todos may contain at most {MAX_TODO_ITEMS} items")
+    todos: list[dict[str, str]] = []
+    seen: set[str] = set()
+    active_count = 0
+    for raw in raw_todos:
+        if not isinstance(raw, Mapping):
+            raise ValueError("todo items must be objects")
+        todo = _normalize_todo(raw, partial=False)
+        if todo["id"] in seen:
+            raise ValueError(f"duplicate todo id: {todo['id']}")
+        seen.add(todo["id"])
+        if todo["status"] == "in_progress":
+            active_count += 1
+        todo.setdefault("completion_criteria", todo["content"])
+        todos.append(todo)
+    if active_count > 1:
+        raise ValueError("todo list may have at most one in_progress item")
+    return todos
+
+
+def _merge_todos(
+    current: list[dict[str, str]], raw_updates: Sequence[Any],
+) -> list[dict[str, str]]:
+    updates: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in raw_updates:
+        if not isinstance(raw, Mapping):
+            raise ValueError("todo items must be objects")
+        update = _normalize_todo(raw, partial=True)
+        if update["id"] in seen:
+            raise ValueError(f"duplicate todo id: {update['id']}")
+        seen.add(update["id"])
+        updates.append(update)
+
+    by_id = {item["id"]: item.copy() for item in current}
+    order = [item["id"] for item in current]
+    for update in updates:
+        item_id = update["id"]
+        if item_id in by_id:
+            by_id[item_id].update(update)
+            continue
+        if "content" not in update or "status" not in update:
+            raise ValueError(
+                f"new todo {item_id!r} requires content and status"
+            )
+        update.setdefault("completion_criteria", update["content"])
+        by_id[item_id] = update
+        order.append(item_id)
+    return _replace_todos([by_id[item_id] for item_id in order])
+
+
+def _working_memory_state(
+    current: Mapping[str, Any], todos: Sequence[Mapping[str, str]],
+) -> dict[str, Any]:
+    state = {field: current[field] for field in _AUTHORED_STATE_FIELDS}
+    state["plan"] = [
+        {
+            "step_id": todo["id"],
+            "description": todo["content"],
+            "status": _STATUS_TO_WORKING_MEMORY[todo["status"]],
+            "completion_criteria": todo["completion_criteria"],
+        }
+        for todo in todos
+    ]
+    return state
+
+
+def _result_data(state: Mapping[str, Any]) -> dict[str, Any]:
+    todos = _todos_from_state(state)
+    summary = {"total": len(todos)}
+    for status in ("pending", "in_progress", "completed", "blocked"):
+        summary[status] = sum(1 for item in todos if item["status"] == status)
+    return {
+        "todos": todos,
+        "revision": int(state["revision"]),
+        "summary": summary,
+    }
+
+
 class CoreTodoToolProvider:
-    """Session-scoped todo list, delegating all semantics to ``TodoStore``."""
+    """Model-friendly todo view over the Task's durable Working Memory plan."""
 
     descriptor = AdapterDescriptor(
         "builtin.core-todo-tools", "0.1.0",
@@ -280,8 +254,8 @@ class CoreTodoToolProvider:
             ToolRisk.R0, False, False, ToolIdempotency.KEYED,
             max_result_tokens=4000,
             rollback=(
-                "write the corrected list again; the revision counter makes every state "
-                "auditable"
+                "write a corrected list with the latest Working Memory revision; "
+                "prior revisions remain auditable"
             ),
             is_internal_state=True,
             effect=ToolEffect.INTERNAL,
@@ -292,7 +266,6 @@ class CoreTodoToolProvider:
 
     def __init__(self) -> None:
         self._started = False
-        self._stores: dict[str, TodoStore] = {}
 
     async def start(self, context: AdapterContext) -> None:
         self._started = True
@@ -305,15 +278,9 @@ class CoreTodoToolProvider:
 
     async def stop(self, deadline: datetime) -> None:
         self._started = False
-        self._stores.clear()
 
     async def list_tools(self) -> tuple[ToolSpec, ...]:
         return self._tools
-
-    def store_for(self, task_id: str) -> TodoStore:
-        """Per-Task store.  Exposed so the Runtime can read revisions/injection text."""
-
-        return self._stores.setdefault(task_id, TodoStore())
 
     async def invoke(
         self, call: ToolCall, context: ToolInvocationContext,
@@ -325,34 +292,54 @@ class CoreTodoToolProvider:
                 call.call_id, False, error_code="NOT_FOUND",
                 message=f"unknown todo tool: {call.name}",
             )
-        store = self.store_for(context.task_id)
+        control = context.working_memory_control
+        if control is None:
+            return ToolResult(
+                call.call_id, False, error_code="UNAVAILABLE",
+                message="working memory capability is unavailable",
+            )
         try:
-            arguments = call.arguments
-            raw_todos = arguments.get("todos")
+            current = await control.read()
+            raw_todos = call.arguments.get("todos")
             if raw_todos is None:
-                items = store.read()
+                data = _result_data(current)
             else:
-                if not isinstance(raw_todos, (list, tuple)):
+                if not isinstance(raw_todos, Sequence) or isinstance(
+                    raw_todos, (str, bytes)
+                ):
                     raise ValueError(
                         f"todos must be an array, got {type(raw_todos).__name__}"
                     )
-                merge = arguments.get("merge", False)
+                merge = call.arguments.get("merge", False)
                 if not isinstance(merge, bool):
                     raise ValueError("merge must be a boolean")
-                items = store.write(list(raw_todos), merge)
+                expected_revision = int(call.arguments["expected_revision"])
+                operation_id = str(call.arguments["operation_id"]).strip()
+                if not operation_id:
+                    raise ValueError("operation_id must not be empty")
+                current_todos = _todos_from_state(current)
+                todos = (
+                    _merge_todos(current_todos, raw_todos)
+                    if merge else _replace_todos(raw_todos)
+                )
+                if todos == current_todos:
+                    data = _result_data(current)
+                else:
+                    updated = await control.update(
+                        expected_revision,
+                        _working_memory_state(current, todos),
+                        operation_id,
+                    )
+                    data = _result_data(updated)
+            return ToolResult(
+                call.call_id, True, data=data,
+                meta={"runtime_internal_state": True},
+            )
         except (KeyError, TypeError, ValueError) as error:
             return ToolResult(
                 call.call_id, False, error_code="INVALID_PARAM", message=str(error),
             )
-        summary: dict[str, int] = {"total": len(items)}
-        for status in ("pending", "in_progress", "completed", "cancelled"):
-            summary[status] = sum(1 for item in items if item["status"] == status)
-        return ToolResult(
-            call.call_id, True,
-            data={
-                "todos": items,
-                "revision": store.snapshot()["revision"],
-                "summary": summary,
-            },
-            meta={"runtime_internal_state": True},
-        )
+        except LookupError as error:
+            return ToolResult(
+                call.call_id, False, error_code="NOT_FOUND", message=str(error),
+            )

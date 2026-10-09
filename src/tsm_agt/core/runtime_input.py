@@ -327,6 +327,8 @@ class SessionTextInput:
     text: str
     input_id: str
     workspace: str | None = None
+    shadow_explicit_task_id: str | None = None
+    shadow_new_task_requested: bool = False
 
     @property
     def channel(self) -> InputChannel:

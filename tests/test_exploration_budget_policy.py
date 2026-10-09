@@ -346,7 +346,7 @@ class ExplorationBudgetKernelTest(unittest.IsolatedAsyncioTestCase):
             policy = RuleBasedExplorationBudgetPolicy(
                 max_scored_actions=1, minimum_scored_actions=1,
             )
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=FocusSequenceModel(), tool_adapters=(tool,),
                 require_evidence_questions=True,
                 evidence_delta_evaluator_adapter=StructuredEvidenceDeltaEvaluator(),
@@ -407,7 +407,7 @@ class ExplorationBudgetKernelTest(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             database = root / "runtime.db"
             tool = RepeatedSearchTool()
-            app = compose_fixture_application(
+            app = compose_legacy_fixture_application(
                 model_adapter=BudgetSequenceModel(), tool_adapters=(tool,),
                 store_adapter=SQLiteRuntimeStore(database),
                 require_evidence_questions=True,
@@ -494,10 +494,10 @@ class ExplorationBudgetKernelTest(unittest.IsolatedAsyncioTestCase):
 
 class ExplorationBudgetCompositionTest(unittest.TestCase):
     def test_fixture_policy_is_optional_and_replaceable(self):
-        without = compose_fixture_application()
+        without = compose_legacy_fixture_application()
         self.assertEqual(without.registry.all(ExplorationBudgetPolicyPort), ())
         policy = RuleBasedExplorationBudgetPolicy()
-        app = compose_fixture_application(exploration_budget_policy_adapter=policy)
+        app = compose_legacy_fixture_application(exploration_budget_policy_adapter=policy)
         self.assertIs(app.registry.require(ExplorationBudgetPolicyPort), policy)
 
     def test_default_budget_is_not_the_old_twelve_call_experiment(self):
@@ -605,3 +605,11 @@ class ExplorationBudgetCompositionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from tsm_agt.core.single_loop import OrchestrationMode
+
+
+def compose_legacy_fixture_application(*args, **kwargs):
+    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
+    return compose_fixture_application(*args, **kwargs)

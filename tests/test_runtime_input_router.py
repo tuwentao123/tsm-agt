@@ -10,6 +10,7 @@ from tsm_agt.core import (
     RuntimeInputContext, RuntimeInputIntent, RuntimeInputRouter,
     SessionInputAction, SessionTextInput, TaskState,
 )
+from tsm_agt.core.single_loop import TaskBindingDecision, TaskBindingKind
 from tsm_agt.ports import (
     AdapterDescriptor, HealthState, HealthStatus,
     SessionInputRelation, SessionInputRelationJudgement,
@@ -143,8 +144,8 @@ class RuntimeInputKernelTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(event.channel.value, "TASK_TEXT")
                 decision = await app.kernel.dispatch_input_event(event)
-                self.assertEqual(decision.action, SessionInputAction.NEW_TASK)
-                self.assertEqual(decision.relation.value, "INDEPENDENT")
+                self.assertIsInstance(decision, TaskBindingDecision)
+                self.assertEqual(decision.binding_kind, TaskBindingKind.NEW)
             finally:
                 await app.registry.stop_all()
 
