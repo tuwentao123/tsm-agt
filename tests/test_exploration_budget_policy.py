@@ -20,7 +20,7 @@ from tsm_agt.bootstrap.exploration_configuration import (
 )
 from tsm_agt.core import AgentProgressKind, AgentTurnResult, TaskState
 from tsm_agt.ports import (
-    AdapterDescriptor, EvidenceDelta, EvidenceItem, EvidenceQuestion,
+    AdapterDescriptor, EvidenceDelta, EvidenceItem,
     ExplorationBudgetAction, ExplorationBudgetObservation,
     ExplorationBudgetPolicyPort, ExplorationBudgetProbe, ExplorationBudgetState,
     FinishReason, HealthState, HealthStatus, Message, MessageRole, ModelRequest,
@@ -505,7 +505,7 @@ class ExplorationBudgetCompositionTest(unittest.TestCase):
         # The ceiling has to cover a real engineering Turn: read, edit, then run
         # a build or test suite, with one model call spent interpreting each
         # Tool result. Fifteen calls ended ordinary work as a budget failure, and
-        # so did forty. Hermes allows 90 iterations per parent turn; Codex has no
+        # so did forty. The reference agent allows 90 iterations per parent turn; Codex has no
         # ceiling at all and relies on compaction.
         self.assertEqual(configuration.agent_max_model_calls, 90)
         self.assertEqual(configuration.agent_max_tool_calls, 120)
@@ -607,9 +607,8 @@ if __name__ == "__main__":
     unittest.main()
 
 
-from tsm_agt.core.single_loop import OrchestrationMode
+from tsm_agt.core import OrchestrationMode
 
 
 def compose_legacy_fixture_application(*args, **kwargs):
-    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
     return compose_fixture_application(*args, **kwargs)

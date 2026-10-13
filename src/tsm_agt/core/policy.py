@@ -10,8 +10,40 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from tsm_agt.ports import ToolCall, ToolRisk, ToolSpec
+from tsm_agt.ports import ToolCall, ToolResultAuthority, ToolRisk, ToolSpec
 from .trust import ProjectTrustLevel
+
+#: ``git`` subcommands that only bring a public repository in. They create no
+#: remote state and cannot rewrite local history, so a project trust that
+#: already permits execution does not need a per-command approval for them.
+_READ_ONLY_GIT_FETCH_SUBCOMMANDS = frozenset({"clone", "fetch", "ls-remote"})
+
+#: Arguments that let a caller inject configuration or run a program through an
+#: otherwise read-only fetch. They keep the command on the approval path.
+_GIT_FETCH_INJECTION_FLAGS = frozenset({
+    "-c", "--config", "-u", "--upload-pack", "--template",
+    "--reference", "--separate-git-dir", "--server-option",
+})
+
+#: Shell executables. The sandbox never authorizes one, so the policy refuses it
+#: outright instead of parking the turn behind an approval a human cannot make
+#: useful: the model must re-issue the program and its arguments directly.
+_DENIED_SHELL_EXECUTABLES = frozenset({
+    "ash", "bash", "csh", "dash", "fish", "ksh", "sh", "tcsh", "zsh",
+    "cmd", "powershell", "pwsh",
+})
+
+#: ``gh api`` flags that turn a read into a write. ``gh api`` defaults to GET but
+#: switches to POST as soon as a field is supplied, so those stay gated.
+_GH_API_WRITE_FLAGS = frozenset({
+    "-X", "--method", "-f", "--field", "-F", "--raw-field", "--input",
+})
+
+#: Two-word ``gh`` subcommands that only read. ``gh api`` is handled separately
+#: because its safety depends on the endpoint and flags.
+_GH_READ_ONLY_SUBCOMMANDS = frozenset({("auth", "status")})
+_GH_READ_ONLY_VIEWS = frozenset({"view", "list", "diff", "status"})
+_GH_SEARCH_KINDS = frozenset({"code", "commits", "issues", "prs", "repos"})
 
 
 class PolicyAction(StrEnum):
@@ -89,6 +121,25 @@ class CoreToolPolicy:
                 f"project trust {project_trust.value} does not allow repository "
                 "commands; grant TRUSTED_BUILD or TRUSTED_FULL first"
             )
+        elif (
+            call.name == "core.run_command"
+            and self._executable_name(call) in _DENIED_SHELL_EXECUTABLES
+        ):
+            action = PolicyAction.DENY
+            reason = (
+                "a shell executable is denied; pass the program and its arguments "
+                "directly as the argv array"
+            )
+        elif call.name == "core.run_command" and self.is_external_source_read(call):
+            # Reading another project's source changes no remote state: a git
+            # fetch brings it in, ``gh api`` reads it where it lives. A project
+            # trust that already permits execution therefore needs no
+            # per-command approval for it; writes still fall through.
+            action = PolicyAction.ALLOW
+            reason = (
+                "read-only source retrieval is allowed under "
+                f"project trust {project_trust.value}"
+            )
         elif effective_risk is ToolRisk.R0 and spec.is_read_only:
             action = PolicyAction.ALLOW
             reason = "R0 read-only workspace tool is allowed"
@@ -146,6 +197,149 @@ class CoreToolPolicy:
             classified if ranks[classified] > ranks[declared] else declared,
             spec.requires_network or network,
             factors,
+        )
+
+    @staticmethod
+    def _executable_name(call: ToolCall) -> str:
+        raw_argv = call.arguments.get("argv")
+        if not isinstance(raw_argv, (list, tuple)) or not raw_argv:
+            return ""
+        name = Path(str(raw_argv[0])).name.lower()
+        for suffix in (".exe", ".cmd", ".bat"):
+            if name.endswith(suffix):
+                return name[: -len(suffix)]
+        return name
+
+    @classmethod
+    def is_external_source_read(cls, call: ToolCall) -> bool:
+        """Whether one invocation reads provenance material outside the workspace.
+
+        This is the single owner of that judgement. Policy uses it to skip
+        approval, and the Runtime uses it to label the execution's result
+        authority, so completion can ask "did this turn read something from
+        outside?" without knowing a single command or tool name.
+        """
+
+        return cls._is_read_only_git_fetch(call) or cls._is_read_only_gh(call)
+
+    @classmethod
+    def retrieves_external_source(cls, call: ToolCall) -> bool:
+        """Whether one invocation actually obtained content from a remote source.
+
+        Narrower than :meth:`is_external_source_read`: a ref listing or a search
+        tells you a repository exists, not what its source says, so only the
+        calls that bring or read content count. Completion uses this to decide
+        whether a declared external dependency was really satisfied.
+        """
+
+        if cls._is_read_only_gh(call):
+            argv = [str(item) for item in (call.arguments.get("argv") or ())]
+            return len(argv) > 1 and argv[1].lower() == "api"
+        return cls._is_read_only_git_fetch(call) and cls._git_fetch_subcommand(
+            call
+        ) in {"clone", "fetch"}
+
+    @classmethod
+    def _git_fetch_subcommand(cls, call: ToolCall) -> str:
+        raw_argv = call.arguments.get("argv")
+        if not isinstance(raw_argv, (list, tuple)):
+            return ""
+        argv = tuple(str(item) for item in raw_argv)
+        valued_options = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+        index = 1
+        while index < len(argv):
+            item = argv[index]
+            if not item.startswith("-"):
+                return item.lower()
+            index += 2 if item in valued_options else 1
+        return ""
+
+    @classmethod
+    def execution_result_authority(
+        cls, spec: ToolSpec, call: ToolCall,
+    ) -> ToolResultAuthority:
+        """The authority to record for one invocation.
+
+        ``core.run_command`` is a general command runner, so its spec says
+        ``PROCESS_FACT``. An invocation that only fetched public material
+        establishes a fact from *outside* the workspace, and saying so here is
+        what lets completion stay generic.
+        """
+
+        if spec.name == "core.run_command" and cls.is_external_source_read(call):
+            return ToolResultAuthority.EXTERNAL_SERVICE
+        return spec.result_authority
+
+    @classmethod
+    def _is_read_only_git_fetch(cls, call: ToolCall) -> bool:
+        """Whether ``argv`` is a ``git`` command that only reads a public remote.
+
+        Only the subcommands that bring a repository *in* are recognised: they
+        create no remote state and cannot rewrite local history. Everything else
+        (push, reset, clean, publish) keeps its normal approval path.
+        """
+
+        raw_argv = call.arguments.get("argv")
+        if not isinstance(raw_argv, (list, tuple)) or len(raw_argv) < 2:
+            return False
+        argv = tuple(str(item) for item in raw_argv)
+        executable = Path(argv[0]).name.lower()
+        for suffix in (".exe", ".cmd", ".bat"):
+            if executable.endswith(suffix):
+                executable = executable[: -len(suffix)]
+                break
+        if executable != "git":
+            return False
+        if any(
+            item in _GIT_FETCH_INJECTION_FLAGS
+            or item.split("=", 1)[0] in _GIT_FETCH_INJECTION_FLAGS
+            for item in argv[1:]
+        ):
+            return False
+        return cls._git_fetch_subcommand(call) in _READ_ONLY_GIT_FETCH_SUBCOMMANDS
+
+    @staticmethod
+    def _is_read_only_gh(call: ToolCall) -> bool:
+        """Whether ``argv`` is a ``gh`` invocation that only reads GitHub.
+
+        ``gh api`` with a raw-Accept header is the direct way to read one
+        file without cloning the repository, so it is the important case here.
+        """
+
+        raw_argv = call.arguments.get("argv")
+        if not isinstance(raw_argv, (list, tuple)) or len(raw_argv) < 2:
+            return False
+        argv = tuple(str(item) for item in raw_argv)
+        executable = Path(argv[0]).name.lower()
+        for suffix in (".exe", ".cmd", ".bat"):
+            if executable.endswith(suffix):
+                executable = executable[: -len(suffix)]
+                break
+        if executable != "gh":
+            return False
+        subcommand = argv[1].lower()
+        if subcommand == "api":
+            if len(argv) < 3:
+                return False
+            for item in argv[2:]:
+                if item.split("=", 1)[0] in _GH_API_WRITE_FLAGS:
+                    return False
+                if item.startswith("-X") and item != "-X":
+                    return False
+            # The GraphQL endpoint is always a POST, whatever the flags say.
+            return not any(
+                item.lower() == "graphql"
+                for item in argv[2:]
+                if not item.startswith("-")
+            )
+        if (subcommand, argv[2].lower() if len(argv) > 2 else "") in _GH_READ_ONLY_SUBCOMMANDS:
+            return True
+        if subcommand == "search":
+            return len(argv) > 2 and argv[2].lower() in _GH_SEARCH_KINDS
+        return (
+            subcommand in {"repo", "pr", "issue", "run", "release"}
+            and len(argv) > 2
+            and argv[2].lower() in _GH_READ_ONLY_VIEWS
         )
 
     @staticmethod

@@ -180,7 +180,13 @@ class TaskRuntimeProjector:
             TaskState.PLANNING,
         }:
             return TaskDisplayStatus.PENDING
-        if state in {TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER}:
+        if state in {
+            TaskState.AWAITING_APPROVAL, TaskState.AWAITING_USER,
+            # A conversation Task idles here between turns: it is not executing,
+            # and a card that reads "running" would hide that it waits for the
+            # next message.
+            TaskState.AWAITING_INPUT,
+        }:
             return TaskDisplayStatus.WAITING
         if state in {TaskState.INTERRUPTING, TaskState.INTERRUPTED, TaskState.CONFLICT}:
             return TaskDisplayStatus.INTERRUPTED
@@ -204,6 +210,8 @@ class TaskRuntimeProjector:
         if task.state is TaskState.AWAITING_APPROVAL or task.pending_approval:
             return TaskExecutionStatus.WAITING_APPROVAL, "approval"
         if task.state is TaskState.AWAITING_USER or task.pending_clarification:
+            return TaskExecutionStatus.WAITING_INPUT, "input"
+        if task.state is TaskState.AWAITING_INPUT:
             return TaskExecutionStatus.WAITING_INPUT, "input"
         if task.state in {TaskState.INTERRUPTING, TaskState.INTERRUPTED, TaskState.CONFLICT}:
             return TaskExecutionStatus.INTERRUPTED, None

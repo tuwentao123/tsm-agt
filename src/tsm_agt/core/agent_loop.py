@@ -7,7 +7,10 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from tsm_agt.ports import FinishReason, Message, ModelUsage, ToolCall
+from tsm_agt.ports import (
+    FinishReason, Message, ModelRecoveryAction, ModelTransportProgress,
+    ModelUsage, ToolCall,
+)
 from .configuration import canonical_hash
 
 
@@ -292,7 +295,6 @@ class AgentTurnCheckpoint:
     goal_revision: int = 1
     action_progress: Mapping[str, Any] = field(default_factory=dict)
     evidence_inventory: Mapping[str, Any] = field(default_factory=dict)
-    evidence_question_state: Mapping[str, Any] = field(default_factory=dict)
     read_hits_state: Mapping[str, Any] = field(default_factory=dict)
     artifact_read_state: Mapping[str, Any] = field(default_factory=dict)
     progressive_scope_state: Mapping[str, Any] = field(default_factory=dict)
@@ -301,7 +303,6 @@ class AgentTurnCheckpoint:
     evidence_relation_state: Mapping[str, Any] = field(default_factory=dict)
     rejection_loop_state: Mapping[str, Any] = field(default_factory=dict)
     exploration_outcome_state: Mapping[str, Any] = field(default_factory=dict)
-    completion_readiness_state: Mapping[str, Any] = field(default_factory=dict)
     task_spec_revision: int = 0
     task_spec_hash: str = ""
     # Historical checkpoint payload retained solely for integrity-checked replay.
@@ -314,6 +315,8 @@ class AgentTurnCheckpoint:
     pending_user_action: Mapping[str, Any] = field(default_factory=dict)
     model_budget_renewal_count: int = 0
     model_budget_total_granted: int = 0
+    checkpoint_schema_version: int = 2
+    finalization_state: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> AgentTurnCheckpoint:
@@ -324,6 +327,10 @@ class AgentTurnCheckpoint:
             raise ValueError("agent checkpoint messages and calls must be lists")
         if not isinstance(raw_seen, list):
             raise ValueError("agent checkpoint seen_call_ids must be a list")
+        schema_version = int(data.get("checkpoint_schema_version", 1))
+        if schema_version == 1:
+            return load_checkpoint_v1(data)
+        stored_hash = data.get("checkpoint_hash")
         checkpoint = cls(
             task_id=str(data["task_id"]),
             turn_id=str(data["turn_id"]),
@@ -339,6 +346,11 @@ class AgentTurnCheckpoint:
             max_tool_calls=int(data["max_tool_calls"]),
             max_output_tokens=int(data["max_output_tokens"]),
             tool_timeout_seconds=float(data["tool_timeout_seconds"]),
+            checkpoint_schema_version=2,
+            finalization_state=(
+                dict(data["finalization_state"])
+                if isinstance(data.get("finalization_state"), Mapping) else {}
+            ),
             model_budget_renewal_count=int(
                 data.get("model_budget_renewal_count", 0)
             ),
@@ -364,10 +376,6 @@ class AgentTurnCheckpoint:
                 dict(data["evidence_inventory"])
                 if isinstance(data.get("evidence_inventory"), Mapping) else {}
             ),
-            evidence_question_state=(
-                dict(data["evidence_question_state"])
-                if isinstance(data.get("evidence_question_state"), Mapping) else {}
-            ),
             read_hits_state=(
                 dict(data["read_hits_state"])
                 if isinstance(data.get("read_hits_state"), Mapping) else {}
@@ -388,21 +396,9 @@ class AgentTurnCheckpoint:
                 dict(data["stop_or_pivot_state"])
                 if isinstance(data.get("stop_or_pivot_state"), Mapping) else {}
             ),
-            evidence_relation_state=(
-                dict(data["evidence_relation_state"])
-                if isinstance(data.get("evidence_relation_state"), Mapping) else {}
-            ),
             rejection_loop_state=(
                 dict(data["rejection_loop_state"])
                 if isinstance(data.get("rejection_loop_state"), Mapping) else {}
-            ),
-            exploration_outcome_state=(
-                dict(data["exploration_outcome_state"])
-                if isinstance(data.get("exploration_outcome_state"), Mapping) else {}
-            ),
-            completion_readiness_state=(
-                dict(data["completion_readiness_state"])
-                if isinstance(data.get("completion_readiness_state"), Mapping) else {}
             ),
             task_spec_revision=int(data.get("task_spec_revision", 0)),
             task_spec_hash=str(data.get("task_spec_hash", "")),
@@ -429,13 +425,13 @@ class AgentTurnCheckpoint:
             or checkpoint.model_budget_total_granted < 0
         ):
             raise ValueError("agent checkpoint budget renewal values must not be negative")
-        stored_hash = data.get("checkpoint_hash")
-        if stored_hash is not None and str(stored_hash) != checkpoint.checkpoint_hash:
+        if (
+            schema_version >= 2 and stored_hash is not None
+            and str(stored_hash) != checkpoint.checkpoint_hash
+        ):
             legacy_content = checkpoint._content_data()
             evolved_fields = (
-                "evidence_relation_state", "rejection_loop_state",
-                "exploration_outcome_state", "evidence_question_state",
-                "completion_readiness_state",
+                "rejection_loop_state",
                 "model_budget_renewal_count", "model_budget_total_granted",
                 "task_spec_revision", "task_spec_hash",
                 "execution_focus", "active_outcome_ids",
@@ -455,6 +451,7 @@ class AgentTurnCheckpoint:
 
     def _content_data(self) -> dict[str, Any]:
         return {
+            "checkpoint_schema_version": 2,
             "task_id": self.task_id,
             "turn_id": self.turn_id,
             "revision": self.revision,
@@ -469,6 +466,7 @@ class AgentTurnCheckpoint:
             "max_tool_calls": self.max_tool_calls,
             "max_output_tokens": self.max_output_tokens,
             "tool_timeout_seconds": self.tool_timeout_seconds,
+            "finalization_state": dict(self.finalization_state or {}),
             "model_budget_renewal_count": self.model_budget_renewal_count,
             "model_budget_total_granted": self.model_budget_total_granted,
             "workspace_fingerprint": self.workspace_fingerprint,
@@ -484,9 +482,6 @@ class AgentTurnCheckpoint:
             "goal_revision": self.goal_revision,
             "action_progress": dict(self.action_progress or {}),
             "evidence_inventory": dict(self.evidence_inventory or {}),
-            "evidence_question_state": dict(
-                self.evidence_question_state or {}
-            ),
             "read_hits_state": dict(self.read_hits_state or {}),
             "artifact_read_state": dict(self.artifact_read_state or {}),
             "progressive_scope_state": dict(self.progressive_scope_state or {}),
@@ -494,14 +489,7 @@ class AgentTurnCheckpoint:
                 self.exploration_budget_state or {}
             ),
             "stop_or_pivot_state": dict(self.stop_or_pivot_state or {}),
-            "evidence_relation_state": dict(self.evidence_relation_state or {}),
             "rejection_loop_state": dict(self.rejection_loop_state or {}),
-            "exploration_outcome_state": dict(
-                self.exploration_outcome_state or {}
-            ),
-            "completion_readiness_state": dict(
-                self.completion_readiness_state or {}
-            ),
             "task_spec_revision": self.task_spec_revision,
             "task_spec_hash": self.task_spec_hash,
             **(
@@ -526,15 +514,70 @@ class AgentTurnCheckpoint:
         return {**self._content_data(), "checkpoint_hash": self.checkpoint_hash}
 
 
+_LEGACY_CHECKPOINT_PROJECTION_FIELDS = frozenset({
+    "evidence_question_state",
+    "completion_readiness_state",
+    "evidence_relation_state",
+    "exploration_outcome_state",
+})
+_LEGACY_TOOL_CALL_FIELDS = frozenset({"evidence_question", "evidence_intent"})
+
+
+def load_checkpoint_v1(data: Mapping[str, Any]) -> AgentTurnCheckpoint:
+    """Verify one v1 payload before dropping its retired projections.
+
+    The integrity check intentionally uses the exact historical envelope.  The
+    conversion only happens afterwards, so a valid v1 checkpoint is never
+    measured against the v2 canonical form.
+    """
+    stored_hash = data.get("checkpoint_hash")
+    if stored_hash is not None:
+        legacy_payload = dict(data)
+        legacy_payload.pop("checkpoint_hash", None)
+        if str(stored_hash) != canonical_hash(legacy_payload):
+            raise ValueError("agent checkpoint integrity hash does not match")
+    legacy_envelope_observed = (
+        "evidence_question_state" in data
+        or "completion_readiness_state" in data
+        or any(
+            isinstance(call, Mapping)
+            and any(key in call for key in _LEGACY_TOOL_CALL_FIELDS)
+            for call in data.get("pending_tool_calls", [])
+        )
+    )
+    upgraded = {
+        key: value
+        for key, value in data.items()
+        if key not in _LEGACY_CHECKPOINT_PROJECTION_FIELDS
+        and key != "checkpoint_hash"
+    }
+    raw_calls = upgraded.get("pending_tool_calls", [])
+    if isinstance(raw_calls, list):
+        upgraded["pending_tool_calls"] = [
+            {
+                key: value for key, value in call.items()
+                if key not in _LEGACY_TOOL_CALL_FIELDS
+            }
+            if isinstance(call, Mapping) else call
+            for call in raw_calls
+        ]
+    upgraded["checkpoint_schema_version"] = 2
+    upgraded["finalization_state"] = {
+        "legacy_evidence_envelope_observed": legacy_envelope_observed,
+    }
+    return AgentTurnCheckpoint.from_data(upgraded)
+
+
 @dataclass(slots=True)
 class TurnState:
     """Every local the agent turn threads through its loop body.
 
-    Mirrors Hermes' ``_LoopState`` (``agent/conversation_loop.py:1385-1420``),
+    Mirrors the reference loop state (the conversation loop's state holder),
     including two of its choices that look like sloppiness and are not:
 
-    * **Most fields are ``Any``.** Hermes types only ``retry_count`` and
-      ``finish_reason``; everything else is opaque to the state holder. The loop
+    * **Most fields are ``Any``.** The reference implementation types only
+      ``retry_count`` and ``finish_reason``; everything else is opaque to the
+      state holder. The loop
       passes values through without interpreting them, and naming a type per
       field would add an import edge per field for no reader. Concrete types
       appear below only where the initial value carries meaning.
@@ -587,6 +630,12 @@ class TurnState:
     budget_wrap_up_decision: Any = None
     protocol_recovery_attempts: int = 0
     protocol_correction: Any = None
+    #: Latched once when a text answer tried to conclude on discovered paths
+    #: alone, so the conversation loop asks at most once and never loops.
+    review_continuations: int = 0
+    reviewer_call_count: int = 0
+    last_candidate_hash: str = ""
+    last_review_reason_code: str = ""
 
     # Produced by the model-call preparation phase and consumed by the call and
     # response phases. Each of these is an intra-iteration fact, not turn-level
@@ -616,7 +665,7 @@ class TurnState:
 class PhaseAction(StrEnum):
     """What the caller must do once a phase hands control back.
 
-    Mirrors Hermes' single control-flow vocabulary
+    Mirrors the reference agent's single control-flow vocabulary
     (``agent/conversation_loop.py:1641-1678``): every phase answers with an
     ``action`` and the loop dispatches on it, so a phase that must end the
     iteration says so instead of breaking out of a loop it does not own.
@@ -719,3 +768,52 @@ class AgentContinuationSuspended:
     completed_outcome_ids: tuple[str, ...]
     remaining_outcome_ids: tuple[str, ...]
     assistant_message: Message
+
+
+async def record_model_transport_progress(
+    kernel: Any, state: TurnState, update: ModelTransportProgress,
+    *, goal: str,
+) -> None:
+    """Record and surface one physical model-attempt transition.
+
+    Both loops owe the same thing: the durable attempt ledger and the live
+    progress stream must see each transition before the provider continues, and
+    a transport fallback has to read as one. A buffered batch made a
+    five-minute stall look like a single instantaneous event after recovery
+    finished.
+    """
+
+    await kernel._record_model_attempt_events(
+        state.task_id, state.turn_id, state.model_call_number, [update]
+    )
+    retry_actions = {
+        ModelRecoveryAction.RETRY_SAME_REQUEST.value,
+        ModelRecoveryAction.RESAMPLE.value,
+        ModelRecoveryAction.RESAMPLE_WITH_CORRECTION.value,
+        ModelRecoveryAction.FALLBACK_TRANSPORT.value,
+    }
+    is_retry = (
+        update.kind == "recovery_decided"
+        and update.recovery_action in retry_actions
+    )
+    reason = update.reason
+    if update.recovery_action == ModelRecoveryAction.FALLBACK_TRANSPORT.value:
+        reason = "stream_fallback:" + reason
+    kernel._notify_agent_progress(state.on_progress, AgentProgress(
+        AgentProgressKind.MODEL_RETRY if is_retry
+        else AgentProgressKind.MODEL_TRANSPORT,
+        model_call=state.model_call_number,
+        max_model_calls=state.checkpoint.max_model_calls,
+        tool_call=state.tool_call_count,
+        max_tool_calls=state.checkpoint.max_tool_calls,
+        goal=goal,
+        reason=reason,
+        transport_attempt=update.attempt,
+        max_transport_attempts=update.max_attempts,
+        retry_delay_seconds=update.delay_seconds,
+        transport_mode=update.transport_mode,
+        transport_event=update.kind,
+        diagnostic_code=update.diagnostic_code,
+        diagnostic_detail=update.diagnostic_detail,
+        recovery_action=update.recovery_action,
+    ))

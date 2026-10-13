@@ -98,10 +98,11 @@ class ResilientModelProvider:
 
     async def _decision(
         self, failure: ModelAttemptFailure, attempt: int, *, fallback: bool,
-        max_attempts: int | None = None,
+        max_attempts: int | None = None, streaming: bool = False,
     ):
         return await self._policy.evaluate(ModelRecoveryProbe(
-            failure, attempt, max_attempts or self._max_provider_attempts, fallback,
+            failure, attempt, max_attempts or self._max_provider_attempts,
+            fallback, streaming,
         ))
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
@@ -173,7 +174,7 @@ class ResilientModelProvider:
                 failure = self._normalize_failure(error).with_visibility(visible)
                 decision = await self._decision(
                     failure, attempt, fallback=(not use_fallback),
-                    max_attempts=max_attempts,
+                    max_attempts=max_attempts, streaming=not use_fallback,
                 )
                 await self._report_failure(
                     request, failure, decision, attempt, max_attempts

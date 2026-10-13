@@ -7,7 +7,6 @@ from tsm_agt.adapters.anthropic_messages import AnthropicMessagesModelProvider
 from tsm_agt.adapters.openai_compatible import OpenAICompatibleProviderError
 from tsm_agt.ports import (
     AdapterContext,
-    EvidenceQuestion,
     FinishReason,
     ImageBlock,
     Message,
@@ -159,23 +158,3 @@ class AnthropicMessagesModelProviderTest(unittest.IsolatedAsyncioTestCase):
             await provider.complete(ModelRequest(
                 "turn-invalid", (Message("user", MessageRole.USER, (TextBlock("hello"),)),),
             ))
-
-    async def test_evidence_envelope_round_trips_through_tool_input(self):
-        transport = RecordingTransport([{
-            "id": "msg-evidence", "stop_reason": "tool_use", "usage": {},
-            "content": [{
-                "type": "tool_use", "id": "toolu-evidence", "name": "core__read_file",
-                "input": {"evidence_question": {"question_id": "Q1", "question": "Where?", "expected_scope": "README.md"}, "tool_arguments": {"path": "README.md"}},
-            }],
-        }])
-        provider = await self._provider(transport)
-        response = await provider.complete(ModelRequest(
-            "turn-evidence", (Message("user", MessageRole.USER, (TextBlock("read"),)),),
-            tools=(self._tool(),), require_evidence_questions=True,
-        ))
-        call = response.message.content[0].call
-        self.assertEqual(call.arguments, {"path": "README.md"})
-        self.assertEqual(
-            call.evidence_question,
-            EvidenceQuestion("Q1", "Where?", expected_scope="README.md"),
-        )

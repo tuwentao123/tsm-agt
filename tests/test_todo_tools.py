@@ -9,7 +9,7 @@ from pathlib import Path
 
 from tsm_agt.adapters.builtin.todo_tools import CoreTodoToolProvider
 from tsm_agt.ports import (
-    AdapterContext, EvidenceCapability, ToolCall, ToolEffect,
+    AdapterContext, ToolCall, ToolEffect,
     ToolInvocationContext, ToolResultAuthority,
 )
 
@@ -95,11 +95,6 @@ class TodoToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(spec.is_internal_state)
         self.assertIs(spec.effect, ToolEffect.INTERNAL)
         self.assertIs(spec.result_authority, ToolResultAuthority.RUNTIME_FACT)
-        self.assertEqual(
-            spec.evidence_capabilities,
-            frozenset[EvidenceCapability](),
-            "an internal checklist must not be evidence for any obligation",
-        )
         self.assertFalse(spec.requires_evidence_question)
 
     async def test_read_on_fresh_working_memory_returns_empty_list(self) -> None:

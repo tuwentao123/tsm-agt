@@ -11,7 +11,7 @@ from tsm_agt.core import (
     SessionResumeCandidate, SessionResumeSafety,
     SessionRouteDisposition, SessionTaskRelation, TaskState,
 )
-from tsm_agt.core.single_loop import (
+from tsm_agt.core.conversation_orchestration import (
     OrchestrationMode,
     TaskBindingKind,
 )
@@ -60,7 +60,6 @@ class SessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
         app = compose_fixture_application(
             model_adapter=EchoModelProvider(), tool_adapters=(),
             session_input_resolver_adapter=resolver,
-            orchestration_mode=OrchestrationMode.LEGACY,
         )
         client = EngineeringAgentClient(root, application_factory=lambda: app)
         await client.start()
@@ -378,8 +377,8 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class SingleLoopSessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
-    async def test_default_session_ingress_uses_binder_without_legacy_router_or_planner(self):
+class ConversationSessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_default_session_ingress_uses_conversation_binder(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             app = compose_fixture_application(
@@ -416,4 +415,4 @@ class SingleLoopSessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.goal, "implement the single loop ingress")
         self.assertEqual(metadata.root_goal, "implement the single loop ingress")
         self.assertTrue(metadata.root_input_event_ref.startswith("session-event:"))
-        self.assertEqual(metadata.orchestration_mode, OrchestrationMode.SINGLE_LOOP)
+        self.assertEqual(metadata.orchestration_mode, OrchestrationMode.CONVERSATION_LOOP)

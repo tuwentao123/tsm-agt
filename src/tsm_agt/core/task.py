@@ -36,6 +36,18 @@ class Phase1TaskState(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class TaskKind(StrEnum):
+    """What a Task *is*: a durable conversation or a discrete work item.
+
+    Mirrors the split the reference agent makes between a persistent thread and
+    the execution of one input. A ``CONVERSATION`` Task never terminalises when a
+    single turn ends; it returns to ``AWAITING_INPUT`` and takes the next turn.
+    """
+
+    WORK_ITEM = "WORK_ITEM"
+    CONVERSATION = "CONVERSATION"
+
+
 class TaskState(StrEnum):
     CREATED = "CREATED"
     INTAKE = "INTAKE"
@@ -47,6 +59,10 @@ class TaskState(StrEnum):
     EXECUTING = "EXECUTING"
     AWAITING_APPROVAL = "AWAITING_APPROVAL"
     AWAITING_USER = "AWAITING_USER"
+    #: A conversation Task that finished a turn and is ready for the next input.
+    #: Non-terminal by design: the next ordinary message becomes another turn on
+    #: this same Task instead of creating a new one.
+    AWAITING_INPUT = "AWAITING_INPUT"
     INTERRUPTING = "INTERRUPTING"
     INTERRUPTED = "INTERRUPTED"
     RESUMING = "RESUMING"
@@ -87,7 +103,9 @@ class TaskState(StrEnum):
             self.CONFLICT,
         }:
             return Phase1TaskState.RUNNING
-        if self in {self.AWAITING_APPROVAL, self.AWAITING_USER}:
+        if self in {
+            self.AWAITING_APPROVAL, self.AWAITING_USER, self.AWAITING_INPUT,
+        }:
             return Phase1TaskState.WAITING
         if self in {self.INTERRUPTING, self.INTERRUPTED}:
             return Phase1TaskState.INTERRUPTED
@@ -139,6 +157,7 @@ LEGAL_TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = {
         {
             TaskState.AWAITING_APPROVAL,
             TaskState.AWAITING_USER,
+            TaskState.AWAITING_INPUT,
             TaskState.INTERRUPTING,
             TaskState.CONFLICT,
             TaskState.VERIFYING,
@@ -147,6 +166,15 @@ LEGAL_TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = {
             TaskState.NEEDS_REVIEW,
         }
     ),
+    #: A conversation Task between turns. It takes another turn, resumes
+    #: explicitly, or closes; it is never terminal by itself.
+    TaskState.AWAITING_INPUT: frozenset({
+        TaskState.EXECUTING,
+        TaskState.RESUMING,
+        TaskState.SUCCEEDED,
+        TaskState.CANCELLED,
+        TaskState.FAILED,
+    }),
     TaskState.AWAITING_APPROVAL: frozenset(
         {TaskState.EXECUTING, TaskState.RUNNING_WORKFLOW, TaskState.INTERRUPTING, TaskState.CONFLICT, TaskState.CANCELLED}
     ),
@@ -197,6 +225,18 @@ SUCCESS_PATH: tuple[TaskState, ...] = (
     TaskState.VERIFYING, TaskState.FINALIZING, TaskState.SUCCEEDED,
 )
 
+#: Where a conversation Task goes when a new conversation replaces it. Named
+#: here (the transition authority) so callers close a conversation without
+#: deciding a terminal state locally.
+SUPERSEDED_CONVERSATION_STATE: TaskState = TaskState.SUCCEEDED
+
+#: States a conversation Task can be reopened from with a brand new Turn. Named
+#: here (the transition authority) so a caller does not decide locally which
+#: stopped states a conversation may continue from.
+CONVERSATION_RESTARTABLE_STATES: frozenset[TaskState] = frozenset({
+    TaskState.INTERRUPTED, TaskState.CONFLICT,
+})
+
 
 class InvalidTaskTransition(ValueError):
     def __init__(self, current: TaskState, target: TaskState) -> None:
@@ -232,20 +272,33 @@ class TaskSnapshot:
     active_onboarding_checkpoint: OnboardingCheckpoint | None = None
     session_id: str = ""
     workspace_access_grants: tuple[WorkspaceAccessGrant, ...] = ()
+    #: Conversation Tasks return to ``AWAITING_INPUT`` between turns instead of
+    #: terminalising; work items keep the one-turn completion path.
+    task_kind: TaskKind = TaskKind.CONVERSATION
 
     @classmethod
     def create(
         cls, task_id: str, goal: str, workspace: str, now: datetime | None = None,
         session_id: str | None = None,
+        task_kind: TaskKind = TaskKind.CONVERSATION,
     ) -> TaskSnapshot:
         timestamp = now or datetime.now(timezone.utc)
         return cls(
             task_id, goal, workspace, TaskState.CREATED, timestamp, timestamp,
             session_id=session_id or standalone_session_id(task_id),
+            task_kind=task_kind,
         )
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> TaskSnapshot:
+        # Historical task-kind records decode into the sole durable turn model;
+        # they cannot select an obsolete execution path.
+        raw_task_kind = str(data.get("task_kind", TaskKind.CONVERSATION.value))
+        task_kind = (
+            TaskKind.CONVERSATION
+            if raw_task_kind.casefold() == "legacy"
+            else TaskKind(raw_task_kind)
+        )
         return cls(
             task_id=str(data["task_id"]),
             goal=str(data["goal"]),
@@ -321,6 +374,7 @@ class TaskSnapshot:
                 else None
             ),
             session_id=str(data.get("session_id") or standalone_session_id(str(data["task_id"]))),
+            task_kind=task_kind,
             workspace_access_grants=tuple(
                 WorkspaceAccessGrant.from_data(item)
                 for item in raw_access_grants
@@ -364,6 +418,7 @@ class TaskSnapshot:
                 None if target.is_terminal else self.active_onboarding_checkpoint
             ),
             session_id=self.session_id,
+            task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
         )
 
@@ -394,6 +449,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
         )
 
@@ -422,6 +478,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
         )
 
@@ -475,6 +532,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
         )
 
@@ -500,6 +558,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
         )
 
@@ -524,6 +583,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
         )
 
@@ -549,6 +609,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
         )
 
@@ -575,6 +636,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
         )
 
@@ -606,6 +668,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
         )
 
@@ -633,6 +696,7 @@ class TaskSnapshot:
             onboarding_snapshots=self.onboarding_snapshots,
             active_onboarding_checkpoint=self.active_onboarding_checkpoint,
             session_id=self.session_id,
+            task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
         )
 
@@ -693,6 +757,7 @@ class TaskSnapshot:
         return {
             "task_id": self.task_id,
             "session_id": self.session_id,
+            "task_kind": self.task_kind.value,
             "goal": self.goal,
             "workspace": self.workspace,
             "state": self.state.value,

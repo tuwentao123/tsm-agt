@@ -66,7 +66,7 @@ class ProjectInstructionsTest(unittest.IsolatedAsyncioTestCase):
             try:
                 await app.kernel.set_project_trust(root, ProjectTrustLevel.TRUSTED_READ)
                 task = await self._executing(app, root)
-                await app.kernel.run_text_turn(task.task_id, "hello")
+                await app.kernel.run_agent_turn(task.task_id, "hello")
                 messages = [
                     item for item in model.request.messages
                     if item.message_id.startswith("project-instructions-context-")
@@ -95,7 +95,7 @@ class ProjectInstructionsTest(unittest.IsolatedAsyncioTestCase):
                 await app.kernel.set_project_trust(root, ProjectTrustLevel.TRUSTED_READ)
                 task = await self._executing(app, root)
                 path.write_text("changed rule", encoding="utf-8")
-                await app.kernel.run_text_turn(task.task_id, "hello")
+                await app.kernel.run_agent_turn(task.task_id, "hello")
                 self.assertFalse(any(
                     item.message_id.startswith("project-instructions-context-")
                     for item in model.request.messages

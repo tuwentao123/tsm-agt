@@ -78,6 +78,19 @@ class TaskRuntimeProjectionTest(unittest.TestCase):
         self.assertEqual(projection.waiting_kind, "approval")
         self.assertEqual(projection.phase, TaskRuntimePhase.EXECUTING)
 
+    def test_idle_conversation_reports_waiting_not_running(self) -> None:
+        # Between two turns a conversation Task is idle. Reporting "running"
+        # made the card claim work was in flight while it waited for input.
+        projection = TaskRuntimeProjector.project(
+            task(TaskState.AWAITING_INPUT), (event(1, "task.created"),)
+        )
+
+        self.assertEqual(projection.display_status, TaskDisplayStatus.WAITING)
+        self.assertEqual(
+            projection.execution_status, TaskExecutionStatus.WAITING_INPUT,
+        )
+        self.assertEqual(projection.waiting_kind, "input")
+
     def test_v3_conclusion_projection_is_independent_from_domain_check(self) -> None:
         projection = TaskRuntimeProjector.project(task(TaskState.SUCCEEDED), (
             event(1, "verify.completed", {"status": "passed"}),

@@ -13,7 +13,7 @@ from tsm_agt.core import (
     ApprovalDecision, ApprovalKind, ApprovalRequired, TaskState,
 )
 from tsm_agt.ports import (
-    EvidenceQuestion, FinishReason, Message, MessageRole, ModelRequest,
+    FinishReason, Message, MessageRole, ModelRequest,
     ModelResponse, ModelUsage, ProviderCapabilities, TextBlock, ToolCall,
     ToolCallBlock, ToolResultBlock,
 )

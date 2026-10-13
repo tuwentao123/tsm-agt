@@ -6,8 +6,8 @@ from datetime import datetime
 
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus,
-    ModelRecoveryAction, ModelRecoveryDecision, ModelRecoveryProbe,
-    ModelRetrySafety,
+    ModelFailureCategory, ModelRecoveryAction, ModelRecoveryDecision,
+    ModelRecoveryProbe, ModelRetrySafety,
 )
 
 
@@ -61,6 +61,22 @@ class RuleBasedModelRecoveryPolicy:
         delay = failure.retry_after_seconds
         if delay is None:
             delay = self._retry_backoff_seconds * (2 ** (probe.provider_attempt - 1))
+        if (
+            probe.streaming
+            and probe.fallback_available
+            and probe.provider_attempt > 1
+            and failure.category is ModelFailureCategory.TRANSIENT_PROVIDER
+            and failure.retry_safety is ModelRetrySafety.SAFE_SAME_REQUEST
+        ):
+            # One identical retry already failed. A long-lived stream that dies
+            # at the transport level does not become likelier to survive by
+            # repeating it, while the one-shot transport is a genuinely
+            # different way to send the same request and remains safe to try.
+            return ModelRecoveryDecision(
+                ModelRecoveryAction.FALLBACK_TRANSPORT,
+                "stream_transport_unstable_fallback_available",
+                delay,
+            )
         mapping = {
             ModelRetrySafety.SAFE_SAME_REQUEST: (
                 ModelRecoveryAction.RETRY_SAME_REQUEST, "safe_same_request"

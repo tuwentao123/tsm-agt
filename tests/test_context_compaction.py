@@ -23,10 +23,30 @@ def text(message_id: str, role: MessageRole, value: str) -> Message:
 
 
 # Adding the ``mandatory-tool-use`` segment, explicit content-vs-filename
-# search guidance, and V4A patch guidance grew the protected static system prompt
-# by this many estimated tokens. Every window below is calibrated against the
-# prompt's size, so each test keeps the exact slack it was measuring before.
-STATIC_PROMPT_GROWTH_TOKENS = 324
+# search guidance, V4A patch guidance, the "read another project's source
+# with the GitHub tools" duty, and the compact tool-failure recovery rule grew
+# the protected static system prompt by this many estimated tokens. Every window
+# below is calibrated against the prompt's size, so each test keeps the exact
+# slack it was measuring before.
+TOOL_FAILURE_RECOVERY_TOKENS = 63
+# The completion-obligation rule is always present; the larger few-shot segment
+# is capability-gated and is absent from these no-tool compaction fixtures.
+COMPLETION_BEHAVIOR_TOKENS = 44
+STATIC_PROMPT_GROWTH_TOKENS = (
+    486 + TOOL_FAILURE_RECOVERY_TOKENS + COMPLETION_BEHAVIOR_TOKENS
+)
+
+#: The capability-filtered stable prompt is smaller than the pre-migration
+#: template for a turn that advertises no tools: the old protected block cost
+#: ~1121 estimated tokens, while the filtered block costs ~585. A window that
+#: must still trigger compaction subtracts that difference before adding its own
+#: slack, so the conversation still faces the same effective budget.
+FILTERED_PROMPT_SHRINK_TOKENS = 536
+
+#: The part of that growth added by the "read another project's source" duty.
+#: One test below pins an absolute window instead of the shared baseline, so it
+#: needs this delta and the tool-failure recovery delta on its own.
+SOURCE_READ_GUIDANCE_TOKENS = 114 + TOOL_FAILURE_RECOVERY_TOKENS
 
 
 def tool_pair(call_id: str, payload: str) -> tuple[Message, Message]:
@@ -60,7 +80,7 @@ class ContextWindowManagerTest(unittest.TestCase):
         conversation = self.conversation()
         prepared = manager.prepare(
             conversation=conversation, tools=(), prompt_template=self.template,
-            context_window=1300 + STATIC_PROMPT_GROWTH_TOKENS,
+            context_window=1300 + STATIC_PROMPT_GROWTH_TOKENS - FILTERED_PROMPT_SHRINK_TOKENS,
             max_output_tokens=128,
         )
 
@@ -227,7 +247,7 @@ class ContextWindowManagerTest(unittest.TestCase):
         )
         prepared = manager.prepare(
             conversation=conversation, tools=(), prompt_template=self.template,
-            context_window=1500, max_output_tokens=128,
+            context_window=1500 + SOURCE_READ_GUIDANCE_TOKENS, max_output_tokens=128,
         )
 
         self.assertIsNotNone(prepared.compaction)
@@ -418,7 +438,7 @@ class ContextCompactionKernelTest(unittest.IsolatedAsyncioTestCase):
                 task = await application.kernel.transition_task(
                     task.task_id, state, state.value
                 )
-            await application.kernel.run_text_turn(task.task_id, "hello")
+            await application.kernel.run_agent_turn(task.task_id, "hello")
             events = await application.registry.require(
                 RuntimeStorePort
             ).read_events(task.task_id)
@@ -465,24 +485,7 @@ class ContextCompactionKernelTest(unittest.IsolatedAsyncioTestCase):
             compacted = [
                 event for event in events if event.event_type == "context.compacted"
             ]
-            shadows = [
-                event for event in events
-                if event.event_type == "context.single_loop_shadow_projected"
-            ]
-            shadow_compactions = [
-                event for event in events
-                if event.event_type == "context.single_loop_shadow_compacted"
-            ]
             self.assertGreaterEqual(len(compacted), 1)
-            self.assertGreaterEqual(len(shadows), 1)
-            self.assertEqual(len(shadow_compactions), len(compacted))
-            self.assertLess(shadows[0].sequence, compacted[0].sequence)
-            self.assertLess(compacted[0].sequence, shadow_compactions[0].sequence)
-            for event in shadows + shadow_compactions:
-                encoded = json.dumps(event.payload)
-                self.assertNotIn("large untrusted observation", encoded)
-                self.assertFalse(event.payload["assistant_body_persisted"])
-                self.assertFalse(event.payload["prompt_body_persisted"])
             for event in compacted:
                 encoded = json.dumps(event.payload)
                 self.assertNotIn("large untrusted observation", encoded)

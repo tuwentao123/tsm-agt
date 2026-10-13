@@ -74,7 +74,7 @@ class ModelRuntimeInputClassifier:
         response = await self._model.complete(ModelRequest(
             turn_id=f"runtime-input-{uuid4().hex}",
             messages=(system, user), max_output_tokens=128,
-            allow_tool_calls=False, require_evidence_questions=False,
+            allow_tool_calls=False,
         ))
         raw = response.message.text.strip()
         start, end = raw.find("{"), raw.rfind("}")

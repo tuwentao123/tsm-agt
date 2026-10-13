@@ -13,7 +13,7 @@ from tsm_agt.core.execution_facts import (
     project_execution_fact,
     project_tool_execution_fact,
 )
-from tsm_agt.core.single_loop import OrchestrationMode
+from tsm_agt.core import OrchestrationMode
 from tsm_agt.ports import (
     AdapterContext,
     AdapterDescriptor,

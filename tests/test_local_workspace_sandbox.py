@@ -52,12 +52,33 @@ class LocalWorkspaceSandboxTest(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(decision.allowed)
                 self.assertIn("shell", decision.reason)
 
+    async def test_allows_the_github_cli(self) -> None:
+        decision = await self.sandbox.authorize(SandboxRequest(
+            ("gh", "api", "repos/openai/codex/contents/README.md"),
+            self.workspace, self.environment,
+        ))
+        self.assertTrue(decision.allowed, decision.reason)
+
     async def test_denies_unlisted_executable(self) -> None:
         decision = await self.sandbox.authorize(SandboxRequest(
             ("curl", "https://example.test"), self.workspace, self.environment
         ))
         self.assertFalse(decision.allowed)
         self.assertIn("allowlist", decision.reason)
+
+    async def test_clone_destination_must_stay_inside_the_workspace(self) -> None:
+        inside = await self.sandbox.authorize(SandboxRequest(
+            ("git", "clone", "--depth", "1", "https://github.com/openai/codex", "vendor/codex"),
+            self.workspace, self.environment,
+        ))
+        self.assertTrue(inside.allowed, inside.reason)
+
+        outside = await self.sandbox.authorize(SandboxRequest(
+            ("git", "clone", "https://github.com/openai/codex", "/tmp/elsewhere"),
+            self.workspace, self.environment,
+        ))
+        self.assertFalse(outside.allowed)
+        self.assertIn("inside the task workspace", outside.reason)
 
     async def test_windows_suffixes_are_classified_without_open_shell(self) -> None:
         allowed = await self.sandbox.authorize(SandboxRequest(

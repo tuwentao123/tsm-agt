@@ -14,7 +14,7 @@ from tsm_agt.adapters.structured_evidence import StructuredEvidenceDeltaEvaluato
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import AgentTurnResult, TaskState
 from tsm_agt.ports import (
-    AdapterDescriptor, EvidenceQuestion, FinishReason, HealthState, HealthStatus,
+    AdapterDescriptor, FinishReason, HealthState, HealthStatus,
     Message, MessageRole, ModelRequest, ModelResponse, ProviderCapabilities,
     RuntimeStorePort, StopOrPivotAction, StopOrPivotPolicyPort,
     StopOrPivotSignals, StopOrPivotState, TextBlock, ToolCall, ToolCallBlock,

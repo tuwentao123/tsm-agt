@@ -25,7 +25,6 @@ from tsm_agt.core import (
 )
 from tsm_agt.ports import (
     AdapterDescriptor,
-    EvidenceQuestion,
     RuntimeStorePort,
     ToolCall,
     ToolIdempotency,
@@ -251,7 +250,7 @@ class KernelToolTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(
                 [tool.name for tool in tools],
-                ["fixture.echo", "core.turn_intent"],
+                ["fixture.echo"],
             )
             self.assertTrue(result.ok)
             self.assertEqual(result.data, {"text": "hello"})

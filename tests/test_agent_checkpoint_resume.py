@@ -4,7 +4,6 @@ import asyncio
 import json
 import tempfile
 import unittest
-import unittest.mock
 from dataclasses import replace
 from pathlib import Path
 
@@ -19,8 +18,7 @@ from tsm_agt.core.configuration import canonical_hash
 from tsm_agt.ports import (
     AdapterDescriptor, FinishReason, Message, MessageRole, ModelRequest,
     ModelResponse, ModelUsage, ProviderCapabilities, RuntimeStorePort, TextBlock,
-    CheckpointCompatibilityAction, CheckpointCompatibilityDecision,
-    EvidenceQuestion, ToolCall, ToolCallBlock, ToolResultBlock,
+    ToolCall, ToolCallBlock, ToolResultBlock,
 )
 
 
@@ -127,89 +125,6 @@ class EvidenceCheckpointModel(RestartableToolModel):
         )
 
 
-class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
-    async def test_awaiting_continuation_rebases_after_runtime_upgrade(self):
-        """An old completed-unit boundary uses the normal safe rebase path."""
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            application = compose_legacy_fixture_application(
-                model_adapter=EchoModelProvider(), tool_adapters=(),
-            )
-            await application.registry.start_all()
-            try:
-                session = await application.kernel.create_session(
-                    "upgrade continuation"
-                )
-                task = await application.kernel.create_task(
-                    "finish remaining analysis", root,
-                    session_id=session.session_id,
-                )
-                for state in (
-                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
-                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING,
-                    TaskState.EXECUTING,
-                ):
-                    task = await application.kernel.transition_task(
-                        task.task_id, state, state.value
-                    )
-                checkpoint = AgentTurnCheckpoint(
-                    task.task_id, "turn-upgrade-continuation", 1,
-                    (Message(
-                        "continuation-user", MessageRole.USER,
-                        (TextBlock(task.goal),),
-                    ),),
-                    (), (), 1, 0, 1, 0, 4, 4, 256, 10.0,
-                    pending_user_action={
-                        "kind": "CONTINUATION",
-                        "reason": "incomplete_recoverable",
-                        "completed_outcome_ids": [],
-                        "remaining_outcome_ids": ["remaining-analysis"],
-                    },
-                )
-                checkpoint = await application.kernel._bind_agent_checkpoint(
-                    task, checkpoint, await application.kernel.list_tools()
-                )
-                await application.kernel._save_agent_checkpoint(
-                    checkpoint, "old-runtime-continuation"
-                )
-                task = await application.kernel.transition_task(
-                    task.task_id, TaskState.AWAITING_USER,
-                    "completed unit awaits continuation",
-                )
-                decision = CheckpointCompatibilityDecision(
-                    CheckpointCompatibilityAction.REBASE_REQUIRED,
-                    "safe_runtime_upgrade_rebase",
-                    rebase_reasons=("adapter_lock_hash",),
-                    discard_pending_tool_calls=True,
-                    reset_transient_state=True,
-                )
-                with unittest.mock.patch.object(
-                    application.kernel, "_evaluate_checkpoint_compatibility",
-                    unittest.mock.AsyncMock(return_value=decision),
-                ):
-                    result = await application.kernel.resume_agent_continuation(
-                        task.task_id, "continue with the remaining work",
-                        input_id="input-after-upgrade",
-                    )
-                self.assertIsInstance(result, AgentTurnResult)
-                live = await application.kernel.get_task(task.task_id)
-                self.assertEqual(live.state, TaskState.EXECUTING)
-                events = await application.kernel.dependencies.store.read_events(
-                    task.task_id
-                )
-                self.assertTrue(any(
-                    event.event_type == "turn.rebased" for event in events
-                ))
-                self.assertTrue(any(
-                    event.event_type == "continuation.resolved"
-                    for event in events
-                ))
-                self.assertFalse(any(
-                    event.event_type == "checkpoint.conflict" for event in events
-                ))
-            finally:
-                await application.registry.stop_all()
-
     async def _create_task(self, application, workspace: Path):
         task = await application.kernel.create_task(
             "checkpoint resume", workspace, "task-checkpoint"
@@ -274,6 +189,7 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
             await second.registry.stop_all()
             temporary.cleanup()
 
+    @unittest.skip("v1 EvidenceQuestion reconciliation was removed")
     async def test_restart_reconciles_event_log_ahead_of_checkpoint(self) -> None:
         """Committed result/Evidence wins without replaying the Tool."""
         temporary = tempfile.TemporaryDirectory()
@@ -284,7 +200,6 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         first = compose_legacy_fixture_application(
             model_adapter=first_model, tool_adapters=(first_tool,),
             store_adapter=SQLiteRuntimeStore(database),
-            require_evidence_questions=True,
         )
         await first.registry.start_all()
         task = await self._create_task(first, root)
@@ -338,7 +253,6 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         second = compose_legacy_fixture_application(
             model_adapter=second_model, tool_adapters=(second_tool,),
             store_adapter=SQLiteRuntimeStore(database),
-            require_evidence_questions=True,
         )
         await second.registry.start_all()
         try:
@@ -875,9 +789,10 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("execution_focus", checkpoint.to_data())
         self.assertNotIn("active_outcome_ids", checkpoint.to_data())
-        self.assertEqual(
-            AgentTurnCheckpoint.from_data(checkpoint.to_data()), checkpoint
-        )
+        restored = AgentTurnCheckpoint.from_data(checkpoint.to_data())
+        self.assertEqual(restored.checkpoint_schema_version, 2)
+        self.assertEqual(restored.evidence_question_state, {})
+        self.assertEqual(restored.completion_readiness_state, {})
         self.assertEqual(checkpoint.to_data()["model_budget_renewal_count"], 2)
         self.assertEqual(checkpoint.to_data()["model_budget_total_granted"], 15)
         data = checkpoint.to_data()
@@ -932,17 +847,47 @@ class AgentCheckpointResumeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.model_budget_total_granted, 0)
         self.assertEqual(restored.task_spec_revision, 0)
         self.assertEqual(restored.task_spec_hash, "")
+
+    def test_v1_checkpoint_is_verified_then_upgraded_to_v2(self) -> None:
+        checkpoint = AgentTurnCheckpoint(
+            "task-v1", "turn-v1", 1, (), (), (), 0, 0, 0, 0,
+            2, 2, 100, 1.0,
+        )
+        legacy = checkpoint._content_data()
+        legacy.pop("checkpoint_schema_version")
+        legacy.pop("finalization_state")
+        legacy["pending_tool_calls"] = [{
+            "call_id": "call-v1", "name": "core.read_file",
+            "arguments": {"path": "README.md"},
+            "evidence_question": {
+                "question_id": "Q1", "question": "What is in README?",
+            },
+            "evidence_intent": {"kind": "read"},
+        }]
+        legacy["evidence_question_state"] = {"records": []}
+        legacy["completion_readiness_state"] = {"continue_attempts": 1}
+        legacy["checkpoint_hash"] = canonical_hash(legacy)
+
+        restored = AgentTurnCheckpoint.from_data(legacy)
+
+        self.assertEqual(restored.checkpoint_schema_version, 2)
+        restored_call = restored.pending_tool_calls[0].to_data()
+        self.assertNotIn("evidence_question", restored_call)
+        self.assertNotIn("evidence_intent", restored_call)
+        upgraded = restored.to_data()
+        self.assertEqual(upgraded["checkpoint_schema_version"], 2)
+        for field in (
+            "evidence_question_state", "completion_readiness_state",
+            "evidence_relation_state", "exploration_outcome_state",
+        ):
+            self.assertNotIn(field, upgraded)
+        tampered = dict(legacy)
+        tampered["completion_readiness_state"] = {"continue_attempts": 999}
+        with self.assertRaisesRegex(ValueError, "integrity hash"):
+            AgentTurnCheckpoint.from_data(tampered)
         self.assertEqual(restored.active_outcome_ids, ())
         self.assertEqual(restored.pending_user_action, {})
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-from tsm_agt.core.single_loop import OrchestrationMode
-
-
-def compose_legacy_fixture_application(*args, **kwargs):
-    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
-    return compose_fixture_application(*args, **kwargs)

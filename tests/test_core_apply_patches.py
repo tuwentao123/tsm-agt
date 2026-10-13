@@ -11,7 +11,7 @@ from tsm_agt.adapters.fixture import InMemoryRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application, compose_readonly_application
 from tsm_agt.core import ApprovalDecision, ApprovalRequired, TaskState
 from tsm_agt.ports import ToolCall
-# Patch where production reads (Hermes ``AGENTS.md:244-245``): the compensation
+# Patch where production reads (the project's import rule): the compensation
 # path (``_compensate_prepared_mutation``) moved to ``WorkspaceMixin`` in
 # ``core/kernel_workspace.py``, so that is the binding it now resolves.
 from tsm_agt.core import kernel_workspace as kernel_workspace_module

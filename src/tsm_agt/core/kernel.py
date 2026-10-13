@@ -21,7 +21,6 @@ from uuid import uuid4
 from tsm_agt.ports import (
     ProcessEnvironmentPolicy,
     CrossProcessLockPort,
-    EvidenceGatePort,
     EvidenceDeltaEvaluatorPort,
     EvidenceDelta,
     EvidenceInventory,
@@ -84,6 +83,9 @@ from tsm_agt.ports import (
     ModelRetrySafety,
     StreamingModelProviderPort,
     ModelUsage,
+    CompletionReviewFailurePolicy, CompletionReviewerPort,
+    CompletionReviewMode, TurnStopPolicyPort,
+    CompletionGap,
     BackgroundProcessStartResult,
     ProcessCommandResult,
     ProcessExecutorPort,
@@ -142,13 +144,6 @@ from tsm_agt.ports import (
     ExplorationOutcomePolicyPort,
     ExplorationOutcomeState,
     ExplorationOutcomeAction,
-    CompletionGap,
-    CompletionReadinessAction,
-    CompletionReadinessDecision,
-    CompletionReadinessMode,
-    CompletionReadinessPolicyPort,
-    CompletionReadinessProbe,
-    CompletionReadinessState,
     FinalAcceptanceAction,
     FinalAcceptanceDecision,
     FinalAcceptancePolicyPort,
@@ -170,11 +165,8 @@ from .agent_loop import (
     ToolBatchSnapshot, ToolBatchStatus,
     AgentTurnResult,
     AgentTurnSuspended,
-    PhaseAction,
-    PhaseVerdict,
     TurnState,
     AgentClarificationSuspended,
-    AgentContinuationSuspended,
     ProviderCapabilityMismatch,
 )
 from .approval import (
@@ -265,9 +257,6 @@ from .kernel_memory import (
 from .kernel_task import (
     TaskMixin,
 )
-from .task_contract import (
-    ContractMixin,
-)
 from .kernel_policy import (
     PolicyMixin,
 )
@@ -283,10 +272,13 @@ from .kernel_steering import (
 from .kernel_checkpoint import (
     CheckpointMixin,
 )
-from .task import LEGAL_TRANSITIONS, SUCCESS_PATH, TaskNotFound, TaskSnapshot, TaskState
+from .task import (
+    LEGAL_TRANSITIONS, SUCCESS_PATH, TaskKind, TaskNotFound, TaskSnapshot,
+    TaskState,
+)
 from .verification_command import is_verification_request
 from .task_spec import (
-    TaskAcceptanceCriterion, TaskContinuationMode, TaskCriterionKind,
+    TaskAcceptanceCriterion, TaskCriterionKind,
     OutcomeBindingAction, OutcomeBindingDecision, OutcomeBindingReason,
     TaskExecutionFocus, TaskExecutionFocusProjector,
     TaskOutcomeCompletionPolicy, TaskOutcomeEligibilityCalculator,
@@ -356,14 +348,10 @@ from .workspace import (
 from .verification import (
     AcceptanceResult, AcceptanceStatus, Evidence, TaskVerificationResult,
 )
-from .evidence_question import (
-    EvidenceObservationKind, EvidenceQuestionProjector,
-    EvidenceQuestionProjection, EvidenceQuestionStatus, ToolActionDisposition,
-)
 from .session_resources import (
     SessionQuestionReference, SessionResourceKind, SessionResourceReference,
 )
-from .single_loop import OrchestrationMode
+from .conversation_orchestration import OrchestrationMode
 from .tool_result_governor import DefaultToolResultGovernor
 from .turn import (
     InvalidModelResponse, InvalidTurnState, ModelInvocationFailed,
@@ -383,7 +371,7 @@ from .tool import (
 
 #: Runtime input event type -> the handler that owns it. A table rather than an
 #: if/elif ladder, so a new input kind is a row and cannot silently fall through
-#: to a neighbouring branch (Hermes ``AGENTS.md:249``). The lookup walks
+#: to a neighbouring branch (the project's dispatch rule). The lookup walks
 #: ``type(event).__mro__``, which keeps ``isinstance`` semantics for a subclass
 #: of a registered event.
 
@@ -397,17 +385,19 @@ class KernelDependencies:
     workspace_path: WorkspacePathPort
     local_identity: LocalIdentityPort
     project_memory: ProjectMemoryPort
+    completion_reviewer: CompletionReviewerPort | None = None
+    turn_stop_policies: tuple[TurnStopPolicyPort, ...] = ()
+    completion_review_mode: CompletionReviewMode = CompletionReviewMode.OFF
+    completion_review_max_continuations: int = 1
+    completion_review_failure_policy: CompletionReviewFailurePolicy = (
+        CompletionReviewFailurePolicy.VISIBLE_UNVERIFIED
+    )
     model_recovery_policy: ModelRecoveryPolicyPort | None = None
     evidence_delta_evaluator: EvidenceDeltaEvaluatorPort | None = None
-    evidence_gate: EvidenceGatePort | None = None
     semantic_action_classifier: SemanticActionClassifierPort | None = None
     read_hits_policy: ReadHitsPolicyPort | None = None
     artifact_read_policy: ArtifactReadPolicyPort | None = None
     progressive_scope_policy: ProgressiveScopePolicyPort | None = None
-    completion_readiness_policy: CompletionReadinessPolicyPort | None = None
-    completion_readiness_mode: CompletionReadinessMode = (
-        CompletionReadinessMode.LEGACY_GATE
-    )
     final_acceptance_policy: FinalAcceptancePolicyPort | None = None
     exploration_budget_policy: ExplorationBudgetPolicyPort | None = None
     stop_or_pivot_policy: StopOrPivotPolicyPort | None = None
@@ -436,20 +426,14 @@ class KernelDependencies:
     )
     runtime_adapters: tuple[RuntimeAdapter, ...] = ()
     configuration_metadata: Mapping[str, Any] = field(default_factory=dict)
-    orchestration_mode: OrchestrationMode = OrchestrationMode.LEGACY
-    single_loop_allow_fallback: bool = False
-    #: Hermes allows 90 iterations per parent turn (50 per subagent) and Codex
+    orchestration_mode: OrchestrationMode = OrchestrationMode.CONVERSATION_LOOP
+    #: The reference agent allows 90 iterations per parent turn (50 per subagent) and Codex
     #: has no ceiling at all, relying on compaction. 40 turned ordinary
     #: engineering work into ``max_model_calls`` failures, which the user could
     #: only answer by continuing -- and each continuation re-read context.
     default_max_model_calls: int = 90
     default_max_tool_calls: int = 120
     default_max_output_tokens: int = 1024
-    #: INV-4 bound: how many consecutive no-progress continuations are allowed
-    #: before an unclosable required gap is finalized as NEEDS_REVIEW instead of
-    #: suspending again. Keep aligned with the readiness policy's own
-    #: ``max_stalled_continuations`` so the two thresholds never drift.
-    completion_max_stalled_continuations: int = 2
     finalization_model_calls: int = 2
     execution_reserve_model_calls: int = 1
     recovery_reserve_model_calls: int = 1
@@ -467,7 +451,6 @@ class KernelDependencies:
     effective_working_memory_projector: EffectiveWorkingMemoryProjector = field(
         default_factory=EffectiveWorkingMemoryProjector
     )
-    require_evidence_questions: bool = True
 
 
 #: Who may drive a Task into each terminal state. "runtime" enforces limits and
@@ -556,7 +539,7 @@ _DELIVERABLE_EFFECTS: frozenset[ToolEffect] = frozenset({
 
 
 def _required_effect_deliveries(spec: TaskSpecSnapshot) -> frozenset[ToolEffect]:
-    """Side effects the contract requires the Task to leave a record of.
+    """Side effects the Task spec requires the Task to leave a record of.
 
     Keyed strictly on a required Outcome's declared effects. A bare
     ``workspace_integrity`` criterion does NOT imply a required change -- with
@@ -584,7 +567,7 @@ def _recorded_effect_deliveries(task: TaskSnapshot) -> frozenset[ToolEffect]:
 
     Delivery asserts that the action *was performed*, not that it succeeded: a
     command that ran and exited non-zero is still an execution, and whether its
-    result is good enough is the contract's own command criteria to judge.
+    result is good enough is the Task spec's own command criteria to judge.
     """
     recorded = set()
     if _has_active_workspace_mutation(task):
@@ -597,39 +580,6 @@ def _recorded_effect_deliveries(task: TaskSnapshot) -> frozenset[ToolEffect]:
     ):
         recorded.add(ToolEffect.EXECUTE)
     return frozenset(recorded)
-
-
-def _readiness_event_payload(
-    decision: CompletionReadinessDecision,
-    probe: CompletionReadinessProbe,
-    *,
-    turn_id: str,
-    mode: CompletionReadinessMode,
-    forced_wrap_up: bool,
-) -> dict[str, Any]:
-    """Durable payload for ``completion.readiness_evaluated``.
-
-    The payload records what the gate saw and what it decided. Gaps are still
-    reported verbatim: ``CompletionGap`` remains the readiness vocabulary even
-    though nothing produces one on its own any more.
-    """
-
-    return {
-        "turn_id": turn_id, "action": decision.action.value,
-        "raw_action": decision.action.value,
-        "reason": decision.reason,
-        "mode": mode.value,
-        "enforced": mode is CompletionReadinessMode.LEGACY_GATE,
-        "forced_wrap_up": forced_wrap_up,
-        "remaining_model_calls": probe.remaining_model_calls,
-        "remaining_tool_calls": probe.remaining_tool_calls,
-        "available_effects": sorted(
-            effect.value for effect in probe.available_effects
-        ),
-        "gap_count": len(decision.gaps),
-        "gaps": [gap.to_data() for gap in decision.gaps],
-        "state": decision.state.to_data(),
-    }
 
 
 def _missing_effect_deliveries(
@@ -666,7 +616,7 @@ def _required_effect_delivery_result(
     evidence = tuple(
         Evidence(
             "tool_effect",
-            f"the contract requires a performed {effect.value} action",
+            f"the task spec requires a performed {effect.value} action",
             ("a durable record exists" if effect not in missing
              else "no durable record exists"),
             "verifier", effect not in missing,
@@ -935,7 +885,7 @@ def _goal_matches_command_argv(
 #: Used when the code is unknown: one retry with an explicitly correct envelope.
 
 
-class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin, TaskMixin, ContractMixin, MemoryMixin, ApprovalMixin, ProgressMixin, OnboardingMixin, ProjectionMixin, ProcessMixin, WorkspaceMixin, ToolMixin, SessionMixin):
+class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin, TaskMixin, MemoryMixin, ApprovalMixin, ProgressMixin, OnboardingMixin, ProjectionMixin, ProcessMixin, WorkspaceMixin, ToolMixin, SessionMixin):
     def __init__(self, dependencies: KernelDependencies) -> None:
         self._dependencies = dependencies
         self._tool_policy = CoreToolPolicy()
@@ -968,10 +918,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
     @property
     def dependencies(self) -> KernelDependencies:
         return self._dependencies
-
-    @property
-    def completion_readiness_mode(self) -> CompletionReadinessMode:
-        return self._dependencies.completion_readiness_mode
 
 
 
@@ -1579,17 +1525,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
 
 
 
-    async def get_evidence_questions(
-        self, task_id: str,
-    ) -> EvidenceQuestionProjection:
-        """Rebuild inspectable question state from the durable Event Log."""
-        await self.get_task(task_id)
-        events = await self._dependencies.store.read_events(task_id)
-        return EvidenceQuestionProjector.project(task_id, events)
-
-
-
-
 
     async def _settle_open_batch_for_cancel(
         self, checkpoint: AgentTurnCheckpoint,
@@ -1707,7 +1642,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         generated_prefixes = (
             "project-onboarding-context-", "project-memory-context-",
             "session-context-", "working-memory-context-", "task-spec-context-",
-            "task-contract-context-",
             "project-instructions-context-", "completion-readiness-",
         )
         return next((
@@ -1719,6 +1653,7 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
     async def _commit_final_agent_result(
         self, *, task_id: str, turn_id: str, user_message: Message,
         assistant_message: Message, llm_payload: Mapping[str, Any],
+        assistant_replay_eligible: bool = False,
         additional_events: tuple[tuple[str, Mapping[str, Any]], ...] = (),
         clear_agent_checkpoint: bool = True,
     ) -> ConclusionReferenceValidation | None:
@@ -1741,6 +1676,18 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                 task.with_agent_checkpoint(None)
                 if clear_agent_checkpoint else task
             )
+            # A conversation Task does not terminalise when one turn ends: it
+            # returns to AWAITING_INPUT in this same atomic commit, so a crash
+            # can never leave "checkpoint cleared but still EXECUTING". The
+            # keep the retained checkpoint archive from being treated as a
+            # finished turn.
+            conversation_finalized = (
+                clear_agent_checkpoint
+                and updated_task.task_kind is TaskKind.CONVERSATION
+                and updated_task.state is TaskState.EXECUTING
+            )
+            if conversation_finalized:
+                updated_task = updated_task.transition(TaskState.AWAITING_INPUT)
             # The turn's durable counters live in the checkpoint being retired.
             # Read them *before* clearing it: `turn.completed` is the only place
             # a finished turn's tool-call count is recoverable afterwards, and a
@@ -1758,9 +1705,20 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             )
             llm_event = RuntimeEvent(
                 f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
-                "llm.completed", dict(llm_payload),
+                "llm.completed", dict(llm_payload), turn_id=turn_id,
             )
             task_events: list[RuntimeEvent] = [llm_event]
+            if conversation_finalized:
+                task_events.append(RuntimeEvent(
+                    f"evt-{uuid4().hex}", task_id,
+                    stored.last_event_sequence + len(task_events) + 1,
+                    "task.state_changed", {
+                        "previous_state": TaskState.EXECUTING.value,
+                        "next_state": TaskState.AWAITING_INPUT.value,
+                        "reason": "conversation turn completed",
+                    },
+                    turn_id=turn_id,
+                ))
             if validation is not None:
                 validation_event_type = {
                     ConclusionValidationStatus.VALID: "conclusion.references_validated",
@@ -1776,12 +1734,13 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                         "conclusion": conclusion.to_data(),
                         "validation": validation.to_data(),
                     },
+                    turn_id=turn_id,
                 ))
             for event_type, payload in additional_events:
                 task_events.append(RuntimeEvent(
                     f"evt-{uuid4().hex}", task_id,
                     stored.last_event_sequence + len(task_events) + 1,
-                    event_type, payload,
+                    event_type, payload, turn_id=turn_id,
                 ))
             task_events.append(RuntimeEvent(
                 f"evt-{uuid4().hex}", task_id,
@@ -1791,12 +1750,18 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                     "model_calls": llm_payload.get("model_call"),
                     "tool_calls": completed_tool_calls,
                 },
+                turn_id=turn_id,
             ))
             session_unit = await self._session_task_result_unit(
                 updated_task, turn_id, user_message, assistant_message,
+                assistant_replay_eligible=assistant_replay_eligible,
                 assistant_conclusion=conclusion,
                 conclusion_validation=validation,
                 answer_event_ref=llm_event.event_id,
+                turn_counters={
+                    "model_calls": llm_payload.get("model_call") or 0,
+                    "tool_calls": completed_tool_calls,
+                },
             )
             command_id = "final-agent-result:" + canonical_hash({
                 "task_id": task_id,
@@ -1856,260 +1821,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             "a delivery contract."
         )
 
-    async def _evaluate_completion_readiness(
-        self, task_id: str, turn_id: str, checkpoint: AgentTurnCheckpoint,
-        visible_tools: tuple[ToolSpec, ...], *, forced_wrap_up: bool,
-    ) -> CompletionReadinessDecision:
-        """Ask the replaceable policy whether a proposed final may finish."""
-        policy = self._dependencies.completion_readiness_policy
-        state = CompletionReadinessState.from_data(
-            checkpoint.completion_readiness_state
-        )
-        available_read_tools = tuple(
-            sorted(tool.name for tool in visible_tools
-                   if tool.is_read_only and not tool.is_internal_state)
-        )
-        available_effects = frozenset(
-            ToolEffect.OBSERVE
-            if tool.effect is ToolEffect.UNSPECIFIED and tool.is_read_only
-            else tool.effect
-            for tool in visible_tools
-            if not tool.is_internal_state
-            and (
-                tool.effect is not ToolEffect.UNSPECIFIED
-                or tool.is_read_only
-            )
-        )
-        available_tools = tuple(sorted(
-            tool.name for tool in visible_tools if not tool.is_internal_state
-        ))
-        task = await self.get_task(task_id)
-        spec = await self.get_task_spec(task_id)
-        questions = await self.get_evidence_questions(task_id)
-        refinement_tools = tuple(
-            tool_name for tool_name in ("core.search_files", "core.read_file")
-            if tool_name in available_tools
-        )
-        missing_delivery_effects = _missing_effect_deliveries(task, spec)
-        has_artifact_read = any(
-            record.observation_kind is EvidenceObservationKind.ARTIFACT_READ
-            for record in questions.records
-        )
-        empty_search_gaps = tuple(
-            CompletionGap(
-                gap_id=f"empty-search:{record.question_ref}",
-                kind="EMPTY_SEARCH_RESULT_REFINEMENT_REQUIRED",
-                description=(
-                    "A repository search only established that its exact query "
-                    "did not match; refine the search or inspect a candidate before "
-                    f"delivering the required workspace change: {record.question}"
-                )[:1000],
-                status="MISSING",
-                recoverable=True,
-                expected_scope=record.expected_scope,
-                required_effects=(ToolEffect.OBSERVE,),
-                candidate_tools=refinement_tools,
-                observed=record.blocking_reason or (
-                    "SEARCH_RESULT_EMPTY_REFINEMENT_REQUIRED"
-                ),
-            )
-            for record in questions.records
-            if (
-                record.observation_kind is EvidenceObservationKind.EMPTY_RESULT
-                and not has_artifact_read
-            )
-        )
-        truncated_search_gaps = tuple(
-            CompletionGap(
-                gap_id=f"truncated-search:{record.question_ref}",
-                kind="TRUNCATED_SEARCH_RESULT",
-                description=(
-                    "A repository search was truncated before it could resolve: "
-                    f"{record.question}"
-                )[:1000],
-                status=record.status.value,
-                recoverable=True,
-                expected_scope=record.expected_scope,
-                required_effects=(ToolEffect.OBSERVE,),
-                candidate_tools=refinement_tools,
-                observed=record.blocking_reason or "",
-            )
-            for record in questions.records
-            if (
-                record.status is EvidenceQuestionStatus.OPEN
-                and record.observation_kind
-                is EvidenceObservationKind.TRUNCATED_RESULT
-            )
-        )
-        gaps = truncated_search_gaps
-        if missing_delivery_effects:
-            if empty_search_gaps:
-                # Require a usable code observation before presenting mutation
-                # tools as the next recovery. A literal no-match is not enough
-                # evidence to edit a workspace safely.
-                gaps += empty_search_gaps
-            else:
-                gaps += (CompletionGap(
-                    gap_id="task-spec:required-effect-delivery",
-                    kind="REQUIRED_DELIVERY_UNSATISFIED",
-                    description=(
-                        "The Task contract requires durable delivery effects that "
-                        "have not been performed: "
-                        + ", ".join(
-                            effect.value for effect in missing_delivery_effects
-                        )
-                    ),
-                    status="MISSING",
-                    recoverable=True,
-                    required_effects=missing_delivery_effects,
-                    candidate_tools=_effect_candidate_tools(
-                        visible_tools, frozenset(missing_delivery_effects)
-                    ),
-                ),)
-        inventory = EvidenceInventory.from_data(checkpoint.evidence_inventory)
-        specs_by_name = {tool.name: tool for tool in visible_tools}
-        execution_facts = project_execution_facts(
-            task.tool_executions.values(), specs_by_name,
-            known_mutation_ids=frozenset(
-                mutation.mutation_id for mutation in task.mutation_journal
-            ),
-            include_successful=True,
-        )
-        unresolved_failure_facts = tuple(
-            fact for fact in execution_facts
-            if fact.is_blocking_failure
-            and fact.resolution is FactResolution.UNRESOLVED
-        )
-        non_succeeded_ids = {
-            fact.execution_id for fact in execution_facts
-            if fact.effect_status is not EffectStatus.SUCCEEDED
-        }
-        probe = CompletionReadinessProbe(
-            goal=task.goal, gaps=gaps,
-            remaining_model_calls=max(
-                0, checkpoint.max_model_calls - checkpoint.model_calls
-            ),
-            remaining_tool_calls=max(
-                0, checkpoint.max_tool_calls - checkpoint.tool_calls
-            ),
-            available_read_tools=available_read_tools,
-            available_effects=available_effects,
-            available_tools=available_tools,
-            forced_wrap_up=forced_wrap_up,
-            evidence_item_count=sum(
-                len(values) for values in inventory.fingerprints.values()
-            ),
-            successful_tool_calls=sum(
-                execution.state is ToolCommitState.COMMITTED
-                and execution.result is not None and execution.result.ok
-                and execution.execution_id not in non_succeeded_ids
-                for execution in task.tool_executions.values()
-            ),
-            unresolved_failures=unresolved_failure_facts,
-        )
-        if policy is None:
-            # A missing policy is a configuration fact, not a crash. Keep
-            # COMPLETE for compositions that intentionally omit it.
-            decision = CompletionReadinessDecision(
-                CompletionReadinessAction.COMPLETE, "policy_not_configured",
-                state, gaps,
-            )
-        else:
-            try:
-                decision = await policy.evaluate(probe, state)
-            except Exception as error:
-                await self._append_events(task_id, ((
-                    "completion.readiness_failed", {
-                        "turn_id": turn_id,
-                        "error_type": type(error).__name__,
-                        "fail_closed": True,
-                    },
-                ),))
-                # INV-5: never accept a final answer on a crashed judge. The
-                # caller surfaces a defined failure (Task FAILED) instead of
-                # success. Diagnostics callers wrap this in their own guard.
-                raise
-        await self._append_events(task_id, ((
-            "completion.readiness_evaluated",
-            _readiness_event_payload(
-                decision, probe, turn_id=turn_id,
-                mode=self.completion_readiness_mode,
-                forced_wrap_up=forced_wrap_up,
-            ),
-        ),))
-        return decision
-
-    async def _inject_agent_decides_completion_diagnostics(
-        self, checkpoint: AgentTurnCheckpoint,
-        visible_tools: tuple[ToolSpec, ...],
-    ) -> AgentTurnCheckpoint:
-        """Give AGENT_DECIDES factual readiness context without directives."""
-        if self.completion_readiness_mode is not CompletionReadinessMode.AGENT_DECIDES:
-            return checkpoint
-        try:
-            decision = await self._evaluate_completion_readiness(
-                checkpoint.task_id, checkpoint.turn_id, checkpoint, visible_tools,
-                forced_wrap_up=False,
-            )
-        except Exception:
-            # Diagnostics are observational and must never break a Turn.
-            return checkpoint
-        diagnostic = {
-            "boundary": "completion_readiness_diagnostics",
-            "mode": self.completion_readiness_mode.value,
-            "action": decision.action.value,
-            "reason": decision.reason,
-            "gaps": [gap.to_data() for gap in decision.gaps],
-        }
-        return replace(
-            checkpoint,
-            messages=(*checkpoint.messages, Message(
-                f"completion-diagnostics-{uuid4().hex}", MessageRole.USER,
-                (TextBlock(json.dumps(diagnostic, sort_keys=True,
-                                      separators=(",", ":"))),),
-            )),
-        )
-
-    @staticmethod
-    def _completion_correction_message(
-        decision: CompletionReadinessDecision,
-    ) -> Message:
-        continue_work = decision.action is CompletionReadinessAction.CONTINUE
-        incomplete_recoverable = (
-            decision.action
-            is CompletionReadinessAction.REPORT_INCOMPLETE_RECOVERABLE
-        )
-        body = {
-            "boundary": "completion_readiness",
-            "action": decision.action.value,
-            "instruction": (
-                "The proposed final answer was not accepted. Perform the "
-                "remaining required in-scope work now using an available "
-                "capability or the candidate tools named in the gaps. If the "
-                "approach that just failed cannot work, take a different one -- "
-                "another tool, or different arguments -- for the same scope: a "
-                "missing path or a rejected call is not evidence that the "
-                "requirement is unprovable. Normal argument validation, policy, "
-                "approval, and sandbox rules still apply. Do not merely offer to "
-                "continue later."
-                if continue_work else
-                (
-                    "Do not call tools. Report that this Turn is incomplete but "
-                    "resumable, identify the last safe checkpoint and remaining "
-                    "required work, and do not describe it as blocked or successful."
-                    if incomplete_recoverable else
-                    "Do not call tools. Give the user the exact blocker, completed "
-                    "evidence, and unverified requirement. Do not claim success."
-                )
-            ),
-            "gaps": [gap.to_data() for gap in decision.gaps],
-        }
-        return Message(
-            f"completion-readiness-{uuid4().hex}", MessageRole.USER,
-            (TextBlock(json.dumps(body, sort_keys=True, separators=(",", ":"))),),
-            scaffolding="completion-readiness",
-        )
-
 
 
 
@@ -2159,13 +1870,25 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
     async def complete_task(self, task_id: str, reason: str) -> TaskSnapshot:
         """Close a Task whose turn ended without pending tool calls.
 
-        This is the whole completion rule (Hermes/Codex semantics): the model
+        This is the whole completion rule (reference agent semantics): the model
         stops calling tools, so the turn is over and the Task succeeded. No
         verdict, no evidence, no criterion is consulted.
 
         ``VERIFYING`` and ``FINALIZING`` are pure accounting hops here: the
         success path lives in ``core/task.py`` next to ``LEGAL_TRANSITIONS``.
+
+        A conversation Task is the exception: one finished turn is not the end of
+        the conversation. ``_commit_final_agent_result`` already returned it to
+        ``AWAITING_INPUT`` in the same commit; this is a safety net for turn
+        paths that do not run through that boundary.
         """
+        task = await self.get_task(task_id)
+        if task.task_kind is TaskKind.CONVERSATION:
+            if task.state is TaskState.EXECUTING:
+                return await self.transition_task(
+                    task_id, TaskState.AWAITING_INPUT, reason
+                )
+            return task
         for target in SUCCESS_PATH:
             task = await self.transition_task(task_id, target, reason)
         return task
@@ -2231,196 +1954,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             reference or "verifier", False,
         )
 
-
-    async def run_text_turn(
-        self, task_id: str, user_text: str, max_output_tokens: int | None = None
-    ) -> TurnResult:
-        normalized_text = user_text.strip()
-        max_output_tokens = (
-            self._dependencies.default_max_output_tokens
-            if max_output_tokens is None else max_output_tokens
-        )
-        if not normalized_text:
-            raise ValueError("user text must not be empty")
-        if max_output_tokens <= 0:
-            raise ValueError("max_output_tokens must be positive")
-
-        stored = await self._dependencies.store.load_task(task_id)
-        if stored is None:
-            raise TaskNotFound(f"task not found: {task_id}")
-        task = TaskSnapshot.from_data(stored.data)
-        if task.state is not TaskState.EXECUTING:
-            raise InvalidTurnState(
-                f"task {task_id} must be EXECUTING, got {task.state.value}"
-            )
-        turn_id = f"turn-{uuid4().hex}"
-        user_message = Message(
-            message_id=f"msg-{uuid4().hex}",
-            role=MessageRole.USER,
-            content=(TextBlock(normalized_text),),
-        )
-        started = RuntimeEvent(
-            event_id=f"evt-{uuid4().hex}",
-            task_id=task_id,
-            sequence=stored.last_event_sequence + 1,
-            event_type="turn.started",
-            payload={
-                "turn_id": turn_id,
-                "orchestration_mode": "LEGACY",
-                "current_input_ref": f"message:{user_message.message_id}",
-                "input_role": user_message.role.value,
-                "input_character_count": len(normalized_text),
-                "max_output_tokens": max_output_tokens,
-            },
-        )
-        await self._dependencies.store.commit(
-            RuntimeUnitOfWork(
-                task_id=task_id,
-                expected_version=stored.version,
-                next_state=task.to_data(),
-                events=(started,),
-            )
-        )
-
-        try:
-            project_context = await self._project_context_messages(task_id)
-            # Keep the current user goal first for ContextWindowManager's protected
-            # first-message rule. PromptTemplate deterministically places tagged
-            # memory immediately before ordinary conversation at assembly time.
-            conversation = (user_message,) + project_context
-            prepared = self._dependencies.context_manager.prepare(
-                conversation=conversation, tools=(),
-                prompt_template=self._dependencies.prompt_template,
-                context_window=self._dependencies.model.capabilities.context_window,
-                max_output_tokens=max_output_tokens,
-                runtime_instruction=_temporal_context_instruction(),
-            )
-        except ContextWindowExceeded as error:
-            await self._record_turn_failure(task_id, turn_id, error)
-            raise ModelInvocationFailed(turn_id, str(error)) from error
-        prompt = self._dependencies.prompt_template.assemble(
-            prepared.messages, (), _temporal_context_instruction()
-        )
-        request = ModelRequest(
-            turn_id=turn_id,
-            messages=prompt.messages,
-            max_output_tokens=max_output_tokens,
-            conclusion_protocol_mode=(
-                ConclusionProtocolMode.REQUIRE_STRUCTURED
-                if self._dependencies.model.capabilities.structured_conclusion
-                else ConclusionProtocolMode.OBSERVE
-            ),
-        )
-        try:
-            response = await self._dependencies.model.complete(request)
-            if response.message.role is not MessageRole.ASSISTANT:
-                raise InvalidModelResponse("model response message must have assistant role")
-            if response.finish_reason.value not in {"stop", "length"}:
-                raise InvalidModelResponse(
-                    f"unsupported finish reason in text turn: {response.finish_reason.value}"
-                )
-        except Exception as error:
-            await self._record_turn_failure(task_id, turn_id, error, prompt.receipt)
-            raise ModelInvocationFailed(turn_id, str(error)) from error
-
-        additional_events: tuple[tuple[str, Mapping[str, Any]], ...] = ()
-        if prepared.compaction is not None:
-            additional_events = (("context.compacted", {
-                "turn_id": turn_id, "model_call": 1,
-                **prepared.compaction.event_data(),
-            }),)
-        await self._commit_final_agent_result(
-            task_id=task_id, turn_id=turn_id, user_message=user_message,
-            assistant_message=response.message,
-            llm_payload={
-                "turn_id": turn_id,
-                "orchestration_mode": "LEGACY",
-                "current_input_ref": f"message:{user_message.message_id}",
-                "prompt_projection_hash": canonical_hash(
-                    [message.to_data() for message in prepared.messages]
-                ),
-                "message": response.message.to_data(),
-                "finish_reason": response.finish_reason.value,
-                "usage": response.usage.to_data(),
-                "response_diagnostics": self._response_diagnostics(response),
-                "context_window": prepared.budget.context_window,
-                "context_estimated_input_tokens": prepared.budget.estimated_input_tokens,
-                "context_estimation_method": prepared.budget.estimation_method,
-                "context_budget": prepared.budget.event_data(),
-                **prompt.receipt.event_data(),
-            },
-            additional_events=additional_events,
-            clear_agent_checkpoint=False,
-        )
-        return TurnResult(
-            turn_id=turn_id, task_id=task_id,
-            assistant_message=response.message,
-            finish_reason=response.finish_reason, usage=response.usage,
-        )
-
-        after_model = await self._dependencies.store.load_task(task_id)
-        if after_model is None:
-            raise TaskNotFound(f"task disappeared during turn: {task_id}")
-        next_sequence = after_model.last_event_sequence + 1
-        completed_events_list = [RuntimeEvent(
-                event_id=f"evt-{uuid4().hex}",
-                task_id=task_id,
-                sequence=next_sequence,
-                event_type="llm.completed",
-                payload={
-                    "turn_id": turn_id,
-                    "message": response.message.to_data(),
-                    "finish_reason": response.finish_reason.value,
-                    "usage": response.usage.to_data(),
-                    "response_diagnostics": self._response_diagnostics(response),
-                    "context_window": prepared.budget.context_window,
-                    "context_estimated_input_tokens": (
-                        prepared.budget.estimated_input_tokens
-                    ),
-                    "context_estimation_method": (
-                        prepared.budget.estimation_method
-                    ),
-                    "context_budget": prepared.budget.event_data(),
-                    **prompt.receipt.event_data(),
-                },
-            )]
-        if prepared.compaction is not None:
-            completed_events_list.append(RuntimeEvent(
-                event_id=f"evt-{uuid4().hex}", task_id=task_id,
-                sequence=next_sequence + len(completed_events_list),
-                event_type="context.compacted",
-                payload={
-                    "turn_id": turn_id, "model_call": 1,
-                    **prepared.compaction.event_data(),
-                },
-            ))
-        completed_events_list.append(RuntimeEvent(
-                event_id=f"evt-{uuid4().hex}",
-                task_id=task_id,
-                sequence=next_sequence + len(completed_events_list),
-                event_type="turn.completed",
-                payload={"turn_id": turn_id},
-            ))
-        completed_events = tuple(completed_events_list)
-        await self._dependencies.store.commit(
-            RuntimeUnitOfWork(
-                task_id=task_id,
-                expected_version=after_model.version,
-                next_state=after_model.data,
-                events=completed_events,
-            )
-        )
-        await self._record_session_task_result(
-            task_id, turn_id, user_message, response.message
-        )
-        return TurnResult(
-            turn_id=turn_id,
-            task_id=task_id,
-            assistant_message=response.message,
-            finish_reason=response.finish_reason,
-            usage=response.usage,
-        )
-
     async def run_agent_turn(
         self,
         task_id: str,
@@ -2457,90 +1990,23 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         if tool_timeout_seconds <= 0:
             raise ValueError("tool_timeout_seconds must be positive")
 
-        metadata = await self.get_task_orchestration_metadata(task_id)
-        if metadata.orchestration_mode is OrchestrationMode.SINGLE_LOOP:
-            from .single_loop.loop import SingleAgentLoop
+        # A conversation Task sits in AWAITING_INPUT between turns; starting a
+        # turn moves it back to EXECUTING before any loop sees it.
+        current = await self.get_task(task_id)
+        if current.state is TaskState.AWAITING_INPUT:
+            await self.transition_task(
+                task_id, TaskState.EXECUTING, "conversation turn started"
+            )
 
-            return await SingleAgentLoop(self).run(
-                task_id,
-                normalized_text,
-                user_blocks,
-                max_model_calls=max_model_calls,
-                max_tool_calls=max_tool_calls,
-                max_output_tokens=max_output_tokens,
-                tool_timeout_seconds=tool_timeout_seconds,
-                on_text_delta=on_text_delta,
-                on_progress=on_progress,
-            )
-        if metadata.orchestration_mode is not OrchestrationMode.LEGACY:
-            raise InvalidTurnState(
-                f"unsupported orchestration mode: {metadata.orchestration_mode.value}"
-            )
-        stored = await self._dependencies.store.load_task(task_id)
-        if stored is None:
-            raise TaskNotFound(f"task not found: {task_id}")
-        task = TaskSnapshot.from_data(stored.data)
-        if task.state is not TaskState.EXECUTING:
-            raise InvalidTurnState(
-                f"task {task_id} must be EXECUTING, got {task.state.value}"
-            )
-        turn_id = f"turn-{uuid4().hex}"
-        user_message = Message(
-            message_id=f"msg-{uuid4().hex}",
-            role=MessageRole.USER,
-            content=user_blocks or (TextBlock(normalized_text),),
-        )
-        visible_tools = await self.list_tools()
-        capabilities = self._dependencies.model.capabilities
-        if visible_tools and not capabilities.tools:
-            raise ProviderCapabilityMismatch(
-                "selected model provider does not support tools, but the Agent turn "
-                f"exposes {len(visible_tools)} tool(s)"
-            )
-        await self._append_events(
-            task_id,
-            (
-                (
-                    "turn.started",
-                    {
-                        "turn_id": turn_id,
-                        "orchestration_mode": "LEGACY",
-                        "current_input_ref": f"message:{user_message.message_id}",
-                        "input_role": user_message.role.value,
-                        "input_character_count": len(normalized_text),
-                        "max_model_calls": max_model_calls,
-                        "max_tool_calls": max_tool_calls,
-                        "max_output_tokens": max_output_tokens,
-                        "visible_tools": [tool.name for tool in visible_tools],
-                        "provider_capabilities": capabilities.to_data(),
-                    },
-                ),
-            ),
-        )
+        from .conversation_loop.loop import ConversationAgentLoop
 
-        project_context = await self._project_context_messages(task_id)
-        initial_messages = (user_message,) + project_context
-        checkpoint = AgentTurnCheckpoint(
-            task_id=task_id,
-            turn_id=turn_id,
-            revision=1,
-            messages=initial_messages,
-            pending_tool_calls=(),
-            seen_call_ids=(),
-            model_calls=0,
-            tool_calls=0,
-            input_tokens=0,
-            output_tokens=0,
+        return await ConversationAgentLoop(self).run(
+            task_id, normalized_text, user_blocks,
             max_model_calls=max_model_calls,
             max_tool_calls=max_tool_calls,
             max_output_tokens=max_output_tokens,
             tool_timeout_seconds=tool_timeout_seconds,
-        )
-        checkpoint = await self._bind_agent_checkpoint(task, checkpoint, visible_tools)
-        await self._save_agent_checkpoint(checkpoint, "turn-started")
-        return await self._continue_agent_turn(
-            checkpoint, visible_tools, on_text_delta=on_text_delta,
-            on_progress=on_progress,
+            on_text_delta=on_text_delta, on_progress=on_progress,
         )
 
     async def resume_agent_turn(
@@ -2553,13 +2019,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         on_text_delta: Callable[[str], None] | None = None,
         on_progress: Callable[[AgentProgress], None] | None = None,
     ) -> AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended:
-        metadata = await self.get_task_orchestration_metadata(task_id)
-        if metadata.orchestration_mode is OrchestrationMode.LEGACY:
-            await self.require_legacy_task_orchestration(task_id)
-        elif metadata.orchestration_mode is not OrchestrationMode.SINGLE_LOOP:
-            raise InvalidTurnState(
-                f"unsupported orchestration mode: {metadata.orchestration_mode.value}"
-            )
         # Spec §5.1: a resume starts a new in-process scope generation.
         await self._close_cancellation_scope(task_id)
         await self.recover_workspace_transactions(task_id)
@@ -2626,9 +2085,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                     },
                 },
             )
-        question_projection = await self._observe_evidence_question(
-            task_id, checkpoint.turn_id, approved_call, result, evidence_delta
-        )
         previous_action = ActionProgressState.from_data(
             checkpoint.action_progress
         )
@@ -2681,7 +2137,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                 if evidence_delta is not None else checkpoint.action_progress
             ),
             evidence_inventory=evidence_inventory,
-            evidence_question_state=question_projection.to_data(),
             read_hits_state=read_hits_state,
             artifact_read_state=artifact_read_state,
             progressive_scope_state=checkpoint.progressive_scope_state,
@@ -2690,7 +2145,7 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             evidence_relation_state=checkpoint.evidence_relation_state,
             rejection_loop_state=checkpoint.rejection_loop_state,
             exploration_outcome_state=checkpoint.exploration_outcome_state,
-            completion_readiness_state=checkpoint.completion_readiness_state,
+            finalization_state=checkpoint.finalization_state,
         )
         tool_message = Message(
             message_id=f"msg-tool-{uuid4().hex}",
@@ -2704,18 +2159,10 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             return await self._suspend_unknown_tool_outcome(
                 blocked_checkpoint, approved_call, result
             )
-        if metadata.orchestration_mode is OrchestrationMode.SINGLE_LOOP:
-            from .single_loop.loop import SingleAgentLoop
+        from .conversation_loop.loop import ConversationAgentLoop
 
-            return await SingleAgentLoop(self).continue_after_approval(
-                resumed,
-                visible_tools,
-                tool_message,
-                on_text_delta=on_text_delta,
-                on_progress=on_progress,
-            )
-        return await self._continue_agent_turn(
-            resumed, visible_tools, initial_tool_message=tool_message,
+        return await ConversationAgentLoop(self).continue_after_approval(
+            resumed, visible_tools, tool_message,
             on_text_delta=on_text_delta,
             on_progress=on_progress,
         )
@@ -2725,113 +2172,11 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         on_text_delta: Callable[[str], None] | None = None,
         on_progress: Callable[[AgentProgress], None] | None = None,
     ) -> AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended:
-        metadata = await self.get_task_orchestration_metadata(task_id)
-        if metadata.orchestration_mode is OrchestrationMode.SINGLE_LOOP:
-            from .single_loop.loop import SingleAgentLoop
+        from .conversation_loop.loop import ConversationAgentLoop
 
-            return await SingleAgentLoop(self).resume_checkpoint(
-                task_id,
-                on_text_delta=on_text_delta,
-                on_progress=on_progress,
-            )
-        await self.require_legacy_task_orchestration(task_id)
-        # Spec §5.1: a resume starts a new in-process scope generation.
-        await self._close_cancellation_scope(task_id)
-        await self.recover_workspace_transactions(task_id)
-        await self.reconcile_background_processes(task_id)
-        stored = await self._require_stored_task(task_id)
-        task = TaskSnapshot.from_data(stored.data)
-        if task.state is TaskState.AWAITING_APPROVAL:
-            raise ApprovalNotPending(
-                "task is waiting for explicit approve/reject; resume cannot grant approval"
-            )
-        if task.state is TaskState.AWAITING_USER:
-            raise ClarificationNotPending(
-                "task is waiting for an answer; resume requires request_id and token"
-            )
-        if task.state not in {
-            TaskState.EXECUTING, TaskState.INTERRUPTED, TaskState.CONFLICT,
-        }:
-            raise InvalidTurnState(
-                f"task {task_id} cannot resume from {task.state.value}"
-            )
-        if task.active_agent_checkpoint is None:
-            raise LookupError(f"task has no active Agent checkpoint: {task_id}")
-        checkpoint = AgentTurnCheckpoint.from_data(task.active_agent_checkpoint)
-        visible_tools = await self.list_tools()
-        decision = await self._evaluate_checkpoint_compatibility(
-            task, checkpoint, visible_tools
+        return await ConversationAgentLoop(self).resume_checkpoint(
+            task_id, on_text_delta=on_text_delta, on_progress=on_progress,
         )
-        if (
-            task.state is TaskState.INTERRUPTED
-            and decision.action is CheckpointCompatibilityAction.EXACT_RESUME
-        ):
-            checkpoint = await self._reconcile_agent_checkpoint(
-                task, checkpoint, visible_tools, decision
-            )
-            task = await self.get_task(task_id)
-        elif decision.action is CheckpointCompatibilityAction.RECONCILE_REQUIRED:
-            checkpoint = await self._reconcile_agent_checkpoint(
-                task, checkpoint, visible_tools, decision
-            )
-            task = await self.get_task(task_id)
-        elif decision.action is CheckpointCompatibilityAction.REBASE_REQUIRED:
-            checkpoint = await self._rebase_agent_checkpoint(
-                task, checkpoint, visible_tools, decision
-            )
-            task = await self.get_task(task_id)
-        elif decision.action is not CheckpointCompatibilityAction.EXACT_RESUME:
-            await self._mark_checkpoint_conflict(
-                task.task_id, checkpoint, decision.conflict_reasons
-            )
-            details = (
-                " (" + ", ".join(decision.conflict_reasons) + ")"
-                if decision.conflict_reasons else ""
-            )
-            raise AgentCheckpointConflict(
-                "Agent checkpoint cannot resume: "
-                + decision.reason_code + details
-            )
-        if task.state in {TaskState.INTERRUPTED, TaskState.CONFLICT}:
-            stored = await self._require_stored_task(task_id)
-            current = TaskSnapshot.from_data(stored.data)
-            resuming = current.transition(TaskState.RESUMING)
-            executing = resuming.transition(TaskState.EXECUTING)
-            events = (
-                RuntimeEvent(
-                    f"evt-{uuid4().hex}", task_id,
-                    stored.last_event_sequence + 1, "task.state_changed",
-                    {"previous_state": current.state.value,
-                     "next_state": resuming.state.value,
-                     "reason": "resume checkpoint validation passed"},
-                ),
-                RuntimeEvent(
-                    f"evt-{uuid4().hex}", task_id,
-                    stored.last_event_sequence + 2, "task.state_changed",
-                    {"previous_state": resuming.state.value,
-                     "next_state": executing.state.value,
-                     "reason": "resume Agent turn"},
-                ),
-            )
-            await self._dependencies.store.commit(RuntimeUnitOfWork(
-                task_id, stored.version, executing.to_data(), events
-            ))
-        await self._append_events(task_id, (("turn.resumed", {
-            "turn_id": checkpoint.turn_id,
-            "previous_revision": checkpoint.revision,
-            "revision": checkpoint.revision + 1,
-            "checkpoint_hash": checkpoint.checkpoint_hash,
-            "reason": "process restart or explicit resume",
-        }),))
-        resumed = replace(checkpoint, revision=checkpoint.revision + 1)
-        await self._save_agent_checkpoint(resumed, "turn-resumed")
-        return await self._continue_agent_turn(
-            resumed, visible_tools, recover_interrupted=True,
-            on_text_delta=on_text_delta,
-            on_progress=on_progress,
-        )
-
-
     @staticmethod
     def _recovery_batch_blocker_message(
         recovery_batch: Sequence[ToolResult],
@@ -2865,17 +2210,18 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         self, task_id: str, user_text: str, *, input_id: str,
         on_text_delta: Callable[[str], None] | None = None,
         on_progress: Callable[[AgentProgress], None] | None = None,
-    ) -> (
-        AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended
-        | AgentContinuationSuspended
-    ):
-        """Resume a model-selected completed-unit boundary without authority."""
+    ) -> AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended:
+        """Migrate a persisted pre-conversation continuation into this loop.
+
+        New turns never create this boundary. The compatibility entry point only
+        keeps durable checkpoints readable for the unchanged CLI and SDK routes.
+        """
         normalized = user_text.strip()
         if not normalized or not input_id.strip():
             raise ValueError("continuation input and input_id are required")
-        await self.require_legacy_task_orchestration(task_id)
-        # Spec §5.1: a resume starts a new in-process scope generation.
         await self._close_cancellation_scope(task_id)
+        await self.recover_workspace_transactions(task_id)
+        await self.reconcile_background_processes(task_id)
         stored = await self._require_stored_task(task_id)
         task = TaskSnapshot.from_data(stored.data)
         if task.state is not TaskState.AWAITING_USER:
@@ -2892,42 +2238,11 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         pending = checkpoint.pending_user_action
         if pending.get("kind") != "CONTINUATION":
             raise ClarificationNotPending("task has no pending continuation")
-        readiness_state = CompletionReadinessState.from_data(
-            checkpoint.completion_readiness_state
-        )
-        if (
-            readiness_state.stalled_continuations
-            >= self._dependencies.completion_max_stalled_continuations
-        ):
-            # INV-4: never re-enter a loop that is already known to be
-            # unproductive. Finalize for human review instead.
-            return await self._finalize_needs_review(
-                checkpoint, (), reason="stalled_continuation_refused",
-                stalled=readiness_state.stalled_continuations,
-                message=checkpoint.messages[-1],
-            )
-        # An explicit user continuation is a new authorization to spend, so the
-        # resumed Turn must be able to act. Without this, a continuation that
-        # was suspended at an exhausted budget resumes with zero capacity, dies
-        # on the next model call, and leaves the Task terminally FAILED - after
-        # which the same request can only be retried as a brand-new Task that
-        # repeats work already done. Capacity is judged by what is left, not by
-        # which reason string produced the suspension.
-        exhausted_capacity = (
-            checkpoint.model_calls >= checkpoint.max_model_calls
-            or checkpoint.tool_calls >= checkpoint.max_tool_calls
-        )
-        replenish_capacity = exhausted_capacity or pending.get("reason") in {
-            "incomplete_recoverable", "unresolved_tool_batch",
-        }
         visible_tools = await self.list_tools()
         compatibility = await self._evaluate_checkpoint_compatibility(
             task, checkpoint, visible_tools
         )
-        if (
-            compatibility.action
-            is CheckpointCompatibilityAction.RECONCILE_REQUIRED
-        ):
+        if compatibility.action is CheckpointCompatibilityAction.RECONCILE_REQUIRED:
             checkpoint = await self._reconcile_agent_checkpoint(
                 task, checkpoint, visible_tools, compatibility
             )
@@ -2936,108 +2251,62 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                 task, checkpoint, visible_tools, compatibility
             )
         elif compatibility.action is not CheckpointCompatibilityAction.EXACT_RESUME:
-            await self._append_events(task_id, ((
-                "continuation.resume_rejected", {
-                    "turn_id": checkpoint.turn_id,
-                    "reason_code": compatibility.reason_code,
-                    "compatibility_action": compatibility.action.value,
-                    "conflict_reasons": list(
-                        compatibility.conflict_reasons
-                        or compatibility.rebase_reasons
-                    ),
-                    "task_state_preserved": task.state.value,
-                },
-            ),))
             raise AgentCheckpointConflict(
                 "Agent continuation cannot resume safely: "
                 + compatibility.reason_code
-                + (
-                    " (" + ", ".join(
-                        compatibility.conflict_reasons
-                        or compatibility.rebase_reasons
-                    ) + ")"
-                    if (compatibility.conflict_reasons
-                        or compatibility.rebase_reasons) else ""
-                )
             )
-        # Rebase/reconciliation commits a new configuration and checkpoint.
-        # Reload before the atomic AWAITING_USER -> EXECUTING transition so the
-        # continuation never writes through a stale Task version.
         stored = await self._require_stored_task(task_id)
         task = TaskSnapshot.from_data(stored.data)
-        if task.state is not TaskState.AWAITING_USER:
-            raise InvalidTurnState(
-                f"task {task_id} changed while preparing continuation"
-            )
         if task.active_agent_checkpoint is None:
             raise LookupError("continuation checkpoint disappeared during validation")
         checkpoint = AgentTurnCheckpoint.from_data(task.active_agent_checkpoint)
-        pending = checkpoint.pending_user_action
-        if pending.get("kind") != "CONTINUATION":
-            raise ClarificationNotPending(
-                "continuation changed while compatibility was validated"
-            )
+        if checkpoint.pending_user_action.get("kind") != "CONTINUATION":
+            raise ClarificationNotPending("continuation changed during validation")
+        replenished = (
+            checkpoint.model_calls >= checkpoint.max_model_calls
+            or checkpoint.tool_calls >= checkpoint.max_tool_calls
+        )
+        continuation_message = Message(
+            f"msg-continuation-input-{input_id}", MessageRole.USER,
+            (TextBlock(normalized),),
+        )
         resumed_checkpoint = replace(
-            checkpoint, revision=checkpoint.revision + 1,
-            messages=self._compact_continuation_messages(
-                checkpoint.messages, normalized, input_id
-            ),
+            checkpoint,
+            revision=checkpoint.revision + 1,
+            messages=checkpoint.messages + (continuation_message,),
             pending_user_action={},
             max_model_calls=(
                 checkpoint.model_calls + self._dependencies.default_max_model_calls
-                if replenish_capacity else checkpoint.max_model_calls
+                if replenished else checkpoint.max_model_calls
             ),
             max_tool_calls=(
                 checkpoint.tool_calls + self._dependencies.default_max_tool_calls
-                if replenish_capacity else checkpoint.max_tool_calls
+                if replenished else checkpoint.max_tool_calls
             ),
             exploration_budget_state=(
-                {} if replenish_capacity else checkpoint.exploration_budget_state
-            ),
-            completion_readiness_state=(
-                # The three per-attempt counters restart so the new attempt gets
-                # its own bounded corrections, but a stalled zero-progress count
-                # must survive: it is what stops the same unsatisfiable
-                # requirement from being retried forever.
-                CompletionReadinessState(
-                    stalled_continuations=CompletionReadinessState.from_data(
-                        checkpoint.completion_readiness_state
-                    ).stalled_continuations,
-                ).to_data()
-                if replenish_capacity else checkpoint.completion_readiness_state
+                {} if replenished else checkpoint.exploration_budget_state
             ),
         )
-        resumed_task = task.transition(TaskState.EXECUTING).with_agent_checkpoint(
+        resumed = task.transition(TaskState.EXECUTING).with_agent_checkpoint(
             resumed_checkpoint.to_data()
         )
-        steering = SteeringProjector.project(
-            task_id, await self._dependencies.store.read_events(task_id)
-        )
-        steering_hash = canonical_hash({
-            "kind": SteeringKind.STEER.value, "text": normalized,
-        })
         events = (
             RuntimeEvent(
                 f"evt-{uuid4().hex}", task_id,
-                stored.last_event_sequence + 1, "continuation.resolved", {
+                stored.last_event_sequence + 1, "continuation.migrated", {
                     "turn_id": checkpoint.turn_id,
                     "input_id": input_id,
                     "input_hash": canonical_hash(normalized),
-                    "completed_outcome_ids": list(
-                        pending.get("completed_outcome_ids", [])
-                    ),
-                    "remaining_outcome_ids": list(
-                        pending.get("remaining_outcome_ids", [])
-                    ),
-                    "capacity_replenished": replenish_capacity,
+                    "capacity_replenished": replenished,
+                    "orchestration_mode": "CONVERSATION_LOOP",
                 },
             ),
             RuntimeEvent(
                 f"evt-{uuid4().hex}", task_id,
                 stored.last_event_sequence + 2, "task.state_changed", {
                     "previous_state": task.state.value,
-                    "next_state": resumed_task.state.value,
-                    "reason": "user input continued a completed unit",
+                    "next_state": resumed.state.value,
+                    "reason": "historical continuation migrated to conversation loop",
                 },
             ),
             RuntimeEvent(
@@ -3046,30 +2315,20 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                     "turn_id": checkpoint.turn_id,
                     "revision": resumed_checkpoint.revision,
                     "checkpoint_hash": resumed_checkpoint.checkpoint_hash,
-                    "reason": "continuation-resolved",
+                    "reason": "conversation-continuation-migrated",
                     "pending_user_action": {},
-                },
-            ),
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", task_id,
-                stored.last_event_sequence + 4, "steering.queued", {
-                    "steering_id": input_id,
-                    "inbound_sequence": steering.latest_inbound_sequence + 1,
-                    "kind": SteeringKind.STEER.value,
-                    "text": normalized,
-                    "text_hash": canonical_hash(normalized),
-                    "request_hash": steering_hash,
                 },
             ),
         )
         await self._dependencies.store.commit(RuntimeUnitOfWork(
-            task_id, stored.version, resumed_task.to_data(), events
+            task_id, stored.version, resumed.to_data(), events
         ))
-        return await self._continue_agent_turn(
+        from .conversation_loop.loop import ConversationAgentLoop
+
+        return await ConversationAgentLoop(self)._drive(
             resumed_checkpoint, visible_tools,
             on_text_delta=on_text_delta, on_progress=on_progress,
         )
-
 
     async def resolve_agent_clarification(
         self, request_id: str, resume_token: str, answer: str | None = None, *,
@@ -3096,7 +2355,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                 f"clarification is not pending: {request_id}"
             )
         task = TaskSnapshot.from_data(stored.data)
-        await self.require_legacy_task_orchestration(task.task_id)
         request = task.pending_clarification
         if task.state is not TaskState.AWAITING_USER or request is None:
             raise ClarificationNotPending(
@@ -3164,9 +2422,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             },
             meta={"request_id": request.request_id, "answered_by_user": True},
         )
-        question_projection = await self._observe_evidence_question(
-            task.task_id, request.turn_id, request.call, result, None
-        )
         stored = await self._require_stored_task(task.task_id)
         task = TaskSnapshot.from_data(stored.data)
         tool_message = Message(
@@ -3183,7 +2438,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                 ) if checkpoint.tool_batch is not None else None
             ),
             tool_calls=checkpoint.tool_calls + 1,
-            evidence_question_state=question_projection.to_data(),
             pending_user_action={},
         )
         resumed = task.resolve_clarification().with_agent_checkpoint(
@@ -3262,9 +2516,11 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         await self._dependencies.store.commit(RuntimeUnitOfWork(
             task.task_id, stored.version, resumed.to_data(), events
         ))
-        return await self._continue_agent_turn(
-            resumed_checkpoint, visible_tools, on_text_delta=on_text_delta,
-            on_progress=on_progress,
+        from .conversation_loop.loop import ConversationAgentLoop
+
+        return await ConversationAgentLoop(self)._drive(
+            resumed_checkpoint, visible_tools,
+            on_text_delta=on_text_delta, on_progress=on_progress,
         )
 
     async def _resolve_outcome_reconciliation(
@@ -3427,7 +2683,9 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         await self._validate_agent_checkpoint(
             await self.get_task(task.task_id), resumed_checkpoint, visible_tools
         )
-        return await self._continue_agent_turn(
+        from .conversation_loop.loop import ConversationAgentLoop
+
+        return await ConversationAgentLoop(self)._drive(
             resumed_checkpoint, visible_tools,
             on_text_delta=on_text_delta, on_progress=on_progress,
         )
@@ -3557,323 +2815,13 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
 
 
 
-    async def _continue_agent_turn(
-        self,
-        checkpoint: AgentTurnCheckpoint,
-        visible_tools: tuple[ToolSpec, ...],
-        *,
-        initial_tool_message: Message | None = None,
-        recover_interrupted: bool = False,
-        on_text_delta: Callable[[str], None] | None = None,
-        on_progress: Callable[[AgentProgress], None] | None = None,
-    ) -> (
-        AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended
-        | AgentContinuationSuspended
-    ):
-        await self.require_legacy_task_orchestration(checkpoint.task_id)
-        state = TurnState(
-            task_id=checkpoint.task_id, turn_id=checkpoint.turn_id,
-            visible_tools=visible_tools,
-            initial_tool_message=initial_tool_message,
-            recover_interrupted=recover_interrupted,
-            on_text_delta=on_text_delta, on_progress=on_progress,
-        )
-        await self.plan_task_spec(state.task_id)
-        state.live_spec = await self.get_task_spec(state.task_id)
-        state.closed_outcomes_at_entry = frozenset(
-            outcome.outcome_id for outcome in state.live_spec.outcomes
-            if outcome.required and outcome.status.is_closed
-        )
-        state.checkpoint = replace(
-            checkpoint, task_spec_revision=state.live_spec.revision,
-            task_spec_hash=state.live_spec.content_hash,
-        )
-        state.checkpoint = await self._inject_agent_decides_completion_diagnostics(
-            state.checkpoint, state.visible_tools
-        )
-        state.messages = list(state.checkpoint.messages)
-        if initial_tool_message is not None:
-            state.messages.append(initial_tool_message)
-        state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
-        state.seen_call_ids = set(state.checkpoint.seen_call_ids)
-        state.model_call_count = state.checkpoint.model_calls
-        state.tool_call_count = state.checkpoint.tool_calls
-        state.input_tokens = state.checkpoint.input_tokens
-        state.output_tokens = state.checkpoint.output_tokens
-        state.last_tool_error = next((
-            f"{block.result.error_code or 'TOOL_ERROR'}"
-            for message in reversed(state.messages)
-            for block in reversed(message.content)
-            if isinstance(block, ToolResultBlock) and not block.result.ok
-        ), None)
-        state.plan_guard = PlanGuard()
-        state.visible_tool_by_name = {tool.name: tool for tool in state.visible_tools}
-        state.checkpoint = self._synchronize_tool_batch(state.checkpoint)
-        state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
-
-        while True:
-            # Cooperative cancellation boundary (task-cancellation-spec §7): a
-            # durable cancel may have landed since the last step (another
-            # process, or a restart without this in-process runner). Stop before
-            # starting new work; the SDK never writes SUCCEEDED for a cancelled
-            # Task.
-            _begin = await self._begin_iteration(state)
-            if _begin.action is PhaseAction.RETURN:
-                return _begin.result
-
-            await self._prepare_model_call(state)
-            _verdict = await self._invoke_model(state)
-            if _verdict.action is PhaseAction.CONTINUE:
-                continue
-            if _verdict.action is PhaseAction.RETURN:
-                return _verdict.result
-
-            _final = await self._finish_iteration(state)
-            if _final.action is PhaseAction.RETURN:
-                return _final.result
-            if _final.action is PhaseAction.CONTINUE:
-                continue
-    async def _begin_iteration(self, state: TurnState) -> PhaseVerdict:
-        """Forward to the turn-phase sibling (late import: no cycle)."""
-
-        from .turn_phases import _begin_iteration as _phase
-
-        return await _phase(self, state)
-
-    async def _finish_iteration(self, state: TurnState) -> PhaseVerdict:
-        """Forward to the turn-phase sibling (late import: no cycle)."""
-
-        from .turn_phases import _finish_iteration as _phase
-
-        return await _phase(self, state)
-    async def _invoke_model(self, state: TurnState) -> PhaseVerdict:
-        """Forward to the turn-phase sibling (late import: no cycle)."""
-
-        from .turn_phases import _invoke_model as _phase
-
-        return await _phase(self, state)
-    async def _prepare_model_call(self, state: TurnState) -> None:
-        """Forward to the turn-phase sibling (late import: no cycle)."""
-
-        from .turn_phases import _prepare_model_call as _phase
-
-        await _phase(self, state)
     async def _run_tool_batch(
         self, state: TurnState,
-    ) -> (
-        AgentTurnSuspended | AgentClarificationSuspended
-        | AgentContinuationSuspended | None
-    ):
-        """Forward to the tool-batch phase sibling (late import: no cycle)."""
-
+    ) -> AgentTurnSuspended | AgentClarificationSuspended | None:
+        """Delegate shared tool execution to the conversation loop batch."""
         from .turn_tool_batch import run_tool_batch
 
         return await run_tool_batch(self, state)
-
-
-
-    async def _maybe_suspend_after_completed_unit(
-        self, checkpoint: AgentTurnCheckpoint,
-        closed_outcomes_at_entry: frozenset[str],
-    ) -> AgentContinuationSuspended | None:
-        """Persist one policy-selected unit boundary from Outcome facts.
-
-        No user phrase is inspected here.  Runtime pauses only when this loop
-        newly closed a required Outcome and the Planner explicitly selected the
-        AFTER_COMPLETED_UNIT policy while later required Outcomes remain.
-        """
-        if checkpoint.pending_tool_calls or (
-            checkpoint.tool_batch is not None and checkpoint.tool_batch.is_open
-        ):
-            return None
-        spec = await self.get_task_spec(checkpoint.task_id)
-        if spec.continuation_mode is not TaskContinuationMode.AFTER_COMPLETED_UNIT:
-            return None
-        closed = tuple(
-            outcome for outcome in spec.outcomes
-            if outcome.required and outcome.status.is_closed
-        )
-        newly_closed = tuple(
-            outcome for outcome in closed
-            if outcome.outcome_id not in closed_outcomes_at_entry
-        )
-        remaining = tuple(
-            outcome for outcome in spec.outcomes
-            if outcome.required and not outcome.status.is_closed
-        )
-        if not newly_closed or not remaining:
-            return None
-        pending = {
-            "kind": "CONTINUATION",
-            "task_id": checkpoint.task_id,
-            "turn_id": checkpoint.turn_id,
-            "completed_outcome_ids": [
-                outcome.outcome_id for outcome in newly_closed
-            ],
-            "remaining_outcome_ids": [
-                outcome.outcome_id for outcome in remaining
-            ],
-        }
-        suspended_checkpoint = replace(
-            checkpoint, revision=checkpoint.revision + 1,
-            pending_user_action=pending,
-            task_spec_revision=spec.revision, task_spec_hash=spec.content_hash,
-        )
-        stored = await self._require_stored_task(checkpoint.task_id)
-        task = TaskSnapshot.from_data(stored.data)
-        if task.state is not TaskState.EXECUTING:
-            return None
-        awaiting = task.transition(TaskState.AWAITING_USER).with_agent_checkpoint(
-            suspended_checkpoint.to_data()
-        )
-        message = Message(
-            f"msg-continuation-{uuid4().hex}", MessageRole.ASSISTANT,
-            (TextBlock(
-                "Completed this unit: "
-                + "; ".join(outcome.description for outcome in newly_closed)
-                + ". Remaining required work: "
-                + "; ".join(outcome.description for outcome in remaining)
-                + "."
-            ),),
-        )
-        events = (
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", checkpoint.task_id,
-                stored.last_event_sequence + 1, "continuation.requested",
-                pending,
-            ),
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", checkpoint.task_id,
-                stored.last_event_sequence + 2, "checkpoint.saved", {
-                    "turn_id": checkpoint.turn_id,
-                    "revision": suspended_checkpoint.revision,
-                    "checkpoint_hash": suspended_checkpoint.checkpoint_hash,
-                    "reason": "completed-unit-continuation",
-                    "pending_user_action": pending,
-                },
-            ),
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", checkpoint.task_id,
-                stored.last_event_sequence + 3, "task.state_changed", {
-                    "previous_state": task.state.value,
-                    "next_state": awaiting.state.value,
-                    "reason": "completed unit awaits semantic continuation",
-                },
-            ),
-        )
-        await self._dependencies.store.commit(RuntimeUnitOfWork(
-            checkpoint.task_id, stored.version, awaiting.to_data(), events
-        ))
-        return AgentContinuationSuspended(
-            checkpoint.task_id, checkpoint.turn_id,
-            suspended_checkpoint.revision,
-            tuple(outcome.outcome_id for outcome in newly_closed),
-            tuple(outcome.outcome_id for outcome in remaining), message,
-        )
-
-
-
-    async def _suspend_incomplete_recoverable(
-        self, checkpoint: AgentTurnCheckpoint, message: Message,
-        gaps: tuple[CompletionGap, ...], *, reason: str = "incomplete_recoverable",
-    ) -> AgentContinuationSuspended:
-        """Persist unmet required work as a resumable boundary.
-
-        The default is exhausted recoverable work. Acceptance criteria that
-        remain unmet after a required blocker disclosure use the same durable
-        continuation boundary, but retain their distinct reason for callers.
-        """
-        spec = await self.get_task_spec(checkpoint.task_id)
-        remaining_outcome_ids = tuple(
-            outcome.outcome_id for outcome in spec.outcomes
-            if outcome.required and not outcome.status.is_closed
-        )
-        required_gap_ids = tuple(sorted(
-            gap.gap_id for gap in gaps if gap.required
-        ))
-        # A user continuation replenishes capacity. That must not turn one
-        # unsatisfiable requirement into an endless series of identical
-        # attempts, so count how many consecutive continuations ended with the
-        # same required gaps and the same outstanding Outcomes, and carry that
-        # count past the replenishment.
-        readiness_state = CompletionReadinessState.from_data(
-            checkpoint.completion_readiness_state
-        )
-        previous = await self._last_continuation_pending(checkpoint.task_id)
-        stalled = (
-            readiness_state.stalled_continuations + 1
-            if _continuation_made_no_progress(
-                previous, required_gap_ids,
-                tuple(sorted(remaining_outcome_ids)),
-            )
-            else 0
-        )
-        if stalled >= self._dependencies.completion_max_stalled_continuations:
-            # INV-4: the same required gaps survived several continuations with
-            # no progress. Stop asking the user to retry an unclosable
-            # requirement and hand the decision to a human instead.
-            return await self._finalize_needs_review(
-                checkpoint, gaps, reason="required_work_unverifiable_or_stalled",
-                stalled=stalled, message=message,
-            )
-        pending = {
-            "kind": "CONTINUATION",
-            "reason": reason,
-            "task_id": checkpoint.task_id,
-            "turn_id": checkpoint.turn_id,
-            "completed_outcome_ids": [],
-            "remaining_outcome_ids": list(remaining_outcome_ids),
-            "gap_ids": list(required_gap_ids),
-            "zero_progress_continuations": stalled,
-        }
-        suspended_checkpoint = replace(
-            checkpoint, revision=checkpoint.revision + 1,
-            pending_user_action=pending,
-            task_spec_revision=spec.revision, task_spec_hash=spec.content_hash,
-            completion_readiness_state=replace(
-                readiness_state, stalled_continuations=stalled
-            ).to_data(),
-        )
-        stored = await self._require_stored_task(checkpoint.task_id)
-        task = TaskSnapshot.from_data(stored.data)
-        if task.state is not TaskState.EXECUTING:
-            raise InvalidTurnState(
-                "recoverable completion boundary requires an executing Task"
-            )
-        awaiting = task.transition(TaskState.AWAITING_USER).with_agent_checkpoint(
-            suspended_checkpoint.to_data()
-        )
-        events = (
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", checkpoint.task_id,
-                stored.last_event_sequence + 1, "continuation.requested", pending,
-            ),
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", checkpoint.task_id,
-                stored.last_event_sequence + 2, "checkpoint.saved", {
-                    "turn_id": checkpoint.turn_id,
-                    "revision": suspended_checkpoint.revision,
-                    "checkpoint_hash": suspended_checkpoint.checkpoint_hash,
-                    "reason": "incomplete-recoverable-continuation",
-                    "pending_user_action": pending,
-                },
-            ),
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", checkpoint.task_id,
-                stored.last_event_sequence + 3, "task.state_changed", {
-                    "previous_state": task.state.value,
-                    "next_state": awaiting.state.value,
-                    "reason": "recoverable work awaits a later Turn",
-                },
-            ),
-        )
-        await self._dependencies.store.commit(RuntimeUnitOfWork(
-            checkpoint.task_id, stored.version, awaiting.to_data(), events
-        ))
-        return AgentContinuationSuspended(
-            checkpoint.task_id, checkpoint.turn_id,
-            suspended_checkpoint.revision, (), remaining_outcome_ids, message,
-        )
 
 
     async def _evaluate_evidence_delta(
@@ -3907,113 +2855,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             },
         ),))
         return evaluation.inventory.to_data(), delta
-
-    async def _bind_evidence_question(
-        self, task_id: str, turn_id: str, call: ToolCall,
-    ) -> EvidenceQuestionProjection:
-        """Bind once per Tool Call and return the durable lifecycle state."""
-        question = call.evidence_question
-        projection = await self.get_evidence_questions(task_id)
-        if question is None:
-            return projection
-        current = projection.get(question.question_id)
-        if current is not None and call.call_id in current.tool_call_ids:
-            return projection
-        projection.bind(question, turn_id, call.call_id)
-        await self._append_events(task_id, ((
-            "evidence.question_bound", {
-                "turn_id": turn_id,
-                "tool_call_id": call.call_id,
-                "tool_name": call.name,
-                "question_ref": canonical_hash(question.question_id)[:12],
-                **question.to_data(),
-            },
-        ),))
-        return await self.get_evidence_questions(task_id)
-
-    async def _observe_evidence_question(
-        self, task_id: str, turn_id: str, call: ToolCall, result: ToolResult,
-        delta: EvidenceDelta | None,
-    ) -> EvidenceQuestionProjection:
-        """Advance lifecycle from a real Tool result, never model prose."""
-        projection = await self.get_evidence_questions(task_id)
-        question = call.evidence_question
-        if question is None:
-            return projection
-        current = projection.get(question.question_id)
-        if current is None:
-            raise ValueError("evidence question must be bound before observation")
-        events = await self._dependencies.store.read_events(task_id)
-        # ``tool.action_disposed`` is appended first; the projected record is
-        # authored by the following ``evidence.question_state_changed`` event.
-        next_sequence = events[-1].sequence + 2 if events else 2
-        projection, record = projection.observe(
-            call, result, delta, event_sequence=next_sequence
-        )
-        await self._append_events(task_id, ((
-            "evidence.question_state_changed", {
-                "turn_id": turn_id,
-                "tool_call_id": call.call_id,
-                "tool_name": call.name,
-                "question_ref": record.question_ref,
-                "previous_status": current.status.value,
-                "next_status": record.status.value,
-                "observation_kind": (
-                    record.observation_kind.value
-                    if record.observation_kind else None
-                ),
-                "blocking_reason": record.blocking_reason,
-                "evidence_count": len(record.evidence_references),
-                "record": record.to_data(),
-            },
-        ),))
-        return await self.get_evidence_questions(task_id)
-
-    async def _dispose_evidence_question(
-        self, task_id: str, turn_id: str, call: ToolCall,
-        disposition: ToolActionDisposition, reason: str,
-    ) -> EvidenceQuestionProjection:
-        """Close a bound question when Runtime removes its Action pre-execution.
-
-        The disposition is an audited lifecycle fact, never successful evidence.
-        Keeping this transition in one Kernel boundary prevents policy adapters
-        from leaving orphan OPEN questions when they redirect or stop an Action.
-        """
-        projection = await self.get_evidence_questions(task_id)
-        if call.evidence_question is None:
-            return projection
-        current = projection.get(call.evidence_question.question_id)
-        if current is None:
-            raise ValueError("evidence question must be bound before disposition")
-        events = await self._dependencies.store.read_events(task_id)
-        next_sequence = events[-1].sequence + 1 if events else 1
-        projection, record = projection.dispose(
-            call, disposition, reason, event_sequence=next_sequence
-        )
-        if record is None:
-            return projection
-        await self._append_events(task_id, ((
-            "tool.action_disposed", {
-                "turn_id": turn_id, "tool_call_id": call.call_id,
-                "tool_name": call.name, "disposition": disposition.value,
-                "reason": reason, "question_ref": record.question_ref,
-            },
-        ), (
-            "evidence.question_state_changed", {
-                "turn_id": turn_id, "tool_call_id": call.call_id,
-                "tool_name": call.name, "question_ref": record.question_ref,
-                "previous_status": current.status.value,
-                "next_status": record.status.value,
-                "observation_kind": (
-                    record.observation_kind.value
-                    if record.observation_kind else None
-                ),
-                "blocking_reason": record.blocking_reason,
-                "evidence_count": len(record.evidence_references),
-                "record": record.to_data(),
-            },
-        )))
-        return await self.get_evidence_questions(task_id)
 
 
 
@@ -4168,6 +3009,8 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         self,
         task_id: str,
         event_data: tuple[tuple[str, Mapping[str, Any]], ...],
+        *,
+        turn_id: str | None = None,
     ) -> None:
         stored = await self._dependencies.store.load_task(task_id)
         if stored is None:
@@ -4179,6 +3022,7 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                 sequence=stored.last_event_sequence + index,
                 event_type=event_type,
                 payload=payload,
+                turn_id=turn_id,
             )
             for index, (event_type, payload) in enumerate(event_data, start=1)
         )

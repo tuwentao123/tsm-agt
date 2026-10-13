@@ -26,23 +26,13 @@ from .prompt import (
     PromptAssembly, PromptAssemblyReceipt, PromptManifest, PromptTemplate,
     PromptTemplateSegment,
 )
-from .single_loop import (
-    ActiveContextProjection,
-    CompletionClaim,
-    CompletionGap,
-    CompletionValidation,
-    IntentDependency,
-    IntentDependencyKind,
-    IntentSource,
+from .conversation_orchestration import (
     OrchestrationMode,
-    SingleAgentLoop,
     TaskBindingDecision,
     TaskBindingKind,
     TaskOrchestrationMetadata,
-    TurnIntent,
-    TurnIntentKind,
+    TaskOrchestrationProjector,
 )
-from .single_loop.task_projection import TaskOrchestrationProjector
 from .task_runtime_projection import (
     TaskDisplayStatus, TaskExecutionStatus, TaskRuntimeFailure,
     TaskRuntimePhase, TaskRuntimeProjection, TaskRuntimeProjector,
@@ -96,7 +86,8 @@ from .process import (
     SupervisedProcessResult,
 )
 from .task import (
-    InvalidTaskTransition, Phase1TaskState, TaskNotFound, TaskSnapshot, TaskState,
+    InvalidTaskTransition, Phase1TaskState, TaskKind, TaskNotFound,
+    TaskSnapshot, TaskState,
 )
 from .task_spec import (
     TASK_SPEC_PROPOSAL_SCHEMA_V1,
@@ -170,11 +161,6 @@ from .workspace import (
 )
 from .verification import (
     AcceptanceResult, AcceptanceStatus, Evidence, TaskVerificationResult,
-)
-from .evidence_question import (
-    EvidenceObservationKind, EvidenceQuestionProjector,
-    EvidenceQuestionProjection, EvidenceQuestionRecord, EvidenceQuestionStatus,
-    ToolActionDisposition,
 )
 from .turn import (
     InvalidModelResponse, InvalidTurnState, ModelInvocationFailed,
@@ -307,6 +293,7 @@ __all__ = [
     "Phase1TaskState",
     "TaskSnapshot",
     "TaskState",
+    "TaskKind",
     "TaskAcceptanceCriterion",
     "TASK_SPEC_PROPOSAL_SCHEMA_V1",
     "TaskContinuationMode",
@@ -406,11 +393,6 @@ __all__ = [
     "AcceptanceStatus",
     "Evidence",
     "TaskVerificationResult",
-    "EvidenceObservationKind",
-    "EvidenceQuestionProjector",
-    "EvidenceQuestionProjection",
-    "EvidenceQuestionRecord",
-    "EvidenceQuestionStatus",
     "TurnResult",
     "DuplicateToolName",
     "InvalidToolArguments",

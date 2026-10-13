@@ -24,7 +24,6 @@ from tsm_agt.ports import (
     AdapterDescriptor,
     ConclusionBlock,
     ConclusionProtocolMode,
-    EvidenceQuestion,
     FinishReason,
     HealthState,
     HealthStatus,
@@ -151,11 +150,6 @@ class AnthropicMessagesModelProvider:
         )
         normalized = self._normalize_response(
             request.turn_id, response, provider_to_internal,
-            require_evidence_questions=request.require_evidence_questions,
-            evidence_required_tools=frozenset(
-                tool.name for tool in request.tools
-                if request.require_evidence_questions and tool.requires_evidence_question
-            ),
             allowed_outcome_refs=frozenset(request.outcome_refs),
         )
         return self._with_diagnostics(
@@ -299,11 +293,6 @@ class AnthropicMessagesModelProvider:
                 "usage": usage,
             },
             provider_to_internal,
-            require_evidence_questions=request.require_evidence_questions,
-            evidence_required_tools=frozenset(
-                tool.name for tool in request.tools
-                if request.require_evidence_questions and tool.requires_evidence_question
-            ),
             allowed_outcome_refs=frozenset(request.outcome_refs),
         )
         normalized = self._with_diagnostics(
@@ -354,7 +343,6 @@ class AnthropicMessagesModelProvider:
                 continue
             converted = self._message_to_provider(
                 message, history_names,
-                frozenset(tool.name for tool in request.tools if request.require_evidence_questions and tool.requires_evidence_question),
                 frozenset(request.outcome_refs),
             )
             if messages and messages[-1]["role"] == converted["role"]:
@@ -383,7 +371,6 @@ class AnthropicMessagesModelProvider:
             payload["tools"] = [
                 self._tool_to_provider(
                     tool, internal_to_provider[tool.name],
-                    request.require_evidence_questions and tool.requires_evidence_question,
                     tool_refs.get(tool.name, request.outcome_refs),
                 )
                 for tool in request.tools
@@ -395,7 +382,6 @@ class AnthropicMessagesModelProvider:
         self,
         message: Message,
         internal_to_provider: Mapping[str, str],
-        evidence_required_tools: frozenset[str],
         outcome_refs: frozenset[str],
     ) -> dict[str, Any]:
         if message.role is MessageRole.TOOL:
@@ -433,7 +419,7 @@ class AnthropicMessagesModelProvider:
                 content.append({
                     "type": "tool_use", "id": block.call.call_id,
                     "name": provider_name,
-                    "input": self._wire_tool_input(block.call, evidence_required_tools, outcome_refs),
+                    "input": self._wire_tool_input(block.call, outcome_refs),
                 })
             elif isinstance(block, ConclusionBlock):
                 content.append({
@@ -444,33 +430,9 @@ class AnthropicMessagesModelProvider:
             content.append({"type": "text", "text": message.text})
         return {"role": message.role.value, "content": content}
 
-    def _tool_to_provider(self, tool: Any, name: str, requires_evidence: bool, outcome_refs: tuple[str, ...]) -> dict[str, Any]:
+    def _tool_to_provider(self, tool: Any, name: str, outcome_refs: tuple[str, ...]) -> dict[str, Any]:
         parameters = dict(tool.parameters)
         description = tool.description
-        if requires_evidence:
-            parameters = {
-                "type": "object",
-                "properties": {
-                    "evidence_question": {
-                        "type": "object",
-                        "properties": {
-                            "question_id": {"type": "string"},
-                            "question": {"type": "string"},
-                            "scope_expansion_reason": {"type": "string"},
-                            "expected_scope": {"type": "string"},
-                        },
-                        "required": ["question_id", "question", "expected_scope"],
-                        "additionalProperties": False,
-                    },
-                    "tool_arguments": parameters,
-                },
-                "required": ["evidence_question", "tool_arguments"],
-                "additionalProperties": False,
-            }
-            description = (
-                f"{description} Bind this call to one evidence question in "
-                "evidence_question and put normal arguments in tool_arguments."
-            )
         if outcome_refs:
             properties = dict(parameters.get("properties", {}))
             properties["outcome_ref"] = {"type": "string"}
@@ -483,8 +445,6 @@ class AnthropicMessagesModelProvider:
         response: Mapping[str, Any],
         provider_to_internal: Mapping[str, str],
         *,
-        require_evidence_questions: bool,
-        evidence_required_tools: frozenset[str],
         allowed_outcome_refs: frozenset[str],
     ) -> ModelResponse:
         raw_content = response.get("content")
@@ -513,24 +473,9 @@ class AnthropicMessagesModelProvider:
                 if outcome_ref is not None:
                     if not isinstance(outcome_ref, str) or not outcome_ref.strip() or (allowed_outcome_refs and outcome_ref not in allowed_outcome_refs):
                         raise RecoverableToolProtocolError("invalid_outcome_ref")
-                evidence = None
-                if internal_name in evidence_required_tools:
-                    keys = {"evidence_question", "tool_arguments"}
-                    if set(arguments) == keys:
-                        raw_question = arguments["evidence_question"]
-                        raw_arguments = arguments["tool_arguments"]
-                        if not isinstance(raw_question, Mapping) or not isinstance(raw_arguments, Mapping):
-                            raise RecoverableToolProtocolError("invalid_evidence_question")
-                        try:
-                            evidence = EvidenceQuestion.from_data(raw_question)
-                        except ValueError as error:
-                            raise RecoverableToolProtocolError("invalid_evidence_question") from error
-                        arguments = dict(raw_arguments)
-                    elif set(arguments) & keys:
-                        raise RecoverableToolProtocolError("missing_evidence_question_envelope")
-                    else:
-                        evidence = self._automatic_evidence_question(call_id, internal_name, arguments)
-                content.append(ToolCallBlock(ToolCall(call_id, internal_name, arguments, evidence, outcome_ref)))
+                content.append(ToolCallBlock(ToolCall(
+                    call_id, internal_name, arguments, outcome_ref=outcome_ref
+                )))
         if not content:
             raise ModelProviderTransportError(
                 "provider returned an empty message",
@@ -571,36 +516,11 @@ class AnthropicMessagesModelProvider:
         return name
 
     @staticmethod
-    def _wire_tool_input(call: ToolCall, evidence_required_tools: frozenset[str], outcome_refs: frozenset[str]) -> dict[str, Any]:
-        payload: dict[str, Any]
-        if call.name in evidence_required_tools:
-            payload = {
-                "evidence_question": call.evidence_question.to_data() if call.evidence_question else None,
-                "tool_arguments": dict(call.arguments),
-            }
-        else:
-            payload = dict(call.arguments)
+    def _wire_tool_input(call: ToolCall, outcome_refs: frozenset[str]) -> dict[str, Any]:
+        payload: dict[str, Any] = dict(call.arguments)
         if call.outcome_ref is not None:
             payload["outcome_ref"] = call.outcome_ref
         return payload
-
-    @staticmethod
-    def _automatic_evidence_question(call_id: str, tool_name: str, arguments: Mapping[str, Any]) -> EvidenceQuestion:
-        encoded = json.dumps({"call_id": call_id, "tool": tool_name, "arguments": arguments}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
-        question_id = "Q-auto-" + hashlib.sha256(encoded).hexdigest()[:12]
-        target = next((str(arguments[key]).strip()[:160] for key in ("path", "query", "pattern", "symbol") if isinstance(arguments.get(key), str) and str(arguments[key]).strip()), "the requested target")
-        return EvidenceQuestion(
-            question_id,
-            f"What evidence does {tool_name} return for {target}?",
-            expected_scope=(
-                str(arguments.get("path", "")).strip()
-                if tool_name in {
-                    "core.read_file", "core.list_files", "core.search_files",
-                    "core.find_files", "core.search_text", "core.grep_search",
-                }
-                else ""
-            ),
-        )
 
     @staticmethod
     def _with_diagnostics(response: ModelResponse, *, transport_kind: str, raw_text: str, chunk_count: int, saw_stop: bool) -> ModelResponse:

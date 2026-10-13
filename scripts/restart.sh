@@ -270,6 +270,18 @@ do_start() {
 
   mkdir -p "$RUN_DIR" "$LOG_DIR"
   export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+  # Search tools use ripgrep when it is on PATH, and a service launched from a
+  # minimal environment would otherwise fall back to the slower in-tree walker
+  # even though ripgrep is installed. Point TSM_AGT_RIPGREP at the binary
+  # directly instead of relying on PATH (see .env.example).
+  if [[ -z "${TSM_AGT_RIPGREP:-}" ]]; then
+    for candidate in /opt/homebrew/bin/rg /usr/local/bin/rg "$HOME/.cargo/bin/rg"; do
+      if [[ -x "$candidate" ]]; then
+        export TSM_AGT_RIPGREP="$candidate"
+        break
+      fi
+    done
+  fi
 
   if [[ "$FOREGROUND" == 1 || "$MODE_IS_CHAT" == 1 ]]; then
     echo "前台运行: (cd $WORKSPACE && ${CMD[*]})"

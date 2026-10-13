@@ -11,6 +11,11 @@ build/
 .env.*
 !.env.example
 .agent/
+# Local CLI identity/state and SQLite shell marker; never source artifacts.
+.local/
+/.headers on
+# Fetched third-party sources and runtime trust cache. Never tracked.
+.tsm/
 
 # Local investigation notes may contain workspace paths and internal project names.
 实测记录与优化问题本.md

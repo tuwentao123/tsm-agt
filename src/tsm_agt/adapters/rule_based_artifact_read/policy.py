@@ -67,7 +67,7 @@ class RuleBasedArtifactReadPolicy:
         )
         if not same_question:
             return ArtifactReadDecision(
-                ArtifactReadAction.ALLOW, "new_evidence_question",
+                ArtifactReadAction.ALLOW, "new_call_fingerprint",
                 len(same_artifact), probe.path_hash, question_hash,
             )
         requested_end = probe.start_line + probe.max_lines - 1
@@ -122,9 +122,18 @@ class RuleBasedArtifactReadPolicy:
 
     @classmethod
     def _question_hash(cls, call: ToolCall) -> str:
-        if call.evidence_question is None:
-            return ""
-        return cls._hash(call.evidence_question.question_id.strip().casefold())
+        return cls._hash({
+            "tool_name": call.name,
+            "arguments": cls._canonical_arguments(call.arguments),
+        })
+
+    @staticmethod
+    def _canonical_arguments(arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {
+            str(key): value
+            for key, value in sorted(arguments.items(), key=lambda item: str(item[0]))
+            if value not in (None, "", (), [], {})
+        }
 
     @staticmethod
     def _hash(value: Any) -> str:

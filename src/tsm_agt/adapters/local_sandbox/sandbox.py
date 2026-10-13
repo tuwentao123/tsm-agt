@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -29,7 +30,7 @@ from tsm_agt.ports import (
 _ALLOWED_EXECUTABLES = frozenset(
     {
         "adb", "bun", "bundle", "cargo", "cmake", "dart",
-        "flutter", "git", "go", "gradle", "gradlew", "java",
+        "flutter", "gh", "git", "go", "gradle", "gradlew", "java",
         "javac", "kotlinc", "make", "ninja", "node", "npm",
         "npx", "pnpm", "pytest", "ruby", "ruff", "rustc",
         "swift", "xcodebuild", "yarn",
@@ -59,6 +60,32 @@ _TRUSTED_RUNTIME_ORIGINS = tuple(
 )
 _RUNTIME_TRUST_CACHE = ".tsm/runtime_trust.json"
 _RUNTIME_TRUST_SCHEMA_VERSION = 2
+
+
+#: A git clone argument that names a remote rather than a local destination.
+_CLONE_REMOTE = re.compile(r"^(?:[a-z][a-z0-9+.\-]*://|[^/\\]+@[^/\\]+:)", re.I)
+
+
+def _git_clone_destination(argv: Sequence[str]) -> str | None:
+    """The local directory a ``git clone`` would write to, or None.
+
+    ``None`` means "not a clone" or "no destination argument", in which case git
+    writes into the working directory and there is nothing extra to check.
+    """
+
+    tokens = [str(item) for item in argv]
+    if not tokens or Path(tokens[0]).name.lower() != "git":
+        return None
+    index = 1
+    while index < len(tokens) and tokens[index].startswith("-"):
+        index += 1
+    if index >= len(tokens) or tokens[index].lower() != "clone":
+        return None
+    positional = [item for item in tokens[index + 1:] if not item.startswith("-")]
+    if not positional:
+        return None
+    candidate = positional[-1]
+    return None if _CLONE_REMOTE.match(candidate) else candidate
 
 
 def _path_is_relative_to(path: Path, root: Path) -> bool:
@@ -176,6 +203,23 @@ class LocalWorkspaceSandbox:
             )
             if runtime_decision is not None:
                 return runtime_decision
+
+        # A clone writes a whole tree into the real filesystem, and nothing else
+        # here constrains where. Keep the destination inside the Task workspace
+        # so "read another project's source" cannot become "write anywhere".
+        clone_destination = _git_clone_destination(request.argv)
+        if clone_destination is not None:
+            workspace_root = self._workspace_path.normalize_workspace(request.cwd)
+            target = Path(clone_destination).expanduser()
+            if not target.is_absolute():
+                target = request.cwd / target
+            if not _path_is_relative_to(
+                Path(os.path.realpath(target)), workspace_root
+            ):
+                return SandboxDecision(
+                    False,
+                    "git clone destination must be inside the task workspace",
+                )
 
         return SandboxDecision(
             True,

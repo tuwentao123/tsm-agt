@@ -237,9 +237,8 @@ if __name__ == "__main__":
     unittest.main()
 
 
-from tsm_agt.core.single_loop import OrchestrationMode
+from tsm_agt.core import OrchestrationMode
 
 
 def compose_legacy_fixture_application(*args, **kwargs):
-    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
     return compose_fixture_application(*args, **kwargs)

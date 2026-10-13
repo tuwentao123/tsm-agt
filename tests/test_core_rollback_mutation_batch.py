@@ -14,7 +14,7 @@ from tsm_agt.ports import ToolCall
 # Patch where production reads. ``rollback_workspace_mutation_batch`` and friends
 # live on ``WorkspaceMixin`` in ``core/kernel_workspace.py`` now, so they resolve
 # this name from *that* module's globals; patching ``kernel_module`` would bind the
-# façade's copy and silently not intercept (Hermes ``AGENTS.md:244-245``).
+# façade's copy and silently not intercept (the project's import rule).
 from tsm_agt.core import kernel_workspace as kernel_workspace_module
 
 

@@ -22,7 +22,7 @@ from tsm_agt.bootstrap import (
 from tsm_agt.cli import _render_investigation_status
 from tsm_agt.core import AgentTurnResult, TaskState, canonical_hash
 from tsm_agt.ports import (
-    AdapterContext, AdapterDescriptor, EvidenceQuestion, FinishReason, HealthState,
+    AdapterContext, AdapterDescriptor, FinishReason, HealthState,
     HealthStatus, InvestigationStatusProjectorPort, InvestigationStatusSignals,
     Message, MessageRole, ModelRequest, ModelResponse, ProviderCapabilities,
     RuntimeStorePort, TextBlock, ToolCall, ToolCallBlock, ToolIdempotency, ToolResult,
@@ -155,7 +155,11 @@ class InvestigationStatusKernelTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(before), len(after))
                 self.assertEqual(status.question_ref, canonical_hash("Q-private-status")[:12])
                 self.assertGreater(status.evidence_total, 0)
-                self.assertEqual(status.model_calls, 2)
+                # Three calls: the stub acts before declaring anything, so it
+                # spends one call on the required intent declaration before its
+                # single tool call. The correction is offered once and the turn
+                # then proceeds, so a model that never declares cannot deadlock.
+                self.assertEqual(status.model_calls, 3)
                 self.assertEqual(status.tool_calls, 1)
                 self.assertEqual(status.latest_decision, "CONTINUE")
                 encoded = str(status.to_data())

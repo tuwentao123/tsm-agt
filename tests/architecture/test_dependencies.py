@@ -165,7 +165,7 @@ if __name__ == "__main__":
 #: and then update this table.
 #:
 #: **When a cohesive method group moves to a mixin sibling of ``core/kernel.py``
-#: (the Hermes facade+siblings shape), redistribute these counts instead of
+#: (the facade-plus-siblings shape), redistribute these counts instead of
 #: leaving them behind: the moved bodies carry their ``TaskState.X`` references
 #: with them. What the ratchet forbids is a *new decision site*, so the rule for
 #: a pure move is that the column **sum is conserved** -- 56 before and after

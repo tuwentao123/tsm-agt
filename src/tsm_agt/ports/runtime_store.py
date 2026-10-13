@@ -20,6 +20,18 @@ class RuntimeEvent:
     occurred_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     schema_version: int = 1
     session_id: str | None = None
+    #: The turn this event belongs to, when it is turn-scoped. Legacy events are
+    #: ``None``; every ``tool.*``/``checkpoint.saved``/``llm.completed``/``turn.*``
+    #: event of a Conversation Task carries the id its checkpoint carries.
+    turn_id: str | None = None
+
+    def __post_init__(self) -> None:
+        # Turn-scoped payloads already state their ``turn_id``; lift it onto the
+        # event so every store can index a turn without re-reading the payload.
+        if self.turn_id is None:
+            candidate = self.payload.get("turn_id")
+            if isinstance(candidate, str) and candidate:
+                object.__setattr__(self, "turn_id", candidate)
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +122,10 @@ class RuntimeCommandRecord:
 class RuntimeStorePort(RuntimeAdapter, Protocol):
     async def commit(self, unit: RuntimeUnitOfWork) -> CommitResult: ...
 
-    async def read_events(self, task_id: str, after_sequence: int = 0) -> tuple[RuntimeEvent, ...]: ...
+    async def read_events(
+        self, task_id: str, after_sequence: int = 0,
+        event_types: tuple[str, ...] | None = None,
+    ) -> tuple[RuntimeEvent, ...]: ...
 
     async def load_task(self, task_id: str) -> StoredTask | None: ...
 

@@ -9,7 +9,6 @@ from tsm_agt.bootstrap import compose_fixture_application, compose_readonly_appl
 from tsm_agt.core import SessionSnapshot, TaskSnapshot, TaskState
 from tsm_agt.ports import (
     AdapterContext,
-    EvidenceCapability,
     FinishReason,
     Message,
     MessageRole,
@@ -250,7 +249,6 @@ class RuntimeInspectionToolProviderTest(unittest.IsolatedAsyncioTestCase):
         for spec in specs.values():
             self.assertEqual(spec.effect, ToolEffect.OBSERVE)
             self.assertEqual(spec.result_authority, ToolResultAuthority.RUNTIME_FACT)
-            self.assertIn(EvidenceCapability.OBSERVE_RUNTIME, spec.evidence_capabilities)
 
         app = compose_readonly_application()
         await app.registry.start_all()

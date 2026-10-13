@@ -38,6 +38,7 @@ def _event(
                 f"assistant-{sequence}", MessageRole.ASSISTANT,
                 (TextBlock(assistant),),
             ).to_data(),
+            "assistant_replay_eligible": True,
             "task_summary": {
                 "task_id": task_id,
                 "turn_id": f"turn-{sequence}",

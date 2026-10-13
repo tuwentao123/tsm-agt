@@ -16,9 +16,6 @@ from typing import Any
 from tsm_agt.ports import RuntimeEvent
 
 from .configuration import canonical_hash
-from .evidence_question import (
-    EvidenceQuestionProjection, EvidenceQuestionStatus,
-)
 
 
 class WorkingPlanStepStatus(StrEnum):
@@ -296,44 +293,10 @@ class EffectiveWorkingMemory:
 class EffectiveWorkingMemoryProjector:
     """Derive minimum trusted progress from persisted Runtime events."""
 
-    def project(
-        self, snapshot: WorkingMemorySnapshot,
-        questions: EvidenceQuestionProjection,
-    ) -> EffectiveWorkingMemory:
-        if snapshot.task_id != questions.task_id:
-            raise ValueError(
-                "working memory and evidence questions belong to different Tasks"
-            )
+    def project(self, snapshot: WorkingMemorySnapshot) -> EffectiveWorkingMemory:
         remaining: list[str] = []
         evidence: list[WorkingEvidenceReference] = []
         sources: set[int] = set()
-        for record in questions.records:
-            if record.status in {
-                EvidenceQuestionStatus.OPEN, EvidenceQuestionStatus.BLOCKED,
-            }:
-                prefix = (
-                    "Resolve evidence question"
-                    if record.status is EvidenceQuestionStatus.OPEN
-                    else "Unblock evidence question"
-                )
-                detail = f"{prefix}: {record.question}"
-                if record.expected_scope:
-                    detail += f" (scope: {record.expected_scope})"
-                if record.blocking_reason:
-                    detail += f" (reason: {record.blocking_reason})"
-                remaining.append(detail[:1000])
-            elif (
-                record.status is EvidenceQuestionStatus.RESOLVED
-                and record.evidence_references
-            ):
-                evidence.append(WorkingEvidenceReference(
-                    evidence_id=f"runtime-question-{record.question_ref}",
-                    kind="evidence_question",
-                    reference=record.evidence_references[-1],
-                    summary=f"Resolved evidence question: {record.question}"[:1000],
-                ))
-            if record.updated_event_sequence > 0:
-                sources.add(record.updated_event_sequence)
         return EffectiveWorkingMemory(
             snapshot=snapshot,
             runtime_remaining_work=tuple(remaining[-20:]),

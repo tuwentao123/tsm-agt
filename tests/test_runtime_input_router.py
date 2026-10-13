@@ -10,7 +10,10 @@ from tsm_agt.core import (
     RuntimeInputContext, RuntimeInputIntent, RuntimeInputRouter,
     SessionInputAction, SessionTextInput, TaskState,
 )
-from tsm_agt.core.single_loop import TaskBindingDecision, TaskBindingKind
+from tsm_agt.core.conversation_orchestration import (
+    TaskBindingDecision,
+    TaskBindingKind,
+)
 from tsm_agt.ports import (
     AdapterDescriptor, HealthState, HealthStatus,
     SessionInputRelation, SessionInputRelationJudgement,

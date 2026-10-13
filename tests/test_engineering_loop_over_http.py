@@ -26,7 +26,7 @@ from tsm_agt.bootstrap import (
     OrchestrationConfiguration,
     compose_openai_compatible_engineering_application,
 )
-from tsm_agt.core.single_loop import OrchestrationMode
+from tsm_agt.core import OrchestrationMode
 from tsm_agt.core import (
     AgentTurnResult, AgentTurnSuspended, ApprovalDecision,
     TaskState,

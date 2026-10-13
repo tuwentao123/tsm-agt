@@ -32,6 +32,7 @@ class ModelCallPurpose(StrEnum):
     SESSION_ROUTING = "SESSION_ROUTING"
     TASK_SPEC = "TASK_SPEC"
     COMPACTION = "COMPACTION"
+    COMPLETION_REVIEW = "COMPLETION_REVIEW"
 
 
 class ConclusionProtocolMode(StrEnum):
@@ -170,7 +171,7 @@ MessageBlock = (
 #: a Runtime-authored "user" turn survive into a later turn and outrank the real
 #: instruction.
 #:
-#: This mirrors Hermes' ``_EPHEMERAL_SCAFFOLDING_FLAGS``
+#: This mirrors the reference agent's ``_EPHEMERAL_SCAFFOLDING_FLAGS``
 #: (``agent/session_persistence.py:36-54``) and copies its two load-bearing
 #: choices. Markers are **named**, not one boolean, because the flags there
 #: distinguish a verification nudge from the assistant candidate it accompanies
@@ -182,7 +183,8 @@ SCAFFOLDING_KINDS = frozenset({
     #: answer is not accepted: ``Kernel._completion_correction_message``, which
     #: builds the message with ``scaffolding="completion-readiness"``. Cited by
     #: symbol, not by line: ``core/kernel.py`` is being decomposed into mixin
-    #: siblings (Hermes ``AGENTS.md:232-248``) and line numbers do not survive it.
+    #: siblings (the project's module-boundary rule) and line numbers do not
+    #: survive it.
     "completion-readiness",
     #: The prompt that re-enters the loop after a user continuation, re-emitted
     #: as ``continuation-input-*`` by ``Kernel._compact_continuation_messages``.
@@ -190,6 +192,8 @@ SCAFFOLDING_KINDS = frozenset({
     #: A user message delivered mid-turn by the steering channel, built as
     #: ``steering-*`` by ``Kernel._apply_pending_steering``.
     "steering",
+    "runtime-finalization",
+    "completion-review",
 })
 
 
@@ -335,12 +339,12 @@ class ModelRequest:
     messages: tuple[Message, ...]
     #: Wire-level output ceiling (``max_tokens`` / ``max_completion_tokens``).
     #: ``None`` sends nothing, leaving the ceiling to the provider -- what Codex
-    #: does always and Hermes does when unset. This is NOT the context budget's
-    #: output reservation: see ``ContextBudget.reserved_output_tokens``.
+    #: does always and the reference harness does when unset. This is NOT the
+    #: context budget's output reservation: see
+    #: ``ContextBudget.reserved_output_tokens``.
     max_output_tokens: int | None = None
     tools: tuple[ToolSpec, ...] = ()
     allow_tool_calls: bool = True
-    require_evidence_questions: bool = False
     outcome_refs: tuple[str, ...] = ()
     # This callback is process-local and is never serialized into a Checkpoint.
     # Adapters can expose retries without leaking HTTP/SSE details into Kernel.

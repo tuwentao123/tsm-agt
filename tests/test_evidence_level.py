@@ -21,7 +21,7 @@ from tsm_agt.ports import (
     EvidenceLevelSignals, FinishReason, HealthState, HealthStatus, Message,
     MessageRole, ModelRequest, ModelResponse, ProviderCapabilities, RuntimeStorePort,
     TextBlock, ToolCall, ToolCallBlock, ToolIdempotency, ToolResult, ToolResultBlock,
-    ToolRisk, ToolSpec, EvidenceQuestion,
+    ToolRisk, ToolSpec,
 )
 
 

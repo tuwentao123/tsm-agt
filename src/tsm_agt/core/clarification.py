@@ -18,7 +18,6 @@ class ClarificationKind(StrEnum):
 
     QUESTION = "QUESTION"
     OUTCOME_RECONCILIATION = "OUTCOME_RECONCILIATION"
-    CONTRACT_BLOCKED = "CONTRACT_BLOCKED"
 
 
 @dataclass(frozen=True, slots=True)

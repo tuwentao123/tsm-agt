@@ -10,11 +10,28 @@ from pathlib import Path
 from tsm_agt.adapters.builtin import CoreReadOnlyToolProvider
 from tsm_agt.adapters.posix_path import PosixWorkspacePath
 from tsm_agt.adapters.windows_path import WindowsWorkspacePath
+from tsm_agt.core.configuration import ripgrep_binary
 from tsm_agt.core.workspace import EXCLUDED_DIRECTORIES
 from tsm_agt.ports import AdapterContext, ToolCall, ToolInvocationContext
 
 
 class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
+    def _point_ripgrep_at(self, binary: Path) -> None:
+        """Make the search tools use a stub ripgrep for this test."""
+
+        previous = os.environ.get("TSM_AGT_RIPGREP")
+        os.environ["TSM_AGT_RIPGREP"] = str(binary)
+        ripgrep_binary.cache_clear()
+
+        def restore() -> None:
+            if previous is None:
+                os.environ.pop("TSM_AGT_RIPGREP", None)
+            else:
+                os.environ["TSM_AGT_RIPGREP"] = previous
+            ripgrep_binary.cache_clear()
+
+        self.addCleanup(restore)
+
     async def asyncSetUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.workspace = Path(self.temp_dir.name)
@@ -335,6 +352,131 @@ class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
             secret.unlink(missing_ok=True)
             outside.rmdir()
 
+    async def test_content_search_locates_with_ripgrep_when_available(self) -> None:
+        # ripgrep answers in exactly the walker's shape: it is a locator, not a
+        # second result format, so evidence accounting cannot tell them apart.
+        stub = self.workspace / "fake-rg"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stdout.write('src/app.py\\0' + '2:class Kernel:\\n')\n"
+            "sys.stdout.write('README.md\\0' + '1:Kernel documentation\\n')\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        self._point_ripgrep_at(stub)
+
+        result = await self.provider.invoke(
+            ToolCall("call-rg", "core.search_files", {"pattern": "kernel"}),
+            self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["search_engine"], "ripgrep")
+        self.assertEqual(
+            [(item["path"], item["line"], item["text"]) for item in result.data["matches"]],
+            [
+                ("src/app.py", 2, "class Kernel:"),
+                ("README.md", 1, "Kernel documentation"),
+            ],
+        )
+
+    async def test_a_failing_ripgrep_falls_back_to_the_walker(self) -> None:
+        stub = self.workspace / "broken-rg"
+        stub.write_text(
+            "#!/usr/bin/env python3\nimport sys\nsys.exit(2)\n", encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        self._point_ripgrep_at(stub)
+
+        result = await self.provider.invoke(
+            ToolCall("call-rg2", "core.search_files", {"pattern": "kernel"}),
+            self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertNotIn("search_engine", result.data)
+        self.assertEqual(len(result.data["matches"]), 2)
+
+    async def test_search_output_modes_answer_without_line_text(self) -> None:
+        # Force the in-tree walker so the answer shape does not depend on
+        # whether ripgrep happens to be installed.
+        self._point_ripgrep_at(self.workspace / "no-such-ripgrep")
+
+        counts = await self.provider.invoke(
+            ToolCall("c-count", "core.search_files", {
+                "pattern": "kernel", "output_mode": "count",
+            }),
+            self.context,
+        )
+        self.assertTrue(counts.ok)
+        self.assertEqual(counts.data["output_mode"], "count")
+        self.assertEqual(
+            counts.data["counts"], {"src/app.py": 1, "README.md": 1}
+        )
+        self.assertEqual(counts.data["total_matches"], 2)
+        self.assertNotIn("matches", counts.data)
+
+        paths = await self.provider.invoke(
+            ToolCall("c-paths", "core.search_files", {
+                "pattern": "kernel", "output_mode": "paths",
+            }),
+            self.context,
+        )
+        self.assertTrue(paths.ok)
+        self.assertCountEqual(paths.data["paths"], ["src/app.py", "README.md"])
+        self.assertEqual(paths.data["files_matched"], 2)
+        self.assertNotIn("matches", paths.data)
+
+    async def test_search_result_pages_with_offset(self) -> None:
+        self._point_ripgrep_at(self.workspace / "no-such-ripgrep")
+
+        first = await self.provider.invoke(
+            ToolCall("c-page-1", "core.search_files", {
+                "pattern": "kernel", "limit": 1,
+            }),
+            self.context,
+        )
+        second = await self.provider.invoke(
+            ToolCall("c-page-2", "core.search_files", {
+                "pattern": "kernel", "limit": 1, "offset": 1,
+            }),
+            self.context,
+        )
+
+        self.assertEqual(len(first.data["matches"]), 1)
+        self.assertEqual(len(second.data["matches"]), 1)
+        self.assertTrue(first.truncated)
+        self.assertNotEqual(
+            first.data["matches"][0]["path"], second.data["matches"][0]["path"]
+        )
+
+    async def test_read_file_reports_a_continuation_offset(self) -> None:
+        long_file = self.workspace / "src" / "long.py"
+        long_file.write_text(
+            "".join(f"line {number}\n" for number in range(1, 41)),
+            encoding="utf-8",
+        )
+
+        partial = await self.provider.invoke(
+            ToolCall("c-read-1", "core.read_file", {
+                "path": "src/long.py", "start_line": 1, "max_lines": 10,
+            }),
+            self.context,
+        )
+        final = await self.provider.invoke(
+            ToolCall("c-read-2", "core.read_file", {
+                "path": "src/long.py", "start_line": 1, "max_lines": 100,
+            }),
+            self.context,
+        )
+
+        self.assertTrue(partial.truncated)
+        self.assertEqual(partial.data["next_offset"], 11)
+        self.assertIn("start_line=11", partial.hint)
+        self.assertFalse(final.truncated)
+        self.assertIsNone(final.data["next_offset"])
+
     async def test_searches_literal_and_regex_with_limits(self) -> None:
         literal = await self.provider.invoke(
             ToolCall(
@@ -620,7 +762,7 @@ class GitignoreIsNotAVisibilityFilterTest(unittest.IsolatedAsyncioTestCase):
     therefore returned zero matches, which is indistinguishable from "the file
     does not exist", and the Agent concluded the workspace was not mounted.
 
-    Codex and Hermes both honour ``.gitignore`` for enumeration, but in both it
+    Codex and reference agents both honour ``.gitignore`` for enumeration, but in both it
     is a default of a command the model chooses and can escape (``rg -u``,
     ``ls``, plain reads). Here it was baked into the tool, with no override and
     no signal. Noise is pruned by ``EXCLUDED_DIRECTORIES`` instead, which is the

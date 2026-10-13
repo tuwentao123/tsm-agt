@@ -26,24 +26,19 @@ from tsm_agt.core import (
     SessionInputDecision, SessionRouteDisposition, SessionTaskRelation,
     SessionSnapshot,
     TaskRuntimeProjection, TaskRuntimeProjector,
-    TaskSnapshot, TaskState, build_session_follow_up_goal,
+    TaskSnapshot, TaskState, TaskKind, build_session_follow_up_goal,
     build_session_follow_up_handoff,
     canonical_hash, SteeringKind, RuntimeInputIntent,
 )
-from tsm_agt.core.single_loop import (
+from tsm_agt.core.conversation_orchestration import (
     TaskBindingDecision,
     TaskBindingKind,
-    TaskOrchestrationProjector,
-    TurnIntent,
 )
-from tsm_agt.core.single_loop.types import IntentAttempt
 from tsm_agt.ports import (
     ImageBlock, ModelRecoveryAction,
     ModelRecoveryExhausted, ModelRetrySafety,
-    RuntimeCommandRecord, RuntimeStorePort, SessionInputRelation,
-    SessionInputRelationJudgement, SessionInputRelationPort, TextBlock,
+    RuntimeCommandRecord, RuntimeStorePort, SessionInputRelation, TextBlock,
 )
-from tsm_agt.ports.evidence import TaskContract
 
 
 class CommandInProgress(RuntimeError):
@@ -109,13 +104,6 @@ class RuntimeTaskResult:
     conclusion_claims: tuple[Mapping[str, Any], ...] = ()
     conclusion_validation: Mapping[str, Any] | None = None
     completion_diagnostics: Mapping[str, Any] | None = None
-    #: Bounded, durable orchestration facts for the Web/UI projection. Legacy
-    #: tasks keep this absent when callers construct synthetic local results;
-    #: Runtime reads always populate it from task events.
-    single_loop: Mapping[str, Any] | None = None
-    #: Current event-projected Contract for the Contract Card. It is separate
-    #: from Task state so Task remains the only execution state machine.
-    contract: Mapping[str, Any] | None = None
     #: Steering the user queued for this Task and that the turn has not consumed
     #: yet. It is a *receipt*, not authority: the Runtime alone decides when an
     #: input is applied, so a caller can observe the queue without owning it.
@@ -146,10 +134,6 @@ class RuntimeTaskResult:
                 dict(self.completion_diagnostics)
                 if self.completion_diagnostics is not None else None
             ),
-            "single_loop": (
-                dict(self.single_loop) if self.single_loop is not None else None
-            ),
-            "contract": dict(self.contract) if self.contract is not None else None,
         }
         if self.todo_list is not None:
             data["todo_list"] = dict(self.todo_list)
@@ -324,7 +308,6 @@ class EngineeringAgentClient:
         workspace: Path | None = None,
         original_user_text: str | None = None,
         context_handoff: Mapping[str, Any] | None = None,
-        evidence_contract: TaskContract | None = None,
     ) -> TaskSnapshot:
         """Create one Task, optionally in a workspace other than the client's.
 
@@ -341,7 +324,6 @@ class EngineeringAgentClient:
             task_relation=task_relation,
             original_user_text=original_user_text,
             context_handoff=context_handoff,
-            evidence_contract=evidence_contract,
         )
 
     async def submit_task(
@@ -352,7 +334,6 @@ class EngineeringAgentClient:
         workspace: Path | None = None,
         original_user_text: str | None = None,
         context_handoff: Mapping[str, Any] | None = None,
-        evidence_contract: TaskContract | None = None,
     ) -> RuntimeTaskResult:
         async with self._submit_lock:
             task = await self.create_task(
@@ -360,7 +341,6 @@ class EngineeringAgentClient:
                 source_task_id=source_task_id, task_relation=task_relation,
                 workspace=workspace, original_user_text=original_user_text,
                 context_handoff=context_handoff,
-                evidence_contract=evidence_contract,
             )
             current = await self.application.kernel.get_task(task.task_id)
             if (
@@ -378,6 +358,47 @@ class EngineeringAgentClient:
                     )
                 )
         return await self.get_task_result(task.task_id)
+
+    async def _start_task_turn(
+        self, task_id: str, user_text: str,
+        *, images: tuple[ImageBlock, ...] = (),
+    ) -> RuntimeTaskResult:
+        """Run one turn on an existing Task in the background.
+
+        A later turn is the same unit of work as a new Task's first turn, so it
+        is scheduled exactly the same way: the caller gets the accepted state
+        immediately and follows the Task's events, instead of holding the
+        request open for the whole model/tool loop.
+        """
+
+        async with self._submit_lock:
+            if task_id not in self._run_tasks:
+                runner = asyncio.create_task(
+                    # The same wrapper a first turn uses: it records a failed
+                    # turn on the Task and returns its result. Scheduling
+                    # ``run_task`` directly left the exception unretrieved, so
+                    # the Task stayed EXECUTING forever and the Web showed a
+                    # spinner with no output and no failure.
+                    self._run_submitted_task(
+                        task_id, user_text, images=images
+                    ),
+                    name=f"tsm-agt-sdk-turn-{task_id}",
+                )
+                self._run_tasks[task_id] = runner
+                runner.add_done_callback(
+                    lambda _done, tid=task_id: self._run_tasks.pop(tid, None)
+                )
+        # Report the turn as started, not the conversation's idle state it is
+        # leaving: a caller (the Web UI) that sees AWAITING_INPUT would treat
+        # the accepted turn as "waiting for input" and never follow it. The turn
+        # leaves AWAITING_INPUT within its first transition, so this is a short
+        # bounded wait, not a wait for the turn to finish.
+        for _ in range(100):
+            current = await self.application.kernel.get_task(task_id)
+            if current.state is not TaskState.AWAITING_INPUT:
+                break
+            await asyncio.sleep(0.01)
+        return await self.get_task_result(task_id)
 
     async def submit_session_text(
         self,
@@ -441,6 +462,14 @@ class EngineeringAgentClient:
                     return SessionTextResult(
                         command_id, "task", decision_data, task=task
                     )
+                if decision.binding_kind is TaskBindingKind.CONVERSATION_CONTINUATION:
+                    assert decision.task_id is not None
+                    return SessionTextResult(
+                        command_id, "continuation", decision_data,
+                        task=await self._start_task_turn(
+                            decision.task_id, normalized, images=image_blocks,
+                        ),
+                    )
                 if decision.binding_kind in {
                     TaskBindingKind.ACTIVE_CONTINUATION,
                     TaskBindingKind.EXPLICIT_CONTINUATION,
@@ -475,7 +504,9 @@ class EngineeringAgentClient:
                             command_id,
                             "continuation",
                             decision_data,
-                            task=await self.run_task(task.task_id, normalized),
+                            task=await self._start_task_turn(
+                                task.task_id, normalized, images=image_blocks,
+                            ),
                         )
                     return SessionTextResult(
                         command_id,
@@ -619,8 +650,6 @@ class EngineeringAgentClient:
             }, execute, lambda result: result.to_data(),
         )
 
-    # A relation must be at least this confident to override the safe default.
-    _RELATION_CONFIDENCE_FLOOR = 0.85
     _RUNNING_TASK_STATES = frozenset({
         TaskState.EXECUTING, TaskState.RUNNING_WORKFLOW,
     })
@@ -763,8 +792,15 @@ class EngineeringAgentClient:
                 session_id, text, input_id, explicit_intent, active,
                 image_blocks, workspace,
             )
-        # (2) Attachments always start a fresh Task: steering is text-only.
+        # (2) Attachments: steering is text-only, so a running turn cannot take
+        #     them and they start a fresh work item. An idle conversation can:
+        #     its next turn carries the images.
         if image_blocks:
+            if active is not None and active.state in self._RUNNING_TASK_STATES:
+                return await self._delegate_session_text(
+                    session_id, text, input_id, image_blocks, workspace, None,
+                    shadow_new_task_requested=True,
+                )
             return await self._delegate_session_text(
                 session_id, text, input_id, image_blocks, workspace, None,
             )
@@ -790,31 +826,15 @@ class EngineeringAgentClient:
                 ),
                 routed_task_id=active.task_id,
             ).to_data())
-        # (4) Running Task: one general judge decides the relation.
+        # (4) A running Task: an ordinary input steers it. The relation is never
+        #     guessed from the text; an explicit intent is the only way to ask
+        #     for replace or stop (rule 1). _settle_if_orphaned above has already
+        #     turned a claimed-but-dead EXECUTING Task into a resumable one, so
+        #     reaching here with a running state means a live turn exists.
         if active is not None and active.state in self._RUNNING_TASK_STATES:
-            judgement = await self._judge_relation(text, session_id, active)
-            relation = judgement.relation
-            reason = judgement.reason_code
-            if (
-                relation is not SessionInputRelation.SUPPLEMENT
-                and judgement.confidence < self._RELATION_CONFIDENCE_FLOOR
-            ):
-                relation = SessionInputRelation.SUPPLEMENT
-                reason = "below_confidence_floor_supplement"
-            if relation is SessionInputRelation.SUPPLEMENT:
-                return await self._steer_active(
-                    text, input_id, active, relation, reason,
-                    RuntimeInputIntent.STEER,
-                )
-            if relation is SessionInputRelation.REPLACE:
-                return await self._steer_active(
-                    text, input_id, active, relation, reason,
-                    RuntimeInputIntent.REPLACE,
-                )
-            if relation is SessionInputRelation.UNRELATED:
-                await self._stop_active_task(active.task_id, input_id)
-            return await self._delegate_session_text(
-                session_id, text, input_id, image_blocks, workspace, relation,
+            return await self._steer_active(
+                text, input_id, active, SessionInputRelation.SUPPLEMENT,
+                "default_steer_while_running", RuntimeInputIntent.STEER,
             )
         # (5) No running Task: existing Session routing creates/answers/clarifies.
         return await self._delegate_session_text(
@@ -862,45 +882,6 @@ class EngineeringAgentClient:
             if self._has_live_turn(task_id):
                 return False
             return await self.application.kernel.settle_orphaned_task(task_id)
-
-    async def _judge_relation(
-        self, text: str, session_id: str, active: TaskSnapshot,
-    ) -> SessionInputRelationJudgement:
-        judges = self.application.registry.all(SessionInputRelationPort)
-        if not judges:
-            return SessionInputRelationJudgement(
-                SessionInputRelation.SUPPLEMENT, 0.0,
-                "no_relation_judge_registered_supplement",
-            )
-        try:
-            conversation = await self.application.kernel.get_session_conversation(
-                session_id
-            )
-            recent = [
-                {
-                    "role": message.role.value, "text": message.text,
-                    "task_id": message.task_id,
-                }
-                for message in conversation.messages[-12:]
-            ]
-        except (LookupError, RuntimeError, ValueError):
-            recent = []
-        context = {
-            "session_id": session_id,
-            "recent_messages": recent,
-            "active_task": {
-                "task_id": active.task_id, "state": active.state.value,
-                "goal": active.goal,
-            },
-        }
-        try:
-            return await judges[0].judge_input_relation(text, context)
-        except Exception:
-            # A judge failure must not change the Task: fall back to supplement.
-            return SessionInputRelationJudgement(
-                SessionInputRelation.SUPPLEMENT, 0.0,
-                "relation_judge_failed_supplement",
-            )
 
     async def _steer_active(
         self, text: str, input_id: str, active: TaskSnapshot,
@@ -973,6 +954,16 @@ class EngineeringAgentClient:
         if intent is RuntimeInputIntent.INTERRUPT:
             if active is None:
                 raise ValueError("interrupt requires an active Task")
+            if active.state is TaskState.AWAITING_INPUT:
+                # An idle conversation has no live turn to interrupt; report it
+                # as a fact instead of asking the Kernel to interrupt a state it
+                # does not accept.
+                return RuntimeCommandResult(input_id, False, UserInputResult(
+                    input_id, "not_running",
+                    SessionInputRelation.UNKNOWN.value,
+                    "no_live_turn_to_interrupt",
+                    routed_task_id=active.task_id,
+                ).to_data())
             inner = await self.interrupt(
                 active.task_id, command_id=input_id,
                 reason="interrupted by explicit user command",
@@ -1074,22 +1065,35 @@ class EngineeringAgentClient:
                 ),
                 on_progress=lambda item: self._record_progress(task_id, item),
             )
-        elif task.state in {TaskState.INTERRUPTED, TaskState.CONFLICT}:
-            result = await kernel.resume_checkpointed_agent_turn(
-                task_id,
+        elif task.state is TaskState.AWAITING_INPUT:
+            # A finished conversation turn: this input becomes its next turn.
+            result = await kernel.run_agent_turn(
+                task_id, user_text,
+                user_blocks=(
+                    (TextBlock(user_text), *images) if images else None
+                ),
                 on_progress=lambda item: self._record_progress(task_id, item),
             )
+        elif task.state in {TaskState.INTERRUPTED, TaskState.CONFLICT}:
+            if task.task_kind is TaskKind.CONVERSATION:
+                # A conversation takes the next message as its next Turn. The
+                # resume path ignores the text, which would drop exactly what
+                # the user just typed.
+                await kernel.start_fresh_conversation_turn(task_id)
+                result = await kernel.run_agent_turn(
+                    task_id, user_text,
+                    user_blocks=(
+                        (TextBlock(user_text), *images) if images else None
+                    ),
+                    on_progress=lambda item: self._record_progress(task_id, item),
+                )
+            else:
+                result = await kernel.resume_checkpointed_agent_turn(
+                    task_id,
+                    on_progress=lambda item: self._record_progress(task_id, item),
+                )
         elif (await self.get_task_result(task_id)).status == "incomplete":
             result = await kernel.resume_checkpointed_agent_turn(
-                task_id,
-                on_progress=lambda item: self._record_progress(task_id, item),
-            )
-        elif (
-            task.state is TaskState.AWAITING_USER
-            and task.pending_clarification is not None
-            and task.pending_clarification.kind.value == "CONTRACT_BLOCKED"
-        ):
-            result = await kernel.resume_contract_gate(
                 task_id,
                 on_progress=lambda item: self._record_progress(task_id, item),
             )
@@ -1175,14 +1179,7 @@ class EngineeringAgentClient:
         todo_list = _todo_list_projection(
             await self.application.kernel.get_effective_working_memory(task_id)
         )
-        single_loop = _single_loop_projection(task, events)
-        contract = await self.application.kernel.get_task_contract(task_id)
         status = _status_for_state(task.state)
-        if (
-            status == "running"
-            and single_loop["incomplete_boundary"] is not None
-        ):
-            status = "incomplete"
         return RuntimeTaskResult(
             task_id, task.state.value, task.state.phase1_state.value,
             status, stored.last_event_sequence,
@@ -1198,8 +1195,6 @@ class EngineeringAgentClient:
             conclusion_claims=projected.conclusion_claims,
             conclusion_validation=projected.conclusion_validation,
             completion_diagnostics=_completion_diagnostics(events),
-            single_loop=single_loop,
-            contract=contract.to_data() if contract is not None else None,
         )
 
     async def read_events(
@@ -1303,68 +1298,6 @@ class EngineeringAgentClient:
             async with self._progress_changed:
                 self._progress_changed.notify_all()
         asyncio.create_task(notify())
-
-    async def get_contract(self, task_id: str) -> Mapping[str, Any] | None:
-        contract = await self.application.kernel.get_task_contract(task_id)
-        return contract.to_data() if contract is not None else None
-
-    async def draft_contract(
-        self, task_id: str, contract: TaskContract, *, expected_revision: int,
-        command_id: str,
-    ) -> RuntimeCommandResult:
-        return await self._command(
-            command_id, "contract_draft", {
-                "task_id": task_id,
-                "expected_revision": expected_revision,
-                "contract": contract.to_data(),
-            }, lambda: self.application.kernel.draft_task_contract(
-                task_id, contract, expected_revision=expected_revision,
-                command_id=command_id,
-            ), lambda value: value.to_data(),
-        )
-
-    async def accept_contract(
-        self, task_id: str, contract_id: str, *, expected_revision: int,
-        command_id: str,
-    ) -> RuntimeCommandResult:
-        return await self._command(
-            command_id, "contract_accept", {
-                "task_id": task_id, "contract_id": contract_id,
-                "expected_revision": expected_revision,
-            }, lambda: self.application.kernel.accept_task_contract(
-                task_id, contract_id, expected_revision=expected_revision,
-                command_id=command_id,
-            ), lambda value: value.to_data(),
-        )
-
-    async def update_contract(
-        self, task_id: str, contract: TaskContract, *, expected_revision: int,
-        command_id: str,
-    ) -> RuntimeCommandResult:
-        return await self._command(
-            command_id, "contract_update", {
-                "task_id": task_id,
-                "expected_revision": expected_revision,
-                "contract": contract.to_data(),
-            }, lambda: self.application.kernel.create_or_update_task_contract(
-                task_id, contract, expected_revision=expected_revision,
-                command_id=command_id,
-            ), lambda value: value.to_data(),
-        )
-
-    async def clear_contract(
-        self, task_id: str, contract_id: str, *, expected_revision: int,
-        command_id: str,
-    ) -> RuntimeCommandResult:
-        return await self._command(
-            command_id, "contract_clear", {
-                "task_id": task_id, "contract_id": contract_id,
-                "expected_revision": expected_revision,
-            }, lambda: self.application.kernel.clear_task_contract(
-                task_id, contract_id, expected_revision=expected_revision,
-                command_id=command_id,
-            ), lambda value: value.to_data(),
-        )
 
     async def interrupt(
         self, task_id: str, *, command_id: str, reason: str,
@@ -1747,135 +1680,13 @@ def _completion_diagnostics(
     return None
 
 
-def _single_loop_projection(
-    task: TaskSnapshot, events: tuple[Any, ...] | list[Any],
-) -> dict[str, Any]:
-    """Project bounded durable single-loop facts without replaying execution.
-
-    The Web consumes this same projection for initial responses, SSE snapshots,
-    and reload. Legacy task metadata deliberately resolves through the projector
-    so historical records remain visible without being reinterpreted by the
-    current orchestration configuration.
-    """
-    metadata = TaskOrchestrationProjector.project(task.task_id, task.goal, events)
-    projection: dict[str, Any] = {
-        "orchestration_mode": metadata.orchestration_mode.value,
-        "root_goal": metadata.root_goal,
-        "binding": {
-            "kind": metadata.binding_kind.value,
-            "root_input_event_ref": metadata.root_input_event_ref,
-            "latest_input_event_ref": metadata.latest_input_event_ref,
-        },
-        "turn_intent": None,
-        "latest_intent_attempt": None,
-        "completion": None,
-        "open_obligations": [],
-        "accepted_evidence": [],
-        "incomplete_boundary": None,
-    }
-    for event in reversed(events):
-        if event.event_type in {"turn.intent_declared", "turn.intent_updated"}:
-            try:
-                projection["turn_intent"] = TurnIntent.from_data(
-                    event.payload
-                ).to_data()
-            except (KeyError, TypeError, ValueError):
-                pass
-            break
-    for event in reversed(events):
-        if event.event_type not in {
-            "tool.intent_accepted",
-            "tool.intent_normalized",
-            "tool.intent_rejected",
-        }:
-            continue
-        try:
-            attempt = IntentAttempt.from_data(event.payload)
-        except (KeyError, TypeError, ValueError):
-            continue
-        projection["latest_intent_attempt"] = attempt.to_data()
-        break
-    for event in reversed(events):
-        if event.event_type != "completion.shadow_validated":
-            continue
-        claim = event.payload.get("claim")
-        if not isinstance(claim, Mapping):
-            continue
-        projection["completion"] = {
-            "diagnostic": True,
-            "outcome": "SUCCEEDED",
-            "gaps": [
-                dict(item)
-                for item in event.payload.get("gaps", ())
-                if isinstance(item, Mapping)
-            ][:50],
-            "divergences": [
-                dict(item)
-                for item in event.payload.get("divergences", ())
-                if isinstance(item, Mapping)
-            ][:50],
-            "effects": list(claim.get("succeeded_effects", ()))[:50],
-            "committed_delta": list(claim.get("net_mutation_ids", ()))[:50],
-            "waiting": None,
-        }
-        break
-    for event in reversed(events):
-        if event.event_type != "context.single_loop_shadow_projected":
-            continue
-        active_context = event.payload.get("active_context")
-        if not isinstance(active_context, Mapping):
-            break
-        authoritative = active_context.get("authoritative")
-        if not isinstance(authoritative, Mapping):
-            break
-        projection["open_obligations"] = [
-            dict(item) for item in authoritative.get("open_obligations", ())
-            if isinstance(item, Mapping)
-        ][:50]
-        projection["accepted_evidence"] = [
-            dict(item) for item in authoritative.get("evidence_refs", ())
-            if isinstance(item, Mapping)
-        ][:50]
-        break
-    for event in reversed(events):
-        if event.event_type != "turn.incomplete_boundary":
-            continue
-        completion = event.payload.get("completion")
-        gaps = completion.get("gaps") if isinstance(completion, Mapping) else ()
-        projection["incomplete_boundary"] = {
-            "turn_id": str(event.payload.get("turn_id", "")),
-            "reason": str(event.payload.get("reason", "")),
-            "gaps": [dict(item) for item in gaps if isinstance(item, Mapping)][:50],
-        }
-        if projection["completion"] is None:
-            projection["completion"] = {
-                "diagnostic": True,
-                "outcome": "INCOMPLETE",
-                "gaps": projection["incomplete_boundary"]["gaps"],
-                "divergences": [],
-                "effects": [],
-                "committed_delta": [],
-                "waiting": {
-                    "reason": projection["incomplete_boundary"]["reason"],
-                },
-            }
-        else:
-            projection["completion"] = {
-                **projection["completion"],
-                "outcome": "INCOMPLETE",
-                "waiting": {
-                    "reason": projection["incomplete_boundary"]["reason"],
-                },
-            }
-        break
-    return projection
-
-
 def _status_for_state(state: TaskState) -> str:
     if state is TaskState.AWAITING_APPROVAL:
         return "awaiting_approval"
     if state is TaskState.AWAITING_USER:
         return "awaiting_user"
+    if state is TaskState.AWAITING_INPUT:
+        return "awaiting_input"
     if state is TaskState.INTERRUPTED:
         return "interrupted"
     if state.is_terminal:
@@ -1893,6 +1704,10 @@ def _approval_data(task: TaskSnapshot) -> Mapping[str, Any] | None:
         return None
     return {
         "request_id": request.request_id, "risk": request.risk.value,
+        # Approval is created by one concrete Agent Turn.  Preserve that
+        # identity for transcript consumers; task_id alone is insufficient for
+        # a multi-turn conversation because a Task can carry many tool batches.
+        "turn_id": request.turn_id,
         "action": request.action, "target": request.target,
         "preview": request.preview, "network_access": request.network_access,
         "data_transmission": request.data_transmission,

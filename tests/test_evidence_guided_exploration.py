@@ -11,7 +11,7 @@ from tsm_agt.core.exploration_coordinator import (
     ExplorationCoordinator, ExplorationCoordinatorAction,
 )
 from tsm_agt.ports import (
-    AdapterDescriptor, EvidenceInventory, EvidenceQuestion, EvidenceRelation,
+    AdapterDescriptor, EvidenceInventory, EvidenceRelation,
     EvidenceRelationKind, EvidenceRelationState, HealthState, HealthStatus,
     ExplorationOutcomeState, RejectionLoopState, ToolCall, ToolResult,
 )

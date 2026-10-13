@@ -25,6 +25,7 @@ class _Message:
     text: str
     task_id: str | None
     source_event_sequence: int = 1
+    turn_id: str | None = None
 
 
 @dataclass
@@ -55,15 +56,26 @@ class _SessionEvent:
 
 
 class _FakeStore:
-    def __init__(self, events) -> None:
+    def __init__(self, events, task_events=None) -> None:
         self._events = tuple(events)
+        self._task_events = dict(task_events or {})
 
     async def read_session_events(self, _session_id: str):
         return self._events
 
+    async def read_events(self, task_id, after_sequence=0, event_types=None):
+        return tuple(
+            event for event in self._task_events.get(task_id, ())
+            if event.sequence > after_sequence
+            and (not event_types or event.event_type in event_types)
+        )
+
 
 class _FakeKernel:
-    def __init__(self, sessions, tasks, projection) -> None:
+    def __init__(
+        self, sessions, tasks, projection, recorded_turns=(), task_events=None,
+        input_turns=(),
+    ) -> None:
         self._sessions = sessions
         self._tasks = tasks
         self._projection = projection
@@ -79,8 +91,17 @@ class _FakeKernel:
                     sequence, "session.task_attached", {"task_id": task_id}
                 ))
                 sequence += 3
+        for index, payload in enumerate(recorded_turns, start=1):
+            events.append(_SessionEvent(
+                sequence + index, "session.task_result_recorded", payload
+            ))
+        for index, payload in enumerate(input_turns, start=1):
+            events.append(_SessionEvent(
+                sequence + len(recorded_turns) + index,
+                "session.turn_input_recorded", payload,
+            ))
         self.dependencies = type(
-            "_Dependencies", (), {"store": _FakeStore(events)}
+            "_Dependencies", (), {"store": _FakeStore(events, task_events)}
         )()
 
     async def list_sessions(self):
@@ -259,7 +280,10 @@ class SessionRestoreEndpointTest(unittest.IsolatedAsyncioTestCase):
         web_app.runtime_server = self.previous
 
     @staticmethod
-    def _server(*, waiting_approval: bool = False, phase1_state: str = "RUNNING"):
+    def _server(
+        *, waiting_approval: bool = False, phase1_state: str = "RUNNING",
+        projection=None, recorded_turns=(), task_events=None, input_turns=(),
+    ):
         sessions = [
             _Session(
                 "session-old", "较早的会话", ("task-old",), None,
@@ -275,7 +299,7 @@ class SessionRestoreEndpointTest(unittest.IsolatedAsyncioTestCase):
             "task-old": _Task("/workspace/alpha", "old goal"),
             "task-new": _Task("/workspace/beta", "new goal"),
         }
-        projection = _Projection((
+        projection = projection or _Projection((
             _Message(MessageRole.USER, "帮我看下这个文档", "task-new"),
             _Message(MessageRole.ASSISTANT, "已新增架构方案文档", "task-new"),
         ))
@@ -300,21 +324,14 @@ class SessionRestoreEndpointTest(unittest.IsolatedAsyncioTestCase):
                     "completed": 0, "blocked": 0,
                 },
             },
-            single_loop={
-                "orchestration_mode": "SINGLE_LOOP",
-                "root_goal": "new goal",
-                "binding": {"kind": "ACTIVE_CONTINUATION"},
-                "turn_intent": {"intent": "INVESTIGATE"},
-                "open_obligations": [{"question_ref": "Q1", "status": "OPEN"}],
-                "accepted_evidence": [{"evidence_id": "e1"}],
-                "incomplete_boundary": {
-                    "turn_id": "turn-1",
-                    "reason": "completion_gaps_unrecoverable",
-                    "gaps": [{"code": "NET_MUTATION_MISSING", "detail": "Mutation is still required."}],
-                },
-            },
         )
-        return _FakeRuntimeServer(_FakeKernel(sessions, tasks, projection), result)
+        return _FakeRuntimeServer(
+            _FakeKernel(
+                sessions, tasks, projection, recorded_turns, task_events,
+                input_turns,
+            ),
+            result,
+        )
 
     async def test_sessions_are_listed_newest_first_with_their_workspace(
         self,
@@ -360,18 +377,6 @@ class SessionRestoreEndpointTest(unittest.IsolatedAsyncioTestCase):
             "in_progress",
         )
         self.assertEqual(
-            payload["tasks"][1]["single_loop"]["orchestration_mode"],
-            "SINGLE_LOOP",
-        )
-        self.assertEqual(
-            payload["tasks"][1]["single_loop"]["binding"]["kind"],
-            "ACTIVE_CONTINUATION",
-        )
-        self.assertEqual(
-            payload["tasks"][1]["single_loop"]["incomplete_boundary"]["gaps"][0]["code"],
-            "NET_MUTATION_MISSING",
-        )
-        self.assertEqual(
             [item["attached_sequence"] for item in payload["tasks"]],
             [1, 4],
         )
@@ -379,6 +384,210 @@ class SessionRestoreEndpointTest(unittest.IsolatedAsyncioTestCase):
             [item["source_event_sequence"] for item in payload["messages"]],
             [1, 1],
         )
+
+    async def test_session_returns_one_call_panel_per_turn(self) -> None:
+        recorded_turns = (
+            {
+                "task_id": "task-new", "turn_id": "turn-1",
+                "turn_counters": {"model_calls": 2, "tool_calls": 1},
+                "task_summary": {
+                    "tool_counts": {"core.read_file": 1},
+                    "important_actions": [{
+                        "tool": "core.read_file", "state": "COMMITTED",
+                        "ok": True, "path": "src/app.py",
+                        # Raw arguments are never part of the Session record;
+                        # this stands in for argv/patch bodies that must not
+                        # reach the page.
+                        "arguments": {"token": "secret"},
+                    }],
+                },
+            },
+            {
+                "task_id": "task-new", "turn_id": "turn-2",
+                "turn_counters": {"model_calls": 3, "tool_calls": 2},
+                "task_summary": {
+                    "tool_counts": {"web.search": 2},
+                    "important_actions": [{
+                        "tool": "web.search", "state": "FAILED", "ok": False,
+                        "error_code": "TIMEOUT", "query": "nba",
+                    }],
+                },
+            },
+            # An older record with no summary must not be reported as a Turn
+            # that provably called nothing.
+            {"task_id": "task-new", "turn_id": "turn-3"},
+        )
+        web_app.runtime_server = self._server(
+            projection=_Projection((
+                # The attached input of a Task carries no turn id of its own;
+                # the Task's first result event is the Turn it opened.
+                _Message(MessageRole.USER, "帮我看下这个文档", "task-new"),
+                _Message(
+                    MessageRole.ASSISTANT, "已新增架构方案文档", "task-new",
+                    turn_id="turn-1",
+                ),
+                _Message(
+                    MessageRole.USER, "再看下天气", "task-new",
+                    turn_id="turn-2",
+                ),
+                _Message(
+                    MessageRole.ASSISTANT, "今天是晴天", "task-new",
+                    turn_id="turn-2",
+                ),
+                # A Task with no recorded Turn must not borrow another's id.
+                _Message(MessageRole.USER, "另一个任务", "task-old"),
+            )),
+            recorded_turns=recorded_turns,
+        )
+
+        payload = await web_app.get_session("session-new")
+
+        self.assertEqual(
+            [turn["turn_id"] for turn in payload["turns"]],
+            ["turn-1", "turn-2", "turn-3"],
+        )
+        self.assertEqual(
+            payload["turns"][0]["tool_counts"], {"core.read_file": 1}
+        )
+        self.assertEqual(
+            payload["turns"][0]["calls"],
+            [{
+                "tool": "core.read_file", "state": "COMMITTED", "ok": True,
+                "path": "src/app.py",
+            }],
+        )
+        self.assertEqual(
+            payload["turns"][1]["calls"][0]["error_code"], "TIMEOUT"
+        )
+        # The per-Turn counters ride the durable record so the panel can state
+        # how much model and tool work the Turn took.
+        self.assertEqual(payload["turns"][0]["model_calls"], 2)
+        self.assertEqual(payload["turns"][1]["tool_calls"], 2)
+        self.assertTrue(payload["turns"][0]["recorded"])
+        self.assertFalse(payload["turns"][2]["recorded"])
+        self.assertIsNone(payload["turns"][2]["model_calls"])
+        self.assertEqual(payload["turns"][2]["tool_counts"], {})
+        self.assertEqual(payload["turns"][2]["calls"], [])
+        # Every message carries the Turn it belongs to, which is how the page
+        # renders each answer's panel under that answer. The attached input is
+        # labelled with the Turn its Task opened.
+        self.assertEqual(
+            [message["turn_id"] for message in payload["messages"]],
+            ["turn-1", "turn-1", "turn-2", "turn-2", None],
+        )
+        # Only the opening input sorts at the Task's attachment; a later Turn's
+        # input keeps its own position so each question stays above its own
+        # answer instead of stacking under the first one.
+        self.assertEqual(
+            [message["first_turn_input"] for message in payload["messages"]],
+            [True, False, False, False, False],
+        )
+
+    async def test_session_returns_durable_turn_progress(self) -> None:
+        # The thinking / tool / transport lines a Turn produced must be readable
+        # after it settles, not only while the live stream is open.
+        task_events = {
+            "task-new": (
+                _SessionEvent(1, "turn.started", {
+                    "turn_id": "turn-1", "input_character_count": 7,
+                }),
+                _SessionEvent(2, "llm.completed", {
+                    "turn_id": "turn-1", "message": {"role": "assistant"},
+                }),
+                _SessionEvent(3, "model.attempt_started", {
+                    "turn_id": "turn-1", "provider_attempt": 1,
+                    "max_provider_attempts": 3, "transport_mode": "streaming",
+                }),
+                _SessionEvent(4, "tool.requested", {
+                    "turn_id": "turn-1",
+                    "call": {
+                        "call_id": "call-1", "name": "core.search_files",
+                        "arguments": {"path": "src", "pattern": "widget"},
+                    },
+                }),
+                _SessionEvent(5, "tool.completed", {
+                    "turn_id": "turn-1",
+                    "result": {"call_id": "call-1", "ok": True},
+                }),
+                _SessionEvent(6, "turn.completed", {
+                    "turn_id": "turn-1", "model_calls": 2, "tool_calls": 1,
+                }),
+            ),
+        }
+        web_app.runtime_server = self._server(
+            recorded_turns=({
+                "task_id": "task-new", "turn_id": "turn-1",
+                "task_summary": {"tool_counts": {"core.search_files": 1}},
+            },),
+            task_events=task_events,
+        )
+
+        payload = await web_app.get_session("session-new")
+
+        items = payload["turns"][0]["progress"]
+        self.assertEqual(
+            [item["kind"] for item in items],
+            [
+                "turn_started", "model_transport", "tool_started",
+                "tool_completed", "turn_completed",
+            ],
+        )
+        self.assertEqual(items[2]["tool_name"], "core.search_files")
+        self.assertEqual(items[2]["target"], "src")
+        self.assertEqual(items[3]["tool_call_id"], "call-1")
+        self.assertTrue(items[3]["ok"])
+        self.assertEqual(items[4]["model_calls"], 2)
+        # ``llm.completed`` is intentionally not part of a Turn's progress: its
+        # payload carries the whole model message.
+        self.assertNotIn("llm", [item["kind"] for item in items])
+
+    async def test_session_keeps_unfinished_turn_trace_after_reload(self) -> None:
+        """A pending approval has a real trace even without a final result."""
+        task_events = {
+            "task-new": (
+                _SessionEvent(1, "turn.started", {"turn_id": "turn-pending"}),
+                _SessionEvent(2, "tool.requested", {
+                    "turn_id": "turn-pending",
+                    "call": {
+                        "call_id": "call-write", "name": "core.write_file",
+                        "arguments": {"path": "docs/spec.md"},
+                    },
+                }),
+                _SessionEvent(3, "approval.requested", {
+                    "turn_id": "turn-pending",
+                    "request": {
+                        "request_id": "approval-pending",
+                        "action": "write docs/spec.md",
+                    },
+                }),
+            ),
+        }
+        web_app.runtime_server = self._server(
+            projection=_Projection((
+                _Message(
+                    MessageRole.USER, "写入 spec", "task-new",
+                    turn_id="turn-pending",
+                ),
+            )),
+            task_events=task_events,
+            input_turns=({
+                "task_id": "task-new", "turn_id": "turn-pending",
+            },),
+        )
+
+        payload = await web_app.get_session("session-new")
+
+        self.assertEqual(
+            [turn["turn_id"] for turn in payload["turns"]], ["turn-pending"],
+        )
+        turn = payload["turns"][0]
+        self.assertFalse(turn["settled"])
+        self.assertFalse(turn["recorded"])
+        self.assertEqual(
+            [item["kind"] for item in turn["progress"]],
+            ["turn_started", "tool_started", "waiting"],
+        )
+        self.assertEqual(turn["progress"][-1]["action"], "write docs/spec.md")
 
     async def test_unanswered_approval_comes_back_with_the_session(self) -> None:
         web_app.runtime_server = self._server(
@@ -490,18 +699,6 @@ class _StreamClient:
         return RuntimeTaskResult(
             task_id=task_id, state="SUCCEEDED", phase1_state="DONE",
             status="completed", cursor=12,
-            single_loop={
-                "orchestration_mode": "SINGLE_LOOP",
-                "binding": {"kind": "NEW"},
-                "turn_intent": None,
-                "open_obligations": [],
-                "accepted_evidence": [],
-                "incomplete_boundary": {
-                    "turn_id": "turn-stream",
-                    "reason": "completion_gaps_unrecoverable",
-                    "gaps": [{"code": "NET_MUTATION_MISSING", "detail": "Mutation is still required."}],
-                },
-            },
         )
 
 
@@ -533,8 +730,7 @@ class StreamCursorProtocolTest(unittest.IsolatedAsyncioTestCase):
             final = await anext(response.body_iterator)
             if isinstance(final, bytes):
                 final = final.decode("utf-8")
-            self.assertIn('"single_loop"', final)
-            self.assertIn('"orchestration_mode": "SINGLE_LOOP"', final)
+            self.assertNotIn('"single_loop"', final)
             await response.body_iterator.aclose()
         finally:
             web_app.runtime_server = previous
@@ -596,11 +792,3 @@ class TaskCardIsolationUiTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class LegacyTaskModeDisplayTest(unittest.TestCase):
-    def test_legacy_task_without_single_loop_metadata_displays_legacy_mode(self) -> None:
-        self.assertIn(
-            "return taskSingleLoop(task)?.orchestration_mode || 'LEGACY';",
-            web_app.INDEX_HTML,
-        )

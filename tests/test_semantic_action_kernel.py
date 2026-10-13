@@ -12,7 +12,7 @@ from tsm_agt.adapters.structured_evidence import StructuredEvidenceDeltaEvaluato
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import TaskState
 from tsm_agt.ports import (
-    AdapterDescriptor, EvidenceQuestion, FinishReason, HealthState, HealthStatus,
+    AdapterDescriptor, FinishReason, HealthState, HealthStatus,
     Message, MessageRole, ModelRequest, ModelResponse, ProviderCapabilities,
     RuntimeStorePort, TextBlock, ToolCall, ToolCallBlock, ToolIdempotency,
     ToolResult, ToolRisk, ToolSpec,
@@ -231,9 +231,8 @@ if __name__ == "__main__":
     unittest.main()
 
 
-from tsm_agt.core.single_loop import OrchestrationMode
+from tsm_agt.core import OrchestrationMode
 
 
 def compose_legacy_fixture_application(*args, **kwargs):
-    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
     return compose_fixture_application(*args, **kwargs)

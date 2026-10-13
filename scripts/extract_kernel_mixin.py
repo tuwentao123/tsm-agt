@@ -1,9 +1,9 @@
 """Extract one cohesive ``Kernel`` method group into a mixin sibling.
 
-One of the steps of the facade+siblings decomposition recorded in
-``tsm-agt-按Hermes重构kernel映射.md``: ``core/kernel.py`` is a god file and the
-Hermes shape (``AGENTS.md:232-248``, ``run_agent.py`` + ``agent/*Mixin``) is a
-façade that inherits one mixin per topic.
+One of the steps of the facade+siblings decomposition recorded in the
+kernel-decomposition mapping document: ``core/kernel.py`` is a god file and
+the facade-plus-siblings shape (``AGENTS.md:232-248``, ``run_agent.py`` +
+``agent/*Mixin``) is a façade that inherits one mixin per topic.
 
 Why a script rather than by hand: the move is mechanical but has three
 assertions that are easy to skip and expensive to skip, because each failure is
@@ -143,7 +143,7 @@ def _bare_loads(node: ast.AST) -> set[str]:
     Annotation subtrees are skipped. ``kernel: Kernel`` inside a moved class is a
     type annotation, and ``from __future__ import annotations`` (which every
     sibling carries) makes it a string that is never evaluated -- so it is not a
-    dependency, and counting it drags the whole facade in. Hermes' mixins annotate
+    dependency, and counting it drags the whole facade in. The reference mixins annotate
     the facade the same way without importing it.
     """
 
@@ -472,7 +472,7 @@ def _sibling_header(
     return (
         f'"""{summary}\n'
         "\n"
-        "A mixin module in the Hermes facade+siblings shape (``run_agent.py`` +\n"
+        "A mixin module in the facade-plus-siblings shape (``run_agent.py`` +\n"
         "``agent/session_persistence.py``): the facade ``core/kernel.py`` imports\n"
         f"this at module level and adds ``{class_name}`` to ``Kernel``'s bases, so\n"
         "**every method resolves through ``Kernel``'s MRO unchanged** --\n"
@@ -481,7 +481,7 @@ def _sibling_header(
         "and no signature changes.\n"
         "\n"
         "This module must never bind the facade at module level; late-import it\n"
-        "inside a method instead (Hermes ``AGENTS.md:243-244``).\n"
+        "inside a method instead (the project's module-boundary rule).\n"
         "\n"
         "Moved from ``core/kernel.py``:\n"
         "\n"
@@ -576,8 +576,8 @@ def _verify(
     if seams:
         print("  A test or tool doing patch(<facade>.<name>) now binds the FACADE's "
               "copy while the moved body reads the sibling's, so the patch silently "
-              "stops intercepting. Repoint it at the sibling module (Hermes "
-              "AGENTS.md:244-245). No check above can see this: the name still "
+              "stops intercepting. Repoint it at the sibling module (the project's "
+              "import rule). No check above can see this: the name still "
               "resolves, just somewhere else.")
 
     detached = _detached_symbol_imports(module)

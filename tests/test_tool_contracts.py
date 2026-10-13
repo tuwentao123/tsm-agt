@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 
 from tsm_agt.core import ToolCommitState, ToolExecutionRecord
 from tsm_agt.ports import (
-    EvidenceQuestion,
     SourceArtifact,
     ToolCall,
     ToolEffect,
@@ -20,7 +19,7 @@ from tsm_agt.ports import (
 
 
 class ToolContractTest(unittest.TestCase):
-    def test_tool_semantics_separate_evidence_from_user_interaction(self) -> None:
+    def test_tool_semantics_keep_protocol_separate_from_results(self) -> None:
         evidence_tool = ToolSpec(
             "fixture.observe", "Observe one fact.",
             {"type": "object", "properties": {}}, ToolRisk.R0,
@@ -39,10 +38,9 @@ class ToolContractTest(unittest.TestCase):
             {"type": "object", "properties": {}}, ToolRisk.R0,
         )
 
-        self.assertTrue(evidence_tool.requires_evidence_question)
-        self.assertFalse(interaction_tool.requires_evidence_question)
-        self.assertTrue(legacy_tool.requires_evidence_question)
         self.assertEqual(interaction_tool.to_data()["protocol"], "wait_user")
+        self.assertNotIn("requires_evidence_question", evidence_tool.to_data())
+        self.assertNotIn("requires_evidence_question", legacy_tool.to_data())
 
     def test_tool_contracts_serialize_provider_neutral_data(self) -> None:
         spec = ToolSpec(
@@ -60,22 +58,16 @@ class ToolContractTest(unittest.TestCase):
         self.assertEqual(call.to_data()["arguments"], {"text": "hello"})
         self.assertTrue(result.to_data()["ok"])
 
-    def test_tool_call_preserves_its_evidence_question_across_storage(self) -> None:
-        call = ToolCall(
-            "call-evidence", "core.read_file", {"path": "README.md"},
-            EvidenceQuestion(
-                "E1", "Does README.md identify the project's entry point?"
-            ),
-        )
+    def test_tool_call_v2_has_only_protocol_fields(self) -> None:
+        call = ToolCall("call-read", "core.read_file", {"path": "README.md"})
 
-        self.assertEqual(ToolCall.from_data(call.to_data()), call)
-        self.assertEqual(
-            call.to_data()["evidence_question"],
-            {
-                "question_id": "E1",
-                "question": "Does README.md identify the project's entry point?",
-            },
-        )
+        stored = call.to_data()
+        self.assertEqual(stored, {
+            "call_id": "call-read",
+            "name": "core.read_file",
+            "arguments": {"path": "README.md"},
+        })
+        self.assertEqual(ToolCall.from_data(stored), call)
 
     def test_source_artifact_round_trips_with_tool_fact_descriptor(self) -> None:
         artifact = SourceArtifact(

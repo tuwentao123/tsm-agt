@@ -14,6 +14,7 @@ import ssl
 import threading
 import time
 import xml.etree.ElementTree as ET
+import zlib
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -40,7 +41,6 @@ from tsm_agt.ports import (
     ToolSpec,
     WebEgressMode,
 )
-from tsm_agt.ports.evidence import EvidenceFact
 from tsm_agt.retrieval.pipeline import RetrievalPipeline
 from tsm_agt.retrieval.providers import (
     DEFAULT_PROVIDER_TIMEOUT_SECONDS, RetrievalProvider,
@@ -109,13 +109,16 @@ _MAX_FETCH_BYTES = 20000
 # the text budget keeps the fetch bounded without rejecting ordinary documents.
 _MIN_RENDERABLE_TEXT_CHARS = 200
 _RENDER_TIMEOUT_SECONDS = 20.0
-_MAX_FETCH_RESPONSE_BYTES = 512_000
+_MAX_FETCH_RESPONSE_BYTES = 2_000_000
+_MAX_DECOMPRESSED_FETCH_BYTES = _MAX_FETCH_RESPONSE_BYTES
+_MAX_STORED_TEXT_CHARS = 2_000_000
+_MAX_WEB_PREVIEW_CHARS = 15_000
 _MAX_FETCH_REDIRECTS = 3
 _ALLOWED_FETCH_CONTENT_TYPES = frozenset({
     "text/html", "text/markdown", "text/plain", "text/x-markdown",
 })
 _MAX_DOCUMENT_CACHE_ENTRIES = 32
-_MAX_DOCUMENT_CACHE_BYTES = 1_000_000
+_MAX_DOCUMENT_CACHE_BYTES = 64_000_000
 _MAX_REFERENCE_CACHE_ENTRIES = 128
 _DOCUMENT_CACHE_TTL_SECONDS = 600.0
 _MAX_FIND_MATCHES = 20
@@ -132,7 +135,7 @@ def _search_outage_failure(
     """Turn a total search failure into ``ok=False``.
 
     ``ok=True`` with an empty list lets a model read "no provider answered" as
-    "the fact does not exist". Hermes reports that case as ``success: false``,
+    "the fact does not exist". The reference implementation reports that case as ``success: false``,
     and the mapping onto this Runtime is ``ok=False``. Three outcomes are kept
     apart:
 
@@ -1026,7 +1029,8 @@ class NetworkToolProvider:
         port_version="1.0",
         capabilities=frozenset({
             "web.search", "web.fetch_markdown", "web.open",
-            "web.find_in_page", "content.summarize", "source.github.resolve",
+            "web.find_in_page", "web.read", "content.summarize",
+            "source.github.resolve",
         }),
     )
 
@@ -1037,7 +1041,10 @@ class NetworkToolProvider:
                 "Search the public web and return lightweight search results "
                 "with source URLs, and publish times when the source exposes "
                 "one. Set freshness for time-sensitive requests such as "
-                "'today's news'."
+                "'today's news'. This finds where something is; it does not read "
+                "it. Use it to locate the repository a request names, then read "
+                "that repository's source with the advertised GitHub source tools "
+                "or core.run_command -- a snippet is a lead, not evidence."
             ),
             parameters={
                 "type": "object",
@@ -1065,13 +1072,14 @@ class NetworkToolProvider:
             rollback="read-only public search request; no remote mutation",
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.EXTERNAL_SERVICE,
-            evidence_capability_ids=frozenset({"web.discovery"}),
         ),
         ToolSpec(
             name="web.fetch_markdown",
             description=(
-                "Fetch one user-supplied public HTTP(S) document with bounded "
-                "redirects and return Markdown or safe visible HTML text."
+                "Fetch one public HTTP(S) document with bounded redirects and "
+                "return Markdown or safe visible HTML text -- a document page, not "
+                "a repository's source tree. To read another project's source, use "
+                "the advertised GitHub source tools or core.run_command instead."
             ),
             parameters={
                 "type": "object",
@@ -1088,7 +1096,6 @@ class NetworkToolProvider:
             rollback="read-only bounded public document request; no remote mutation",
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.EXTERNAL_SERVICE,
-            evidence_capability_ids=frozenset({"web.document"}),
         ),
         ToolSpec(
             name="web.open",
@@ -1114,7 +1121,6 @@ class NetworkToolProvider:
             rollback="read-only bounded public document request; no remote mutation",
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.EXTERNAL_SERVICE,
-            evidence_capability_ids=frozenset({"web.document"}),
         ),
         ToolSpec(
             name="web.find_in_page",
@@ -1143,11 +1149,43 @@ class NetworkToolProvider:
             result_authority=ToolResultAuthority.DERIVED,
         ),
         ToolSpec(
+            name="web.read",
+            description=(
+                "Read a bounded character window from a document_ref already "
+                "opened during the current Task and turn. Use it to read the "
+                "middle of a long document after web.find_in_page reports an "
+                "offset; it never makes a network request."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "document_ref": {"type": "string", "minLength": 1},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "max_chars": {
+                        "type": "integer", "minimum": 1,
+                        "maximum": _MAX_WEB_PREVIEW_CHARS,
+                    },
+                },
+                "required": ["document_ref"],
+                "additionalProperties": False,
+            },
+            risk=ToolRisk.R0,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            idempotency=ToolIdempotency.IDEMPOTENT,
+            requires_network=False,
+            data_transmission="none",
+            rollback="reads an already-opened bounded document only; no remote mutation",
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.DERIVED,
+        ),
+        ToolSpec(
             name="source.github.resolve",
             description=(
-                "Resolve one HTTPS github.com repository URL or current Task/turn "
-                "search_ref into a canonical local GitHub source-tool target. "
-                "This parses locally and never makes a network request."
+                "Entry point once you know which GitHub repository a request is "
+                "about but not which file: give it the repository URL and it returns "
+                "the repository identity plus the source tool and arguments to call "
+                "next. Parses locally and never makes a network request."
             ),
             parameters={
                 "type": "object",
@@ -1155,10 +1193,10 @@ class NetworkToolProvider:
                     "url": {"type": "string", "format": "uri"},
                     "search_ref": {"type": "string", "minLength": 1},
                 },
-                "oneOf": [
-                    {"required": ["url"]},
-                    {"required": ["search_ref"]},
-                ],
+                # Keep the provider-facing schema a plain object.  Several
+                # OpenAI-compatible endpoints reject a top-level oneOf even
+                # though JSON Schema permits it; exact-one validation remains
+                # enforced by _resolve_github_source below.
                 "additionalProperties": False,
             },
             risk=ToolRisk.R0,
@@ -1207,6 +1245,7 @@ class NetworkToolProvider:
         search_tavily_api_key: str = "",
         search_mode: str = "live",
         render_url: str = "",
+        github_source_tools: bool = False,
         document_cache_max_entries: int = _MAX_DOCUMENT_CACHE_ENTRIES,
         document_cache_max_bytes: int = _MAX_DOCUMENT_CACHE_BYTES,
         reference_cache_max_entries: int = _MAX_REFERENCE_CACHE_ENTRIES,
@@ -1258,6 +1297,7 @@ class NetworkToolProvider:
                 "search_tavily_mode='key' requires TSM_AGT_SEARCH_TAVILY_API_KEY"
             )
         self._enable_fetch = enable_fetch
+        self._github_source_tools = github_source_tools
         search_scope = (search_mode or "cached").strip().lower()
         if search_scope not in {"off", "cached", "live"}:
             raise ValueError("search_mode must be 'off', 'cached', or 'live'")
@@ -1323,11 +1363,15 @@ class NetworkToolProvider:
         self._started = False
 
     async def list_tools(self) -> tuple[ToolSpec, ...]:
-        return tuple(
-            tool for tool in self._tools
-            if self._enable_fetch
-            or tool.name not in {"web.fetch_markdown", "web.open", "web.find_in_page"}
-        )
+        hidden = {
+            "web.fetch_markdown", "web.open", "web.find_in_page", "web.read",
+        } if not self._enable_fetch else set()
+        if not self._github_source_tools:
+            # This tool only routes a GitHub URL into the GitHub source adapter's
+            # tools. Advertising it while that adapter is absent hands the model
+            # targets it cannot call, so it stays out of the toolset entirely.
+            hidden.add("source.github.resolve")
+        return tuple(tool for tool in self._tools if tool.name not in hidden)
 
     async def invoke(self, call: ToolCall, context: ToolInvocationContext) -> ToolResult:
         if not self._started:
@@ -1381,6 +1425,16 @@ class NetworkToolProvider:
                     self._find_in_page, call.arguments, scope
                 )
                 fact_descriptor = self._fact_descriptor(scope, data)
+            elif call.name == "web.read":
+                if not self._enable_fetch:
+                    return ToolResult(
+                        call.call_id, False, error_code="CAPABILITY_DISABLED",
+                        message="web.read is disabled for this provider",
+                    )
+                data = await asyncio.to_thread(
+                    self._read_document, call.arguments, scope
+                )
+                fact_descriptor = self._fact_descriptor(scope, data)
             elif call.name == "source.github.resolve":
                 data = self._resolve_github_source(call.arguments, scope)
                 fact_descriptor = self._github_fact_descriptor(scope, data)
@@ -1392,7 +1446,6 @@ class NetworkToolProvider:
             return ToolResult(
                 call.call_id, True, data=data, truncated=bool(data.get("truncated", False)),
                 meta={"untrusted_data": True}, fact_descriptor=fact_descriptor,
-                evidence_facts=self._evidence_facts(call, data),
             )
         except _FetchFailure as error:
             return ToolResult(
@@ -1408,48 +1461,6 @@ class NetworkToolProvider:
             )
         except (OSError, TimeoutError, URLError) as error:
             return ToolResult(call.call_id, False, error_code="NETWORK_ERROR", message=str(error), retryable=True)
-
-    @staticmethod
-    def _evidence_facts(
-        call: ToolCall, data: Mapping[str, Any],
-    ) -> tuple[EvidenceFact, ...]:
-        complete = not bool(data.get("truncated", False))
-        if call.name == "web.search":
-            results = data.get("results", [])
-            candidates = [
-                {
-                    "url": item.get("url"),
-                    "title": item.get("title"),
-                }
-                for item in results
-                if isinstance(item, Mapping)
-            ] if isinstance(results, list) else []
-            return (EvidenceFact(
-                fact_id=f"{call.call_id}:web.discovery",
-                kind="web.discovery",
-                execution_ref=f"tool_call:{call.call_id}",
-                attributes={"query": call.arguments.get("query", ""), "candidates": candidates},
-                provenance={"provider": "builtin.network-tools"},
-                complete=complete,
-            ),)
-        if call.name in {"web.fetch_markdown", "web.open"}:
-            canonical_url = data.get("canonical_url")
-            content_hash = data.get("content_hash")
-            if not isinstance(canonical_url, str) or not canonical_url or not isinstance(content_hash, str) or not content_hash:
-                return ()
-            return (EvidenceFact(
-                fact_id=f"{call.call_id}:web.document",
-                kind="web.document",
-                execution_ref=f"tool_call:{call.call_id}",
-                attributes={
-                    "canonical_url": canonical_url,
-                    "content_hash": content_hash,
-                    "complete": complete,
-                },
-                provenance=dict(data.get("provenance", {})) if isinstance(data.get("provenance"), Mapping) else {},
-                complete=complete,
-            ),)
-        return ()
 
     def _search_deadline(
         self, context: ToolInvocationContext | None,
@@ -1803,12 +1814,37 @@ class NetworkToolProvider:
                 self._document_cache_bytes -= evicted.size_bytes
         return {
             **dict(fetched),
+            "content": self._document_preview(document),
             "canonical_url": canonical_url,
             "document_ref": document_ref,
             "content_hash": content_hash,
+            "total_chars": len(content),
+            "total_bytes": document.size_bytes,
+            "preview_truncated": len(content) > _MAX_WEB_PREVIEW_CHARS,
+            "document_truncated": document.truncated,
+            "truncated": bool(fetched["truncated"]) or len(content) > _MAX_WEB_PREVIEW_CHARS,
             "fetched_at": fetched_at,
             "provenance": provenance,
         }
+
+    @staticmethod
+    def _document_preview(document: _WebDocument) -> str:
+        content = document.content
+        if len(content) <= _MAX_WEB_PREVIEW_CHARS:
+            return content
+        head_size = (_MAX_WEB_PREVIEW_CHARS * 3) // 4
+        tail_size = _MAX_WEB_PREVIEW_CHARS - head_size
+        head = content[:head_size]
+        tail = content[-tail_size:]
+        if (newline := head.rfind("\n")) > head_size // 2:
+            head = head[:newline]
+        if 0 <= (newline := tail.find("\n")) < tail_size // 2:
+            tail = tail[newline + 1:]
+        return (
+            f"{head}\n\n[... middle omitted; use web.find_in_page with "
+            f"document_ref={document.document_ref!r} to locate details in the "
+            f"{len(content):,}-character document ...]\n\n{tail}"
+        )
 
     def _fetch_document(
         self, arguments: Mapping[str, Any], scope: tuple[str, str],
@@ -1825,7 +1861,18 @@ class NetworkToolProvider:
         if ref_id is not None:
             if not isinstance(ref_id, str) or not ref_id.strip():
                 raise ValueError("ref_id must be a non-empty string")
-            url = self._reference_url(scope, ref_id.strip())
+            reference = ref_id.strip()
+            try:
+                url = self._reference_url(scope, reference)
+            except _FetchFailure:
+                # Models routinely pass the document_ref returned by
+                # web.fetch_markdown here. Re-opening that document is the
+                # intent, and the reference cache is not the right home for it.
+                with self._cache_lock:
+                    document = self._document_cache.get((scope, reference))
+                if document is None:
+                    raise
+                url = document.requested_url
         if not isinstance(url, str) or not url.strip():
             raise ValueError("url must be a non-empty string")
         return self._fetch_document({"url": url}, scope)
@@ -1893,6 +1940,59 @@ class NetworkToolProvider:
             "truncated": total > len(matches),
         }
 
+    def _read_document(
+        self, arguments: Mapping[str, Any], scope: tuple[str, str],
+    ) -> Mapping[str, Any]:
+        """Return one bounded character window of an already-open document.
+
+        The document cache is scoped to a single ``(task_id, turn_id)`` pair, so
+        this reads only what the current turn already fetched: it never opens a
+        socket, never falls back to a workspace file, and never re-authorizes a
+        fetch that the current turn did not make.
+        """
+        document_ref = self._required_string(arguments, "document_ref")
+        offset = int(arguments.get("offset", 0))
+        if offset < 0:
+            raise ValueError("offset must be zero or greater")
+        max_chars = int(arguments.get("max_chars", _MAX_WEB_PREVIEW_CHARS))
+        if not 1 <= max_chars <= _MAX_WEB_PREVIEW_CHARS:
+            raise ValueError(
+                f"max_chars must be between 1 and {_MAX_WEB_PREVIEW_CHARS}"
+            )
+        key = (scope, document_ref)
+        with self._cache_lock:
+            self._expire_cache(time.monotonic())
+            document = self._document_cache.get(key)
+            if document is None:
+                raise _FetchFailure(
+                    "DOCUMENT_REF_NOT_FOUND",
+                    "document_ref is unknown or expired for this Task and turn; "
+                    "open the document first",
+                )
+            self._document_cache.move_to_end(key)
+        content = document.content
+        total_chars = len(content)
+        if total_chars and offset >= total_chars:
+            raise ValueError(
+                f"offset {offset} is beyond the {total_chars}-character document"
+            )
+        window = content[offset:offset + max_chars]
+        next_offset = offset + len(window)
+        return {
+            "document_ref": document.document_ref,
+            "canonical_url": document.canonical_url,
+            "content_hash": document.content_hash,
+            "offset": offset,
+            "max_chars": max_chars,
+            "content": window,
+            "returned_chars": len(window),
+            "total_chars": total_chars,
+            "next_offset": next_offset if next_offset < total_chars else None,
+            "document_truncated": document.truncated,
+            "provenance": dict(document.provenance),
+            "truncated": next_offset < total_chars,
+        }
+
     @staticmethod
     def _fact_descriptor(
         scope: tuple[str, str], data: Mapping[str, Any],
@@ -1933,7 +2033,7 @@ class NetworkToolProvider:
                 headers={
                     "User-Agent": _USER_AGENT,
                     "Accept": "text/markdown, text/plain, text/html;q=0.9",
-                    "Accept-Encoding": "identity",
+                    "Accept-Encoding": "gzip, deflate, identity",
                 },
                 timeout_seconds=15.0,
                 max_bytes=_MAX_FETCH_RESPONSE_BYTES,
@@ -1967,11 +2067,9 @@ class NetworkToolProvider:
                     retryable=response.status_code >= 500,
                 )
             content_encoding = response.header("content-encoding").strip().casefold()
-            if content_encoding and content_encoding != "identity":
-                raise _FetchFailure(
-                    "UNSUPPORTED_CONTENT_ENCODING",
-                    "compressed responses are not accepted",
-                )
+            payload = self._decode_content_encoding(
+                response.body, content_encoding, response.truncated,
+            )
             raw_content_type = response.header("content-type")
             content_type = raw_content_type.split(";", 1)[0].strip().casefold()
             if content_type not in _ALLOWED_FETCH_CONTENT_TYPES:
@@ -1979,13 +2077,13 @@ class NetworkToolProvider:
                     "UNSUPPORTED_CONTENT_TYPE",
                     "response Content-Type must be text/html, text/plain, or Markdown",
                 )
-            text = self._decode_fetch_content(response.body, raw_content_type)
+            text = self._decode_fetch_content(payload, raw_content_type)
             if content_type == "text/html":
                 parser = _HTMLToTextParser()
                 parser.feed(text)
                 parser.close()
                 text = parser.text()
-            content = html.unescape(text[:_MAX_FETCH_CHARS])
+            content = html.unescape(text[:_MAX_STORED_TEXT_CHARS])
             # A JS-rendered app before its bundle runs converts to almost
             # nothing. When the host configured a render service, ask it for the
             # rendered text instead of handing the model a blank page. Only HTML
@@ -2006,7 +2104,7 @@ class NetworkToolProvider:
                 "content_type": content_type,
                 "content": content,
                 "rendered_by": rendered_by,
-                "truncated": response.truncated or len(text) > _MAX_FETCH_CHARS,
+                "truncated": response.truncated or len(text) > _MAX_STORED_TEXT_CHARS,
                 "redirect_count": redirects,
                 "redirect_chain": redirect_chain,
                 "egress_mode": str(self._egress_mode),
@@ -2062,6 +2160,67 @@ class NetworkToolProvider:
             parser.close()
             return parser.text().strip() or None
         return None
+
+    @staticmethod
+    def _decode_content_encoding(
+        payload: bytes, content_encoding: str, truncated: bool,
+    ) -> bytes:
+        if not content_encoding or content_encoding == "identity":
+            return payload
+        encodings = tuple(
+            item.strip() for item in content_encoding.split(",") if item.strip()
+        )
+        if len(encodings) != 1 or encodings[0] not in {"gzip", "deflate"}:
+            raise _FetchFailure(
+                "UNSUPPORTED_CONTENT_ENCODING",
+                "response Content-Encoding must be identity, gzip, or deflate",
+            )
+        if truncated:
+            raise _FetchFailure(
+                "COMPRESSED_RESPONSE_TRUNCATED",
+                "compressed response exceeded the byte limit before decoding",
+            )
+        encoding = encodings[0]
+        try:
+            return NetworkToolProvider._decompress_bounded(
+                payload,
+                16 + zlib.MAX_WBITS if encoding == "gzip" else zlib.MAX_WBITS,
+            )
+        except zlib.error:
+            if encoding != "deflate":
+                raise _FetchFailure(
+                    "INVALID_COMPRESSED_RESPONSE",
+                    "gzip response could not be decoded",
+                ) from None
+            try:
+                return NetworkToolProvider._decompress_bounded(
+                    payload, -zlib.MAX_WBITS,
+                )
+            except zlib.error:
+                raise _FetchFailure(
+                    "INVALID_COMPRESSED_RESPONSE",
+                    "deflate response could not be decoded",
+                ) from None
+
+    @staticmethod
+    def _decompress_bounded(payload: bytes, window_bits: int) -> bytes:
+        decompressor = zlib.decompressobj(window_bits)
+        limit = _MAX_DECOMPRESSED_FETCH_BYTES
+        decoded = decompressor.decompress(payload, limit + 1)
+        if len(decoded) > limit or decompressor.unconsumed_tail:
+            raise _FetchFailure(
+                "DECOMPRESSED_RESPONSE_TOO_LARGE",
+                "decoded response exceeded the decompressed byte limit",
+            )
+        decoded += decompressor.flush(limit + 1 - len(decoded))
+        if len(decoded) > limit:
+            raise _FetchFailure(
+                "DECOMPRESSED_RESPONSE_TOO_LARGE",
+                "decoded response exceeded the decompressed byte limit",
+            )
+        if not decompressor.eof or decompressor.unused_data:
+            raise zlib.error("incomplete or trailing compressed response")
+        return decoded
 
     @staticmethod
     def _decode_fetch_content(payload: bytes, content_type: str) -> str:

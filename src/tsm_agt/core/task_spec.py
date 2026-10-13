@@ -72,6 +72,12 @@ class TaskCriterionKind(StrEnum):
     #: Planner may never author or drop it; the Runtime derives it from the
     #: proposal's Outcomes and re-derives it on every revision.
     REQUIRED_EFFECT = "required_effect"
+    #: Planner-authored, machine-decidable. The Task must contain at least one
+    #: committed execution whose result came from outside this workspace, so a
+    #: Task that promises to explain another project cannot be answered from
+    #: local files or from the model's own recollection. The claim is about the
+    #: *provenance* of one read, not about which tool performed it.
+    EXTERNAL_SOURCE_READ = "external_source_read"
 
 
 #: Criterion kinds only the Runtime may author. They are excluded from every

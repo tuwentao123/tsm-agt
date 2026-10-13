@@ -207,7 +207,7 @@ class ProjectOnboardingTest(unittest.IsolatedAsyncioTestCase):
                     task = await application.kernel.transition_task(task.task_id, state, state.value)
                 self.assertTrue(task.onboarding_snapshots[0].trusted_rules_read)
                 self.assertNotIn("AGENTS.md", [fact.value for fact in task.onboarding_snapshots[0].facts])
-                await application.kernel.run_text_turn(task.task_id, "summarize")
+                await application.kernel.run_agent_turn(task.task_id, "summarize")
                 assert model.request is not None
                 messages = [
                     message for message in model.request.messages

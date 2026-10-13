@@ -7,8 +7,14 @@ from collections.abc import Mapping
 
 from tsm_agt.ports import ProcessEnvironmentPolicy
 
+#: System paths first so an allowed tool keeps resolving to the same binary it
+#: always did; package-manager prefixes are appended because tools the sandbox
+#: allowlist accepts (``gh``, for one) live there and nowhere else.
 _BASE_ENVIRONMENT = {
-    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+    "PATH": (
+        "/usr/bin:/bin:/usr/sbin:/sbin"
+        ":/opt/homebrew/bin:/usr/local/bin"
+    ),
     "LANG": "C.UTF-8",
 }
 

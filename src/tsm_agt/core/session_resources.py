@@ -13,7 +13,12 @@ from enum import StrEnum
 from typing import Any
 
 from .configuration import canonical_hash
-from .evidence_question import EvidenceQuestionStatus
+
+class SessionReferenceStatus(StrEnum):
+    OPEN = "OPEN"
+    RESOLVED = "RESOLVED"
+    BLOCKED = "BLOCKED"
+    DROPPED = "DROPPED"
 
 
 class SessionResourceKind(StrEnum):
@@ -32,7 +37,7 @@ class SessionResourceReference:
     source_turn_id: str
     source_tool: str
     question_ref: str | None = None
-    question_status: EvidenceQuestionStatus | None = None
+    question_status: SessionReferenceStatus | None = None
     evidence_references: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -50,7 +55,7 @@ class SessionResourceReference:
         cls, *, canonical_path: str, resolved_root: str, root_kind: str,
         resource_kind: SessionResourceKind, source_task_id: str,
         source_turn_id: str, source_tool: str, question_ref: str | None = None,
-        question_status: EvidenceQuestionStatus | None = None,
+        question_status: SessionReferenceStatus | None = None,
         evidence_references: tuple[str, ...] = (),
     ) -> SessionResourceReference:
         identity = canonical_hash({
@@ -97,7 +102,7 @@ class SessionResourceReference:
             str(data["source_tool"]),
             (str(data["question_ref"])
              if data.get("question_ref") is not None else None),
-            (EvidenceQuestionStatus(str(raw_status))
+            (SessionReferenceStatus(str(raw_status))
              if raw_status is not None else None),
             tuple(str(item) for item in raw_refs),
         )
@@ -107,7 +112,7 @@ class SessionResourceReference:
 class SessionQuestionReference:
     question_ref: str
     question: str
-    status: EvidenceQuestionStatus
+    status: SessionReferenceStatus
     source_task_id: str
     source_turn_id: str
     catalog_refs: tuple[str, ...] = ()
@@ -143,7 +148,7 @@ class SessionQuestionReference:
             raise ValueError("session question references must be lists")
         return cls(
             str(data["question_ref"]), str(data["question"]),
-            EvidenceQuestionStatus(str(data["status"])),
+            SessionReferenceStatus(str(data["status"])),
             str(data["source_task_id"]), str(data["source_turn_id"]),
             tuple(str(item) for item in raw_catalog),
             tuple(str(item) for item in raw_evidence),

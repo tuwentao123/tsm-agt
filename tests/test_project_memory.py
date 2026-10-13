@@ -162,7 +162,7 @@ class ProjectMemoryTest(unittest.IsolatedAsyncioTestCase):
                     if node.kind is FlowNodeKind.MEMORY
                 ]
                 self.assertEqual([node.label for node in memory_nodes], ["Memory saved"])
-                await application.kernel.run_text_turn(task.task_id, "What command?")
+                await application.kernel.run_agent_turn(task.task_id, "What command?")
                 assert model.request is not None
                 memory_messages = [
                     message for message in model.request.messages

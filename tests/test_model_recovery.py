@@ -160,6 +160,23 @@ class ModelRecoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1].response.message.text, "fallback answer")
         self.assertEqual(physical.calls, 2)
 
+    async def test_unstable_stream_falls_back_instead_of_repeating_itself(self):
+        # A gateway that kills the SSE stream twice: repeating the stream a third
+        # time is not what recovers the turn, the one-shot transport is.
+        physical = AttemptStreamingModel([
+            failure(ModelFailureCategory.TRANSIENT_PROVIDER,
+                    ModelRetrySafety.SAFE_SAME_REQUEST),
+            failure(ModelFailureCategory.TRANSIENT_PROVIDER,
+                    ModelRetrySafety.SAFE_SAME_REQUEST),
+            response("non-streaming answer"),
+        ])
+        model = await self._coordinator(physical)
+        events = [event async for event in model.stream_complete(
+            ModelRequest("turn", ())
+        )]
+        self.assertEqual(events[-1].response.message.text, "non-streaming answer")
+        self.assertEqual(physical.calls, 3)
+
     async def test_visible_partial_output_is_never_replayed(self):
         physical = AttemptStreamingModel([[
             ModelTextDelta("visible"),

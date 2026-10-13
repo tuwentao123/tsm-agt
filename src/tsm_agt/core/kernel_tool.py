@@ -1,6 +1,6 @@
 """Tool invocation and batch lifecycle for ``Kernel``.
 
-A mixin module in the Hermes facade+siblings shape (``run_agent.py`` +
+A mixin module in the facade-plus-siblings shape (``run_agent.py`` +
 ``agent/session_persistence.py``): the facade ``core/kernel.py`` imports
 this at module level and adds ``ToolMixin`` to ``Kernel``'s bases, so
 **every method resolves through ``Kernel``'s MRO unchanged** --
@@ -9,7 +9,7 @@ attributes all still resolve. Moved bodies are verbatim: nothing is renamed
 and no signature changes.
 
 This module must never bind the facade at module level; late-import it
-inside a method instead (Hermes ``AGENTS.md:243-244``).
+inside a method instead (the project's module-boundary rule).
 
 Moved from ``core/kernel.py``:
 
@@ -64,7 +64,7 @@ from tsm_agt.ports import (
     ToolEffect, ToolIdempotency, ToolInvocationContext,
     ToolMemoryControl, ToolProcessControl, ToolProviderPort,
     ToolRecoveryKind, ToolResult, ToolResultBlock, ToolRisk,
-    ToolSpec, ToolTaskSpecControl, ToolTurnIntentControl,
+    ToolSpec, ToolTaskSpecControl,
     ToolWorkingMemoryControl, ToolWorkspaceControl,
 )
 from uuid import uuid4
@@ -95,31 +95,8 @@ from .tool import (
     ToolNotFound, validate_tool_arguments
 )
 from .turn import InvalidModelResponse, InvalidTurnState
-from .single_loop.types import (
-    IntentAttempt,
-    IntentAttemptStatus,
-    IntentRequestValidationError,
-    IntentSource,
-    IntentValidationErrorData,
-    ToolIntentRequest,
-    TurnIntent,
-    TurnIntentKind,
-)
 from .verification_command import is_verification_request
 from .workspace import WorkspacePatchConflict, prepare_workspace_text_write
-
-
-_TURN_INTENT_STRENGTH = {
-    TurnIntentKind.DIRECT_RESPONSE: 0,
-    TurnIntentKind.INVESTIGATE: 1,
-    TurnIntentKind.INSPECT_RUNTIME: 1,
-    TurnIntentKind.MODIFY: 2,
-    TurnIntentKind.VERIFY: 2,
-}
-
-
-def _turn_intent_strength(kind: TurnIntentKind) -> int:
-    return _TURN_INTENT_STRENGTH[kind]
 
 
 def _render_workspace_patch(
@@ -463,221 +440,7 @@ class _TaskSpecControl(ToolTaskSpecControl):
         )
 
 
-@dataclass(frozen=True, slots=True)
-class _TaskTurnIntentControl(ToolTurnIntentControl):
-    """Narrow capability: persist intent only for one current Agent turn."""
-
-    kernel: Kernel
-    task_id: str
-    turn_id: str
-
-    async def declare(self, intent: Mapping[str, Any]) -> Mapping[str, Any]:
-        declared = TurnIntent.from_data(intent)
-        if declared.turn_id != self.turn_id:
-            raise ValueError("turn intent must target the active turn")
-        return await self.kernel.declare_turn_intent(
-            self.task_id,
-            self.turn_id,
-            declared,
-        )
-
-    async def record_attempt(
-        self,
-        call_id: str,
-        arguments: Mapping[str, Any],
-    ) -> Mapping[str, Any]:
-        return await self.kernel.record_turn_intent_attempt(
-            self.task_id,
-            self.turn_id,
-            call_id,
-            arguments,
-        )
-
-
 class ToolMixin:
-    async def declare_turn_intent(
-        self,
-        task_id: str,
-        turn_id: str,
-        intent: TurnIntent,
-    ) -> Mapping[str, Any]:
-        """Append a bounded model declaration without granting general Task writes."""
-
-        if intent.turn_id != turn_id:
-            raise ValueError("turn intent must target the active turn")
-        if intent.source not in {
-            IntentSource.MODEL_DECLARED,
-            IntentSource.RUNTIME_INFERRED,
-        }:
-            raise ValueError("turn intent has an unsupported source")
-        stored = await self._require_stored_task(task_id)
-        task = TaskSnapshot.from_data(stored.data)
-        if task.active_agent_checkpoint is not None:
-            checkpoint = AgentTurnCheckpoint.from_data(task.active_agent_checkpoint)
-            if checkpoint.turn_id != turn_id:
-                raise ValueError("turn intent does not match the active task checkpoint")
-        previous: TurnIntent | None = None
-        for event in reversed(await self._dependencies.store.read_events(task_id)):
-            if event.event_type not in {"turn.intent_declared", "turn.intent_updated"}:
-                continue
-            candidate = TurnIntent.from_data(event.payload)
-            if candidate.turn_id == turn_id:
-                previous = candidate
-                break
-        if previous is not None and _turn_intent_strength(intent.kind) < _turn_intent_strength(
-            previous.kind
-        ):
-            raise ValueError(
-                f"turn intent cannot downgrade from {previous.kind.value} to {intent.kind.value}"
-            )
-        event = RuntimeEvent(
-            event_id=f"evt-{uuid4().hex}",
-            task_id=task_id,
-            sequence=stored.last_event_sequence + 1,
-            event_type=(
-                "turn.intent_declared"
-                if previous is None else "turn.intent_updated"
-            ),
-            payload=intent.to_data(),
-        )
-        await self._dependencies.store.commit(RuntimeUnitOfWork(
-            task_id,
-            stored.version,
-            task.to_data(),
-            (event,),
-        ))
-        return intent.to_data()
-
-    async def record_turn_intent_attempt(
-        self,
-        task_id: str,
-        turn_id: str,
-        call_id: str,
-        arguments: Mapping[str, Any],
-    ) -> Mapping[str, Any]:
-        """Persist an intent attempt before exposing its result to the model.
-
-        Attempt events are audit/recovery data only in PR-B. A successful request
-        also derives the legacy ``TurnIntent`` read model so existing completion
-        validation keeps its current authority without accepting model-authored
-        effects.
-        """
-        if not call_id.strip():
-            raise ValueError("turn intent call_id must not be empty")
-        stored = await self._require_stored_task(task_id)
-        task = TaskSnapshot.from_data(stored.data)
-        if task.active_agent_checkpoint is not None:
-            checkpoint = AgentTurnCheckpoint.from_data(task.active_agent_checkpoint)
-            if checkpoint.turn_id != turn_id:
-                raise ValueError("turn intent does not match the active task checkpoint")
-        events = await self._dependencies.store.read_events(task_id)
-        terminal_types = {
-            "tool.intent_accepted",
-            "tool.intent_normalized",
-            "tool.intent_rejected",
-        }
-        for event in reversed(events):
-            if event.event_type not in terminal_types:
-                continue
-            if event.payload.get("turn_id") != turn_id or event.payload.get(
-                "tool_call_id"
-            ) != call_id:
-                continue
-            return IntentAttempt.from_data(event.payload).to_data()
-
-        attempt_id = f"intent-attempt:{turn_id}:{call_id}"
-        raw_schema_version = 1 if "expected_effects" in arguments else 2
-        attempted = RuntimeEvent(
-            event_id=f"evt-{uuid4().hex}",
-            task_id=task_id,
-            sequence=stored.last_event_sequence + 1,
-            event_type="tool.intent_attempted",
-            payload={
-                "schema_version": 1,
-                "attempt_id": attempt_id,
-                "turn_id": turn_id,
-                "tool_call_id": call_id,
-                "requested_intent": ToolIntentRequest.requested_intent(arguments),
-                "raw_schema_version": raw_schema_version,
-                "legacy_input": "expected_effects" in arguments,
-                "has_expected_effects": "expected_effects" in arguments,
-            },
-        )
-        await self._dependencies.store.commit(RuntimeUnitOfWork(
-            task_id,
-            stored.version,
-            task.to_data(),
-            (attempted,),
-        ))
-        requested_intent = ToolIntentRequest.requested_intent(arguments)
-        try:
-            request = ToolIntentRequest.from_tool_arguments(arguments)
-            legacy_intent = request.to_legacy_turn_intent(turn_id)
-            if legacy_intent is not None:
-                await self.declare_turn_intent(task_id, turn_id, legacy_intent)
-            attempt = IntentAttempt(
-                schema_version=1,
-                attempt_id=attempt_id,
-                turn_id=turn_id,
-                tool_call_id=call_id,
-                requested_intent=requested_intent,
-                normalized_intent=request.intent,
-                status=(
-                    IntentAttemptStatus.NORMALIZED
-                    if request.normalized_effect_aliases
-                    else IntentAttemptStatus.ACCEPTED
-                ),
-                implied_effects=request.implied_effects,
-                continuation_task_id=request.continuation_task_id,
-                legacy_input=request.legacy_input,
-                normalized_effect_aliases=request.normalized_effect_aliases,
-            )
-        except IntentRequestValidationError as error:
-            attempt = IntentAttempt(
-                schema_version=1,
-                attempt_id=attempt_id,
-                turn_id=turn_id,
-                tool_call_id=call_id,
-                requested_intent=requested_intent,
-                normalized_intent=ToolIntentRequest.known_intent(arguments),
-                status=IntentAttemptStatus.REJECTED,
-                implied_effects=(
-                    ToolIntentRequest.implied_effects_for(
-                        ToolIntentRequest.known_intent(arguments)
-                    )
-                ),
-                legacy_input="expected_effects" in arguments,
-                validation_error=error.detail,
-            )
-        except ValueError as error:
-            attempt = IntentAttempt(
-                schema_version=1,
-                attempt_id=attempt_id,
-                turn_id=turn_id,
-                tool_call_id=call_id,
-                requested_intent=requested_intent,
-                normalized_intent=ToolIntentRequest.known_intent(arguments),
-                status=IntentAttemptStatus.REJECTED,
-                implied_effects=(
-                    ToolIntentRequest.implied_effects_for(
-                        ToolIntentRequest.known_intent(arguments)
-                    )
-                ),
-                legacy_input="expected_effects" in arguments,
-                validation_error=IntentValidationErrorData(
-                    field="intent",
-                    message=str(error),
-                    received=requested_intent,
-                ),
-            )
-        event_type = {
-            IntentAttemptStatus.ACCEPTED: "tool.intent_accepted",
-            IntentAttemptStatus.NORMALIZED: "tool.intent_normalized",
-            IntentAttemptStatus.REJECTED: "tool.intent_rejected",
-        }[attempt.status]
-        await self._append_events(task_id, ((event_type, attempt.to_data()),))
-        return attempt.to_data()
-
     @staticmethod
     def _latest_recoverable_tool_batch(
         messages: Sequence[Message],
@@ -690,7 +453,7 @@ class ToolMixin:
         generated_prefixes = (
             "project-instructions-context-", "task-spec-context-",
             "project-onboarding-context-", "project-memory-context-",
-            "session-context-", "working-memory-context-", "task-contract-context-",
+            "session-context-", "working-memory-context-",
             "completion-readiness-", "continuation-input-", "steering-",
         )
         results: list[ToolResult] = []
@@ -916,11 +679,6 @@ class ToolMixin:
                     f"{call.call_id}: unknown tool {call.name}; available tools: "
                     + ", ".join(sorted(visible_tool_by_name))
                 )
-                continue
-            if spec.name == "core.turn_intent":
-                # Intent is an R0 internal declaration with its own parser. Its
-                # rejected attempts must be durable and model-visible instead of
-                # being discarded by generic batch validation before execution.
                 continue
             try:
                 validate_tool_arguments(spec, call.arguments)
@@ -1309,8 +1067,7 @@ class ToolMixin:
         existing = task.tool_executions.get(
             ToolExecutionRecord.identity(turn_id, call.call_id)
         )
-        if selected_spec.name != "core.turn_intent":
-            validate_tool_arguments(selected_spec, call.arguments)
+        validate_tool_arguments(selected_spec, call.arguments)
         call = await self._bind_tool_call_outcome(
             task_id, call, selected_spec,
             allow_closed_ref=(
@@ -1611,7 +1368,9 @@ class ToolMixin:
             approval_request_id=approval_request_id,
             idempotency=selected_spec.idempotency,
             effect=selected_spec.effect,
-            result_authority=selected_spec.result_authority,
+            result_authority=self._tool_policy.execution_result_authority(
+                selected_spec, call
+            ),
         )
         prepared_task = task.with_tool_execution(execution)
         if next_state is not None:
@@ -1725,7 +1484,6 @@ class ToolMixin:
                 self, task_id, invocation_id,
                 execution.idempotency_key or payload_hash,
             ),
-            turn_intent_control=_TaskTurnIntentControl(self, task_id, turn_id),
             workspace_path=self._dependencies.workspace_path,
             additional_read_roots=self._additional_read_roots(
                 running_task, call.name
@@ -1811,7 +1569,6 @@ class ToolMixin:
                     result.fact_descriptor.to_data()
                     if result.fact_descriptor is not None else None
                 ),
-                "evidence_facts": [fact.to_data() for fact in result.evidence_facts],
                 "execution_id": execution.execution_id,
                 "outcome_ref": call.outcome_ref,
                 "commit_state": commit_state.value,

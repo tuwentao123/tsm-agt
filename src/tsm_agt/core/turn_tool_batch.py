@@ -17,7 +17,8 @@ import json
 import time
 
 from .agent_loop import (
-    AgentClarificationSuspended, AgentContinuationSuspended, AgentProgress, AgentProgressKind, AgentTurnCheckpoint, AgentTurnSuspended, ToolBatchStatus, TurnState,
+    AgentClarificationSuspended, AgentProgress, AgentProgressKind,
+    AgentTurnCheckpoint, AgentTurnSuspended, ToolBatchStatus, TurnState,
 )
 from .approval import (
     ApprovalRequired,
@@ -30,9 +31,6 @@ from .configuration import (
 )
 from dataclasses import (
     replace,
-)
-from .evidence_question import (
-    ToolActionDisposition,
 )
 from .execution import (
     ToolCommitState, ToolExecutionRecord,
@@ -58,12 +56,6 @@ from .trust import (
 from tsm_agt.ports import (
     ArtifactReadAction, ExplorationBudgetAction, ExplorationBudgetObservation, ExplorationBudgetProbe, ExplorationBudgetState, ExplorationOutcomeAction, Message, MessageRole, ProgressiveScopeAction, ProgressiveScopeDecision, ReadHitsAction, StopOrPivotAction, StopOrPivotSignals, TextBlock, ToolCall, ToolRecoveryKind, ToolResult, ToolResultBlock,
 )
-from .single_loop.task_projection import (
-    TaskOrchestrationProjector,
-)
-from .single_loop.types import (
-    OrchestrationMode,
-)
 from .turn import (
     InvalidModelResponse,
 )
@@ -88,97 +80,10 @@ def _govern_runtime_result(
     return kernel._dependencies.tool_result_governor.govern(spec, call, result)
 
 
-async def _emit_execution_effect_shadow(
-    kernel: Any,
-    state: TurnState,
-    call: ToolCall,
-) -> None:
-    """Persist a SINGLE_LOOP-only, non-authoritative execution projection.
-
-    The execution ledger and ``tool.completed`` / ``tool.failed`` lifecycle event
-    are already committed when this runs. This event deliberately has no Task
-    projection or completion reader in PR-A; it is audit data for validating the
-    new fact model before it becomes contract authority.
-    """
-    task = await kernel.get_task(state.task_id)
-    events = await kernel._dependencies.store.read_events(state.task_id)
-    metadata = TaskOrchestrationProjector.project(
-        state.task_id,
-        task.goal,
-        events,
-    )
-    if metadata.orchestration_mode is not OrchestrationMode.SINGLE_LOOP:
-        return
-    execution_id = ToolExecutionRecord.identity(state.turn_id, call.call_id)
-    execution = task.tool_executions.get(execution_id)
-    if execution is None or any(
-        event.event_type == "execution.effect_shadow_projected"
-        and event.payload.get("execution_id") == execution_id
-        for event in events
-    ):
-        return
-    spec = state.visible_tool_by_name.get(execution.call.name)
-    mutation_ids = frozenset(
-        mutation.mutation_id for mutation in task.mutation_journal
-    )
-    execution_fact = project_tool_execution_fact(
-        execution,
-        spec,
-        known_mutation_ids=mutation_ids,
-    )
-    if execution_fact is None:
-        return
-    effect_fact = project_execution_fact(
-        execution,
-        spec,
-        known_mutation_ids=mutation_ids,
-    )
-    await kernel._append_events(
-        state.task_id,
-        ((
-            "execution.effect_shadow_projected",
-            {
-                "projection_version": 1,
-                "turn_id": state.turn_id,
-                "tool_call_id": call.call_id,
-                "execution_id": execution_id,
-                "source_event_type": (
-                    "tool.completed"
-                    if execution.result is not None and execution.result.ok
-                    else "tool.failed"
-                ),
-                "execution_fact": execution_fact.to_data(),
-                "effect_fact": (
-                    effect_fact.to_data() if effect_fact is not None else None
-                ),
-            },
-        ),),
-    )
-
-
 async def run_tool_batch(
     kernel: Any, state: TurnState,
-) -> (
-    AgentTurnSuspended | AgentClarificationSuspended
-    | AgentContinuationSuspended | None
-):
-    """Drain this iteration's pending tool calls.
-
-    Returns the turn's terminal outcome when the batch ends the turn, or ``None``
-    once the batch is drained and the caller should continue its own loop. The four
-    ``return``s below are the turn's terminal outcomes, which is why the caller
-    forwards a non-``None`` result unchanged.
-    """
-    """Drain this iteration's pending tool calls.
-
-    Returns the turn's terminal outcome when the batch ends the turn, or
-    ``None`` once the batch is drained and the caller should continue its own
-    loop. Extracted verbatim: every ``return`` below returned from
-    ``_continue_agent_turn``, so wrapping preserves the shape.
-
-    Reads and writes ``state`` only -- the closure is exactly ``self`` and
-    ``state``, which is the contract ``TurnState`` exists to provide.
-    """
+) -> AgentTurnSuspended | AgentClarificationSuspended | None:
+    """Drain pending tool calls for a ConversationAgentLoop turn."""
     while state.pending_tool_calls:
         state.checkpoint, replaced = await kernel._apply_pending_steering(
             replace(
@@ -227,31 +132,6 @@ async def run_tool_batch(
                 allow_closed_ref=True,
             )
             state.pending_tool_calls[0] = call
-        requires_question = (
-            kernel._dependencies.require_evidence_questions
-            and call_spec is not None
-            and call_spec.requires_evidence_question
-        )
-        question = call.evidence_question
-        if requires_question and question is None:
-            raise InvalidModelResponse(
-                f"pending tool call {call.call_id} lost its evidence_question"
-            )
-        if not requires_question and question is not None:
-            # Compatibility for checkpoints written before ToolSpec carried
-            # result authority.  A non-evidence protocol must not create a
-            # second, contradictory lifecycle for the same interaction.
-            call = replace(call, evidence_question=None)
-            state.pending_tool_calls[0] = call
-            question = None
-        if requires_question and question is not None:
-            question_projection = await kernel._bind_evidence_question(
-                state.task_id, state.turn_id, call
-            )
-            state.checkpoint = replace(
-                state.checkpoint,
-                evidence_question_state=question_projection.to_data(),
-            )
         task_before_action = await kernel.get_task(state.task_id)
         memory_before_action = await kernel.get_working_memory(state.task_id)
         semantic_action = await kernel._classify_semantic_action(
@@ -329,17 +209,11 @@ async def run_tool_batch(
                     role=MessageRole.TOOL,
                     content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
                 ))
-                question_projection = await kernel._dispose_evidence_question(
-                    state.task_id, state.turn_id, call,
-                    ToolActionDisposition.REPLACE,
-                    "exploration_route_rejected",
-                )
                 state.pending_tool_calls.pop(0)
                 state.checkpoint = replace(
                     state.checkpoint, messages=tuple(state.messages),
                     pending_tool_calls=tuple(state.pending_tool_calls),
                     seen_call_ids=tuple(sorted(state.seen_call_ids)),
-                    evidence_question_state=question_projection.to_data(),
                 )
                 await kernel._save_agent_checkpoint(
                     state.checkpoint, "exploration-route-rejected"
@@ -384,8 +258,7 @@ async def run_tool_batch(
                     "for the same evidence question and search method."
                 ),
                 hint=(
-                    "Retry only if broader search is necessary and set "
-                    "evidence_question.scope_expansion_reason. Otherwise keep "
+                    "Retry only if broader search is necessary. Otherwise keep "
                     "the narrower scope or change the investigation method."
                 ),
                 meta={
@@ -400,17 +273,12 @@ async def run_tool_batch(
                 role=MessageRole.TOOL,
                 content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
             ))
-            question_projection = await kernel._dispose_evidence_question(
-                state.task_id, state.turn_id, call, ToolActionDisposition.REPLACE,
-                "scope_expansion_reason_required",
-            )
             state.pending_tool_calls.pop(0)
             state.checkpoint = replace(
                 state.checkpoint, messages=tuple(state.messages),
                 pending_tool_calls=tuple(state.pending_tool_calls),
                 seen_call_ids=tuple(sorted(state.seen_call_ids)),
                 stop_or_pivot_state=pivot_state,
-                evidence_question_state=question_projection.to_data(),
             )
             await kernel._save_agent_checkpoint(
                 state.checkpoint, "scope-expansion-reason-required"
@@ -494,17 +362,11 @@ async def run_tool_batch(
                     role=MessageRole.TOOL,
                     content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
                 ))
-                question_projection = await kernel._dispose_evidence_question(
-                    state.task_id, state.turn_id, call,
-                    ToolActionDisposition.REPLACE,
-                    "exploration_focus_required",
-                )
                 state.pending_tool_calls.pop(0)
                 state.checkpoint = replace(
                     state.checkpoint, messages=tuple(state.messages),
                     pending_tool_calls=tuple(state.pending_tool_calls),
                     seen_call_ids=tuple(sorted(state.seen_call_ids)),
-                    evidence_question_state=question_projection.to_data(),
                 )
                 await kernel._save_agent_checkpoint(
                     state.checkpoint, "exploration-focus-required"
@@ -575,18 +437,12 @@ async def run_tool_batch(
                     role=MessageRole.TOOL,
                     content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
                 ))
-                question_projection = await kernel._dispose_evidence_question(
-                    state.task_id, state.turn_id, call,
-                    ToolActionDisposition.REPLACE,
-                    "exploration_change_method_required",
-                )
                 state.pending_tool_calls.pop(0)
                 state.checkpoint = replace(
                     state.checkpoint, messages=tuple(state.messages),
                     pending_tool_calls=tuple(state.pending_tool_calls),
                     seen_call_ids=tuple(sorted(state.seen_call_ids)),
                     stop_or_pivot_state=pivot_state,
-                    evidence_question_state=question_projection.to_data(),
                 )
                 await kernel._save_agent_checkpoint(
                     state.checkpoint, "exploration-change-method-required"
@@ -615,10 +471,6 @@ async def run_tool_batch(
                     role=MessageRole.TOOL,
                     content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
                 ))
-                question_projection = await kernel._dispose_evidence_question(
-                    state.task_id, state.turn_id, call, ToolActionDisposition.CANCEL,
-                    "exploration_budget_wrap_up",
-                )
                 state.pending_tool_calls.pop(0)
                 state.budget_wrap_up = True
                 state.budget_wrap_up_decision = budget_decision
@@ -627,7 +479,6 @@ async def run_tool_batch(
                     pending_tool_calls=tuple(state.pending_tool_calls),
                     seen_call_ids=tuple(sorted(state.seen_call_ids)),
                     stop_or_pivot_state=pivot_state,
-                    evidence_question_state=question_projection.to_data(),
                 )
                 await kernel._save_agent_checkpoint(
                     state.checkpoint, "exploration-budget-wrap-up"
@@ -684,17 +535,12 @@ async def run_tool_batch(
                 role=MessageRole.TOOL,
                 content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
             ))
-            question_projection = await kernel._dispose_evidence_question(
-                state.task_id, state.turn_id, call, ToolActionDisposition.REPLACE,
-                "read_hits_required",
-            )
             state.pending_tool_calls.pop(0)
             state.checkpoint = replace(
                 state.checkpoint, messages=tuple(state.messages),
                 pending_tool_calls=tuple(state.pending_tool_calls),
                 seen_call_ids=tuple(sorted(state.seen_call_ids)),
                 stop_or_pivot_state=pivot_state,
-                evidence_question_state=question_projection.to_data(),
             )
             await kernel._save_agent_checkpoint(
                 state.checkpoint, "read-hits-required"
@@ -713,11 +559,11 @@ async def run_tool_batch(
                 call.call_id, False, error_code="ARTIFACT_ALREADY_READ",
                 message=(
                     "The same unchanged file range was already read for this "
-                    "evidence question."
+                    "same call fingerprint."
                 ),
                 hint=(
                     "Reuse the existing Tool Result or Evidence. Read a different "
-                    "line range, use a genuinely different evidence_question, or "
+                    "line range, use different effective arguments, or "
                     "read again after the file content changes."
                 ),
                 meta={
@@ -732,16 +578,11 @@ async def run_tool_batch(
                 role=MessageRole.TOOL,
                 content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
             ))
-            question_projection = await kernel._dispose_evidence_question(
-                state.task_id, state.turn_id, call, ToolActionDisposition.REPLACE,
-                "artifact_read_reuse_required",
-            )
             state.pending_tool_calls.pop(0)
             state.checkpoint = replace(
                 state.checkpoint, messages=tuple(state.messages),
                 pending_tool_calls=tuple(state.pending_tool_calls),
                 seen_call_ids=tuple(sorted(state.seen_call_ids)),
-                evidence_question_state=question_projection.to_data(),
             )
             await kernel._save_agent_checkpoint(
                 state.checkpoint, "artifact-read-reuse-required"
@@ -812,10 +653,6 @@ async def run_tool_batch(
             goal=task_before_action.goal,
         )
         if pivot_decision.terminal:
-            question_projection = await kernel._dispose_evidence_question(
-                state.task_id, state.turn_id, call, ToolActionDisposition.CANCEL,
-                "plan_no_progress_stopped",
-            )
             cancelled_calls = tuple(state.pending_tool_calls)
             for cancelled in cancelled_calls:
                 state.messages.append(Message(
@@ -857,7 +694,6 @@ async def run_tool_batch(
                         (), status=ToolBatchStatus.CANCELLED
                     ) if state.checkpoint.tool_batch is not None else None
                 ),
-                evidence_question_state=question_projection.to_data(),
             )
             state.no_progress_stop = True
             await kernel._append_events(state.task_id, (("plan.no_progress_stopped", {
@@ -926,7 +762,6 @@ async def run_tool_batch(
             goal_revision=state.checkpoint.goal_revision,
             action_progress=state.checkpoint.action_progress,
             evidence_inventory=state.checkpoint.evidence_inventory,
-            evidence_question_state=state.checkpoint.evidence_question_state,
             read_hits_state=state.checkpoint.read_hits_state,
             artifact_read_state=state.checkpoint.artifact_read_state,
             progressive_scope_state=state.checkpoint.progressive_scope_state,
@@ -935,9 +770,7 @@ async def run_tool_batch(
             evidence_relation_state=state.checkpoint.evidence_relation_state,
             rejection_loop_state=state.checkpoint.rejection_loop_state,
             exploration_outcome_state=state.checkpoint.exploration_outcome_state,
-            completion_readiness_state=(
-                state.checkpoint.completion_readiness_state
-            ),
+            finalization_state=state.checkpoint.finalization_state,
         )
         await kernel._save_agent_checkpoint(
             suspension, "before-tool-execution"
@@ -954,15 +787,12 @@ async def run_tool_batch(
             max_tool_calls=state.checkpoint.max_tool_calls,
             tool_name=call.name,
             goal=task_before_action.goal,
-            question=(question.question if question is not None else ""),
             operation=call.name,
             operation_arguments=dict(presentation.visible_arguments),
             operation_presentation=presentation.text,
             operation_presentation_mode=presentation.mode,
             scope_target=kernel._live_scope_target(call),
-            scope_change_reason=(
-                question.scope_expansion_reason if question is not None else ""
-            ),
+            scope_change_reason="",
         ))
         try:
             result = await kernel._invoke_agent_tool(
@@ -1002,7 +832,6 @@ async def run_tool_batch(
                 reason=request.reason, required=request.required,
                 resume_token=required.resume_token,
             )
-        await _emit_execution_effect_shadow(kernel, state, call)
         tool_elapsed_milliseconds = max(
             0, int((time.monotonic() - tool_started_at) * 1000)
         )
@@ -1011,9 +840,6 @@ async def run_tool_batch(
                 state.task_id, state.turn_id, call, result,
                 state.checkpoint.evidence_inventory,
             )
-        )
-        question_projection = await kernel._observe_evidence_question(
-            state.task_id, state.turn_id, call, result, evidence_delta
         )
         if evidence_delta is not None:
             result = replace(
@@ -1126,15 +952,12 @@ async def run_tool_batch(
                 if evidence_delta is not None else 0
             ),
             goal=task_before_action.goal,
-            question=(question.question if question is not None else ""),
             operation=call.name,
             operation_arguments=dict(presentation.visible_arguments),
             operation_presentation=presentation.text,
             operation_presentation_mode=presentation.mode,
             scope_target=kernel._live_scope_target(call),
-            scope_change_reason=(
-                question.scope_expansion_reason if question is not None else ""
-            ),
+            scope_change_reason="",
         ))
         if not result.ok:
             state.last_tool_error = (
@@ -1184,7 +1007,6 @@ async def run_tool_batch(
                 await kernel.get_working_memory(state.task_id)
             ).content_hash,
             evidence_inventory=evidence_inventory,
-            evidence_question_state=question_projection.to_data(),
             read_hits_state=read_hits_state,
             artifact_read_state=artifact_read_state,
             progressive_scope_state=progressive_scope_state,
@@ -1193,9 +1015,7 @@ async def run_tool_batch(
             evidence_relation_state=evidence_relation_state,
             rejection_loop_state=rejection_loop_state,
             exploration_outcome_state=exploration_outcome_state,
-            completion_readiness_state=(
-                state.checkpoint.completion_readiness_state
-            ),
+            finalization_state=state.checkpoint.finalization_state,
             action_progress=(
                 ActionProgressState(
                     decision.action_signature,
@@ -1215,27 +1035,3 @@ async def run_tool_batch(
             return await kernel._suspend_unknown_tool_outcome(
                 after_tool, call, result
             )
-        continuation = await kernel._maybe_suspend_after_completed_unit(
-            state.checkpoint, state.closed_outcomes_at_entry
-        )
-        if continuation is not None:
-            source_user_message = next((
-                message for message in state.messages
-                if message.role is MessageRole.USER
-                and not message.message_id.startswith((
-                    "project-onboarding-context-",
-                    "project-memory-context-", "session-context-",
-                    "working-memory-context-", "task-spec-context-", "task-contract-context-",
-                    "project-instructions-context-",
-                ))
-            ), None)
-            if source_user_message is None:
-                raise RuntimeError(
-                    "Agent continuation lost its source user message"
-                )
-            await kernel._record_session_task_result(
-                state.task_id, state.turn_id, source_user_message,
-                continuation.assistant_message,
-            )
-            await kernel._refresh_continuation_session_identity(state.task_id)
-            return continuation

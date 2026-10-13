@@ -177,7 +177,6 @@ class ModelSessionInputResolver:
                 messages=messages, max_output_tokens=512,
                 tools=(submit_tool,) if supports_tools else (),
                 allow_tool_calls=supports_tools,
-                require_evidence_questions=False,
                 purpose=ModelCallPurpose.SESSION_ROUTING,
                 timeout_seconds=self._timeout_seconds, max_provider_attempts=1,
             )

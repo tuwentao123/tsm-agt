@@ -1,11 +1,11 @@
 import unittest
 
-from tsm_agt.core.single_loop.binder import (
+from tsm_agt.core.conversation_orchestration import (
+    TaskBindingKind,
     TaskBindingRequest,
     TaskBindingTask,
     bind_task_input,
 )
-from tsm_agt.core.single_loop import TaskBindingKind
 
 
 class TaskBinderTest(unittest.TestCase):
@@ -79,8 +79,8 @@ class TaskBinderTest(unittest.TestCase):
 
         self.assertEqual(accepted.binding_kind, TaskBindingKind.USER_INTERACTION)
         self.assertEqual(accepted.task_id, "task-approval")
-        self.assertEqual(queued.binding_kind, TaskBindingKind.QUEUED_AFTER_APPROVAL)
-        self.assertEqual(queued.task_id, "task-approval")
+        self.assertEqual(queued.binding_kind, TaskBindingKind.CHOICE_REQUIRED)
+        self.assertIsNone(queued.task_id)
 
     def test_no_active_or_terminal_only_tasks_create_new_binding(self) -> None:
         no_tasks = self.bind()
@@ -136,5 +136,5 @@ class TaskBinderTest(unittest.TestCase):
             continuation_requested=True,
         )
 
-        self.assertEqual(decision.binding_kind, TaskBindingKind.QUEUED_AFTER_APPROVAL)
-        self.assertEqual(decision.task_id, "task-approval")
+        self.assertEqual(decision.binding_kind, TaskBindingKind.CHOICE_REQUIRED)
+        self.assertIsNone(decision.task_id)

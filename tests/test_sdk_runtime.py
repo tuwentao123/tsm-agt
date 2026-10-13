@@ -10,7 +10,7 @@ from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import ApprovalDecision, ModelInvocationFailed, TaskState
 from tsm_agt.ports import (
-    AdapterDescriptor, CompletionReadinessMode, FinishReason, Message,
+    AdapterDescriptor, FinishReason, Message,
     MessageRole, ModelRequest,
     ModelResponse, ModelUsage, ProviderCapabilities, RuntimeStorePort, TextBlock,
     ToolCall,
@@ -22,12 +22,7 @@ from tsm_agt.ports import (
     ModelRecoveryAction, ModelRecoveryDecision, ModelRecoveryExhausted,
     ModelRetrySafety,
 )
-from tsm_agt.core.single_loop import OrchestrationMode
-from tsm_agt.ports.evidence import (
-    ContractAuthority,
-    EvidenceRequirement,
-    TaskContract,
-)
+from tsm_agt.core import OrchestrationMode
 from tsm_agt.sdk import EngineeringAgentClient
 from tsm_agt.sdk.runtime import _is_resumable_stop
 
@@ -167,45 +162,6 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     "private provider detail", str(final.to_data())
                 )
 
-    async def test_user_contract_blocked_result_waits_for_contract_recovery(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            application = compose_fixture_application(
-                model_adapter=ContractBlockingModel(),
-                tool_adapters=(),
-            )
-            client = EngineeringAgentClient(
-                root,
-                application_factory=lambda: application,
-                poll_interval=0.001,
-            )
-            contract = TaskContract(
-                objective="verify source provenance",
-                authority=ContractAuthority.USER,
-                evidence_requirements=(EvidenceRequirement("source", "source.artifact"),),
-            )
-            async with client:
-                accepted = await client.submit_task(
-                    "answer",
-                    command_id="sdk-user-contract-blocked",
-                    evidence_contract=contract,
-                )
-                result = await client.wait_task(accepted.task_id, timeout=5)
-                events = await application.registry.require(RuntimeStorePort).read_events(
-                    accepted.task_id
-                )
-
-        self.assertEqual(result.state, TaskState.AWAITING_USER.value)
-        self.assertEqual(result.status, "awaiting_user")
-        self.assertEqual(result.clarification["kind"], "CONTRACT_BLOCKED")
-        self.assertEqual(result.clarification["missing_requirement_ids"], ["source"])
-        self.assertEqual(
-            next(event for event in events if event.event_type == "clarification.requested")
-            .payload["kind"],
-            "CONTRACT_BLOCKED",
-        )
-        self.assertNotIn("llm.completed", [event.event_type for event in events])
-
     async def test_concurrent_duplicate_submit_starts_only_one_runner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -312,7 +268,6 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             application = compose_fixture_application(
                 model_adapter=EchoModelProvider(), tool_adapters=(),
-                completion_readiness_mode=CompletionReadinessMode.OBSERVE_ONLY,
             )
             client = EngineeringAgentClient(
                 root, application_factory=lambda: application, poll_interval=0.001
@@ -647,7 +602,7 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
         # Asserted by CALLING the producer, not by reading the Kernel class's
         # source. A source assertion tests the shape of the code rather than its
         # behaviour: it passes while the call site is mis-wired and fails on a
-        # correct refactor (Hermes AGENTS.md:487-502) -- which is exactly what
+        # correct refactor (the project phase-boundary rule) -- which is exactly what
         # happened when this phase moved out of Kernel.
         from tsm_agt.core.kernel import Kernel
 
@@ -734,7 +689,7 @@ class PlannerTransportFailureTest(unittest.IsolatedAsyncioTestCase):
             application = compose_fixture_application(
                 task_spec_planner_adapter=_TransportFailingPlanner(error),
                 tool_adapters=(),
-                orchestration_mode=OrchestrationMode.LEGACY,
+                orchestration_mode=OrchestrationMode.CONVERSATION_LOOP,
             )
             client = EngineeringAgentClient(
                 root, application_factory=lambda: application,
@@ -789,7 +744,6 @@ class _IncompleteSingleLoopModel(EchoModelProvider):
                     MessageRole.ASSISTANT,
                     (ToolCallBlock(ToolCall(
                         "incomplete-intent",
-                        "core.turn_intent",
                         {
                             "intent": "MODIFY",
                             "expected_effects": ["mutate"],
@@ -811,6 +765,7 @@ class _IncompleteSingleLoopModel(EchoModelProvider):
         )
 
 
+@unittest.skip("SINGLE_LOOP ingress was superseded by Conversation Loop")
 class SingleLoopSdkIncompleteTest(unittest.IsolatedAsyncioTestCase):
     async def test_incomplete_turn_is_projected_without_failing_the_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

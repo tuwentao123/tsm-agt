@@ -21,10 +21,13 @@ from tsm_agt.bootstrap import (
 from tsm_agt.bootstrap.exploration_configuration import (
     ExplorationBudgetConfiguration,
 )
+from tsm_agt.bootstrap.orchestration_configuration import (
+    load_orchestration_configuration,
+)
 from tsm_agt.core import (
     ApprovalDecision, ApprovalRequired, ProjectTrustLevel, TaskState,
 )
-from tsm_agt.core.single_loop import OrchestrationMode
+from tsm_agt.core import OrchestrationMode
 from tsm_agt.ports import (
     CrossProcessLockPort,
     EvidenceDeltaEvaluatorPort,
@@ -36,6 +39,7 @@ from tsm_agt.ports import (
     FlowArtifactExportPort,
     ReplayCursorStorePort,
     ModelProviderPort,
+    CompletionReviewerPort,
     ProcessExecutorPort,
     RuntimeInputClassifierPort,
     RuntimeStorePort,
@@ -112,7 +116,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 application.registry.all(RuntimeInputClassifierPort), ()
             )
-            self.assertEqual(len(application.registry.all(ToolProviderPort)), 2)
+            self.assertEqual(len(application.registry.all(ToolProviderPort)), 1)
             for port in (
                 ModelProviderPort,
                 ProcessExecutorPort,
@@ -150,7 +154,8 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                     "core.list_files", "core.search_files",
                     "core.find_files",
                     "core.read_file", "core.search_text", "core.grep_search",
-                    "core.turn_intent",
+                    "git.status", "git.diff", "git.log", "git.show",
+                    "git.blame", "git.branches",
                     "runtime.inspect_task", "runtime.list_task_events",
                     "runtime.inspect_session", "runtime.search_history",
                 ],
@@ -179,6 +184,32 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                 compose_openai_compatible_readonly_application_from_env(
                     Path("/definitely/missing/tsm-agt.env")
                 )
+
+    async def test_github_source_tools_are_registered_with_the_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text(
+                "TSM_AGT_MODEL_BASE_URL=https://models.example.test/v1\n"
+                "TSM_AGT_MODEL=open\n"
+                "TSM_AGT_OPEN_MODEL=test-model\n"
+                "TSM_AGT_MODEL_API_KEY=test-secret\n"
+                "TSM_AGT_GITHUB_SOURCE_ENABLED=true\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                application = compose_openai_compatible_engineering_application_from_env(
+                    env_file
+                )
+        await application.registry.start_all()
+        self.addAsyncCleanup(application.registry.stop_all)
+
+        names = [tool.name for tool in await application.kernel.list_tools()]
+        # ``source.github.resolve`` only routes into the GitHub source adapter's
+        # tools, so advertising it without them hands the model targets it
+        # cannot call. Both must appear together.
+        self.assertIn("source.github.resolve", names)
+        self.assertIn("source.github.get_file", names)
+        self.assertIn("source.github.list_tree", names)
 
     async def test_real_provider_engineering_composition_has_process_tools(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -210,6 +241,9 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             )
             model = application.registry.require(ModelProviderPort)
             self.assertTrue(model.capabilities.tools)
+            self.assertIsNotNone(
+                application.registry.require(CompletionReviewerPort)
+            )
             sandbox = application.registry.require(SandboxPort)
             self.assertEqual(
                 sandbox.descriptor.adapter_id,
@@ -222,10 +256,12 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                     "core.list_files", "core.search_files",
                     "core.find_files",
                     "core.read_file", "core.search_text", "core.grep_search",
+                    "git.status", "git.diff", "git.log", "git.show",
+                    "git.blame", "git.branches",
                     "runtime.inspect_task", "runtime.list_task_events",
                     "runtime.inspect_session", "runtime.search_history",
                     "web.search", "web.fetch_markdown", "web.open",
-                    "web.find_in_page", "source.github.resolve", "content.summarize",
+                    "web.find_in_page", "web.read", "content.summarize",
                     "core.run_command",
                     "core.process_status", "core.process_logs",
                     "core.process_stop", "core.apply_patch",
@@ -238,7 +274,6 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                     "core.memory_verify", "core.memory_forget",
                     "core.working_memory_read",
                     "core.working_memory_update", "core.todo_list",
-                    "core.turn_intent",
                     "core.task_spec_read",
                     "core.task_spec_update",
                     "code.symbol_overview", "code.definition",
@@ -609,27 +644,27 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             application.kernel.dependencies.orchestration_mode,
-            OrchestrationMode.SINGLE_LOOP,
+            OrchestrationMode.CONVERSATION_LOOP,
         )
 
     def test_fixture_can_select_legacy_orchestration(self) -> None:
         application = compose_fixture_application(
-            orchestration_mode=OrchestrationMode.LEGACY
+            orchestration_mode=OrchestrationMode.CONVERSATION_LOOP
         )
 
         self.assertEqual(
             application.kernel.dependencies.orchestration_mode,
-            OrchestrationMode.LEGACY,
+            OrchestrationMode.CONVERSATION_LOOP,
         )
 
     def test_fixture_can_select_single_loop_orchestration(self) -> None:
         application = compose_fixture_application(
-            orchestration_mode=OrchestrationMode.SINGLE_LOOP
+            orchestration_mode=OrchestrationMode.CONVERSATION_LOOP
         )
 
         self.assertEqual(
             application.kernel.dependencies.orchestration_mode,
-            OrchestrationMode.SINGLE_LOOP,
+            OrchestrationMode.CONVERSATION_LOOP,
         )
         self.assertEqual(
             application.kernel.dependencies.configuration_metadata[
@@ -638,13 +673,14 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             {
                 "mode": "single_loop",
                 "single_loop_allow_fallback": False,
+                "conversation_loop_enabled": True,
             },
         )
 
     def test_orchestration_configuration_rejects_fallback(self) -> None:
         self.assertEqual(
             OrchestrationConfiguration(mode="single_loop").mode,
-            OrchestrationMode.SINGLE_LOOP,
+            OrchestrationMode.CONVERSATION_LOOP,
         )
         with self.assertRaisesRegex(ValueError, "must be false"):
             OrchestrationConfiguration(single_loop_allow_fallback=True)
@@ -668,7 +704,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             application.kernel.dependencies.orchestration_mode,
-            OrchestrationMode.SINGLE_LOOP,
+            OrchestrationMode.CONVERSATION_LOOP,
         )
         self.assertEqual(
             application.kernel.dependencies.configuration_metadata[
@@ -707,11 +743,108 @@ class OrchestrationEnvironmentOverrideTest(unittest.TestCase):
 
         self.assertEqual(
             application.kernel.dependencies.orchestration_mode,
-            OrchestrationMode.LEGACY,
+            OrchestrationMode.CONVERSATION_LOOP,
         )
         self.assertEqual(
             application.kernel.dependencies.configuration_metadata["sources"][
                 "orchestration.mode"
             ],
             "env_file",
+        )
+
+
+class ConversationLoopConfigurationTest(unittest.TestCase):
+    """The feature flag that selects the model-led loop for new Tasks."""
+
+    def _env_file(self, directory: str, extra: str = "") -> Path:
+        env_file = Path(directory) / ".env"
+        env_file.write_text(
+            "TSM_AGT_MODEL_BASE_URL=https://models.example.test/v1\n"
+            "TSM_AGT_MODEL=open\n"
+            "TSM_AGT_OPEN_MODEL=test-model\n"
+            "TSM_AGT_MODEL_API_KEY=test-secret\n" + extra,
+            encoding="utf-8",
+        )
+        return env_file
+
+    def test_default_selects_the_conversation_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = self._env_file(directory)
+            with patch.dict(os.environ, {}, clear=True):
+                application = (
+                    compose_openai_compatible_engineering_application_from_env(
+                        env_file
+                    )
+                )
+
+        self.assertEqual(
+            application.kernel.dependencies.orchestration_mode,
+            OrchestrationMode.CONVERSATION_LOOP,
+        )
+        sources = application.kernel.dependencies.configuration_metadata["sources"]
+        self.assertEqual(sources["orchestration.mode"], "default")
+        self.assertEqual(
+            sources["orchestration.conversation_loop_enabled"], "default"
+        )
+
+    def test_deprecated_flag_cannot_disable_conversation_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = self._env_file(
+                directory, "TSM_AGT_CONVERSATION_LOOP_ENABLED=false\n"
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                application = (
+                    compose_openai_compatible_engineering_application_from_env(
+                        env_file
+                    )
+                )
+
+        self.assertEqual(
+            application.kernel.dependencies.orchestration_mode,
+            OrchestrationMode.CONVERSATION_LOOP,
+        )
+        sources = application.kernel.dependencies.configuration_metadata["sources"]
+        self.assertEqual(
+            sources["orchestration.conversation_loop_enabled"], "env_file"
+        )
+
+    def test_explicit_mode_wins_over_the_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = self._env_file(
+                directory,
+                "TSM_AGT_ORCHESTRATION_MODE=single_loop\n"
+                "TSM_AGT_CONVERSATION_LOOP_ENABLED=true\n",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                application = (
+                    compose_openai_compatible_engineering_application_from_env(
+                        env_file
+                    )
+                )
+
+        self.assertEqual(
+            application.kernel.dependencies.orchestration_mode,
+            OrchestrationMode.CONVERSATION_LOOP,
+        )
+        sources = application.kernel.dependencies.configuration_metadata["sources"]
+        self.assertEqual(sources["orchestration.mode"], "env_file")
+
+    def test_invalid_flag_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "absent.env"
+            with self.assertRaisesRegex(
+                ValueError, "TSM_AGT_CONVERSATION_LOOP_ENABLED"
+            ):
+                load_orchestration_configuration(
+                    path, {"TSM_AGT_CONVERSATION_LOOP_ENABLED": "maybe"}
+                )
+
+    def test_conversation_loop_mode_value_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "absent.env"
+            configuration = load_orchestration_configuration(
+                path, {"TSM_AGT_ORCHESTRATION_MODE": "conversation_loop"}
+            )
+        self.assertEqual(
+            configuration.mode, OrchestrationMode.CONVERSATION_LOOP
         )

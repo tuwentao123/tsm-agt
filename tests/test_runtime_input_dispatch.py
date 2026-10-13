@@ -1,6 +1,6 @@
 """``Kernel.dispatch_input_event`` dispatches by table, not by an if/elif ladder.
 
-Hermes bans ``if/elif`` ladders of four or more branches keyed on a kind
+The project bans ``if/elif`` ladders of four or more branches keyed on a kind
 (``AGENTS.md:249``) and prescribes a table -> handler. The ladder this replaced
 had six branches, and its failure mode was silent: adding a seventh input kind
 without a branch fell through to whatever ``isinstance`` matched next.

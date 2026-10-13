@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 
 from tsm_agt.ports import (
@@ -61,19 +62,16 @@ class BuiltinEvidenceRelationProvider(_Lifecycle):
     ) -> tuple[EvidenceRelation, ...]:
         self._require_started()
         relations: list[EvidenceRelation] = []
-        question_id = (
-            call.evidence_question.question_id.strip()
-            if call.evidence_question is not None else ""
-        )
-        if question_id and question_id in state.question_ids:
+        fingerprint = self._call_fingerprint(call)
+        if fingerprint in state.question_ids:
             relations.append(EvidenceRelation(
                 EvidenceRelationKind.SAME_QUESTION,
-                self.descriptor.adapter_id, question_id, 1.0,
+                self.descriptor.adapter_id, fingerprint, 1.0,
             ))
-        elif question_id:
+        else:
             relations.append(EvidenceRelation(
                 EvidenceRelationKind.NEW_QUESTION,
-                self.descriptor.adapter_id, question_id, 1.0,
+                self.descriptor.adapter_id, fingerprint, 1.0,
             ))
         if (
             semantic_action is not None
@@ -89,6 +87,23 @@ class BuiltinEvidenceRelationProvider(_Lifecycle):
                 confidence=0.8,
             ))
         return tuple(relations)
+    @staticmethod
+    def _call_fingerprint(call: ToolCall) -> str:
+        payload = {
+            "tool_name": call.name,
+            "arguments": BuiltinEvidenceRelationProvider._canonical_arguments(
+                call.arguments
+            ),
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+    @staticmethod
+    def _canonical_arguments(arguments):
+        return {
+            str(key): value
+            for key, value in sorted(arguments.items(), key=lambda item: str(item[0]))
+            if value not in (None, "", (), [], {})
+        }
 
 
 class RuleBasedEvidenceRelationPolicy(_Lifecycle):
@@ -119,7 +134,7 @@ class RuleBasedEvidenceRelationPolicy(_Lifecycle):
                 "FIRST",
             )
         for kind, reason in (
-            (EvidenceRelationKind.SAME_QUESTION, "same_evidence_question"),
+            (EvidenceRelationKind.SAME_QUESTION, "same_call_fingerprint"),
             (EvidenceRelationKind.SAME_TARGET, "same_semantic_target"),
         ):
             if kind in kinds:

@@ -92,13 +92,9 @@ class StructuredEvidenceDeltaEvaluator:
             {category: tuple(sorted(values)) for category, values in known.items()},
             zero_count,
         )
-        question_id = (
-            call.evidence_question.question_id.strip()
-            if call.evidence_question is not None else ""
-        )
         return EvidenceEvaluation(
             EvidenceDelta(
-                question_id, tuple(new_items),
+                self._call_fingerprint(call), tuple(new_items),
                 (
                     f"recoverable:{result.error_code or 'TOOL_FAILED'}"
                     if recoverable_input
@@ -256,9 +252,16 @@ class StructuredEvidenceDeltaEvaluator:
     def _is_empty_observation(data: Any) -> bool:
         if not isinstance(data, Mapping):
             return data in (None, "", (), [])
+        # ``content`` covers the external source tools: ``get_file`` returns file
+        # text (a string, so it never counts as an empty sequence here) while
+        # ``search_code``/``list_tree`` return arrays, and an empty array means
+        # the call matched nothing. Without this, an external code search that
+        # found nothing was recorded as a structured *fact*, so the turn treated
+        # a no-match as evidence.
         evidence_fields = (
             "matches", "references", "definitions", "implementations",
-            "symbols", "diagnostics", "entries", "edits",
+            "symbols", "diagnostics", "entries", "edits", "content", "results",
+            "files",
         )
         present = [data[field] for field in evidence_fields if field in data]
         return bool(present) and all(
@@ -267,6 +270,13 @@ class StructuredEvidenceDeltaEvaluator:
             and len(value) == 0
             for value in present
         )
+
+    @classmethod
+    def _call_fingerprint(cls, call: ToolCall) -> str:
+        return cls._hash({
+            "tool_name": call.name,
+            "arguments": cls._stable(call.arguments),
+        })
 
     @staticmethod
     def _hash(value: Any) -> str:

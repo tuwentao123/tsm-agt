@@ -59,31 +59,17 @@ class RuleBasedProgressiveScopePolicy:
         self._require_started()
         if not self._is_search(semantic_action) or not probe.scope_hash:
             return ProgressiveScopeDecision(ProgressiveScopeAction.ALLOW, "not_scoped_search")
-        reason = (
-            call.evidence_question.scope_expansion_reason.strip()
-            if call.evidence_question is not None else ""
-        )
-        reason_hash = self._hash(reason) if reason else ""
+        fingerprint = self._call_fingerprint(call)
+        reason_hash = fingerprint
         if state.focused_scope_hash and not self._inside_focus(state, probe):
-            if reason:
-                return ProgressiveScopeDecision(
-                    ProgressiveScopeAction.ALLOW, "expanded_with_reason",
-                    "expanded", state.focused_depth, probe.depth, reason_hash,
-                )
             return ProgressiveScopeDecision(
-                ProgressiveScopeAction.REQUIRE_EXPANSION_REASON,
-                "expanded_without_reason", "expanded",
-                state.focused_depth, probe.depth,
+                ProgressiveScopeAction.ALLOW, "expanded_call_fingerprint",
+                "expanded", state.focused_depth, probe.depth, reason_hash,
             )
         if state.broad_hits_pending and probe.depth == 0:
-            if reason:
-                return ProgressiveScopeDecision(
-                    ProgressiveScopeAction.ALLOW, "repeated_broad_search_with_reason",
-                    "same", 0, 0, reason_hash,
-                )
             return ProgressiveScopeDecision(
-                ProgressiveScopeAction.REQUIRE_EXPANSION_REASON,
-                "broad_hits_require_narrowing", "same", 0, 0,
+                ProgressiveScopeAction.ALLOW, "distinct_broad_call_fingerprint",
+                "same", 0, 0, reason_hash,
             )
         previous = self._track(state, semantic_action.semantic_signature)
         if previous is None:
@@ -102,14 +88,10 @@ class RuleBasedProgressiveScopePolicy:
                 ProgressiveScopeAction.ALLOW, "expanded_after_zero_results", relation,
                 previous.depth, probe.depth, reason_hash,
             )
-        if reason:
-            return ProgressiveScopeDecision(
-                ProgressiveScopeAction.ALLOW, "expanded_with_reason", relation,
-                previous.depth, probe.depth, reason_hash,
-            )
         return ProgressiveScopeDecision(
-            ProgressiveScopeAction.REQUIRE_EXPANSION_REASON,
-            "expanded_without_reason", relation, previous.depth, probe.depth,
+            ProgressiveScopeAction.ALLOW,
+            "expanded_call_fingerprint", relation, previous.depth, probe.depth,
+            reason_hash,
         )
 
     async def after_result(
@@ -209,6 +191,21 @@ class RuleBasedProgressiveScopePolicy:
             isinstance(value, Sequence) and not isinstance(value, (str, bytes))
             and len(value) == 0 for value in present
         )
+
+    @classmethod
+    def _call_fingerprint(cls, call: ToolCall) -> str:
+        return cls._hash({
+            "tool_name": call.name,
+            "arguments": cls._canonical_arguments(call.arguments),
+        })
+
+    @staticmethod
+    def _canonical_arguments(arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {
+            str(key): value
+            for key, value in sorted(arguments.items(), key=lambda item: str(item[0]))
+            if value not in (None, "", (), [], {})
+        }
 
     @staticmethod
     def _hash(value: Any) -> str:

@@ -73,7 +73,7 @@ class RuleBasedReadHitsPolicy:
         question_hash = self._question_hash(call)
         if not question_hash or question_hash != state.question_hash:
             return ReadHitsDecision(
-                ReadHitsAction.ALLOW, "different_evidence_question",
+                ReadHitsAction.ALLOW, "different_call_fingerprint",
                 len(state.candidate_path_hashes), state.question_hash,
             )
         if self._consumes_candidate(call, state):
@@ -157,9 +157,18 @@ class RuleBasedReadHitsPolicy:
 
     @classmethod
     def _question_hash(cls, call: ToolCall) -> str:
-        if call.evidence_question is None:
-            return ""
-        return cls._hash(call.evidence_question.question_id.strip().casefold())
+        return cls._hash({
+            "tool_name": call.name,
+            "arguments": cls._canonical_arguments(call.arguments),
+        })
+
+    @classmethod
+    def _canonical_arguments(cls, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {
+            str(key): value
+            for key, value in sorted(arguments.items(), key=lambda item: str(item[0]))
+            if value not in (None, "", (), [], {})
+        }
 
     @classmethod
     def _path_hash(cls, path: str) -> str:

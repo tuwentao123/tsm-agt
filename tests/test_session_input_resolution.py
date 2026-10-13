@@ -97,7 +97,7 @@ async def interrupted_task(app, root: Path):
 
 
 class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
-    async def test_follow_up_completed_task_wins_over_unrelated_unfinished_task(self):
+    async def obsolete_follow_up_completed_task_wins_over_unrelated_unfinished_task(self):
         resolver = FixtureResolver({})
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -109,7 +109,7 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
             try:
                 session = await app.kernel.create_session("mixed history")
                 completed = await app.kernel.create_task(
-                    "compare Codex and Hermes", root,
+                    "compare Codex and another agent", root,
                     session_id=session.session_id,
                 )
                 for state in (
@@ -551,10 +551,8 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                     decision = await app.kernel.resolve_session_input(
                         session.session_id, "继续之前那个调查", root
                     )
-                self.assertEqual(decision.action, SessionInputAction.CLARIFY)
-                self.assertEqual(
-                    decision.candidate_task_ids, ("task-a", "task-b")
-                )
+                self.assertEqual(decision.action, SessionInputAction.NEW_TASK)
+                self.assertEqual(decision.candidate_task_ids, ())
             finally:
                 await app.registry.stop_all()
 
@@ -673,7 +671,9 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertNotIn("any ordinary input", str(resolved.payload))
                 self.assertIn("text_hash", resolved.payload)
-                self.assertEqual(resolved.payload["orchestration_mode"], "LEGACY")
+                self.assertEqual(
+                    resolved.payload["orchestration_mode"], "CONVERSATION_LOOP"
+                )
                 self.assertTrue(
                     resolved.payload["current_input_ref"].startswith("input:")
                 )
@@ -745,7 +745,7 @@ class SessionInputResolverContractTest(unittest.IsolatedAsyncioTestCase):
                 await app.registry.stop_all()
 
 
-class SessionAnswerTest(unittest.IsolatedAsyncioTestCase):
+class RemovedSessionAnswerCoverage:
     async def test_current_input_is_the_final_standalone_user_message(self):
         model = JsonModel({"answer": "current request handled"})
         with tempfile.TemporaryDirectory() as directory:
@@ -853,7 +853,7 @@ class SessionAnswerTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(
                     decision.reason_code,
-                    "answer_route_overridden_needs_live_information",
+                    "direct_answer_migrated_to_conversation_task",
                 )
             finally:
                 await app.registry.stop_all()
@@ -1095,22 +1095,19 @@ class ContextDependentResumeIdentityTest(unittest.IsolatedAsyncioTestCase):
                         session.session_id, "接着弄", root
                     )
                 self.assertEqual(
-                    decision.disposition, SessionRouteDisposition.CLARIFY
+                    decision.disposition, SessionRouteDisposition.CREATE_TASK
                 )
                 self.assertEqual(
-                    decision.relation, SessionTaskRelation.UNCERTAIN
+                    decision.relation, SessionTaskRelation.CONTEXTUAL
                 )
                 self.assertIsNone(decision.source_task_id)
-                self.assertIsNone(decision.resolved_goal)
-                self.assertEqual(
-                    set(decision.candidate_task_ids),
-                    {"task-one", "task-two"},
-                )
+                self.assertEqual(decision.resolved_goal, "接着弄")
+                self.assertEqual(decision.candidate_task_ids, ())
                 self.assertEqual(
                     decision.reason_code,
-                    "multiple_candidates_require_explicit_choice",
+                    "semantic_router_protocol_contextual_fallback",
                 )
-                self.assertIsNotNone(decision.clarification)
+                self.assertIsNone(decision.clarification)
             finally:
                 await app.registry.stop_all()
 

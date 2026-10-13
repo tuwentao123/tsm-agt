@@ -1,6 +1,6 @@
 """Model request/response validation, diagnostics and failure recording for `Kernel`.
 
-A mixin module in the Hermes facade+siblings shape (``run_agent.py`` +
+A mixin module in the facade-plus-siblings shape (``run_agent.py`` +
 ``agent/session_persistence.py``): the facade ``core/kernel.py`` imports
 this at module level and adds ``ModelMixin`` to ``Kernel``'s bases, so
 **every method resolves through ``Kernel``'s MRO unchanged** --
@@ -9,7 +9,7 @@ attributes all still resolve. Moved bodies are verbatim: nothing is renamed
 and no signature changes.
 
 This module must never bind the facade at module level; late-import it
-inside a method instead (Hermes ``AGENTS.md:243-244``).
+inside a method instead (the project's module-boundary rule).
 
 Moved from ``core/kernel.py``:
 
@@ -59,19 +59,18 @@ _PROTOCOL_CORRECTION_BY_REASON = {
     ),
     "invalid_tool_batch": (
         "One of your tool calls was rejected before execution: {detail} "
-        "Re-issue that call with every required argument filled in, or choose a "
-        "different approach if you cannot supply them. Do not repeat the rejected "
-        "call unchanged."
+        "Correct its name or arguments using the advertised schema and continue "
+        "the original user request. No rejected call ran. Do not replace an "
+        "unfinished requested modification with instructions, a draft, or a claim "
+        "that a tool or permission is unavailable. Do not repeat the rejected call "
+        "unchanged."
     ),
 }
 
 
 _GENERIC_PROTOCOL_CORRECTION = (
-    "Your previous response used an invalid tool-call envelope. Retry the "
-    "response once. For every tool call, pass exactly an evidence_question "
-    "object with question_id and question, plus a tool_arguments object "
-    "containing the tool's normal parameters. Do not repeat or describe the "
-    "invalid call."
+    "Your previous response used an invalid tool-call payload. Retry once with "
+    "the tool's declared parameters. Do not repeat or describe the invalid call."
 )
 
 
@@ -86,7 +85,7 @@ class ModelMixin:
         user_message = self._source_user_message(checkpoint.messages)
         llm_payload = {
             "turn_id": checkpoint.turn_id,
-            "orchestration_mode": "LEGACY",
+            "orchestration_mode": "CONVERSATION_LOOP",
             "current_input_ref": (
                 f"message:{user_message.message_id}"
                 if user_message is not None else ""
@@ -249,7 +248,6 @@ class ModelMixin:
     @staticmethod
     def _validate_agent_response(
         message: Message, finish_reason: FinishReason, *,
-        evidence_required_tools: frozenset[str] = frozenset(),
         allow_tool_calls: bool = True,
     ) -> tuple[ToolCall, ...]:
         from .kernel import Kernel
@@ -267,18 +265,6 @@ class ModelMixin:
             raise InvalidModelResponse(
                 "assistant response contains duplicate tool call_id values"
             )
-        if evidence_required_tools:
-            unbound = [
-                call.call_id for call in tool_calls
-                if call.name in evidence_required_tools
-                and call.evidence_question is None
-            ]
-            if unbound:
-                raise InvalidModelResponse(
-                    "every evidence-producing tool call must bind one "
-                    "evidence_question: "
-                    + ", ".join(unbound)
-                )
         if tool_calls and not allow_tool_calls:
             raise RecoverableToolProtocolError(
                 "tool_call_emitted_while_disabled"
@@ -427,7 +413,7 @@ class ModelMixin:
         """The retry text for one recoverable tool-protocol error.
 
         Table-driven, so a new code adds a row instead of another ladder branch,
-        and callable from a test without reading source (Hermes AGENTS.md:487-502).
+        and callable from a test without reading source (the project's phase-boundary rule).
         """
         from .kernel import Kernel
 

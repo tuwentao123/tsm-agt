@@ -96,6 +96,13 @@ from .task_spec_planner import TaskSpecPlannerPort
 from .rubric_judge import (
     JudgeVerdict, RubricEvidence, RubricJudgePort, RubricJudgement,
 )
+from .turn_finalization import (
+    CompletionReviewAction, CompletionReviewError,
+    CompletionReviewFailurePolicy, CompletionReviewerPort,
+    CompletionReviewMode, CompletionReviewVerdict, FinalizationAction,
+    FinalizationCandidate, FinalizationDecision, ToolExecutionSummary,
+    TurnFinalizationFailed, TurnStopPolicyPort,
+)
 from .checkpoint_compatibility import (
     CheckpointCompatibilityAction, CheckpointCompatibilityDecision,
     CheckpointCompatibilityPolicyPort, CheckpointCompatibilityProbe,
@@ -121,11 +128,7 @@ from .progressive_scope_policy import (
     ProgressiveScopePolicyPort, ProgressiveScopeState, ProgressiveScopeUpdate,
     ScopeProbe, ScopeTrack,
 )
-from .completion_readiness import (
-    CompletionGap, CompletionReadinessAction, CompletionReadinessDecision,
-    CompletionReadinessMode, CompletionReadinessPolicyPort,
-    CompletionReadinessProbe, CompletionReadinessState,
-)
+from .completion_gap import CompletionGap
 from .final_acceptance import (
     FinalAcceptanceAction, FinalAcceptanceDecision, FinalAcceptancePolicyPort,
     FinalAcceptanceProbe, FinalAcceptanceViolation, FinalQuestionEvidence,
@@ -165,20 +168,7 @@ from .investigation_status import (
 from .investigation_flow import (
     InvestigationFlowFact, InvestigationFlowProjectorPort,
 )
-from .evidence import (
-    ContractAuthority,
-    ContractPhase,
-    EvidenceCapability as TypedEvidenceCapability,
-    EvidenceFact,
-    EvidenceGatePort,
-    EvidenceRequirement,
-    GateDecision,
-    GateResolution,
-    RecoveryAction,
-    TaskContract,
-)
 from .tool import (
-    EvidenceQuestion,
     SourceArtifact,
     ToolFactDescriptor,
     OutcomeBindingMode,
@@ -190,7 +180,6 @@ from .tool import (
     ToolMemoryControl,
     ToolWorkingMemoryControl,
     ToolTaskSpecControl,
-    ToolTurnIntentControl,
     ToolProviderPort,
     ToolProcessControl,
     ToolWorkspaceControl,
@@ -201,9 +190,6 @@ from .tool import (
     ToolRisk,
     ToolProtocol,
     ToolSpec,
-    EvidenceCapability,
-    EXPLICIT_ONLY_EVIDENCE_CAPABILITIES,
-    derive_evidence_capabilities,
 )
 
 __all__ = [
@@ -228,33 +214,13 @@ __all__ = [
     "ConclusionBlock",
     "ConclusionProtocolMode",
     "ImageBlock",
-    "EvidenceQuestion",
     "SourceArtifact",
     "ToolFactDescriptor",
     "WebEgressMode",
     "ToolEffect",
     "ToolResultAuthority",
-    "EvidenceCapability",
-    "TypedEvidenceCapability",
-    "ContractAuthority",
-    "ContractPhase",
-    "EvidenceFact",
-    "EvidenceGatePort",
-    "EvidenceRequirement",
-    "GateDecision",
-    "GateResolution",
-    "RecoveryAction",
-    "TaskContract",
-    "EXPLICIT_ONLY_EVIDENCE_CAPABILITIES",
-    "derive_evidence_capabilities",
     "ToolProtocol",
     "CompletionGap",
-    "CompletionReadinessAction",
-    "CompletionReadinessDecision",
-    "CompletionReadinessMode",
-    "CompletionReadinessPolicyPort",
-    "CompletionReadinessProbe",
-    "CompletionReadinessState",
     "FinalAcceptanceAction",
     "FinalAcceptanceDecision",
     "FinalAcceptancePolicyPort",
@@ -412,7 +378,6 @@ __all__ = [
     "ToolMemoryControl",
     "ToolWorkingMemoryControl",
     "ToolTaskSpecControl",
-    "ToolTurnIntentControl",
     "ToolProviderPort",
     "ToolProcessControl",
     "ToolWorkspaceControl",

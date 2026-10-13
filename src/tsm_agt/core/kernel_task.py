@@ -1,6 +1,6 @@
 """Task lifecycle and Task SPEC planning for `Kernel`.
 
-A mixin module in the Hermes facade+siblings shape (``run_agent.py`` +
+A mixin module in the facade-plus-siblings shape (``run_agent.py`` +
 ``agent/session_persistence.py``): the facade ``core/kernel.py`` imports
 this at module level and adds ``TaskMixin`` to ``Kernel``'s bases, so
 **every method resolves through ``Kernel``'s MRO unchanged** --
@@ -9,7 +9,7 @@ attributes all still resolve. Moved bodies are verbatim: nothing is renamed
 and no signature changes.
 
 This module must never bind the facade at module level; late-import it
-inside a method instead (Hermes ``AGENTS.md:243-244``).
+inside a method instead (the project's module-boundary rule).
 
 Moved from ``core/kernel.py``:
 
@@ -45,17 +45,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from tsm_agt.ports import (
-    Message, MessageRole, RuntimeEvent, RuntimeUnitOfWork, SessionEvent,
+    CompletionGap, Message, MessageRole, RuntimeEvent, RuntimeUnitOfWork, SessionEvent,
     SessionTaskUnitOfWork, SessionUnitOfWork, TextBlock, ToolResult,
     ModelAttemptFailed, ModelFailureCategory, ModelRecoveryAction,
     ModelRecoveryExhausted, ModelRetrySafety,
 )
-from tsm_agt.ports.evidence import (
-    ContractAuthority, ContractPhase, TaskContract,
-)
 from typing import Any
 from uuid import uuid4
-from .agent_loop import AgentContinuationSuspended, AgentTurnCheckpoint
+from .agent_loop import AgentTurnCheckpoint
 from .configuration import canonical_hash
 from .document_references import extract_document_references
 from .runtime_input import SessionTaskRelation
@@ -64,14 +61,17 @@ from .session_context import (
     ContextAuthority, ContextScope, SessionConversationMessage,
 )
 from .session_handoff import clip_text
-from .single_loop import (
+from .conversation_orchestration import (
     OrchestrationMode,
     TaskBindingKind,
     TaskOrchestrationMetadata,
     TaskOrchestrationProjector,
 )
 from .steering import SteeringKind, SteeringProjector
-from .task import TaskNotFound, TaskSnapshot, TaskState
+from .task import (
+    SUPERSEDED_CONVERSATION_STATE, TaskKind, TaskNotFound, TaskSnapshot,
+    TaskState,
+)
 from .task_spec import (
     MAX_AUTHORED_ACCEPTANCE_CRITERIA, REQUIRED_EFFECT_CRITERION_ID,
     RUNTIME_AUTHORED_CRITERION_KINDS, TaskAcceptanceCriterion,
@@ -101,7 +101,7 @@ def _required_effect_criterion(
     return TaskAcceptanceCriterion(
         criterion_id=REQUIRED_EFFECT_CRITERION_ID,
         description=(
-            "Every side effect the Task contract declares as required has a "
+            "Every side effect the Task spec declares as required has a "
             f"durable record of actually being performed: {named} "
             "(a surviving workspace change for mutate, a successful committed "
             "execution for execute)."
@@ -393,9 +393,14 @@ class TaskMixin:
         """Ask the semantic Planner for a proposal; Runtime owns persistence."""
         planner = self._dependencies.task_spec_planner
         current = await self.get_task_spec(task_id)
+        task = await self.get_task(task_id)
+        # A conversation spans unrelated requests, so one acceptance SPEC cannot
+        # describe it. Its per-request meaning lives in the turn messages, and
+        # the initial advisory spec is kept as-is.
+        if task.task_kind is TaskKind.CONVERSATION:
+            return current
         if planner is None or current.outcomes:
             return current
-        task = await self.get_task(task_id)
         try:
             (
                 current_request,
@@ -480,7 +485,7 @@ class TaskMixin:
             )
             await self._append_events(task_id, (("task_spec.revised", {
                 "writer": "task-spec-planner",
-                "orchestration_mode": "LEGACY",
+                "orchestration_mode": OrchestrationMode.CONVERSATION_LOOP.value,
                 "revision": candidate.revision,
                 "content_hash": candidate.content_hash,
                 "snapshot": candidate.to_data(),
@@ -536,7 +541,7 @@ class TaskMixin:
         operation_id: str, writer: str, goal: str | None = None,
         allow_goal_change: bool = False,
     ) -> TaskSpecSnapshot:
-        """Revise one Task contract; only Replace may change its goal."""
+        """Revise one Task spec; only Replace may change its goal."""
         for item in acceptance_criteria:
             validate_authored_criterion(
                 item.verification_kind, item.evidence_reference, item.command,
@@ -613,6 +618,43 @@ class TaskMixin:
         ))
         return candidate
 
+    async def _supersede_idle_conversations(
+        self, session: SessionSnapshot,
+    ) -> None:
+        """Close idle conversation tasks before creating a new conversation.
+
+        Enforces "at most one CONVERSATION task per Session" and repairs any
+        history that predates the invariant. Each close is its own commit, so a
+        failure between closing and creating leaves the old conversation closed
+        but still readable -- never two live conversations.
+        """
+
+        for task_id in session.task_ids:
+            stored = await self._dependencies.store.load_task(task_id)
+            if stored is None:
+                continue
+            task = TaskSnapshot.from_data(stored.data)
+            if not (
+                task.task_kind is TaskKind.CONVERSATION
+                and task.state is TaskState.AWAITING_INPUT
+            ):
+                continue
+            # Replacement is not a verified success: close it directly instead
+            # of walking the acceptance-gated SUCCESS_PATH.
+            superseded = task.transition(SUPERSEDED_CONVERSATION_STATE)
+            event = RuntimeEvent(
+                f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
+                "task.state_changed", {
+                    "previous_state": task.state.value,
+                    "next_state": superseded.state.value,
+                    "reason": "superseded by new conversation",
+                },
+            )
+            await self._dependencies.store.commit(RuntimeUnitOfWork(
+                task_id, stored.version, superseded.to_data(), (event,)
+            ))
+            await self._record_session_task_state(superseded)
+
     async def create_task(
         self, goal: str, workspace: Path, task_id: str | None = None,
         session_id: str | None = None, command_id: str | None = None,
@@ -620,7 +662,6 @@ class TaskMixin:
         task_relation: SessionTaskRelation = SessionTaskRelation.INDEPENDENT,
         original_user_text: str | None = None,
         context_handoff: Mapping[str, Any] | None = None,
-        evidence_contract: TaskContract | None = None,
     ) -> TaskSnapshot:
         """Create one Task and attach it to its Session.
 
@@ -633,9 +674,6 @@ class TaskMixin:
         normalized_goal = goal.strip()
         if not normalized_goal:
             raise ValueError("task goal must not be empty")
-        provided_contract_data = (
-            evidence_contract.to_data() if evidence_contract is not None else None
-        )
         if command_id is not None:
             if not command_id.strip():
                 raise ValueError("command_id must not be empty")
@@ -653,21 +691,9 @@ class TaskMixin:
                 requested_workspace = self._dependencies.workspace_path.normalize_workspace(
                     workspace
                 )
-                prior_events = await self._dependencies.store.read_events(prior_task_id)
-                created = next(
-                    (
-                        event for event in reversed(prior_events)
-                        if event.event_type == "task.created"
-                    ),
-                    None,
-                )
-                prior_contract = (
-                    created.payload.get("evidence_contract") if created is not None else None
-                )
                 if (
                     prior_task.goal != normalized_goal
                     or prior_workspace != requested_workspace
-                    or canonical_hash(prior_contract) != canonical_hash(provided_contract_data)
                 ):
                     raise ValueError("command_id was reused with different Task input")
                 return prior_task
@@ -676,30 +702,6 @@ class TaskMixin:
         )
 
         identity = task_id or f"task-{uuid4().hex}"
-        contract_data = provided_contract_data
-        initial_contract: TaskContract
-        initial_contract_event: str
-        if evidence_contract is None:
-            initial_contract = TaskContract(
-                contract_id=f"contract-{uuid4().hex}",
-                revision=1,
-                objective=normalized_goal,
-                authority=ContractAuthority.MODEL_DRAFT,
-                phase=ContractPhase.DRAFT,
-                guidance={"draft_source": "deterministic_goal_metadata"},
-            )
-            initial_contract_event = "contract.drafted"
-        else:
-            initial_contract = replace(
-                evidence_contract,
-                contract_id=(
-                    evidence_contract.contract_id or f"contract-{uuid4().hex}"
-                ),
-                revision=1,
-                authority=ContractAuthority.USER_EXPLICIT,
-                phase=ContractPhase.ACTIVE,
-            )
-            initial_contract_event = "contract.created_by_user"
         session_identity = session_id or standalone_session_id(identity)
         session_stored = await self._dependencies.store.load_session(session_identity)
         if session_stored is None:
@@ -740,6 +742,31 @@ class TaskMixin:
                 )
         elif source_task_id is not None:
             raise ValueError("non-derived Task cannot have a source Task")
+        # A conversation is the durable unit: only an independent Task created
+        # under the conversation loop is one. Derived/follow-up work stays a
+        # work item so it keeps the one-turn completion path.
+        task_kind = (
+            TaskKind.CONVERSATION
+            if (
+                source_task_id is None
+                and self._dependencies.orchestration_mode
+                is OrchestrationMode.CONVERSATION_LOOP
+            )
+            else TaskKind.WORK_ITEM
+        )
+        if task_kind is TaskKind.CONVERSATION:
+            await self._supersede_idle_conversations(session)
+            if session_stored is not None:
+                # Superseding wrote session events, so the version and sequence
+                # read above are stale; reload before the atomic create commit.
+                reloaded = await self._dependencies.store.load_session(
+                    session_identity
+                )
+                assert reloaded is not None
+                session = SessionSnapshot.from_data(reloaded.data)
+                session_version = reloaded.version
+                session_sequence = reloaded.last_event_sequence
+                attach_sequence = session_sequence + 1
         session = session.attach_task(identity)
         attached_payload: dict[str, Any] = {
             "task_id": identity, "active_task_id": identity,
@@ -779,6 +806,7 @@ class TaskMixin:
             goal=normalized_goal,
             workspace=str(resolved_workspace),
             session_id=session_identity,
+            task_kind=task_kind,
         ).with_project_trust(
             trust.level, trust.fingerprint, trust.subject
         ).with_workspace_baseline(baseline)
@@ -820,9 +848,8 @@ class TaskMixin:
             event_type="task.created",
             payload={
                 "goal": snapshot.goal, "workspace": snapshot.workspace,
-                "evidence_contract": contract_data,
                 "session_id": session_identity,
-                "single_loop": orchestration_metadata.to_data(),
+                "conversation": orchestration_metadata.to_data(),
                 "source_task_id": source_task_id,
                 "task_relation": task_relation.value,
                 # INV-9: a derived Task's source facts are persisted separately
@@ -850,25 +877,13 @@ class TaskMixin:
                 },
             },
         )
-        contract_event = RuntimeEvent(
-            event_id=f"evt-{uuid4().hex}",
-            task_id=snapshot.task_id,
-            sequence=2,
-            event_type=initial_contract_event,
-            payload={
-                "command_id": command_id or f"task-create-contract-{identity}",
-                "request_hash": canonical_hash(initial_contract.to_data()),
-                "content_hash": canonical_hash(initial_contract.to_data()),
-                "snapshot": initial_contract.to_data(),
-            },
-        )
         await self._dependencies.store.commit_session_and_task(SessionTaskUnitOfWork(
             SessionUnitOfWork(
                 session_identity, session_version, session.to_data(), session_events
             ),
             RuntimeUnitOfWork(
                 snapshot.task_id, 0, snapshot.to_data(),
-                (event, contract_event),
+                (event,),
             ),
             command_id or f"command-create-task-{uuid4().hex}",
         ))
@@ -893,7 +908,19 @@ class TaskMixin:
                     "Pass the requested path; Runtime may require Task-scoped approval."
                 ),
             },
-            "task_spec": snapshot.to_data(),
+            "task_spec": (
+                # A conversation spans unrelated requests: the initial SPEC is
+                # background, never the acceptance criteria for the current turn.
+                {
+                    "advisory": True,
+                    "reason": (
+                        "conversation task; the current request is the latest "
+                        "user message"
+                    ),
+                }
+                if task.task_kind is TaskKind.CONVERSATION
+                else snapshot.to_data()
+            ),
         }
         body = json.dumps(
             context_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -916,15 +943,6 @@ class TaskMixin:
         task = await self.get_task(task_id)
         events = await self._dependencies.store.read_events(task_id)
         return TaskOrchestrationProjector.project(task_id, task.goal, events)
-
-    async def require_legacy_task_orchestration(self, task_id: str) -> None:
-        """Prevent a fixed single-loop Task from entering the legacy runner."""
-        metadata = await self.get_task_orchestration_metadata(task_id)
-        if metadata.orchestration_mode is not OrchestrationMode.LEGACY:
-            raise InvalidTurnState(
-                f"task {task_id} is fixed to {metadata.orchestration_mode.value}; "
-                "the legacy Agent loop cannot run or resume it"
-            )
 
     async def transition_task(
         self, task_id: str, target: TaskState, reason: str, *,
@@ -1205,59 +1223,3 @@ class TaskMixin:
         except (InvalidTurnState, TaskNotFound):
             return False
         return True
-
-    async def _finalize_needs_review(
-        self, checkpoint: AgentTurnCheckpoint, gaps: tuple[CompletionGap, ...],
-        *, reason: str, stalled: int, message: Message,
-    ) -> AgentContinuationSuspended:
-        """Terminate an unclosable required gap as a human-review state.
-
-        INV-4's bounded escape hatch: after the stall cap the Runtime must stop
-        and hand the decision to a human instead of suspending forever in
-        AWAITING_USER. ``message`` is the model's last user-facing text so the
-        caller can still show what was produced.
-        """
-        stored = await self._require_stored_task(checkpoint.task_id)
-        task = TaskSnapshot.from_data(stored.data)
-        if task.state not in {TaskState.EXECUTING, TaskState.AWAITING_USER}:
-            raise InvalidTurnState(
-                "needs-review finalization requires EXECUTING/AWAITING_USER, "
-                f"got {task.state.value}"
-            )
-        finalized = task.transition(TaskState.NEEDS_REVIEW).with_agent_checkpoint(
-            replace(
-                checkpoint,
-                revision=checkpoint.revision + 1,
-                pending_user_action={},
-            ).to_data()
-        )
-        required_gap_ids = tuple(gap.gap_id for gap in gaps if gap.required)
-        events = (
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", checkpoint.task_id,
-                stored.last_event_sequence + 1,
-                "completion.finalized_needs_review", {
-                    "turn_id": checkpoint.turn_id,
-                    "reason": reason,
-                    "stalled_continuations": stalled,
-                    "unmet_gap_ids": list(required_gap_ids),
-                },
-            ),
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", checkpoint.task_id,
-                stored.last_event_sequence + 2, "task.state_changed", {
-                    "previous_state": task.state.value,
-                    "next_state": finalized.state.value,
-                    "reason": reason,
-                },
-            ),
-        )
-        await self._dependencies.store.commit(RuntimeUnitOfWork(
-            checkpoint.task_id, stored.version, finalized.to_data(), events
-        ))
-        # NEEDS_REVIEW is terminal: release its in-process resources now.
-        await self._close_cancellation_scope(checkpoint.task_id)
-        return AgentContinuationSuspended(
-            checkpoint.task_id, checkpoint.turn_id,
-            checkpoint.revision + 1, (), required_gap_ids, message,
-        )

@@ -55,6 +55,13 @@ _EFFECTFUL_AUTHORITIES = frozenset({
     ToolResultAuthority.PROCESS_FACT, ToolResultAuthority.MUTATION_FACT,
 })
 
+#: Authorities whose payload carries a captured process outcome. An invocation
+#: that fetched public material is labelled ``EXTERNAL_SERVICE`` even though a
+#: command ran, so its exit status still has to be read the same way.
+_PROCESS_OUTCOME_AUTHORITIES = frozenset({
+    ToolResultAuthority.PROCESS_FACT, ToolResultAuthority.EXTERNAL_SERVICE,
+})
+
 _CANCELLED_CODES = frozenset({"PROCESS_CANCELLED", "CANCELLED"})
 
 
@@ -206,13 +213,13 @@ def classify_effect_status(
         return (EffectStatus.UNKNOWN, "CANCELLED")
     if invocation_state is ToolCommitState.UNKNOWN_OUTCOME:
         return (EffectStatus.UNKNOWN, "UNKNOWN_OUTCOME")
-    if authority is ToolResultAuthority.PROCESS_FACT and (
+    if authority in _PROCESS_OUTCOME_AUTHORITIES and (
         str(payload.get("status", "")).strip().lower() == "cancelled"
     ):
         return (EffectStatus.UNKNOWN, "PROCESS_CANCELLED")
     if not ok:
         return (EffectStatus.FAILED, error_code or "TOOL_ERROR")
-    if authority is ToolResultAuthority.PROCESS_FACT and (
+    if authority in _PROCESS_OUTCOME_AUTHORITIES and (
         payload.get("succeeded") is False
     ):
         return (
@@ -249,8 +256,7 @@ def project_tool_execution_fact(
     """Project any terminal execution, including successful observations.
 
     This has no completion semantics. ``ExecutionFact`` remains the narrower
-    delivery-effect projection consumed by legacy readiness logic, while this
-    broader projection is written only as a SINGLE_LOOP shadow event in PR-A.
+    delivery-effect projection used by compatibility diagnostics.
     """
     effect, authority = _execution_semantics(record, spec)
     if record.state is ToolCommitState.CANCELLED:

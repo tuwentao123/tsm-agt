@@ -44,6 +44,174 @@ class CommandRiskPolicyTest(unittest.TestCase):
                 self.assertEqual(decision.action, PolicyAction.REQUIRE_APPROVAL)
                 self.assertFalse(decision.requires_network)
 
+    def test_reading_a_public_repository_needs_no_approval(self) -> None:
+        for argv in (
+            ["git", "clone", "https://github.com/openai/codex"],
+            ["git", "clone", "--depth", "1", "https://github.com/openai/codex", "vendor/codex"],
+            ["git", "-C", ".", "fetch", "origin"],
+            ["git", "ls-remote", "https://github.com/openai/codex", "HEAD"],
+        ):
+            with self.subTest(argv=argv):
+                decision = self.policy.evaluate(
+                    self.spec,
+                    ToolCall("call-fetch", "core.run_command", {"argv": argv}),
+                    ProjectTrustLevel.TRUSTED_BUILD,
+                )
+                self.assertEqual(decision.action, PolicyAction.ALLOW)
+                self.assertIn("read-only source retrieval", decision.reason)
+
+    def test_config_or_program_injection_keeps_approval(self) -> None:
+        for argv in (
+            ["git", "clone", "--config=core.fsmonitor=/evil", "https://github.com/openai/codex"],
+            ["git", "clone", "--upload-pack", "/evil", "https://github.com/openai/codex"],
+            ["git", "clone", "--template", "/evil", "https://github.com/openai/codex"],
+            ["git", "clone", "--separate-git-dir=/elsewhere", "https://github.com/openai/codex"],
+        ):
+            with self.subTest(argv=argv):
+                decision = self.policy.evaluate(
+                    self.spec,
+                    ToolCall("call-inject", "core.run_command", {"argv": argv}),
+                    ProjectTrustLevel.TRUSTED_BUILD,
+                )
+                self.assertNotEqual(decision.action, PolicyAction.ALLOW)
+
+    def test_remote_writes_never_borrow_the_read_only_exemption(self) -> None:
+        for argv in (
+            ["git", "push", "origin", "main"],
+            ["git", "reset", "--hard"],
+            ["git", "clean", "-fd"],
+            ["git", "pull"],
+            ["npm", "publish"],
+        ):
+            with self.subTest(argv=argv):
+                decision = self.policy.evaluate(
+                    self.spec,
+                    ToolCall("call-write", "core.run_command", {"argv": argv}),
+                    ProjectTrustLevel.TRUSTED_BUILD,
+                )
+                self.assertNotEqual(decision.action, PolicyAction.ALLOW)
+
+    def test_reading_github_with_gh_needs_no_approval(self) -> None:
+        for argv in (
+            ["gh", "api", "-H", "Accept: application/vnd.github.raw",
+             "repos/openai/codex/contents/README.md"],
+            ["gh", "api", "repos/openai/codex/git/trees/main?recursive=1",
+             "--jq", ".tree[].path"],
+            ["gh", "search", "code", "agent loop"],
+            ["gh", "auth", "status"],
+            ["gh", "repo", "view", "openai/codex"],
+        ):
+            with self.subTest(argv=argv):
+                decision = self.policy.evaluate(
+                    self.spec,
+                    ToolCall("call-gh-read", "core.run_command", {"argv": argv}),
+                    ProjectTrustLevel.TRUSTED_BUILD,
+                )
+                self.assertEqual(decision.action, PolicyAction.ALLOW)
+
+    def test_a_shell_is_denied_outright_not_parked_for_approval(self) -> None:
+        for argv in (
+            ["bash", "-lc", "gh repo list"],
+            ["sh", "-c", "ls"],
+            ["/bin/zsh", "-lc", "pwd"],
+            ["powershell", "-Command", "ls"],
+        ):
+            with self.subTest(argv=argv):
+                decision = self.policy.evaluate(
+                    self.spec,
+                    ToolCall("call-shell", "core.run_command", {"argv": argv}),
+                    ProjectTrustLevel.TRUSTED_BUILD,
+                )
+                # The sandbox never authorizes a shell, so an approval request
+                # would only park the turn; the model must be told to retry.
+                self.assertEqual(decision.action, PolicyAction.DENY)
+                self.assertIn("shell executable is denied", decision.reason)
+
+    def test_invocation_authority_follows_the_classification(self) -> None:
+        from tsm_agt.ports import ToolResultAuthority
+
+        for argv in (
+            ["gh", "api", "repos/openai/codex/contents/README.md"],
+            ["git", "clone", "https://github.com/openai/codex"],
+            ["git", "fetch", "origin"],
+        ):
+            with self.subTest(argv=argv):
+                call = ToolCall("call-auth", "core.run_command", {"argv": argv})
+                self.assertTrue(self.policy.is_external_source_read(call))
+                self.assertIs(
+                    self.policy.execution_result_authority(self.spec, call),
+                    ToolResultAuthority.EXTERNAL_SERVICE,
+                )
+
+        for argv in (
+            ["python3", "-m", "pytest"],
+            ["git", "push", "origin", "main"],
+            ["gh", "api", "-X", "POST", "repos/x/y/issues"],
+        ):
+            with self.subTest(argv=argv):
+                call = ToolCall("call-auth", "core.run_command", {"argv": argv})
+                self.assertFalse(self.policy.is_external_source_read(call))
+                self.assertIs(
+                    self.policy.execution_result_authority(self.spec, call),
+                    ToolResultAuthority.PROCESS_FACT,
+                )
+
+    def test_source_retrieval_is_narrower_than_external_access(self) -> None:
+        from tsm_agt.ports import ToolCall as Call
+
+        def call(argv):
+            return Call("c", "core.run_command", {"argv": argv})
+
+        for argv, retrieves, approval_free in (
+            (["gh", "api", "repos/o/r/contents/a.py"], True, True),
+            (["git", "clone", "https://github.com/o/r"], True, True),
+            (["git", "fetch", "origin"], True, True),
+            (["git", "ls-remote", "https://github.com/o/r"], False, True),
+            (["gh", "search", "code", "x"], False, True),
+            (["gh", "repo", "view", "o/r"], False, True),
+            (["python3", "-m", "pytest"], False, False),
+        ):
+            with self.subTest(argv=argv):
+                # Only the calls that bring or read content count as having
+                # read a source; the ref listing and the views are a cheaper
+                # kind of access that completion must not accept.
+                self.assertEqual(
+                    self.policy.retrieves_external_source(call(argv)), retrieves
+                )
+                self.assertEqual(
+                    self.policy.is_external_source_read(call(argv)), approval_free
+                )
+
+    def test_gh_writes_never_borrow_the_read_only_exemption(self) -> None:
+        for argv in (
+            ["gh", "api", "-X", "POST", "repos/x/y/issues", "-f", "title=t"],
+            ["gh", "api", "-f", "title=t", "repos/x/y/issues"],
+            ["gh", "api", "--method=DELETE", "repos/x/y"],
+            ["gh", "api", "graphql", "-f", "query=x"],
+            ["gh", "auth", "login"],
+            ["gh", "repo", "clone", "openai/codex"],
+            ["gh", "release", "create", "v1"],
+        ):
+            with self.subTest(argv=argv):
+                decision = self.policy.evaluate(
+                    self.spec,
+                    ToolCall("call-gh-write", "core.run_command", {"argv": argv}),
+                    ProjectTrustLevel.TRUSTED_BUILD,
+                )
+                self.assertNotEqual(decision.action, PolicyAction.ALLOW)
+
+    def test_untrusted_workspace_still_denies_repository_commands(self) -> None:
+        decision = self.policy.evaluate(
+            self.spec,
+            ToolCall(
+                "call-untrusted",
+                "core.run_command",
+                {"argv": ["git", "clone", "https://github.com/openai/codex"]},
+            ),
+            ProjectTrustLevel.UNTRUSTED,
+        )
+        self.assertEqual(decision.action, PolicyAction.DENY)
+
     def test_dependency_network_and_device_writes_escalate_to_r3(self) -> None:
         cases = (
             (["npm", "install"], True),
@@ -65,7 +233,7 @@ class CommandRiskPolicyTest(unittest.TestCase):
 
     def test_previously_r4_commands_now_require_r3_approval(self) -> None:
         cases = (
-            ["bash", "-c", "echo unsafe"],
+            # A shell is refused outright; see the dedicated test above.
             ["python3", "-c", "print('unclassified')"],
             ["rm", "-rf", "build"],
             ["git", "push", "origin", "main"],

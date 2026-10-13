@@ -91,26 +91,13 @@ class WebPhase1StateTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("function renderTodoPanel(todoList)", web_app.INDEX_HTML)
         self.assertIn("renderTodoPanel(task.todoList)", web_app.INDEX_HTML)
 
-    async def test_ui_projects_incomplete_boundary_without_success_presentation(
-        self,
-    ) -> None:
+    async def test_ui_omits_retired_single_loop_projection(self) -> None:
         html = web_app.INDEX_HTML
 
-        self.assertIn("任务暂未完成", html)
-        self.assertIn("当前无法安全声明任务已完成，已保留本次进度和已获取的证据。", html)
-        self.assertIn("另有 ${gaps.length - 3} 项未完成", html)
-        self.assertIn("继续排查", html)
-        self.assertIn("提供信息", html)
-        self.assertIn("新建任务", html)
-        self.assertIn("需要你的确认后才能继续", html)
-        self.assertIn("查看并确认", html)
-        self.assertIn("singleLoop: task.single_loop || null", html)
-        self.assertIn("taskOrchestrationMode(task)", html)
-        self.assertIn("renderSingleLoopCompletion(task)", html)
-        self.assertIn("completion.committed_delta", html)
-        self.assertIn("completion.divergences", html)
-        self.assertIn("completion-value", html)
-        self.assertIn("task-card-state.incomplete", html)
+        self.assertNotIn("single_loop", html)
+        self.assertNotIn("singleLoop", html)
+        self.assertNotIn("incomplete_boundary", html)
+        self.assertNotIn("renderSingleLoopCompletion", html)
 
 
 class WorkspaceDirectoryPickerTest(unittest.IsolatedAsyncioTestCase):

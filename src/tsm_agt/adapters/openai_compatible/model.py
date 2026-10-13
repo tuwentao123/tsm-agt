@@ -34,7 +34,7 @@ from tsm_agt.ports import (
     RecoverableToolProtocolError,
     TextBlock,
     ToolCall,
-    EvidenceQuestion, ImageBlock, ToolCallBlock,
+    ImageBlock, ToolCallBlock,
     ToolResultBlock,
 )
 
@@ -189,12 +189,6 @@ class OpenAICompatibleModelProvider:
         )
         normalized = self._normalize_response(
             request.turn_id, response, provider_to_internal,
-            require_evidence_questions=request.require_evidence_questions,
-            evidence_required_tools=frozenset(
-                tool.name for tool in request.tools
-                if request.require_evidence_questions
-                and tool.requires_evidence_question
-            ),
             allow_text_tool_fallback=request.allow_tool_calls,
             allowed_outcome_refs=frozenset(request.outcome_refs),
             conclusion_protocol_mode=request.conclusion_protocol_mode,
@@ -455,12 +449,6 @@ class OpenAICompatibleModelProvider:
                 "usage": usage,
             },
             provider_to_internal,
-            require_evidence_questions=request.require_evidence_questions,
-            evidence_required_tools=frozenset(
-                tool.name for tool in request.tools
-                if request.require_evidence_questions
-                and tool.requires_evidence_question
-            ),
             allow_text_tool_fallback=request.allow_tool_calls,
             allowed_outcome_refs=frozenset(request.outcome_refs),
             conclusion_protocol_mode=request.conclusion_protocol_mode,
@@ -712,11 +700,6 @@ class OpenAICompatibleModelProvider:
         provider_messages = [
             self._message_to_provider(
                 message, history_to_provider,
-                frozenset(
-                    tool.name for tool in request.tools
-                    if request.require_evidence_questions
-                    and tool.requires_evidence_question
-                ),
                 frozenset(request.outcome_refs),
             )
             for message in request.messages
@@ -740,8 +723,6 @@ class OpenAICompatibleModelProvider:
                 provider_name = internal_to_provider[tool.name]
                 encoded_tools.append(self._tool_to_provider(
                     tool, provider_name,
-                    request.require_evidence_questions
-                    and tool.requires_evidence_question,
                     self._strict_tool_schema,
                     tool_outcome_refs.get(tool.name, request.outcome_refs),
                 ))
@@ -753,47 +734,11 @@ class OpenAICompatibleModelProvider:
 
     @staticmethod
     def _tool_to_provider(
-        tool: Any, provider_name: str, require_evidence_questions: bool,
-        strict_tool_schema: bool,
+        tool: Any, provider_name: str, strict_tool_schema: bool,
         outcome_refs: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         parameters = dict(tool.parameters)
         description = tool.description
-        if require_evidence_questions:
-            parameters = {
-                "type": "object",
-                "properties": {
-                    "evidence_question": {
-                        "type": "object",
-                        "properties": {
-                            "question_id": {"type": "string"},
-                            "question": {"type": "string"},
-                            "scope_expansion_reason": {"type": "string"},
-                            "expected_scope": {"type": "string"},
-                        },
-                        "required": [
-                            "question_id", "question", "expected_scope"
-                        ],
-                        "additionalProperties": False,
-                    },
-                    "tool_arguments": parameters,
-                },
-                "required": ["evidence_question", "tool_arguments"],
-                "additionalProperties": False,
-            }
-            description = (
-                f"{description} Before invoking it, bind the call to one concrete "
-                "evidence question: a stable question_id and the unknown this "
-                "result should clarify. Put the tool's normal parameters in "
-                "tool_arguments. The function arguments must be exactly "
-                "{\"evidence_question\":{\"question_id\":\"Q1\","
-                "\"question\":\"What unknown will this resolve?\","
-                "\"expected_scope\":\"the path this question is about\"},"
-                "\"tool_arguments\":{...}}. If deliberately expanding a previously narrowed "
-                "search scope, add scope_expansion_reason; otherwise omit it. "
-                "For tools without a filesystem scope, expected_scope is an "
-                "empty string."
-            )
         if outcome_refs:
             properties = dict(parameters.get("properties", {}))
             properties["outcome_ref"] = {
@@ -819,7 +764,6 @@ class OpenAICompatibleModelProvider:
     @staticmethod
     def _message_to_provider(
         message: Message, internal_to_provider: Mapping[str, str],
-        evidence_required_tools: frozenset[str],
         outcome_refs: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         if message.role is MessageRole.TOOL:
@@ -870,23 +814,11 @@ class OpenAICompatibleModelProvider:
                     "function": {
                         "name": internal_to_provider[call.name],
                         "arguments": json.dumps(
-                            (
-                                {
-                                    "evidence_question": (
-                                        call.evidence_question.to_data()
-                                        if call.evidence_question is not None else None
-                                    ),
-                                    "tool_arguments": dict(call.arguments),
-                                    **({"outcome_ref": call.outcome_ref}
-                                       if call.outcome_ref is not None else {}),
-                                }
-                                if call.name in evidence_required_tools
-                                else {
-                                    **dict(call.arguments),
-                                    **({"outcome_ref": call.outcome_ref}
-                                       if call.outcome_ref is not None else {}),
-                                }
-                            ),
+                            {
+                                **dict(call.arguments),
+                                **({"outcome_ref": call.outcome_ref}
+                                   if call.outcome_ref is not None else {}),
+                            },
                             ensure_ascii=False, separators=(",", ":")
                         ),
                     },
@@ -910,8 +842,7 @@ class OpenAICompatibleModelProvider:
         turn_id: str,
         response: Mapping[str, Any],
         provider_to_internal: Mapping[str, str],
-        *, require_evidence_questions: bool = False,
-        evidence_required_tools: frozenset[str] | None = None,
+        *,
         allow_text_tool_fallback: bool = True,
         allowed_outcome_refs: frozenset[str] = frozenset(),
         conclusion_protocol_mode: ConclusionProtocolMode = ConclusionProtocolMode.OBSERVE,
@@ -940,14 +871,6 @@ class OpenAICompatibleModelProvider:
         ):
             recovered = cls._recover_text_tool_calls(
                 text, provider_to_internal,
-                evidence_required_tools=(
-                    evidence_required_tools
-                    if evidence_required_tools is not None
-                    else (
-                        frozenset(provider_to_internal.values())
-                        if require_evidence_questions else frozenset()
-                    )
-                ),
             )
             if recovered is not None:
                 if not allow_text_tool_fallback:
@@ -1032,42 +955,8 @@ class OpenAICompatibleModelProvider:
                 raise OpenAICompatibleProviderError(
                     f"provider requested an unadvertised tool: {name}"
                 )
-            evidence_question = None
-            requires_evidence = (
-                internal_name in evidence_required_tools
-                if evidence_required_tools is not None
-                else require_evidence_questions
-            )
-            if requires_evidence:
-                envelope_keys = {"evidence_question", "tool_arguments"}
-                if set(arguments) == envelope_keys:
-                    raw_question = arguments.get("evidence_question")
-                    tool_arguments = arguments.get("tool_arguments")
-                    if not isinstance(raw_question, Mapping):
-                        raise RecoverableToolProtocolError(
-                            "invalid_evidence_question"
-                        )
-                    if not isinstance(tool_arguments, Mapping):
-                        raise RecoverableToolProtocolError(
-                            "invalid_tool_arguments_envelope"
-                        )
-                    try:
-                        evidence_question = EvidenceQuestion.from_data(raw_question)
-                    except ValueError as error:
-                        raise RecoverableToolProtocolError(
-                            "invalid_evidence_question"
-                        ) from error
-                    arguments = tool_arguments
-                elif set(arguments) & envelope_keys:
-                    raise RecoverableToolProtocolError(
-                        "missing_evidence_question_envelope"
-                    )
-                else:
-                    evidence_question = cls._automatic_evidence_question(
-                        call_id, internal_name, arguments
-                    )
             content.append(ToolCallBlock(ToolCall(
-                call_id, internal_name, arguments, evidence_question, outcome_ref
+                call_id, internal_name, arguments, outcome_ref=outcome_ref
             )))
         if not content:
             # A successful HTTP response with neither text nor a tool action is
@@ -1218,7 +1107,6 @@ class OpenAICompatibleModelProvider:
     @classmethod
     def _recover_text_tool_calls(
         cls, text: str, provider_to_internal: Mapping[str, str],
-        evidence_required_tools: frozenset[str],
     ) -> list[dict[str, Any]] | None:
         """Recover exact top-level tool blocks emitted by compatible gateways."""
         block = re.compile(
@@ -1244,21 +1132,6 @@ class OpenAICompatibleModelProvider:
                 return None
             if not isinstance(arguments, Mapping):
                 return None
-            if provider_to_internal[provider_name] in evidence_required_tools:
-                envelope_keys = {"evidence_question", "tool_arguments"}
-                if set(arguments) == envelope_keys:
-                    question = arguments.get("evidence_question")
-                    tool_arguments = arguments.get("tool_arguments")
-                    if not isinstance(question, Mapping) or not isinstance(
-                        tool_arguments, Mapping
-                    ):
-                        return None
-                    try:
-                        EvidenceQuestion.from_data(question)
-                    except ValueError:
-                        return None
-                elif set(arguments) & envelope_keys:
-                    return None
             seen_ids.add(call_id)
             recovered.append({
                 "id": call_id,
@@ -1280,32 +1153,3 @@ class OpenAICompatibleModelProvider:
             r'\s*<tool_use(?:\s+[^>]*)?>.*</tool_use>\s*',
             text, flags=re.DOTALL,
         ))
-
-    @staticmethod
-    def _automatic_evidence_question(
-        call_id: str, tool_name: str, arguments: Mapping[str, Any],
-    ) -> EvidenceQuestion:
-        """Add audit metadata when a compatible model omits only the envelope."""
-
-        encoded = json.dumps(
-            {"call_id": call_id, "tool": tool_name, "arguments": arguments},
-            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-            default=str,
-        ).encode("utf-8")
-        question_id = "Q-auto-" + hashlib.sha256(encoded).hexdigest()[:12]
-        target = next((
-            value.strip()[:160]
-            for key in ("path", "query", "pattern", "symbol")
-            if isinstance((value := arguments.get(key)), str) and value.strip()
-        ), "the requested target")
-        return EvidenceQuestion(
-            question_id,
-            f"What evidence does {tool_name} return for {target}?",
-            expected_scope=(
-                str(arguments.get("path", "")).strip()
-                if tool_name in {
-                    "core.read_file", "core.list_files", "core.search_files",
-                    "core.find_files", "core.search_text", "core.grep_search",
-                } else ""
-            ),
-        )

@@ -13,18 +13,13 @@ from tsm_agt.core import (
     TaskState,
 )
 from tsm_agt.core.configuration import canonical_hash
-from tsm_agt.core.single_loop import OrchestrationMode
+from tsm_agt.core.conversation_orchestration import OrchestrationMode
 from tsm_agt.core.session_context import (
     SessionContextProjector,
     SessionConversationMessage,
     SessionConversationProjection,
     SessionTaskSummary,
     SessionWorkingState,
-)
-from tsm_agt.ports.evidence import (
-    ContractAuthority,
-    EvidenceRequirement,
-    TaskContract,
 )
 from tsm_agt.ports import MessageRole
 from tsm_agt.ports import RuntimeStorePort
@@ -63,35 +58,23 @@ class KernelTaskTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[1].payload["previous_state"], "CREATED")
         self.assertEqual(events[1].payload["next_state"], "INTAKE")
 
-    async def test_create_command_rejects_contract_content_change(self) -> None:
-        first = TaskContract(
-            objective="verify source",
-            authority=ContractAuthority.USER,
-            evidence_requirements=(EvidenceRequirement("source", "source.artifact"),),
-        )
-        second = TaskContract(
-            objective="verify source",
-            authority=ContractAuthority.USER,
-            evidence_requirements=(EvidenceRequirement("source", "source.artifact", 2),),
-        )
+    async def test_create_command_rejects_goal_change(self) -> None:
         await self.application.kernel.create_task(
             "answer",
             Path(self.temp_dir.name),
-            command_id="create-contract-idempotency",
-            evidence_contract=first,
+            command_id="create-idempotency",
         )
 
         with self.assertRaisesRegex(ValueError, "different Task input"):
             await self.application.kernel.create_task(
-                "answer",
+                "a different answer",
                 Path(self.temp_dir.name),
-                command_id="create-contract-idempotency",
-                evidence_contract=second,
+                command_id="create-idempotency",
             )
 
-    async def test_new_task_persists_single_loop_orchestration_metadata(self) -> None:
+    async def test_new_task_persists_conversation_orchestration_metadata(self) -> None:
         task = await self.application.kernel.create_task(
-            "fix failing tests", Path(self.temp_dir.name), task_id="task-legacy"
+            "fix failing tests", Path(self.temp_dir.name), task_id="task-conversation"
         )
 
         metadata = await self.application.kernel.get_task_orchestration_metadata(
@@ -102,12 +85,13 @@ class KernelTaskTest(unittest.IsolatedAsyncioTestCase):
         ).read_events(task.task_id))[0]
 
         self.assertEqual(
-            metadata.orchestration_mode, OrchestrationMode.SINGLE_LOOP
+            metadata.orchestration_mode, OrchestrationMode.CONVERSATION_LOOP
         )
         self.assertEqual(metadata.root_goal, "fix failing tests")
         self.assertEqual(
-            event.payload["single_loop"], metadata.to_data()
+            event.payload["conversation"], metadata.to_data()
         )
+        self.assertNotIn("single_loop", event.payload)
         self.assertTrue(metadata.root_input_event_ref.startswith("session-event:"))
         self.assertEqual(
             metadata.root_input_event_ref, metadata.latest_input_event_ref
@@ -117,7 +101,7 @@ class KernelTaskTest(unittest.IsolatedAsyncioTestCase):
         store = InMemoryRuntimeStore()
         original = compose_fixture_application(
             store_adapter=store,
-            orchestration_mode=OrchestrationMode.LEGACY,
+            orchestration_mode=OrchestrationMode.CONVERSATION_LOOP,
         )
         await original.registry.start_all()
         try:
@@ -130,14 +114,14 @@ class KernelTaskTest(unittest.IsolatedAsyncioTestCase):
         reopened = compose_fixture_application(
             store_adapter=store,
             tool_adapters=(),
-            orchestration_mode=OrchestrationMode.SINGLE_LOOP,
+            orchestration_mode=OrchestrationMode.CONVERSATION_LOOP,
         )
         await reopened.registry.start_all()
         try:
             metadata = await reopened.kernel.get_task_orchestration_metadata(
                 task.task_id
             )
-            self.assertEqual(metadata.orchestration_mode, OrchestrationMode.LEGACY)
+            self.assertEqual(metadata.orchestration_mode, OrchestrationMode.CONVERSATION_LOOP)
             for state in (
                 TaskState.INTAKE,
                 TaskState.RESOLVING_PROJECT,
@@ -154,7 +138,7 @@ class KernelTaskTest(unittest.IsolatedAsyncioTestCase):
                     for event in events
                     if event.event_type == "turn.started"
                 ],
-                [OrchestrationMode.LEGACY.value],
+                [OrchestrationMode.CONVERSATION_LOOP.value],
             )
         finally:
             await reopened.registry.stop_all()
@@ -162,7 +146,7 @@ class KernelTaskTest(unittest.IsolatedAsyncioTestCase):
     async def test_single_loop_task_runs_the_single_loop(self) -> None:
         application = compose_fixture_application(
             tool_adapters=(),
-            orchestration_mode=OrchestrationMode.SINGLE_LOOP,
+            orchestration_mode=OrchestrationMode.CONVERSATION_LOOP,
         )
         await application.registry.start_all()
         try:
@@ -188,7 +172,7 @@ class KernelTaskTest(unittest.IsolatedAsyncioTestCase):
                 next(event for event in events if event.event_type == "turn.started").payload[
                     "orchestration_mode"
                 ],
-                OrchestrationMode.SINGLE_LOOP.value,
+                OrchestrationMode.CONVERSATION_LOOP.value,
             )
         finally:
             await application.registry.stop_all()
@@ -341,7 +325,7 @@ class LegacyTaskCompatibilityTest(unittest.IsolatedAsyncioTestCase):
             store = InMemoryRuntimeStore()
             legacy = compose_fixture_application(
                 store_adapter=store,
-                orchestration_mode=OrchestrationMode.LEGACY,
+                orchestration_mode=OrchestrationMode.CONVERSATION_LOOP,
             )
             await legacy.registry.start_all()
             try:
@@ -378,6 +362,6 @@ class LegacyTaskCompatibilityTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await reopened.registry.stop_all()
 
-        self.assertEqual(metadata.orchestration_mode, OrchestrationMode.LEGACY)
+        self.assertEqual(metadata.orchestration_mode, OrchestrationMode.CONVERSATION_LOOP)
         self.assertEqual(rollback.reverts_mutation_id, mutation.mutation_id)
         self.assertFalse((workspace / "legacy.txt").exists())

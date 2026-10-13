@@ -1,6 +1,6 @@
 """Pre/post policy probes and the Tool-resource catalog for `Kernel` (exploration budget, read hits, artifact reads).
 
-A mixin module in the Hermes facade+siblings shape (``run_agent.py`` +
+A mixin module in the facade-plus-siblings shape (``run_agent.py`` +
 ``agent/session_persistence.py``): the facade ``core/kernel.py`` imports
 this at module level and adds ``PolicyMixin`` to ``Kernel``'s bases, so
 **every method resolves through ``Kernel``'s MRO unchanged** --
@@ -9,7 +9,7 @@ attributes all still resolve. Moved bodies are verbatim: nothing is renamed
 and no signature changes.
 
 This module must never bind the facade at module level; late-import it
-inside a method instead (Hermes ``AGENTS.md:243-244``).
+inside a method instead (the project's module-boundary rule).
 
 Moved from ``core/kernel.py``:
 

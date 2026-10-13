@@ -1,4 +1,4 @@
-"""The ``Kernel`` facade + mixin-sibling shape (Hermes ``AGENTS.md:232-248``).
+"""The ``Kernel`` facade + mixin-sibling shape (the project module-boundary rule).
 
 ``run_agent.py`` is a 1,176-line ``AIAgent`` that inherits 13 ``agent/*Mixin``
 classes; ``core/kernel.py`` is following the same decomposition, one mixin per

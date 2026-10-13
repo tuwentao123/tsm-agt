@@ -86,11 +86,13 @@ class InMemoryRuntimeStore:
         return CommitResult(unit.task_id, committed)
 
     async def read_events(
-        self, task_id: str, after_sequence: int = 0
+        self, task_id: str, after_sequence: int = 0,
+        event_types: tuple[str, ...] | None = None,
     ) -> tuple[RuntimeEvent, ...]:
         return tuple(
             event for event in self._events.get(task_id, ())
             if event.sequence > after_sequence
+            and (not event_types or event.event_type in event_types)
         )
 
     async def load_task(self, task_id: str) -> StoredTask | None:

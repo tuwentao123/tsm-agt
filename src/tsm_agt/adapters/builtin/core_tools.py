@@ -13,11 +13,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from tsm_agt.core.configuration import ripgrep_binary
 from tsm_agt.core.workspace import EXCLUDED_DIRECTORIES
 from tsm_agt.ports import (
     AdapterContext,
     AdapterDescriptor,
-    EvidenceCapability,
     HealthState,
     HealthStatus,
     ResolvedWorkspacePath,
@@ -39,6 +39,9 @@ _MAX_SEARCH_MATCHES = 500
 _MAX_SEARCH_FILES = 5000
 _MAX_SEARCH_FILE_BYTES = 1_000_000
 _MAX_MATCH_TEXT_CHARS = 500
+
+#: Locating runs before reading, so it must not outlive the turn it serves.
+_RIPGREP_TIMEOUT_SECONDS = 20.0
 _MAX_FIND_LIMIT = 500
 _MAX_FIND_ENTRIES = 50_000
 
@@ -100,11 +103,6 @@ class CoreReadOnlyToolProvider:
             idempotency=ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
-            # Reports whether its own scope was covered (``truncated`` / ``skipped_count``); reading one file cannot
-            # certify that a scope was enumerated.
-            extra_evidence_capabilities=frozenset({
-                EvidenceCapability.ENUMERATE_SCOPE,
-            }),
         ),
         ToolSpec(
             name="core.search_files",
@@ -112,10 +110,10 @@ class CoreReadOnlyToolProvider:
                 "Primary repository search tool. Search file contents or file names with "
                 "one explicit target. target defaults to 'content': use it for source "
                 "symbols, UI labels, DOM ids/classes, functions, configuration keys, and "
-                "error text. Use target='files' only when an exact or wildcard file name "
-                "is already known. Content results include paths, line numbers, text, and "
-                "optional context; file results include matching paths and sizes. Inspect "
-                "relevant hits with core.read_file before concluding or editing."
+                "error text; use target='files' only when a file name is already known. "
+                "output_mode='paths'|'count' answers a survey cheaply, and offset pages "
+                "past a capped result. Inspect hits with core.read_file before "
+                "concluding."
             ),
             parameters={
                 "type": "object",
@@ -134,6 +132,15 @@ class CoreReadOnlyToolProvider:
                         "type": "integer", "minimum": 1,
                         "maximum": _MAX_SEARCH_MATCHES,
                     },
+                    "offset": {
+                        "type": "integer", "minimum": 0,
+                        "maximum": _MAX_SEARCH_MATCHES,
+                    },
+                    "output_mode": {
+                        "type": "string",
+                        "enum": ["matches", "paths", "count"],
+                        "default": "matches",
+                    },
                     "context": {
                         "type": "integer", "minimum": 0, "maximum": 20,
                     },
@@ -147,9 +154,6 @@ class CoreReadOnlyToolProvider:
             idempotency=ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
-            extra_evidence_capabilities=frozenset({
-                EvidenceCapability.ENUMERATE_SCOPE,
-            }),
         ),
         ToolSpec(
             name="core.find_files",
@@ -177,11 +181,6 @@ class CoreReadOnlyToolProvider:
             idempotency=ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
-            # Reports whether its own scope was covered (``truncated`` / ``skipped_count``); reading one file cannot
-            # certify that a scope was enumerated.
-            extra_evidence_capabilities=frozenset({
-                EvidenceCapability.ENUMERATE_SCOPE,
-            }),
         ),
         ToolSpec(
             name="core.read_file",
@@ -252,11 +251,6 @@ class CoreReadOnlyToolProvider:
             idempotency=ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
-            # Reports whether its own scope was covered (``truncated`` / ``skipped_count``); reading one file cannot
-            # certify that a scope was enumerated.
-            extra_evidence_capabilities=frozenset({
-                EvidenceCapability.ENUMERATE_SCOPE,
-            }),
         ),
         ToolSpec(
             name="core.grep_search",
@@ -293,11 +287,6 @@ class CoreReadOnlyToolProvider:
             idempotency=ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
-            # Reports whether its own scope was covered (``truncated`` / ``skipped_count``); reading one file cannot
-            # certify that a scope was enumerated.
-            extra_evidence_capabilities=frozenset({
-                EvidenceCapability.ENUMERATE_SCOPE,
-            }),
         ),
     )
 
@@ -444,6 +433,8 @@ class CoreReadOnlyToolProvider:
             "regex": "regex",
             "case_sensitive": "case_sensitive",
             "limit": "max_matches",
+            "offset": "offset",
+            "output_mode": "output_mode",
         }
         for source, destination in mappings.items():
             if source in call.arguments:
@@ -457,14 +448,21 @@ class CoreReadOnlyToolProvider:
         )
         if not result.ok:
             return result
-        return replace(
-            result,
-            hint=(
-                "Inspect relevant content matches with core.read_file before concluding "
-                "or editing. If no match answers the question, refine the pattern or "
-                "search a broader in-scope path."
-            ),
+        # A truncated result is a stopping cue, not a conclusion: say what to do
+        # next instead of leaving "there were more matches" to the model's
+        # imagination.
+        hint = (
+            "Inspect relevant content matches with core.read_file before concluding "
+            "or editing. If no match answers the question, refine the pattern or "
+            "search a broader in-scope path."
         )
+        if result.truncated:
+            hint = (
+                "Truncated: these matches are not the whole answer. Narrow the "
+                "pattern or path, or search past the last match shown, and read the "
+                "hit with core.read_file before concluding."
+            )
+        return replace(result, hint=hint)
 
     def _find_files(
         self, call: ToolCall, context: ToolInvocationContext
@@ -602,6 +600,14 @@ class CoreReadOnlyToolProvider:
             content = content[:_MAX_READ_CHARS]
         actual_end = start_line + len(selected) - 1 if selected else start_line - 1
         truncated = char_truncated or actual_end < len(lines)
+        # A partial read is the normal way to read a long file, so the next call
+        # is named instead of leaving the model to guess that more exists.
+        hint = (
+            f"Truncated at line {actual_end} of {len(lines)}: continue with "
+            f"core.read_file path={raw_path} start_line={actual_end + 1} before "
+            "concluding from this file."
+            if truncated else None
+        )
         return ToolResult(
             call_id=call.call_id,
             ok=True,
@@ -612,9 +618,13 @@ class CoreReadOnlyToolProvider:
                 "start_line": start_line,
                 "end_line": actual_end,
                 "total_lines": len(lines),
+                # A machine-readable continuation cursor, so paging a long file
+                # does not depend on re-deriving it from end_line.
+                "next_offset": actual_end + 1 if truncated else None,
                 "content": content,
             },
             truncated=truncated,
+            hint=hint,
             meta={"untrusted_data": True},
         )
 
@@ -638,6 +648,17 @@ class CoreReadOnlyToolProvider:
         )
         include_glob = self._optional_string_argument(call.arguments, "include")
         exclude_glob = self._optional_string_argument(call.arguments, "exclude")
+        # A cheap shape answers a cheap question: "which files" and "how many"
+        # do not need every matching line carried back to the model.
+        output_mode = self._string_argument(
+            call.arguments, "output_mode", default="matches"
+        ).casefold()
+        if output_mode not in {"matches", "paths", "count"}:
+            raise ValueError("output_mode must be 'matches', 'paths' or 'count'")
+        offset = self._bounded_int(
+            call.arguments, "offset", default=0, minimum=0,
+            maximum=_MAX_SEARCH_MATCHES,
+        )
         before_context = self._bounded_int(
             call.arguments,
             "before_context",
@@ -656,6 +677,18 @@ class CoreReadOnlyToolProvider:
         root = resolved.path
         if not root.exists():
             return self._error(call, "NOT_FOUND", f"path does not exist: {raw_path}")
+        binary = ripgrep_binary()
+        if binary is not None:
+            located = self._locate_with_ripgrep(
+                binary=binary, call=call, context=context, root=root,
+                resolved=resolved, raw_path=raw_path, query=query,
+                use_regex=use_regex, case_sensitive=case_sensitive,
+                include_glob=include_glob, exclude_glob=exclude_glob,
+                before_context=before_context, after_context=after_context,
+                max_matches=max_matches, output_mode=output_mode, offset=offset,
+            )
+            if located is not None:
+                return located
         flags = 0 if case_sensitive else re.IGNORECASE
         pattern = re.compile(query if use_regex else re.escape(query), flags)
 
@@ -666,9 +699,14 @@ class CoreReadOnlyToolProvider:
             else self._walk_searchable(root, walk_stats)
         )
         matches: list[dict[str, Any]] = []
+        counts: dict[str, int] = {}
+        paths_seen: dict[str, None] = {}
         scanned_files = 0
         skipped_files = 0
         truncated = False
+        # Only the detailed mode has to be capped: counting and listing paths
+        # keep no line text, so they can survey the whole walk.
+        scan_cap = min(_MAX_SEARCH_MATCHES, offset + max_matches)
         for path in files:
             if not path.is_file():
                 continue
@@ -702,6 +740,14 @@ class CoreReadOnlyToolProvider:
                 continue
             scanned_files += 1
             lines = text.splitlines()
+            if output_mode != "matches":
+                file_hits = sum(
+                    1 for line in lines if pattern.search(line) is not None
+                )
+                if file_hits:
+                    counts[relative_path] = file_hits
+                    paths_seen[relative_path] = None
+                continue
             for line_number, line in enumerate(lines, start=1):
                 if pattern.search(line) is None:
                     continue
@@ -718,29 +764,238 @@ class CoreReadOnlyToolProvider:
                     end = min(len(lines), line_number + after_context)
                     match["after_context"] = lines[line_number:end]
                 matches.append(match)
-                if len(matches) >= max_matches:
+                if len(matches) >= scan_cap:
                     truncated = True
                     break
-            if truncated and len(matches) >= max_matches:
+            if truncated and len(matches) >= scan_cap:
                 break
+        payload, page_truncated = self._search_payload(
+            output_mode, matches, counts, list(paths_seen), offset, max_matches,
+        )
         return ToolResult(
             call_id=call.call_id,
             ok=True,
             data={
                 "search_target": "content",
+                "output_mode": output_mode,
                 "query": query,
                 "path": self._display_path(resolved.workspace, root),
                 **self._resolved_path_data(context, raw_path, resolved),
-                "matches": matches,
+                **payload,
                 "scanned_files": scanned_files,
                 "skipped_files": skipped_files,
                 "generated_directories_skipped": walk_stats[
                     "generated_directories_skipped"
                 ],
             },
-            truncated=truncated,
+            truncated=truncated or page_truncated,
             meta={"untrusted_data": True},
         )
+
+    @staticmethod
+    def _search_payload(
+        output_mode: str, matches: list[dict[str, Any]],
+        counts: dict[str, int], paths: list[str], offset: int, limit: int,
+    ) -> tuple[dict[str, Any], bool]:
+        """Project the gathered hits into the requested answer shape.
+
+        ``truncated`` is about the *page*, not the scan: more items exist past
+        what this call returns, so the caller can continue with ``offset``.
+        """
+
+        if output_mode == "count":
+            ordered = sorted(counts.items())
+            page = ordered[offset:offset + limit]
+            return ({
+                "counts": dict(page),
+                "files_matched": len(ordered),
+                "total_matches": sum(counts.values()),
+            }, offset + limit < len(ordered))
+        if output_mode == "paths":
+            page = paths[offset:offset + limit]
+            return ({
+                "paths": page,
+                "files_matched": len(paths),
+            }, offset + limit < len(paths))
+        page = matches[offset:offset + limit]
+        # ``match_count`` counts this page only: the scan stops at the page, so
+        # asserting a total would claim a completeness this call never had.
+        # ``truncated`` is what says more results exist.
+        return ({"matches": page, "match_count": len(page)},
+                offset + limit < len(matches))
+
+    def _locate_with_ripgrep(
+        self, *, binary: str, call: ToolCall, context: ToolInvocationContext,
+        root: Path, resolved: ResolvedWorkspacePath, raw_path: str,
+        query: str, use_regex: bool, case_sensitive: bool,
+        include_glob: str | None, exclude_glob: str | None,
+        before_context: int, after_context: int, max_matches: int,
+        output_mode: str = "matches", offset: int = 0,
+    ) -> ToolResult | None:
+        """Locate candidate lines with ripgrep and answer in the walker's shape.
+
+        ripgrep is what a coding agent's ``rg`` habit is built on: it honours the
+        project's own ignore files, skips binaries without reading them, and
+        stays fast on a large tree. It is a *locator* here, not a second result
+        format -- the payload is identical to the in-tree walker's, so evidence
+        accounting cannot tell the two apart. ``None`` means "not trustworthy
+        for this search" and the walker answers instead.
+        """
+
+        command = [
+            binary, "--null", "--no-heading", "--color", "never",
+            "--with-filename", "--no-messages",
+            f"--max-filesize={_MAX_SEARCH_FILE_BYTES}",
+            "--case-sensitive" if case_sensitive else "--ignore-case",
+        ]
+        if output_mode == "count":
+            # Native counting: ripgrep reports per-file totals without any line
+            # text, so this shape never has to carry matches at all.
+            command.append("--count")
+        elif output_mode == "paths":
+            command.append("--files-with-matches")
+        else:
+            command.extend([
+                "--line-number", f"--max-count={offset + max_matches}",
+            ])
+        if not use_regex:
+            command.append("--fixed-strings")
+        if include_glob:
+            command.extend(["--glob", include_glob])
+        if exclude_glob:
+            command.extend(["--glob", f"!{exclude_glob}"])
+        # ripgrep knows the project's ignore files, not this Runtime's fixed
+        # pruned set, so the walker's exclusions are restated here.
+        for name in sorted(EXCLUDED_DIRECTORIES):
+            command.extend(["--glob", f"!{name}/**"])
+        command.extend(["--", query, str(root)])
+        try:
+            completed = subprocess.run(
+                command, capture_output=True, check=False,
+                cwd=str(root), timeout=_RIPGREP_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if completed.returncode not in (0, 1):
+            return None
+
+        matches: list[dict[str, Any]] = []
+        counts: dict[str, int] = {}
+        paths_seen: dict[str, None] = {}
+        counted_paths: set[str] = set()
+        line_cache: dict[Path, list[str] | None] = {}
+        skipped_files = 0
+        truncated = False
+        if output_mode == "paths":
+            # ``--files-with-matches`` emits NUL-separated paths and no newlines.
+            entries = [
+                part for part in
+                completed.stdout.decode("utf-8", errors="replace").split("\x00")
+                if part
+            ]
+        else:
+            entries = completed.stdout.decode(
+                "utf-8", errors="replace"
+            ).splitlines()
+        for entry in entries:
+            # ``--null`` separates the path from ``line:text``/``count`` so a
+            # path that itself contains a colon cannot be misread.
+            if output_mode == "paths":
+                path_text, separator, rest = entry, "\x00", ""
+            else:
+                path_text, separator, rest = entry.partition("\x00")
+            if not separator:
+                continue
+            if output_mode == "count":
+                line_text, _, _content = rest.partition(":")
+            else:
+                line_text, _, content = rest.partition(":")
+            line_number = 0
+            if output_mode != "paths":
+                try:
+                    line_number = int(line_text)
+                except ValueError:
+                    continue
+            path = Path(path_text)
+            if not path.is_absolute():
+                # ripgrep prints a path the way it was given; a relative one is
+                # relative to the directory it searched.
+                path = root / path
+            try:
+                relative = self._safe_relative(context, path)
+                if self._is_sensitive(relative):
+                    skipped_files += 1
+                    continue
+                relative_path = relative.as_posix()
+            except (_WorkspaceAccessError, _SensitivePathError):
+                skipped_files += 1
+                continue
+            if output_mode == "paths":
+                paths_seen.setdefault(relative_path, None)
+                continue
+            if output_mode == "count":
+                counts[relative_path] = line_number
+                continue
+            if len(matches) >= offset + max_matches:
+                truncated = True
+                break
+            counted_paths.add(relative_path)
+            match: dict[str, Any] = {
+                "path": relative_path,
+                **self._resource_data(context, path, resolved.workspace),
+                "line": line_number,
+                "text": content[:_MAX_MATCH_TEXT_CHARS],
+            }
+            if before_context or after_context:
+                if path not in line_cache:
+                    line_cache[path] = self._cached_lines(path)
+                lines = line_cache[path]
+                if lines is not None and before_context:
+                    start = max(0, line_number - before_context - 1)
+                    match["before_context"] = lines[start:line_number - 1]
+                if lines is not None and after_context:
+                    end = min(len(lines), line_number + after_context)
+                    match["after_context"] = lines[line_number:end]
+            matches.append(match)
+
+        payload, page_truncated = self._search_payload(
+            output_mode, matches, counts, list(paths_seen), offset, max_matches,
+        )
+        return ToolResult(
+            call_id=call.call_id,
+            ok=True,
+            data={
+                "search_target": "content",
+                "search_engine": "ripgrep",
+                "output_mode": output_mode,
+                "query": query,
+                "path": self._display_path(resolved.workspace, root),
+                **self._resolved_path_data(context, raw_path, resolved),
+                **payload,
+                # ripgrep reports matches, not how much it walked, so this
+                # counts the files that matched rather than files read.
+                "scanned_files": (
+                    len(paths_seen) or len(counts) or len(counted_paths)
+                ),
+                "skipped_files": skipped_files,
+                "generated_directories_skipped": 0,
+            },
+            truncated=truncated or page_truncated,
+            meta={"untrusted_data": True},
+        )
+
+    @staticmethod
+    def _cached_lines(path: Path) -> list[str] | None:
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return None
+        if b"\x00" in raw:
+            return None
+        try:
+            return raw.decode("utf-8").splitlines()
+        except UnicodeDecodeError:
+            return None
 
     @staticmethod
     def _walk(root: Path) -> Iterable[Path]:

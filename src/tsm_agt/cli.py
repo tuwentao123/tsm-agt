@@ -53,23 +53,19 @@ from tsm_agt.core import (
     ProjectTrustLevel,
     ProjectOnboardingSnapshot,
     RuntimeInputIntent,
-    SessionInputDecision,
     SessionTextInput,
     SessionContinuationMode,
     SessionResumeSafety,
-    SessionAnswerRequiresTask,
-    SessionRouteDisposition, SessionTaskRelation,
-    SessionChoiceAction,
-    build_session_follow_up_goal,
+    SessionTaskRelation,
     ModelInvocationFailed,
     SteeringKind,
+    TaskKind,
     TaskState,
     TaskRuntimeProjector,
     TaskVerificationStatus,
     build_flow_export_document,
 )
-from tsm_agt.core.single_loop import (
-    OrchestrationMode,
+from tsm_agt.core.conversation_orchestration import (
     TaskBindingDecision,
     TaskBindingKind,
 )
@@ -403,35 +399,6 @@ async def _task_demo(goal: str, workspace: Path) -> int:
                     f"{event.payload['next_state']}: {event.payload['reason']}"
                 )
             print(f"{event.sequence:02d} {event.event_type}: {detail}")
-    finally:
-        await application.registry.stop_all()
-    return 0
-
-
-async def _turn_demo(prompt: str, workspace: Path) -> int:
-    application = compose_fixture_application()
-    await application.start()
-    try:
-        task = await application.kernel.create_task("single text turn", workspace)
-        for target in (
-            TaskState.INTAKE,
-            TaskState.RESOLVING_PROJECT,
-            TaskState.SELECTING_EXTENSIONS,
-            TaskState.ROUTING,
-            TaskState.EXECUTING,
-        ):
-            task = await application.kernel.transition_task(
-                task.task_id, target, f"prepare {target.value.lower()}"
-            )
-        result = await application.kernel.run_text_turn(task.task_id, prompt)
-        print(f"assistant: {result.assistant_message.text}")
-        print(
-            f"usage: input={result.usage.input_tokens}, "
-            f"output={result.usage.output_tokens}"
-        )
-        store = application.registry.require(RuntimeStorePort)
-        for event in await store.read_events(task.task_id):
-            print(f"{event.sequence:02d} {event.event_type}")
     finally:
         await application.registry.stop_all()
     return 0
@@ -1231,19 +1198,10 @@ async def _chat(
             route_source_task_id = None
             route_relation = SessionTaskRelation.INDEPENDENT
             route_goal = prompt
-            original_user_text = (
-                prompt
-                if application.kernel.dependencies.orchestration_mode
-                is OrchestrationMode.SINGLE_LOOP
-                else None
-            )
+            original_user_text = prompt
             session_answer_text: str | None = None
             session = await application.kernel.get_session(session.session_id)
-            if (
-                application.kernel.dependencies.orchestration_mode
-                is OrchestrationMode.SINGLE_LOOP
-                and session.pending_interaction is None
-            ):
+            if session.pending_interaction is None:
                 binding = await application.kernel.dispatch_input_event(
                     SessionTextInput(
                         session.session_id,
@@ -1255,11 +1213,12 @@ async def _chat(
                     )
                 )
                 if not isinstance(binding, TaskBindingDecision):
-                    raise RuntimeError("single-loop session binding returned an invalid result")
+                    raise RuntimeError("conversation session binding returned an invalid result")
                 if binding.binding_kind in {
                     TaskBindingKind.EXPLICIT_CONTINUATION,
                     TaskBindingKind.EXPLICIT_REFERENCE,
                     TaskBindingKind.ACTIVE_CONTINUATION,
+                    TaskBindingKind.CONVERSATION_CONTINUATION,
                 }:
                     assert binding.task_id is not None
                     explicit_resume_task = binding.task_id
@@ -1272,7 +1231,7 @@ async def _chat(
                         session.session_id,
                         candidates,
                         "存在多个活跃 Task，请选择要继续的 Task。",
-                        source="single-loop-binding",
+                        source="conversation-binding",
                     )
                     for option, candidate in zip(
                         interaction.options, candidates, strict=True
@@ -1289,127 +1248,6 @@ async def _chat(
                 }:
                     output_fn("当前 Task 正在等待受控交互，请使用对应的审批或澄清入口。")
                     continue
-            if (
-                application.kernel.dependencies.orchestration_mode
-                is OrchestrationMode.LEGACY
-                and explicit_resume_task is None
-                and not explicit_new_task
-            ):
-                local_choice = (
-                    await application.kernel.resolve_pending_session_choice(
-                        session.session_id, prompt
-                    )
-                )
-                if local_choice.action is SessionChoiceAction.SELECT:
-                    disposition = SessionRouteDisposition(
-                        str(local_choice.metadata.get(
-                            "disposition", SessionRouteDisposition.RESUME_TASK.value
-                        ))
-                    )
-                    if disposition is SessionRouteDisposition.RESUME_TASK:
-                        explicit_resume_task = local_choice.target_id
-                        output_fn(
-                            f"[会话] 已按候选 {local_choice.option_id} 选择继续"
-                            f"未完成 Task {local_choice.target_id}；正在校验恢复安全性。"
-                        )
-                    else:
-                        route_source_task_id = str(
-                            local_choice.metadata["source_task_id"]
-                        )
-                        route_relation = SessionTaskRelation(
-                            str(local_choice.metadata["relation"])
-                        )
-                        route_goal = str(local_choice.metadata["resolved_goal"])
-                        prompt = route_goal
-                        output_fn(
-                            "[会话] 已选择基于历史 Task 创建后续工作："
-                            f"{route_source_task_id}"
-                        )
-                else:
-                    if session.pending_interaction is not None:
-                        await application.kernel.clear_pending_session_interaction(
-                            session.session_id,
-                            "session_first_ordinary_input_superseded_choice",
-                        )
-                        session = await application.kernel.get_session(
-                            session.session_id
-                        )
-                    try:
-                        decision = await application.kernel.dispatch_input_event(
-                            SessionTextInput(
-                                session.session_id, prompt,
-                                f"input-{uuid4().hex}", str(root),
-                            )
-                        )
-                        if not isinstance(decision, SessionInputDecision):
-                            raise RuntimeError(
-                                "session text dispatch returned an invalid result"
-                            )
-                    except (KeyboardInterrupt, asyncio.CancelledError):
-                        output_fn(
-                            f"session saved: {session.session_id} "
-                            f"(resume with: tsm-agt chat --session "
-                            f"{session.session_id})"
-                        )
-                        return 130
-                    if decision.disposition is SessionRouteDisposition.ANSWER:
-                        try:
-                            session_answer_text = (
-                                await application.kernel.answer_session_message(
-                                    session.session_id, prompt
-                                )
-                            )
-                        except SessionAnswerRequiresTask as error:
-                            # The answering model held no tools and reported the
-                            # route cannot serve this message. Re-route it as
-                            # contextual work instead of printing an apology.
-                            await application.kernel.record_session_route_self_correction(
-                                session.session_id, prompt, error.reason
-                            )
-                            route_source_task_id = None
-                            route_relation = SessionTaskRelation.CONTEXTUAL
-                            route_goal = prompt
-                            output_fn(
-                                "[会话] 该输入无法在无工具的直接回答中完成，"
-                                "已改为创建 Task 执行。"
-                            )
-                        except (KeyboardInterrupt, asyncio.CancelledError):
-                            output_fn(
-                                f"session saved: {session.session_id} "
-                                f"(resume with: tsm-agt chat --session "
-                                f"{session.session_id})"
-                            )
-                            return 130
-                    elif (
-                        decision.disposition
-                        is SessionRouteDisposition.RESUME_TASK
-                    ):
-                        assert decision.source_task_id is not None
-                        source = next(
-                            item for item in decision.task_catalog
-                            if item.task_id == decision.source_task_id
-                        )
-                        route_source_task_id = decision.source_task_id
-                        route_relation = SessionTaskRelation.FOLLOW_UP
-                        route_goal = build_session_follow_up_goal(
-                            prompt, source
-                        )
-                        prompt = route_goal
-                    elif (
-                        decision.disposition
-                        is SessionRouteDisposition.CREATE_TASK
-                    ):
-                        route_source_task_id = decision.source_task_id
-                        route_relation = decision.relation
-                        assert decision.resolved_goal is not None
-                        route_goal = decision.resolved_goal
-                        prompt = route_goal
-                    else:
-                        output_fn(
-                            decision.clarification
-                            or "无法确定这条输入要关联哪项任务，请补充说明。"
-                        )
-                        continue
             if session_answer_text is not None:
                 output_fn(f"agent> {session_answer_text}")
                 continue
@@ -1418,11 +1256,29 @@ async def _chat(
                 await application.kernel.clear_pending_session_interaction(
                     session.session_id, "task_selected_for_continuation"
                 )
+            # An idle conversation Task is not a recovery candidate: it simply
+            # takes this input as its next turn. Skipping the resume machinery
+            # keeps it out of the "no safe checkpoint" blocked path.
+            selected_task = None
+            if selected_resume_task is not None:
+                try:
+                    selected_task = await application.kernel.get_task(
+                        selected_resume_task
+                    )
+                except LookupError:
+                    # An unknown/stale task id falls back to the resume-candidate
+                    # path below, which reports it as blocked.
+                    selected_task = None
+            continuing_conversation = (
+                selected_task is not None
+                and selected_task.task_kind is TaskKind.CONVERSATION
+                and selected_task.state is TaskState.AWAITING_INPUT
+            )
             continuation = (
                 await application.kernel.resolve_session_continuation(
                     session.session_id, root, task_id=selected_resume_task
                 )
-                if selected_resume_task is not None
+                if selected_resume_task is not None and not continuing_conversation
                 else None
             )
             if (
@@ -1622,6 +1478,14 @@ async def _chat(
                     "[恢复] 可使用 /new <目标> 新建任务，或修复冲突后再恢复。"
                 )
                 continue
+            elif continuing_conversation:
+                task = selected_task
+                assert task is not None
+                session = await application.kernel.select_session_task(
+                    session.session_id, task.task_id
+                )
+                output_fn(f"task: {task.task_id}")
+                output_fn("[会话] 正在继续当前会话。")
             else:
                 task = await application.kernel.create_task(
                     route_goal, root, session_id=session.session_id,
@@ -1645,7 +1509,7 @@ async def _chat(
                     )
                 output_fn("[进度] 正在识别项目、加载工具并准备上下文…")
             try:
-                if not resume_mode:
+                if not resume_mode and task.state is TaskState.CREATED:
                     transition_targets = [
                         TaskState.INTAKE,
                         TaskState.RESOLVING_PROJECT,
@@ -3407,9 +3271,6 @@ def main() -> int:
     demo = subparsers.add_parser("task-demo", help="persist a legal task state trace")
     demo.add_argument("goal")
     demo.add_argument("--workspace", type=Path, default=Path.cwd())
-    turn = subparsers.add_parser("turn-demo", help="run one provider-neutral text turn")
-    turn.add_argument("prompt")
-    turn.add_argument("--workspace", type=Path, default=Path.cwd())
     tool = subparsers.add_parser("tool-demo", help="run one fixture tool call")
     tool.add_argument("text")
     tool.add_argument("--workspace", type=Path, default=Path.cwd())
@@ -3716,8 +3577,6 @@ def main() -> int:
             return 2
     if args.command == "task-demo":
         return asyncio.run(_task_demo(args.goal, args.workspace))
-    if args.command == "turn-demo":
-        return asyncio.run(_turn_demo(args.prompt, args.workspace))
     if args.command == "tool-demo":
         return asyncio.run(_tool_demo(args.text, args.workspace))
     if args.command == "agent-demo":

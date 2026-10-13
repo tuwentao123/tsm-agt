@@ -128,18 +128,15 @@ class ExplorationCoordinator:
         rejection_state: RejectionLoopState,
         outcome_state: ExplorationOutcomeState,
     ) -> ExplorationCoordinatorUpdate:
-        questions = list(relation_state.question_ids)
-        question_id = (
-            call.evidence_question.question_id.strip()
-            if call.evidence_question is not None else ""
-        )
-        if question_id and question_id not in questions:
-            questions.append(question_id)
+        fingerprints = list(relation_state.question_ids)
+        fingerprint = self._call_fingerprint(call)
+        if fingerprint not in fingerprints:
+            fingerprints.append(fingerprint)
         targets = list(relation_state.target_hashes)
         if semantic_action is not None and semantic_action.target_hash not in targets:
             targets.append(semantic_action.target_hash)
         next_relations = EvidenceRelationState(
-            tuple(questions[-200:]), tuple(targets[-500:]),
+            tuple(fingerprints[-200:]), tuple(targets[-500:]),
             relation_state.successful_calls + int(result.ok), 1,
         )
         next_rejections = (
@@ -153,6 +150,24 @@ class ExplorationCoordinator:
         return ExplorationCoordinatorUpdate(
             next_relations, next_rejections, outcome
         )
+
+    @staticmethod
+    def _call_fingerprint(call: ToolCall) -> str:
+        payload = {
+            "tool_name": call.name,
+            "arguments": ExplorationCoordinator._canonical_arguments(call.arguments),
+        }
+        return hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str,
+        ).encode()).hexdigest()
+
+    @staticmethod
+    def _canonical_arguments(arguments: Mapping[str, object]) -> Mapping[str, object]:
+        return {
+            str(key): value
+            for key, value in sorted(arguments.items(), key=lambda item: str(item[0]))
+            if value not in (None, "", (), [], {})
+        }
 
     @staticmethod
     def _bounded_probe(call: ToolCall) -> ToolCall:
@@ -177,12 +192,8 @@ class ExplorationCoordinator:
         call: ToolCall, semantic_action: SemanticAction | None,
         assessment: EvidenceRelationAssessment,
     ) -> str:
-        question_id = (
-            call.evidence_question.question_id
-            if call.evidence_question is not None else ""
-        )
         payload = {
-            "question_id": question_id, "tool": call.name,
+            "call_fingerprint": ExplorationCoordinator._call_fingerprint(call),
             "semantic_signature": (
                 semantic_action.semantic_signature if semantic_action else ""
             ),

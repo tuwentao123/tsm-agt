@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -9,6 +10,7 @@ from collections.abc import Mapping
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -21,10 +23,10 @@ from tsm_agt.core import (
     note_stream_released,
 )
 from tsm_agt.local_api import LocalEventApiServer
-from tsm_agt.ports import ImageBlock
-from tsm_agt.ports.evidence import TaskContract
+from tsm_agt.ports import ImageBlock, MessageRole
 
 app = FastAPI(title="tsm-agt-web")
+logger = logging.getLogger(__name__)
 WEBUI_VERSION = "deepseek-cn-v20260921-session-timeline-order"
 
 INDEX_HTML = """
@@ -68,15 +70,26 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .main{display:flex;flex-direction:column;min-width:0;min-height:0;height:100vh;overflow:hidden;background:transparent}
 .topbar{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:18px 32px;border-bottom:1px solid var(--border);background:rgba(255,255,255,.9);backdrop-filter:blur(12px)}
 #conversation-name{font-weight:500}
+.session-id{margin-top:2px;font-family:"SFMono-Regular","JetBrains Mono","Fira Code",monospace;font-size:11px;color:#7b8794;cursor:pointer;user-select:text;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:52ch}
+.session-id:hover{color:#2563eb}
+.session-id.copied{color:#0f766e}
+.turn-marker{align-self:flex-end;margin:0 2px -2px auto;font-family:"SFMono-Regular","JetBrains Mono","Fira Code",monospace;font-size:10px;color:#94a3b8;cursor:pointer;user-select:text}
+.turn-marker:hover{color:#2563eb}
+.turn-marker.copied{color:#0f766e}
 .topbar .icon-btn{font-size:12px}
 .chat-shell{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden;padding:18px 22px 14px}
 .workspace-stage{flex:1;min-height:0;width:100%;display:grid;grid-template-columns:minmax(0,1.18fr) minmax(320px,.82fr);gap:14px;align-items:stretch}
-.pane-shell{min-height:0;display:flex;flex-direction:column;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.72);border-radius:24px;overflow:hidden;backdrop-filter:blur(10px);box-shadow:none}
+.pane-shell{position:relative;min-height:0;display:flex;flex-direction:column;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.72);border-radius:24px;overflow:hidden;backdrop-filter:blur(10px);box-shadow:none}
 .pane-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:14px 18px 10px;border-bottom:1px solid rgba(237,242,247,.75);background:rgba(255,255,255,.78)}
 .pane-title{font-size:15px;font-weight:700;color:#111827}
 .pane-subtitle{margin-top:4px;font-size:12px;color:#64748b}
 .pane-badge{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:#eff6ff;color:#2563eb;font-size:12px;font-weight:600}
 .chat-area,.trace-pane{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:10px;display:flex;flex-direction:column;gap:8px;background:transparent}
+.chat-area.has-approval-dock{padding-bottom:min(52vh,460px)}
+.approval-dock{display:none;position:absolute;left:10px;right:10px;bottom:10px;z-index:20;pointer-events:none}
+.approval-dock.visible{display:block}
+.approval-dock .message.approval{width:100%;max-width:none;min-height:0;max-height:min(48vh,420px);overflow:auto;pointer-events:auto;padding:9px 11px;gap:6px;box-shadow:0 12px 28px rgba(15,23,42,.16)}
+.approval-dock .approval-title{font-size:14px}.approval-dock .approval-subtitle{display:none}.approval-dock .approval-risk{padding:3px 8px;font-size:10px}.approval-dock .approval-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.approval-dock .approval-item{padding:5px 7px}.approval-dock .approval-label{margin-bottom:2px;font-size:9px}.approval-dock .approval-value{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.approval-dock .approval-actions{gap:7px}.approval-dock .approval-btn{min-height:32px;padding:7px 13px;border-radius:10px;font-size:12px}.approval-details{border-top:1px solid #e5edf5;padding-top:5px}.approval-details>summary{cursor:pointer;font-size:11px;color:#64748b;user-select:none}.approval-details[open]>summary{margin-bottom:6px}.approval-details .approval-preview{max-height:140px}
 .trace-pane{gap:8px;background:rgba(255,255,255,.2)}
 .trace-live-board{display:flex;flex-direction:column;gap:6px}
 .trace-future-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
@@ -204,9 +217,37 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .task-progress-line.markdown-progress{padding:0;border:none;background:transparent;white-space:normal;color:#475569;font-size:14px;line-height:1.68}
 .task-progress-line.markdown-progress .message-section{gap:0}
 .task-progress-line.markdown-progress .tool-call-markdown{max-width:100%}
+.turn-calls{width:min(88ch,100%);margin:0 auto;border:1px solid #e6edf5;border-radius:12px;background:#fbfdff;overflow:hidden}
+.turn-calls.has-calls{border-color:#d7e3f1;background:#f8fbff}
+.turn-trace{align-self:stretch;width:100%;max-width:none;padding:0;margin:0;background:transparent;border:none;box-shadow:none}
+.turn-calls > summary{display:flex;align-items:center;gap:8px;padding:7px 11px;font-size:11px;color:#64748b;cursor:pointer;list-style:none}
+.turn-calls > summary::-webkit-details-marker{display:none}
+.turn-calls > summary::before{content:'▸';font-size:10px;color:#94a3b8;transition:transform .15s ease;flex:none}
+.turn-calls[open] > summary::before{transform:rotate(90deg)}
+.turn-calls-label{font-weight:600;color:#475569;flex:none}
+.turn-calls-names{color:#7b8794;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.turn-call-list{display:flex;flex-direction:column;gap:4px;padding:7px 11px 10px;border-top:1px solid #edf2f7}
+.turn-call-row{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;font-size:11px;line-height:1.5}
+.turn-call-name{font-family:"SFMono-Regular","JetBrains Mono","Fira Code",monospace;font-size:11px;color:#1e293b;background:#eef4fb;border:1px solid #d7e3f1;border-radius:6px;padding:1px 6px;flex:none}
+.turn-call-status{font-size:10px;border-radius:999px;padding:1px 7px;flex:none}
+.turn-call-status.ok{color:#0f766e;background:#e8f7f3;border:1px solid #bfe6dd}
+.turn-call-status.failed{color:#b42318;background:#fdeceb;border:1px solid #f6cdc9}
+.turn-call-target{color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
+.turn-source-evaluation{margin:0 11px 8px;padding:8px 9px;border:1px solid #cfe2ff;border-radius:9px;background:#f5f9ff}.turn-source-evaluation-heading{font-size:11px;font-weight:700;color:#1d4ed8}.turn-source-evaluation-heading span{font-weight:500;color:#64748b}.turn-source-evaluation-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-top:6px}.turn-source-evaluation-grid div{display:flex;flex-direction:column;gap:1px}.turn-source-evaluation-grid small{font-size:9px;color:#64748b}.turn-source-evaluation-grid strong{font-size:10px;color:#334155;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.turn-source-evaluation-grid strong.good{color:#047857}.turn-source-evaluation-grid strong.warn{color:#b45309}.turn-source-evaluation-note{margin-top:6px;font-size:10px;line-height:1.4;color:#475569}
+.live-turn{opacity:.98}
+.live-turn-panel{width:min(88ch,100%);margin:0 auto;border:1px solid #cfe2ff;border-radius:12px;background:linear-gradient(180deg,#f7fbff,#f2f8ff);padding:9px 12px;display:flex;flex-direction:column;gap:5px}
+.live-turn-head{display:flex;align-items:center;gap:7px;font-size:11px;font-weight:600;color:#2563eb}
+.live-turn-dot{width:7px;height:7px;border-radius:50%;background:#1677ff;box-shadow:0 0 0 4px rgba(22,119,255,.14);animation:live-turn-pulse 1.4s ease-in-out infinite;flex:none}
+@keyframes live-turn-pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.live-turn-line{font-size:12px;color:#475569;line-height:1.55;word-break:break-word;padding-left:14px;position:relative}
+.live-turn-line::before{content:'·';position:absolute;left:4px;color:#94a3b8}
+.live-turn-line.active{color:#1d4ed8}
+.live-turn-line.active::before{content:'▸';color:#1677ff}
+.live-turn-line.failed{color:#b42318}
+.live-turn-line.failed::before{content:'✕';color:#d92d20}
 .task-progress-empty{font-size:12px;color:#686d75}
 .task-card .message.approval{max-width:100%;align-self:stretch;margin-top:4px}
-.message.approval{align-self:flex-start;max-width:min(920px,100%);background:linear-gradient(180deg,#ffffff,#f8fafc);border:1px solid #d9e1ec;border-radius:18px;padding:10px 12px;display:flex;flex-direction:column;gap:8px;box-shadow:0 6px 14px rgba(15,23,42,.05);position:relative;overflow:hidden}
+.message.approval{align-self:stretch;width:100%;max-width:none;scroll-margin-block:12px 24px;background:linear-gradient(180deg,#ffffff,#f8fafc);border:1px solid #d9e1ec;border-radius:18px;padding:10px 12px;display:flex;flex-direction:column;gap:8px;box-shadow:0 6px 14px rgba(15,23,42,.05);position:relative;overflow:hidden}
 .message.approval::before{content:'';position:absolute;inset:0;background:radial-gradient(circle at top right,rgba(255,240,201,.08),transparent 32%);pointer-events:none}
 .approval-hero{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}
 .approval-title{font-size:15px;font-weight:700;color:#1f2937;letter-spacing:-.02em;line-height:1.1}
@@ -365,7 +406,10 @@ textarea::placeholder{color:#94a3b8}
 
   <main class=\"main\">
     <div class=\"topbar\">
-      <div id=\"conversation-name\">新建会话</div>
+      <div>
+        <div id=\"conversation-name\">新建会话</div>
+        <div id=\"conversation-session-id\" class=\"session-id\" title=\"点击复制会话 id\" hidden></div>
+      </div>
       <div>
         <span id=\"workspace-status\" class=\"section-title\"></span>
         <button class=\"icon-btn\" onclick=\"clearMessages()\">清空</button>
@@ -386,6 +430,7 @@ textarea::placeholder{color:#94a3b8}
             <div class=\"pane-badge\">Conversation Live</div>
           </div>
           <section id=\"chat-area\" class=\"chat-area\"></section>
+          <section id=\"approval-dock\" class=\"approval-dock\" aria-live=\"polite\"></section>
         </section>
         <aside class=\"pane-shell\">
           <div class=\"pane-header\">
@@ -429,6 +474,10 @@ textarea::placeholder{color:#94a3b8}
 <script>
 """ + r"""
 const selectedImages = [];
+// Approval cards can be created after a long-running Turn.  Reveal each new
+// request once, but do not fight the user's own scrolling while they inspect
+// its preview.
+const revealedApprovalRequests = new Set();
 const workspaces = [];
 const conversations = [];
 const ACTIVE_WORKSPACE_STORAGE_KEY = 'tsm-agt.active-workspace';
@@ -628,6 +677,9 @@ function renderWorkspaceList() {
           );
           activeConversationId = conversation.id;
           updateWorkspaceState();
+          // The header shows the active Session, so switching conversations
+          // has to refresh it alongside the messages.
+          renderConversations();
           renderMessages();
           restoreConversationDraft();
           ensureConversationLoaded(conversation.id);
@@ -713,6 +765,52 @@ function renderConversations() {
   renderWorkspaceList();
   const active = getActiveConversation();
   document.getElementById('conversation-name').textContent = active?.title || '新建会话';
+  renderSessionId(active);
+}
+
+// The Session id is what a Task, a Turn and any log line refer back to, so it
+// stays visible at the top of the conversation instead of only in the store.
+function renderSessionId(active) {
+  const element = document.getElementById('conversation-session-id');
+  if (!element) return;
+  if (!active?.id) {
+    element.hidden = true;
+    element.textContent = '';
+    element.onclick = null;
+    return;
+  }
+  element.hidden = false;
+  element.textContent = `会话 ${active.id}`;
+  element.title = '点击复制会话 id';
+  element.onclick = () => copyTextToClipboard(active.id, element);
+}
+
+function copyTextToClipboard(text, element, restore = null) {
+  const original = restore || element?.textContent || '';
+  const done = () => {
+    if (!element) return;
+    element.classList.add('copied');
+    element.textContent = '已复制';
+    setTimeout(() => {
+      element.classList.remove('copied');
+      element.textContent = original;
+    }, 1200);
+  };
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => done());
+    return;
+  }
+  // http:// origins are not a secure context in every browser, so the
+  // clipboard API is not always available.
+  const area = document.createElement('textarea');
+  area.value = text;
+  area.style.position = 'fixed';
+  area.style.opacity = '0';
+  document.body.appendChild(area);
+  area.select();
+  try { document.execCommand('copy'); } catch (error) { console.error(error); }
+  document.body.removeChild(area);
+  done();
 }
 
 function escapeHtml(value) {
@@ -1081,10 +1179,14 @@ document.addEventListener('click', (event) => {
 function renderMessages(forceScrollToBottom = false) {
   const active = getActiveConversation();
   const chatArea = document.getElementById('chat-area');
+  const approvalDock = document.getElementById('approval-dock');
   const previousScrollTop = chatArea.scrollTop;
   const shouldStickToBottom = forceScrollToBottom || shouldAutoFollowChat || isNearChatBottom(chatArea);
   ensureChatScrollTracking(chatArea);
   chatArea.innerHTML = '';
+  approvalDock.innerHTML = '';
+  approvalDock.classList.remove('visible');
+  chatArea.classList.remove('has-approval-dock');
 
   if (!activeWorkspaceId) {
     chatArea.innerHTML = `
@@ -1120,21 +1222,73 @@ function renderMessages(forceScrollToBottom = false) {
     return;
   }
 
-  active.messages.forEach((message) => {
+  // The Turn that is running belongs directly under the question it answers,
+  // above the conclusion it will produce. The Task card sits at the Task's
+  // first Turn and would put this Turn's progress far above it.
+  const runningTask = active.messages.find(
+    (item) => item.role === 'task'
+      && ['PREPARING', 'RUNNING'].includes(item.task?.phase1State),
+  );
+  const lastQuestionIndex = active.messages.reduce(
+    (found, item, index) => (item.role === 'user' ? index : found), -1,
+  );
+  const currentTurnId = active.messages[lastQuestionIndex]?.turnId;
+  const durableCurrentTurn = currentTurnId
+    ? active.turnCalls?.get(currentTurnId)
+    : null;
+  // A reloaded in-flight Turn may already have a durable event trail. Do not
+  // render a second, volatile copy; before its first committed event the live
+  // panel remains the immediate status signal.
+  const hasDurableCurrentTrace = !durableCurrentTurn?.settled
+    && Array.isArray(durableCurrentTurn?.progress)
+    && durableCurrentTurn.progress.length > 0;
+  let liveInserted = false;
+
+  active.messages.forEach((message, index) => {
     const element = document.createElement('div');
     element.className = `message ${message.role}`;
+    let inputTrace = null;
     const text = String(message.content ?? '').trim();
     if (message.role === 'task') {
       renderTaskCard(element, message, active.id);
     } else if (message.role === 'approval') {
+      if (message.approval?.request_id) {
+        element.dataset.approvalRequestId = message.approval.request_id;
+      }
       renderApprovalCard(element, message);
+      // Approval is an operation dock, not transcript history: it remains
+      // pinned at the bottom of the chat pane while the message list scrolls.
+      approvalDock.appendChild(element);
+      approvalDock.classList.add('visible');
+      chatArea.classList.add('has-approval-dock');
+      return;
     } else if (message.role === 'system') {
       element.textContent = text;
     } else {
+      // Every Turn starts at its input, so the Turn id is labelled there. It is
+      // what ties this exchange to its Task events and its call panel.
+      if (message.role === 'user' && message.turnId) {
+        chatArea.appendChild(renderTurnMarker(message.turnId));
+      }
+      // Follow a coding agent's transcript order: the Turn's work (what it
+      // thought, which tools it used, how it ended) reads above, and the final
+      // conclusion is the last thing under it.
+      const callPanel = renderTurnCallPanel(active, message);
+      if (callPanel && message.role === 'assistant') element.appendChild(callPanel);
+
       const body = document.createElement('div');
       body.className = 'message-body';
       body.innerHTML = renderMarkdown(text);
       element.appendChild(body);
+
+      // Do not nest an in-flight trace in the user bubble: its full-width
+      // panel would expand the bubble and make the input appear left-aligned.
+      // It is a sibling directly below the input instead.
+      if (callPanel && message.role === 'user') {
+        inputTrace = document.createElement('div');
+        inputTrace.className = 'turn-trace';
+        inputTrace.appendChild(callPanel);
+      }
 
       // Attachments render under the text so the prompt stays readable.
       if (message.images?.length) {
@@ -1152,7 +1306,15 @@ function renderMessages(forceScrollToBottom = false) {
       }
     }
     chatArea.appendChild(element);
+    if (inputTrace) chatArea.appendChild(inputTrace);
+    if (runningTask && !hasDurableCurrentTrace && !liveInserted && index === lastQuestionIndex) {
+      chatArea.appendChild(renderLiveTurnPanel(runningTask.task));
+      liveInserted = true;
+    }
   });
+  if (runningTask && !hasDurableCurrentTrace && !liveInserted) {
+    chatArea.appendChild(renderLiveTurnPanel(runningTask.task));
+  }
 
   // The trace pane is a sibling view, not a tail step of chat scrolling. It must
   // render on every pass; keeping it after the scroll branches meant the whole
@@ -1183,7 +1345,6 @@ function renderTracePane(conversation) {
 const 风险文案 = { R0: '无副作用', R1: '低风险', R2: '需授权', R3: '高风险' };
 
 function taskStateClass(task) {
-  if (isTaskIncomplete(task)) return 'incomplete';
   const state = task?.projection?.display_status || task?.phase1State;
   if (state === 'completed' || state === 'DONE') return 'done';
   if (state === 'failed' || state === 'cancelled' || state === 'FAILED' || state === 'CANCELLED') return 'failed';
@@ -1246,53 +1407,7 @@ function taskProjection(task) {
   return task?.projection || null;
 }
 
-function taskSingleLoop(task) {
-  return task?.singleLoop || null;
-}
-
-function taskIncompleteBoundary(task) {
-  const boundary = taskSingleLoop(task)?.incomplete_boundary;
-  return boundary && typeof boundary === 'object' ? boundary : null;
-}
-
-function isTaskIncomplete(task) {
-  return Boolean(taskIncompleteBoundary(task));
-}
-
-function taskOrchestrationMode(task) {
-  return taskSingleLoop(task)?.orchestration_mode || 'LEGACY';
-}
-
-function incompleteGapDescription(gap) {
-  return String(gap?.description || gap?.detail || gap?.kind || gap?.code || '').trim();
-}
-
-function incompleteNeedsApproval(task) {
-  const gaps = taskIncompleteBoundary(task)?.gaps;
-  if (!Array.isArray(gaps) || gaps.length !== 1) return false;
-  const kind = String(gaps[0]?.kind || gaps[0]?.code || '').toUpperCase();
-  return kind.includes('APPROVAL') || kind.includes('USER_DECISION');
-}
-
-function focusIncompleteInput() {
-  const prompt = document.getElementById('prompt');
-  if (!prompt) return;
-  prompt.placeholder = '例如：文件路径、报错信息、task-id，或你希望我优先处理的部分';
-  prompt.focus();
-}
-
-function openIncompleteApproval(taskId) {
-  const approval = document.querySelector(`[data-incomplete-approval-task="${taskId}"]`);
-  approval?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-}
-
-function startIndependentTask() {
-  createConversation();
-  focusIncompleteInput();
-}
-
 function taskDisplayLabel(task) {
-  if (isTaskIncomplete(task)) return '任务暂未完成';
   const projection = taskProjection(task);
   if (projection) {
     return {
@@ -1311,6 +1426,7 @@ function taskWaitingLabel(task) {
   if (projection?.execution_status === 'waiting_approval') return '等待授权';
   if (projection?.execution_status === 'waiting_input') return '等待输入';
   if (task?.waiting?.kind === 'APPROVAL' || task?.status === 'awaiting_approval') return '等待授权';
+  if (task?.status === 'awaiting_input') return '等待下一条消息';
   if (task?.waiting || task?.status === 'awaiting_user') return '等待输入';
   return '持续执行';
 }
@@ -1537,8 +1653,71 @@ function renderTraceView(tracePane, conversation) {
     </div>
   `;
   sidebar.append(overview);
+  sidebar.append(renderSourceEvaluationRunner());
   board.append(main, sidebar);
   tracePane.appendChild(board);
+}
+
+let sourceEvaluationRunId = '';
+let sourceEvaluationPoll = null;
+
+function percent(value) {
+  return typeof value === 'number' ? `${Math.round(value * 100)}%` : '—';
+}
+
+function renderSourceEvaluationRunner() {
+  const panel = document.createElement('section');
+  panel.className = 'trace-overview-panel';
+  panel.id = 'source-evaluation-runner';
+  panel.innerHTML = `
+    <div class='trace-panel-heading'><div><div class='trace-panel-title'>源码行为评测</div><div class='trace-panel-caption'>真实模型样例 · 独立 Session · 不影响当前会话</div></div></div>
+    <button class='new-session-btn' id='start-source-evaluation' ${activeWorkspaceId ? '' : 'disabled'}>启动 2 个源码取证样例</button>
+    <div class='trace-panel-caption' id='source-evaluation-status'>不会自动开启 tool_choice=required。</div>`;
+  panel.querySelector('#start-source-evaluation')?.addEventListener('click', startSourceEvaluation);
+  return panel;
+}
+
+async function startSourceEvaluation() {
+  if (!activeWorkspaceId) return;
+  const button = document.getElementById('start-source-evaluation');
+  if (button) button.disabled = true;
+  try {
+    const response = await fetch('/evaluations/source-analysis/runs', {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({workspace_id: activeWorkspaceId}),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || '启动评测失败');
+    sourceEvaluationRunId = data.run_id;
+    await refreshSourceEvaluation();
+    if (sourceEvaluationPoll) clearInterval(sourceEvaluationPoll);
+    sourceEvaluationPoll = setInterval(refreshSourceEvaluation, 2500);
+  } catch (error) {
+    showError(error.message || '启动评测失败');
+    if (button) button.disabled = false;
+  }
+}
+
+async function refreshSourceEvaluation() {
+  if (!sourceEvaluationRunId) return;
+  try {
+    const response = await fetch(`/evaluations/source-analysis/runs/${encodeURIComponent(sourceEvaluationRunId)}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || '读取评测失败');
+    const status = document.getElementById('source-evaluation-status');
+    if (!status) return;
+    const metrics = data.metrics || {};
+    const cases = (data.cases || []).map((item) => `${escapeHtml(item.title)}：${escapeHtml(item.status)} / ${item.source_read ? '已读源码' : '未读源码'}`).join('<br>');
+    status.innerHTML = `<b>${escapeHtml(data.status || 'starting')}</b> · 样本 ${metrics.sample_count || 0}<br>首轮零工具 ${percent(metrics.first_turn_zero_tool_rate)} · 读源码 ${percent(metrics.source_read_rate)} · 仅搜索 ${percent(metrics.search_only_rate)} · Review 介入 ${percent(metrics.review_intervention_rate)} · 通过 ${percent(metrics.pass_rate)}${cases ? `<br>${cases}` : ''}`;
+    if (data.status === 'completed' && sourceEvaluationPoll) {
+      clearInterval(sourceEvaluationPoll); sourceEvaluationPoll = null;
+      const button = document.getElementById('start-source-evaluation');
+      if (button) button.disabled = false;
+    }
+  } catch (error) {
+    const status = document.getElementById('source-evaluation-status');
+    if (status) status.textContent = error.message || '读取评测失败';
+  }
 }
 
 function isMarkdownProgress(text) {
@@ -1605,117 +1784,6 @@ function renderTodoPanel(todoList) {
   return panel;
 }
 
-function renderSingleLoopCompletion(task) {
-  const completion = taskSingleLoop(task)?.completion;
-  if (!completion || typeof completion !== 'object') return null;
-  const panel = document.createElement('section');
-  panel.className = 'completion-panel';
-  const title = document.createElement('div');
-  title.className = 'completion-title';
-  title.textContent = '完成契约';
-  panel.appendChild(title);
-  const summary = document.createElement('div');
-  summary.className = 'completion-summary';
-  const outcome = String(completion.outcome || 'UNKNOWN');
-  summary.textContent = `结果：${outcome} · completion diagnostics`;
-  panel.appendChild(summary);
-  const formatValue = (value) => {
-    if (value === null || value === undefined) return '';
-    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-      return String(value);
-    }
-    if (Array.isArray(value)) return `${value.length} 项`;
-    if (typeof value === 'object') {
-      return Object.entries(value).slice(0, 8).map(([key, item]) => (
-        `${key}=${typeof item === 'object' ? '[对象]' : String(item)}`
-      )).join(' · ');
-    }
-    return '';
-  };
-  const appendField = (label, value) => {
-    const values = Array.isArray(value) ? value.slice(0, 12) : [value];
-    const rendered = values.map(formatValue).filter(Boolean);
-    if (rendered.length === 0) return;
-    const item = document.createElement('div');
-    item.className = 'completion-item';
-    const field = document.createElement('span');
-    field.className = 'completion-label';
-    field.textContent = label;
-    const detail = document.createElement('span');
-    detail.className = 'completion-value';
-    detail.textContent = rendered.join('；');
-    item.append(field, detail);
-    panel.appendChild(item);
-  };
-  appendField('effects', completion.effects);
-  appendField('committed delta', completion.committed_delta);
-  appendField('gaps', completion.gaps);
-  appendField('divergences', completion.divergences);
-  return panel;
-}
-
-function renderContractCard(task, conversationId) {
-  const contract = task.contract;
-  if (!contract || !['DRAFT', 'ACTIVE'].includes(contract.phase)) return null;
-  const panel = document.createElement('section');
-  panel.className = 'task-panel contract-card';
-  const title = document.createElement('strong');
-  title.textContent = contract.phase === 'DRAFT' ? '完成标准草案' : '已启用完成标准';
-  const summary = document.createElement('div');
-  summary.className = 'task-progress-line';
-  summary.textContent = contract.objective;
-  panel.append(title, summary);
-  const requirements = Array.isArray(contract.evidence_requirements)
-    ? contract.evidence_requirements : [];
-  if (requirements.length) {
-    const details = document.createElement('div');
-    details.className = 'task-progress-line';
-    details.textContent = `验证方式：${requirements.map((item) => item.kind).join('、')}`;
-    panel.appendChild(details);
-  }
-  const actions = document.createElement('div');
-  actions.className = 'approval-actions';
-  const request = async (path, method, body) => {
-    const response = await fetch(path, {
-      method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    });
-    if (!response.ok) throw new Error(await response.text());
-    const card = taskMessage(conversationId, task.taskId);
-    if (card) card.task.contract = (await response.json()).result || null;
-    renderMessages();
-  };
-  if (contract.phase === 'DRAFT') {
-    const accept = document.createElement('button');
-    accept.className = 'approval-btn approve';
-    accept.textContent = '接受合同';
-    accept.onclick = () => request(`/tasks/${task.taskId}/contract/accept`, 'POST', {
-      contract_id: contract.contract_id, expected_revision: contract.revision,
-      command_id: crypto.randomUUID(),
-    }).catch((error) => showError(error.message));
-    actions.appendChild(accept);
-  }
-  const edit = document.createElement('button');
-  edit.textContent = '编辑目标';
-  edit.onclick = () => {
-    const objective = window.prompt('完成目标', contract.objective);
-    if (!objective || !objective.trim()) return;
-    request(`/tasks/${task.taskId}/contract`, 'PUT', {
-      expected_revision: contract.revision, command_id: crypto.randomUUID(),
-      contract: { ...contract, objective: objective.trim() },
-    }).catch((error) => showError(error.message));
-  };
-  actions.appendChild(edit);
-  const clear = document.createElement('button');
-  clear.textContent = contract.phase === 'DRAFT' ? '按普通任务执行' : '清除合同';
-  clear.onclick = () => request(`/tasks/${task.taskId}/contract`, 'DELETE', {
-    contract_id: contract.contract_id, expected_revision: contract.revision,
-    command_id: crypto.randomUUID(),
-  }).catch((error) => showError(error.message));
-  actions.appendChild(clear);
-  panel.appendChild(actions);
-  return panel;
-}
-
 function renderTaskCard(element, message, conversationId, mode = 'conversation') {
   const task = message.task || {};
   const card = document.createElement('div');
@@ -1724,9 +1792,7 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
   header.className = 'task-card-header';
   const title = document.createElement('div');
   title.className = 'task-card-title';
-  title.textContent = isTaskIncomplete(task)
-    ? '任务暂未完成'
-    : task.goal || `任务 ${String(task.taskId || '').slice(0, 8)}`;
+  title.textContent = task.goal || `任务 ${String(task.taskId || '').slice(0, 8)}`;
   const state = document.createElement('div');
   state.className = `task-card-state ${taskStateClass(task)}`;
   state.textContent = taskDisplayLabel(task);
@@ -1743,65 +1809,6 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
   `;
   card.appendChild(meta);
 
-  const incompleteBoundary = taskIncompleteBoundary(task);
-  if (incompleteBoundary) {
-    const boundary = document.createElement('section');
-    boundary.className = 'incomplete-boundary';
-    const description = document.createElement('div');
-    description.className = 'incomplete-copy';
-    description.textContent = '当前无法安全声明任务已完成，已保留本次进度和已获取的证据。';
-    boundary.appendChild(description);
-    const gaps = Array.isArray(incompleteBoundary.gaps)
-      ? incompleteBoundary.gaps : [];
-    gaps.slice(0, 3).forEach((gap) => {
-      const text = incompleteGapDescription(gap);
-      if (!text) return;
-      const item = document.createElement('div');
-      item.className = 'incomplete-gap';
-      item.textContent = `还需要：${text}`;
-      boundary.appendChild(item);
-    });
-    if (gaps.length > 3) {
-      const remaining = document.createElement('div');
-      remaining.className = 'incomplete-gap';
-      remaining.textContent = `另有 ${gaps.length - 3} 项未完成`;
-      boundary.appendChild(remaining);
-    }
-    const actions = document.createElement('div');
-    actions.className = 'incomplete-actions';
-    const pendingApproval = incompleteNeedsApproval(task);
-    const primary = document.createElement('button');
-    primary.className = 'primary';
-    primary.textContent = pendingApproval ? '查看并确认' : '继续排查';
-    primary.onclick = () => {
-      if (pendingApproval) {
-        openIncompleteApproval(task.taskId);
-      } else {
-        resumeContinuation(task.taskId, conversationId);
-      }
-    };
-    actions.appendChild(primary);
-    if (pendingApproval) {
-      const notice = document.createElement('div');
-      notice.className = 'incomplete-copy';
-      notice.textContent = '需要你的确认后才能继续';
-      boundary.appendChild(notice);
-    } else {
-      const provide = document.createElement('button');
-      provide.textContent = '提供信息';
-      provide.onclick = focusIncompleteInput;
-      const create = document.createElement('button');
-      create.textContent = '新建任务';
-      create.onclick = startIndependentTask;
-      actions.append(provide, create);
-    }
-    boundary.appendChild(actions);
-    card.appendChild(boundary);
-  }
-
-  const completionPanel = renderSingleLoopCompletion(task);
-  if (completionPanel) card.appendChild(completionPanel);
-
   const summary = document.createElement('div');
   summary.className = 'task-card-summary';
   const progressCount = (task.progress || []).length;
@@ -1810,7 +1817,6 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
   const executionLabel = taskExecutionLabel(task);
   summary.innerHTML = `
     <div class='task-summary-item'><div class='task-summary-label'>当前阶段</div><div class='task-summary-value'>${displayLabel}</div></div>
-    <div class='task-summary-item'><div class='task-summary-label'>编排模式</div><div class='task-summary-value'>${taskOrchestrationMode(task)}</div></div>
     <div class='task-summary-item'><div class='task-summary-label'>持久流程事件</div><div class='task-summary-value'>${traceCursor || progressCount}</div></div>
     <div class='task-summary-item'><div class='task-summary-label'>执行状态</div><div class='task-summary-value'>${executionLabel}</div></div>
   `;
@@ -1857,34 +1863,40 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
 
   const todoPanel = renderTodoPanel(task.todoList);
   if (todoPanel) card.appendChild(todoPanel);
-  const contractPanel = renderContractCard(task, conversationId);
-  if (contractPanel) card.appendChild(contractPanel);
 
+  // In conversation mode this card spans every Turn, so its buffer would stack
+  // all Turns' lines at the Task's first Turn -- far above the question being
+  // answered. The live Turn renders its own progress at the end of the
+  // conversation, and each settled Turn keeps its durable call panel under its
+  // answer, so the card carries no progress panel in that mode.
   const progress = document.createElement('div');
-  progress.className = `task-progress task-panel ${mode === 'conversation' ? 'active' : ''}`;
+  progress.className = 'task-progress task-panel';
   progress.classList.add('task-collapsible');
   const lines = task.progress || [];
-  if (lines.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'task-progress-empty';
-    empty.textContent = task.phase1State === 'WAITING'
-      ? '该任务正在等待处理，不会自动重放历史执行日志。'
-      : '暂无新的执行进度';
-    progress.appendChild(empty);
-  } else {
-    lines.slice(-30).forEach((item) => {
-      const line = document.createElement('div');
-      line.className = 'task-progress-line';
-      if (isMarkdownProgress(item.text)) {
-        line.classList.add('markdown-progress');
-        line.innerHTML = renderMarkdown(item.text);
-      } else {
-        line.textContent = item.text;
-      }
-      progress.appendChild(line);
-    });
+  if (mode !== 'conversation') {
+    progress.classList.add('active');
+    if (lines.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'task-progress-empty';
+      empty.textContent = task.phase1State === 'WAITING'
+        ? '该任务正在等待处理，不会自动重放历史执行日志。'
+        : '暂无新的执行进度';
+      progress.appendChild(empty);
+    } else {
+      lines.slice(-30).forEach((item) => {
+        const line = document.createElement('div');
+        line.className = 'task-progress-line';
+        if (isMarkdownProgress(item.text)) {
+          line.classList.add('markdown-progress');
+          line.innerHTML = renderMarkdown(item.text);
+        } else {
+          line.textContent = item.text;
+        }
+        progress.appendChild(line);
+      });
+    }
+    card.appendChild(progress);
   }
-  card.appendChild(progress);
 
   const tracePanel = document.createElement('div');
   tracePanel.className = `task-panel ${mode === 'trace' ? 'active' : ''}`;
@@ -1948,7 +1960,23 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
     card.appendChild(toggle);
   });
 
-  if (task.waiting?.kind === 'APPROVAL' && task.waiting.approval) {
+  // A pending approval belongs to the Turn that requested the mutation, not
+  // necessarily the Task's opening Turn.  On a restored conversation it is
+  // rendered as its own message after that Task's latest user input (see
+  // ensureConversationLoaded), rather than being stranded in this historical
+  // Task card.  Keep this inline path only for a live card before that message
+  // has been materialized.
+  const hasStandaloneApproval = getConversationById(conversationId)?.messages
+    .some((item) => (
+      item.role === 'approval'
+      && item.taskId === task.taskId
+      && item.approval?.request_id === task.waiting?.approval?.request_id
+    ));
+  if (
+    task.waiting?.kind === 'APPROVAL'
+    && task.waiting.approval
+    && !hasStandaloneApproval
+  ) {
     const approval = document.createElement('div');
     approval.className = 'message approval';
     approval.dataset.incompleteApprovalTask = task.taskId;
@@ -2005,8 +2033,6 @@ function upsertTaskCard(conversationId, rawTask) {
         phase1State: rawTask.phase1_state || 'PREPARING',
         status: rawTask.status || 'running',
         projection: rawTask.projection || null,
-        singleLoop: rawTask.single_loop || null,
-        contract: rawTask.contract || null,
         todoList: rawTask.todo_list || null,
         traceCursor: Number(rawTask.projection?.trace_cursor || rawTask.progress_cursor || 0),
         cursor: Number(rawTask.progress_cursor || 0),
@@ -2024,12 +2050,6 @@ function upsertTaskCard(conversationId, rawTask) {
       Number(message.task.cursor || 0), Number(rawTask.progress_cursor || 0),
     );
     message.task.waiting = rawTask.waiting ?? message.task.waiting;
-    if (Object.prototype.hasOwnProperty.call(rawTask, 'single_loop')) {
-      message.task.singleLoop = rawTask.single_loop;
-    }
-    if (Object.prototype.hasOwnProperty.call(rawTask, 'contract')) {
-      message.task.contract = rawTask.contract;
-    }
     if (Object.prototype.hasOwnProperty.call(rawTask, 'todo_list')) {
       message.task.todoList = rawTask.todo_list;
     }
@@ -2068,8 +2088,8 @@ function renderApprovalCard(element, message) {
 
   const heading = document.createElement('div');
   heading.innerHTML = `
-    <div class="approval-title">授权确认</div>
-    <div class="approval-subtitle">请确认以下操作内容与影响范围。新版授权面板会展示风险等级、目标与变更预览，避免误操作。</div>
+    <div class="approval-title">需要授权</div>
+    <div class="approval-subtitle">请确认以下操作内容与影响范围。</div>
   `;
 
   const risk = document.createElement('div');
@@ -2080,36 +2100,50 @@ function renderApprovalCard(element, message) {
   hero.appendChild(risk);
   element.appendChild(hero);
 
-  const grid = document.createElement('div');
-  grid.className = 'approval-grid';
-
-  const rows = [
-    ['动作', approval.action],
-    ['目标', approval.target],
-    ['网络访问', approval.network_access ? '允许外网访问' : '仅本地操作'],
-    ['数据外发', approval.data_transmission || 'none'],
-    ['可回滚', approval.rollback || '未知'],
-  ];
-
-  rows.forEach(([label, value]) => {
-    if (!value && value !== false) return;
+  const makeApprovalItem = (label, value, compact = false) => {
     const item = document.createElement('div');
     item.className = 'approval-item';
-    item.innerHTML = `
-      <div class="approval-label">${label}</div>
-      <div class="approval-value">${renderInlineMarkdown(String(value))}</div>
-    `;
-    grid.appendChild(item);
-  });
+    const labelElement = document.createElement('div');
+    labelElement.className = 'approval-label';
+    labelElement.textContent = label;
+    const valueElement = document.createElement('div');
+    valueElement.className = 'approval-value';
+    const text = String(value ?? '未知').trim();
+    valueElement.textContent = compact && text.length > 120
+      ? `${text.slice(0, 117)}…` : text;
+    item.append(labelElement, valueElement);
+    return item;
+  };
+
+  const grid = document.createElement('div');
+  grid.className = 'approval-grid';
+  grid.append(
+    makeApprovalItem('动作', approval.action, true),
+    makeApprovalItem('目标', approval.target || '当前工作区', true),
+  );
 
   element.appendChild(grid);
 
+  const details = document.createElement('details');
+  details.className = 'approval-details';
+  const summary = document.createElement('summary');
+  summary.textContent = '查看完整操作详情';
+  details.appendChild(summary);
+  const detailsGrid = document.createElement('div');
+  detailsGrid.className = 'approval-grid';
+  detailsGrid.append(
+    makeApprovalItem('网络访问', approval.network_access ? '允许外网访问' : '仅本地操作'),
+    makeApprovalItem('数据外发', approval.data_transmission || 'none'),
+    makeApprovalItem('可回滚', approval.rollback || '未知'),
+  );
+  details.appendChild(detailsGrid);
   if (approval.preview) {
     const preview = document.createElement('pre');
     preview.className = 'approval-preview';
     preview.textContent = approval.preview;
-    element.appendChild(preview);
+    details.appendChild(preview);
   }
+  element.appendChild(details);
 
   const actions = document.createElement('div');
   actions.className = 'approval-actions';
@@ -2201,6 +2235,22 @@ async function decideApproval(message, decision) {
     return;
   }
   const card = taskMessage(message.conversationId || activeConversationId, message.taskId);
+  const conversation = getConversationById(
+    message.conversationId || activeConversationId,
+  );
+  // Restored/live conversations render approvals as standalone messages.
+  // Update that message too; changing only the task card leaves the visible
+  // approval dock with its old buttons forever.
+  const standalone = conversation?.messages.find((item) => (
+    item.role === 'approval'
+    && item.taskId === message.taskId
+    && item.approval?.request_id === approval.request_id
+  ));
+  if (standalone && conversation) {
+    conversation.messages = conversation.messages.filter(
+      (item) => item !== standalone,
+    );
+  }
   if (card) {
     card.task.approvalResolution = {
       requestId: approval.request_id, decision,
@@ -2527,15 +2577,19 @@ async function runTask() {
     showError('发送消息前请先选择工作区。');
     return;
   }
-  if (!getActiveConversation()) {
-    createConversation();
-  }
 
+  // Read the composer before creating the first conversation.  Creating a
+  // conversation restores its draft and used to clear a user's first input
+  // before it was captured, producing a misleading "请输入描述" error.
   const promptElement = document.getElementById('prompt');
   const prompt = promptElement.value.trim();
   if (!prompt) {
     showError('请输入描述');
     return;
+  }
+
+  if (!getActiveConversation()) {
+    createConversation();
   }
 
   const images = selectedImages.slice();
@@ -2568,7 +2622,14 @@ async function runTask() {
       })
     });
     if (!response.ok) {
-      throw new Error(`请求失败，状态码 ${response.status}`);
+      let detail = '';
+      try {
+        const errorBody = await response.json();
+        detail = errorBody.detail ? `：${errorBody.detail}` : '';
+      } catch (_) {
+        // Keep the status-only fallback for non-JSON gateway responses.
+      }
+      throw new Error(`请求失败，状态码 ${response.status}${detail}`);
     }
 
     const data = await response.json();
@@ -2589,12 +2650,18 @@ async function runTask() {
     }
     const card = upsertTaskCard(conversationId, {
       task_id: task.task_id,
-      goal: prompt,
+      // A continuation keeps the conversation's own goal; only a first turn
+      // names it.
+      goal: (
+        data.kind === 'continuation'
+        && taskMessage(conversationId, task.task_id)
+      )
+        ? taskMessage(conversationId, task.task_id).task.goal
+        : prompt,
       phase1_state: task.phase1_state || 'PREPARING',
       status: task.status || 'running',
       progress_cursor: 0,
       projection: task.projection || null,
-      single_loop: task.single_loop || null,
       waiting: task.approval
         ? { kind: 'APPROVAL', approval: task.approval }
         : task.status === 'awaiting_user'
@@ -2605,17 +2672,26 @@ async function runTask() {
       renderFinalResult(task.task_id, task, conversationId);
       setLoading(false);
       updateComposerButtonState();
-    } else if (
-      task.phase1_state === 'WAITING'
-      || task.status === 'awaiting_user'
-      || task.status === 'awaiting_approval'
-    ) {
-      appendTaskAssistantText(task.task_id, task.assistant_text, conversationId);
-      if (card) card.task.waiting = card.task.waiting || { kind: 'INPUT' };
-      setLoading(false);
+    } else if (data.kind === 'continuation') {
+      // A later turn on this conversation was accepted and runs in the
+      // background exactly like a first turn. Its task still reads as idle
+      // (AWAITING_INPUT -> WAITING) until that turn starts, so following it is
+      // what shows progress and the new answer.
+      // This Turn starts with an empty buffer: lines kept from the previous
+      // Turn must never read as progress of the question just asked.
+      if (card) card.task.progress = [];
+      followTask(task.task_id, conversationId);
       updateComposerButtonState();
-      renderMessages();
     } else {
+      // Even an immediately suspended Task must attach its SSE follower. It
+      // replays the durable trace and publishes the approval/clarification
+      // payload; stopping here made the latest Turn appear to have no trace
+      // and no approval dock.
+      if (task.approval) {
+        appendApproval(task.task_id, task.approval, conversationId);
+      } else if (task.status === 'awaiting_user' && card) {
+        card.task.waiting = card.task.waiting || { kind: 'INPUT' };
+      }
       followTask(task.task_id, conversationId);
       updateComposerButtonState();
     }
@@ -2658,13 +2734,320 @@ function appendTaskAssistantText(taskId, text, conversationId) {
   return true;
 }
 
+function renderTurnMarker(turnId) {
+  const marker = document.createElement('div');
+  marker.className = 'turn-marker';
+  const short = String(turnId).slice(0, 13);
+  marker.textContent = `轮次 ${short}`;
+  marker.title = `点击复制完整轮次 id：${turnId}`;
+  marker.onclick = () => copyTextToClipboard(
+    turnId, marker, `轮次 ${short}`,
+  );
+  return marker;
+}
+
+function turnCallTarget(call) {
+  const target = call.path || call.query || call.pattern
+    || call.target || call.file_glob;
+  return target ? String(target) : '';
+}
+
+// Live view of the Turn that is running: model calls ("thinking") and tool
+// calls, in the order they happened. It disappears as soon as the Turn settles,
+// where the durable per-Turn panel above takes over.
+function renderLiveTurnPanel(task) {
+  const lines = Array.isArray(task?.progress) ? task.progress : [];
+  const wrap = document.createElement('div');
+  wrap.className = 'message assistant live-turn';
+  const panel = document.createElement('div');
+  panel.className = 'live-turn-panel';
+
+  const head = document.createElement('div');
+  head.className = 'live-turn-head';
+  const dot = document.createElement('span');
+  dot.className = 'live-turn-dot';
+  const heading = document.createElement('span');
+  heading.textContent = '本轮进行中';
+  head.append(dot, heading);
+  panel.appendChild(head);
+
+  if (lines.length === 0) {
+    const pending = document.createElement('div');
+    pending.className = 'live-turn-line active';
+    // Before any model frame arrives the Task may still be preparing the
+    // workspace, so "thinking" would overstate what is happening.
+    pending.textContent = task?.phase1State === 'PREPARING'
+      ? '正在准备…' : '正在思考…';
+    panel.appendChild(pending);
+  } else {
+    lines.slice(-12).forEach((item) => {
+      const kind = item.progressData?.kind || '';
+      const row = document.createElement('div');
+      row.className = 'live-turn-line';
+      if (kind === 'model_started' || kind === 'tool_started') {
+        row.classList.add('active');
+      } else if (item.progressData?.ok === false) {
+        row.classList.add('failed');
+      }
+      row.textContent = item.text;
+      panel.appendChild(row);
+    });
+  }
+  wrap.appendChild(panel);
+  return wrap;
+}
+
+// One call panel per Turn. Settled Turns render under their answer; incomplete
+// Turns render under their input. Its content comes from durable Session and
+// Runtime records, so a reload never turns real work into an empty transcript.
+// Durable per-Turn progress items share the live stream's vocabulary, so one
+// mapping describes a Turn while it runs and after it settles. Transport items
+// fall through to describeProgress; tool results borrow the name of the call
+// they answer.
+function turnProgressLines(items) {
+  const names = new Map();
+  const lines = [];
+  (items || []).forEach((item) => {
+    const kind = item?.kind || '';
+    if (kind === 'turn_started') {
+      lines.push({ text: '本轮开始', tone: 'active' });
+      return;
+    }
+    if (kind === 'tool_started') {
+      const name = String(item.tool_name || '未知工具');
+      if (item.tool_call_id) names.set(item.tool_call_id, name);
+      lines.push({
+        text: `调用工具：${name}${item.target ? ` · ${item.target}` : ''}`,
+        tone: 'active',
+      });
+      return;
+    }
+    if (kind === 'tool_completed') {
+      const name = names.get(item.tool_call_id) || '工具';
+      const ok = item.ok !== false;
+      lines.push({
+        text: ok
+          ? `${name} 完成`
+          : `${name} 失败${item.error_code ? `（${item.error_code}）` : ''}`,
+        tone: ok ? '' : 'failed',
+      });
+      return;
+    }
+    if (kind === 'model_completed') {
+      const called = Number(item.tool_call_count || 0);
+      lines.push({
+        text: `模型第 ${item.model_call || 1} 轮回复完成`
+          + (called ? ` · 请求 ${called} 个工具` : ''),
+        tone: '',
+      });
+      return;
+    }
+    if (kind === 'turn_completed') {
+      lines.push({
+        text: `本轮结束 · 模型 ${item.model_calls ?? '?'} 次`
+          + ` · 工具 ${item.tool_calls ?? '?'} 次`,
+        tone: '',
+      });
+      return;
+    }
+    if (kind === 'turn_interrupted' || kind === 'turn_failed') {
+      const what = kind === 'turn_interrupted' ? '本轮中断' : '本轮失败';
+      lines.push({
+        text: `${what}${item.detail ? `：${item.detail}` : ''}`,
+        tone: 'failed',
+      });
+      return;
+    }
+    if (kind === 'waiting') {
+      lines.push({
+        text: item.waiting_kind === 'approval'
+          ? `等待授权${item.action ? `：${item.action}` : ''}`
+          : '等待用户输入',
+        tone: 'active',
+      });
+      return;
+    }
+    if (kind === 'completion_review') {
+      if (item.review_action === 'UNVERIFIED') {
+        lines.push({
+          text: '完成审查暂不可用；回答已展示为未核验草稿',
+          tone: 'active',
+        });
+      } else if (item.review_action === 'SKIPPED') {
+        lines.push({ text: '未启用完成审查：任务没有验收合约', tone: '' });
+      } else {
+        lines.push({
+          text: `完成审查：${item.review_action || '已完成'}`,
+          tone: item.review_action === 'CONTINUE' ? 'active' : '',
+        });
+      }
+      return;
+    }
+    const described = describeProgress(item);
+    if (described) {
+      lines.push({ text: described, tone: item.ok === false ? 'failed' : '' });
+    }
+  });
+  return lines;
+}
+
+function renderTurnCallPanel(conversation, message) {
+  const turn = conversation?.turnCalls?.get(message.turnId);
+  if (!turn) return null;
+  const incomplete = turn.settled === false;
+  // A completed Turn belongs to its answer. A suspended/failed-before-answer
+  // Turn has no answer to anchor to, so it belongs directly below its input.
+  if (
+    (message.role !== 'assistant' || incomplete)
+    && (message.role !== 'user' || !incomplete)
+  ) return null;
+  const calls = Array.isArray(turn.calls) ? turn.calls : [];
+  const counts = turn.tool_counts || {};
+  const recorded = turn.recorded !== false;
+  const counted = Object.values(counts).reduce(
+    (sum, value) => sum + Number(value || 0), 0,
+  );
+  // The durable counter is authoritative when present; older records only kept
+  // the per-tool counts, so fall back to their sum.
+  const toolCalls = Number.isInteger(turn.tool_calls) ? turn.tool_calls : counted;
+  const modelCalls = Number.isInteger(turn.model_calls) ? turn.model_calls : null;
+  const failed = calls.filter(
+    (call) => call.ok === false || call.state === 'FAILED',
+  ).length;
+  const total = Math.max(toolCalls, counted);
+  const progress = Array.isArray(turn.progress) ? turn.progress : [];
+  const panel = document.createElement('details');
+  panel.className = `turn-calls ${total > 0 ? 'has-calls' : 'no-calls'}`;
+  // A Turn that called nothing is itself worth stating, but it stays collapsed
+  // so a long conversation does not become a wall of empty panels. A Turn with
+  // recorded activity always shows it: that record is the point.
+  panel.open = incomplete || total > 0 || progress.length > 0;
+
+  const summary = document.createElement('summary');
+  const label = document.createElement('span');
+  label.className = 'turn-calls-label';
+  const facts = [];
+  if (modelCalls !== null) facts.push(`模型 ${modelCalls} 次`);
+  if (incomplete) {
+    const factText = facts.length ? ` · ${facts.join(' · ')}` : '';
+    label.textContent = `本轮未完成${factText}`;
+  } else if (!recorded) {
+    label.textContent = '本轮 · 无调用记录';
+  } else {
+    facts.push(`工具 ${total} 次`);
+    if (failed) facts.push(`失败 ${failed} 次`);
+    label.textContent = `本轮 · ${facts.join(' · ')}`;
+  }
+  summary.appendChild(label);
+  if (total > 0) {
+    const names = document.createElement('span');
+    names.className = 'turn-calls-names';
+    names.textContent = Object.keys(counts).join('、');
+    summary.appendChild(names);
+  }
+  panel.appendChild(summary);
+
+  const evaluation = buildSourceEvaluation(turn, progress);
+  if (evaluation) panel.appendChild(renderSourceEvaluation(evaluation));
+
+  // The durable lines win: they are what the Turn actually did, in order, and
+  // they survive a reload. The per-call table stays for older records that
+  // predate the progress events.
+  const lines = turnProgressLines(progress);
+  if (lines.length) {
+    const list = document.createElement('div');
+    list.className = 'turn-call-list turn-progress-list';
+    lines.forEach((line) => {
+      const row = document.createElement('div');
+      row.className = `live-turn-line ${line.tone || ''}`.trim();
+      row.textContent = line.text;
+      list.appendChild(row);
+    });
+    panel.appendChild(list);
+  } else if (calls.length) {
+    const list = document.createElement('div');
+    list.className = 'turn-call-list';
+    calls.forEach((call) => {
+      const failed = call.ok === false || call.state === 'FAILED';
+      const row = document.createElement('div');
+      row.className = 'turn-call-row';
+      const name = document.createElement('span');
+      name.className = 'turn-call-name';
+      name.textContent = String(call.tool || '未知工具');
+      const target = turnCallTarget(call);
+      const status = document.createElement('span');
+      status.className = `turn-call-status ${failed ? 'failed' : 'ok'}`;
+      status.textContent = failed
+        ? String(call.error_code || call.failure_code || 'FAILED')
+        : (call.succeeded === false ? '未达成' : '成功');
+      row.append(name, status);
+      if (target) {
+        const detail = document.createElement('span');
+        detail.className = 'turn-call-target';
+        detail.textContent = target;
+        row.appendChild(detail);
+      }
+      list.appendChild(row);
+    });
+    // The record keeps the Turn's counts for every call but only its most
+    // recent action rows, so say so rather than implying the list is complete.
+    if (total > calls.length) {
+      const note = document.createElement('div');
+      note.className = 'turn-call-target';
+      note.textContent = `另有 ${total - calls.length} 次调用未在此列出`;
+      list.appendChild(note);
+    }
+    panel.appendChild(list);
+  }
+  return panel;
+}
+
+function buildSourceEvaluation(turn, progress) {
+  const started = progress.find((item) => item.kind === 'turn_started');
+  if (started?.tool_exposure_profile !== 'source-analysis-initial') return null;
+  const toolStarts = progress.filter((item) => item.kind === 'tool_started');
+  const sourceRead = toolStarts.some((item) => (
+    ['source.github.get_file', 'core.read_file'].includes(item.tool_name)
+  ));
+  const reviews = progress.filter((item) => item.kind === 'completion_review');
+  const latestReview = reviews.at(-1);
+  return {
+    profile: started.tool_exposure_profile,
+    visibleToolCount: Number(started.visible_tool_count || 0),
+    firstTool: toolStarts[0]?.tool_name || '',
+    sourceRead,
+    review: latestReview?.review_action || '未记录',
+    reviewReason: latestReview?.review_reason_code || '',
+    finalToolCalls: Number(turn.tool_calls || 0),
+  };
+}
+
+function renderSourceEvaluation(evaluation) {
+  const section = document.createElement('section');
+  section.className = 'turn-source-evaluation';
+  const first = evaluation.firstTool || '未调用';
+  const recommendation = (!evaluation.firstTool || !evaluation.sourceRead)
+    ? '继续收集样本；若零工具或未读源码持续偏高，再评估 required。'
+    : '当前样本无需启用 required。';
+  section.innerHTML = `
+    <div class="turn-source-evaluation-heading">源码取证评测 <span>历史真实 Turn</span></div>
+    <div class="turn-source-evaluation-grid">
+      <div><small>首轮工具面</small><strong>${evaluation.visibleToolCount} 个 · 已收窄</strong></div>
+      <div><small>首个动作</small><strong>${escapeHtml(first)}</strong></div>
+      <div><small>实际读取源码</small><strong class="${evaluation.sourceRead ? 'good' : 'warn'}">${evaluation.sourceRead ? '是' : '否'}</strong></div>
+      <div><small>Completion Review</small><strong>${escapeHtml(evaluation.review)}</strong></div>
+    </div>
+    <div class="turn-source-evaluation-note">${escapeHtml(recommendation)}${evaluation.reviewReason ? ` 原因：${escapeHtml(evaluation.reviewReason)}` : ''}</div>
+  `;
+  return section;
+}
+
 function renderFinalResult(taskId, state, conversationId) {
   const card = taskMessage(conversationId, taskId)
     || upsertTaskCard(conversationId, { task_id: taskId });
   if (card) {
     applyTaskProjection(card.task, state.projection);
     applyTaskProtocol(card.task, state);
-    card.task.singleLoop = state.single_loop || null;
     card.task.phase1State = state.phase1_state || card.task.phase1State;
     card.task.status = state.status || card.task.status;
     card.task.waiting = null;
@@ -2722,13 +3105,13 @@ function followTask(taskId, conversationId) {
     if (!response.ok) return false;
     const state = await response.json();
     const current = taskMessage(conversationId, taskId) || card;
-    appendTaskAssistantText(taskId, state.assistant_text, conversationId);
+    const appendedText = appendTaskAssistantText(
+      taskId, state.assistant_text, conversationId,
+    );
     if (current) {
       applyTaskProjection(current.task, state.projection);
       applyTaskProtocol(current.task, state);
       current.task.todoList = state.todo_list || null;
-      current.task.singleLoop = state.single_loop || null;
-      current.task.contract = state.contract || null;
       if (!state.projection) {
         current.task.phase1State = state.phase1_state;
         current.task.status = state.status;
@@ -2752,6 +3135,25 @@ function followTask(taskId, conversationId) {
       (state.phase1_state === 'WAITING' || state.status === 'awaiting_user')
       && !submittedApprovalIsSettling
     ) {
+      // Rebuilding here is what gives the settled Turn its call panel. It runs
+      // only for a Turn that produced a new durable answer: an accepted
+      // continuation that has not started yet looks identical to an idle Task,
+      // and rebuilding over it would drop the input the user just sent.
+      if (appendedText) {
+        await refreshConversationHistory(conversationId).catch(
+          (error) => console.error(error),
+        );
+        // The rebuilt history is authoritative, but never let a rebuild that
+        // lagged the Turn cost the answer that was already shown.
+        const rebuilt = getConversationById(conversationId);
+        const kept = (rebuilt?.messages || []).some(
+          (item) => item.role === 'assistant'
+            && item.content === String(state.assistant_text || '').trim(),
+        );
+        if (!kept) {
+          appendTaskAssistantText(taskId, state.assistant_text, conversationId);
+        }
+      }
       if (conversationId === activeConversationId) renderMessages();
       follower.stop();
       setLoading(false);
@@ -2791,8 +3193,6 @@ function followTask(taskId, conversationId) {
         if (currentCard) {
           applyTaskProjection(currentCard.task, payload.projection);
           applyTaskProtocol(currentCard.task, payload);
-          currentCard.task.singleLoop = payload.single_loop || null;
-          currentCard.task.contract = payload.contract || null;
           if (!payload.projection) currentCard.task.phase1State = 'WAITING';
           currentCard.task.waiting = payload.waiting;
         }
@@ -2889,6 +3289,17 @@ async function ensureConversationLoaded(conversationId) {
     const tasksById = new Map(
       (data.tasks || []).map((task) => [task.task_id, task]),
     );
+    conversation.turnCalls = new Map(
+      (data.turns || [])
+        .filter((turn) => turn && turn.turn_id)
+        .map((turn) => [turn.turn_id, turn]),
+    );
+    const lastTurnByTask = new Map();
+    (data.turns || []).forEach((turn) => {
+      if (turn?.task_id && turn.turn_id) {
+        lastTurnByTask.set(turn.task_id, turn.turn_id);
+      }
+    });
     const timeline = [];
     let insertionOrder = 0;
     const visibleAssistantTaskIds = new Set();
@@ -2897,10 +3308,11 @@ async function ensureConversationLoaded(conversationId) {
       if (message.role === 'assistant' && message.task_id) {
         visibleAssistantTaskIds.add(message.task_id);
       }
-      // A Task records its input at attachment time, so a user message already
-      // sorts correctly. Older records only kept it on the result event, which
-      // lands after the Task card, so fall back to the attachment position.
-      const sequence = message.role === 'user' && task
+      // The opening input of a Task sorts at its attachment so it stays above
+      // the Task card. Every later Turn's input keeps its own event position:
+      // clamping them all to the attachment is what stacked every question at
+      // the top of the conversation while the answers sat at the bottom.
+      const sequence = message.role === 'user' && task && message.first_turn_input
         ? Math.min(
             Number(message.source_event_sequence),
             Number(task.attached_sequence),
@@ -2912,9 +3324,15 @@ async function ensureConversationLoaded(conversationId) {
         message: {
           role: message.role, content: message.content, images: [],
           taskId: message.task_id || null,
+          turnId: message.turn_id || null,
+          firstTurnInput: Boolean(message.first_turn_input),
         },
       });
     });
+    // Pending approvals are actionable session state, not transcript history.
+    // Keep them at the bottom of the conversation so a user never has to find
+    // a decision inside an old Task card or an earlier Turn's trace.
+    const pendingApprovals = [];
     (data.tasks || []).forEach((task) => {
       timeline.push({
         sequence: Number(task.attached_sequence || 0),
@@ -2924,7 +3342,6 @@ async function ensureConversationLoaded(conversationId) {
           role: 'task', content: '', task: {
             taskId: task.task_id, goal: task.goal,
             projection: task.projection || null,
-            singleLoop: task.single_loop || null,
             todoList: task.todo_list || null,
             phase1State: task.phase1_state, status: task.status,
             cursor: Number(task.progress_cursor || 0), progress: [],
@@ -2944,7 +3361,18 @@ async function ensureConversationLoaded(conversationId) {
           message: {
             role: 'assistant', content: task.assistant_text, images: [],
             taskId: task.task_id,
+            turnId: lastTurnByTask.get(task.task_id) || null,
           },
+        });
+      }
+      // A Task can span many Turns. The approval is deliberately not inserted
+      // in that historical timeline: it is rendered as an actionable footer
+      // below every conversation item after sorting.
+      if (task.waiting?.kind === 'APPROVAL' && task.waiting.approval) {
+        pendingApprovals.push({
+          role: 'approval', content: '', taskId: task.task_id,
+          turnId: task.waiting.approval.turn_id || null,
+          approval: task.waiting.approval, conversationId,
         });
       }
     });
@@ -2953,7 +3381,10 @@ async function ensureConversationLoaded(conversationId) {
       || left.order - right.order
       || left.insertionOrder - right.insertionOrder
     ));
-    conversation.messages = timeline.map((item) => item.message);
+    conversation.messages = [
+      ...timeline.map((item) => item.message),
+      ...pendingApprovals,
+    ];
     renderConversations();
     renderMessages();
 
@@ -2973,6 +3404,16 @@ async function ensureConversationLoaded(conversationId) {
     conversation.loaded = false;
     console.error(error);
   }
+}
+
+// A finished Turn is only fully described by the Session record: each answer
+// gets its own Turn id and call panel there. Rebuilding from that record after
+// a Turn settles is what keeps the panel visible without a manual reload.
+async function refreshConversationHistory(conversationId) {
+  const conversation = getConversationById(conversationId);
+  if (!conversation) return;
+  conversation.loaded = false;
+  await ensureConversationLoaded(conversationId);
 }
 
 async function loadWorkspaces() {
@@ -3082,6 +3523,33 @@ runtime_error: str | None = None
 configuration_issues: list[str] = []
 workspace_registry: list[dict[str, str]] = []
 session_workspace_bindings: dict[str, str] = {}
+
+# These runs are deliberately Web-local: the evaluated Agent Tasks themselves
+# are durable Runtime records, while this small index only groups independent
+# sample sessions for the diagnostics screen.  An evaluation never joins the
+# user's active Session or contributes assistant text to its prompt context.
+source_evaluation_runs: dict[str, dict[str, Any]] = {}
+
+_SOURCE_EVALUATION_CASES: tuple[dict[str, str], ...] = (
+    {
+        "id": "codex-input-routing",
+        "title": "Codex：输入与 turn 路径",
+        "prompt": (
+            "分析 openai/codex 源码：普通用户输入如何进入 turn，"
+            "是否存在独立的输入意图识别提示词工程。请先定位官方仓库并读取"
+            "对应实现文件，再区分源码事实与推断。"
+        ),
+    },
+    {
+        "id": "hermes-completion-loop",
+        "title": "Hermes：普通 loop 与完成判断",
+        "prompt": (
+            "分析 NousResearch/hermes-agent 源码：普通对话 loop 如何决定继续"
+            "调用工具或结束，是否有 completion review/goal judge。请先定位官方"
+            "仓库并读取 loop、prompt 或 judge 的实现文件，再给出源码证据。"
+        ),
+    },
+)
 
 
 def _root_cause_message(error: BaseException) -> str:
@@ -3464,6 +3932,19 @@ async def submit_session_input(payload: dict) -> dict:
         # A rejected workspace is a caller-visible conflict, most often a
         # Session whose earlier Tasks ran in a different directory.
         raise HTTPException(status_code=409, detail=str(error)) from error
+    except Exception as error:
+        # Never let an unexpected runtime failure terminate the HTTP response.
+        # Browsers surface a dropped response as the opaque "Failed to fetch",
+        # which hides the session and task context needed to diagnose it.
+        logger.exception(
+            "session-input failed session_id=%s workspace_id=%s request_id=%s",
+            session_id, workspace_id, request_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="session input failed; check server logs for the request id",
+            headers={"X-Request-Id": request_id},
+        ) from error
     data = dict(result.result)
     status = 202 if data.get("kind") == "task" else 200
     return JSONResponse(content=data, status_code=status)
@@ -3500,6 +3981,112 @@ def _explicit_user_input_intent(raw: object) -> RuntimeInputIntent | None:
             detail="intent must be one of: steer, replace, new, stop, queue",
         )
     return mapping[value]
+
+
+def _source_evaluation_case_snapshot(case: Mapping[str, Any]) -> dict[str, Any]:
+    """Project an isolated Task's durable events into comparable metrics."""
+    events = case.get("events") if isinstance(case.get("events"), list) else []
+    progress = [item for event in events if (item := _turn_progress_item(event))]
+    started = next((item for item in progress if item.get("kind") == "turn_started"), {})
+    tools = [item for item in progress if item.get("kind") == "tool_started"]
+    read_names = {"source.github.get_file", "core.read_file"}
+    search_names = {"web.search", "web.fetch_markdown", "source.github.resolve", "source.github.list_tree", "source.github.search_code"}
+    reads = [item for item in tools if item.get("tool_name") in read_names]
+    searches = [item for item in tools if item.get("tool_name") in search_names]
+    reviews = [item for item in progress if item.get("kind") == "completion_review"]
+    review = reviews[-1] if reviews else {}
+    result = case.get("result") if isinstance(case.get("result"), Mapping) else {}
+    status = str(result.get("status") or case.get("status") or "starting")
+    terminal = status in {"completed", "failed", "incomplete", "awaiting_user"}
+    return {
+        "id": case.get("id"), "title": case.get("title"), "task_id": case.get("task_id"),
+        "status": status, "tool_exposure_profile": started.get("tool_exposure_profile"),
+        "visible_tool_count": int(started.get("visible_tool_count") or 0),
+        "first_tool": tools[0].get("tool_name") if tools else None,
+        "tool_call_count": len(tools), "source_read": bool(reads),
+        "search_only": bool(searches) and not reads,
+        "review_action": review.get("review_action"),
+        "review_reason_code": review.get("review_reason_code"),
+        "passed": (status == "completed" and bool(reads) and review.get("review_action") != "EXHAUSTED") if terminal else None,
+        "error": case.get("error"),
+    }
+
+
+async def _launch_source_evaluation(run_id: str, workspace: Path) -> None:
+    """Submit real work in fresh Sessions; it never touches the active chat."""
+    assert runtime_server is not None
+    run = source_evaluation_runs[run_id]
+    run["status"] = "launching"
+    kernel = runtime_server._client.application.kernel
+    for case in run["cases"]:
+        try:
+            await kernel.create_session(case["title"], session_id=case["session_id"])
+            submitted = await runtime_server._client.submit_user_input(
+                case["session_id"], case["prompt"], input_id=f"evaluation-{uuid4().hex}",
+                explicit_intent=RuntimeInputIntent.NEW_TASK, workspace=workspace,
+            )
+            case["task_id"] = str(submitted.result.get("task_id") or "")
+            case["status"] = "running" if case["task_id"] else "failed"
+            if not case["task_id"]:
+                case["error"] = "Runtime 未返回 task_id"
+        except Exception as error:
+            case["status"] = "failed"
+            case["error"] = str(error)
+    run["status"] = "running"
+
+
+async def _refresh_source_evaluation(run: dict[str, Any]) -> dict[str, Any]:
+    if runtime_server is None:
+        return {"status": "unavailable", "cases": [], "metrics": {}}
+    kernel = runtime_server._client.application.kernel
+    snapshots = []
+    for case in run["cases"]:
+        if task_id := str(case.get("task_id") or ""):
+            try:
+                case["result"] = (await runtime_server._client.get_task_result(task_id)).to_data()
+                case["events"] = list(await kernel.dependencies.store.read_events(task_id, event_types=_TURN_PROGRESS_EVENT_TYPES))
+            except (LookupError, PermissionError) as error:
+                case["error"] = str(error)
+        snapshots.append(_source_evaluation_case_snapshot(case))
+    settled = snapshots and all(item["status"] in {"completed", "failed", "incomplete", "awaiting_user"} for item in snapshots)
+    if settled:
+        run["status"] = "completed"
+    measured = [item for item in snapshots if item["tool_exposure_profile"]]
+    count = len(measured)
+    rate = lambda predicate: sum(predicate(item) for item in measured) / count if count else None
+    return {"run_id": run["id"], "status": run["status"], "cases": snapshots, "metrics": {
+        "sample_count": count, "first_turn_zero_tool_rate": rate(lambda item: not item["first_tool"]),
+        "source_read_rate": rate(lambda item: item["source_read"]),
+        "search_only_rate": rate(lambda item: item["search_only"]),
+        "review_intervention_rate": rate(lambda item: item["review_action"] == "CONTINUE"),
+        "pass_rate": rate(lambda item: item["passed"] is True),
+    }}
+
+
+@app.post("/evaluations/source-analysis/runs")
+async def start_source_evaluation(payload: dict) -> dict:
+    """Start the fixed real-model samples only after the user clicks UI."""
+    if runtime_server is None:
+        raise HTTPException(status_code=503, detail=runtime_error or "runtime unavailable")
+    workspace_id = str(payload.get("workspace_id") or "").strip()
+    workspace = next((item for item in workspace_registry if item["id"] == workspace_id), None)
+    if workspace is None:
+        raise HTTPException(status_code=400, detail="workspace selection is required")
+    run_id = f"source-eval-{uuid4().hex}"
+    source_evaluation_runs[run_id] = {"id": run_id, "status": "starting", "cases": [
+        {**case, "session_id": f"evaluation-{uuid4().hex}", "status": "starting"}
+        for case in _SOURCE_EVALUATION_CASES
+    ]}
+    asyncio.create_task(_launch_source_evaluation(run_id, Path(workspace["path"])), name=run_id)
+    return {"run_id": run_id, "status": "starting", "case_count": len(_SOURCE_EVALUATION_CASES)}
+
+
+@app.get("/evaluations/source-analysis/runs/{run_id}")
+async def get_source_evaluation(run_id: str) -> dict:
+    run = source_evaluation_runs.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="evaluation run not found")
+    return await _refresh_source_evaluation(run)
 
 
 @app.post("/tasks/{task_id}/stop")
@@ -3657,17 +4244,6 @@ async def create_task(payload: dict) -> dict:
 
     goal = str(payload.get("goal", ""))
     image_blocks = _normalize_image_blocks(payload.get("images"))
-    raw_contract = payload.get("evidence_contract")
-    if raw_contract is not None and not isinstance(raw_contract, dict):
-        raise HTTPException(status_code=400, detail="evidence_contract must be an object")
-    try:
-        evidence_contract = (
-            TaskContract.from_data(raw_contract)
-            if isinstance(raw_contract, dict) else None
-        )
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-
     if image_blocks:
         # Record only the count; base64 payloads must never enter the goal.
         goal = f"{goal}\n\n[web-ui-attached-images: {len(image_blocks)}]"
@@ -3681,7 +4257,6 @@ async def create_task(payload: dict) -> dict:
             session_id=session_id,
             images=tuple(image_blocks),
             workspace=Path(workspace_path),
-            evidence_contract=evidence_contract,
         ))
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
@@ -3753,6 +4328,33 @@ async def get_session(session_id: str) -> dict:
         if event.event_type == "session.task_attached"
         and event.payload.get("task_id")
     }
+    turns = _session_turn_calls(session_events)
+    # A Turn's progress is durable fact, not a live-only view: the thinking,
+    # tool and transport lines are read back for every settled Turn so the
+    # conversation keeps showing what happened after the Turn ends.
+    turn_progress: dict[str, list[dict]] = {}
+    for task_id in snapshot.task_ids:
+        for event in runtime_server._call(
+            kernel.dependencies.store.read_events(
+                task_id, event_types=_TURN_PROGRESS_EVENT_TYPES,
+            )
+        ):
+            item = _turn_progress_item(event)
+            if item is None:
+                continue
+            turn_progress.setdefault(str(item.pop("turn_id")), []).append(item)
+    for turn in turns:
+        turn["progress"] = turn_progress.get(turn["turn_id"], [])
+    # ``session.task_attached`` records the input that opened a Task without a
+    # turn id, while the Turn it opened is that Task's first result event. The
+    # pairing is by construction, so the first Turn's id is what labels the
+    # attached input.
+    first_turn_by_task: dict[str, str] = {}
+    for turn in turns:
+        task_id = str(turn.get("task_id") or "")
+        turn_id = str(turn.get("turn_id") or "")
+        if task_id and turn_id and task_id not in first_turn_by_task:
+            first_turn_by_task[task_id] = turn_id
     task_items: list[dict] = []
     for task_id in snapshot.task_ids:
         try:
@@ -3774,7 +4376,6 @@ async def get_session(session_id: str) -> dict:
             "waiting": _waiting_payload(result),
             "assistant_text": result.assistant_text,
             "projection": dict(result.projection) if result.projection else None,
-            "single_loop": dict(result.single_loop) if result.single_loop else None,
             "todo_list": (
                 dict(result.todo_list) if result.todo_list is not None else None
             ),
@@ -3789,16 +4390,300 @@ async def get_session(session_id: str) -> dict:
         "latest_task_state": latest["phase1_state"] if latest else None,
         "waiting": latest["waiting"] if latest else None,
         "tasks": task_items,
+        # One record per Turn, in Session order. The Web renders it as the call
+        # panel under that Turn's answer, so what a Turn actually called stays
+        # visible after a reload instead of living only in the live progress
+        # stream.
+        "turns": turns,
         "messages": [
-            {
-                "role": message.role.value,
-                "content": message.text,
-                "task_id": message.task_id,
-                "source_event_sequence": message.source_event_sequence,
-            }
+            _session_message_data(message, first_turn_by_task)
             for message in projection.messages
         ],
     }
+
+
+def _session_message_data(message, first_turn_by_task: Mapping[str, str]) -> dict:
+    """One Session message with the position facts the page sorts by."""
+
+    task_id = message.task_id or ""
+    turn_id = message.turn_id
+    # ``session.task_attached`` records a Task's opening input without a turn
+    # id; the Turn it opened is that Task's first result event.
+    if turn_id is None and message.role is MessageRole.USER and task_id:
+        turn_id = first_turn_by_task.get(task_id)
+    return {
+        "role": message.role.value,
+        "content": message.text,
+        "task_id": message.task_id,
+        "turn_id": turn_id,
+        # The opening input belongs at its Task's attachment, above the Task
+        # card. A later Turn's input keeps its own event position, which is what
+        # places each question directly above its own answer instead of stacking
+        # every question at the top of the conversation.
+        "first_turn_input": bool(
+            message.role is MessageRole.USER
+            and turn_id
+            and turn_id == first_turn_by_task.get(task_id)
+        ),
+        "source_event_sequence": message.source_event_sequence,
+    }
+
+
+#: The action keys a Turn's summary keeps. Anything else (command argv,
+#: environment, patch bodies) is deliberately not in Session context.
+_TURN_CALL_KEYS = (
+    "tool", "state", "ok", "error_code", "succeeded", "failure_code",
+    "path", "query", "pattern", "target", "file_glob",
+)
+
+#: The durable events that describe how one Turn progressed. Reading only these
+#: keeps whole model messages and patch bodies out of the per-Turn view.
+_TURN_PROGRESS_EVENT_TYPES = (
+    "turn.started",
+    "model.attempt_started",
+    "model.attempt_failed",
+    "model.recovery_decided",
+    "conversation.model_response_recorded",
+    "tool.requested",
+    "tool.completed",
+    "tool.failed",
+    "turn.completed",
+    "turn.interrupted",
+    "llm.failed",
+    "turn.completion_review_completed",
+    "turn.completion_review_exhausted",
+    "turn.completion_review_skipped",
+    "turn.completion_review_bypassed",
+    "approval.requested",
+)
+
+#: Argument keys a progress line may name as the call's target. Same rule as
+#: ``_TURN_CALL_KEYS``: navigation metadata only, never command or patch bodies.
+_TURN_PROGRESS_TARGET_KEYS = (
+    "path", "query", "pattern", "target", "file_glob", "url",
+)
+
+#: Bound for any single string copied into a progress line.
+_TURN_PROGRESS_TEXT_LIMIT = 200
+
+
+def _turn_progress_item(event) -> dict | None:
+    """Normalize one durable event into a Turn progress item.
+
+    The shapes mirror the live ``AgentProgress`` items the page already renders,
+    so one renderer covers both the in-flight Turn and its durable record.
+    """
+
+    payload = event.payload if isinstance(event.payload, Mapping) else {}
+    turn_id = str(
+        payload.get("turn_id") or getattr(event, "turn_id", "") or ""
+    )
+    if not turn_id:
+        return None
+    kind = event.event_type
+    base: dict[str, Any] = {"turn_id": turn_id, "sequence": event.sequence}
+    if kind == "turn.started":
+        return {
+            **base, "kind": "turn_started",
+            "input_characters": payload.get("input_character_count"),
+            "tool_exposure_profile": payload.get("tool_exposure_profile"),
+            "visible_tool_count": len(payload.get("visible_tools") or ()),
+        }
+    if kind in {"model.attempt_started", "model.attempt_failed",
+                "model.recovery_decided"}:
+        event_kind = {
+            "model.attempt_started": "attempt_started",
+            "model.attempt_failed": "attempt_failed",
+            "model.recovery_decided": "recovery_decided",
+        }[kind]
+        return {
+            **base, "kind": "model_transport",
+            "transport_event": event_kind,
+            "transport_attempt": payload.get("provider_attempt"),
+            "max_transport_attempts": payload.get("max_provider_attempts"),
+            "transport_mode": payload.get("transport_mode"),
+            "diagnostic_code": payload.get("diagnostic_code"),
+            "diagnostic_detail": _bounded_text(payload.get("diagnostic_detail")),
+            "recovery_action": payload.get("recovery_action"),
+            "retry_delay_seconds": payload.get("delay_seconds"),
+        }
+    if kind == "conversation.model_response_recorded":
+        return {
+            **base, "kind": "model_completed",
+            "model_call": payload.get("model_call"),
+            "tool_call_count": payload.get("tool_call_count"),
+            "finish_reason": payload.get("finish_reason"),
+        }
+    if kind == "tool.requested":
+        call = payload.get("call")
+        call = call if isinstance(call, Mapping) else {}
+        arguments = call.get("arguments")
+        arguments = arguments if isinstance(arguments, Mapping) else {}
+        target = next(
+            (
+                str(arguments[key]).strip()
+                for key in _TURN_PROGRESS_TARGET_KEYS
+                if isinstance(arguments.get(key), str)
+                and str(arguments[key]).strip()
+            ),
+            "",
+        )
+        return {
+            **base, "kind": "tool_started",
+            "tool_name": str(call.get("name") or ""),
+            "tool_call_id": str(call.get("call_id") or ""),
+            "target": target[:_TURN_PROGRESS_TEXT_LIMIT],
+        }
+    if kind in {"tool.completed", "tool.failed"}:
+        result = payload.get("result")
+        result = result if isinstance(result, Mapping) else {}
+        return {
+            **base, "kind": "tool_completed",
+            "tool_call_id": str(result.get("call_id") or ""),
+            "ok": bool(result.get("ok")),
+            "error_code": result.get("error_code"),
+        }
+    if kind == "turn.completed":
+        return {
+            **base, "kind": "turn_completed",
+            "model_calls": payload.get("model_calls"),
+            "tool_calls": payload.get("tool_calls"),
+        }
+    if kind == "turn.interrupted":
+        return {
+            **base, "kind": "turn_interrupted",
+            "diagnostic_code": payload.get("failure_category"),
+            "detail": _bounded_text(payload.get("message")),
+        }
+    if kind == "approval.requested":
+        request = payload.get("request")
+        request = request if isinstance(request, Mapping) else {}
+        return {
+            **base,
+            "kind": "waiting",
+            "waiting_kind": "approval",
+            "action": _bounded_text(request.get("action") or payload.get("action")),
+            "request_id": str(
+                request.get("request_id") or payload.get("request_id") or ""
+            ),
+        }
+    if kind == "turn.completion_review_completed":
+        return {
+            **base, "kind": "completion_review",
+            "review_action": payload.get("action"),
+            "review_reason_code": payload.get("reason_code"),
+        }
+    if kind == "turn.completion_review_exhausted":
+        return {
+            **base, "kind": "completion_review",
+            "review_action": "EXHAUSTED",
+            "review_reason_code": payload.get("reason_code"),
+        }
+    if kind == "turn.completion_review_skipped":
+        return {
+            **base, "kind": "completion_review",
+            "review_action": "SKIPPED",
+            "review_reason_code": payload.get("reason_code"),
+        }
+    if kind == "turn.completion_review_bypassed":
+        return {
+            **base, "kind": "completion_review",
+            "review_action": "UNVERIFIED",
+            "review_reason_code": payload.get("reason_code"),
+        }
+    if kind == "llm.failed":
+        # A recoverable stop also writes ``turn.interrupted``; that one line is
+        # the whole story, so the duplicate is dropped.
+        if payload.get("recoverable"):
+            return None
+        return {
+            **base, "kind": "turn_failed",
+            "error_type": payload.get("error_type"),
+            "diagnostic_code": payload.get("failure_category"),
+            "detail": _bounded_text(payload.get("message")),
+        }
+    return None
+
+
+def _bounded_text(value: Any) -> str:
+    text = str(value).strip() if value is not None else ""
+    return text[:_TURN_PROGRESS_TEXT_LIMIT]
+
+
+def _session_turn_calls(session_events) -> list[dict]:
+    """Return every Session Turn, including durable but unfinished Turns.
+
+    Input is recorded before a Turn runs; a result is recorded only after it
+    settles. Keeping the input record in this projection means a refresh never
+    erases work paused for approval, interrupted, or still running. Settled
+    records subsequently enrich that same Turn with its safe summary.
+    """
+    turns_by_id: dict[str, dict] = {}
+    for event in session_events:
+        payload = event.payload if isinstance(event.payload, Mapping) else {}
+        if event.event_type == "session.turn_input_recorded":
+            turn_id = str(payload.get("turn_id") or "")
+            if not turn_id:
+                continue
+            turns_by_id.setdefault(turn_id, {
+                "turn_id": turn_id,
+                "task_id": str(payload.get("task_id") or ""),
+                "recorded": False,
+                "settled": False,
+                "model_calls": None,
+                "tool_calls": None,
+                "tool_counts": {},
+                "calls": [],
+                "source_event_sequence": event.sequence,
+            })
+            continue
+        if event.event_type != "session.task_result_recorded":
+            continue
+        raw_summary = payload.get("task_summary")
+        summary = raw_summary if isinstance(raw_summary, Mapping) else {}
+        calls = [
+            {
+                key: item[key]
+                for key in _TURN_CALL_KEYS
+                if item.get(key) is not None
+            }
+            for item in (summary.get("important_actions") or ())
+            if isinstance(item, Mapping)
+        ]
+        counts = summary.get("tool_counts")
+        recorded = isinstance(counts, Mapping)
+        counters = payload.get("turn_counters")
+        counters = counters if isinstance(counters, Mapping) else {}
+        turn_id = str(payload.get("turn_id") or summary.get("turn_id") or "")
+        if not turn_id:
+            continue
+        prior = turns_by_id.get(turn_id)
+        turns_by_id[turn_id] = {
+            "turn_id": turn_id,
+            "task_id": str(payload.get("task_id") or ""),
+            # An older record may carry no summary at all. Saying "no calls"
+            # then would be a claim the record does not support, so the page
+            # gets told which of the two it is looking at.
+            "recorded": recorded,
+            "settled": True,
+            "model_calls": counters.get("model_calls"),
+            "tool_calls": counters.get("tool_calls"),
+            "tool_counts": (
+                {str(key): value for key, value in counts.items()}
+                if recorded else {}
+            ),
+            #: Per-call detail, newest last. ``tool_counts`` stays the
+            #: authoritative total because the summary keeps only the most
+            #: recent rows.
+            "calls": calls,
+            # The input event is the Turn's timeline anchor when present; the
+            # result event is a later completion fact, not a new Turn.
+            "source_event_sequence": (
+                prior["source_event_sequence"] if prior is not None
+                else event.sequence
+            ),
+        }
+    return list(turns_by_id.values())
 
 
 @app.post("/approvals")
@@ -3859,99 +4744,6 @@ async def resolve_approval(payload: dict) -> JSONResponse:
         },
         status_code=202,
     )
-
-
-@app.get("/tasks/{task_id}/contract")
-async def get_task_contract(task_id: str) -> dict:
-    if runtime_server is None:
-        raise HTTPException(status_code=503, detail=runtime_error or "runtime unavailable")
-    contract = runtime_server._call(runtime_server._client.get_contract(task_id))
-    return {"contract": contract}
-
-
-def _contract_payload(payload: dict) -> tuple[TaskContract, int, str]:
-    raw = payload.get("contract")
-    expected_revision = payload.get("expected_revision")
-    command_id = str(payload.get("command_id", "")).strip()
-    if not isinstance(raw, dict) or not isinstance(expected_revision, int) or not command_id:
-        raise HTTPException(
-            status_code=400,
-            detail="contract, expected_revision, and command_id are required",
-        )
-    try:
-        return TaskContract.from_data(raw), expected_revision, command_id
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-
-
-@app.post("/tasks/{task_id}/contracts/drafts")
-async def draft_task_contract(task_id: str, payload: dict) -> dict:
-    if runtime_server is None:
-        raise HTTPException(status_code=503, detail=runtime_error or "runtime unavailable")
-    contract, expected_revision, command_id = _contract_payload(payload)
-    try:
-        result = runtime_server._call(runtime_server._client.draft_contract(
-            task_id, contract, expected_revision=expected_revision, command_id=command_id,
-        ))
-    except (LookupError, ValueError) as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
-    return result.to_data()
-
-
-@app.post("/tasks/{task_id}/contract/accept")
-async def accept_task_contract(task_id: str, payload: dict) -> dict:
-    if runtime_server is None:
-        raise HTTPException(status_code=503, detail=runtime_error or "runtime unavailable")
-    contract_id = str(payload.get("contract_id", "")).strip()
-    command_id = str(payload.get("command_id", "")).strip()
-    expected_revision = payload.get("expected_revision")
-    if not contract_id or not command_id or not isinstance(expected_revision, int):
-        raise HTTPException(
-            status_code=400,
-            detail="contract_id, expected_revision, and command_id are required",
-        )
-    try:
-        result = runtime_server._call(runtime_server._client.accept_contract(
-            task_id, contract_id, expected_revision=expected_revision, command_id=command_id,
-        ))
-    except (LookupError, ValueError) as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
-    return result.to_data()
-
-
-@app.put("/tasks/{task_id}/contract")
-async def update_task_contract(task_id: str, payload: dict) -> dict:
-    if runtime_server is None:
-        raise HTTPException(status_code=503, detail=runtime_error or "runtime unavailable")
-    contract, expected_revision, command_id = _contract_payload(payload)
-    try:
-        result = runtime_server._call(runtime_server._client.update_contract(
-            task_id, contract, expected_revision=expected_revision, command_id=command_id,
-        ))
-    except (LookupError, ValueError) as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
-    return result.to_data()
-
-
-@app.delete("/tasks/{task_id}/contract")
-async def clear_task_contract(task_id: str, payload: dict) -> dict:
-    if runtime_server is None:
-        raise HTTPException(status_code=503, detail=runtime_error or "runtime unavailable")
-    contract_id = str(payload.get("contract_id", "")).strip()
-    command_id = str(payload.get("command_id", "")).strip()
-    expected_revision = payload.get("expected_revision")
-    if not contract_id or not command_id or not isinstance(expected_revision, int):
-        raise HTTPException(
-            status_code=400,
-            detail="contract_id, expected_revision, and command_id are required",
-        )
-    try:
-        result = runtime_server._call(runtime_server._client.clear_contract(
-            task_id, contract_id, expected_revision=expected_revision, command_id=command_id,
-        ))
-    except (LookupError, ValueError) as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
-    return result.to_data()
 
 
 @app.get("/tasks/{task_id}")
@@ -4071,8 +4863,6 @@ async def stream(
                             "task_id": task_id,
                             "waiting": waiting,
                             "projection": result.projection,
-                            "single_loop": result.single_loop,
-                            "contract": result.contract,
                             "latest_answer_event_ref": result.latest_answer_event_ref,
                             "conclusion_claims": [
                                 dict(item) for item in result.conclusion_claims
@@ -4104,8 +4894,6 @@ async def stream(
                             "task_id": task_id,
                             "final": True,
                             "projection": result.projection,
-                            "single_loop": result.single_loop,
-                            "contract": result.contract,
                             "latest_answer_event_ref": result.latest_answer_event_ref,
                             "conclusion_claims": [
                                 dict(item) for item in result.conclusion_claims
@@ -4126,8 +4914,21 @@ async def stream(
                 )
                 return
             await asyncio.sleep(1)
+            # Keep idle connections observable to browsers and reverse
+            # proxies.  Without a comment frame, the server is polling but
+            # the wire is silent and common SSE timeouts tear down the stream.
+            if request is None or not await request.is_disconnected():
+                yield ": heartbeat\n\n"
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def main() -> None:

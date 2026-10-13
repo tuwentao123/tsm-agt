@@ -102,7 +102,15 @@ class ModelTaskSpecPlanner:
                     "When the request names a specific data source or artifact to "
                     "consult, make consulting it required work with its own outcome "
                     "carrying the observe (or execute) effect rather than leaving "
-                    "it to an ANSWER alone. "
+                    "it to an ANSWER alone. When the request depends on material "
+                    "outside this workspace -- another project's source code, a "
+                    "public repository, an external document -- also add an "
+                    "acceptance criterion with verification_kind "
+                    "external_source_read, and give the outcome that consults it the "
+                    "observe (or execute) effect. Runtime machine-checks that "
+                    "criterion: the Task cannot finish until one tool result "
+                    "actually came from outside the workspace, so local files and "
+                    "the model's own recollection cannot satisfy it. "
                     "Read-only observation may support an ANSWER without directly "
                     "completing it. For a pure knowledge question, submit exactly "
                     "one ANSWER outcome: a single reply is one deliverable, so never "
@@ -180,7 +188,6 @@ class ModelTaskSpecPlanner:
                 # (task-ef2f8587 interrupted on exactly that).
                 max_output_tokens=4096,
                 allow_tool_calls=supports_tools,
-                require_evidence_questions=False,
             ))
             calls = tuple(
                 block.call for block in response.message.content

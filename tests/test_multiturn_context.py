@@ -50,9 +50,9 @@ class RecordingModelProvider(EchoModelProvider):
     keeps the token-budget compactor in play, a large one lets the projector's own
     count bound be the only limit. Tests need to choose.
 
-    The 4300 default is 4096 raised by the 204 estimated tokens the protected
-    static prompt gained from the ``mandatory-tool-use`` segment, so the default
-    window keeps the slack these tests were calibrated against.
+    The 4363 default is 4096 raised by the protected static prompt growth from
+    the ``mandatory-tool-use`` and ``tool-failure-recovery`` segments, so the
+    default window keeps the slack these tests were calibrated against.
     """
 
     descriptor = AdapterDescriptor(
@@ -60,7 +60,7 @@ class RecordingModelProvider(EchoModelProvider):
         frozenset({"text"}),
     )
 
-    def __init__(self, context_window: int = 4300) -> None:
+    def __init__(self, context_window: int = 4363) -> None:
         super().__init__()
         self.capabilities = ProviderCapabilities(context_window=context_window)
         self.requests: list[ModelRequest] = []
@@ -111,7 +111,7 @@ class ContextualResolver:
 class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
     async def make_client(
         self, root: Path, *, projector=None, context_manager=None,
-        context_window: int = 4300,
+        context_window: int = 4363,
     ):
         model = RecordingModelProvider(context_window)
         app = compose_fixture_application(
@@ -404,7 +404,7 @@ class ConversationMessageContractTest(unittest.TestCase):
 
     def test_system_role_stays_out_of_the_conversation(self) -> None:
         """The system prompt is built once and replayed verbatim, never
-        reconstructed from history (Hermes ``agent/AGENTS.md:56-62``)."""
+        reconstructed from history (project invariant)."""
 
         with self.assertRaises(ValueError):
             self._message(role=MessageRole.SYSTEM, text="you are")
@@ -430,7 +430,8 @@ class ScaffoldingMarkerTest(unittest.TestCase):
 
     Without this, persisting a turn's messages into conversation history would
     write a Runtime-authored "user" turn that later outranks the real
-    instruction -- the failure Hermes' ``_EPHEMERAL_SCAFFOLDING_FLAGS``
+    instruction -- the failure the reference implementation's
+    ``_EPHEMERAL_SCAFFOLDING_FLAGS``
     (``agent/session_persistence.py:36-54``) exists to prevent.
     """
 
@@ -449,7 +450,10 @@ class ScaffoldingMarkerTest(unittest.TestCase):
 
         self.assertEqual(
             SCAFFOLDING_KINDS,
-            {"completion-readiness", "continuation-input", "steering"},
+            {
+                "completion-readiness", "continuation-input", "steering",
+                "runtime-finalization", "completion-review",
+            },
         )
 
     def test_ordinary_messages_are_not_scaffolding(self) -> None:

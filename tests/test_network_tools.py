@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gzip
 import json
 import tempfile
 import unittest
+import zlib
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from pathlib import Path
@@ -10,7 +12,7 @@ from unittest.mock import Mock, patch
 
 from tsm_agt.adapters.builtin import NetworkToolProvider
 from tsm_agt.adapters.builtin.network_tools import (
-    _search_outage_failure,
+    _MAX_DECOMPRESSED_FETCH_BYTES, _search_outage_failure,
     FetchResponse, _BingNewsRssProvider, _DuckDuckGoLiteProvider,
     _RssNewsProvider, _TavilyProvider, _WikipediaProvider,
 )
@@ -18,7 +20,7 @@ from tsm_agt.retrieval.schemas import RetrievalResult, RetrievalSearchResponse
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import CoreToolPolicy, PolicyAction, ProjectTrustLevel, TaskState
 from tsm_agt.ports import (
-    AdapterContext, EvidenceQuestion, ToolCall, ToolEffect,
+    AdapterContext, ToolCall, ToolEffect,
 )
 
 
@@ -26,12 +28,14 @@ class _FakeFetchTransport:
     def __init__(self, responses: dict[str, FetchResponse | Exception]) -> None:
         self.responses = responses
         self.calls: list[str] = []
+        self.headers: list[dict[str, str]] = []
         self.pinned_addresses: list[str | None] = []
 
     def fetch(
         self, url, *, headers, timeout_seconds, max_bytes, pinned_address=None,
     ):
         self.calls.append(url)
+        self.headers.append(dict(headers))
         self.pinned_addresses.append(pinned_address)
         response = self.responses[url]
         if isinstance(response, Exception):
@@ -60,7 +64,7 @@ class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
             [tool.name for tool in tools],
             [
                 "web.search", "web.fetch_markdown", "web.open",
-                "web.find_in_page", "source.github.resolve", "content.summarize",
+                "web.find_in_page", "web.read", "content.summarize",
             ],
         )
         fetch = tools[1]
@@ -68,6 +72,25 @@ class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fetch.is_read_only)
         self.assertEqual(fetch.effect, ToolEffect.OBSERVE)
         self.assertIn("HTTP(S) URL", fetch.data_transmission)
+
+    async def test_github_resolve_is_advertised_only_with_the_github_adapter(self) -> None:
+        # ``source.github.resolve`` only names targets inside the GitHub source
+        # adapter. Without that adapter it routes the model to tools that do not
+        # exist, so it must stay out of the advertised toolset.
+        self.assertNotIn(
+            "source.github.resolve",
+            [tool.name for tool in await self.provider.list_tools()],
+        )
+
+        with_adapter = NetworkToolProvider(
+            search_mode="live", github_source_tools=True
+        )
+        await with_adapter.start(AdapterContext({}, lambda *_: None))
+        self.addAsyncCleanup(with_adapter.stop, datetime.now())
+        self.assertIn(
+            "source.github.resolve",
+            [tool.name for tool in await with_adapter.list_tools()],
+        )
 
     async def test_fetch_returns_markdown_without_transforming_it(self):
         transport = _FakeFetchTransport({
@@ -94,9 +117,6 @@ class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.data["content"], "# Spec\\n\\n- Keep this Markdown intact.\\n")
         self.assertEqual(result.data["content_type"], "text/markdown")
         self.assertEqual(transport.calls, ["https://docs.example.test/spec.md"])
-        fact, = result.evidence_facts
-        self.assertEqual(fact.kind, "web.document")
-        self.assertTrue(fact.complete)
         self.assertTrue(result.meta["untrusted_data"])
 
     async def test_fetch_converts_html_without_script_or_style_content(self):
@@ -257,7 +277,7 @@ class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
 
         # Every provider failed, so this is an outage and must not be reported as
         # a successful search with zero results: a model reading "ok, no results"
-        # concludes the fact does not exist. Hermes reports the same case as
+        # concludes the fact does not exist. The reference implementation reports the same case as
         # ``success: false``.
         self.assertFalse(result.ok, result.to_data())
         self.assertEqual(result.error_code, "SEARCH_UNAVAILABLE")
@@ -579,7 +599,7 @@ class WebSearchModeTest(unittest.IsolatedAsyncioTestCase):
     Mirrors Codex's ``WebSearchMode`` with one deliberate difference: the default
     is ``live``, because unlike Codex there is no provider-side index for
     ``cached`` to serve from. ``cached`` (no egress) and ``off`` remain available
-    for hosts that want the stricter posture. The failure mapping mirrors Hermes'
+    for hosts that want the stricter posture. The failure mapping mirrors the reference implementation's
     ``success: false`` -- an outage reported as ``ok=True`` with an empty list
     would let a model conclude that a fact does not exist when in truth nothing
     answered.
@@ -866,6 +886,231 @@ class WebOpenAndFindTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.fact_descriptor.authority, "external_web_document")
         self.assertEqual(result.fact_descriptor.scope, ("task:task-a", "turn:turn-a"))
 
+    async def test_open_previews_large_documents_and_keeps_full_text_searchable(self):
+        content = "HEAD\n" + ("a" * 12_000) + "\nMIDDLE_TOKEN\n" + ("z" * 12_000) + "\nTAIL"
+        provider = await self._provider({
+            self.URL: FetchResponse(
+                200, self.URL, {"Content-Type": "text/plain"}, content.encode(),
+            ),
+        })
+        context = self._context("task-a", "turn-a")
+
+        opened = await provider.invoke(
+            ToolCall("open-large", "web.open", {"url": self.URL}), context,
+        )
+        self.assertTrue(opened.ok, opened.to_data())
+        self.assertTrue(opened.truncated)
+        self.assertTrue(opened.data["preview_truncated"])
+        self.assertEqual(opened.data["total_chars"], len(content))
+        self.assertIn("HEAD", opened.data["content"])
+        self.assertIn("TAIL", opened.data["content"])
+        self.assertIn("web.find_in_page", opened.data["content"])
+        self.assertNotIn("MIDDLE_TOKEN", opened.data["content"])
+
+        found = await provider.invoke(
+            ToolCall("find-middle", "web.find_in_page", {
+                "document_ref": opened.data["document_ref"], "pattern": "MIDDLE_TOKEN",
+            }),
+            context,
+        )
+        self.assertTrue(found.ok, found.to_data())
+        self.assertEqual(found.data["match_count"], 1)
+        self.assertGreater(found.data["matches"][0]["offset"], 12_000)
+        self.assertEqual(provider._fetch_transport.calls, [self.URL])
+
+    async def test_read_pages_an_opened_document_without_a_network_request(self):
+        content = "HEAD\n" + ("a" * 12_000) + "\nMIDDLE_TOKEN\n" + ("z" * 12_000) + "\nTAIL"
+        provider = await self._provider({
+            self.URL: FetchResponse(
+                200, self.URL, {"Content-Type": "text/plain"}, content.encode(),
+            ),
+        })
+        context = self._context("task-a", "turn-a")
+        opened = await provider.invoke(
+            ToolCall("open-large", "web.open", {"url": self.URL}), context,
+        )
+        self.assertTrue(opened.ok, opened.to_data())
+        document_ref = opened.data["document_ref"]
+
+        start = await provider.invoke(
+            ToolCall("read-head", "web.read", {
+                "document_ref": document_ref, "offset": 0, "max_chars": 4,
+            }),
+            context,
+        )
+        self.assertTrue(start.ok, start.to_data())
+        self.assertEqual(start.data["content"], "HEAD")
+        self.assertEqual(start.data["offset"], 0)
+        self.assertEqual(start.data["returned_chars"], 4)
+        self.assertEqual(start.data["total_chars"], len(content))
+        self.assertEqual(start.data["next_offset"], 4)
+        self.assertTrue(start.data["truncated"])
+
+        middle_offset = content.index("MIDDLE_TOKEN")
+        middle = await provider.invoke(
+            ToolCall("read-middle", "web.read", {
+                "document_ref": document_ref,
+                "offset": middle_offset,
+                "max_chars": 12,
+            }),
+            context,
+        )
+        self.assertTrue(middle.ok, middle.to_data())
+        self.assertEqual(middle.data["content"], "MIDDLE_TOKEN")
+
+        tail = await provider.invoke(
+            ToolCall("read-tail", "web.read", {
+                "document_ref": document_ref,
+                "offset": len(content) - 4,
+            }),
+            context,
+        )
+        self.assertTrue(tail.ok, tail.to_data())
+        self.assertEqual(tail.data["content"], "TAIL")
+        self.assertIsNone(tail.data["next_offset"])
+        self.assertFalse(tail.data["truncated"])
+
+        # Paging never refetches: the document was read once, from the cache.
+        self.assertEqual(provider._fetch_transport.calls, [self.URL])
+
+    async def test_read_rejects_unknown_refs_foreign_scopes_and_bad_offsets(self):
+        content = "one two three"
+        provider = await self._provider({
+            self.URL: FetchResponse(
+                200, self.URL, {"Content-Type": "text/plain"}, content.encode(),
+            ),
+        })
+        context = self._context("task-a", "turn-a")
+        opened = await provider.invoke(
+            ToolCall("open", "web.open", {"url": self.URL}), context,
+        )
+        document_ref = opened.data["document_ref"]
+
+        unknown = await provider.invoke(
+            ToolCall("read-unknown", "web.read", {"document_ref": "webdoc:missing"}),
+            context,
+        )
+        self.assertFalse(unknown.ok)
+        self.assertEqual(unknown.error_code, "DOCUMENT_REF_NOT_FOUND")
+
+        beyond = await provider.invoke(
+            ToolCall("read-beyond", "web.read", {
+                "document_ref": document_ref, "offset": len(content) + 5,
+            }),
+            context,
+        )
+        self.assertFalse(beyond.ok)
+
+        other_scope = await provider.invoke(
+            ToolCall("read-other", "web.read", {"document_ref": document_ref}),
+            self._context("task-a", "turn-b"),
+        )
+        self.assertFalse(other_scope.ok)
+        self.assertEqual(other_scope.error_code, "DOCUMENT_REF_NOT_FOUND")
+
+    async def test_open_decodes_gzip_and_deflate_documents_with_bounded_output(self):
+        content = b"# Spec\n\nCompressed but searchable content.\n"
+        raw_deflater = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        encodings = (
+            ("gzip", "gzip", gzip.compress(content)),
+            ("deflate", "deflate", zlib.compress(content)),
+            (
+                "raw-deflate", "deflate",
+                raw_deflater.compress(content) + raw_deflater.flush(),
+            ),
+        )
+        context = self._context("task-a", "turn-a")
+
+        for name, encoding, payload in encodings:
+            with self.subTest(encoding=name):
+                provider = await self._provider({
+                    self.URL: FetchResponse(
+                        200, self.URL,
+                        {
+                            "Content-Type": "text/markdown",
+                            "Content-Encoding": encoding,
+                        },
+                        payload,
+                    ),
+                })
+                result = await provider.invoke(
+                    ToolCall(f"open-{name}", "web.open", {"url": self.URL}),
+                    context,
+                )
+
+                self.assertTrue(result.ok, result.to_data())
+                self.assertEqual(result.data["content"], content.decode())
+                self.assertEqual(
+                    provider._fetch_transport.headers[-1]["Accept-Encoding"],
+                    "gzip, deflate, identity",
+                )
+
+    async def test_open_rejects_unsafe_or_unsupported_compressed_documents(self):
+        context = self._context("task-a", "turn-a")
+        oversized = gzip.compress(b"x" * (_MAX_DECOMPRESSED_FETCH_BYTES + 1))
+        cases = {
+            "br": (
+                FetchResponse(
+                    200, self.URL,
+                    {"Content-Type": "text/markdown", "Content-Encoding": "br"},
+                    b"opaque",
+                ),
+                "UNSUPPORTED_CONTENT_ENCODING",
+            ),
+            "oversized-gzip": (
+                FetchResponse(
+                    200, self.URL,
+                    {"Content-Type": "text/markdown", "Content-Encoding": "gzip"},
+                    oversized,
+                ),
+                "DECOMPRESSED_RESPONSE_TOO_LARGE",
+            ),
+            "truncated-gzip": (
+                FetchResponse(
+                    200, self.URL,
+                    {"Content-Type": "text/markdown", "Content-Encoding": "gzip"},
+                    gzip.compress(b"incomplete"),
+                    truncated=True,
+                ),
+                "COMPRESSED_RESPONSE_TRUNCATED",
+            ),
+        }
+
+        for name, (response, error_code) in cases.items():
+            with self.subTest(case=name):
+                provider = await self._provider({self.URL: response})
+                result = await provider.invoke(
+                    ToolCall(f"open-{name}", "web.open", {"url": self.URL}),
+                    context,
+                )
+
+                self.assertFalse(result.ok)
+                self.assertEqual(result.error_code, error_code)
+
+    async def test_open_accepts_the_document_ref_from_an_earlier_fetch(self):
+        provider = await self._provider({
+            self.URL: FetchResponse(
+                200, self.URL, {"Content-Type": "text/markdown"},
+                b"# Spec\n\nSearchable content.\n",
+            ),
+        })
+        context = self._context("task-a", "turn-a")
+        fetched = await provider.invoke(
+            ToolCall("fetch", "web.fetch_markdown", {"url": self.URL}), context,
+        )
+        self.assertTrue(fetched.ok, fetched.to_data())
+
+        # Models routinely feed web.fetch_markdown's document_ref back into
+        # web.open as ref_id. That means "re-open this document", so it must
+        # succeed instead of reporting an unknown search ref.
+        result = await provider.invoke(
+            ToolCall("reopen", "web.open", {"ref_id": fetched.data["document_ref"]}),
+            context,
+        )
+
+        self.assertTrue(result.ok, result.to_data())
+        self.assertEqual(result.data["canonical_url"], self.URL)
+
     async def test_find_only_reads_the_opened_document_and_bounds_matches(self):
         provider = await self._provider({
             self.URL: FetchResponse(
@@ -997,7 +1242,6 @@ class WebOpenAndFindTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             first.data["results"][0]["ref_id"], second.data["results"][0]["ref_id"],
         )
-
 
 class GitHubSourceResolveTest(unittest.IsolatedAsyncioTestCase):
     @staticmethod

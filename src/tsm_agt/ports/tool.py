@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .adapter import RuntimeAdapter
-from .evidence import EvidenceFact
 from .process import BackgroundProcessStartResult, ProcessCommandResult
 from .workspace_path import WorkspacePathPort
 
@@ -59,90 +58,6 @@ class ToolResultAuthority(StrEnum):
     RUNTIME_FACT = "runtime_fact"
     EXTERNAL_SERVICE = "external_service"
     DERIVED = "derived"
-
-
-class EvidenceCapability(StrEnum):
-    """What a successful result is allowed to *prove*.
-
-    **Reconstructed, not restored.** The working-tree version of this file was
-    lost to an accidental ``git reset --hard`` and never existed in any commit or
-    in the object database. This definition is rebuilt from three surviving
-    sources, in this order of authority:
-
-    1. ``tests/test_evidence_capabilities.py`` (originally
-       ``test_proof_closure.py::EvidenceCapabilityTest``) -- a surviving test that
-       pins the derivation table case by case, the ``frozenset()`` default, and
-       the exact substrings of both fail-closed errors;
-    2. ``Artifact Graph与Proof Obligation任务证明闭环实施SPEC.md`` §4.3 (deleted in
-       ``6f2a870``, recoverable via ``git show '6f2a870^:...'``) -- the member
-       list and the ``(effect, result_authority)`` pair behind each;
-    3. the two consumers that existed at reconstruction time,
-       ``core/evidence_coverage.py`` and ``core/proof_projection.py`` -- both were
-       removed with the P0 proof layer, so ``ToolSpec.evidence_capabilities`` is
-       now the derivation table's only production reader.
-
-    One rule is a judgement call and is called out where it is applied: which
-    pairs count as "observable" for an explicit declaration. The only pair used
-    positively anywhere is ``(OBSERVE, WORKSPACE_FACT)``; the only negative case
-    is ``(UNSPECIFIED, NONE)``, so the rule is stated as "the result authority
-    must establish some fact".
-    """
-
-    #: Derived from ``(effect, result_authority)`` -- see the table below.
-    READ_ARTIFACT = "READ_ARTIFACT"
-    MUTATE_ARTIFACT = "MUTATE_ARTIFACT"
-    OBSERVE_EFFECT = "OBSERVE_EFFECT"
-    EXECUTE_VERIFICATION = "EXECUTE_VERIFICATION"
-    OBSERVE_RUNTIME = "OBSERVE_RUNTIME"
-    OBSERVE_EXTERNAL = "OBSERVE_EXTERNAL"
-    #: Not derivable from the two declared fields; a tool declares these itself.
-    #: ``ENUMERATE_SCOPE`` can report completeness (``complete`` / ``stop_reason``
-    #: / ``skipped_count``); ``OBSERVE_RELATION`` can report symbol, config or
-    #: reference relationships.
-    ENUMERATE_SCOPE = "ENUMERATE_SCOPE"
-    OBSERVE_RELATION = "OBSERVE_RELATION"
-
-
-#: Capabilities no ``(effect, result_authority)`` pair can produce. Only these may
-#: appear in ``ToolSpec.extra_evidence_capabilities``.
-EXPLICIT_ONLY_EVIDENCE_CAPABILITIES: frozenset[EvidenceCapability] = frozenset({
-    EvidenceCapability.ENUMERATE_SCOPE,
-    EvidenceCapability.OBSERVE_RELATION,
-})
-
-#: The single authority for derived capabilities. A tool that declares only
-#: ``effect`` + ``result_authority`` gets its capabilities from here, so no adapter
-#: has to maintain a second, divergent list.
-_DERIVED_EVIDENCE_CAPABILITIES: Mapping[
-    tuple[ToolEffect, ToolResultAuthority], EvidenceCapability
-] = {
-    (ToolEffect.OBSERVE, ToolResultAuthority.WORKSPACE_FACT):
-        EvidenceCapability.READ_ARTIFACT,
-    (ToolEffect.MUTATE, ToolResultAuthority.MUTATION_FACT):
-        EvidenceCapability.MUTATE_ARTIFACT,
-    (ToolEffect.OBSERVE, ToolResultAuthority.PROCESS_FACT):
-        EvidenceCapability.OBSERVE_EFFECT,
-    (ToolEffect.EXECUTE, ToolResultAuthority.PROCESS_FACT):
-        EvidenceCapability.EXECUTE_VERIFICATION,
-    (ToolEffect.OBSERVE, ToolResultAuthority.RUNTIME_FACT):
-        EvidenceCapability.OBSERVE_RUNTIME,
-    (ToolEffect.OBSERVE, ToolResultAuthority.EXTERNAL_SERVICE):
-        EvidenceCapability.OBSERVE_EXTERNAL,
-}
-
-
-def derive_evidence_capabilities(
-    effect: ToolEffect, result_authority: ToolResultAuthority,
-) -> frozenset[EvidenceCapability]:
-    """Capabilities implied by what a tool *does* and what its result *means*.
-
-    Total and deterministic: an unlisted pair yields the empty set rather than
-    guessing, which is what keeps ``UNSPECIFIED`` tools from silently acquiring
-    proof weight.
-    """
-
-    capability = _DERIVED_EVIDENCE_CAPABILITIES.get((effect, result_authority))
-    return frozenset({capability}) if capability is not None else frozenset()
 
 
 class ToolProtocol(StrEnum):
@@ -197,50 +112,6 @@ class WebEgressMode(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class EvidenceQuestion:
-    """The concrete unknown that one model-requested tool call should resolve."""
-
-    question_id: str
-    question: str
-    scope_expansion_reason: str = ""
-    expected_scope: str = ""
-
-    def __post_init__(self) -> None:
-        normalized_id = self.question_id.strip()
-        normalized_question = self.question.strip()
-        normalized_reason = self.scope_expansion_reason.strip()
-        normalized_scope = self.expected_scope.strip()
-        if not normalized_id or len(normalized_id) > 64:
-            raise ValueError("evidence question_id must contain 1..64 characters")
-        if not normalized_question or len(normalized_question) > 500:
-            raise ValueError("evidence question must contain 1..500 characters")
-        if len(normalized_reason) > 500:
-            raise ValueError("scope expansion reason must contain at most 500 characters")
-        if len(normalized_scope) > 1000:
-            raise ValueError("expected scope must contain at most 1000 characters")
-
-    def to_data(self) -> dict[str, str]:
-        data = {
-            "question_id": self.question_id.strip(),
-            "question": self.question.strip(),
-        }
-        if self.scope_expansion_reason.strip():
-            data["scope_expansion_reason"] = self.scope_expansion_reason.strip()
-        if self.expected_scope.strip():
-            data["expected_scope"] = self.expected_scope.strip()
-        return data
-
-    @classmethod
-    def from_data(cls, data: Mapping[str, Any]) -> EvidenceQuestion:
-        return cls(
-            question_id=str(data.get("question_id", "")),
-            question=str(data.get("question", "")),
-            scope_expansion_reason=str(data.get("scope_expansion_reason", "")),
-            expected_scope=str(data.get("expected_scope", "")),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class ToolSpec:
     name: str
     description: str
@@ -257,13 +128,6 @@ class ToolSpec:
     effect: ToolEffect = ToolEffect.UNSPECIFIED
     result_authority: ToolResultAuthority = ToolResultAuthority.UNSPECIFIED
     protocol: ToolProtocol = ToolProtocol.IMMEDIATE
-    #: Supplement for capabilities no ``(effect, result_authority)`` pair can
-    #: produce. Anything derivable here is rejected below: two lists that can
-    #: disagree is exactly the "third parallel taxonomy" this design removes.
-    extra_evidence_capabilities: frozenset[EvidenceCapability] = frozenset()
-    #: Explicit typed-evidence kinds this provider may normalize from success.
-    #: These IDs are consumed by EvidenceGate, never inferred from ToolEffect.
-    evidence_capability_ids: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if (
@@ -296,54 +160,6 @@ class ToolSpec:
             raise ValueError(
                 "interaction tools must return user_intent via wait_user protocol"
             )
-        # Fail closed at construction, not at read: a declaration that contradicts
-        # the derivation must never reach a Task, and a reader who never asks for
-        # ``evidence_capabilities`` must not be able to carry it either.
-        declared = frozenset(self.extra_evidence_capabilities)
-        conflicting = declared - EXPLICIT_ONLY_EVIDENCE_CAPABILITIES
-        if conflicting:
-            raise ValueError(
-                "evidence capabilities "
-                f"{sorted(item.value for item in conflicting)} are derived from "
-                "effect + result_authority and must not be declared again; only "
-                f"{sorted(item.value for item in EXPLICIT_ONLY_EVIDENCE_CAPABILITIES)} "
-                "may be declared explicitly"
-            )
-        if declared and self.result_authority in {
-            ToolResultAuthority.UNSPECIFIED, ToolResultAuthority.NONE,
-        }:
-            raise ValueError(
-                "an explicit evidence capability requires an observable "
-                "result_authority: it claims the tool can prove something, so its "
-                f"result must establish some fact, not {self.result_authority.value!r}"
-            )
-        if any(not capability.strip() for capability in self.evidence_capability_ids):
-            raise ValueError("evidence capability ids must not contain empty values")
-
-    @property
-    def evidence_capabilities(self) -> frozenset[EvidenceCapability]:
-        """Everything this tool is allowed to prove: derived union declared."""
-
-        return derive_evidence_capabilities(
-            self.effect, self.result_authority,
-        ) | frozenset(self.extra_evidence_capabilities)
-
-    @property
-    def requires_evidence_question(self) -> bool:
-        """Whether model calls need a fact-finding obligation envelope.
-
-        ``UNSPECIFIED`` deliberately stays conservative for existing external
-        adapters.  User interaction, mutation journals and Runtime control facts
-        have their own lifecycle and must not be forced into Evidence Questions.
-        """
-
-        return self.result_authority in {
-            ToolResultAuthority.UNSPECIFIED,
-            ToolResultAuthority.WORKSPACE_FACT,
-            ToolResultAuthority.PROCESS_FACT,
-            ToolResultAuthority.EXTERNAL_SERVICE,
-            ToolResultAuthority.DERIVED,
-        }
 
     def to_data(self) -> dict[str, Any]:
         return {
@@ -362,7 +178,6 @@ class ToolSpec:
             "effect": self.effect.value,
             "result_authority": self.result_authority.value,
             "protocol": self.protocol.value,
-            "evidence_capability_ids": sorted(self.evidence_capability_ids),
         }
 
 
@@ -371,17 +186,10 @@ class ToolCall:
     call_id: str
     name: str
     arguments: Mapping[str, Any] = field(default_factory=dict)
-    evidence_question: EvidenceQuestion | None = None
     outcome_ref: str | None = None
     # Runtime-owned and persisted after binding. Provider adapters never accept
     # this value from model-generated arguments.
     outcome_binding_mode: OutcomeBindingMode = OutcomeBindingMode.FULFILLMENT
-    #: The model's declared evidence intent for this call. Diagnostic only: it is
-    #: validated and may only *add* attribution -- never remove it and never block
-    #: the action (§5.2) -- which is why the raw mapping is carried here and parsed
-    #: by the proof layer rather than trusted at the tool boundary.
-    evidence_intent: Mapping[str, Any] | None = None
-
     def __post_init__(self) -> None:
         if not self.call_id.strip():
             raise ValueError("tool call_id must not be empty")
@@ -396,17 +204,10 @@ class ToolCall:
             "name": self.name,
             "arguments": dict(self.arguments),
         }
-        if self.evidence_question is not None:
-            data["evidence_question"] = self.evidence_question.to_data()
         if self.outcome_ref is not None:
             data["outcome_ref"] = self.outcome_ref
         if self.outcome_binding_mode is not OutcomeBindingMode.FULFILLMENT:
             data["outcome_binding_mode"] = self.outcome_binding_mode.value
-        # Omitted when absent, like every other optional key here: this is
-        # checkpoint wire, and a new unconditional key would change the bytes --
-        # and the content hash -- of every ToolCall already recorded.
-        if self.evidence_intent is not None:
-            data["evidence_intent"] = dict(self.evidence_intent)
         return data
 
     @classmethod
@@ -414,20 +215,10 @@ class ToolCall:
         arguments = data.get("arguments", {})
         if not isinstance(arguments, Mapping):
             raise ValueError("tool call arguments must be an object")
-        raw_question = data.get("evidence_question")
-        if raw_question is not None and not isinstance(raw_question, Mapping):
-            raise ValueError("tool call evidence_question must be an object")
-        raw_intent = data.get("evidence_intent")
-        if raw_intent is not None and not isinstance(raw_intent, Mapping):
-            raise ValueError("tool call evidence_intent must be an object")
         return cls(
             call_id=str(data["call_id"]),
             name=str(data["name"]),
             arguments=dict(arguments),
-            evidence_question=(
-                EvidenceQuestion.from_data(raw_question)
-                if isinstance(raw_question, Mapping) else None
-            ),
             outcome_ref=(
                 str(data["outcome_ref"])
                 if data.get("outcome_ref") is not None else None
@@ -435,9 +226,6 @@ class ToolCall:
             outcome_binding_mode=OutcomeBindingMode(str(
                 data.get("outcome_binding_mode", "FULFILLMENT")
             )),
-            evidence_intent=(
-                dict(raw_intent) if isinstance(raw_intent, Mapping) else None
-            ),
         )
 
 
@@ -589,7 +377,6 @@ class ToolResult:
     truncated: bool = False
     meta: Mapping[str, Any] = field(default_factory=dict)
     fact_descriptor: ToolFactDescriptor | None = None
-    evidence_facts: tuple[EvidenceFact, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.call_id.strip():
@@ -606,12 +393,6 @@ class ToolResult:
             self.fact_descriptor, ToolFactDescriptor
         ):
             raise ValueError("tool result fact_descriptor must be ToolFactDescriptor")
-        if not self.ok and self.evidence_facts:
-            raise ValueError("failed tool result cannot contain evidence facts")
-        if any(not isinstance(fact, EvidenceFact) for fact in self.evidence_facts):
-            raise ValueError("tool result evidence_facts must contain EvidenceFact values")
-        if self.truncated and any(fact.complete for fact in self.evidence_facts):
-            raise ValueError("truncated tool result cannot contain complete evidence facts")
 
     @property
     def effective_recovery_kind(self) -> ToolRecoveryKind:
@@ -642,8 +423,6 @@ class ToolResult:
                 result["recovery_action"] = dict(self.recovery_action)
         if self.fact_descriptor is not None:
             result["fact_descriptor"] = self.fact_descriptor.to_data()
-        if self.evidence_facts:
-            result["evidence_facts"] = [fact.to_data() for fact in self.evidence_facts]
         return result
 
     @classmethod
@@ -657,11 +436,6 @@ class ToolResult:
         raw_fact_descriptor = data.get("fact_descriptor")
         if raw_fact_descriptor is not None and not isinstance(raw_fact_descriptor, Mapping):
             raise ValueError("tool result fact_descriptor must be an object")
-        raw_evidence_facts = data.get("evidence_facts", [])
-        if not isinstance(raw_evidence_facts, list) or not all(
-            isinstance(item, Mapping) for item in raw_evidence_facts
-        ):
-            raise ValueError("tool result evidence_facts must be an object list")
         return cls(
             call_id=str(data["call_id"]),
             ok=bool(data["ok"]),
@@ -681,9 +455,6 @@ class ToolResult:
             fact_descriptor=(
                 ToolFactDescriptor.from_data(raw_fact_descriptor)
                 if isinstance(raw_fact_descriptor, Mapping) else None
-            ),
-            evidence_facts=tuple(
-                EvidenceFact.from_data(item) for item in raw_evidence_facts
             ),
         )
 
@@ -808,18 +579,6 @@ class ToolTaskSpecControl(Protocol):
     ) -> Mapping[str, Any]: ...
 
 
-class ToolTurnIntentControl(Protocol):
-    """Persist model-declared intent attempts for the invocation's active turn."""
-
-    async def declare(self, intent: Mapping[str, Any]) -> Mapping[str, Any]: ...
-
-    async def record_attempt(
-        self,
-        call_id: str,
-        arguments: Mapping[str, Any],
-    ) -> Mapping[str, Any]: ...
-
-
 @dataclass(frozen=True, slots=True)
 class ToolInvocationContext:
     invocation_id: str
@@ -837,7 +596,6 @@ class ToolInvocationContext:
     memory_control: ToolMemoryControl | None = None
     working_memory_control: ToolWorkingMemoryControl | None = None
     task_spec_control: ToolTaskSpecControl | None = None
-    turn_intent_control: ToolTurnIntentControl | None = None
     workspace_path: WorkspacePathPort | None = None
     additional_read_roots: tuple[Path, ...] = ()
     resource_paths: Mapping[str, str] = field(default_factory=dict)

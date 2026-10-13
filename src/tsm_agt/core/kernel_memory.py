@@ -1,6 +1,6 @@
 """Task memory and working memory for `Kernel`.
 
-A mixin module in the Hermes facade+siblings shape (``run_agent.py`` +
+A mixin module in the facade-plus-siblings shape (``run_agent.py`` +
 ``agent/session_persistence.py``): the facade ``core/kernel.py`` imports
 this at module level and adds ``MemoryMixin`` to ``Kernel``'s bases, so
 **every method resolves through ``Kernel``'s MRO unchanged** --
@@ -9,7 +9,7 @@ attributes all still resolve. Moved bodies are verbatim: nothing is renamed
 and no signature changes.
 
 This module must never bind the facade at module level; late-import it
-inside a method instead (Hermes ``AGENTS.md:243-244``).
+inside a method instead (the project's module-boundary rule).
 
 Moved from ``core/kernel.py``:
 
@@ -39,7 +39,6 @@ from tsm_agt.ports import (
 from typing import Any
 from uuid import uuid4
 from .configuration import canonical_hash
-from .evidence_question import EvidenceQuestionProjector
 from .memory import MemoryRecord, MemoryScope, MemorySourceKind, MemoryView
 from .task import TaskSnapshot, TaskState
 from .trust import workspace_fingerprint
@@ -69,9 +68,8 @@ class MemoryMixin:
         snapshot = self._dependencies.working_memory_projector.project(
             task_id, task.goal, events
         )
-        questions = EvidenceQuestionProjector.project(task_id, events)
         return self._dependencies.effective_working_memory_projector.project(
-            snapshot, questions
+            snapshot
         )
 
     async def update_working_memory(
@@ -353,12 +351,11 @@ class MemoryMixin:
     async def _working_memory_context_message(self, task_id: str) -> Message | None:
         effective = await self.get_effective_working_memory(task_id)
         snapshot = effective.snapshot
-        questions = await self.get_evidence_questions(task_id)
         if snapshot.revision == 1 and not any((
             snapshot.constraints, snapshot.facts, snapshot.decisions,
             snapshot.hypotheses, snapshot.open_questions, snapshot.plan,
             snapshot.completed_work, effective.remaining_work, effective.evidence,
-        )) and not questions.records:
+        )):
             return None
         execution_state = {
             "task_id": snapshot.task_id,
@@ -387,9 +384,6 @@ class MemoryMixin:
                 "durable memory, or private chain-of-thought. Validate hypotheses "
                 "and use only referenced evidence for completion claims."
             ),
-            "evidence_questions": [
-                record.to_data() for record in questions.records
-            ],
             **execution_state,
         }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return Message(

@@ -310,7 +310,7 @@ class SQLiteRuntimeStoreTest(unittest.IsolatedAsyncioTestCase):
         version = self.store._require_connection().execute(
             "SELECT value FROM runtime_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        self.assertEqual(version, "2")
+        self.assertEqual(version, "3")
 
         await self.store.commit_session_and_task(SessionTaskUnitOfWork(
             SessionUnitOfWork(
@@ -319,7 +319,9 @@ class SQLiteRuntimeStoreTest(unittest.IsolatedAsyncioTestCase):
             ),
             RuntimeUnitOfWork(
                 "task-1", 1, {"state": "COMPLETED"},
-                (RuntimeEvent("evt-1", "task-1", 1, "turn.completed"),),
+                (RuntimeEvent(
+                    "evt-1", "task-1", 1, "turn.completed", turn_id="turn-1",
+                ),),
             ),
             "final-command",
         ))
@@ -327,6 +329,8 @@ class SQLiteRuntimeStoreTest(unittest.IsolatedAsyncioTestCase):
             await self.store.load_session_task_command("final-command"),
             ("session-1", "task-1"),
         )
+        events = await self.store.read_events("task-1")
+        self.assertEqual([event.turn_id for event in events], ["turn-1"])
 
 
 if __name__ == "__main__":

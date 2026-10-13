@@ -65,3 +65,39 @@ def test_render_markdown_collapses_single_blank_line_without_extra_breaks() -> N
     assert source.count("join(String.fromCharCode(10))") == 2
     assert "function isMarkdownProgress(text)" in source
     assert "line.innerHTML = renderMarkdown(item.text);" in source
+
+
+def test_restored_approval_is_rendered_in_a_fixed_conversation_dock() -> None:
+    """A multi-turn Task must not bury or scroll a pending approval."""
+
+    source = _index_html_source()
+
+    assert "const pendingApprovals = [];" in source
+    assert "Pending approvals are actionable session state" in source
+    assert "...pendingApprovals," in source
+    assert 'id=\\"approval-dock\\"' in source
+    assert ".approval-dock{display:none;position:absolute" in source
+    assert "approvalDock.appendChild(element);" in source
+    assert "approvalDock.classList.add('visible');" in source
+    assert "chatArea.classList.add('has-approval-dock');" in source
+
+
+def test_approval_dock_uses_a_compact_summary_with_optional_details() -> None:
+    source = _index_html_source()
+
+    assert 'heading.innerHTML = `' in source
+    assert '<div class="approval-title">需要授权</div>' in source
+    assert "summary.textContent = '查看完整操作详情';" in source
+    assert "makeApprovalItem('动作', approval.action, true)" in source
+    assert ".approval-dock .message.approval{width:100%;max-width:none;min-height:0" in source
+
+
+def test_unfinished_turn_trace_is_a_sibling_of_its_input_bubble() -> None:
+    """A full-width trace must not stretch a right-aligned user message."""
+
+    source = _index_html_source()
+
+    assert ".turn-trace{align-self:stretch;width:100%;max-width:none" in source
+    assert "inputTrace = document.createElement('div');" in source
+    assert "inputTrace.className = 'turn-trace';" in source
+    assert "if (inputTrace) chatArea.appendChild(inputTrace);" in source

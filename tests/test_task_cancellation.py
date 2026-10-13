@@ -14,9 +14,6 @@ import unittest
 from pathlib import Path
 
 from tsm_agt.adapters.fixture import EchoModelProvider
-from tsm_agt.adapters.rule_based_completion_readiness import (
-    RuleBasedCompletionReadinessPolicy,
-)
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     CANCELLATION_METRICS,
@@ -496,9 +493,8 @@ if __name__ == "__main__":
     unittest.main()
 
 
-from tsm_agt.core.single_loop import OrchestrationMode
+from tsm_agt.core import OrchestrationMode
 
 
 def compose_legacy_fixture_application(*args, **kwargs):
-    kwargs["orchestration_mode"] = OrchestrationMode.LEGACY
     return compose_fixture_application(*args, **kwargs)

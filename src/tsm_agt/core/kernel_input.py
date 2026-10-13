@@ -1,6 +1,6 @@
 """Runtime input dispatch and routing for `Kernel`.
 
-A mixin module in the Hermes facade+siblings shape (``run_agent.py`` +
+A mixin module in the facade-plus-siblings shape (``run_agent.py`` +
 ``agent/session_persistence.py``): the facade ``core/kernel.py`` imports
 this at module level and adds ``InputMixin`` to ``Kernel``'s bases, so
 **every method resolves through ``Kernel``'s MRO unchanged** --
@@ -9,7 +9,7 @@ attributes all still resolve. Moved bodies are verbatim: nothing is renamed
 and no signature changes.
 
 This module must never bind the facade at module level; late-import it
-inside a method instead (Hermes ``AGENTS.md:243-244``).
+inside a method instead (the project's module-boundary rule).
 
 Moved from ``core/kernel.py``:
 
@@ -49,10 +49,7 @@ from .agent_loop import (
 )
 from .cancellation import note_cancel_requested
 from .configuration import canonical_hash
-from .single_loop import OrchestrationMode, TaskBindingDecision
-from .evidence_question import (
-    EvidenceQuestionProjector, ToolActionDisposition
-)
+from .conversation_orchestration import OrchestrationMode, TaskBindingDecision
 from .runtime_input import (
     ApprovalResolutionInput, CancelTaskInput, ClarificationReplyInput,
     InterruptTaskInput, RuntimeInputContext, RuntimeInputIntent,
@@ -90,7 +87,7 @@ class InputMixin:
         Protocol replies are resolved directly against their pending request;
         only ``RuntimeTextInput`` may enter the ordinary-text route.
 
-        Dispatch is a **table**, not an if/elif ladder (Hermes ``AGENTS.md:249``):
+        Dispatch is a **table**, not an if/elif ladder (the project's dispatch rule):
         a new input kind adds a row to ``_INPUT_HANDLERS`` plus one uniform
         handler, and cannot silently fall through to a neighbouring branch. The
         handlers all accept both callbacks even where only some publish progress,
@@ -176,19 +173,11 @@ class InputMixin:
         on_progress: Callable[[AgentProgress], None] | None = None,
     ):
         del on_text_delta, on_progress  # this route publishes neither
-        if self._dependencies.orchestration_mode is OrchestrationMode.SINGLE_LOOP:
-            return await self.bind_session_input(
-                event.session_id,
-                current_input_event_ref=f"input:{event.input_id}",
-                explicit_task_id=event.shadow_explicit_task_id,
-                new_task_requested=event.shadow_new_task_requested,
-            )
-        return await self.resolve_session_input(
+        return await self.bind_session_input(
             event.session_id,
-            event.text,
-            Path(event.workspace) if event.workspace else None,
-            shadow_explicit_task_id=event.shadow_explicit_task_id,
-            shadow_new_task_requested=event.shadow_new_task_requested,
+            current_input_event_ref=f"input:{event.input_id}",
+            explicit_task_id=event.shadow_explicit_task_id,
+            new_task_requested=event.shadow_new_task_requested,
         )
 
     async def _handle_runtime_text(
@@ -348,22 +337,6 @@ class InputMixin:
             if applied and checkpoint is not None:
                 approval = task.pending_approval
                 assert approval is not None
-                evidence_projection = EvidenceQuestionProjector.project(
-                    task_id, events
-                )
-                evidence_record = None
-                if approval.call.evidence_question is not None:
-                    current_evidence = evidence_projection.get(
-                        approval.call.evidence_question.question_id
-                    )
-                    if (
-                        current_evidence is not None
-                        and approval.call.call_id in current_evidence.tool_call_ids
-                    ):
-                        evidence_projection, evidence_record = evidence_projection.dispose(
-                            approval.call, ToolActionDisposition.REPLACE,
-                            "pending approval superseded by runtime input",
-                        )
                 cancellation_messages = tuple(
                     Message(
                         f"msg-superseded-{call.call_id}-{uuid4().hex}",
@@ -399,33 +372,6 @@ class InputMixin:
                         "pending_user_action": {},
                     },
                 ))
-                if evidence_record is not None:
-                    current_record = current_evidence
-                    assert current_record is not None
-                    sequence += 1
-                    evidence_record = replace(
-                        evidence_record, updated_event_sequence=sequence
-                    )
-                    committed_events.append(RuntimeEvent(
-                        f"evt-{uuid4().hex}", task_id, sequence,
-                        "evidence.question_state_changed", {
-                            "turn_id": approval.turn_id,
-                            "tool_call_id": approval.call.call_id,
-                            "tool_name": approval.call.name,
-                            "question_ref": evidence_record.question_ref,
-                            "previous_status": current_record.status.value,
-                            "next_status": evidence_record.status.value,
-                            "observation_kind": (
-                                evidence_record.observation_kind.value
-                                if evidence_record.observation_kind else None
-                            ),
-                            "blocking_reason": evidence_record.blocking_reason,
-                            "evidence_count": len(
-                                evidence_record.evidence_references
-                            ),
-                            "record": evidence_record.to_data(),
-                        },
-                    ))
                 sequence += 1
                 committed_events.append(RuntimeEvent(
                     f"evt-{uuid4().hex}", task_id, sequence,
@@ -433,7 +379,7 @@ class InputMixin:
                         "turn_id": approval.turn_id,
                         "tool_call_id": approval.call.call_id,
                         "tool_name": approval.call.name,
-                        "disposition": ToolActionDisposition.REPLACE.value,
+                        "disposition": "REPLACE",
                         "reason": "pending approval superseded by runtime input",
                     },
                 ))

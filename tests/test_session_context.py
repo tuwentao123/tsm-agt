@@ -54,6 +54,7 @@ class SessionContextProjectorTest(unittest.TestCase):
                     f"assistant-{sequence}", MessageRole.ASSISTANT,
                     (TextBlock(assistant),),
                 ).to_data(),
+                "assistant_replay_eligible": True,
                 "task_summary": {
                     "task_id": f"task-{sequence}",
                     "turn_id": f"turn-{sequence}",
@@ -125,6 +126,29 @@ class SessionContextProjectorTest(unittest.TestCase):
             body["recent_task_summaries"][0]["tool_counts"],
             {"core.search_text": 1},
         )
+
+    def test_unreviewed_assistant_text_is_kept_for_history_but_not_prompted(self) -> None:
+        snapshot = SessionSnapshot.create(
+            "session-1", "uid:1", "replay boundary"
+        ).bump_context()
+        event = self._event(1, "inspect the external source", "unsupported long answer")
+        event = SessionEvent(
+            event.event_id, event.session_id, event.sequence, event.event_type,
+            {**event.payload, "assistant_replay_eligible": False},
+        )
+
+        projection = SessionContextProjector().project(snapshot, (event,))
+        # The durable history/UI can still disclose exactly what happened.
+        self.assertEqual(
+            [item.text for item in projection.messages],
+            ["inspect the external source", "unsupported long answer"],
+        )
+        body = json.loads(SessionContextProjector().for_prompt(projection).message.text)
+        self.assertEqual(
+            [item["text"] for item in body["recent_messages"]],
+            ["inspect the external source"],
+        )
+        self.assertNotIn("unsupported long answer", json.dumps(body))
 
     def test_all_task_summaries_enter_projection_before_token_budgeting(self) -> None:
         snapshot = SessionSnapshot.create(
@@ -462,6 +486,54 @@ class SessionContextProjectorTest(unittest.TestCase):
         self.assertEqual(user_messages, ["那继续验证啊"])
         self.assertEqual(projection.messages[0].source_event_sequence, 1)
 
+    def test_later_conversation_turns_keep_their_own_user_message(self) -> None:
+        snapshot = SessionSnapshot.create(
+            "session-1", "uid:1", "conversation turns"
+        ).bump_context().bump_context()
+        attached = SessionEvent(
+            "event-1", "session-1", 1, "session.task_attached", {
+                "task_id": "task-1", "active_task_id": "task-1",
+                "task_relation": "INDEPENDENT",
+                "user_text": "看下今天的新闻",
+            },
+        )
+
+        def turn(sequence: int, asked: str, answered: str) -> SessionEvent:
+            return SessionEvent(
+                f"event-{sequence}", "session-1", sequence,
+                "session.task_result_recorded", {
+                    "task_id": "task-1",
+                    "turn_id": f"turn-{sequence}",
+                    "user_message": Message(
+                        f"user-{sequence}", MessageRole.USER,
+                        (TextBlock(asked),),
+                    ).to_data(),
+                    "assistant_message": Message(
+                        f"assistant-{sequence}", MessageRole.ASSISTANT,
+                        (TextBlock(answered),),
+                    ).to_data(),
+                },
+            )
+
+        projection = SessionContextProjector().project(
+            snapshot,
+            (
+                attached,
+                turn(2, "看下今天的新闻", "今天有三条要闻"),
+                turn(3, "再看下天气", "今天是晴天"),
+            ),
+        )
+
+        self.assertEqual(
+            [(item.role, item.text) for item in projection.messages],
+            [
+                (MessageRole.USER, "看下今天的新闻"),
+                (MessageRole.ASSISTANT, "今天有三条要闻"),
+                (MessageRole.USER, "再看下天气"),
+                (MessageRole.ASSISTANT, "今天是晴天"),
+            ],
+        )
+
     def test_legacy_handoff_goal_recovers_the_user_sentence(self) -> None:
         snapshot = SessionSnapshot.create(
             "session-1", "uid:1", "legacy handoff"
@@ -648,7 +720,7 @@ class SessionContextRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 first = await self._executing_task(
                     first_app, root, "first task", "task-first", session.session_id
                 )
-                await first_app.kernel.run_text_turn(
+                await first_app.kernel.run_agent_turn(
                     first.task_id, "Use Kotlin and never Java"
                 )
                 before = await first_app.kernel.get_session_conversation(session.session_id)
@@ -684,7 +756,7 @@ class SessionContextRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 second = await self._executing_task(
                     second_app, root, "follow-up", "task-second", "session-restart"
                 )
-                await second_app.kernel.run_text_turn(
+                await second_app.kernel.run_agent_turn(
                     second.task_id, "Which language did I require?"
                 )
                 request = second_model.requests[-1]
@@ -696,7 +768,10 @@ class SessionContextRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 context = json.loads(context_messages[0].text)
                 self.assertEqual(
                     [item["text"] for item in context["recent_messages"]],
-                    ["Use Kotlin and never Java", "answered: Use Kotlin and never Java"],
+                    [
+                        "Use Kotlin and never Java",
+                        "Which language did I require?",
+                    ],
                 )
                 self.assertEqual(request.messages[-1].text, "Which language did I require?")
             finally:
@@ -716,11 +791,11 @@ class SessionContextRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 task_one = await self._executing_task(
                     application, root, "private", "task-one", one.session_id
                 )
-                await application.kernel.run_text_turn(task_one.task_id, "only session one")
+                await application.kernel.run_agent_turn(task_one.task_id, "only session one")
                 task_two = await self._executing_task(
                     application, root, "other", "task-two", two.session_id
                 )
-                await application.kernel.run_text_turn(task_two.task_id, "session two request")
+                await application.kernel.run_agent_turn(task_two.task_id, "session two request")
                 serialized = json.dumps(
                     [message.to_data() for message in model.requests[-1].messages],
                     ensure_ascii=False,

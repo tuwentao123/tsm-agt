@@ -4,7 +4,8 @@ import unittest
 from datetime import datetime, timezone
 
 from tsm_agt.core import (
-    ApprovalRequest, InvalidTaskTransition, Phase1TaskState, TaskSnapshot,
+    ApprovalRequest, InvalidTaskTransition, Phase1TaskState, TaskKind,
+    TaskSnapshot,
     TaskState,
     WorkspaceAccessCapability, WorkspaceAccessGrant,
 )
@@ -28,6 +29,7 @@ class TaskStateMachineTest(unittest.TestCase):
             TaskState.EXECUTING: Phase1TaskState.RUNNING,
             TaskState.AWAITING_APPROVAL: Phase1TaskState.WAITING,
             TaskState.AWAITING_USER: Phase1TaskState.WAITING,
+            TaskState.AWAITING_INPUT: Phase1TaskState.WAITING,
             TaskState.INTERRUPTING: Phase1TaskState.INTERRUPTED,
             TaskState.INTERRUPTED: Phase1TaskState.INTERRUPTED,
             TaskState.RESUMING: Phase1TaskState.RUNNING,
@@ -85,7 +87,13 @@ class TaskStateMachineTest(unittest.TestCase):
 
         self.assertEqual(conflicted.state, TaskState.CONFLICT)
 
-    def test_serialization_round_trip(self) -> None:
+    def test_historical_task_kind_decodes_to_conversation(self) -> None:
+        historical = self.task.to_data()
+        historical["task_kind"] = "LEGACY"
+        restored = TaskSnapshot.from_data(historical)
+        self.assertIs(restored.task_kind, TaskKind.CONVERSATION)
+        self.assertEqual(restored.to_data()["task_kind"], "CONVERSATION")
+
         data = self.task.to_data()
         self.assertEqual(data["phase1_state"], Phase1TaskState.PREPARING.value)
         self.assertEqual(TaskSnapshot.from_data(data), self.task)

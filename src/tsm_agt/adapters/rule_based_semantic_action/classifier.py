@@ -75,13 +75,11 @@ class RuleBasedSemanticActionClassifier:
         scope_kind, scope = self._scope(call)
         target_hash = self._hash({"kind": target_kind, "value": target})
         scope_hash = self._hash({"kind": scope_kind.value, "value": scope})
-        semantic_target = (
-            call.evidence_question.question_id.strip().casefold()
-            if call.evidence_question is not None else target
-        )
         semantic_signature = self._hash({
             "family": family.value,
-            "target": semantic_target,
+            "tool_name": call.name,
+            "arguments": self._canonical_arguments(call.arguments),
+            "target": target,
         })
         return SemanticAction(
             family, target_kind, target_hash, scope_kind, scope_hash,
@@ -93,10 +91,7 @@ class RuleBasedSemanticActionClassifier:
     ) -> tuple[SemanticActionFamily, str, str, float]:
         name = call.name
         arguments = call.arguments
-        question = (
-            call.evidence_question.question.casefold()
-            if call.evidence_question is not None else ""
-        )
+        question = ""
         if name == "core.list_files":
             return (SemanticActionFamily.INSPECT_PROJECT_STRUCTURE, "structure",
                     "project-structure", 0.98)
@@ -215,9 +210,17 @@ class RuleBasedSemanticActionClassifier:
 
     @classmethod
     def _question_or(cls, fallback: str, call: ToolCall) -> str:
-        if call.evidence_question is None:
-            return fallback
-        return "question:" + cls._hash(call.evidence_question.question.casefold())
+        return fallback
+
+    @classmethod
+    def _canonical_arguments(
+        cls, arguments: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        return {
+            str(key): value
+            for key, value in sorted(arguments.items(), key=lambda item: str(item[0]))
+            if value not in (None, "", (), [], {})
+        }
 
     @classmethod
     def _mutation_target(cls, arguments: Mapping[str, Any]) -> str:

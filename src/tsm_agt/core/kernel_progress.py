@@ -1,6 +1,6 @@
 """Agent-progress reporting and progressive-scope policy probes for `Kernel`.
 
-A mixin module in the Hermes facade+siblings shape (``run_agent.py`` +
+A mixin module in the facade-plus-siblings shape (``run_agent.py`` +
 ``agent/session_persistence.py``): the facade ``core/kernel.py`` imports
 this at module level and adds ``ProgressMixin`` to ``Kernel``'s bases, so
 **every method resolves through ``Kernel``'s MRO unchanged** --
@@ -9,7 +9,7 @@ attributes all still resolve. Moved bodies are verbatim: nothing is renamed
 and no signature changes.
 
 This module must never bind the facade at module level; late-import it
-inside a method instead (Hermes ``AGENTS.md:243-244``).
+inside a method instead (the project's module-boundary rule).
 
 Moved from ``core/kernel.py``:
 
@@ -179,10 +179,9 @@ class ProgressMixin:
         projector = self._dependencies.agent_progress_projector
         if projector is None:
             return
-        question_ref = (
-            canonical_hash(call.evidence_question.question_id)[:12]
-            if call.evidence_question is not None else ""
-        )
+        question_ref = canonical_hash({
+            "tool": call.name, "arguments": dict(call.arguments),
+        })[:12]
         try:
             projection = await projector.project(AgentProgressSignals(
                 phase=phase,
@@ -242,19 +241,13 @@ class ProgressMixin:
             budget_score=projection.budget_score, value_band=projection.value_band,
             next_action=projection.next_action, reason=projection.reason,
             goal=goal,
-            question=(
-                call.evidence_question.question
-                if call.evidence_question is not None else ""
-            ),
+            question="",
             operation=call.name,
             operation_arguments=dict(presentation.visible_arguments),
             operation_presentation=presentation.text,
             operation_presentation_mode=presentation.mode,
             scope_target=self._live_scope_target(call),
-            scope_change_reason=(
-                call.evidence_question.scope_expansion_reason
-                if call.evidence_question is not None else ""
-            ),
+            scope_change_reason="",
             budget_reason=(
                 budget_decision.reason if budget_decision is not None else ""
             ),

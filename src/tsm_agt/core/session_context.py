@@ -146,10 +146,10 @@ def _prompt_conclusion_summary(
 #: ``SYSTEM`` is excluded deliberately, and this is not the same restriction that
 #: used to live here: the system prompt is built once per Session and replayed
 #: verbatim, so it must never be reconstructed from conversation history
-#: (Hermes invariant, ``agent/AGENTS.md:56-62``). Tool rows, by contrast, must
-#: survive a turn boundary or multi-turn context cannot be replayed at all --
-#: the ``messages`` table in ``hermes_state_common.py:443-474`` carries
-#: ``role='tool'`` alongside real user/assistant rows for exactly that reason.
+#: (project invariant). Tool rows, by contrast, must survive a turn boundary or
+#: multi-turn context cannot be replayed at all -- the persisted ``messages``
+#: table carries ``role='tool'`` alongside real user/assistant rows for exactly
+#: that reason.
 #:
 #: ``AWAITING``-style marker roles are not conversation content and stay out.
 _SESSION_CONVERSATION_ROLES = frozenset({
@@ -172,6 +172,9 @@ class SessionConversationMessage:
     #: carrying a pairing field is a writer bug, not degraded input.
     tool_call_id: str | None = None
     tool_name: str | None = None
+    #: Whether an assistant result may become a premise in a later model turn.
+    #: It never controls UI or audit retention.
+    replay_eligible: bool = True
 
     def __post_init__(self) -> None:
         if self.role not in _SESSION_CONVERSATION_ROLES:
@@ -210,6 +213,8 @@ class SessionConversationMessage:
             data["tool_call_id"] = self.tool_call_id
         if self.tool_name is not None:
             data["tool_name"] = self.tool_name
+        if not self.replay_eligible:
+            data["replay_eligible"] = False
         return data
 
 
@@ -599,6 +604,40 @@ class SessionPromptProjection:
     prompt_data: Mapping[str, Any] | None = None
 
 
+def _attachment_inputs_recorded_by_their_turn(
+    events: Sequence[SessionEvent],
+) -> frozenset[str]:
+    """Tasks whose first Turn recorded its own input, keyed by task id.
+
+    Only the *first* Turn's record makes the attachment redundant, and a Turn
+    records its input before its result event, so the record has to precede the
+    Task's first result event to count. Otherwise (an older record, or a Task
+    whose first Turn never recorded anything) the attachment is still the only
+    place its input exists.
+    """
+
+    first_result: dict[str, int] = {}
+    first_input: dict[str, int] = {}
+    for event in sorted(events, key=lambda item: item.sequence):
+        task_id = str(event.payload.get("task_id") or "")
+        if not task_id:
+            continue
+        if (
+            event.event_type == "session.task_result_recorded"
+            and task_id not in first_result
+        ):
+            first_result[task_id] = event.sequence
+        elif (
+            event.event_type == "session.turn_input_recorded"
+            and task_id not in first_input
+        ):
+            first_input[task_id] = event.sequence
+    return frozenset(
+        task_id for task_id, sequence in first_input.items()
+        if sequence < first_result.get(task_id, sequence + 1)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SessionContextProjector:
     recent_execution_limit: int = 10
@@ -634,10 +673,19 @@ class SessionContextProjector:
         resources: dict[str, SessionResourceReference] = {}
         questions: dict[str, SessionQuestionReference] = {}
         task_summaries: dict[str, SessionTaskSummary] = {}
-        # A Task that recorded its own input owns its user message. The goal
+        # ``session.task_attached`` carries the user message for a Task's FIRST
+        # turn. A conversation Task keeps taking turns on the same Task, and
+        # every later turn records its own ``user_message`` on a result event,
+        # so this exemption is consumed by the first result event. The goal
         # carried by a later result event is a rewritten handoff, so it must not
         # replace words the user actually typed.
-        tasks_with_recorded_input: set[str] = set()
+        unconsumed_attachment_input: set[str] = set()
+        # A Turn now records its input when it starts, so a Turn that never
+        # finishes still has its question in the history. For a Task whose first
+        # Turn did that, the attachment holds the same words and is skipped.
+        superseded_attachment_input = _attachment_inputs_recorded_by_their_turn(
+            events
+        )
 
         for event in sorted(events, key=lambda item: item.sequence):
             if event.session_id != snapshot.session_id:
@@ -645,26 +693,49 @@ class SessionContextProjector:
             if event.event_type == "session.task_attached":
                 task_id = str(event.payload.get("task_id") or "")
                 user_text = str(event.payload.get("user_text") or "").strip()
-                if task_id and user_text:
-                    tasks_with_recorded_input.add(task_id)
+                if (
+                    task_id and user_text
+                    and task_id not in superseded_attachment_input
+                ):
+                    unconsumed_attachment_input.add(task_id)
                     messages.append(SessionConversationMessage(
                         f"msg-session-input-{task_id}", MessageRole.USER,
                         user_text, task_id, None, event.sequence,
                     ))
                     sources.add(event.sequence)
+            elif event.event_type == "session.turn_input_recorded":
+                task_id = str(event.payload.get("task_id") or "")
+                turn_id = str(event.payload.get("turn_id") or "")
+                projected = self._visible_message(
+                    event.payload.get("user_message"), MessageRole.USER,
+                    task_id, turn_id, event.sequence,
+                )
+                if projected is not None and projected.message_id not in seen_message_ids:
+                    seen_message_ids.add(projected.message_id)
+                    messages.append(projected)
+                    sources.add(event.sequence)
             elif event.event_type == "session.task_result_recorded":
                 task_id = str(event.payload.get("task_id") or "")
                 turn_id = str(event.payload.get("turn_id") or "")
+                # Missing is deliberately false so pre-review records cannot
+                # silently become factual premises after an upgrade.
+                assistant_replay_eligible = (
+                    event.payload.get("assistant_replay_eligible") is True
+                )
                 for key, role in (("user_message", MessageRole.USER),
                                   ("assistant_message", MessageRole.ASSISTANT)):
                     if (
                         role is MessageRole.USER
-                        and task_id in tasks_with_recorded_input
+                        and task_id in unconsumed_attachment_input
                     ):
                         # The attachment already carried the real input.
                         continue
                     projected = self._visible_message(
-                        event.payload.get(key), role, task_id, turn_id, event.sequence
+                        event.payload.get(key), role, task_id, turn_id, event.sequence,
+                        replay_eligible=(
+                            assistant_replay_eligible
+                            if role is MessageRole.ASSISTANT else True
+                        ),
                     )
                     if projected is None or projected.message_id in seen_message_ids:
                         continue
@@ -676,6 +747,9 @@ class SessionContextProjector:
                     seen_message_ids.add(projected.message_id)
                     messages.append(projected)
                     sources.add(event.sequence)
+                # The attachment owns the first turn's input only; from the next
+                # turn on the result event is the sole record of what was asked.
+                unconsumed_attachment_input.discard(task_id)
                 self._apply_working_state(explicit_state, event.payload)
                 self._apply_catalogs(resources, questions, event.payload)
                 raw_summary = event.payload.get("task_summary")
@@ -877,7 +951,13 @@ class SessionContextProjector:
             message for message in projection.messages
             if not (
                 message.role is MessageRole.ASSISTANT
-                and message.task_id in terminal_failure_task_ids
+                and (
+                    message.task_id in terminal_failure_task_ids
+                    or (
+                        message.task_id is not None
+                        and not message.replay_eligible
+                    )
+                )
             )
         )
         # Selection is by provenance, not recency. ``scope`` names the Task
@@ -1287,13 +1367,6 @@ class SessionContextProjector:
                     arguments[key] = (value[:500] if isinstance(value, str) else value)
             if arguments:
                 call_data["arguments"] = arguments
-        if call.evidence_question is not None:
-            call_data["evidence_question"] = {
-                "question_id": call.evidence_question.question_id,
-                "question": call.evidence_question.question[:500],
-                "expected_scope": call.evidence_question.expected_scope[:1000],
-            }
-
         result_data: dict[str, Any] = {
             "execution_id": execution.execution_id,
             "state": execution.state.value,
@@ -1450,7 +1523,7 @@ class SessionContextProjector:
     @staticmethod
     def _visible_message(
         raw: Any, expected_role: MessageRole, task_id: str | None,
-        turn_id: str | None, sequence: int,
+        turn_id: str | None, sequence: int, *, replay_eligible: bool = True,
     ) -> SessionConversationMessage | None:
         if not isinstance(raw, Mapping):
             return None
@@ -1462,7 +1535,8 @@ class SessionContextProjector:
         if message.role is not expected_role or not text:
             return None
         return SessionConversationMessage(
-            message.message_id, expected_role, text, task_id, turn_id, sequence
+            message.message_id, expected_role, text, task_id, turn_id, sequence,
+            replay_eligible=replay_eligible,
         )
 
     @staticmethod

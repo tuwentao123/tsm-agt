@@ -18,13 +18,33 @@ from urllib.request import Request, urlopen
 
 from .configuration import GitHubSourceConfiguration
 from tsm_agt.ports import (AdapterContext, AdapterDescriptor, HealthState, HealthStatus, SourceArtifact, ToolCall, ToolEffect, ToolFactDescriptor, ToolIdempotency, ToolInvocationContext, ToolRecoveryKind, ToolResult, ToolResultAuthority, ToolRisk, ToolSpec)
-from tsm_agt.ports.evidence import EvidenceFact
 
 _SHA = re.compile(r"^[0-9a-f]{40,64}$", re.I)
 _REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _MAX_SEARCH_RESULTS = 50
-_MAX_SEARCH_BLOBS = 50
+#: One GitHub request fetches one blob, and an unauthenticated quota is 60
+#: requests/hour, so a code search must not scan an unbounded slice of a tree.
+_MAX_SEARCH_BLOBS = 12
 _MAX_CONTENT_CHARS = 64_000
+#: Byte budget for a recursive tree listing. GitHub caps a tree at 100k entries,
+#: so this is a bound on metadata (not on model-visible content) that still
+#: covers real repositories: openai/codex lists ~10k entries in ~3 MB.
+_TREE_RESPONSE_MAX_BYTES = 32_000_000
+
+
+def _is_rate_limited(response: GitHubApiResponse) -> bool:
+    """Whether a 403 is GitHub refusing an exhausted API quota.
+
+    A plain 403 can also mean "you may not read this repository", so the header
+    and body must confirm the rate-limit case before it is retried.
+    """
+
+    remaining = str(response.headers.get("X-RateLimit-Remaining", "")).strip()
+    if remaining == "0":
+        return True
+    body = response.body.decode("utf-8", errors="replace").casefold()
+    return "rate limit" in body or "secondary rate" in body
+
 
 @dataclass(frozen=True, slots=True)
 class GitHubApiResponse:
@@ -43,7 +63,7 @@ class UrllibGitHubTransport:
             try: response = urlopen(Request(url, headers=dict(headers), method="GET"), timeout=timeout_seconds)
             except HTTPError as error: response = error
             body = response.read(max_bytes + 1)
-            if len(body) > max_bytes: raise _GitHubFailure("RESPONSE_TOO_LARGE", "GitHub response exceeded configured byte cap")
+            if len(body) > max_bytes: raise _GitHubFailure("RESPONSE_TOO_LARGE", f"GitHub response exceeded the {max_bytes}-byte cap for {url}")
             return GitHubApiResponse(int(getattr(response, "status", response.getcode())), str(response.geturl()), {str(k): str(v) for k, v in response.headers.items()}, body)
         finally:
             if response is not None: response.close()
@@ -63,9 +83,9 @@ class GitHubSourceToolProvider:
         self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
         self._risk = ToolRisk.R1 if configuration.private_access else ToolRisk.R0
         self._tools = tuple(self._spec(name, description, parameters) for name, description, parameters in (
-            ("source.github.search_code", "Search code only by a pinned GitHub repository tree; repo/ref are resolved to an immutable commit SHA.", {"query":{"type":"string","minLength":1},"repo":{"type":"string"},"ref":{"type":"string"},"path":{"type":"string"},"page":{"type":"integer","minimum":1},"per_page":{"type":"integer","minimum":1,"maximum":50}}),
-            ("source.github.get_file", "Read one GitHub file at a branch or tag resolved to an immutable commit SHA.", {"repo":{"type":"string"},"path":{"type":"string"},"ref":{"type":"string"}}),
-            ("source.github.list_tree", "List a bounded GitHub tree at an immutable resolved commit SHA.", {"repo":{"type":"string"},"ref":{"type":"string"},"path":{"type":"string"},"page":{"type":"integer","minimum":1},"per_page":{"type":"integer","minimum":1,"maximum":100}}),
+            ("source.github.search_code", "Find which file of a GitHub repository contains something, when you do not already know the path: returns the matching file paths at an immutable commit SHA. The query is a literal case-insensitive substring, not a boolean or phrase expression, so send plain text. A match is a lead, not a finding: read it with source.github.get_file before describing what it does. When nothing matches, list paths with source.github.list_tree instead. Read-only; no approval needed.", {"query":{"type":"string","minLength":1},"repo":{"type":"string"},"ref":{"type":"string"},"path":{"type":"string"},"page":{"type":"integer","minimum":1},"per_page":{"type":"integer","minimum":1,"maximum":50}}),
+            ("source.github.get_file", "Read one file of another project at an immutable commit SHA -- this is how you see what a repository actually does instead of recalling it. The path must be exact; a guessed path only returns NOT_FOUND, so obtain it from source.github.search_code or source.github.list_tree first. Read-only; no approval needed.", {"repo":{"type":"string"},"path":{"type":"string"},"ref":{"type":"string"}}),
+            ("source.github.list_tree", "List the file paths of a GitHub repository at an immutable commit SHA. Use this when the layout is unknown: take a path from the result and read it with source.github.get_file.", {"repo":{"type":"string"},"ref":{"type":"string"},"path":{"type":"string"},"page":{"type":"integer","minimum":1},"per_page":{"type":"integer","minimum":1,"maximum":100}}),
             ("source.github.get_commit", "Get immutable GitHub commit metadata.", {"repo":{"type":"string"},"sha":{"type":"string"}}),
             ("source.github.get_pull_request", "Get read-only GitHub pull request metadata and immutable head/base SHAs.", {"repo":{"type":"string"},"number":{"type":"integer","minimum":1}}),
             ("source.github.get_issue", "Get read-only GitHub issue metadata.", {"repo":{"type":"string"},"number":{"type":"integer","minimum":1}}),
@@ -73,7 +93,7 @@ class GitHubSourceToolProvider:
 
     def _spec(self, name: str, description: str, properties: Mapping[str, Any]) -> ToolSpec:
         required = {"source.github.get_file": ["repo", "path", "ref"], "source.github.list_tree": ["repo", "ref"], "source.github.get_commit": ["repo", "sha"], "source.github.get_pull_request": ["repo", "number"], "source.github.get_issue": ["repo", "number"]}.get(name, ["query", "repo"])
-        return ToolSpec(name, description, {"type":"object", "properties":properties, "required":required, "additionalProperties":False}, self._risk, True, True, ToolIdempotency.IDEMPOTENT, 2000, True, "configured GitHub API host and repository identifiers", "read-only GitHub GET request; no remote mutation", False, ToolEffect.OBSERVE, ToolResultAuthority.EXTERNAL_SERVICE, evidence_capability_ids=frozenset({"source.artifact"}) if name == "source.github.get_file" else frozenset())
+        return ToolSpec(name, description, {"type":"object", "properties":properties, "required":required, "additionalProperties":False}, self._risk, True, True, ToolIdempotency.IDEMPOTENT, 2000, True, "configured GitHub API host and repository identifiers", "read-only GitHub GET request; no remote mutation", False, ToolEffect.OBSERVE, ToolResultAuthority.EXTERNAL_SERVICE)
 
     async def start(self, context: AdapterContext) -> None: self._started = True
     async def stop(self, deadline: datetime) -> None: self._cache.clear(); self._started = False
@@ -96,28 +116,6 @@ class GitHubSourceToolProvider:
                     canonical_url=str(data["url"]),
                     content_hash=str(data["content_hash"]),
                 ),)
-            evidence_facts = ()
-            if source_artifacts:
-                artifact = source_artifacts[0]
-                evidence_facts = (EvidenceFact(
-                    fact_id=f"{call.call_id}:source.artifact",
-                    kind="source.artifact",
-                    execution_ref=f"tool_call:{call.call_id}",
-                    attributes={
-                        "repository": artifact.repository,
-                        "immutable_revision": True,
-                        "revision": artifact.commit_sha,
-                        "path": artifact.path,
-                        "blob_identity": artifact.blob_sha,
-                        "content_hash": artifact.content_hash,
-                        "complete": True,
-                    },
-                    provenance={
-                        "provider": "github.source",
-                        "canonical_url": artifact.canonical_url,
-                    },
-                    complete=True,
-                ),)
             return ToolResult(
                 call.call_id,
                 True,
@@ -131,7 +129,6 @@ class GitHubSourceToolProvider:
                     source_artifacts=source_artifacts,
                     content_hash=str(data["content_hash"]),
                 ),
-                evidence_facts=evidence_facts,
             )
         except _GitHubFailure as error:
             return ToolResult(call.call_id, False, error_code=error.code, message=error.message, retryable=error.retryable, recovery_kind=error.recovery_kind)
@@ -150,7 +147,7 @@ class GitHubSourceToolProvider:
             return self._record(repo, number, name.rsplit("_", 1)[-1], context)
         raise _GitHubFailure("NOT_FOUND", f"unknown GitHub source tool: {name}")
 
-    def _request(self, endpoint: str, context: ToolInvocationContext) -> Mapping[str, Any]:
+    def _request(self, endpoint: str, context: ToolInvocationContext, *, max_bytes: int | None = None) -> Mapping[str, Any]:
         remaining = (context.deadline.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds() if context.deadline.tzinfo is None else (context.deadline - datetime.now(timezone.utc)).total_seconds()
         if remaining <= 0: raise _GitHubFailure("TIMEOUT", "GitHub request deadline elapsed", True)
         url = f"{self._configuration.api_base}{endpoint}"
@@ -159,11 +156,24 @@ class GitHubSourceToolProvider:
         headers = {"Accept":"application/vnd.github+json", "User-Agent":"tsm-agt-github-source"}
         if self._configuration.token: headers["Authorization"] = f"Bearer {self._configuration.token}"
         if cached and cached.etag: headers["If-None-Match"] = cached.etag
-        try: response = self._transport.get(url, headers=headers, timeout_seconds=max(0.1, remaining), max_bytes=self._configuration.response_max_bytes)
+        try: response = self._transport.get(url, headers=headers, timeout_seconds=max(0.1, remaining), max_bytes=max_bytes or self._configuration.response_max_bytes)
         except TimeoutError as error: raise _GitHubFailure("TIMEOUT", "GitHub request timed out", True) from error
         except (OSError, URLError) as error: raise _GitHubFailure("NETWORK_ERROR", "GitHub network request failed", True) from error
         if response.status_code == 304 and cached and time.monotonic() - cached.stored_at <= self._configuration.cache_ttl_seconds: return cached.payload
         if response.status_code in {429, 502, 503, 504}: raise _GitHubFailure("RATE_LIMITED" if response.status_code == 429 else "NETWORK_ERROR", "GitHub service is temporarily unavailable", True)
+        if response.status_code == 403 and _is_rate_limited(response):
+            # GitHub answers an exhausted unauthenticated quota with 403, not
+            # 429. Without a token only 60 requests/hour are available, so the
+            # operator needs to be told the actionable fix rather than "HTTP 403".
+            raise _GitHubFailure(
+                "RATE_LIMITED",
+                "GitHub API rate limit exhausted"
+                + (
+                    "; configure TSM_AGT_GITHUB_TOKEN to raise the limit"
+                    if not self._configuration.token else ""
+                ),
+                True,
+            )
         if response.status_code >= 400: raise _GitHubFailure("NOT_FOUND" if response.status_code == 404 else "GITHUB_HTTP_ERROR", f"GitHub returned HTTP {response.status_code}")
         try: payload = json.loads(response.body)
         except json.JSONDecodeError as error: raise _GitHubFailure("INVALID_RESPONSE", "GitHub returned invalid JSON") from error
@@ -172,8 +182,24 @@ class GitHubSourceToolProvider:
         while len(self._cache) > self._configuration.cache_max_entries: self._cache.popitem(last=False)
         return payload
 
+    def _tree_max_bytes(self) -> int:
+        """Budget for a recursive tree listing.
+
+        A tree is structural metadata, not content handed to the model: the
+        bounded result is ``page``/``per_page`` of it. Real repositories exceed
+        the content cap here (``openai/codex`` is ~3 MB), so the listing must not
+        inherit it or every tree/search call fails on a repository worth reading.
+        """
+
+        return max(self._configuration.response_max_bytes, _TREE_RESPONSE_MAX_BYTES)
+
     def _resolve(self, repo: str, ref: str, context: ToolInvocationContext) -> str:
-        payload = self._request(f"/repos/{quote(repo, safe='/')}/commits/{quote(ref, safe='')}", context); sha = str(payload.get("sha", ""))
+        # A commit body is metadata here: only its ``sha`` reaches the tree
+        # request, never the model. It still carries every changed file's patch,
+        # so a commit that touches many files exceeds the *content* cap and
+        # makes the whole repository unreadable through list_tree/search_code.
+        # Like a tree listing, it therefore needs the metadata budget.
+        payload = self._request(f"/repos/{quote(repo, safe='/')}/commits/{quote(ref, safe='')}", context, max_bytes=self._tree_max_bytes()); sha = str(payload.get("sha", ""))
         if not _SHA.fullmatch(sha): raise _GitHubFailure("INVALID_RESPONSE", "GitHub commit response lacks a valid SHA")
         return sha.lower()
     def _default_branch(self, repo: str, context: ToolInvocationContext) -> str: return self._text(self._request(f"/repos/{quote(repo, safe='/')}", context).get("default_branch"), "default_branch")
@@ -181,17 +207,46 @@ class GitHubSourceToolProvider:
         payload = self._request(f"/repos/{quote(repo, safe='/')}/contents/{quote(path, safe='/')}?ref={sha}", context); content = base64.b64decode(self._text(payload.get("content"), "content").replace("\n", ""), validate=True).decode("utf-8", errors="replace"); truncated = len(content) > _MAX_CONTENT_CHARS; content = content[:_MAX_CONTENT_CHARS]
         return self._source(repo, sha, path, self._text(payload.get("sha"), "blob_sha"), content, truncated)
     def _tree(self, repo: str, sha: str, path: str | None, args: Mapping[str, Any], context: ToolInvocationContext) -> Mapping[str, Any]:
-        payload = self._request(f"/repos/{quote(repo, safe='/')}/git/trees/{sha}?recursive=1", context); entries = [item for item in payload.get("tree", []) if isinstance(item, Mapping) and (not path or str(item.get("path", "")).startswith(path + "/") or str(item.get("path")) == path)]; page, per = self._page(args, 100); visible = entries[(page-1)*per:page*per]; normalized = [{"path":str(item.get("path","")), "type":str(item.get("type","")), "blob_sha":str(item.get("sha","")), "url":self._web_url(repo, sha, str(item.get("path","")))} for item in visible]
+        payload = self._request(f"/repos/{quote(repo, safe='/')}/git/trees/{sha}?recursive=1", context, max_bytes=self._tree_max_bytes()); entries = [item for item in payload.get("tree", []) if isinstance(item, Mapping) and (not path or str(item.get("path", "")).startswith(path + "/") or str(item.get("path")) == path)]; page, per = self._page(args, 100); visible = entries[(page-1)*per:page*per]; normalized = [{"path":str(item.get("path","")), "type":str(item.get("type","")), "blob_sha":str(item.get("sha","")), "url":self._web_url(repo, sha, str(item.get("path","")))} for item in visible]
         return self._source(repo, sha, path or "", None, normalized, bool(payload.get("truncated")) or len(entries) > page*per, extra={"next_page":page+1 if len(entries)>page*per else None, "tree_truncated":bool(payload.get("truncated"))})
     def _search(self, repo: str, query: str, sha: str, path: str | None, args: Mapping[str, Any], context: ToolInvocationContext) -> Mapping[str, Any]:
-        tree = self._tree(repo, sha, path, {"page":1,"per_page":_MAX_SEARCH_BLOBS}, context); matches=[]
+        # The matcher is a literal case-insensitive substring. Models habitually
+        # send a quoted phrase, which would then never match anything, so the
+        # surrounding quotes are stripped rather than searched for.
+        needle = query.strip().strip('"').strip("'").strip() or query.strip()
+        tree = self._tree(repo, sha, path, {"page":1,"per_page":_MAX_SEARCH_BLOBS}, context); matches=[]; skipped=0
         for item in tree["content"]:
             if item["type"] != "blob": continue
-            blob = self._request(f"/repos/{quote(repo, safe='/')}/git/blobs/{quote(item['blob_sha'], safe='')}", context); text=base64.b64decode(self._text(blob.get("content"), "content").replace("\n", ""), validate=True).decode("utf-8", errors="replace")
-            if query.casefold() in text.casefold(): matches.append({**item, "content_hash":"sha256:"+hashlib.sha256(text.encode()).hexdigest()})
+            try:
+                blob = self._request(f"/repos/{quote(repo, safe='/')}/git/blobs/{quote(item['blob_sha'], safe='')}", context)
+            except _GitHubFailure as error:
+                # One oversized or unreadable blob (a lock file, minified asset,
+                # binary) must not fail the whole search: skip it and report the
+                # coverage as incomplete instead.
+                if error.code not in {"RESPONSE_TOO_LARGE", "NOT_FOUND", "GITHUB_HTTP_ERROR"}:
+                    raise
+                skipped += 1
+                continue
+            text=base64.b64decode(self._text(blob.get("content"), "content").replace("\n", ""), validate=True).decode("utf-8", errors="replace")
+            if needle.casefold() in text.casefold(): matches.append({**item, "content_hash":"sha256:"+hashlib.sha256(text.encode()).hexdigest()})
             if len(matches) >= _MAX_SEARCH_RESULTS: break
         page, per = self._page(args, 50); visible=matches[(page-1)*per:page*per]
-        return self._source(repo, sha, path or "", None, visible, bool(tree["truncated"]) or len(matches)>page*per, extra={"query":query,"next_page":page+1 if len(matches)>page*per else None,"complete":not bool(tree["truncated"])})
+        incomplete = bool(tree["truncated"]) or len(matches)>page*per or skipped > 0
+        extra: dict[str, Any] = {
+            "query": needle,
+            "next_page": page+1 if len(matches)>page*per else None,
+            "complete": not incomplete,
+            "skipped_blobs": skipped,
+        }
+        if not visible and page == 1:
+            # An empty content search is not evidence that a repository lacks the
+            # subject, so hand the caller the way forward instead of a dead end.
+            extra["hint"] = (
+                "No file content matched this literal substring. List the "
+                "repository paths with source.github.list_tree, then read a "
+                "candidate file with source.github.get_file."
+            )
+        return self._source(repo, sha, path or "", None, visible, incomplete, extra=extra)
     def _commit(self, repo: str, sha: str, context: ToolInvocationContext) -> Mapping[str, Any]:
         payload=self._request(f"/repos/{quote(repo, safe='/')}/commits/{sha}", context); return self._source(repo, sha, "", None, {k:payload.get(k) for k in ("sha","html_url","message","author","committer","parents")}, False, url=str(payload.get("html_url") or self._web_url(repo, sha, "")))
     def _record(self, repo: str, number: int, kind: str, context: ToolInvocationContext) -> Mapping[str, Any]:
@@ -210,7 +265,10 @@ class GitHubSourceToolProvider:
         return repo
     @staticmethod
     def _path(value: Any, optional: bool=False) -> str | None:
-        if value is None and optional: return None
+        # An omitted *or blank* path means "no path filter" for the tools whose
+        # schema declares path optional. Models routinely send "" for that, and
+        # rejecting it turned a valid call into INVALID_PARAM.
+        if optional and (value is None or (isinstance(value, str) and not value.strip())): return None
         path=GitHubSourceToolProvider._text(value,"path").strip("/")
         if not path or "\\" in path or any(part in {"", ".", ".."} for part in path.split("/")): raise ValueError("path must be a relative non-traversing repository path")
         return path

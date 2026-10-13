@@ -73,7 +73,6 @@ class ModelRubricJudge:
                 ),
             ),
             max_output_tokens=256,
-            require_evidence_questions=False,
         )
         try:
             response = await self._model.complete(request)

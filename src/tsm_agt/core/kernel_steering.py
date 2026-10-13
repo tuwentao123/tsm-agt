@@ -1,6 +1,6 @@
 """Steering queue and its application at iteration boundaries for `Kernel`.
 
-A mixin module in the Hermes facade+siblings shape (``run_agent.py`` +
+A mixin module in the facade-plus-siblings shape (``run_agent.py`` +
 ``agent/session_persistence.py``): the facade ``core/kernel.py`` imports
 this at module level and adds ``SteeringMixin`` to ``Kernel``'s bases, so
 **every method resolves through ``Kernel``'s MRO unchanged** --
@@ -9,7 +9,7 @@ attributes all still resolve. Moved bodies are verbatim: nothing is renamed
 and no signature changes.
 
 This module must never bind the facade at module level; late-import it
-inside a method instead (Hermes ``AGENTS.md:243-244``).
+inside a method instead (the project's module-boundary rule).
 
 Moved from ``core/kernel.py``:
 
@@ -29,9 +29,6 @@ from tsm_agt.ports import (
 from uuid import uuid4
 from .agent_loop import AgentTurnCheckpoint
 from .configuration import canonical_hash
-from .evidence_question import (
-    EvidenceQuestionProjector, EvidenceQuestionStatus
-)
 from .steering import SteeringKind, SteeringProjection, SteeringProjector
 from .task import TaskSnapshot, TaskState
 from .task_spec import TaskSpecProjector, TaskSpecSnapshot
@@ -183,7 +180,7 @@ class SteeringMixin:
                     continuation_mode = replacement_spec.continuation_mode
                     schema_version = replacement_spec.schema_version
             # Ordinary steering is conversation input, not a durable Task
-            # constraint. Only explicit Replace revises the Task contract; a
+            # constraint. Only explicit Replace revises the Task spec; a
             # model may later propose structured scope/constraint/focus changes.
             updated_spec = current_spec
             task_spec_event: RuntimeEvent | None = None
@@ -245,45 +242,6 @@ class SteeringMixin:
                         "snapshot": updated_memory.to_data(),
                     },
                 )
-            question_projection = EvidenceQuestionProjector.project(
-                checkpoint.task_id, events
-            )
-            question_events: list[RuntimeEvent] = []
-            if replaced:
-                first_question_sequence = (
-                    stored.last_event_sequence
-                    + 3
-                    + (1 if working_memory_event is not None else 0)
-                )
-                question_projection, dropped_questions = (
-                    question_projection.drop_open(
-                        event_sequence=first_question_sequence,
-                        reason="goal_replaced",
-                    )
-                )
-                for record in dropped_questions:
-                    question_events.append(RuntimeEvent(
-                        f"evt-{uuid4().hex}", checkpoint.task_id,
-                        record.updated_event_sequence,
-                        "evidence.question_state_changed", {
-                            "turn_id": record.source_turn_id,
-                            "tool_call_id": (
-                                record.tool_call_ids[-1]
-                                if record.tool_call_ids else ""
-                            ),
-                            "tool_name": "runtime.redirect",
-                            "question_ref": record.question_ref,
-                            "previous_status": EvidenceQuestionStatus.OPEN.value,
-                            "next_status": record.status.value,
-                            "observation_kind": (
-                                record.observation_kind.value
-                                if record.observation_kind else None
-                            ),
-                            "blocking_reason": record.blocking_reason,
-                            "evidence_count": len(record.evidence_references),
-                            "record": record.to_data(),
-                        },
-                    ))
             updated_checkpoint = replace(
                 checkpoint, revision=checkpoint.revision + 1,
                 messages=tuple(messages),
@@ -291,7 +249,6 @@ class SteeringMixin:
                 last_steering_inbound_sequence=pending[-1].inbound_sequence,
                 goal_revision=goal_revision,
                 working_memory_hash=working_memory_hash,
-                evidence_question_state=question_projection.to_data(),
                 exploration_budget_state=(
                     {} if replaced else checkpoint.exploration_budget_state
                 ),
@@ -307,8 +264,8 @@ class SteeringMixin:
                 exploration_outcome_state=(
                     {} if replaced else checkpoint.exploration_outcome_state
                 ),
-                completion_readiness_state=(
-                    {} if replaced else checkpoint.completion_readiness_state
+                finalization_state=(
+                    {} if replaced else checkpoint.finalization_state
                 ),
             )
             updated_task = task.with_agent_checkpoint(updated_checkpoint.to_data())
@@ -334,7 +291,6 @@ class SteeringMixin:
                     committed.append(task_spec_event)
                 if working_memory_event is not None:
                     committed.append(working_memory_event)
-                committed.extend(question_events)
                 await self._dependencies.store.commit(RuntimeUnitOfWork(
                     checkpoint.task_id, stored.version, updated_task.to_data(),
                     tuple(committed),

@@ -25,7 +25,9 @@ from tsm_agt.ports import (
     RuntimeCommandRecord,
 )
 
-_SCHEMA_VERSION = 2
+#: v3 adds ``runtime_events.turn_id`` so a Conversation Task's per-turn events
+#: can be read back as one turn.
+_SCHEMA_VERSION = 3
 
 
 class SQLiteRuntimeStore:
@@ -144,8 +146,8 @@ class SQLiteRuntimeStore:
                     """
                     INSERT INTO runtime_events(
                         event_id, task_id, sequence, event_type, payload_json,
-                        occurred_at, schema_version, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        occurred_at, schema_version, session_id, turn_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.event_id,
@@ -156,6 +158,7 @@ class SQLiteRuntimeStore:
                         event.occurred_at.isoformat(),
                         event.schema_version,
                         event.session_id or str(unit.next_state.get("session_id") or "") or None,
+                        event.turn_id,
                     ),
                 )
             connection.execute("COMMIT")
@@ -168,7 +171,8 @@ class SQLiteRuntimeStore:
         return CommitResult(unit.task_id, committed_version)
 
     async def read_events(
-        self, task_id: str, after_sequence: int = 0
+        self, task_id: str, after_sequence: int = 0,
+        event_types: tuple[str, ...] | None = None,
     ) -> tuple[RuntimeEvent, ...]:
         if after_sequence < 0:
             raise ValueError("after_sequence must not be negative")
@@ -182,15 +186,30 @@ class SQLiteRuntimeStore:
             "session_id" if "session_id" in event_columns
             else "NULL AS session_id"
         )
+        turn_column = (
+            "turn_id" if "turn_id" in event_columns else "NULL AS turn_id"
+        )
+        # A caller that only needs one kind of fact (a Turn's progress, say)
+        # must not pay for the bulk it does not read: event payloads include
+        # whole model messages and patch bodies.
+        type_clause = ""
+        parameters: list[Any] = [task_id, after_sequence]
+        if event_types:
+            type_clause = (
+                " AND event_type IN ("
+                + ", ".join("?" for _ in event_types) + ")"
+            )
+            parameters.extend(event_types)
         rows = connection.execute(
             """
             SELECT event_id, task_id, sequence, event_type, payload_json,
-                   occurred_at, schema_version, """ + session_column + """
+                   occurred_at, schema_version, """ + session_column + """,
+                   """ + turn_column + """
             FROM runtime_events
-            WHERE task_id = ? AND sequence > ?
+            WHERE task_id = ? AND sequence > ?""" + type_clause + """
             ORDER BY sequence ASC
             """,
-            (task_id, after_sequence),
+            tuple(parameters),
         ).fetchall()
         return tuple(
             RuntimeEvent(
@@ -202,6 +221,7 @@ class SQLiteRuntimeStore:
                 occurred_at=datetime.fromisoformat(str(row["occurred_at"])),
                 schema_version=int(row["schema_version"]),
                 session_id=(str(row["session_id"]) if row["session_id"] else None),
+                turn_id=(str(row["turn_id"]) if row["turn_id"] else None),
             )
             for row in rows
         )
@@ -374,10 +394,11 @@ class SQLiteRuntimeStore:
         )
         for event, payload_json in encoded_events:
             connection.execute(
-                "INSERT INTO runtime_events(event_id, task_id, sequence, event_type, payload_json, occurred_at, schema_version, session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO runtime_events(event_id, task_id, sequence, event_type, payload_json, occurred_at, schema_version, session_id, turn_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (event.event_id, event.task_id, event.sequence, event.event_type,
                  payload_json, event.occurred_at.isoformat(), event.schema_version,
-                 event.session_id or str(unit.next_state.get("session_id") or "") or None),
+                 event.session_id or str(unit.next_state.get("session_id") or "") or None,
+                 event.turn_id),
             )
         return CommitResult(unit.task_id, committed_version)
 
@@ -669,6 +690,7 @@ class SQLiteRuntimeStore:
                 occurred_at TEXT NOT NULL,
                 schema_version INTEGER NOT NULL CHECK(schema_version > 0),
                 session_id TEXT,
+                turn_id TEXT,
                 UNIQUE(task_id, sequence),
                 FOREIGN KEY(task_id) REFERENCES runtime_tasks(task_id)
             );
@@ -699,6 +721,14 @@ class SQLiteRuntimeStore:
             connection.execute(
                 "ALTER TABLE runtime_events ADD COLUMN session_id TEXT"
             )
+        if "turn_id" not in event_columns:
+            connection.execute(
+                "ALTER TABLE runtime_events ADD COLUMN turn_id TEXT"
+            )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runtime_events_task_turn_sequence "
+            "ON runtime_events(task_id, turn_id, sequence)"
+        )
         connection.execute("BEGIN IMMEDIATE")
         try:
             row = connection.execute(
@@ -711,10 +741,11 @@ class SQLiteRuntimeStore:
                 )
             else:
                 version = int(row["value"])
-                if version == 1:
-                    SQLiteRuntimeStore._migrate_session_task_commands_v1_to_v2(
-                        connection
-                    )
+                if version in (1, 2):
+                    if version == 1:
+                        SQLiteRuntimeStore._migrate_session_task_commands_v1_to_v2(
+                            connection
+                        )
                     connection.execute(
                         "UPDATE runtime_meta SET value = ? WHERE key = 'schema_version'",
                         (str(_SCHEMA_VERSION),),

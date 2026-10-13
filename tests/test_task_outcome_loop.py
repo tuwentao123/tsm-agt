@@ -15,7 +15,7 @@ from tsm_agt.core import (
     TaskSpecSnapshot, TaskState,
 )
 from tsm_agt.core.configuration import canonical_hash
-from tsm_agt.core.single_loop import OrchestrationMode
+from tsm_agt.core import OrchestrationMode
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, FinishReason, HealthState, HealthStatus,
     Message, MessageRole, ModelRequest, ModelResponse, ModelUsage,

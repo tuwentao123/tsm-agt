@@ -84,9 +84,10 @@ def context_window_manager(
 ) -> ContextWindowManager:
     """Build the token-budget compactor from configuration.
 
-    **本项目新增，非 Hermes.** Hermes has per-tool caps, a spill-to-file layer and
-    ``enforce_turn_budget``, but no single "keep at least N recent messages"
-    knob; this only exposes a value this project already hard-coded.
+    **Project-specific, not inherited.** The reference agent has per-tool caps,
+    a spill-to-file layer and ``enforce_turn_budget``, but no single "keep at
+    least N recent messages" knob; this only exposes a value this project
+    already hard-coded.
     """
 
     return ContextWindowManager(
@@ -106,9 +107,10 @@ def session_context_projector(
     they bound other sections and were never the subject of the multi-turn
     fidelity question.
 
-    **本项目新增，非 Hermes.** Hermes replays its whole ``messages`` table each
-    turn and has no equivalent count bound, so there is no upstream shape to
-    copy; this only exposes a bound this project already enforced internally.
+    **Project-specific, not inherited.** The reference agent replays its whole
+    ``messages`` table each turn and has no equivalent count bound, so there is
+    no upstream shape to copy; this only exposes a bound this project already
+    enforced internally.
     """
 
     return SessionContextProjector(

@@ -94,6 +94,10 @@ class ModelRecoveryProbe:
     provider_attempt: int
     max_provider_attempts: int
     fallback_available: bool = False
+    #: Whether the failed attempt used the streaming transport. A long-lived
+    #: stream that dies mid-flight is a different situation from a one-shot
+    #: request that failed: repeating it is not what fixes it.
+    streaming: bool = False
 
 
 @dataclass(frozen=True, slots=True)

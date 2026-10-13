@@ -686,8 +686,6 @@ class ContextWindowManager:
             value = call.arguments.get(key)
             if isinstance(value, (str, int, float, bool)):
                 summary[key] = value if not isinstance(value, str) else value[:300]
-        if call.evidence_question is not None:
-            summary["question_id"] = call.evidence_question.question_id[:64]
         return summary
 
     @staticmethod
