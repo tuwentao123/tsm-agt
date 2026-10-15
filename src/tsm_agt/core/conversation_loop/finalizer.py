@@ -111,6 +111,7 @@ class ConversationFinalizer:
             output_tokens=state.output_tokens,
             finalization_state={
                 "review_continuations": state.review_continuations,
+                "runtime_continuations": state.runtime_continuations,
                 "reviewer_call_count": state.reviewer_call_count,
                 "last_candidate_hash": state.last_candidate_hash,
                 "last_review_reason_code": state.last_review_reason_code,

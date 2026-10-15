@@ -51,7 +51,8 @@ def latest_tool_result_instruction(
             f"Its structured recovery facts are: "
             f"{json.dumps(action, ensure_ascii=False, sort_keys=True)}. "
             "Choose a legal next step within the advertised tools and continue "
-            "the original user request; do not restate the error as a result."
+            "the original user request. If no legal recovery remains, report the "
+            "blocker with those facts and do not claim the work was completed."
         )
         return "\n\n".join(part for part in (availability, recovery_instruction) if part)
     if state.last_tool_error:

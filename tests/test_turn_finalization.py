@@ -16,6 +16,7 @@ from tsm_agt.ports import (
     AdapterContext, CompletionReviewAction, CompletionReviewError,
     FinalizationAction, FinalizationCandidate, FinishReason, Message,
     MessageRole, ModelCallPurpose, ModelRequest, ModelResponse, TextBlock,
+    ToolRecoveryKind, ToolResult, ToolResultBlock,
 )
 
 
@@ -123,6 +124,63 @@ class RuntimeFinalizationGateTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIs(decision.action, FinalizationAction.INCOMPLETE)
         self.assertEqual(decision.reason_code, "empty_response_budget_exhausted")
+
+    async def test_unstarted_execution_gets_one_recovery_turn(self) -> None:
+        state = self._state()
+        state.messages = [Message(
+            "tool-result", MessageRole.TOOL, (ToolResultBlock(ToolResult(
+                "call", False, error_code="EXECUTABLE_NOT_FOUND",
+                message="not installed",
+                recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+                recovery_action={"execution_state": "not_started"},
+            )),),
+        )]
+        decision = await RuntimeFinalizationGate().evaluate(
+            state, ModelResponse(
+                _message("answer", MessageRole.ASSISTANT, "Please install it."),
+                FinishReason.STOP,
+            ),
+        )
+        self.assertIs(decision.action, FinalizationAction.CONTINUE)
+        self.assertEqual(decision.reason_code, "unresolved_execution_outcome")
+
+    async def test_unstarted_execution_allows_evidence_based_blocker_after_recovery(self) -> None:
+        state = self._state()
+        state.runtime_continuations = 1
+        state.messages = [Message(
+            "tool-result", MessageRole.TOOL, (ToolResultBlock(ToolResult(
+                "call", False, error_code="EXECUTABLE_NOT_FOUND",
+                message="not installed",
+                recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+                recovery_action={"execution_state": "not_started"},
+            )),),
+        )]
+        decision = await RuntimeFinalizationGate().evaluate(
+            state, ModelResponse(
+                _message("answer", MessageRole.ASSISTANT, "The executable is absent."),
+                FinishReason.STOP,
+            ),
+        )
+        self.assertIs(decision.action, FinalizationAction.ACCEPT)
+        self.assertEqual(decision.reason_code, "unstarted_execution_blocker_visible")
+
+    async def test_known_process_failure_can_finalize_as_evidence(self) -> None:
+        state = self._state()
+        state.messages = [Message(
+            "tool-result", MessageRole.TOOL, (ToolResultBlock(ToolResult(
+                "call", False, error_code="PROCESS_EXIT_NON_ZERO",
+                message="command exited 1",
+                data={"execution_state": "failed_known", "exit_code": 1},
+            )),),
+        )]
+        decision = await RuntimeFinalizationGate().evaluate(
+            state, ModelResponse(
+                _message("answer", MessageRole.ASSISTANT, "The command exited with code 1."),
+                FinishReason.STOP,
+            ),
+        )
+        self.assertIs(decision.action, FinalizationAction.ACCEPT)
+        self.assertEqual(decision.reason_code, "runtime_state_terminal")
 
 
 class CompletionReviewConfigurationTest(unittest.TestCase):

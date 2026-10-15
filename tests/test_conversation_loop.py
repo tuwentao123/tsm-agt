@@ -13,11 +13,14 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
+from tsm_agt.adapters.builtin import CoreProcessToolProvider
 from tsm_agt.adapters.fixture import EchoModelProvider
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
+    AgentTurnSuspended,
     AgentTurnIncomplete,
     AgentTurnResult,
+    ApprovalDecision,
     TaskState,
 )
 from tsm_agt.core.conversation_loop import (
@@ -641,6 +644,59 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
                 # A finished text turn must not leave a live checkpoint that a
                 # process restart could later mislabel as an orphaned run.
                 self.assertIsNone(stored.active_agent_checkpoint)
+        finally:
+            await application.registry.stop_all()
+
+    async def test_trust_refresh_rebinds_checkpoint_before_approval_resume(self):
+        model = ScriptedModel([
+            tool_response("build", "call-build", "core.run_command", {
+                "argv": ["npm", "run", "build"], "cwd": ".",
+            }),
+            text_response("blocked", "Build was not approved."),
+        ])
+        application = compose_fixture_application(
+            model_adapter=model, tool_adapters=(CoreProcessToolProvider(),),
+        )
+        await application.registry.start_all()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                identity = workspace / "package.json"
+                identity.write_text('{"name":"before"}\n', encoding="utf-8")
+                task = await _executing(application, workspace, "task-trust-refresh")
+                # The task was created under the old fingerprint. This is a
+                # benign pre-command change, not a change made while approval
+                # is pending, so the refreshed binding must travel with the
+                # suspended checkpoint.
+                identity.write_text('{"name":"after"}\n', encoding="utf-8")
+                suspended = await application.kernel.run_agent_turn(
+                    task.task_id, "build the project",
+                )
+
+                self.assertIsInstance(suspended, AgentTurnSuspended)
+                assert isinstance(suspended, AgentTurnSuspended)
+                awaiting = await application.kernel.get_task(task.task_id)
+                checkpoint = awaiting.active_agent_checkpoint
+                assert checkpoint is not None
+                self.assertEqual(
+                    checkpoint["workspace_fingerprint"],
+                    awaiting.project_fingerprint,
+                )
+                events = await application.registry.require(
+                    RuntimeStorePort
+                ).read_events(task.task_id)
+                self.assertIn(
+                    "checkpoint.workspace_binding_refreshed",
+                    [event.event_type for event in events],
+                )
+
+                resumed = await application.kernel.resolve_agent_approval(
+                    suspended.approval_request_id, ApprovalDecision.DENY,
+                    "do not run this build",
+                )
+                self.assertIsInstance(resumed, AgentTurnResult)
+                restored = await application.kernel.get_task(task.task_id)
+                self.assertIsNot(restored.state, TaskState.CONFLICT)
         finally:
             await application.registry.stop_all()
 

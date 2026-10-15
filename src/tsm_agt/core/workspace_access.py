@@ -10,9 +10,10 @@ from typing import Any
 
 
 class WorkspaceAccessCapability(StrEnum):
-    """Capabilities deliberately kept narrower than filesystem permissions."""
+    """Capabilities deliberately kept narrower than unrestricted filesystem access."""
 
     READ = "READ"
+    WRITE = "WRITE"
 
 
 @dataclass(frozen=True, slots=True)

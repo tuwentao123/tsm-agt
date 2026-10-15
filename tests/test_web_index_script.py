@@ -82,6 +82,17 @@ def test_restored_approval_is_rendered_in_a_fixed_conversation_dock() -> None:
     assert "chatArea.classList.add('has-approval-dock');" in source
 
 
+def test_composer_stays_outside_the_scrollable_conversation_stage() -> None:
+    """Long transcripts or an approval dock must never push input off-screen."""
+
+    source = _index_html_source()
+
+    assert "html,body{height:100%;overflow:hidden}" in source
+    assert ".chat-shell{flex:1 1 0;min-height:0;height:0" in source
+    assert ".workspace-stage{flex:1 1 0;min-height:0;height:100%" in source
+    assert ".composer{flex:0 0 auto;position:relative;z-index:30" in source
+
+
 def test_approval_dock_uses_a_compact_summary_with_optional_details() -> None:
     source = _index_html_source()
 

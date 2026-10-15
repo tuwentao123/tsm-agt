@@ -91,6 +91,19 @@ class TaskRuntimeProjectionTest(unittest.TestCase):
         )
         self.assertEqual(projection.waiting_kind, "input")
 
+    def test_conflict_is_interrupted_even_if_legacy_data_kept_an_approval(self) -> None:
+        snapshot = task(TaskState.CONFLICT)
+        projection = TaskRuntimeProjector.project(snapshot, (
+            event(1, "task.created"),
+            event(2, "task.state_changed", {
+                "previous_state": "AWAITING_APPROVAL", "next_state": "CONFLICT",
+            }),
+        ))
+
+        self.assertEqual(projection.display_status, TaskDisplayStatus.INTERRUPTED)
+        self.assertEqual(projection.execution_status, TaskExecutionStatus.INTERRUPTED)
+        self.assertIsNone(projection.waiting_kind)
+
     def test_v3_conclusion_projection_is_independent_from_domain_check(self) -> None:
         projection = TaskRuntimeProjector.project(task(TaskState.SUCCEEDED), (
             event(1, "verify.completed", {"status": "passed"}),

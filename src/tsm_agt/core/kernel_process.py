@@ -41,6 +41,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import shutil
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -54,7 +56,7 @@ from uuid import uuid4
 from .onboarding import ProjectOnboardingScanner
 from .process import (
     BackgroundProcessRecord, BackgroundProcessState,
-    ProcessSandboxDenied
+    PreparedProcessExecution, ProcessPreparationError, ProcessSandboxDenied,
 )
 from .task import TaskNotFound, TaskSnapshot, TaskState
 from .turn import InvalidTurnState
@@ -93,25 +95,20 @@ class ProcessMixin:
             raise InvalidTurnState(
                 f"task {task_id} must be EXECUTING, got {task.state.value}"
             )
-        resolved_cwd = self._resolve_process_cwd(Path(task.workspace), cwd)
-        validated_environment = self._validate_process_environment(environment or {})
-        environment_policy = ProcessEnvironmentPolicy(
-            inherit_host_environment=True,
-            allowed_host_variables=("SSH_AUTH_SOCK", "HOME", "USER"),
-            blocked_host_variables=("AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"),
-            runtime_trust_mode="governed",
-        )
-        safe_environment = dict(
-            executor.prepare_environment(
-                validated_environment,
-                environment_policy,
+        try:
+            prepared = self._prepare_process_execution(
+                task, argv, cwd, environment or {},
             )
-        )
+        except ProcessPreparationError as error:
+            await self._record_process_preparation_failure(
+                task_id, turn_id, argv, cwd, error, invocation_id,
+            )
+            raise FileNotFoundError(str(error)) from error
         sandbox_request = SandboxRequest(
-            argv,
-            resolved_cwd,
-            safe_environment,
-            environment_policy=environment_policy,
+            prepared.argv,
+            prepared.cwd,
+            prepared.environment,
+            environment_policy=prepared.environment_policy,
         )
         decision = await self._dependencies.sandbox.authorize(sandbox_request)
         if not decision.allowed:
@@ -121,8 +118,8 @@ class ProcessMixin:
                     "process.denied",
                     {
                         "turn_id": turn_id,
-                        "argv_hash": self._argv_hash(argv),
-                        "cwd": str(resolved_cwd),
+                        "argv_hash": self._argv_hash(prepared.argv),
+                        "cwd": str(prepared.cwd),
                         "reason": decision.reason,
                         "invocation_id": invocation_id,
                     },
@@ -132,8 +129,10 @@ class ProcessMixin:
 
         process_id = f"process-{uuid4().hex}"
         request = ProcessStartRequest(
-            process_id=process_id, argv=argv, cwd=resolved_cwd,
-            environment=safe_environment, max_output_bytes=max_output_bytes,
+            process_id=process_id, argv=prepared.argv, cwd=prepared.cwd,
+            environment=prepared.environment,
+            environment_policy=prepared.environment_policy,
+            max_output_bytes=max_output_bytes,
         )
         try:
             handle = await executor.start_process(request)
@@ -144,8 +143,8 @@ class ProcessMixin:
                     "process.failed",
                     {
                         "turn_id": turn_id, "process_id": process_id,
-                        "argv_hash": self._argv_hash(argv),
-                        "cwd": str(resolved_cwd),
+                        "argv_hash": self._argv_hash(prepared.argv),
+                        "cwd": str(prepared.cwd),
                         "error_type": type(error).__name__,
                         "message": "process executor could not start the requested argv",
                         "invocation_id": invocation_id,
@@ -213,26 +212,31 @@ class ProcessMixin:
             raise InvalidTurnState(
                 f"task {task_id} must be EXECUTING, got {task.state.value}"
             )
-        resolved_cwd = self._resolve_process_cwd(Path(task.workspace), cwd)
-        safe_environment = self._validate_process_environment(environment or {})
-        environment_policy = ProcessEnvironmentPolicy(
-            inherit_host_environment=True,
-            allowed_host_variables=("SSH_AUTH_SOCK", "HOME", "USER"),
-            blocked_host_variables=("AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"),
-            runtime_trust_mode="governed",
-        )
+        try:
+            prepared = self._prepare_process_execution(
+                task, argv, cwd, environment or {},
+            )
+        except ProcessPreparationError as error:
+            await self._record_process_preparation_failure(
+                task_id, turn_id, argv, cwd, error, invocation_id,
+            )
+            raise FileNotFoundError(str(error)) from error
         decision = await self._dependencies.sandbox.authorize(
-            SandboxRequest(argv, resolved_cwd, safe_environment)
+            SandboxRequest(
+                prepared.argv, prepared.cwd, prepared.environment,
+                environment_policy=prepared.environment_policy,
+            )
         )
         if not decision.allowed:
             await self._append_events(task_id, (("process.denied", {
-                "turn_id": turn_id, "argv_hash": self._argv_hash(argv),
-                "cwd": str(resolved_cwd), "reason": decision.reason,
+                "turn_id": turn_id, "argv_hash": self._argv_hash(prepared.argv),
+                "cwd": str(prepared.cwd), "reason": decision.reason,
             }),))
             raise ProcessSandboxDenied(decision.reason)
         process_id = f"process-{uuid4().hex}"
         request = ProcessStartRequest(
-            process_id, argv, resolved_cwd, safe_environment, max_output_bytes
+            process_id, prepared.argv, prepared.cwd, prepared.environment,
+            prepared.environment_policy, max_output_bytes,
         )
         handle = await executor.start_process(request)
         deadline = handle.started_at + timedelta(seconds=max_lifetime_seconds)
@@ -491,6 +495,91 @@ class ProcessMixin:
         if not resolved.is_dir():
             raise ValueError(f"process cwd is not a directory: {resolved}")
         return resolved
+
+    async def _record_process_preparation_failure(
+        self, task_id: str, turn_id: str, argv: tuple[str, ...], cwd: str,
+        error: ProcessPreparationError, invocation_id: str | None,
+    ) -> None:
+        await self._append_events(task_id, ((
+            "process.failed",
+            {
+                "turn_id": turn_id,
+                "argv_hash": self._argv_hash(argv),
+                "cwd": cwd,
+                "error_type": "FileNotFoundError",
+                "message": "process executable was unavailable before start",
+                "error_code": error.code,
+                "invocation_id": invocation_id,
+            },
+        ),))
+
+    def _prepare_process_execution(
+        self, task: TaskSnapshot, argv: tuple[str, ...], cwd: str,
+        environment: Mapping[str, str],
+    ) -> PreparedProcessExecution:
+        """Resolve an executable and governed environment before it can run.
+
+        This is deliberately generic: it knows neither package managers nor
+        project types.  A missing executable is a *not-started* outcome rather
+        than an executor crash, so callers can decide a safe next step.
+        """
+        executor = self._require_process_executor()
+        resolved_cwd = self._resolve_process_cwd(Path(task.workspace), cwd)
+        validated_environment = self._validate_process_environment(environment)
+        policy = ProcessEnvironmentPolicy(
+            inherit_host_environment=True,
+            allowed_host_variables=("SSH_AUTH_SOCK", "HOME", "USER"),
+            blocked_host_variables=("AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"),
+            runtime_trust_mode="governed",
+        )
+        safe_environment = dict(executor.prepare_environment(validated_environment, policy))
+        executable = argv[0]
+        launch_path: Path
+        if os.path.sep in executable or (os.path.altsep and os.path.altsep in executable):
+            candidate = Path(executable)
+            candidate = candidate if candidate.is_absolute() else resolved_cwd / candidate
+            # Validate relative launchers against the workspace but preserve the
+            # lexical launcher path.  ``resolve()`` here would replace a stable
+            # wrapper identity with its implementation target after approval.
+            if not Path(executable).is_absolute():
+                self._dependencies.workspace_path.resolve_access_path(
+                    resolved_cwd, executable
+                )
+            launch_path = Path(os.path.abspath(str(candidate)))
+        else:
+            discovered = shutil.which(executable, path=safe_environment.get("PATH"))
+            launch_path = Path(discovered) if discovered else Path()
+        if not str(launch_path) or not launch_path.is_file() or not os.access(launch_path, os.X_OK):
+            raise ProcessPreparationError(
+                "EXECUTABLE_NOT_FOUND",
+                f"command executable is unavailable in the governed environment: {executable}",
+                executable=executable,
+            )
+        resolved_target = Path(os.path.realpath(launch_path))
+        if not resolved_target.is_file() or not os.access(resolved_target, os.X_OK):
+            raise ProcessPreparationError(
+                "EXECUTABLE_NOT_FOUND",
+                f"command executable target is unavailable in the governed environment: {executable}",
+                executable=executable,
+            )
+        return PreparedProcessExecution(
+            launch_path=launch_path, resolved_target=resolved_target,
+            launch_fingerprint=self._process_path_fingerprint(launch_path),
+            target_fingerprint=self._process_path_fingerprint(resolved_target),
+            environment_fingerprint=hashlib.sha256(json.dumps(
+                safe_environment, sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest(),
+            argv=(str(launch_path), *argv[1:]), cwd=resolved_cwd,
+            environment=safe_environment, environment_policy=policy,
+        )
+
+    @staticmethod
+    def _process_path_fingerprint(path: Path) -> str:
+        stat_result = path.stat()
+        return hashlib.sha256(
+            f"{stat_result.st_dev}:{stat_result.st_ino}:{stat_result.st_mode}:"
+            f"{stat_result.st_size}:{stat_result.st_mtime_ns}".encode()
+        ).hexdigest()
 
     @staticmethod
     def _validate_process_environment(

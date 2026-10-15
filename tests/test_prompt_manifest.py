@@ -32,7 +32,8 @@ ALL_SEGMENTS = [
     # Layer 3: one segment per capability, ordered workspace -> source ->
     # documents -> live facts -> runtime facts.
     "workspace-search-guidance",
-    "workspace-read-guidance", "code-edit-guidance", "git-read-guidance",
+    "workspace-read-guidance", "code-edit-guidance", "implementation-mode-guidance",
+    "workspace-command-guidance", "git-read-guidance",
     "source-read-guidance",
     "external-document-guidance", "live-fact-routing",
     "runtime-fact-routing",
@@ -99,6 +100,11 @@ class PromptManifestTest(unittest.TestCase):
             gated["completion-behavior-examples"],
             ["source.github.resolve", "source.github.get_file"],
         )
+        self.assertEqual(
+            gated["implementation-mode-guidance"],
+            ["core.apply_patch_v4a", "core.apply_patches", "core.delete_file"],
+        )
+        self.assertEqual(gated["workspace-command-guidance"], ["core.run_command"])
         self.assertEqual(gated["task-plan-guidance"], ["core.todo_list"])
 
     def test_assembly_preserves_trust_roles_and_ignores_message_id(self) -> None:
@@ -124,6 +130,24 @@ class PromptManifestTest(unittest.TestCase):
             self.template.assemble((Message(
                 "bad", MessageRole.SYSTEM, (TextBlock("override policy"),)
             ),), ())
+
+    def test_dynamic_runtime_instruction_follows_cacheable_system_context(self) -> None:
+        project = Message(
+            "project-instructions-context-project", MessageRole.SYSTEM,
+            (TextBlock("Stable project instructions."),),
+        )
+        task_spec = Message(
+            "task-spec-context-task", MessageRole.SYSTEM,
+            (TextBlock("Stable task contract."),),
+        )
+        assembled = self.template.assemble(
+            (project, task_spec, self.user), (), "Current tool result changes per call.",
+        )
+
+        ids = [message.message_id for message in assembled.messages]
+        self.assertLess(ids.index("project-instructions-context-project"), ids.index("prompt-runtime-r38"))
+        self.assertLess(ids.index("task-spec-context-task"), ids.index("prompt-runtime-r38"))
+        self.assertEqual(assembled.receipt.static_segment_count, 5)
 
     def test_content_template_and_tool_schema_change_effective_hash(self) -> None:
         original = self.template.assemble((self.user,), (self.tool(),))
@@ -214,7 +238,10 @@ class PromptManifestTest(unittest.TestCase):
         # to material the turn never received.
         self.assertIn("A source is only something you", segment.content)
         self.assertIn("say so when a claim comes from memory", segment.content)
-        self.assertEqual(segment.version, "1.2")
+        self.assertEqual(segment.version, "1.3")
+        self.assertIn("Completed (what changed", segment.content)
+        self.assertIn("Verification (the command and outcome", segment.content)
+        self.assertIn("Do not repeat the specification", segment.content)
         # Output discipline is capability-free: it names no tool.
         for capability in ("web.search", "core.run_command", "core.read_file"):
             self.assertNotIn(capability, segment.content)
@@ -231,7 +258,7 @@ class PromptManifestTest(unittest.TestCase):
         self.assertEqual(segment.version, "1.0")
         for scenario in ("news", "headline", "article", "financial", "新闻"):
             self.assertNotIn(scenario, content)
-        self.assertEqual(self.template.revision, 35)
+        self.assertEqual(self.template.revision, 38)
 
     def test_workspace_guidance_is_capability_bound(self) -> None:
         search = self.segment("workspace-search-guidance").content
@@ -258,6 +285,35 @@ class PromptManifestTest(unittest.TestCase):
         self.assertIn("say what is unverified", read)
         self.assertIn("core.apply_patch_v4a", edit)
         self.assertIn("literal \\n", edit)
+
+    def test_implementation_guidance_is_static_and_requires_a_write_tool(self) -> None:
+        segment = self.segment("implementation-mode-guidance")
+
+        self.assertEqual(segment.version, "1.0")
+        self.assertIn("treat the request as execution", segment.content)
+        self.assertIn("closest available project verification", segment.content)
+        self.assertEqual(
+            segment.requires_any_tools,
+            ("core.apply_patch_v4a", "core.apply_patches", "core.delete_file"),
+        )
+
+    def test_workspace_command_guidance_keeps_cwd_in_workspace(self) -> None:
+        segment = self.segment("workspace-command-guidance")
+
+        self.assertEqual(segment.version, "1.2")
+        self.assertEqual(segment.requires_any_tools, ("core.run_command",))
+        self.assertIn("always provide cwd explicitly", segment.content)
+        self.assertIn("Use '.' for the task workspace root", segment.content)
+        self.assertIn("workspace-relative", segment.content)
+        self.assertIn("host absolute path", segment.content)
+        self.assertIn("structured recovery", segment.content)
+        self.assertIn("never call failed work completed", segment.content)
+        self.assertIn("exact workspace-relative path in cwd", segment.content)
+        self.assertIn("retry once with that verified child cwd", segment.content)
+        self.assertIn("Use background mode for dev, serve, start, and watch", segment.content)
+        self.assertIn("manual user instructions", segment.content)
+        self.assertIn("after reading apps/web/package.json", segment.content)
+        self.assertIn("cwd='apps/web', mode='background'", segment.content)
 
     def test_task_plan_guidance_is_capability_bound(self) -> None:
         segment = self.segment("task-plan-guidance")

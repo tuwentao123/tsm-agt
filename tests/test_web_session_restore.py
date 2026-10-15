@@ -279,6 +279,46 @@ class SessionRestoreEndpointTest(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         web_app.runtime_server = self.previous
 
+    async def test_workspace_trust_lookup_runs_on_runtime_thread(self) -> None:
+        """Optional trust metadata must not use Runtime SQLite from ASGI."""
+        original_registry = list(web_app.workspace_registry)
+
+        class Kernel:
+            async def get_project_trust(self, _workspace):
+                return type("_Trust", (), {"level": web_app.ProjectTrustLevel.UNTRUSTED})()
+
+        class Server:
+            calls = 0
+            _client = type(
+                "_Client", (), {
+                    "application": type("_App", (), {"kernel": Kernel()})()
+                },
+            )()
+
+            def _call(self, awaitable, *, timeout: float = 70):
+                del timeout
+                self.calls += 1
+                try:
+                    awaitable.send(None)
+                except StopIteration as stop:
+                    return stop.value
+                raise AssertionError("fake coroutine unexpectedly suspended")
+
+        server = Server()
+        web_app.runtime_server = server
+        web_app.workspace_registry[:] = [{
+            "id": "workspace-1", "name": "project", "path": "/tmp/project",
+        }]
+        try:
+            result = await web_app.list_workspaces()
+        finally:
+            web_app.workspace_registry[:] = original_registry
+
+        self.assertEqual(server.calls, 1)
+        self.assertEqual(
+            result["workspaces"][0]["trust_level"], "UNTRUSTED"
+        )
+
     @staticmethod
     def _server(
         *, waiting_approval: bool = False, phase1_state: str = "RUNNING",
@@ -589,6 +629,42 @@ class SessionRestoreEndpointTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(turn["progress"][-1]["action"], "write docs/spec.md")
 
+    async def test_legacy_background_failure_is_shown_on_its_unfinished_turn(
+        self,
+    ) -> None:
+        """A historical SDK label must not hide a failure after reload."""
+        task_events = {
+            "task-new": (
+                _SessionEvent(1, "turn.started", {"turn_id": "turn-live"}),
+                _SessionEvent(2, "tool.requested", {
+                    "turn_id": "turn-live",
+                    "call": {"call_id": "call-1", "name": "core.run_command"},
+                }),
+                _SessionEvent(3, "llm.failed", {
+                    "turn_id": "sdk-background",
+                    "error_type": "ValueError",
+                    "message": "task already has a pending approval",
+                }),
+            ),
+        }
+        web_app.runtime_server = self._server(
+            projection=_Projection((
+                _Message(MessageRole.USER, "重新试试", "task-new", turn_id="turn-live"),
+            )),
+            task_events=task_events,
+            input_turns=({"task_id": "task-new", "turn_id": "turn-live"},),
+        )
+
+        payload = await web_app.get_session("session-new")
+
+        self.assertEqual(
+            [item["kind"] for item in payload["turns"][0]["progress"]],
+            ["turn_started", "tool_started", "turn_failed"],
+        )
+        self.assertIn(
+            "pending approval", payload["turns"][0]["progress"][-1]["detail"],
+        )
+
     async def test_unanswered_approval_comes_back_with_the_session(self) -> None:
         web_app.runtime_server = self._server(
             waiting_approval=True, phase1_state="WAITING"
@@ -688,8 +764,12 @@ class _ProgressEnvelope:
 
 
 class _StreamClient:
-    def __init__(self) -> None:
+    def __init__(
+        self, *, phase1_state: str = "DONE", status: str = "completed",
+    ) -> None:
         self.afters: list[int] = []
+        self.phase1_state = phase1_state
+        self.status = status
 
     def read_progress(self, _task_id: str, *, after: int = 0):
         self.afters.append(after)
@@ -697,14 +777,19 @@ class _StreamClient:
 
     async def get_task_result(self, task_id: str):
         return RuntimeTaskResult(
-            task_id=task_id, state="SUCCEEDED", phase1_state="DONE",
-            status="completed", cursor=12,
+            task_id=task_id, state=self.phase1_state,
+            phase1_state=self.phase1_state,
+            status=self.status, cursor=12,
         )
 
 
 class _StreamServer:
-    def __init__(self) -> None:
-        self._client = _StreamClient()
+    def __init__(
+        self, *, phase1_state: str = "DONE", status: str = "completed",
+    ) -> None:
+        self._client = _StreamClient(
+            phase1_state=phase1_state, status=status,
+        )
 
     def _call(self, awaitable, *, timeout: float = 70):
         try:
@@ -745,8 +830,39 @@ class StreamCursorProtocolTest(unittest.IsolatedAsyncioTestCase):
         finally:
             web_app.runtime_server = previous
 
+    async def test_interrupted_turn_emits_final_frame_and_closes_stream(self) -> None:
+        """A resumable Task interruption still settles the current Turn."""
+        previous = web_app.runtime_server
+        web_app.runtime_server = _StreamServer(
+            phase1_state="INTERRUPTED", status="incomplete",
+        )
+        try:
+            response = await web_app.stream("task-stream", after=9)
+            final = await anext(response.body_iterator)
+            if isinstance(final, bytes):
+                final = final.decode("utf-8")
+            self.assertIn('"final": true', final)
+            self.assertIn('"phase1_state": "INTERRUPTED"', final)
+            with self.assertRaises(StopAsyncIteration):
+                await anext(response.body_iterator)
+        finally:
+            web_app.runtime_server = previous
+
 
 class TaskCardIsolationUiTest(unittest.TestCase):
+    def test_interrupted_turn_rebuilds_durable_trace_before_follower_stops(self):
+        html = web_app.INDEX_HTML
+        self.assertIn(
+            "'INTERRUPTED', 'DONE', 'FAILED', 'CANCELLED', 'NEEDS_REVIEW'",
+            html,
+        )
+        self.assertIn("async function renderFinalResult", html)
+        self.assertIn(
+            "const refreshed = await refreshConversationHistory(conversationId)",
+            html,
+        )
+        self.assertIn("await finish(state)", html)
+
     def test_progress_is_written_to_a_task_card_not_session_system_text(self):
         html = web_app.INDEX_HTML
         self.assertIn("function appendTaskProgress(taskId, progress, conversationId)", html)

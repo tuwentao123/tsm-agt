@@ -78,11 +78,22 @@ class CheckpointMixin:
                     f"task {task_id} cannot start a fresh turn from "
                     f"{current.state.value}"
                 )
+            restarted = current.clear_pending_interactions()
             executing = (
-                current.transition(TaskState.RESUMING)
+                restarted.transition(TaskState.RESUMING)
                 .transition(TaskState.EXECUTING)
                 .with_agent_checkpoint(None)
             )
+            events: list[RuntimeEvent] = []
+            if current.pending_approval is not None:
+                events.append(RuntimeEvent(
+                    f"evt-{uuid4().hex}", task_id,
+                    stored.last_event_sequence + len(events) + 1,
+                    "approval.invalidated", {
+                        "request_id": current.pending_approval.request_id,
+                        "reason": "fresh_conversation_turn",
+                    },
+                ))
             event = RuntimeEvent(
                 f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
                 "task.state_changed", {
@@ -91,9 +102,12 @@ class CheckpointMixin:
                     "reason": "conversation turn started over a stopped turn",
                 },
             )
+            events.append(replace(
+                event, sequence=stored.last_event_sequence + len(events) + 1,
+            ))
             try:
                 await self._dependencies.store.commit(RuntimeUnitOfWork(
-                    task_id, stored.version, executing.to_data(), (event,),
+                    task_id, stored.version, executing.to_data(), tuple(events),
                 ))
                 return
             except ValueError as error:
@@ -517,7 +531,7 @@ class CheckpointMixin:
                 f"checkpoint conflict cannot transition from {current.state.value}"
             )
         conflicted = current.transition(TaskState.CONFLICT)
-        events = (
+        events: list[RuntimeEvent] = [
             RuntimeEvent(
                 f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
                 "checkpoint.conflict",
@@ -525,16 +539,28 @@ class CheckpointMixin:
                  "checkpoint_hash": checkpoint.checkpoint_hash,
                  "conflicts": list(conflicts)},
             ),
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 2,
-                "task.state_changed",
-                {"previous_state": current.state.value,
-                 "next_state": conflicted.state.value,
-                 "reason": "Agent checkpoint identity conflict"},
-            ),
-        )
+        ]
+        if current.pending_approval is not None:
+            # This is neither an approval nor a user denial: the exact action
+            # was invalidated before it could be resumed.  Preserve that fact
+            # in the durable trace and close the corresponding flow node.
+            events.append(RuntimeEvent(
+                f"evt-{uuid4().hex}", task_id,
+                stored.last_event_sequence + len(events) + 1,
+                "approval.invalidated",
+                {"request_id": current.pending_approval.request_id,
+                 "reason": "checkpoint_identity_conflict"},
+            ))
+        events.append(RuntimeEvent(
+            f"evt-{uuid4().hex}", task_id,
+            stored.last_event_sequence + len(events) + 1,
+            "task.state_changed",
+            {"previous_state": current.state.value,
+             "next_state": conflicted.state.value,
+             "reason": "Agent checkpoint identity conflict"},
+        ))
         await self._dependencies.store.commit(RuntimeUnitOfWork(
-            task_id, stored.version, conflicted.to_data(), events
+            task_id, stored.version, conflicted.to_data(), tuple(events)
         ))
 
     async def _rebase_agent_checkpoint(

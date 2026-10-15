@@ -207,14 +207,17 @@ class TaskRuntimeProjector:
         # Terminal state always wins over stale event/progress state.
         if task.state.is_terminal:
             return TaskExecutionStatus.STOPPED, None
+        # A persisted approval is valid only in its dedicated suspension state.
+        # Checkpoint conflicts from older runtimes may still carry the field;
+        # never revive their UI approval card from that stale data.
+        if task.state in {TaskState.INTERRUPTING, TaskState.INTERRUPTED, TaskState.CONFLICT}:
+            return TaskExecutionStatus.INTERRUPTED, None
         if task.state is TaskState.AWAITING_APPROVAL or task.pending_approval:
             return TaskExecutionStatus.WAITING_APPROVAL, "approval"
         if task.state is TaskState.AWAITING_USER or task.pending_clarification:
             return TaskExecutionStatus.WAITING_INPUT, "input"
         if task.state is TaskState.AWAITING_INPUT:
             return TaskExecutionStatus.WAITING_INPUT, "input"
-        if task.state in {TaskState.INTERRUPTING, TaskState.INTERRUPTED, TaskState.CONFLICT}:
-            return TaskExecutionStatus.INTERRUPTED, None
         return TaskExecutionStatus.RUNNING, None
 
     @staticmethod

@@ -115,7 +115,7 @@ class PromptTemplate:
     def default(cls) -> PromptTemplate:
         return cls(
             manifest_id="builtin.engineering-agent",
-            revision=35,
+            revision=38,
             static_segments=(
                 PromptTemplateSegment(
                     "system-safety", "core", "1.0",
@@ -148,14 +148,20 @@ class PromptTemplate:
                     "rather than offering to continue later.",
                 ),
                 PromptTemplateSegment(
-                    "response-format-guidance", "harness", "1.2",
+                    "response-format-guidance", "harness", "1.3",
                     "Answer the current request, not the conversation's earlier ones. "
                     "Lead with the conclusion or result, then only needed detail. Name "
                     "support for factual claims and mark unverified parts. A source is "
                     "only something you actually received here; never credit unread "
                     "material, and say so when a claim comes from memory. Do not restate, "
                     "re-summarize, or re-format an earlier answer. For an acknowledgment, "
-                    "preference, or small follow-up, reply briefly and ask what is needed.",
+                    "preference, or small follow-up, reply briefly and ask what is needed. "
+                    "For a workspace implementation result, report only the applicable "
+                    "short sections: Completed (what changed and at most five paths), "
+                    "Verification (the command and outcome, or the specific reason it is "
+                    "unverified), and Blocked (only when a blocker remains). Do not repeat "
+                    "the specification, narrate the tool trace, paste large source blocks, "
+                    "or offer a plan as though it were a completed change.",
                 ),
                 PromptTemplateSegment(
                     "execution-discipline", "harness", "1.3",
@@ -235,6 +241,57 @@ class PromptTemplate:
                     "characters; never send literal \\n as a substitute for line breaks "
                     "in old_text or patch text.",
                     requires_any_tools=("core.apply_patch_v4a",),
+                ),
+                PromptTemplateSegment(
+                    "implementation-mode-guidance", "harness", "1.0",
+                    "When the current user directly asks to create, implement, fix, "
+                    "modify, or refactor workspace code, treat the request as execution, "
+                    "not a request for a plan. Read only the context needed to make the "
+                    "change, then use an advertised workspace write tool when scope and "
+                    "Runtime policy permit. After a successful change, run the closest "
+                    "available project verification, or state the specific reason it "
+                    "cannot run. Do not substitute pseudocode, manual steps, or future "
+                    "work for an authorized workspace change. A tool being advertised "
+                    "does not itself grant approval; Runtime decides that when it is called.",
+                    requires_any_tools=(
+                        "core.apply_patch_v4a", "core.apply_patches", "core.delete_file",
+                    ),
+                ),
+                PromptTemplateSegment(
+                    "workspace-command-guidance", "harness", "1.2",
+                    "For every core.run_command call, always provide cwd explicitly. "
+                    "Use '.' for the task workspace root, or a verified workspace-relative "
+                    "subdirectory such as 'packages/web'; do not rely on a default directory, "
+                    "do not use shell cd to establish it, and do not copy a host absolute path "
+                    "from the user request into cwd. If the requested target is outside the "
+                    "task workspace, do not silently substitute a different directory: use "
+                    "an advertised legal path or report that scope blocker. After a command "
+                    "or other tool failure, read its error, hint, and structured recovery "
+                    "facts. Correct a clearly safe argument error or choose another legal "
+                    "method and continue the original request; never call failed work "
+                    "completed. Do not blindly retry a command whose outcome is unknown. "
+                    "When a workspace read or earlier tool result establishes a child "
+                    "directory containing the relevant package manifest, build configuration, "
+                    "or test entry point, treat that directory as the command target: pass "
+                    "its exact workspace-relative path in cwd for later install, build, test, "
+                    "lint, or development commands. Keep that established target across a "
+                    "short follow-up; do not fall back to the workspace root merely because "
+                    "the latest user message omits the path. If a command fails because its "
+                    "manifest or configuration is absent from cwd, locate the relevant "
+                    "workspace file, then retry once with that verified child cwd when the "
+                    "failed command had a known outcome. Use foreground mode for bounded "
+                    "build, test, lint, and type-check commands and inspect their exit result. "
+                    "Use background mode for dev, serve, start, and watch commands, then use "
+                    "the advertised process status or log tools to establish readiness. Do not "
+                    "replace a recoverable in-scope command with manual user instructions. "
+                    "Example: after reading apps/web/package.json, run its build with "
+                    "argv=['npm','run','build'], cwd='apps/web', mode='foreground'. To start "
+                    "that project's development server, use argv=['npm','run','dev'], "
+                    "cwd='apps/web', mode='background', then inspect the returned process with "
+                    "process status or logs. If the first command instead says the manifest is "
+                    "missing from '.', locate the verified manifest and make that corrected cwd "
+                    "call; do not ask the user to run it manually.",
+                    requires_any_tools=("core.run_command",),
                 ),
                 PromptTemplateSegment(
                     "git-read-guidance", "harness", "1.0",
@@ -342,9 +399,9 @@ class PromptTemplate:
         )
         order = (
             *(segment.segment_id for segment in self.static_segments),
-            "runtime_instruction_if_present",
             "trusted_project_instructions_if_present",
             "task_spec_if_present",
+            "runtime_instruction_if_present",
             "untrusted_project_onboarding_if_present",
             "untrusted_project_memory_if_present",
             "session_conversation_projection_if_present",
@@ -454,8 +511,8 @@ class PromptTemplate:
         ):
             raise ValueError("working memory context must use the untrusted user role")
         messages = (
-            system_messages + runtime_messages + project_instruction_messages
-            + task_spec_messages + onboarding_messages
+            system_messages + project_instruction_messages + task_spec_messages
+            + runtime_messages + onboarding_messages
             + memory_messages + session_messages + document_reference_messages
             + working_memory_messages
             + ordinary_conversation
@@ -480,7 +537,7 @@ class PromptTemplate:
         return PromptAssembly(messages, PromptAssemblyReceipt(
             manifest_hash=manifest.manifest_hash,
             effective_prompt_hash=effective_hash, message_count=len(messages),
-            static_segment_count=len(system_messages) + len(runtime_messages),
+            static_segment_count=len(system_messages),
             conversation_message_count=len(conversation), tool_count=len(tools),
             toolset_hash=toolset_hash,
             role_order=tuple(message.role.value for message in messages),

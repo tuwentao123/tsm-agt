@@ -306,20 +306,21 @@ class CommandRiskKernelTest(unittest.IsolatedAsyncioTestCase):
             await self.application.kernel.invoke_tool(
                 self.task.task_id, "turn-push",
                 ToolCall("call-push", "core.run_command", {
-                    "argv": ["git", "push", "origin", "main"]
+                    "argv": ["git", "push", "origin", "main"], "cwd": ".",
                 }),
             )
         request = caught.exception.request
         self.assertEqual(request.risk, ToolRisk.R3)
         self.assertEqual(request.network_access, "required")
-        self.assertIn('"argv":["git","push","origin","main"]', request.preview)
+        self.assertIn('"push","origin","main"]', request.preview)
+        self.assertIn('"cwd":"."', request.preview)
 
     async def test_r3_approval_explains_dynamic_network_risk(self) -> None:
         with self.assertRaises(ApprovalRequired) as caught:
             await self.application.kernel.invoke_tool(
                 self.task.task_id, "turn-install",
                 ToolCall("call-install", "core.run_command", {
-                    "argv": ["npm", "install"]
+                    "argv": ["npm", "install"], "cwd": ".",
                 }),
             )
         request = caught.exception.request
@@ -339,7 +340,7 @@ class CommandRiskKernelTest(unittest.IsolatedAsyncioTestCase):
             await self.application.kernel.invoke_tool(
                 self.task.task_id, "turn-delete",
                 ToolCall("call-delete", "core.run_command", {
-                    "argv": ["rm", "-rf", "build"]
+                    "argv": ["rm", "-rf", "build"], "cwd": ".",
                 }),
             )
         self.assertEqual(caught.exception.request.risk, ToolRisk.R3)

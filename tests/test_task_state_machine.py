@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from tsm_agt.core import (
@@ -33,7 +34,7 @@ class TaskStateMachineTest(unittest.TestCase):
             TaskState.INTERRUPTING: Phase1TaskState.INTERRUPTED,
             TaskState.INTERRUPTED: Phase1TaskState.INTERRUPTED,
             TaskState.RESUMING: Phase1TaskState.RUNNING,
-            TaskState.CONFLICT: Phase1TaskState.RUNNING,
+            TaskState.CONFLICT: Phase1TaskState.INTERRUPTED,
             TaskState.VERIFYING: Phase1TaskState.RUNNING,
             TaskState.FINALIZING: Phase1TaskState.RUNNING,
             TaskState.SUCCEEDED: Phase1TaskState.DONE,
@@ -139,6 +140,16 @@ class TaskStateMachineTest(unittest.TestCase):
         awaiting = executing.await_approval(request, self.now)
 
         self.assertEqual(TaskSnapshot.from_data(awaiting.to_data()), awaiting)
+
+        conflicted = awaiting.transition(TaskState.CONFLICT, self.now)
+
+        self.assertIsNone(conflicted.pending_approval)
+
+        # Old durable snapshots may have reached CONFLICT before the cleanup
+        # rule existed. A later fresh turn must scrub them as well.
+        legacy_conflict = replace(awaiting, state=TaskState.CONFLICT)
+        cleaned = legacy_conflict.clear_pending_interactions(self.now)
+        self.assertIsNone(cleaned.pending_approval)
 
     def test_legacy_approval_without_preview_still_loads(self) -> None:
         request = {

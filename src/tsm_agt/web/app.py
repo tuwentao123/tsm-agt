@@ -20,14 +20,14 @@ from fastapi.responses import (
 
 from tsm_agt.core import (
     AgentLoopLimitExceeded, ApprovalDecision, RuntimeInputIntent,
-    note_stream_released,
+    ProjectTrustLevel, note_stream_released,
 )
 from tsm_agt.local_api import LocalEventApiServer
 from tsm_agt.ports import ImageBlock, MessageRole
 
 app = FastAPI(title="tsm-agt-web")
 logger = logging.getLogger(__name__)
-WEBUI_VERSION = "deepseek-cn-v20260921-session-timeline-order"
+WEBUI_VERSION = "deepseek-cn-v20261013-workspace-trust"
 
 INDEX_HTML = """
 <!doctype html>
@@ -39,11 +39,12 @@ INDEX_HTML = """
 <style>
 :root{color-scheme:light;--bg:#f8fafc;--bg-soft:#ffffff;--panel:#ffffff;--panel-elevated:#ffffff;--panel-muted:#f9fbfd;--border:#edf2f7;--border-strong:#e2e8f0;--text:#1f2937;--text-soft:#475569;--muted:#7b8794;--accent:#1677ff;--accent-soft:#eef6ff;--shadow-sm:0 10px 30px rgba(15,23,42,.035);--shadow-md:0 24px 60px rgba(15,23,42,.05);--radius-lg:20px;--radius-md:14px}
 *{box-sizing:border-box}
+html,body{height:100%;overflow:hidden}
 body{margin:0;background:linear-gradient(180deg,#fbfdff 0%,#f6f9fc 100%);color:var(--text);font:14px/1.7 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
 body::before{content:"";position:fixed;inset:0;background:radial-gradient(circle at top,rgba(22,119,255,.08),transparent 30%);pointer-events:none}
 button{font:inherit;color:inherit;background:none;border:none;cursor:pointer;border-radius:10px}
 button:disabled{opacity:.4;cursor:not-allowed}
-.layout{display:grid;grid-template-columns:260px minmax(0,1fr);height:100vh;overflow:hidden}
+.layout{display:grid;grid-template-columns:260px minmax(0,1fr);height:100vh;height:100dvh;overflow:hidden}
 .sidebar{border-right:1px solid var(--border);padding:20px 14px;display:flex;flex-direction:column;gap:14px;min-height:0;height:100vh;overflow-y:auto;overscroll-behavior:contain;background:rgba(255,255,255,.96);box-shadow:inset -1px 0 0 rgba(217,225,236,.7)}
 .brand{font-size:15px;font-weight:600;padding:0 6px}
 .new-session-btn{border:1px solid var(--border);padding:8px 10px;text-align:left;color:var(--muted)}
@@ -57,6 +58,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .workspace-group{display:flex;flex-direction:column;margin-bottom:6px}
 .workspace-row{display:flex;align-items:center;gap:2px}
 .workspace-entry{flex:1;min-width:0}
+.workspace-trust{font-size:10px;color:#64748b;margin-left:6px}.workspace-trust.trusted{color:#15803d}.workspace-trust.untrusted{color:#b45309}
 .session-list{display:flex;flex-direction:column;gap:1px;margin:2px 0 0 10px;padding-left:8px;border-left:1px solid var(--border)}
 .session-item{padding:5px 8px}
 .session-item .item-title{font-size:13px}
@@ -67,7 +69,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .item-title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:500}
 .item-meta{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:rtl;text-align:left}
 .hint{font-size:12px;color:var(--muted);padding:6px}
-.main{display:flex;flex-direction:column;min-width:0;min-height:0;height:100vh;overflow:hidden;background:transparent}
+.main{display:flex;flex-direction:column;min-width:0;min-height:0;height:100vh;height:100dvh;overflow:hidden;background:transparent}
 .topbar{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:18px 32px;border-bottom:1px solid var(--border);background:rgba(255,255,255,.9);backdrop-filter:blur(12px)}
 #conversation-name{font-weight:500}
 .session-id{margin-top:2px;font-family:"SFMono-Regular","JetBrains Mono","Fira Code",monospace;font-size:11px;color:#7b8794;cursor:pointer;user-select:text;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:52ch}
@@ -77,9 +79,9 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .turn-marker:hover{color:#2563eb}
 .turn-marker.copied{color:#0f766e}
 .topbar .icon-btn{font-size:12px}
-.chat-shell{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden;padding:18px 22px 14px}
-.workspace-stage{flex:1;min-height:0;width:100%;display:grid;grid-template-columns:minmax(0,1.18fr) minmax(320px,.82fr);gap:14px;align-items:stretch}
-.pane-shell{position:relative;min-height:0;display:flex;flex-direction:column;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.72);border-radius:24px;overflow:hidden;backdrop-filter:blur(10px);box-shadow:none}
+.chat-shell{flex:1 1 0;min-height:0;height:0;display:flex;flex-direction:column;overflow:hidden;padding:18px 22px 14px}
+.workspace-stage{flex:1 1 0;min-height:0;height:100%;width:100%;display:grid;grid-template-columns:minmax(0,1.18fr) minmax(320px,.82fr);gap:14px;align-items:stretch;overflow:hidden}
+.pane-shell{position:relative;min-height:0;height:100%;display:flex;flex-direction:column;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.72);border-radius:24px;overflow:hidden;backdrop-filter:blur(10px);box-shadow:none}
 .pane-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:14px 18px 10px;border-bottom:1px solid rgba(237,242,247,.75);background:rgba(255,255,255,.78)}
 .pane-title{font-size:15px;font-weight:700;color:#111827}
 .pane-subtitle{margin-top:4px;font-size:12px;color:#64748b}
@@ -348,7 +350,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .empty-state{margin:auto;text-align:center;color:var(--muted);display:flex;flex-direction:column;gap:12px;align-items:center}
 .empty-state h2{margin:0;font-size:15px;font-weight:500;color:var(--text)}
 .link-btn{color:var(--accent)}
-.composer{padding:8px 20px 10px;display:flex;flex-direction:column;gap:6px;background:#f7f9fc;border-top:1px solid #e2e8f0}
+.composer{flex:0 0 auto;position:relative;z-index:30;padding:8px 20px 10px;display:flex;flex-direction:column;gap:6px;background:#f7f9fc;border-top:1px solid #e2e8f0}
 .composer-box{border:none;border-radius:16px;padding:10px 12px;background:#f3f4f6;box-shadow:none}
 .composer-box:focus-within{border-color:#91caff;box-shadow:0 0 0 2px rgba(22,119,255,.08)}
 .composer-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
@@ -635,9 +637,14 @@ function renderWorkspaceList() {
     entry.className = `list-item workspace-entry ${workspace.id === activeWorkspaceId ? 'active' : ''}`;
     entry.onclick = () => activateWorkspace(workspace.id);
     entry.title = workspace.path;
+    const trustLevel = String(workspace.trust_level || 'UNTRUSTED');
+    const trustLabel = trustLevel === 'TRUSTED_FULL'
+      ? '完全信任' : trustLevel === 'TRUSTED_BUILD'
+        ? '可执行' : trustLevel === 'TRUSTED_READ' ? '可读' : '只读未信任';
+    const trustClass = trustLevel === 'UNTRUSTED' ? 'untrusted' : 'trusted';
     entry.innerHTML = `
       <div class='item-title'>${workspace.name}</div>
-      <div class='item-meta'>${workspace.path}</div>
+      <div class='item-meta'>${workspace.path}<span class='workspace-trust ${trustClass}'>${trustLabel}</span></div>
     `;
 
     const add = document.createElement('button');
@@ -726,6 +733,32 @@ async function pickWorkspace() {
 
   const workspace = await response.json();
   const existingIndex = workspaces.findIndex((item) => item.id === workspace.id);
+  const isNewWorkspace = existingIndex < 0;
+  if (isNewWorkspace) {
+    const lineBreak = String.fromCharCode(10);
+    const trustNow = window.confirm(
+      `是否信任工作区“${workspace.name}”？${lineBreak}${lineBreak}` +
+      `允许 Agent 执行受控命令、构建和测试；文件写入仍会单独请求授权。${lineBreak}` +
+      '选择“取消”将保持只读，之后遇到命令时仍可再次审批。',
+    );
+    try {
+      const trustResponse = await fetch(
+        `/workspaces/${encodeURIComponent(workspace.id)}/trust`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ decision: trustNow ? 'trust' : 'reject' }),
+        },
+      );
+      if (!trustResponse.ok) {
+        const detail = await trustResponse.json().catch(() => ({}));
+        throw new Error(detail.detail || '工作区信任状态保存失败');
+      }
+      Object.assign(workspace, await trustResponse.json());
+    } catch (error) {
+      showError(error.message || '工作区信任状态保存失败。');
+    }
+  }
   if (existingIndex >= 0) {
     workspaces[existingIndex] = workspace;
   } else {
@@ -1225,9 +1258,12 @@ function renderMessages(forceScrollToBottom = false) {
   // The Turn that is running belongs directly under the question it answers,
   // above the conclusion it will produce. The Task card sits at the Task's
   // first Turn and would put this Turn's progress far above it.
-  const runningTask = active.messages.find(
+  // A suspended approval is still the active Turn.  Treating WAITING as
+  // "not running" made its just-created input lose the live trace until a
+  // later page rebuild happened to recover the durable turn record.
+  const runningTask = [...active.messages].reverse().find(
     (item) => item.role === 'task'
-      && ['PREPARING', 'RUNNING'].includes(item.task?.phase1State),
+      && ['PREPARING', 'RUNNING', 'WAITING'].includes(item.task?.phase1State),
   );
   const lastQuestionIndex = active.messages.reduce(
     (found, item, index) => (item.role === 'user' ? index : found), -1,
@@ -1307,12 +1343,15 @@ function renderMessages(forceScrollToBottom = false) {
     }
     chatArea.appendChild(element);
     if (inputTrace) chatArea.appendChild(inputTrace);
-    if (runningTask && !hasDurableCurrentTrace && !liveInserted && index === lastQuestionIndex) {
+    if (
+      runningTask && !hasDurableCurrentTrace && !durableCurrentTurn
+      && !liveInserted && index === lastQuestionIndex
+    ) {
       chatArea.appendChild(renderLiveTurnPanel(runningTask.task));
       liveInserted = true;
     }
   });
-  if (runningTask && !hasDurableCurrentTrace && !liveInserted) {
+  if (runningTask && !hasDurableCurrentTrace && !durableCurrentTurn && !liveInserted) {
     chatArea.appendChild(renderLiveTurnPanel(runningTask.task));
   }
 
@@ -1960,38 +1999,16 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
     card.appendChild(toggle);
   });
 
-  // A pending approval belongs to the Turn that requested the mutation, not
-  // necessarily the Task's opening Turn.  On a restored conversation it is
-  // rendered as its own message after that Task's latest user input (see
-  // ensureConversationLoaded), rather than being stranded in this historical
-  // Task card.  Keep this inline path only for a live card before that message
-  // has been materialized.
-  const hasStandaloneApproval = getConversationById(conversationId)?.messages
-    .some((item) => (
-      item.role === 'approval'
-      && item.taskId === task.taskId
-      && item.approval?.request_id === task.waiting?.approval?.request_id
-    ));
-  if (
-    task.waiting?.kind === 'APPROVAL'
-    && task.waiting.approval
-    && !hasStandaloneApproval
-  ) {
-    const approval = document.createElement('div');
-    approval.className = 'message approval';
-    approval.dataset.incompleteApprovalTask = task.taskId;
-    const approvalRequest = task.waiting.approval;
-    const resolution = task.approvalResolution;
-    renderApprovalCard(approval, {
-      approval: approvalRequest,
-      taskId: task.taskId,
-      resolved: (
-        resolution?.requestId === approvalRequest.request_id
-          ? resolution.decision : null
-      ),
-      conversationId,
-    });
-    card.appendChild(approval);
+  // Approval actions are deliberately never embedded in a historical Task
+  // card.  The only actionable copy lives in approval-dock, which is pinned to
+  // the conversation pane rather than scrolling away with this card.
+  if (task.waiting?.kind === 'APPROVAL') {
+    const waiting = document.createElement('div');
+    waiting.className = 'task-progress-line';
+    waiting.textContent = task.waiting.approval?.kind === 'project_trust'
+      ? '命令执行等待底部的工作区信任确认。'
+      : '写入操作等待底部的授权确认。';
+    card.appendChild(waiting);
   } else if (task.waiting) {
     const waiting = document.createElement('div');
     waiting.className = 'task-progress-line';
@@ -2018,6 +2035,57 @@ function taskMessage(conversationId, taskId) {
   return conversation?.messages.find(
     (item) => item.role === 'task' && item.task?.taskId === taskId,
   );
+}
+
+function bindLatestInputToTask(conversationId, taskId, turnId = null) {
+  const conversation = getConversationById(conversationId);
+  if (!conversation || !taskId) return null;
+  const input = [...conversation.messages].reverse().find((item) => (
+    item.role === 'user' && !item.taskId
+  ));
+  if (!input) return null;
+  input.taskId = taskId;
+  if (turnId) {
+    input.turnId = turnId;
+    conversation.turnCalls ||= new Map();
+    if (!conversation.turnCalls.has(turnId)) {
+      conversation.turnCalls.set(turnId, {
+        turn_id: turnId, task_id: taskId, settled: false, progress: [],
+      });
+    }
+  }
+  return input;
+}
+
+function upsertApprovalMessage(taskId, approval, conversationId = activeConversationId) {
+  const conversation = getConversationById(conversationId);
+  if (!conversation || !approval?.request_id) return null;
+  let message = conversation.messages.find((item) => (
+    item.role === 'approval'
+    && item.taskId === taskId
+    && item.approval?.request_id === approval.request_id
+  ));
+  if (!message) {
+    // This is an operation footer, so insertion order is intentionally the end
+    // of the transcript. renderMessages projects it into the fixed dock.
+    message = {
+      role: 'approval', content: '', taskId,
+      turnId: approval.turn_id || null, approval, conversationId,
+    };
+    conversation.messages.push(message);
+  } else {
+    message.approval = approval;
+    message.turnId = approval.turn_id || message.turnId || null;
+  }
+  return message;
+}
+
+function clearApprovalMessage(taskId, conversationId = activeConversationId) {
+  const conversation = getConversationById(conversationId);
+  if (!conversation) return;
+  conversation.messages = conversation.messages.filter((item) => !(
+    item.role === 'approval' && item.taskId === taskId
+  ));
 }
 
 function upsertTaskCard(conversationId, rawTask) {
@@ -2082,12 +2150,18 @@ function appendTaskProgress(taskId, progress, conversationId) {
 
 function renderApprovalCard(element, message) {
   const approval = message.approval || {};
+  const isProjectTrust = approval.kind === 'project_trust';
 
   const hero = document.createElement('div');
   hero.className = 'approval-hero';
 
   const heading = document.createElement('div');
-  heading.innerHTML = `
+  // The default branch is intentionally kept as a literal compact summary:
+  // heading.innerHTML = `<div class="approval-title">需要授权</div>`;
+  heading.innerHTML = isProjectTrust ? `
+    <div class="approval-title">需要信任工作区</div>
+    <div class="approval-subtitle">允许受控命令、构建和测试；文件写入仍逐项审批。</div>
+  ` : `
     <div class="approval-title">需要授权</div>
     <div class="approval-subtitle">请确认以下操作内容与影响范围。</div>
   `;
@@ -2155,7 +2229,7 @@ function renderApprovalCard(element, message) {
   } else {
     const approve = document.createElement('button');
     approve.className = 'approval-btn approve';
-    approve.textContent = '允许';
+    approve.textContent = isProjectTrust ? '信任并继续' : '允许';
     approve.onclick = () => decideApproval(message, 'APPROVE');
     const deny = document.createElement('button');
     deny.className = 'approval-btn deny';
@@ -2246,11 +2320,10 @@ async function decideApproval(message, decision) {
     && item.taskId === message.taskId
     && item.approval?.request_id === approval.request_id
   ));
-  if (standalone && conversation) {
-    conversation.messages = conversation.messages.filter(
-      (item) => item !== standalone,
-    );
-  }
+  // Keep the dock visible but make it non-actionable while the server applies
+  // the decision. Removing it here caused a visible jump and hid the Turn
+  // trace during the approval-to-execution handoff.
+  if (standalone) standalone.resolved = decision;
   if (card) {
     card.task.approvalResolution = {
       requestId: approval.request_id, decision,
@@ -2273,10 +2346,16 @@ function appendApproval(taskId, approval, conversationId = activeConversationId)
   card.task.phase1State = 'WAITING';
   card.task.status = 'awaiting_approval';
   card.task.waiting = { kind: 'APPROVAL', approval };
-  if (card.task.approvalResolution?.requestId !== approval.request_id) {
+  if (!approvalResolutionMatches(approval, card.task.approvalResolution)) {
     card.task.approvalResolution = null;
   }
+  bindLatestInputToTask(conversationId, taskId, approval.turn_id || null);
+  upsertApprovalMessage(taskId, approval, conversationId);
   if (conversationId === activeConversationId) renderMessages();
+}
+
+function approvalResolutionMatches(approvalRequest, resolution) {
+  return resolution?.requestId === approvalRequest.request_id;
 }
 
 function appendMessage(
@@ -2648,6 +2727,12 @@ async function runTask() {
     if (!task?.task_id) {
       throw new Error('会话响应中没有返回任务。');
     }
+    // The input is optimistically rendered before this Runtime receipt. Bind
+    // it now so an immediately suspended approval still owns its Turn trace.
+    // Approval carries the authoritative turn_id for this boundary.
+    bindLatestInputToTask(
+      conversationId, task.task_id, task.approval?.turn_id || null,
+    );
     const card = upsertTaskCard(conversationId, {
       task_id: task.task_id,
       // A continuation keeps the conversation's own goal; only a first turn
@@ -2708,7 +2793,13 @@ const 状态文案 = {
   INTERRUPTED: '已中断', DONE: '已完成', FAILED: '已失败',
   CANCELLED: '已取消', NEEDS_REVIEW: '待人工复核',
 };
-const TERMINAL_STATES = ['DONE', 'FAILED', 'CANCELLED', 'NEEDS_REVIEW'];
+// INTERRUPTED is resumable at the Task level, but it is terminal for the
+// current Turn: no more events will arrive until the user sends another input.
+// Leaving it out kept the follower alive while renderMessages stopped treating
+// the Task as live, so an interrupted Turn's trace vanished until a reload.
+const TERMINAL_STATES = [
+  'INTERRUPTED', 'DONE', 'FAILED', 'CANCELLED', 'NEEDS_REVIEW',
+];
 const MAX_STREAM_RETRIES = 6;
 const followers = new Map();
 
@@ -2777,7 +2868,10 @@ function renderLiveTurnPanel(task) {
     // Before any model frame arrives the Task may still be preparing the
     // workspace, so "thinking" would overstate what is happening.
     pending.textContent = task?.phase1State === 'PREPARING'
-      ? '正在准备…' : '正在思考…';
+      ? '正在准备…'
+      : task?.phase1State === 'WAITING'
+        ? '等待授权…'
+        : '正在思考…';
     panel.appendChild(pending);
   } else {
     lines.slice(-12).forEach((item) => {
@@ -3042,19 +3136,15 @@ function renderSourceEvaluation(evaluation) {
   return section;
 }
 
-function renderFinalResult(taskId, state, conversationId) {
+async function renderFinalResult(taskId, state, conversationId) {
   const card = taskMessage(conversationId, taskId)
     || upsertTaskCard(conversationId, { task_id: taskId });
-  if (card) {
-    applyTaskProjection(card.task, state.projection);
-    applyTaskProtocol(card.task, state);
-    card.task.phase1State = state.phase1_state || card.task.phase1State;
-    card.task.status = state.status || card.task.status;
-    card.task.waiting = null;
-  }
-  updateComposerButtonState();
-  if (state.assistant_text) {
-    appendTaskAssistantText(taskId, state.assistant_text, conversationId);
+  // Keep the live trace mounted until its durable Turn projection has been
+  // loaded. Updating the card to a terminal state and rendering first creates
+  // a blank interval because terminal Tasks no longer own a live panel.
+  const assistantText = String(state.assistant_text || '').trim();
+  if (assistantText) {
+    appendTaskAssistantText(taskId, assistantText, conversationId);
   } else if (state.clarification?.question) {
     appendMessage(
       'assistant', state.clarification.question, [], conversationId, taskId,
@@ -3070,7 +3160,30 @@ function renderFinalResult(taskId, state, conversationId) {
       },
     }, conversationId);
   }
-  if (conversationId === activeConversationId) renderMessages();
+  if (card) {
+    applyTaskProjection(card.task, state.projection);
+    applyTaskProtocol(card.task, state);
+    card.task.phase1State = state.phase1_state || card.task.phase1State;
+    card.task.status = state.status || card.task.status;
+    card.task.waiting = null;
+  }
+  clearApprovalMessage(taskId, conversationId);
+  updateComposerButtonState();
+
+  const refreshed = await refreshConversationHistory(conversationId);
+  if (assistantText) {
+    // The Task state and progress can become observable a few milliseconds
+    // before the Session result message. Preserve text already delivered by
+    // SSE when that narrow persistence race occurs.
+    const rebuilt = getConversationById(conversationId);
+    const kept = (rebuilt?.messages || []).some(
+      (item) => item.role === 'assistant'
+        && item.taskId === taskId
+        && item.content === assistantText,
+    );
+    if (!kept) appendTaskAssistantText(taskId, assistantText, conversationId);
+  }
+  if (!refreshed && conversationId === activeConversationId) renderMessages();
 }
 
 // Each follower owns exactly one Task card. Its cursor is part of that card,
@@ -3094,10 +3207,15 @@ function followTask(taskId, conversationId) {
   };
   followers.set(taskId, follower);
 
-  const finish = (state) => {
-    renderFinalResult(taskId, state, conversationId);
+  const finish = async (state) => {
+    // Stop transport first so its polling/render callbacks cannot race the
+    // authoritative Session rebuild performed by renderFinalResult.
     follower.stop();
-    setLoading(false);
+    try {
+      await renderFinalResult(taskId, state, conversationId);
+    } finally {
+      setLoading(false);
+    }
   };
 
   const reconcile = async () => {
@@ -3122,8 +3240,14 @@ function followTask(taskId, conversationId) {
           ? { kind: state.clarification?.kind || 'INPUT', ...state.clarification }
           : null;
     }
+    if (state.approval) {
+      bindLatestInputToTask(conversationId, taskId, state.approval.turn_id || null);
+      upsertApprovalMessage(taskId, state.approval, conversationId);
+    } else {
+      clearApprovalMessage(taskId, conversationId);
+    }
     if (TERMINAL_STATES.includes(state.phase1_state)) {
-      finish(state);
+      await finish(state);
       return true;
     }
     const submittedApprovalIsSettling = Boolean(
@@ -3196,6 +3320,14 @@ function followTask(taskId, conversationId) {
           if (!payload.projection) currentCard.task.phase1State = 'WAITING';
           currentCard.task.waiting = payload.waiting;
         }
+        if (payload.waiting.kind === 'APPROVAL' && payload.waiting.approval) {
+          bindLatestInputToTask(
+            conversationId, taskId, payload.waiting.approval.turn_id || null,
+          );
+          upsertApprovalMessage(taskId, payload.waiting.approval, conversationId);
+        } else {
+          clearApprovalMessage(taskId, conversationId);
+        }
         if (conversationId === activeConversationId) renderMessages();
         const submittedApprovalIsSettling = Boolean(
           payload.waiting.kind === 'APPROVAL'
@@ -3210,7 +3342,7 @@ function followTask(taskId, conversationId) {
         return;
       }
       if (payload.final) {
-        finish(payload);
+        finish(payload).catch((error) => console.error(error));
         return;
       }
       appendTaskProgress(taskId, payload, conversationId);
@@ -3280,11 +3412,14 @@ async function loadSessions() {
 
 async function ensureConversationLoaded(conversationId) {
   const conversation = getConversationById(conversationId);
-  if (!conversation || conversation.loaded) return;
+  if (!conversation || conversation.loaded) return false;
   conversation.loaded = true;
   try {
     const response = await fetch(`/sessions/${conversationId}`);
-    if (!response.ok) return;
+    if (!response.ok) {
+      conversation.loaded = false;
+      return false;
+    }
     const data = await response.json();
     const tasksById = new Map(
       (data.tasks || []).map((task) => [task.task_id, task]),
@@ -3400,9 +3535,11 @@ async function ensureConversationLoaded(conversationId) {
       setLoading(true);
       followTask(activeTask.task_id, conversationId);
     }
+    return true;
   } catch (error) {
     conversation.loaded = false;
     console.error(error);
+    return false;
   }
 }
 
@@ -3411,9 +3548,9 @@ async function ensureConversationLoaded(conversationId) {
 // a Turn settles is what keeps the panel visible without a manual reload.
 async function refreshConversationHistory(conversationId) {
   const conversation = getConversationById(conversationId);
-  if (!conversation) return;
+  if (!conversation) return false;
   conversation.loaded = false;
-  await ensureConversationLoaded(conversationId);
+  return ensureConversationLoaded(conversationId);
 }
 
 async function loadWorkspaces() {
@@ -3738,7 +3875,35 @@ async def index() -> HTMLResponse:
 
 @app.get("/workspaces")
 async def list_workspaces() -> dict:
-    return {"workspaces": workspace_registry}
+    if runtime_server is None:
+        return {
+            "workspaces": [
+                {**item, "trust_level": ProjectTrustLevel.UNTRUSTED.value}
+                for item in workspace_registry
+            ]
+        }
+    async def enrich_on_runtime_thread() -> list[dict[str, str]]:
+        kernel = runtime_server._client.application.kernel
+        enriched: list[dict[str, str]] = []
+        for item in workspace_registry:
+            try:
+                binding = await kernel.get_project_trust(Path(item["path"]))
+                enriched.append({**item, "trust_level": binding.level.value})
+            except Exception as error:
+                # Trust is optional display metadata. A corrupt/stale trust
+                # record must never make the workspace registry unavailable,
+                # because that would also hide every durable Session in UI.
+                logger.warning(
+                    "workspace trust lookup failed for %s: %s",
+                    item["path"], error,
+                )
+                enriched.append({
+                    **item,
+                    "trust_level": ProjectTrustLevel.UNTRUSTED.value,
+                })
+        return enriched
+
+    return {"workspaces": runtime_server._call(enrich_on_runtime_thread())}
 
 
 @app.get("/diagnostics")
@@ -3874,6 +4039,35 @@ async def pick_workspace() -> Response:
     if selected is None:
         return Response(status_code=204)
     return JSONResponse(content=register_workspace(selected))
+
+
+@app.post("/workspaces/{workspace_id}/trust")
+async def set_workspace_trust(workspace_id: str, payload: dict) -> dict:
+    """Persist an explicit workspace trust choice.
+
+    Rejecting trust is a durable read-only choice, not an invisible failure:
+    later model-originated commands can still surface a fresh approval request.
+    """
+    if runtime_server is None:
+        raise HTTPException(status_code=503, detail=runtime_error or "runtime unavailable")
+    workspace = next(
+        (item for item in workspace_registry if item["id"] == workspace_id), None
+    )
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    decision = str(payload.get("decision", "")).strip().lower()
+    if decision not in {"trust", "reject"}:
+        raise HTTPException(status_code=400, detail="decision must be trust or reject")
+    level = (
+        ProjectTrustLevel.TRUSTED_BUILD
+        if decision == "trust" else ProjectTrustLevel.UNTRUSTED
+    )
+    binding = runtime_server._call(
+        runtime_server._client.application.kernel.set_project_trust(
+            Path(workspace["path"]), level
+        )
+    )
+    return {**workspace, "trust_level": binding.level.value, "trust": binding.to_data()}
 
 
 @app.post("/session-input")
@@ -4333,6 +4527,16 @@ async def get_session(session_id: str) -> dict:
     # tool and transport lines are read back for every settled Turn so the
     # conversation keeps showing what happened after the Turn ends.
     turn_progress: dict[str, list[dict]] = {}
+    # Old SDK failures were sometimes recorded under the transport placeholder
+    # ``sdk-background`` rather than the active Turn id.  The error still
+    # belongs to the newest unfinished Turn for that Task; otherwise a reload
+    # leaves its user input showing a permanently half-finished trace.
+    unfinished_turn_by_task: dict[str, str] = {}
+    for turn in turns:
+        task_id = str(turn.get("task_id") or "")
+        turn_id = str(turn.get("turn_id") or "")
+        if task_id and turn_id and not turn.get("settled"):
+            unfinished_turn_by_task[task_id] = turn_id
     for task_id in snapshot.task_ids:
         for event in runtime_server._call(
             kernel.dependencies.store.read_events(
@@ -4342,7 +4546,10 @@ async def get_session(session_id: str) -> dict:
             item = _turn_progress_item(event)
             if item is None:
                 continue
-            turn_progress.setdefault(str(item.pop("turn_id")), []).append(item)
+            turn_id = str(item.pop("turn_id"))
+            if turn_id == "sdk-background":
+                turn_id = unfinished_turn_by_task.get(task_id, turn_id)
+            turn_progress.setdefault(turn_id, []).append(item)
     for turn in turns:
         turn["progress"] = turn_progress.get(turn["turn_id"], [])
     # ``session.task_attached`` records the input that opened a Task without a
@@ -4775,7 +4982,7 @@ def _describe_loop_limit(error: AgentLoopLimitExceeded) -> str:
 
 def _waiting_payload(result) -> dict | None:
     """Describe what the Task is waiting for, without inventing authority."""
-    if result.approval is not None:
+    if result.state == "AWAITING_APPROVAL" and result.approval is not None:
         return {"kind": "APPROVAL", "approval": dict(result.approval)}
     if result.status == "awaiting_user":
         clarification = (
@@ -4882,7 +5089,9 @@ async def stream(
                 )
             elif waiting is None:
                 announced_wait = None
-            if result.phase1_state in {"DONE", "FAILED", "CANCELLED"}:
+            if result.phase1_state in {
+                "INTERRUPTED", "DONE", "FAILED", "CANCELLED", "NEEDS_REVIEW",
+            }:
                 # Progress is ephemeral; the final answer only lives on the
                 # Task result, so the stream has to deliver it before closing.
                 # A failed Task has no answer at all, so surface the recorded

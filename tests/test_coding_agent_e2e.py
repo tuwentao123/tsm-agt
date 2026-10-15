@@ -69,6 +69,7 @@ class CodingLoopModel(EchoModelProvider):
                     __import__("sys").executable, "-m", "unittest",
                     "discover", "-s", "tests", "-v",
                 ],
+                "cwd": ".",
                 "mode": "foreground", "timeout_seconds": 30,
             })
         command = tool_results[-1]
@@ -213,6 +214,7 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
                                     __import__("sys").executable, "-m",
                                     "py_compile", "calc.py",
                                 ],
+                                "cwd": ".",
                                 "mode": "foreground",
                             },
                             outcome_ref="verification_results",

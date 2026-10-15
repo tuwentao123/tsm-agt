@@ -26,6 +26,17 @@ _RUNTIME_CONTINUATION = (
     "Continue the same turn. Complete the response or issue the tool call still required."
 )
 
+_UNRESOLVED_EXECUTION_CONTINUATION = (
+    "Continue the same turn once. Runtime records that a requested execution never "
+    "started. Use the advertised tools to make a safe next attempt, or give an "
+    "evidence-based blocker that does not claim the work was completed."
+)
+
+# This is deliberately independent of the user-facing model-call budget.  A
+# protocol fact can request one corrective turn; it must never turn a known
+# blocker into dozens of empty model completions.
+_MAX_RUNTIME_RECOVERY_CONTINUATIONS = 1
+
 
 class RuntimeFinalizationGate:
     """Enforce protocol invariants without interpreting the user's intent."""
@@ -73,7 +84,61 @@ class RuntimeFinalizationGate:
                 "empty_final_response" if has_budget else "empty_response_budget_exhausted",
                 _RUNTIME_CONTINUATION if has_budget else "",
             )
+        if _latest_unstarted_execution(state.messages):
+            can_attempt_recovery = (
+                state.runtime_continuations
+                < _MAX_RUNTIME_RECOVERY_CONTINUATIONS
+                and has_budget
+            )
+            return FinalizationDecision(
+                (
+                    FinalizationAction.CONTINUE
+                    if can_attempt_recovery else FinalizationAction.ACCEPT
+                ),
+                (
+                    "unresolved_execution_outcome"
+                    if can_attempt_recovery else "unstarted_execution_blocker_visible"
+                ),
+                _UNRESOLVED_EXECUTION_CONTINUATION if can_attempt_recovery else "",
+            )
         return FinalizationDecision(FinalizationAction.ACCEPT, "runtime_state_terminal")
+
+
+def _latest_unstarted_execution(messages: tuple[Message, ...]) -> bool:
+    """Read only runtime lifecycle facts, never the model's prose or intent.
+
+    ``failed_known`` is a terminal execution fact: the process did run and its
+    failure is evidence the model may report or recover from.  It is not a
+    reason to veto a final answer.  Only ``not_started`` needs one protocol
+    correction, because no execution fact exists for the proposed action.
+
+    A completed tool batch is an execution boundary. Older results cannot keep
+    an unrelated later answer from finalizing.
+    """
+    for message in reversed(messages):
+        results = [
+            block.result for block in message.content
+            if isinstance(block, ToolResultBlock)
+        ]
+        if not results:
+            continue
+        for result in reversed(results):
+            fields: dict[str, Any] = {}
+            if isinstance(result.data, dict):
+                fields.update(result.data)
+            if isinstance(result.recovery_action, dict):
+                fields.update(result.recovery_action)
+            if isinstance(result.meta, dict):
+                fields.update(result.meta)
+            state = str(fields.get("execution_state", "")).strip().lower()
+            if state == "not_started":
+                return True
+            if state in {"succeeded", "failed_known", "running"}:
+                return False
+        # A completed tool batch is an execution boundary.  Older failures do
+        # not keep a later, unrelated result from finalizing forever.
+        return False
+    return False
 
 
 class ConversationFinalizationPipeline:
@@ -288,6 +353,7 @@ class ConversationFinalizationPipeline:
     async def append_runtime_continuation(
         self, state: TurnState, decision: FinalizationDecision,
     ) -> None:
+        state.runtime_continuations += 1
         payload = {
             "type": "runtime_finalization_continuation",
             "reason": decision.reason_code,
@@ -328,6 +394,7 @@ class ConversationFinalizationPipeline:
             messages=tuple(state.messages),
             finalization_state={
                 "review_continuations": state.review_continuations,
+                "runtime_continuations": state.runtime_continuations,
                 "reviewer_call_count": state.reviewer_call_count,
                 "last_candidate_hash": state.last_candidate_hash,
                 "last_review_reason_code": state.last_review_reason_code,

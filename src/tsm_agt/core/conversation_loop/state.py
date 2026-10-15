@@ -54,6 +54,9 @@ def build_turn_state(
         review_continuations=int(
             checkpoint.finalization_state.get("review_continuations", 0)
         ),
+        runtime_continuations=int(
+            checkpoint.finalization_state.get("runtime_continuations", 0)
+        ),
         reviewer_call_count=int(
             checkpoint.finalization_state.get("reviewer_call_count", 0)
         ),

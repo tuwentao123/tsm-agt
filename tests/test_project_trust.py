@@ -47,7 +47,7 @@ class ProjectTrustTest(unittest.IsolatedAsyncioTestCase):
                 denied = await application.kernel.invoke_tool(
                     task.task_id, "turn-command",
                     ToolCall("call-command", "core.run_command", {
-                        "argv": ["python3", "-m", "pytest"]
+                        "argv": ["python3", "-m", "pytest"], "cwd": ".",
                     }),
                 )
                 self.assertFalse(denied.ok)
@@ -125,7 +125,7 @@ class ProjectTrustTest(unittest.IsolatedAsyncioTestCase):
                     await application.kernel.invoke_tool(
                         task.task_id, "turn-test",
                         ToolCall("call-test", "core.run_command", {
-                            "argv": ["npm", "test"]
+                            "argv": ["npm", "test"], "cwd": ".",
                         }),
                     )
                 request = caught.exception.request
@@ -158,7 +158,7 @@ class ProjectTrustTest(unittest.IsolatedAsyncioTestCase):
                     await application.kernel.invoke_tool(
                         task.task_id, "turn-r3-push",
                         ToolCall("call-r3-push", "core.run_command", {
-                            "argv": ["git", "push", "origin", "main"]
+                            "argv": ["git", "push", "origin", "main"], "cwd": ".",
                         }),
                     )
                 self.assertEqual(caught.exception.request.risk.value, "R3")

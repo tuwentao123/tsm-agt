@@ -384,7 +384,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                     )
                 call = ToolCall(
                     "call-local-gate", "core.run_command",
-                    {"argv": [sys.executable, script.name]},
+                    {"argv": [sys.executable, script.name], "cwd": "."},
                 )
                 with self.assertRaises(ApprovalRequired) as caught:
                     await application.kernel.invoke_tool(

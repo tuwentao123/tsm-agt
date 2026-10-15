@@ -1026,8 +1026,13 @@ class EngineeringAgentClient:
                 }
             ):
                 try:
+                    checkpoint = current.active_agent_checkpoint
+                    turn_id = (
+                        str(checkpoint.get("turn_id") or "").strip()
+                        if isinstance(checkpoint, Mapping) else ""
+                    ) or "sdk-background"
                     await self.application.kernel._record_turn_failure(
-                        task_id, "sdk-background", error
+                        task_id, turn_id, error
                     )
                 except (RuntimeError, ValueError):
                     pass
@@ -1687,7 +1692,7 @@ def _status_for_state(state: TaskState) -> str:
         return "awaiting_user"
     if state is TaskState.AWAITING_INPUT:
         return "awaiting_input"
-    if state is TaskState.INTERRUPTED:
+    if state in {TaskState.INTERRUPTING, TaskState.INTERRUPTED, TaskState.CONFLICT}:
         return "interrupted"
     if state.is_terminal:
         if state is TaskState.SUCCEEDED:
@@ -1699,6 +1704,11 @@ def _status_for_state(state: TaskState) -> str:
 
 
 def _approval_data(task: TaskSnapshot) -> Mapping[str, Any] | None:
+    # The approval payload is actionable only while the Task is explicitly
+    # suspended for it.  This also makes old persisted snapshots from before
+    # conflict-cleanup safe to restore.
+    if task.state is not TaskState.AWAITING_APPROVAL:
+        return None
     request = task.pending_approval
     if request is None:
         return None

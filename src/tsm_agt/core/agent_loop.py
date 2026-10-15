@@ -633,6 +633,10 @@ class TurnState:
     #: Latched once when a text answer tried to conclude on discovered paths
     #: alone, so the conversation loop asks at most once and never loops.
     review_continuations: int = 0
+    #: Protocol-only recovery prompts are separately bounded from completion
+    #: review. They exist for an execution that never started, not to second
+    #: guess a known tool outcome or consume the whole model-call budget.
+    runtime_continuations: int = 0
     reviewer_call_count: int = 0
     last_candidate_hash: str = ""
     last_review_reason_code: str = ""

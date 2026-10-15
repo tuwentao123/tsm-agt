@@ -100,14 +100,13 @@ class TaskState(StrEnum):
             self.VERIFYING,
             self.FINALIZING,
             self.RESUMING,
-            self.CONFLICT,
         }:
             return Phase1TaskState.RUNNING
         if self in {
             self.AWAITING_APPROVAL, self.AWAITING_USER, self.AWAITING_INPUT,
         }:
             return Phase1TaskState.WAITING
-        if self in {self.INTERRUPTING, self.INTERRUPTED}:
+        if self in {self.INTERRUPTING, self.INTERRUPTED, self.CONFLICT}:
             return Phase1TaskState.INTERRUPTED
         if self is self.NEEDS_REVIEW:
             return Phase1TaskState.NEEDS_REVIEW
@@ -389,6 +388,13 @@ class TaskSnapshot:
     ) -> TaskSnapshot:
         if target not in LEGAL_TRANSITIONS[self.state]:
             raise InvalidTaskTransition(self.state, target)
+        # A checkpoint identity conflict invalidates the suspended interaction
+        # exactly as a terminal transition does.  Keeping an old approval here
+        # made a restored Task look actionable even though that Turn can no
+        # longer be resumed safely.
+        invalidates_pending_interaction = (
+            target.is_terminal or target is TaskState.CONFLICT
+        )
         return TaskSnapshot(
             task_id=self.task_id,
             goal=self.goal,
@@ -397,10 +403,10 @@ class TaskSnapshot:
             created_at=self.created_at,
             updated_at=now or datetime.now(timezone.utc),
             pending_approval=(
-                None if target.is_terminal else self.pending_approval
+                None if invalidates_pending_interaction else self.pending_approval
             ),
             pending_clarification=(
-                None if target.is_terminal else self.pending_clarification
+                None if invalidates_pending_interaction else self.pending_clarification
             ),
             tool_executions=self.tool_executions,
             background_processes=self.background_processes,
@@ -505,6 +511,23 @@ class TaskSnapshot:
             raise ValueError("task does not have a pending clarification")
         resumed = self.transition(TaskState.EXECUTING, now)
         return replace(resumed, pending_clarification=None)
+
+    def clear_pending_interactions(
+        self, now: datetime | None = None,
+    ) -> TaskSnapshot:
+        """Drop interactions that cannot be carried into a fresh Turn.
+
+        This is intentionally separate from ``transition``: historical
+        snapshots written before conflict cleanup can already be in CONFLICT
+        while still containing a pending approval.  Starting a *new*
+        conversation Turn must never inherit that old authority request.
+        """
+        return replace(
+            self,
+            pending_approval=None,
+            pending_clarification=None,
+            updated_at=now or datetime.now(timezone.utc),
+        )
 
     def with_tool_execution(
         self, execution: ToolExecutionRecord, now: datetime | None = None

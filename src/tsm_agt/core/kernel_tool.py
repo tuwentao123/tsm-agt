@@ -84,6 +84,7 @@ from .execution import (
     ToolExecutionRecord
 )
 from .memory import MemoryScope, MemorySourceKind
+from .process import ProcessPreparationError
 from .task import TaskNotFound, TaskSnapshot, TaskState
 from .task_spec import (
     OutcomeBindingAction, OutcomeBindingDecision, OutcomeBindingReason,
@@ -1014,6 +1015,123 @@ class ToolMixin:
             )
         )
 
+    def _normalize_workspace_command_cwd(
+        self, task: TaskSnapshot, call: ToolCall,
+    ) -> ToolCall:
+        """Canonicalize an in-workspace absolute command directory.
+
+        Models and users commonly know the workspace by its host-absolute
+        path, while the process capability intentionally executes only inside
+        the Task workspace.  Accept that spelling only after the path service
+        resolves it canonically under the Task root, then persist and approve
+        the equivalent relative path.  This keeps policy hashes, approval
+        payloads, execution records, and the eventual process invocation on
+        one exact argument set without weakening workspace containment.
+        """
+
+        if call.name != "core.run_command":
+            return call
+        raw_cwd = call.arguments.get("cwd")
+        if not isinstance(raw_cwd, str) or not Path(raw_cwd).is_absolute():
+            return call
+        try:
+            resolved = self._dependencies.workspace_path.resolve_read_path(
+                Path(task.workspace), raw_cwd,
+            )
+        except (OSError, PermissionError, ValueError) as error:
+            raise InvalidToolArguments(
+                "process cwd must stay inside the workspace"
+            ) from error
+        if not resolved.path.is_dir():
+            raise InvalidToolArguments(
+                f"process cwd is not a directory: {resolved.path}"
+            )
+        arguments = dict(call.arguments)
+        arguments["cwd"] = resolved.relative_path or "."
+        return replace(call, arguments=arguments)
+
+    def _prepare_workspace_command(
+        self, task: TaskSnapshot, call: ToolCall,
+    ) -> tuple[ToolCall, Mapping[str, str]]:
+        """Bind an approval to a resolved executable before process spawn.
+
+        This is a side-effect-free, generic preflight.  It resolves only the
+        controlled environment and executable; it does not inspect package
+        managers, infer project type, or relax the command policy.
+        """
+        if call.name != "core.run_command":
+            return call, {}
+        raw_argv = call.arguments.get("argv")
+        if not isinstance(raw_argv, (list, tuple)) or not all(
+            isinstance(item, str) for item in raw_argv
+        ):
+            return call, {}
+        raw_cwd = call.arguments.get("cwd")
+        raw_environment = call.arguments.get("environment", {})
+        if not isinstance(raw_cwd, str) or not isinstance(raw_environment, Mapping):
+            return call, {}
+        try:
+            prepared = self._prepare_process_execution(
+                task, tuple(raw_argv), raw_cwd, raw_environment,
+            )
+        except ValueError:
+            # Preserve schema/path validation's established tool-error path.
+            # Only an executable-availability result is useful before approval.
+            return call, {}
+        arguments = dict(call.arguments)
+        arguments["argv"] = list(prepared.argv)
+        return replace(call, arguments=arguments), prepared.approval_identity()
+
+    async def _record_command_preflight_failure(
+        self,
+        task_id: str,
+        turn_id: str,
+        call: ToolCall,
+        selected_spec: ToolSpec,
+        stored: Any,
+        error: ProcessPreparationError,
+    ) -> ToolResult:
+        """Persist a not-started failure without a meaningless approval."""
+        result = self._dependencies.tool_result_governor.govern(
+            selected_spec,
+            call,
+            ToolResult(
+                call_id=call.call_id,
+                ok=False,
+                error_code=error.code,
+                message=str(error),
+                hint=(
+                    "No process was started. Inspect the available project "
+                    "environment or choose another advertised tool."
+                ),
+                recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+                recovery_action={
+                    "execution_state": "not_started",
+                    "executable": error.executable,
+                    "cwd": str(call.arguments.get("cwd", "<missing>")),
+                },
+                meta={"execution_state": "not_started"},
+            ),
+        )
+        await self._dependencies.store.commit(RuntimeUnitOfWork(
+            task_id=task_id,
+            expected_version=stored.version,
+            next_state=stored.data,
+            events=(RuntimeEvent(
+                event_id=f"evt-{uuid4().hex}", task_id=task_id,
+                sequence=stored.last_event_sequence + 1,
+                event_type="tool.failed",
+                payload={
+                    "turn_id": turn_id,
+                    "outcome_ref": call.outcome_ref,
+                    "preflight": True,
+                    "call": call.to_data(),
+                    "result": result.to_data(),
+                },
+            ),),
+        ))
+        return result
+
     async def invoke_tool(
         self,
         task_id: str,
@@ -1048,6 +1166,25 @@ class ToolMixin:
                     current_trust.level, current_trust.fingerprint,
                     current_trust.subject,
                 )
+                checkpoint_turn_id = ""
+                if task.active_agent_checkpoint is not None:
+                    active_checkpoint = AgentTurnCheckpoint.from_data(
+                        task.active_agent_checkpoint
+                    )
+                    checkpoint_turn_id = active_checkpoint.turn_id
+                    task = task.with_agent_checkpoint(replace(
+                        active_checkpoint,
+                        workspace_fingerprint=current_trust.fingerprint,
+                    ).to_data())
+                if agent_checkpoint is not None:
+                    requested_checkpoint = AgentTurnCheckpoint.from_data(
+                        agent_checkpoint
+                    )
+                    checkpoint_turn_id = requested_checkpoint.turn_id
+                    agent_checkpoint = replace(
+                        requested_checkpoint,
+                        workspace_fingerprint=current_trust.fingerprint,
+                    ).to_data()
                 trust_event = RuntimeEvent(
                     event_id=f"evt-{uuid4().hex}", task_id=task_id,
                     sequence=stored.last_event_sequence + 1,
@@ -1058,16 +1195,36 @@ class ToolMixin:
                         "subject": current_trust.subject,
                     },
                 )
+                events = (trust_event,)
+                if checkpoint_turn_id:
+                    events += (RuntimeEvent(
+                        event_id=f"evt-{uuid4().hex}", task_id=task_id,
+                        sequence=stored.last_event_sequence + 2,
+                        event_type="checkpoint.workspace_binding_refreshed",
+                        payload={
+                            "turn_id": checkpoint_turn_id,
+                            "reason": "project_trust_refreshed_before_command",
+                            "workspace_fingerprint": current_trust.fingerprint,
+                        },
+                    ),)
                 await self._dependencies.store.commit(RuntimeUnitOfWork(
-                    task_id, stored.version, task.to_data(), (trust_event,)
+                    task_id, stored.version, task.to_data(), events,
                 ))
                 stored = await self._require_stored_task(task_id)
 
         provider, selected_spec = await self._find_tool(call.name)
+        validate_tool_arguments(selected_spec, call.arguments)
+        call = self._normalize_workspace_command_cwd(task, call)
+        execution_identity: Mapping[str, str] = {}
+        try:
+            call, execution_identity = self._prepare_workspace_command(task, call)
+        except ProcessPreparationError as error:
+            return await self._record_command_preflight_failure(
+                task_id, turn_id, call, selected_spec, stored, error
+            )
         existing = task.tool_executions.get(
             ToolExecutionRecord.identity(turn_id, call.call_id)
         )
-        validate_tool_arguments(selected_spec, call.arguments)
         call = await self._bind_tool_call_outcome(
             task_id, call, selected_spec,
             allow_closed_ref=(
@@ -1164,6 +1321,9 @@ class ToolMixin:
         external_read_root = self._external_read_root_requiring_approval(
             task, call
         )
+        external_write_root = self._external_write_root_requiring_approval(
+            task, call
+        )
         if external_read_root is not None:
             request = ApprovalRequest(
                 request_id=f"approval-{uuid4().hex}",
@@ -1189,6 +1349,70 @@ class ToolMixin:
                 ),
                 kind=ApprovalKind.WORKSPACE_READ,
                 workspace_access_root=str(external_read_root),
+            )
+            await self._persist_approval_request(
+                stored, task, request, policy_event, agent_checkpoint
+            )
+            raise ApprovalRequired(request)
+        if external_write_root is not None:
+            request = ApprovalRequest(
+                request_id=f"approval-{uuid4().hex}", task_id=task_id,
+                turn_id=turn_id, invocation_id=invocation_id,
+                policy_decision_id=decision.decision_id,
+                payload_hash=decision.payload_hash, risk=ToolRisk.R1, call=call,
+                action=f"Allow {call.name} to write outside the current workspace",
+                target=str(external_write_root),
+                preview="Permission: read/write; scope: current Task.",
+                network_access="not required", data_transmission="none",
+                rollback="workspace mutation journal",
+                created_at=utc_now(), agent_checkpoint=(
+                    dict(agent_checkpoint) if agent_checkpoint is not None else None
+                ), kind=ApprovalKind.WORKSPACE_WRITE,
+                workspace_access_root=str(external_write_root),
+            )
+            await self._persist_approval_request(
+                stored, task, request, policy_event, agent_checkpoint
+            )
+            raise ApprovalRequired(request)
+        # An untrusted workspace must not make an Agent command disappear as a
+        # low-level policy denial.  For model-originated calls, turn the trust
+        # gate into a resumable approval so the user can explicitly grant
+        # TRUSTED_BUILD and the exact command can be retried.  Direct kernel
+        # callers without a checkpoint retain the fail-closed ToolResult
+        # behavior used by the low-level API.
+        if (
+            call.name == "core.run_command"
+            and not task.project_trust.allows_project_execution
+            and agent_checkpoint is not None
+        ):
+            request = ApprovalRequest(
+                request_id=f"approval-{uuid4().hex}",
+                task_id=task_id,
+                turn_id=turn_id,
+                invocation_id=invocation_id,
+                policy_decision_id=decision.decision_id,
+                payload_hash=decision.payload_hash,
+                risk=decision.effective_risk,
+                call=call,
+                action="Trust this workspace for controlled commands, builds, and tests",
+                target=str(Path(task.workspace)),
+                preview=(
+                    "Current workspace is UNTRUSTED. Approving grants "
+                    "TRUSTED_BUILD for this workspace and permits controlled "
+                    "commands; individual writes and higher-risk actions still "
+                    "require their own approval."
+                ),
+                network_access=(
+                    "may be required by the requested command"
+                    if decision.requires_network else "not required"
+                ),
+                data_transmission=selected_spec.data_transmission,
+                rollback="trust can be revoked by setting the workspace back to read-only",
+                created_at=utc_now(),
+                agent_checkpoint=dict(agent_checkpoint),
+                kind=ApprovalKind.PROJECT_TRUST,
+                workspace_access_root=str(Path(task.workspace)),
+                execution_identity=execution_identity,
             )
             await self._persist_approval_request(
                 stored, task, request, policy_event, agent_checkpoint
@@ -1220,6 +1444,7 @@ class ToolMixin:
                 agent_checkpoint=(
                     dict(agent_checkpoint) if agent_checkpoint is not None else None
                 ),
+                execution_identity=execution_identity,
             )
             awaiting = task.await_approval(request)
             approval_event = RuntimeEvent(

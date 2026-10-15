@@ -17,6 +17,7 @@ from tsm_agt.ports import (
     ToolEffect,
     ToolIdempotency,
     ToolInvocationContext,
+    ToolRecoveryKind,
     ToolResult,
     ToolResultAuthority,
     ToolRisk,
@@ -78,7 +79,11 @@ class CoreProcessToolProvider:
                     "max_lifetime_seconds": {"type": "number"},
                     "stop_on_task_end": {"type": "boolean"},
                 },
-                "required": ["argv"],
+                # Directory is part of the command identity: it must be visible
+                # to the model, approval flow, execution record, and process
+                # launcher.  Do not silently turn an omitted directory into the
+                # workspace root.
+                "required": ["argv", "cwd"],
                 "additionalProperties": False,
             },
             risk=ToolRisk.R2,
@@ -224,6 +229,18 @@ class CoreProcessToolProvider:
             return self._error(call, "INVALID_PARAM", str(error))
         except RuntimeError as error:
             return self._error(call, "TOOL_FAILED", str(error), retryable=True)
+        except FileNotFoundError as error:
+            return self._error(
+                call, "EXECUTABLE_NOT_FOUND", str(error),
+                recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+                recovery_action={"execution_state": "not_started"},
+            )
+        except OSError as error:
+            return self._error(
+                call, "PROCESS_START_FAILED", str(error),
+                recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+                recovery_action={"execution_state": "not_started"},
+            )
 
     async def _run_command(
         self, arguments: Mapping[str, Any], control,
@@ -235,7 +252,7 @@ class CoreProcessToolProvider:
             or any(not isinstance(item, str) or not item or "\x00" in item for item in raw_argv)
         ):
             raise TypeError("argv must be a non-empty array of non-empty strings without NUL bytes")
-        cwd = arguments.get("cwd", ".")
+        cwd = arguments.get("cwd")
         if not isinstance(cwd, str) or not cwd.strip():
             raise TypeError("cwd must be a non-empty workspace-relative string")
         raw_environment = arguments.get("environment", {})
@@ -327,9 +344,12 @@ class CoreProcessToolProvider:
 
     @staticmethod
     def _error(
-        call: ToolCall, code: str, message: str, retryable: bool = False
+        call: ToolCall, code: str, message: str, retryable: bool = False,
+        recovery_kind: ToolRecoveryKind = ToolRecoveryKind.NONE,
+        recovery_action: Mapping[str, Any] | None = None,
     ) -> ToolResult:
         return ToolResult(
             call.call_id, False, error_code=code, message=message,
-            retryable=retryable,
+            retryable=retryable, recovery_kind=recovery_kind,
+            recovery_action=dict(recovery_action or {}),
         )

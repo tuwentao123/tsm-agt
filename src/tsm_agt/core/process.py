@@ -5,13 +5,67 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Mapping
 
-from tsm_agt.ports import ProcessCommandResult, ProcessHandle, ProcessResult
+from tsm_agt.ports import (
+    ProcessCommandResult, ProcessEnvironmentPolicy, ProcessHandle,
+    ProcessResult,
+)
 
 
 class ProcessSandboxDenied(PermissionError):
     pass
+
+
+class ProcessPreparationError(FileNotFoundError):
+    """A command could not start, before any process side effect occurred."""
+
+    def __init__(self, code: str, message: str, *, executable: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+        self.executable = executable
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedProcessExecution:
+    """The exact, governed process plan used for approval and execution.
+
+    Environment values are intentionally retained only inside the Runtime.  The
+    externally visible audit record can use ``to_audit_data`` without exposing
+    PATH or user-provided variables.
+    """
+
+    # ``launch_path`` is the stable user-approved invocation identity.  It may
+    # be a wrapper or symlink. ``resolved_target`` is intentionally separate:
+    # it proves what would run, but must never replace the launcher in argv.
+    launch_path: Path
+    resolved_target: Path
+    launch_fingerprint: str
+    target_fingerprint: str
+    environment_fingerprint: str
+    argv: tuple[str, ...]
+    cwd: Path
+    environment: Mapping[str, str]
+    environment_policy: ProcessEnvironmentPolicy
+
+    def to_audit_data(self) -> dict[str, str]:
+        return {
+            "launch_path": str(self.launch_path),
+            "resolved_target": str(self.resolved_target),
+            "cwd": str(self.cwd),
+        }
+
+    def approval_identity(self) -> dict[str, str]:
+        """Stable facts that must still hold when an approval is consumed."""
+        return {
+            "launch_path": str(self.launch_path),
+            "resolved_target": str(self.resolved_target),
+            "launch_fingerprint": self.launch_fingerprint,
+            "target_fingerprint": self.target_fingerprint,
+            "cwd": str(self.cwd),
+            "environment_fingerprint": self.environment_fingerprint,
+        }
 
 
 class BackgroundProcessState(StrEnum):

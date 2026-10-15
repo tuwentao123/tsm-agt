@@ -9,7 +9,7 @@ from pathlib import Path
 from tsm_agt.adapters.builtin import CoreProcessToolProvider, CoreReadOnlyToolProvider
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
-    ApprovalDecision,
+    ApprovalDecision, ApprovalPayloadMismatch,
     ApprovalRequired,
     BackgroundProcessState,
     ProjectTrustLevel,
@@ -93,6 +93,18 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spec.risk, ToolRisk.R2)
         self.assertEqual(spec.idempotency, ToolIdempotency.NON_IDEMPOTENT)
         self.assertEqual(spec.parameters["properties"]["argv"]["type"], "array")
+        self.assertEqual(spec.parameters["required"], ["argv", "cwd"])
+
+    async def test_run_command_rejects_an_omitted_working_directory_before_approval(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "core.run_command is missing required arguments: cwd",
+        ):
+            await self.application.kernel.invoke_tool(
+                self.task.task_id, "turn-missing-cwd",
+                ToolCall("call-missing-cwd", "core.run_command", {
+                    "argv": [sys.executable, "-V"],
+                }),
+            )
 
     async def test_run_command_foreground_has_no_shell_and_bounded_output(self) -> None:
         marker = Path(self.temporary.name) / "must-not-exist"
@@ -104,6 +116,7 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         result = await self._approve_call(ToolCall(
             "call-command-fg", "core.run_command", {
                 "argv": [sys.executable, script.name, "$(touch must-not-exist)"],
+                "cwd": ".",
                 "mode": "foreground", "max_output_bytes": 40,
             },
         ))
@@ -160,6 +173,76 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("$(touch must-not-exist)", rendered)
         self.assertNotIn("problem", rendered)
 
+    async def test_missing_executable_is_a_not_started_result_without_approval(self) -> None:
+        result = await self.application.kernel.invoke_tool(
+            self.task.task_id, "turn-preflight",
+            ToolCall("call-command-missing", "core.run_command", {
+                "argv": ["tsm-agent-definitely-missing-command"],
+                "cwd": ".",
+                "mode": "foreground",
+            }),
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "EXECUTABLE_NOT_FOUND")
+        self.assertEqual(
+            result.effective_recovery_kind.value, "retry_after_state_change",
+        )
+        self.assertEqual(result.recovery_action["execution_state"], "not_started")
+        task = await self.application.kernel.get_task(self.task.task_id)
+        self.assertIsNone(task.pending_approval)
+        events = await self.application.registry.require(RuntimeStorePort).read_events(
+            self.task.task_id
+        )
+        self.assertEqual(events[-1].event_type, "tool.failed")
+        self.assertTrue(events[-1].payload["preflight"])
+
+    async def test_preparation_preserves_launcher_identity_when_target_is_a_symlink(self) -> None:
+        target = Path(self.temporary.name) / "launcher-target"
+        target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        target.chmod(0o755)
+        launcher = Path(self.temporary.name) / "launcher"
+        try:
+            launcher.symlink_to(target.name)
+        except OSError as error:
+            self.skipTest(f"test environment cannot create symlinks: {error}")
+        prepared = self.application.kernel._prepare_process_execution(
+            self.task, (str(launcher),), ".", {},
+        )
+        self.assertEqual(prepared.argv[0], str(launcher))
+        self.assertEqual(prepared.launch_path, launcher)
+        self.assertEqual(prepared.resolved_target, target.resolve())
+        self.assertNotEqual(
+            prepared.approval_identity()["launch_path"],
+            prepared.approval_identity()["resolved_target"],
+        )
+
+    async def test_approval_is_invalidated_when_launcher_target_changes(self) -> None:
+        first_target = Path(self.temporary.name) / "first-launcher-target"
+        second_target = Path(self.temporary.name) / "second-launcher-target"
+        for target in (first_target, second_target):
+            target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            target.chmod(0o755)
+        launcher = Path(self.temporary.name) / "approved-launcher"
+        try:
+            launcher.symlink_to(first_target.name)
+        except OSError as error:
+            self.skipTest(f"test environment cannot create symlinks: {error}")
+        call = ToolCall("call-command-identity", "core.run_command", {
+            "argv": [str(launcher)], "cwd": ".", "mode": "foreground",
+        })
+        with self.assertRaises(ApprovalRequired) as caught:
+            await self.application.kernel.invoke_tool(
+                self.task.task_id, "turn-identity", call,
+            )
+        request = caught.exception.request
+        launcher.unlink()
+        launcher.symlink_to(second_target.name)
+        with self.assertRaises(ApprovalPayloadMismatch):
+            await self.application.kernel.resolve_approval(
+                self.task.task_id, request.request_id, request.payload_hash,
+                ApprovalDecision.APPROVE, "approve stale launcher",
+            )
+
     async def test_foreground_internal_timeout_is_definitive_not_unknown(self) -> None:
         script = Path(self.temporary.name) / "slow_command.py"
         script.write_text(
@@ -169,6 +252,7 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         result = await self._approve_call(ToolCall(
             "call-command-timeout", "core.run_command", {
                 "argv": [sys.executable, script.name],
+                "cwd": ".",
                 "mode": "foreground", "timeout_seconds": 0.2,
                 "termination_grace_seconds": 0.05,
             },
@@ -193,6 +277,7 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
                 "argv": [
                     sys.executable, script.name,
                 ],
+                "cwd": ".",
                 "mode": "background", "max_lifetime_seconds": 30,
                 "stop_on_task_end": True,
             },
@@ -235,17 +320,95 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         secret = await self._approve_call(ToolCall(
             "call-command-secret", "core.run_command", {
                 "argv": [sys.executable, "-V"],
+                "cwd": ".",
                 "environment": {"API_TOKEN": "must-not-forward"},
             },
         ), "turn-secret")
         self.assertFalse(secret.ok)
         self.assertEqual(secret.error_code, "INVALID_PARAM")
 
+    async def test_run_command_normalizes_absolute_cwd_inside_workspace_before_approval(self) -> None:
+        workspace = Path(self.temporary.name).resolve()
+        call = ToolCall(
+            "call-command-absolute-cwd", "core.run_command", {
+                "argv": [
+                    sys.executable, "-c",
+                    "import os; print(os.getcwd())",
+                ],
+                "cwd": str(workspace),
+            },
+        )
+
+        with self.assertRaises(ApprovalRequired) as caught:
+            await self.application.kernel.invoke_tool(
+                self.task.task_id, "turn-absolute-cwd", call,
+            )
+        request = caught.exception.request
+        # Approval sees the exact canonical payload that the process will use,
+        # rather than a host path that later fails the workspace resolver.
+        self.assertEqual(request.call.arguments["cwd"], ".")
+        self.assertEqual(
+            request.execution_identity["launch_path"], sys.executable,
+        )
+        result = await self.application.kernel.resolve_approval(
+            self.task.task_id, request.request_id, request.payload_hash,
+            ApprovalDecision.APPROVE, "approve normalized workspace cwd",
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["stdout"]["text"].strip(), str(workspace))
+        events = await self.application.registry.require(RuntimeStorePort).read_events(
+            self.task.task_id
+        )
+        prepared = next(
+            event for event in events
+            if event.event_type == "tool.prepared"
+            and event.payload["call"]["call_id"] == call.call_id
+        )
+        self.assertEqual(prepared.payload["call"]["arguments"]["cwd"], ".")
+
+    async def test_run_command_rejects_absolute_cwd_outside_workspace_before_approval(self) -> None:
+        outside = Path(self.temporary.name).resolve().parent
+        call = ToolCall(
+            "call-command-outside-absolute-cwd", "core.run_command", {
+                "argv": [sys.executable, "-V"], "cwd": str(outside),
+            },
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "process cwd must stay inside the workspace",
+        ):
+            await self.application.kernel.invoke_tool(
+                self.task.task_id, "turn-outside-absolute-cwd", call,
+            )
+
+    async def test_run_command_rejects_absolute_cwd_through_workspace_symlink(self) -> None:
+        workspace = Path(self.temporary.name).resolve()
+        outside = workspace.parent
+        link = workspace / "outside-link"
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"test environment cannot create directory symlinks: {error}")
+        call = ToolCall(
+            "call-command-symlink-absolute-cwd", "core.run_command", {
+                "argv": [sys.executable, "-V"], "cwd": str(link),
+            },
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "process cwd must stay inside the workspace",
+        ):
+            await self.application.kernel.invoke_tool(
+                self.task.task_id, "turn-symlink-absolute-cwd", call,
+            )
+
 
     async def test_run_command_applies_governed_environment_policy(self) -> None:
         result = await self._approve_call(ToolCall(
             "call-command-governed", "core.run_command", {
                 "argv": [sys.executable, "-V"],
+                "cwd": ".",
                 "environment": {"CUSTOM_FLAG": "enabled"},
             },
         ))
@@ -271,7 +434,7 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
                     task.task_id, state, state.value
                 )
             call = ToolCall("call-denied", "core.run_command", {
-                "argv": [sys.executable, "-m", "unittest"]
+                "argv": [sys.executable, "-m", "unittest"], "cwd": ".",
             })
             with self.assertRaises(ApprovalRequired) as caught:
                 await denied_application.kernel.invoke_tool(

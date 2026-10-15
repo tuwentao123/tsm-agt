@@ -108,6 +108,7 @@ class InMemoryRuntimeStore:
             data=dict(state),
         )
 
+
     async def commit_session(self, unit: SessionUnitOfWork) -> CommitResult:
         current = self._session_versions.get(unit.session_id, 0)
         if current != unit.expected_version:

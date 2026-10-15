@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hmac
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
@@ -20,6 +20,8 @@ class ApprovalDecision(StrEnum):
 class ApprovalKind(StrEnum):
     TOOL_ACTION = "tool_action"
     WORKSPACE_READ = "workspace_read"
+    WORKSPACE_WRITE = "workspace_write"
+    PROJECT_TRUST = "project_trust"
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +44,7 @@ class ApprovalRequest:
     agent_checkpoint: Mapping[str, Any] | None = None
     kind: ApprovalKind = ApprovalKind.TOOL_ACTION
     workspace_access_root: str = ""
+    execution_identity: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> ApprovalRequest:
@@ -79,6 +82,10 @@ class ApprovalRequest:
             ),
             kind=ApprovalKind(str(data.get("kind", ApprovalKind.TOOL_ACTION.value))),
             workspace_access_root=str(data.get("workspace_access_root", "")),
+            execution_identity={
+                str(name): str(value)
+                for name, value in dict(data.get("execution_identity", {})).items()
+            } if isinstance(data.get("execution_identity"), Mapping) else {},
         )
 
     def matches(self, request_id: str, payload_hash: str) -> bool:
@@ -108,6 +115,7 @@ class ApprovalRequest:
             ),
             "kind": self.kind.value,
             "workspace_access_root": self.workspace_access_root,
+            "execution_identity": dict(self.execution_identity),
         }
 
 

@@ -218,6 +218,15 @@ class WaitingProjectionTest(unittest.TestCase):
 
         self.assertIsNone(web_app._waiting_payload(result))
 
+    def test_stale_approval_on_an_interrupted_task_is_not_rendered(self) -> None:
+        result = RuntimeTaskResult(
+            task_id="task-web", state="CONFLICT", phase1_state="INTERRUPTED",
+            status="interrupted", cursor=8,
+            approval={"request_id": "approval-stale", "action": "core.run_command"},
+        )
+
+        self.assertIsNone(web_app._waiting_payload(result))
+
 
 class LoopLimitReportingTest(unittest.TestCase):
     def test_spent_budget_is_described_with_its_cause(self) -> None:

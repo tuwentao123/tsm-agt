@@ -780,11 +780,23 @@ class FlowProjector:
                 waiting = {
                     "AWAITING_APPROVAL": FlowNodeStatus.WAITING_APPROVAL,
                     "AWAITING_USER": FlowNodeStatus.WAITING_USER,
-                    "CONFLICT": FlowNodeStatus.WAITING_USER,
                 }
                 next_status = terminal.get(
-                    next_state, waiting.get(next_state, FlowNodeStatus.RUNNING)
+                    next_state,
+                    (FlowNodeStatus.FAILED if next_state == "CONFLICT"
+                     else waiting.get(next_state, FlowNodeStatus.RUNNING)),
                 )
+                if next_state == "CONFLICT":
+                    # Older snapshots can contain a checkpoint conflict after
+                    # an approval request without an explicit invalidation
+                    # event. Replay the later conflict as the authoritative
+                    # close of that Turn's only actionable approval.
+                    for node in tuple(nodes.values()):
+                        if (
+                            node.kind is FlowNodeKind.APPROVAL
+                            and node.status is FlowNodeStatus.WAITING_APPROVAL
+                        ):
+                            finish(node.node_id, event, FlowNodeStatus.CANCELLED)
                 if active_phase_id is not None:
                     prior_status = (
                         next_status if next_status in {
@@ -1070,7 +1082,9 @@ class FlowProjector:
                             "event_type": event_type,
                         }, node_id=node_id, invocation_id=invocation_id,
                     )
-            elif event_type in {"approval.requested", "approval.resolved"}:
+            elif event_type in {
+                "approval.requested", "approval.resolved", "approval.invalidated",
+            }:
                 request_id = str(payload.get("request_id", f"seq-{event.sequence}"))
                 node_id = f"approval:{request_id}"
                 if event_type == "approval.requested":
@@ -1104,11 +1118,14 @@ class FlowProjector:
                     ), None)
                     finish(
                         node_id, event, FlowNodeStatus.SUCCEEDED
-                        if decision == "approve" else FlowNodeStatus.CANCELLED,
+                        if event_type == "approval.resolved" and decision == "approve"
+                        else FlowNodeStatus.CANCELLED,
                     )
                     add_fact(
                         FlowDiagnosticCategory.CONTROL, event,
-                        "approval.resolved", {"decision": decision},
+                        event_type,
+                        ({"decision": decision} if event_type == "approval.resolved"
+                         else {"reason": str(payload.get("reason") or "invalidated")}),
                         node_id=node_id,
                         invocation_id=approval_invocation_id,
                     )

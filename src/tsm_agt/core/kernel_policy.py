@@ -499,7 +499,10 @@ class PolicyMixin:
         return tuple(
             Path(grant.canonical_root)
             for grant in task.workspace_access_grants
-            if grant.capability is WorkspaceAccessCapability.READ
+            if grant.capability in {
+                WorkspaceAccessCapability.READ,
+                WorkspaceAccessCapability.WRITE,
+            }
         )
 
     @staticmethod

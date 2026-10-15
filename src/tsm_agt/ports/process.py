@@ -113,6 +113,9 @@ class ProcessResult:
     def to_data(self) -> dict[str, object]:
         return {
             "process_id": self.process_id,
+            "execution_state": (
+                "succeeded" if self.succeeded else "failed_known"
+            ),
             "succeeded": self.succeeded,
             "failure_code": self.failure_code,
             "status": self.status.value,
@@ -166,6 +169,7 @@ class BackgroundProcessStartResult:
     def to_data(self) -> dict[str, object]:
         return {
             "mode": "background",
+            "execution_state": "running" if self.started else "failed_known",
             "started": self.started,
             "process_id": self.process_id,
             "state": self.state,
