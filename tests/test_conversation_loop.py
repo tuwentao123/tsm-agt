@@ -724,6 +724,15 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
                 ]
                 self.assertFalse(failures[0].ok)
                 self.assertEqual(failures[0].error_code, "INVALID_ARGUMENT")
+                self.assertTrue(failures[0].retryable)
+                self.assertEqual(
+                    failures[0].effective_recovery_kind,
+                    ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS,
+                )
+                self.assertEqual(failures[0].recovery_action, {
+                    "tool": "does.not.exist",
+                    "reason": "arguments_do_not_match_advertised_schema",
+                })
                 self.assertIn("continue the original user request", failures[0].hint)
                 events = await application.registry.require(
                     RuntimeStorePort

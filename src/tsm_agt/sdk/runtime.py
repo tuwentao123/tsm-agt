@@ -225,10 +225,24 @@ def _todo_list_projection(working_memory: Any) -> dict[str, Any] | None:
     summary: dict[str, int] = {"total": len(todos)}
     for status in ("pending", "in_progress", "completed", "blocked"):
         summary[status] = sum(1 for item in todos if item["status"] == status)
+    active = next(
+        (item for item in todos if item["status"] == "in_progress"), None
+    )
+    next_pending = next(
+        (item for item in todos if item["status"] == "pending"), None
+    )
     return {
         "revision": working_memory.snapshot.revision,
         "todos": todos,
         "summary": summary,
+        "plan_state": {
+            "active_item_id": active["id"] if active else None,
+            "next_pending_item_id": next_pending["id"] if next_pending else None,
+            "open_item_ids": [
+                item["id"] for item in todos
+                if item["status"] in {"pending", "in_progress"}
+            ],
+        },
     }
 
 

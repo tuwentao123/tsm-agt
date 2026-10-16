@@ -43,6 +43,7 @@ from tsm_agt.ports import (
     RuntimeUnitOfWork,
     TextBlock,
     ToolCall,
+    ToolRecoveryKind,
     ToolResult,
     ToolResultBlock,
     ToolSpec,
@@ -107,7 +108,7 @@ _CODE_CHANGE_TOOL_NAMES = frozenset({
     "core.list_files", "core.search_files", "core.read_file",
     "code.definition", "code.references", "code.diagnostics",
     "git.status", "git.diff", "core.apply_patch_v4a", "core.apply_patches",
-    "core.delete_file", "core.run_command", "core.process_status",
+    "core.delete_file", "core.run_command", "core.process_wait", "core.process_status",
     "core.process_logs", "core.process_stop", "core.todo_list",
 })
 _WEB_RESEARCH_TOOL_NAMES = frozenset({
@@ -815,6 +816,16 @@ class ConversationAgentLoop:
                             "the original user request. No call was executed; do not "
                             "substitute instructions or claim a tool is unavailable."
                         ),
+                        retryable=True,
+                        recovery_kind=(
+                            ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS
+                        ),
+                        recovery_action={
+                            "tool": call.name,
+                            "reason": (
+                                "arguments_do_not_match_advertised_schema"
+                            ),
+                        },
                         meta={
                             "runtime_guard": "CONVERSATION_LOOP_TOOL_PROTOCOL",
                             "protocol_reason": error.reason_code,

@@ -583,16 +583,21 @@ function updateComposerButtonState() {
   const cancelButton = document.getElementById('cancel-btn');
   if (!sendButton || !cancelButton) return;
 
-  const runningTask = conversations
-    .flatMap((conversation) => conversation.messages || [])
-    .find((message) => {
-      const task = message.task;
-      return task && !TERMINAL_STATES.includes(task.phase1State);
-    });
+  // Cancellation is scoped to the authoritative active Task of the visible
+  // conversation.  Searching every historical task card let an old stale
+  // PREPARING/RUNNING card keep the composer cancel button alive after the
+  // current Turn had already completed.
+  const active = getActiveConversation();
+  const runningTask = active?.activeTaskId
+    ? taskMessage(active.id, active.activeTaskId)
+    : null;
 
   sendButton.disabled = !getActiveWorkspace();
 
-  if (runningTask?.task?.taskId) {
+  if (
+    runningTask?.task?.taskId
+    && !TERMINAL_STATES.includes(runningTask.task.phase1State)
+  ) {
     cancelButton.classList.remove('hidden');
     cancelButton.dataset.taskId = runningTask.task.taskId;
     cancelButton.disabled = false;
@@ -2643,7 +2648,15 @@ async function cancelRunningTask(taskId) {
       throw new Error(`取消任务失败，状态码 ${response.status}`);
     }
 
-    updateComposerButtonState();
+    // The interrupt endpoint is accepted synchronously, while its terminal
+    // state is published asynchronously. Follow the authoritative result so
+    // the button cannot remain visible merely because this card is stale.
+    const active = getActiveConversation();
+    if (active && taskId === active.activeTaskId) {
+      followTask(taskId, active.id);
+    } else {
+      updateComposerButtonState();
+    }
   } catch (error) {
     console.error(error);
     showError(error.message || '取消任务时发生未知错误。');
@@ -3424,6 +3437,10 @@ async function ensureConversationLoaded(conversationId) {
     const tasksById = new Map(
       (data.tasks || []).map((task) => [task.task_id, task]),
     );
+    // This is the session authority for what may be stopped from the composer;
+    // rendered historical cards are deliberately not an authority signal.
+    // Set it before rendering, because rendering also refreshes composer state.
+    conversation.activeTaskId = data.active_task_id || null;
     conversation.turnCalls = new Map(
       (data.turns || [])
         .filter((turn) => turn && turn.turn_id)

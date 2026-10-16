@@ -58,7 +58,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tsm_agt.ports import (
-    BackgroundProcessStartResult, Message, MessageRole,
+    BackgroundProcessStartResult, Message, MessageRole, ProcessWaitResult,
     OutcomeBindingMode, RecoverableToolProtocolError, RuntimeEvent,
     RuntimeUnitOfWork, ToolArgumentPresentation, ToolCall, ToolCallBlock,
     ToolEffect, ToolIdempotency, ToolInvocationContext,
@@ -67,6 +67,13 @@ from tsm_agt.ports import (
     ToolSpec, ToolTaskSpecControl,
     ToolWorkingMemoryControl, ToolWorkspaceControl,
 )
+
+
+# ``core.process_wait`` has its own bounded observation window.  The outer
+# tool deadline must leave time for that observation to turn into a normal
+# RUNNING/terminal result, persist its events, and return it to the caller.
+# This is deliberately not a process-lifetime extension.
+_PROCESS_WAIT_RETURN_GRACE_SECONDS = 2.0
 from uuid import uuid4
 from .agent_loop import (
     AgentClarificationSuspended, AgentTurnCheckpoint, ToolBatchSnapshot,
@@ -154,34 +161,40 @@ class _TaskProcessControl(ToolProcessControl):
 
     async def run(
         self, argv: tuple[str, ...], *, cwd: str,
-        environment: Mapping[str, str], background: bool,
-        timeout_seconds: float, termination_grace_seconds: float,
+        environment: Mapping[str, str],
         max_output_bytes: int, max_lifetime_seconds: float,
         stop_on_task_end: bool,
-    ) -> ProcessCommandResult | BackgroundProcessStartResult:
-        if background:
-            record = await self.kernel.start_background_process(
-                self.task_id, self.turn_id, argv, cwd=cwd,
-                environment=environment,
-                max_lifetime_seconds=max_lifetime_seconds,
-                max_output_bytes=max_output_bytes,
-                stop_on_task_end=stop_on_task_end,
-                invocation_id=self.invocation_id,
-            )
-            return BackgroundProcessStartResult(
-                process_id=record.process_id,
-                state=record.state.value,
-                started_at=record.handle.started_at,
-                deadline_at=record.deadline_at,
-                max_lifetime_seconds=record.max_lifetime_seconds,
-                stop_on_task_end=record.stop_on_task_end,
-            )
-        return await self.kernel.run_foreground_process(
+    ) -> BackgroundProcessStartResult:
+        record = await self.kernel.start_background_process(
             self.task_id, self.turn_id, argv, cwd=cwd,
-            environment=environment, timeout_seconds=timeout_seconds,
-            termination_grace_seconds=termination_grace_seconds,
+            environment=environment,
+            max_lifetime_seconds=max_lifetime_seconds,
             max_output_bytes=max_output_bytes,
+            stop_on_task_end=stop_on_task_end,
             invocation_id=self.invocation_id,
+        )
+        # A non-blocking poll captures fast command completion without making
+        # process start depend on an eventual exit.
+        record = await self.kernel.get_background_process_status(
+            self.task_id, record.process_id
+        )
+        return BackgroundProcessStartResult(
+            process_id=record.process_id,
+            state=record.state.value,
+            started_at=record.handle.started_at,
+            deadline_at=record.deadline_at,
+            max_lifetime_seconds=record.max_lifetime_seconds,
+            stop_on_task_end=record.stop_on_task_end,
+            exit_code=record.exit_code,
+            termination_signal=record.termination_signal,
+            finished_at=record.finished_at,
+        )
+
+    async def wait(
+        self, process_id: str, wait_seconds: float
+    ) -> ProcessWaitResult:
+        return await self.kernel.wait_background_process(
+            self.task_id, process_id, wait_seconds=wait_seconds
         )
 
     async def status(self, process_id: str) -> Mapping[str, Any]:
@@ -478,6 +491,7 @@ class ToolMixin:
                 break
         recoverable = {
             ToolRecoveryKind.RETRY_SAME,
+            ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS,
             ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
         }
         return tuple(
@@ -794,6 +808,12 @@ class ToolMixin:
                 error_code="INVALID_PARAM",
                 message=str(error),
                 hint="Correct the arguments using the advertised tool schema.",
+                retryable=True,
+                recovery_kind=ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS,
+                recovery_action={
+                    "tool": call.name,
+                    "reason": "arguments_do_not_match_advertised_schema",
+                },
             )
         await self._append_events(
             task_id,
@@ -1577,6 +1597,21 @@ class ToolMixin:
                 # TERM/KILL and output draining before the outer Tool deadline.
                 effective_timeout_seconds = max(
                     timeout_seconds, float(declared) + float(grace) + 2.0
+                )
+        elif call.name == "core.process_wait":
+            requested_wait = call.arguments.get("wait_seconds")
+            if (
+                isinstance(requested_wait, (int, float))
+                and not isinstance(requested_wait, bool)
+                and 0 < float(requested_wait) <= 30
+            ):
+                # Waiting out the observation window is a successful result:
+                # the process may still be RUNNING.  Do not let the generic
+                # tool deadline race the inner wait and turn that fact into a
+                # synthetic TIMEOUT error.
+                effective_timeout_seconds = max(
+                    timeout_seconds,
+                    float(requested_wait) + _PROCESS_WAIT_RETURN_GRACE_SECONDS,
                 )
         stored = await self._dependencies.store.load_task(task_id)
         if stored is None:

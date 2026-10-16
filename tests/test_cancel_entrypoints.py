@@ -30,6 +30,12 @@ class WebCancelEntryPointTest(unittest.TestCase):
         self.assertIn("/tasks/${taskId}/cancel", html)
         self.assertIn("取消任务", html)
 
+    def test_composer_cancel_is_scoped_to_current_session_active_task(self) -> None:
+        html = web_app.INDEX_HTML
+        self.assertIn("const active = getActiveConversation();", html)
+        self.assertIn("active?.activeTaskId", html)
+        self.assertIn("conversation.activeTaskId = data.active_task_id || null;", html)
+
 
 if __name__ == "__main__":
     unittest.main()

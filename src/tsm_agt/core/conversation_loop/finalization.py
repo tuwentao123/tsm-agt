@@ -20,6 +20,10 @@ from tsm_agt.ports import (
 from ..agent_loop import TurnState
 from ..task_spec import TaskCriterionKind
 from ..tool_result_governor import _sanitize_value
+from .action_facts import (
+    latest_failed_delivery_action, post_mutation_verification_fact,
+    project_runtime_action_facts,
+)
 
 
 _RUNTIME_CONTINUATION = (
@@ -30,6 +34,26 @@ _UNRESOLVED_EXECUTION_CONTINUATION = (
     "Continue the same turn once. Runtime records that a requested execution never "
     "started. Use the advertised tools to make a safe next attempt, or give an "
     "evidence-based blocker that does not claim the work was completed."
+)
+
+_FAILED_ACTION_CONTINUATION = (
+    "Continue the same turn once. Runtime observed that the latest delivery "
+    "action failed. Decide the next legal recovery or an evidence-based blocker; "
+    "do not merely restate the failed result or claim the request was completed."
+)
+
+_POST_MUTATION_VERIFICATION_CONTINUATION = (
+    "Continue the same turn once. Runtime recorded a workspace mutation without "
+    "a successful recognized post-change verification. Decide whether to run an "
+    "available verification, perform another necessary action, or state a "
+    "specific evidence-based reason verification is not applicable. Do not call "
+    "the change verified without evidence."
+)
+
+_FAILED_VERIFICATION_CONTINUATION = (
+    "Continue the same turn once. Runtime recorded that the latest recognized "
+    "post-change verification did not pass. Decide a legal recovery or state a "
+    "specific evidence-based blocker; do not claim the requested change verified."
 )
 
 # This is deliberately independent of the user-facing model-call budget.  A
@@ -101,6 +125,37 @@ class RuntimeFinalizationGate:
                 ),
                 _UNRESOLVED_EXECUTION_CONTINUATION if can_attempt_recovery else "",
             )
+        action_facts = project_runtime_action_facts(
+            state.messages, state.visible_tool_by_name,
+        )
+        post_mutation = post_mutation_verification_fact(action_facts)
+        action_issue = (
+            (
+                "post_mutation_verification_failed",
+                _FAILED_VERIFICATION_CONTINUATION,
+            ) if post_mutation.status == "failed" else
+            (
+                "post_mutation_verification_missing",
+                _POST_MUTATION_VERIFICATION_CONTINUATION,
+            ) if post_mutation.status in {"missing", "unknown"} else
+            (
+                "latest_delivery_action_failed",
+                _FAILED_ACTION_CONTINUATION,
+            ) if latest_failed_delivery_action(action_facts) is not None else None
+        )
+        if action_issue is not None:
+            reason, instruction = action_issue
+            can_attempt_recovery = (
+                state.runtime_continuations
+                < _MAX_RUNTIME_RECOVERY_CONTINUATIONS
+                and has_budget
+            )
+            return FinalizationDecision(
+                FinalizationAction.CONTINUE if can_attempt_recovery
+                else FinalizationAction.ACCEPT,
+                reason if can_attempt_recovery else reason + "_blocker_visible",
+                instruction if can_attempt_recovery else "",
+            )
         return FinalizationDecision(FinalizationAction.ACCEPT, "runtime_state_terminal")
 
 
@@ -108,9 +163,10 @@ def _latest_unstarted_execution(messages: tuple[Message, ...]) -> bool:
     """Read only runtime lifecycle facts, never the model's prose or intent.
 
     ``failed_known`` is a terminal execution fact: the process did run and its
-    failure is evidence the model may report or recover from.  It is not a
-    reason to veto a final answer.  Only ``not_started`` needs one protocol
-    correction, because no execution fact exists for the proposed action.
+    failure is evidence the model may report or recover from. It is not an
+    *unstarted-execution* veto. The bounded action-fact rule is evaluated
+    separately below. Only ``not_started`` lacks an execution fact for the
+    proposed action and needs this protocol correction.
 
     A completed tool batch is an execution boundary. Older results cannot keep
     an unrelated later answer from finalizing.

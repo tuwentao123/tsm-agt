@@ -153,7 +153,12 @@ class ProcessCommandResult:
 
 @dataclass(frozen=True, slots=True)
 class BackgroundProcessStartResult:
-    """Proof that a background process entered supervised RUNNING state."""
+    """Proof that a process was started under Runtime supervision.
+
+    ``core.run_command`` always returns this start fact.  A process may exit
+    between ``start_process`` and the Runtime's first non-blocking poll, so
+    ``state`` is deliberately not restricted to ``RUNNING``.
+    """
 
     process_id: str
     state: str
@@ -161,15 +166,28 @@ class BackgroundProcessStartResult:
     deadline_at: datetime
     max_lifetime_seconds: float
     stop_on_task_end: bool
+    exit_code: int | None = None
+    termination_signal: str | None = None
+    finished_at: datetime | None = None
 
     @property
     def started(self) -> bool:
-        return self.state == "RUNNING"
+        # This result is constructed only after the operating system accepted
+        # the spawn.  A fast natural exit does not erase that fact.
+        return True
+
+    @property
+    def execution_state(self) -> str:
+        if self.state == "RUNNING":
+            return "running"
+        if self.state == "EXITED" and self.exit_code == 0:
+            return "succeeded"
+        return "failed_known"
 
     def to_data(self) -> dict[str, object]:
         return {
-            "mode": "background",
-            "execution_state": "running" if self.started else "failed_known",
+            "mode": "managed",
+            "execution_state": self.execution_state,
             "started": self.started,
             "process_id": self.process_id,
             "state": self.state,
@@ -177,7 +195,52 @@ class BackgroundProcessStartResult:
             "deadline_at": self.deadline_at.isoformat(),
             "max_lifetime_seconds": self.max_lifetime_seconds,
             "stop_on_task_end": self.stop_on_task_end,
+            "exit_code": self.exit_code,
+            "termination_signal": self.termination_signal,
+            "finished_at": (
+                self.finished_at.isoformat() if self.finished_at else None
+            ),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessWaitResult:
+    """One bounded observation of a Runtime-managed process."""
+
+    process_id: str
+    state: str
+    waited_seconds: float
+    stdout: ProcessOutput
+    stderr: ProcessOutput
+    result: ProcessResult | None = None
+
+    def to_data(self) -> dict[str, object]:
+        if self.result is not None:
+            data = self.result.to_data()
+            data["state"] = self.state
+        else:
+            data = {
+                "process_id": self.process_id,
+                "execution_state": "running",
+                "succeeded": None,
+                "failure_code": None,
+                "status": None,
+                "exit_code": None,
+                "termination_signal": None,
+                "stdout": {
+                    "text": self.stdout.text,
+                    "total_bytes": self.stdout.total_bytes,
+                    "truncated": self.stdout.truncated,
+                },
+                "stderr": {
+                    "text": self.stderr.text,
+                    "total_bytes": self.stderr.total_bytes,
+                    "truncated": self.stderr.truncated,
+                },
+            }
+            data["state"] = self.state
+        data["waited_seconds"] = self.waited_seconds
+        return data
 
 
 @dataclass(frozen=True, slots=True)

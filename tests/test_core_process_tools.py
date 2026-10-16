@@ -15,6 +15,7 @@ from tsm_agt.core import (
     ProjectTrustLevel,
     TaskState,
 )
+from tsm_agt.core.tool import InvalidToolArguments
 from tsm_agt.ports import (
     AdapterContext,
     AdapterDescriptor,
@@ -24,6 +25,7 @@ from tsm_agt.ports import (
     SandboxRequest,
     ToolCall,
     ToolIdempotency,
+    ToolRecoveryKind,
     ToolRisk,
     RuntimeStorePort,
 )
@@ -106,7 +108,7 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
                 }),
             )
 
-    async def test_run_command_foreground_has_no_shell_and_bounded_output(self) -> None:
+    async def test_run_command_starts_managed_process_and_wait_returns_output(self) -> None:
         marker = Path(self.temporary.name) / "must-not-exist"
         script = Path(self.temporary.name) / "foreground_command.py"
         script.write_text(
@@ -117,16 +119,24 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
             "call-command-fg", "core.run_command", {
                 "argv": [sys.executable, script.name, "$(touch must-not-exist)"],
                 "cwd": ".",
-                "mode": "foreground", "max_output_bytes": 40,
+                "max_output_bytes": 40,
             },
         ))
         self.assertTrue(result.ok)
-        self.assertEqual(result.data["mode"], "foreground")
-        self.assertEqual(result.data["status"], "exited")
-        self.assertEqual(result.data["exit_code"], 0)
-        self.assertIn("$(touch must-not-exist)", result.data["stdout"]["text"])
-        self.assertTrue(result.data["stdout"]["truncated"])
-        self.assertEqual(result.data["stderr"]["text"], "problem\n")
+        self.assertEqual(result.data["mode"], "managed")
+        self.assertTrue(result.data["started"])
+        waited = await self.application.kernel.invoke_tool(
+            self.task.task_id, "turn-command-wait",
+            ToolCall("call-command-wait", "core.process_wait", {
+                "process_id": result.data["process_id"], "wait_seconds": 1,
+            }),
+        )
+        self.assertTrue(waited.ok)
+        self.assertEqual(waited.data["status"], "exited")
+        self.assertEqual(waited.data["exit_code"], 0)
+        self.assertIn("$(touch must-not-exist)", waited.data["stdout"]["text"])
+        self.assertTrue(waited.data["stdout"]["truncated"])
+        self.assertEqual(waited.data["stderr"]["text"], "problem\n")
         self.assertFalse(marker.exists())
 
         events = await self.application.registry.require(
@@ -145,8 +155,13 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [event.event_type for event in process_events],
-            ["process.started", "process.exited"],
+            ["process.started"],
         )
+        self.assertTrue(any(
+            event.event_type == "process.exited"
+            and event.payload.get("process_id") == result.data["process_id"]
+            for event in events
+        ))
         projection = await self.application.kernel.get_flow_projection(
             self.task.task_id
         )
@@ -179,7 +194,6 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
             ToolCall("call-command-missing", "core.run_command", {
                 "argv": ["tsm-agent-definitely-missing-command"],
                 "cwd": ".",
-                "mode": "foreground",
             }),
         )
         self.assertFalse(result.ok)
@@ -228,7 +242,7 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         except OSError as error:
             self.skipTest(f"test environment cannot create symlinks: {error}")
         call = ToolCall("call-command-identity", "core.run_command", {
-            "argv": [str(launcher)], "cwd": ".", "mode": "foreground",
+            "argv": [str(launcher)], "cwd": ".",
         })
         with self.assertRaises(ApprovalRequired) as caught:
             await self.application.kernel.invoke_tool(
@@ -243,7 +257,7 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
                 ApprovalDecision.APPROVE, "approve stale launcher",
             )
 
-    async def test_foreground_internal_timeout_is_definitive_not_unknown(self) -> None:
+    async def test_wait_expiry_leaves_managed_process_running(self) -> None:
         script = Path(self.temporary.name) / "slow_command.py"
         script.write_text(
             "import time\nprint('started', flush=True)\ntime.sleep(30)\n",
@@ -253,20 +267,94 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
             "call-command-timeout", "core.run_command", {
                 "argv": [sys.executable, script.name],
                 "cwd": ".",
-                "mode": "foreground", "timeout_seconds": 0.2,
-                "termination_grace_seconds": 0.05,
             },
         ), "turn-timeout")
         self.assertTrue(result.ok)
-        self.assertEqual(result.data["status"], "timed_out")
+        waited = await self.application.kernel.invoke_tool(
+            self.task.task_id, "turn-timeout-wait",
+            ToolCall("call-timeout-wait", "core.process_wait", {
+                "process_id": result.data["process_id"], "wait_seconds": 0.2,
+            }),
+        )
+        self.assertTrue(waited.ok)
+        self.assertEqual(waited.data["state"], "RUNNING")
+        self.assertEqual(waited.data["execution_state"], "running")
         task = await self.application.kernel.get_task(self.task.task_id)
         execution = task.tool_executions[
             "turn-timeout:call-command-timeout"
         ]
         self.assertEqual(execution.state.value, "COMMITTED")
-        self.assertNotEqual(result.error_code, "UNKNOWN_OUTCOME")
+        self.assertEqual(
+            task.background_processes[result.data["process_id"]].state,
+            BackgroundProcessState.RUNNING,
+        )
+        await self.application.kernel.stop_background_process(
+            self.task.task_id, result.data["process_id"], grace_seconds=0.01,
+        )
 
-    async def test_run_command_background_returns_managed_process(self) -> None:
+    async def test_wait_range_error_is_recoverable_with_correction_facts(self) -> None:
+        result = await self.application.kernel.invoke_tool(
+            self.task.task_id, "turn-invalid-wait",
+            ToolCall("call-invalid-wait", "core.process_wait", {
+                "process_id": "process-not-reached", "wait_seconds": 600,
+            }),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "INVALID_PARAM")
+        self.assertTrue(result.retryable)
+        self.assertEqual(
+            result.recovery_kind,
+            ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS,
+        )
+        self.assertEqual(result.recovery_action, {
+            "field": "wait_seconds", "minimum": 0.01,
+            "maximum": 30.0, "received": 600,
+        })
+
+    async def test_process_lease_is_not_a_model_argument(self) -> None:
+        with self.assertRaises(InvalidToolArguments):
+            await self.application.kernel.invoke_tool(
+                self.task.task_id, "turn-lease-argument",
+                ToolCall("call-lease-argument", "core.run_command", {
+                    "argv": [sys.executable, "-V"], "cwd": ".",
+                    "max_lifetime_seconds": 10,
+                }),
+            )
+
+    async def test_wait_expiry_is_not_raced_by_the_outer_tool_deadline(self) -> None:
+        """A wait window may finish normally even when it matches caller timeout.
+
+        The process is deliberately still running.  Before the protocol grace,
+        the generic outer deadline could win this race and incorrectly report a
+        TIMEOUT instead of the observation result.
+        """
+        script = Path(self.temporary.name) / "deadline_race.py"
+        script.write_text(
+            "import time\ntime.sleep(30)\n", encoding="utf-8",
+        )
+        started = await self._approve_call(ToolCall(
+            "call-deadline-race-start", "core.run_command", {
+                "argv": [sys.executable, script.name], "cwd": ".",
+            },
+        ), "turn-deadline-race")
+        self.assertTrue(started.ok)
+        waited = await self.application.kernel.invoke_tool(
+            self.task.task_id, "turn-deadline-race-wait",
+            ToolCall("call-deadline-race-wait", "core.process_wait", {
+                "process_id": started.data["process_id"], "wait_seconds": 0.05,
+            }),
+            # Matches the requested observation window.  Runtime supplies the
+            # protocol return grace rather than making this a timeout race.
+            timeout_seconds=0.05,
+        )
+        self.assertTrue(waited.ok)
+        self.assertEqual(waited.data["state"], "RUNNING")
+        await self.application.kernel.stop_background_process(
+            self.task.task_id, started.data["process_id"], grace_seconds=0.01,
+        )
+
+    async def test_run_command_returns_managed_process(self) -> None:
         script = Path(self.temporary.name) / "background_command.py"
         script.write_text(
             "import time\nprint('service-ready', flush=True)\ntime.sleep(30)\n",
@@ -278,12 +366,10 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
                     sys.executable, script.name,
                 ],
                 "cwd": ".",
-                "mode": "background", "max_lifetime_seconds": 30,
-                "stop_on_task_end": True,
             },
         ))
         self.assertTrue(result.ok)
-        self.assertEqual(result.data["mode"], "background")
+        self.assertEqual(result.data["mode"], "managed")
         self.assertEqual(result.data["state"], "RUNNING")
         process_id = result.data["process_id"]
         self.assertNotIn("pid", result.data)
@@ -306,6 +392,34 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(collected, "service-ready\n")
         await self.application.kernel.stop_background_process(
             self.task.task_id, process_id, grace_seconds=0.01
+        )
+
+    async def test_turn_scope_close_preserves_task_owned_managed_process(self) -> None:
+        """Approval/resume closes a turn scope, not an already-started server."""
+        script = Path(self.temporary.name) / "persistent_server.py"
+        script.write_text(
+            "import time\nprint('ready', flush=True)\ntime.sleep(30)\n",
+            encoding="utf-8",
+        )
+        result = await self._approve_call(ToolCall(
+            "call-command-persist", "core.run_command", {
+                "argv": [sys.executable, script.name],
+                "cwd": ".",
+            },
+        ), "turn-before-approval")
+        process_id = result.data["process_id"]
+
+        # This is the same cleanup operation performed before resuming an
+        # approval checkpoint. It may release old model/turn resources but must
+        # not stop task-owned process_id.
+        await self.application.kernel._close_cancellation_scope(self.task.task_id)
+
+        status = await self.application.kernel.get_background_process_status(
+            self.task.task_id, process_id,
+        )
+        self.assertEqual(status.state, BackgroundProcessState.RUNNING)
+        await self.application.kernel.stop_background_process(
+            self.task.task_id, process_id, grace_seconds=0.01,
         )
 
     async def test_run_command_rejects_workspace_escape_and_credential_environment(self) -> None:
@@ -356,7 +470,13 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.data["stdout"]["text"].strip(), str(workspace))
+        waited = await self.application.kernel.invoke_tool(
+            self.task.task_id, "turn-absolute-cwd-wait",
+            ToolCall("call-absolute-cwd-wait", "core.process_wait", {
+                "process_id": result.data["process_id"], "wait_seconds": 1,
+            }),
+        )
+        self.assertEqual(waited.data["stdout"]["text"].strip(), str(workspace))
         events = await self.application.registry.require(RuntimeStorePort).read_events(
             self.task.task_id
         )
@@ -413,7 +533,13 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
             },
         ))
         self.assertTrue(result.ok)
-        self.assertTrue(result.data["succeeded"])
+        waited = await self.application.kernel.invoke_tool(
+            self.task.task_id, "turn-governed-wait",
+            ToolCall("call-governed-wait", "core.process_wait", {
+                "process_id": result.data["process_id"], "wait_seconds": 1,
+            }),
+        )
+        self.assertTrue(waited.data["succeeded"])
 
         denied_application = compose_fixture_application(
             tool_adapters=(CoreProcessToolProvider(),)

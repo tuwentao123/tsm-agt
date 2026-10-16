@@ -33,6 +33,14 @@ class ToolRecoveryContractTest(unittest.TestCase):
         self.assertEqual(restored, original)
         self.assertFalse(restored.recovery_action["same_call_safe"])
 
+    def test_corrected_argument_recovery_round_trips(self) -> None:
+        original = ToolResult(
+            "wait", False, error_code="INVALID_PARAM", retryable=True,
+            recovery_kind=ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS,
+            recovery_action={"field": "wait_seconds", "maximum": 30},
+        )
+        self.assertEqual(ToolResult.from_data(original.to_data()), original)
+
     def test_success_does_not_pay_context_cost_for_empty_recovery(self) -> None:
         data = ToolResult("ok", True, data={"value": 1}).to_data()
         self.assertNotIn("recovery_kind", data)
@@ -59,12 +67,17 @@ class ToolRecoveryContractTest(unittest.TestCase):
                     "patch", False, error_code="CONFLICT",
                     recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
                 ),
+            ), ToolResultBlock(
+                ToolResult(
+                    "wait", False, error_code="INVALID_PARAM",
+                    recovery_kind=ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS,
+                ),
             ),)),
         )
 
         self.assertEqual(
             [item.call_id for item in Kernel._latest_recoverable_tool_batch(messages)],
-            ["read", "patch"],
+            ["read", "wait", "patch"],
         )
 
         result = ToolResult(

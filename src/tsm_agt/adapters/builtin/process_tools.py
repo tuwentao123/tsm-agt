@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime
+from math import isfinite
 from typing import Any
 
 from tsm_agt.ports import (
@@ -12,7 +13,6 @@ from tsm_agt.ports import (
     BackgroundProcessStartResult,
     HealthState,
     HealthStatus,
-    ProcessCommandResult,
     ToolCall,
     ToolEffect,
     ToolIdempotency,
@@ -23,6 +23,22 @@ from tsm_agt.ports import (
     ToolRisk,
     ToolSpec,
 )
+
+
+class _BoundedNumberError(ValueError):
+    """A mechanical argument constraint that the caller can safely correct."""
+
+    def __init__(self, name: str, minimum: float, maximum: float, value: Any) -> None:
+        super().__init__(f"{name} must be a number in {minimum:g}..{maximum:g}")
+        self.recovery_action: dict[str, Any] = {
+            "field": name,
+            "minimum": minimum,
+            "maximum": maximum,
+        }
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            self.recovery_action["received"] = value
+        else:
+            self.recovery_action["received_type"] = type(value).__name__
 
 
 class CoreProcessToolProvider:
@@ -36,7 +52,7 @@ class CoreProcessToolProvider:
         capabilities=frozenset(
             {
                 "core.run_command", "core.process_status",
-                "core.process_logs", "core.process_stop",
+                "core.process_logs", "core.process_stop", "core.process_wait",
             }
         ),
     )
@@ -46,9 +62,10 @@ class CoreProcessToolProvider:
             name="core.run_command",
             description=(
                 "Run a command as a structured argv array inside the task workspace. "
-                "No shell parses the arguments. Use foreground mode for bounded commands "
-                "such as builds and tests; use background mode for servers, watchers, or "
-                "log streams, then manage the returned process_id with process tools. "
+                "No shell parses the arguments. Every command is started as a Runtime-"
+                "managed process and returns promptly with a process_id and its current "
+                "state. Use core.process_wait only when a later step needs a bounded "
+                "wait for exit; use status or logs to observe a running process. "
                 "Prefer web.search and web.fetch_markdown for public web pages. "
                 "Reading another project's source is a normal use of this tool. "
                 "With the gh CLI, gh api -H 'Accept: application/vnd.github.raw' "
@@ -58,10 +75,11 @@ class CoreProcessToolProvider:
                 "denied, so pass the program and its arguments directly and inspect "
                 "files with core.list_files, core.read_file, or core.search_files. "
                 "The environment starts minimal and rejects credential-like variable names. "
-                "A successful ToolResult means the process outcome was captured; for a "
-                "foreground command, inspect data.succeeded and data.failure_code to "
-                "determine command success. A background data.started value proves only "
-                "supervised start, not service readiness or terminal success. "
+                "A successful ToolResult proves only that Runtime started and supervises "
+                "the process. data.state='RUNNING' is neither service readiness nor a "
+                "terminal command result. If data.state is terminal, inspect exit_code "
+                "and succeeded. Runtime, not this call, assigns the process resource "
+                "lease and reports its deadline_at. This lease is not a wait duration. "
                 "Bringing a public repository in with git clone, git fetch, or "
                 "git ls-remote is allowed without extra approval under a trusted "
                 "project; other commands require approval."
@@ -72,12 +90,7 @@ class CoreProcessToolProvider:
                     "argv": {"type": "array"},
                     "cwd": {"type": "string"},
                     "environment": {"type": "object"},
-                    "mode": {"type": "string"},
-                    "timeout_seconds": {"type": "number"},
-                    "termination_grace_seconds": {"type": "number"},
                     "max_output_bytes": {"type": "integer"},
-                    "max_lifetime_seconds": {"type": "number"},
-                    "stop_on_task_end": {"type": "boolean"},
                 },
                 # Directory is part of the command identity: it must be visible
                 # to the model, approval flow, execution record, and process
@@ -91,16 +104,46 @@ class CoreProcessToolProvider:
             is_concurrency_safe=False,
             idempotency=ToolIdempotency.NON_IDEMPOTENT,
             rollback=(
-                "stop a returned background process; foreground filesystem or external "
-                "side effects require separate inspection and rollback"
+                "stop a returned managed process; filesystem or external side effects "
+                "require separate inspection and rollback"
             ),
             effect=ToolEffect.EXECUTE,
             result_authority=ToolResultAuthority.PROCESS_FACT,
         ),
         ToolSpec(
+            name="core.process_wait",
+            description=(
+                "Wait once, for a bounded number of seconds, for one task-owned "
+                "managed process. wait_seconds must be from 0.01 through 30 and is "
+                "one observation window, not the process resource lease. For a longer "
+                "exit-bound task, make later wait calls with windows no greater than 30. "
+                "If it has not exited at the end of the window, it "
+                "remains running and this tool returns its current logs and state; it "
+                "never terminates the process on wait expiry. Use this only when a "
+                "subsequent step needs the exit result."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "process_id": {"type": "string"},
+                    "wait_seconds": {
+                        "type": "number", "minimum": 0.01, "maximum": 30,
+                    },
+                },
+                "required": ["process_id", "wait_seconds"],
+                "additionalProperties": False,
+            },
+            risk=ToolRisk.R0,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            idempotency=ToolIdempotency.IDEMPOTENT,
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.PROCESS_FACT,
+        ),
+        ToolSpec(
             name="core.process_status",
             description=(
-                "Get the current state of one background process owned by this task. "
+                "Get the current state of one managed process owned by this task. "
                 "Returns RUNNING, EXITED, CANCELLED, TIMED_OUT, or ORPHANED plus "
                 "lifecycle timestamps and exit information."
             ),
@@ -120,7 +163,7 @@ class CoreProcessToolProvider:
         ToolSpec(
             name="core.process_logs",
             description=(
-                "Read retained stdout and stderr from one task-owned background "
+                "Read retained stdout and stderr from one task-owned managed "
                 "process. Pass the returned next cursors on the next call to receive "
                 "only new output. Output is bounded and may report truncation."
             ),
@@ -144,7 +187,7 @@ class CoreProcessToolProvider:
         ToolSpec(
             name="core.process_stop",
             description=(
-                "Stop one background process owned by this task. The supervisor sends "
+                "Stop one managed process owned by this task. The supervisor sends "
                 "TERM to its process group, waits for the grace period, and uses KILL "
                 "only if needed. This action requires approval."
             ),
@@ -167,8 +210,26 @@ class CoreProcessToolProvider:
         ),
     )
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, managed_process_max_lifetime_seconds: float = 3600.0,
+        stop_managed_process_on_task_end: bool = True,
+    ) -> None:
+        if (
+            not isinstance(managed_process_max_lifetime_seconds, (int, float))
+            or isinstance(managed_process_max_lifetime_seconds, bool)
+            or not isfinite(managed_process_max_lifetime_seconds)
+            or not 0 < float(managed_process_max_lifetime_seconds) <= 86_400
+        ):
+            raise ValueError(
+                "managed_process_max_lifetime_seconds must be finite and in 0..86400"
+            )
+        if not isinstance(stop_managed_process_on_task_end, bool):
+            raise TypeError("stop_managed_process_on_task_end must be a boolean")
         self._started = False
+        self._managed_process_max_lifetime_seconds = float(
+            managed_process_max_lifetime_seconds
+        )
+        self._stop_managed_process_on_task_end = stop_managed_process_on_task_end
 
     async def start(self, context: AdapterContext) -> None:
         self._started = True
@@ -203,6 +264,12 @@ class CoreProcessToolProvider:
             elif call.name == "core.process_status":
                 process_id = self._non_empty_string(call.arguments, "process_id")
                 data = await control.status(process_id)
+            elif call.name == "core.process_wait":
+                process_id = self._non_empty_string(call.arguments, "process_id")
+                wait_seconds = self._bounded_number(
+                    call.arguments, "wait_seconds", 0.0, 0.01, 30.0
+                )
+                data = (await control.wait(process_id, wait_seconds)).to_data()
             elif call.name == "core.process_logs":
                 process_id = self._non_empty_string(call.arguments, "process_id")
                 stdout_cursor = self._non_negative_int(
@@ -225,6 +292,12 @@ class CoreProcessToolProvider:
             return self._error(call, "NOT_FOUND", str(error))
         except PermissionError as error:
             return self._error(call, "PERMISSION_DENIED", str(error))
+        except _BoundedNumberError as error:
+            return self._error(
+                call, "INVALID_PARAM", str(error), retryable=True,
+                recovery_kind=ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS,
+                recovery_action=error.recovery_action,
+            )
         except (TypeError, ValueError) as error:
             return self._error(call, "INVALID_PARAM", str(error))
         except RuntimeError as error:
@@ -244,7 +317,7 @@ class CoreProcessToolProvider:
 
     async def _run_command(
         self, arguments: Mapping[str, Any], control,
-    ) -> ProcessCommandResult | BackgroundProcessStartResult:
+    ) -> BackgroundProcessStartResult:
         raw_argv = arguments.get("argv")
         if (
             not isinstance(raw_argv, (list, tuple))
@@ -261,31 +334,14 @@ class CoreProcessToolProvider:
             for name, value in raw_environment.items()
         ):
             raise TypeError("environment must be an object containing string values")
-        mode = arguments.get("mode", "foreground")
-        if mode not in {"foreground", "background"}:
-            raise ValueError("mode must be foreground or background")
-        timeout_seconds = self._bounded_number(
-            arguments, "timeout_seconds", 300.0, 0.01, 3600.0
-        )
-        grace_seconds = self._bounded_number(
-            arguments, "termination_grace_seconds", 2.0, 0.0, 30.0
-        )
         max_output_bytes = self._bounded_int(
             arguments, "max_output_bytes", 1_000_000, 1, 5_000_000
         )
-        max_lifetime_seconds = self._bounded_number(
-            arguments, "max_lifetime_seconds", 3600.0, 0.01, 86_400.0
-        )
-        stop_on_task_end = arguments.get("stop_on_task_end", True)
-        if not isinstance(stop_on_task_end, bool):
-            raise TypeError("stop_on_task_end must be a boolean")
         return await control.run(
             tuple(raw_argv), cwd=cwd, environment=dict(raw_environment),
-            background=mode == "background", timeout_seconds=timeout_seconds,
-            termination_grace_seconds=grace_seconds,
             max_output_bytes=max_output_bytes,
-            max_lifetime_seconds=max_lifetime_seconds,
-            stop_on_task_end=stop_on_task_end,
+            max_lifetime_seconds=self._managed_process_max_lifetime_seconds,
+            stop_on_task_end=self._stop_managed_process_on_task_end,
         )
 
     @staticmethod
@@ -324,9 +380,10 @@ class CoreProcessToolProvider:
         value = arguments.get(name, default)
         if (
             not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not isfinite(float(value))
             or value < minimum or value > maximum
         ):
-            raise TypeError(f"{name} must be a number in {minimum:g}..{maximum:g}")
+            raise _BoundedNumberError(name, minimum, maximum, value)
         return float(value)
 
     @staticmethod

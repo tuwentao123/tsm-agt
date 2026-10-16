@@ -3,13 +3,14 @@
 The loop owns no prompt of its own: it composes the same protected template the
 other orchestration paths use and lets that template filter its capability
 guidance against the tools actually advertised this turn.  What this module adds
-is the one *dynamic* instruction the runtime may hand the model: a facts-only
-note about the latest durable tool result.
+is the one *dynamic* instruction the runtime may hand the model: a compact,
+facts-only note about action and verification results.
 
 That note is deliberately not a gate.  It may name an ``error_code``,
 ``retryable`` flag, or ``recovery_action`` that already exists in the ledger; it
-may never require a tool the Runtime did not expose, and it may never block a
-plain text answer.
+may never require a tool the Runtime did not expose or pick a repair method.
+The bounded finalization policy is a separate protocol rule; this prompt note
+itself never blocks a plain-text answer.
 """
 
 from __future__ import annotations
@@ -21,6 +22,10 @@ from tsm_agt.ports import Message, ToolSpec
 
 from ..agent_loop import TurnState
 from ..prompt import PromptAssembly, PromptTemplate
+from .action_facts import (
+    latest_failed_delivery_action, post_mutation_verification_fact,
+    project_runtime_action_facts,
+)
 
 def latest_tool_result_instruction(
     kernel: Any, state: TurnState, model_tools: tuple[ToolSpec, ...] = (),
@@ -31,15 +36,36 @@ def latest_tool_result_instruction(
     prompt is left untouched on the common path.
     """
 
-    write_tools = [tool.name for tool in model_tools if tool.effect.value == "mutate"]
-    availability = ""
-    if write_tools:
-        availability = (
-            "Runtime fact: this model call has workspace write tools available: "
-            + ", ".join(write_tools)
-            + ". A tool being available does not itself grant approval; Runtime "
-            "decides that when called. Not calling one does not mean it is absent "
-            "or that write permission was denied."
+    # Keep the stable prompt and advertised tool definitions cacheable. This
+    # dynamic note contains only the compact result facts that changed.
+    # Use the turn's full advertised tool registry: a tool may have produced a
+    # durable result on an earlier iteration but be outside a narrower profile
+    # selected for the *next* model call. Its effect metadata must not vanish.
+    tool_specs = state.visible_tool_by_name
+    if not isinstance(tool_specs, dict):
+        tool_specs = {tool.name: tool for tool in model_tools}
+    facts = project_runtime_action_facts(state.messages, tool_specs)
+    latest_failure = latest_failed_delivery_action(facts)
+    post_mutation = post_mutation_verification_fact(facts)
+    fact_parts: list[str] = []
+    if latest_failure is not None:
+        fact_parts.append(
+            "Runtime action facts: " + json.dumps(
+                latest_failure.prompt_data(), ensure_ascii=False, sort_keys=True,
+            ) + ". This action does not establish completion of the original "
+            "request. Choose a legal recovery, a different legal method, or an "
+            "evidence-based blocker; do not claim the action succeeded."
+        )
+    post_mutation_data = post_mutation.prompt_data()
+    if post_mutation_data is not None and post_mutation.status in {
+        "missing", "failed", "unknown",
+    }:
+        fact_parts.append(
+            "Runtime post-mutation facts: " + json.dumps(
+                post_mutation_data, ensure_ascii=False, sort_keys=True,
+            ) + ". These facts do not select a verifier or recovery for you. "
+            "Decide whether an available verification is needed; do not describe "
+            "the change as verified without matching evidence."
         )
     recovery_batch = kernel._latest_recoverable_tool_batch(state.messages)
     if recovery_batch:
@@ -54,7 +80,7 @@ def latest_tool_result_instruction(
             "the original user request. If no legal recovery remains, report the "
             "blocker with those facts and do not claim the work was completed."
         )
-        return "\n\n".join(part for part in (availability, recovery_instruction) if part)
+        return "\n\n".join((*fact_parts, recovery_instruction))
     if state.last_tool_error:
         error_instruction = (
             "The latest durable tool result is a failure "
@@ -62,8 +88,8 @@ def latest_tool_result_instruction(
             "with corrected facts only when that is safe, otherwise change "
             "method or report the blocker."
         )
-        return "\n\n".join(part for part in (availability, error_instruction) if part)
-    return availability
+        return "\n\n".join((*fact_parts, error_instruction))
+    return "\n\n".join(fact_parts)
 
 
 def assemble_stable_prompt(

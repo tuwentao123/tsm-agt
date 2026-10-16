@@ -95,7 +95,6 @@ class TodoToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(spec.is_internal_state)
         self.assertIs(spec.effect, ToolEffect.INTERNAL)
         self.assertIs(spec.result_authority, ToolResultAuthority.RUNTIME_FACT)
-        self.assertFalse(spec.requires_evidence_question)
 
     async def test_read_on_fresh_working_memory_returns_empty_list(self) -> None:
         result = await self._call({})
@@ -112,6 +111,11 @@ class TodoToolProviderTest(unittest.IsolatedAsyncioTestCase):
                     "completed": 0,
                     "blocked": 0,
                 },
+                "plan_state": {
+                    "active_item_id": None,
+                    "next_pending_item_id": None,
+                    "open_item_ids": [],
+                },
             },
         )
 
@@ -124,6 +128,11 @@ class TodoToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.data["revision"], 2)
         self.assertEqual(result.data["summary"]["in_progress"], 1)
+        self.assertEqual(result.data["plan_state"], {
+            "active_item_id": "b",
+            "next_pending_item_id": "a",
+            "open_item_ids": ["a", "b"],
+        })
         self.assertEqual(
             self.control.state["plan"],
             [

@@ -230,10 +230,27 @@ def _result_data(state: Mapping[str, Any]) -> dict[str, Any]:
     summary = {"total": len(todos)}
     for status in ("pending", "in_progress", "completed", "blocked"):
         summary[status] = sum(1 for item in todos if item["status"] == status)
+    active = next(
+        (item for item in todos if item["status"] == "in_progress"), None
+    )
+    next_pending = next(
+        (item for item in todos if item["status"] == "pending"), None
+    )
     return {
         "todos": todos,
         "revision": int(state["revision"]),
         "summary": summary,
+        # Return the canonical list as well as the minimal next-step view.  A
+        # model should not have to infer which item is actionable from display
+        # ordering after every update or after a resumed turn.
+        "plan_state": {
+            "active_item_id": active["id"] if active else None,
+            "next_pending_item_id": next_pending["id"] if next_pending else None,
+            "open_item_ids": [
+                item["id"] for item in todos
+                if item["status"] in {"pending", "in_progress"}
+            ],
+        },
     }
 
 

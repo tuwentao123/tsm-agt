@@ -50,7 +50,7 @@ class RuleBasedSemanticActionClassifier:
         "core.rollback_mutation_batch", "core.rollback_mutation_groups",
     })
     _PROCESS_TOOLS = frozenset({
-        "core.process_status", "core.process_logs", "core.process_stop",
+        "core.process_wait", "core.process_status", "core.process_logs", "core.process_stop",
     })
 
     def __init__(self) -> None:

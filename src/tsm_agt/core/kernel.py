@@ -890,8 +890,9 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         self._dependencies = dependencies
         self._tool_policy = CoreToolPolicy()
         self._background_deadline_tasks: dict[str, asyncio.Task[None]] = {}
-        #: Per-Task in-process cancellation resources (task-cancellation-spec
-        #: §5.1). Not persisted; closed when the Task settles.
+        #: Per-turn in-process cancellation resources (task-cancellation-spec
+        #: §5.1). Not persisted; closed when a turn is replaced, suspended, or
+        #: settled. Task-owned managed processes deliberately live outside it.
         self._cancellation_scopes: dict[str, CancellationScope] = {}
         #: In-memory cancel snapshot behind CancellationSignal.requested().
         #: Durable truth stays in task.state_changed; this is only a fast read.
@@ -1384,7 +1385,12 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         ))
 
     async def _close_cancellation_scope(self, task_id: str) -> None:
-        """Release every in-process resource of a settled Task generation."""
+        """Release transient resources of a settled/replaced turn generation.
+
+        Task-owned managed processes are persisted separately and are not part
+        of this scope: an approval pause must preserve them for the resumed
+        checkpoint.
+        """
         scope = self._cancellation_scopes.pop(task_id, None)
         if scope is None:
             return

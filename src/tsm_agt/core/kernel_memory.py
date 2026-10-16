@@ -363,6 +363,20 @@ class MemoryMixin:
             "facts": list(snapshot.facts),
             "hypotheses": list(snapshot.hypotheses),
             "plan": [step.to_data() for step in snapshot.plan],
+            "plan_state": {
+                "active_item_id": next((
+                    step.step_id for step in snapshot.plan
+                    if step.status.value == "IN_PROGRESS"
+                ), None),
+                "next_pending_item_id": next((
+                    step.step_id for step in snapshot.plan
+                    if step.status.value == "PENDING"
+                ), None),
+                "open_item_ids": [
+                    step.step_id for step in snapshot.plan
+                    if step.status.value in {"PENDING", "IN_PROGRESS"}
+                ],
+            },
             "evidence": [item.to_data() for item in effective.evidence],
             "runtime_derived": {
                 "remaining_work": list(effective.runtime_remaining_work),

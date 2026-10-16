@@ -48,7 +48,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tsm_agt.ports import (
     ProcessCommandResult, ProcessEnvironmentPolicy, ProcessExecutorPort,
-    ProcessExitStatus, ProcessLogs, ProcessStartRequest, RuntimeEvent,
+    ProcessExitStatus, ProcessLogs, ProcessOutput, ProcessStartRequest, ProcessWaitResult,
+    RuntimeEvent,
     RuntimeUnitOfWork, SandboxRequest
 )
 from typing import Any
@@ -258,20 +259,14 @@ class ProcessMixin:
         )
         self._schedule_background_deadline(task_id, record)
 
-        async def stop_background() -> None:
-            current = await self._get_background_process(
-                task_id, record.process_id
-            )
-            if current.state is BackgroundProcessState.RUNNING:
-                await self._stop_background_record(
-                    task_id, current, ProcessExitStatus.CANCELLED, 2.0
-                )
-
-        # Idempotent with _cleanup_background_processes_for_task_end: it only
-        # stops a process that is still RUNNING at scope-close time.
-        self._cancellation_scope(task_id).register_cleanup(
-            f"process:{process_id}", stop_background
-        )
+        # A managed process belongs to the Task, not to the current agent-turn
+        # generation. In particular, an approval suspension closes the old
+        # turn's cancellation scope before resuming its checkpoint. Registering
+        # this process in that scope would incorrectly terminate a server or
+        # install merely because the next tool call needs user approval.
+        #
+        # Task terminal transitions, explicit ``core.process_stop``, and the
+        # deadline below are the only lifecycle owners for this record.
         return record
 
     async def get_background_process_status(
@@ -313,6 +308,53 @@ class ProcessMixin:
             "stderr_next_cursor": logs.stderr.next_cursor,
         }),))
         return logs
+
+    async def wait_background_process(
+        self, task_id: str, process_id: str, *, wait_seconds: float,
+    ) -> ProcessWaitResult:
+        """Wait once for a managed process without changing its lifecycle.
+
+        This is deliberately an observation, not a command timeout: when the
+        requested window elapses the process remains managed and the caller
+        receives ``RUNNING`` rather than a synthetic termination.
+        """
+        if wait_seconds <= 0 or wait_seconds > 30:
+            raise ValueError("process wait_seconds must be in 0.01..30")
+        wait_started = asyncio.get_running_loop().time()
+        record = await self.get_background_process_status(task_id, process_id)
+        executor = self._require_process_executor()
+        result = None
+        if record.state is BackgroundProcessState.RUNNING:
+            try:
+                async with asyncio.timeout(wait_seconds):
+                    result = await executor.wait_process(record.handle)
+            except TimeoutError:
+                # A command may have exited at the timeout boundary. Poll once
+                # before reporting RUNNING; neither branch stops the process.
+                result = await executor.poll_process(record.handle)
+            if result is not None:
+                record = await self._complete_background_process(
+                    task_id, record, result
+                )
+            else:
+                record = await self.get_background_process_status(
+                    task_id, process_id
+                )
+        if result is None and record.state.is_terminal and executor.owns_process(record.handle):
+            result = await executor.poll_process(record.handle)
+        logs = await self.read_background_process_logs(task_id, process_id)
+        return ProcessWaitResult(
+            process_id=process_id,
+            state=record.state.value,
+            waited_seconds=asyncio.get_running_loop().time() - wait_started,
+            stdout=ProcessOutput(
+                logs.stdout.text, logs.stdout.total_bytes, logs.stdout.truncated
+            ),
+            stderr=ProcessOutput(
+                logs.stderr.text, logs.stderr.total_bytes, logs.stderr.truncated
+            ),
+            result=result,
+        )
 
     async def stop_background_process(
         self, task_id: str, process_id: str, *, grace_seconds: float = 2.0
@@ -437,9 +479,9 @@ class ProcessMixin:
                 )
         deadline_task = asyncio.create_task(enforce())
         self._background_deadline_tasks[record.process_id] = deadline_task
-        self._cancellation_scope(task_id).register_task(
-            deadline_task, name=f"deadline:{record.process_id}"
-        )
+        # Deadline ownership follows the managed process, not the current turn
+        # scope. It is cancelled by ``_complete_background_process`` when the
+        # process exits, is stopped, or is cleaned up at Task termination.
 
     def _require_process_executor(self) -> ProcessExecutorPort:
         executor = self._dependencies.process_executor

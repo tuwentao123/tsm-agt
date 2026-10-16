@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .adapter import RuntimeAdapter
-from .process import BackgroundProcessStartResult, ProcessCommandResult
+from .process import BackgroundProcessStartResult, ProcessWaitResult
 from .workspace_path import WorkspacePathPort
 
 
@@ -79,6 +79,7 @@ class ToolRecoveryKind(StrEnum):
 
     NONE = "none"
     RETRY_SAME = "retry_same"
+    RETRY_WITH_CORRECTED_ARGUMENTS = "retry_with_corrected_arguments"
     RETRY_AFTER_STATE_CHANGE = "retry_after_state_change"
     USER_ACTION_REQUIRED = "user_action_required"
     TERMINAL = "terminal"
@@ -476,13 +477,14 @@ class ToolProcessControl(Protocol):
         *,
         cwd: str,
         environment: Mapping[str, str],
-        background: bool,
-        timeout_seconds: float,
-        termination_grace_seconds: float,
         max_output_bytes: int,
         max_lifetime_seconds: float,
         stop_on_task_end: bool,
-    ) -> ProcessCommandResult | BackgroundProcessStartResult: ...
+    ) -> BackgroundProcessStartResult: ...
+
+    async def wait(
+        self, process_id: str, wait_seconds: float
+    ) -> ProcessWaitResult: ...
 
     async def status(self, process_id: str) -> Mapping[str, Any]: ...
 

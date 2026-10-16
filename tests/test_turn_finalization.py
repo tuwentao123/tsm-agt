@@ -16,7 +16,8 @@ from tsm_agt.ports import (
     AdapterContext, CompletionReviewAction, CompletionReviewError,
     FinalizationAction, FinalizationCandidate, FinishReason, Message,
     MessageRole, ModelCallPurpose, ModelRequest, ModelResponse, TextBlock,
-    ToolRecoveryKind, ToolResult, ToolResultBlock,
+    ToolCall, ToolCallBlock, ToolEffect, ToolRecoveryKind, ToolResult,
+    ToolResultAuthority, ToolResultBlock, ToolRisk, ToolSpec,
 )
 
 
@@ -106,6 +107,29 @@ class RuntimeFinalizationGateTest(unittest.IsolatedAsyncioTestCase):
             messages=[], pending_tool_calls=[], model_call_count=model_calls,
         )
 
+    @staticmethod
+    def _spec(name: str, effect: ToolEffect, authority: ToolResultAuthority) -> ToolSpec:
+        return ToolSpec(
+            name, name, {"type": "object"}, ToolRisk.R0,
+            is_read_only=effect not in {ToolEffect.MUTATE, ToolEffect.EXECUTE},
+            effect=effect, result_authority=authority,
+        )
+
+    @staticmethod
+    def _tool_exchange(
+        call_id: str, name: str, arguments: dict[str, object], result: ToolResult,
+    ) -> list[Message]:
+        return [
+            Message(
+                "call-" + call_id, MessageRole.ASSISTANT,
+                (ToolCallBlock(ToolCall(call_id, name, arguments)),),
+            ),
+            Message(
+                "result-" + call_id, MessageRole.TOOL,
+                (ToolResultBlock(result),),
+            ),
+        ]
+
     async def test_length_continues_while_budget_remains(self) -> None:
         decision = await RuntimeFinalizationGate().evaluate(
             self._state(), ModelResponse(
@@ -164,23 +188,115 @@ class RuntimeFinalizationGateTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(decision.action, FinalizationAction.ACCEPT)
         self.assertEqual(decision.reason_code, "unstarted_execution_blocker_visible")
 
-    async def test_known_process_failure_can_finalize_as_evidence(self) -> None:
+    async def test_known_process_failure_gets_one_recovery_turn(self) -> None:
         state = self._state()
-        state.messages = [Message(
-            "tool-result", MessageRole.TOOL, (ToolResultBlock(ToolResult(
-                "call", False, error_code="PROCESS_EXIT_NON_ZERO",
-                message="command exited 1",
-                data={"execution_state": "failed_known", "exit_code": 1},
-            )),),
-        )]
+        state.visible_tool_by_name = {
+            "core.run_command": self._spec(
+                "core.run_command", ToolEffect.EXECUTE,
+                ToolResultAuthority.PROCESS_FACT,
+            ),
+        }
+        state.messages = self._tool_exchange(
+            "call", "core.run_command", {"argv": ["node", "server.ts"]},
+            ToolResult(
+                "call", True, message="command exited 1",
+                data={
+                    "execution_state": "failed_known", "succeeded": False,
+                    "failure_code": "PROCESS_EXIT_NON_ZERO", "exit_code": 1,
+                },
+            ),
+        )
         decision = await RuntimeFinalizationGate().evaluate(
             state, ModelResponse(
                 _message("answer", MessageRole.ASSISTANT, "The command exited with code 1."),
                 FinishReason.STOP,
             ),
         )
+        self.assertIs(decision.action, FinalizationAction.CONTINUE)
+        self.assertEqual(decision.reason_code, "latest_delivery_action_failed")
+
+    async def test_failed_delivery_action_allows_blocker_after_one_continuation(self) -> None:
+        state = self._state()
+        state.runtime_continuations = 1
+        state.visible_tool_by_name = {
+            "core.run_command": self._spec(
+                "core.run_command", ToolEffect.EXECUTE,
+                ToolResultAuthority.PROCESS_FACT,
+            ),
+        }
+        state.messages = self._tool_exchange(
+            "call", "core.run_command", {"argv": ["node", "server.ts"]},
+            ToolResult(
+                "call", True,
+                data={"succeeded": False, "failure_code": "PROCESS_EXIT_NON_ZERO"},
+            ),
+        )
+        decision = await RuntimeFinalizationGate().evaluate(
+            state, ModelResponse(
+                _message("answer", MessageRole.ASSISTANT, "The dependency is absent."),
+                FinishReason.STOP,
+            ),
+        )
         self.assertIs(decision.action, FinalizationAction.ACCEPT)
-        self.assertEqual(decision.reason_code, "runtime_state_terminal")
+        self.assertEqual(
+            decision.reason_code, "latest_delivery_action_failed_blocker_visible",
+        )
+
+    async def test_mutation_without_post_change_verification_gets_one_turn(self) -> None:
+        state = self._state()
+        state.visible_tool_by_name = {
+            "core.apply_patch": self._spec(
+                "core.apply_patch", ToolEffect.MUTATE,
+                ToolResultAuthority.MUTATION_FACT,
+            ),
+        }
+        state.messages = self._tool_exchange(
+            "call", "core.apply_patch", {"path": "app.py"},
+            ToolResult("call", True, data={"mutation_id": "mutation-1"}),
+        )
+        decision = await RuntimeFinalizationGate().evaluate(
+            state, ModelResponse(
+                _message("answer", MessageRole.ASSISTANT, "Changed app.py."),
+                FinishReason.STOP,
+            ),
+        )
+        self.assertIs(decision.action, FinalizationAction.CONTINUE)
+        self.assertEqual(
+            decision.reason_code, "post_mutation_verification_missing",
+        )
+
+    async def test_failed_post_change_verification_gets_one_turn(self) -> None:
+        state = self._state()
+        state.visible_tool_by_name = {
+            "core.apply_patch": self._spec(
+                "core.apply_patch", ToolEffect.MUTATE,
+                ToolResultAuthority.MUTATION_FACT,
+            ),
+            "core.run_command": self._spec(
+                "core.run_command", ToolEffect.EXECUTE,
+                ToolResultAuthority.PROCESS_FACT,
+            ),
+        }
+        state.messages = self._tool_exchange(
+            "patch", "core.apply_patch", {"path": "app.py"},
+            ToolResult("patch", True, data={"mutation_id": "mutation-1"}),
+        ) + self._tool_exchange(
+            "test", "core.run_command", {"argv": ["python", "-m", "pytest"]},
+            ToolResult(
+                "test", True,
+                data={"succeeded": False, "failure_code": "PROCESS_EXIT_NON_ZERO"},
+            ),
+        )
+        decision = await RuntimeFinalizationGate().evaluate(
+            state, ModelResponse(
+                _message("answer", MessageRole.ASSISTANT, "The test failed."),
+                FinishReason.STOP,
+            ),
+        )
+        self.assertIs(decision.action, FinalizationAction.CONTINUE)
+        self.assertEqual(
+            decision.reason_code, "post_mutation_verification_failed",
+        )
 
 
 class CompletionReviewConfigurationTest(unittest.TestCase):

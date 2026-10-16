@@ -262,7 +262,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                     "runtime.inspect_session", "runtime.search_history",
                     "web.search", "web.fetch_markdown", "web.open",
                     "web.find_in_page", "web.read", "content.summarize",
-                    "core.run_command",
+                    "core.run_command", "core.process_wait",
                     "core.process_status", "core.process_logs",
                     "core.process_stop", "core.apply_patch",
                     "core.apply_patch_v4a", "core.apply_patches", "core.delete_file",
@@ -396,7 +396,13 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                     ApprovalDecision.APPROVE, "approve exact Python smoke command",
                 )
                 self.assertTrue(result.ok)
-                self.assertEqual(result.data["stdout"]["text"], "gate-ok\n")
+                waited = await application.kernel.invoke_tool(
+                    task.task_id, "turn-local-gate-wait",
+                    ToolCall("call-local-gate-wait", "core.process_wait", {
+                        "process_id": result.data["process_id"], "wait_seconds": 1,
+                    }),
+                )
+                self.assertEqual(waited.data["stdout"]["text"], "gate-ok\n")
             finally:
                 await application.registry.stop_all()
 
