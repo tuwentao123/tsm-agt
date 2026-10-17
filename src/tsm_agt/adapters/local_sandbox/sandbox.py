@@ -29,7 +29,7 @@ from tsm_agt.ports import (
 
 _ALLOWED_EXECUTABLES = frozenset(
     {
-        "adb", "bun", "bundle", "cargo", "cmake", "dart",
+        "adb", "bun", "bundle", "cargo", "cmake", "curl", "dart",
         "flutter", "gh", "git", "go", "gradle", "gradlew", "java",
         "javac", "kotlinc", "make", "ninja", "node", "npm",
         "npx", "pnpm", "pytest", "ruby", "ruff", "rustc",

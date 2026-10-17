@@ -890,11 +890,41 @@ class TaskMixin:
         return snapshot
 
     async def _task_spec_context_message(self, task_id: str) -> Message:
-        snapshot = await self.get_task_spec(task_id)
         task = await self.get_task(task_id)
         workspace = self._dependencies.workspace_path.normalize_workspace(
             Path(task.workspace)
         )
+        # A Conversation has a durable task record for lifecycle and audit, but
+        # it has no durable *semantic* task contract.  Its original goal must
+        # never re-enter a later model sample as the current request.
+        if task.task_kind is TaskKind.CONVERSATION:
+            context_data = {
+                "boundary": "conversation_runtime_environment",
+                "runtime_environment": {
+                    "primary_workspace": str(workspace),
+                    "relative_path_base": str(workspace),
+                    "path_semantics": (
+                        "Relative paths including '.' use this base; the base is not "
+                        "evidence that a user-named target is this workspace."
+                    ),
+                    "external_reads": (
+                        "Pass the requested path; Runtime may require Task-scoped approval."
+                    ),
+                },
+                "conversation": {
+                    "current_request_source": "latest user message",
+                    "initial_task_goal": "audit metadata only; not prompt context",
+                },
+            }
+            body = json.dumps(
+                context_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            return Message(
+                f"conversation-environment-context-{canonical_hash(context_data)[:16]}",
+                MessageRole.SYSTEM, (TextBlock(body),),
+            )
+
+        snapshot = await self.get_task_spec(task_id)
         context_data = {
             "boundary": "inspectable_task_spec",
             "runtime_environment": {
@@ -908,19 +938,7 @@ class TaskMixin:
                     "Pass the requested path; Runtime may require Task-scoped approval."
                 ),
             },
-            "task_spec": (
-                # A conversation spans unrelated requests: the initial SPEC is
-                # background, never the acceptance criteria for the current turn.
-                {
-                    "advisory": True,
-                    "reason": (
-                        "conversation task; the current request is the latest "
-                        "user message"
-                    ),
-                }
-                if task.task_kind is TaskKind.CONVERSATION
-                else snapshot.to_data()
-            ),
+            "task_spec": snapshot.to_data(),
         }
         body = json.dumps(
             context_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")

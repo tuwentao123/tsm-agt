@@ -6,12 +6,15 @@ from datetime import datetime, timezone
 from tsm_agt.core import ToolCommitState, ToolExecutionRecord
 from tsm_agt.ports import (
     SourceArtifact,
+    ModelToolContract,
     ToolCall,
     ToolEffect,
     ToolFactDescriptor,
+    ToolFactCapability,
     ToolIdempotency,
     ToolProtocol,
     ToolResult,
+    ToolResultMaterialization,
     ToolResultAuthority,
     ToolRisk,
     ToolSpec,
@@ -57,6 +60,39 @@ class ToolContractTest(unittest.TestCase):
         self.assertEqual(spec.to_data()["risk"], "R0")
         self.assertEqual(call.to_data()["arguments"], {"text": "hello"})
         self.assertTrue(result.to_data()["ok"])
+
+    def test_model_tool_contract_is_separate_from_runtime_description(self) -> None:
+        spec = ToolSpec(
+            "fixture.inspect", "Verbose operator documentation.",
+            {"type": "object"}, ToolRisk.R0,
+            model_contract=ModelToolContract(
+                purpose="Inspect one fixture.",
+                use_when=("a fixture must be examined",),
+                avoid_when=("a mutation is needed",),
+                returns=("bounded fixture content",),
+            ),
+        )
+        self.assertEqual(spec.model_description().splitlines()[0], "Inspect one fixture.")
+        self.assertEqual(spec.to_data()["description"], "Verbose operator documentation.")
+        self.assertEqual(spec.to_data()["model_contract"]["purpose"], "Inspect one fixture.")
+
+    def test_tool_fact_materialization_and_capabilities_round_trip(self) -> None:
+        descriptor = ToolFactDescriptor(
+            "workspace_read",
+            materialization=ToolResultMaterialization.CONTENT,
+            capabilities=(ToolFactCapability.DESCRIBE_CONTENT,),
+        )
+        self.assertEqual(ToolFactDescriptor.from_data(descriptor.to_data()), descriptor)
+
+    def test_legacy_tool_fact_descriptor_defaults_to_unknown_semantics(self) -> None:
+        descriptor = ToolFactDescriptor.from_data({
+            "authority": "legacy_workspace_read",
+            "scope": [],
+            "artifact_refs": [],
+            "source_artifacts": [],
+        })
+        self.assertIs(descriptor.materialization, ToolResultMaterialization.UNKNOWN)
+        self.assertEqual(descriptor.capabilities, ())
 
     def test_tool_call_v2_has_only_protocol_fields(self) -> None:
         call = ToolCall("call-read", "core.read_file", {"path": "README.md"})

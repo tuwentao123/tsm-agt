@@ -477,10 +477,15 @@ class TaskSpecKernelTest(unittest.IsolatedAsyncioTestCase):
                 ))
                 message = await app.kernel._task_spec_context_message(task.task_id)
                 self.assertEqual(message.role, MessageRole.SYSTEM)
+                self.assertTrue(
+                    message.message_id.startswith("conversation-environment-context-")
+                )
                 self.assertIn(str(root.resolve()), message.text)
                 self.assertIn("relative_path_base", message.text)
                 self.assertIn("not evidence", message.text)
                 self.assertIn("Task-scoped approval", message.text)
+                self.assertNotIn("inspect another repository if the user asks", message.text)
+                self.assertNotIn('"task_spec"', message.text)
             finally:
                 await app.registry.stop_all()
 

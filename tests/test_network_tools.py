@@ -20,7 +20,8 @@ from tsm_agt.retrieval.schemas import RetrievalResult, RetrievalSearchResponse
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import CoreToolPolicy, PolicyAction, ProjectTrustLevel, TaskState
 from tsm_agt.ports import (
-    AdapterContext, ToolCall, ToolEffect,
+    AdapterContext, ToolCall, ToolEffect, ToolFactCapability,
+    ToolResultMaterialization,
 )
 
 
@@ -885,6 +886,14 @@ class WebOpenAndFindTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.data["provenance"]["source"], "web.fetch_markdown")
         self.assertEqual(result.fact_descriptor.authority, "external_web_document")
         self.assertEqual(result.fact_descriptor.scope, ("task:task-a", "turn:turn-a"))
+        self.assertEqual(
+            result.fact_descriptor.materialization,
+            ToolResultMaterialization.CONTENT,
+        )
+        self.assertEqual(
+            result.fact_descriptor.capabilities,
+            (ToolFactCapability.DESCRIBE_CONTENT,),
+        )
 
     async def test_open_previews_large_documents_and_keeps_full_text_searchable(self):
         content = "HEAD\n" + ("a" * 12_000) + "\nMIDDLE_TOKEN\n" + ("z" * 12_000) + "\nTAIL"
@@ -1145,6 +1154,10 @@ class WebOpenAndFindTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider._fetch_transport.calls, [self.URL])
         self.assertEqual(found.data["content_hash"], opened.data["content_hash"])
         self.assertEqual(found.fact_descriptor.artifact_refs[0], opened.data["document_ref"])
+        self.assertEqual(
+            found.fact_descriptor.materialization,
+            ToolResultMaterialization.LOCATOR,
+        )
 
     async def test_refs_and_documents_do_not_cross_task_or_turn_scopes(self):
         provider = await self._provider({

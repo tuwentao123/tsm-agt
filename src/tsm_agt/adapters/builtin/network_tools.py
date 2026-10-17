@@ -30,13 +30,16 @@ from tsm_agt.ports import (
     AdapterDescriptor,
     HealthState,
     HealthStatus,
+    ModelToolContract,
     ToolCall,
     ToolEffect,
+    ToolFactCapability,
     ToolIdempotency,
     ToolInvocationContext,
     ToolFactDescriptor,
     ToolResult,
     ToolResultAuthority,
+    ToolResultMaterialization,
     ToolRisk,
     ToolSpec,
     WebEgressMode,
@@ -1049,8 +1052,8 @@ class NetworkToolProvider:
             parameters={
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
-                    "top_k": {"type": "integer"},
+                    "query": {"type": "string", "description": "Public-web search query; required."},
+                    "top_k": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Maximum leads to return; defaults to 5."},
                     "freshness": {
                         "type": "string",
                         "enum": list(FRESHNESS_VALUES),
@@ -1072,6 +1075,12 @@ class NetworkToolProvider:
             rollback="read-only public search request; no remote mutation",
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.EXTERNAL_SERVICE,
+            model_contract=ModelToolContract(
+                purpose="Find public-web documents that may answer a question.",
+                use_when=("a current or external source must be located",),
+                avoid_when=("you need to claim document details from a result snippet; open or fetch the relevant result first",),
+                returns=("search-result leads with URLs/ref_ids and optional publish times", "no document content is materialized"),
+            ),
         ),
         ToolSpec(
             name="web.fetch_markdown",
@@ -1083,7 +1092,7 @@ class NetworkToolProvider:
             ),
             parameters={
                 "type": "object",
-                "properties": {"url": {"type": "string", "format": "uri"}},
+                "properties": {"url": {"type": "string", "format": "uri", "description": "One public HTTP(S) document URL."}},
                 "required": ["url"],
                 "additionalProperties": False,
             },
@@ -1096,6 +1105,12 @@ class NetworkToolProvider:
             rollback="read-only bounded public document request; no remote mutation",
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.EXTERNAL_SERVICE,
+            model_contract=ModelToolContract(
+                purpose="Fetch and materialize one public document as bounded readable text.",
+                use_when=("a known public URL needs to be read",),
+                avoid_when=("you need a repository tree or source history; use GitHub source tools or a task command",),
+                returns=("document content, canonical URL, content hash, and truncation state",),
+            ),
         ),
         ToolSpec(
             name="web.open",
@@ -1107,8 +1122,8 @@ class NetworkToolProvider:
             parameters={
                 "type": "object",
                 "properties": {
-                    "ref_id": {"type": "string", "minLength": 1},
-                    "url": {"type": "string", "format": "uri"},
+                    "ref_id": {"type": "string", "minLength": 1, "description": "Task/turn-scoped search lead to open."},
+                    "url": {"type": "string", "format": "uri", "description": "One public HTTP(S) document URL when no ref_id is available."},
                 },
                 "additionalProperties": False,
             },
@@ -1121,6 +1136,12 @@ class NetworkToolProvider:
             rollback="read-only bounded public document request; no remote mutation",
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.EXTERNAL_SERVICE,
+            model_contract=ModelToolContract(
+                purpose="Open one public document from a search lead or explicit URL.",
+                use_when=("a search lead needs source content",),
+                avoid_when=("you only need to locate candidates; use web.search",),
+                returns=("a bounded document preview plus document_ref for follow-up reads/searches", "preview truncation means the full document was not shown"),
+            ),
         ),
         ToolSpec(
             name="web.find_in_page",
@@ -1131,9 +1152,9 @@ class NetworkToolProvider:
             parameters={
                 "type": "object",
                 "properties": {
-                    "document_ref": {"type": "string", "minLength": 1},
-                    "pattern": {"type": "string", "minLength": 1},
-                    "max_matches": {"type": "integer", "minimum": 1, "maximum": _MAX_FIND_MATCHES},
+                    "document_ref": {"type": "string", "minLength": 1, "description": "Task/turn-scoped ref returned by web.open or fetch."},
+                    "pattern": {"type": "string", "minLength": 1, "description": "Literal text to locate within that document."},
+                    "max_matches": {"type": "integer", "minimum": 1, "maximum": _MAX_FIND_MATCHES, "description": "Maximum matches to return."},
                 },
                 "required": ["document_ref", "pattern"],
                 "additionalProperties": False,
@@ -1147,6 +1168,12 @@ class NetworkToolProvider:
             rollback="reads an already-opened bounded document only; no remote mutation",
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.DERIVED,
+            model_contract=ModelToolContract(
+                purpose="Locate text offsets in one already-opened document.",
+                use_when=("a long document needs a relevant passage located",),
+                avoid_when=("you need surrounding or complete content; use web.read at the returned offset",),
+                returns=("matching offsets and snippets only",),
+            ),
         ),
         ToolSpec(
             name="web.read",
@@ -1159,11 +1186,12 @@ class NetworkToolProvider:
             parameters={
                 "type": "object",
                 "properties": {
-                    "document_ref": {"type": "string", "minLength": 1},
-                    "offset": {"type": "integer", "minimum": 0},
+                    "document_ref": {"type": "string", "minLength": 1, "description": "Task/turn-scoped ref returned by web.open or fetch."},
+                    "offset": {"type": "integer", "minimum": 0, "description": "Zero-based character offset; defaults to 0."},
                     "max_chars": {
                         "type": "integer", "minimum": 1,
                         "maximum": _MAX_WEB_PREVIEW_CHARS,
+                        "description": "Maximum characters in this window.",
                     },
                 },
                 "required": ["document_ref"],
@@ -1178,6 +1206,12 @@ class NetworkToolProvider:
             rollback="reads an already-opened bounded document only; no remote mutation",
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.DERIVED,
+            model_contract=ModelToolContract(
+                purpose="Read one bounded content window from an already-opened document.",
+                use_when=("a relevant offset is known or more of an opened document is needed",),
+                avoid_when=("the document has not been opened in this turn",),
+                returns=("a content window and next offset when more content remains",),
+            ),
         ),
         ToolSpec(
             name="source.github.resolve",
@@ -1394,7 +1428,13 @@ class NetworkToolProvider:
                 )
                 if failure is not None:
                     return failure
-                fact_descriptor = self._fact_descriptor(scope, data)
+                fact_descriptor = self._fact_descriptor(
+                    scope,
+                    data,
+                    authority="external_web_search",
+                    materialization=ToolResultMaterialization.POINTER,
+                    capabilities=(ToolFactCapability.LOCATE_RESOURCE,),
+                )
             elif call.name == "web.fetch_markdown":
                 if not self._enable_fetch:
                     return ToolResult(
@@ -1404,7 +1444,13 @@ class NetworkToolProvider:
                 data = await asyncio.to_thread(
                     self._fetch_document, call.arguments, scope
                 )
-                fact_descriptor = self._fact_descriptor(scope, data)
+                fact_descriptor = self._fact_descriptor(
+                    scope,
+                    data,
+                    authority="external_web_document",
+                    materialization=ToolResultMaterialization.CONTENT,
+                    capabilities=(ToolFactCapability.DESCRIBE_CONTENT,),
+                )
             elif call.name == "web.open":
                 if not self._enable_fetch:
                     return ToolResult(
@@ -1414,7 +1460,13 @@ class NetworkToolProvider:
                 data = await asyncio.to_thread(
                     self._open_document, call.arguments, scope
                 )
-                fact_descriptor = self._fact_descriptor(scope, data)
+                fact_descriptor = self._fact_descriptor(
+                    scope,
+                    data,
+                    authority="external_web_document",
+                    materialization=ToolResultMaterialization.CONTENT,
+                    capabilities=(ToolFactCapability.DESCRIBE_CONTENT,),
+                )
             elif call.name == "web.find_in_page":
                 if not self._enable_fetch:
                     return ToolResult(
@@ -1424,7 +1476,13 @@ class NetworkToolProvider:
                 data = await asyncio.to_thread(
                     self._find_in_page, call.arguments, scope
                 )
-                fact_descriptor = self._fact_descriptor(scope, data)
+                fact_descriptor = self._fact_descriptor(
+                    scope,
+                    data,
+                    authority="external_web_document",
+                    materialization=ToolResultMaterialization.LOCATOR,
+                    capabilities=(ToolFactCapability.LOCATE_RESOURCE,),
+                )
             elif call.name == "web.read":
                 if not self._enable_fetch:
                     return ToolResult(
@@ -1434,13 +1492,27 @@ class NetworkToolProvider:
                 data = await asyncio.to_thread(
                     self._read_document, call.arguments, scope
                 )
-                fact_descriptor = self._fact_descriptor(scope, data)
+                fact_descriptor = self._fact_descriptor(
+                    scope,
+                    data,
+                    authority="external_web_document",
+                    materialization=ToolResultMaterialization.CONTENT,
+                    capabilities=(ToolFactCapability.DESCRIBE_CONTENT,),
+                )
             elif call.name == "source.github.resolve":
                 data = self._resolve_github_source(call.arguments, scope)
                 fact_descriptor = self._github_fact_descriptor(scope, data)
             elif call.name == "content.summarize":
                 data = self._summarize(call.arguments)
-                fact_descriptor = None
+                fact_descriptor = ToolFactDescriptor(
+                    authority="derived_summary",
+                    scope=(f"task:{scope[0]}", f"turn:{scope[1]}"),
+                    content_hash="sha256:" + hashlib.sha256(
+                        str(call.arguments["content"]).encode("utf-8")
+                    ).hexdigest(),
+                    materialization=ToolResultMaterialization.DERIVED,
+                    capabilities=(ToolFactCapability.DESCRIBE_DERIVED,),
+                )
             else:
                 return ToolResult(call.call_id, False, error_code="NOT_FOUND", message=f"unknown network tool: {call.name}")
             return ToolResult(
@@ -1766,6 +1838,8 @@ class NetworkToolProvider:
             scope=tuple(fact_scope),
             artifact_refs=(str(data["canonical_url"]),),
             content_hash=str(data["content_hash"]),
+            materialization=ToolResultMaterialization.POINTER,
+            capabilities=(ToolFactCapability.LOCATE_RESOURCE,),
         )
 
     def _store_document(
@@ -1995,13 +2069,29 @@ class NetworkToolProvider:
 
     @staticmethod
     def _fact_descriptor(
-        scope: tuple[str, str], data: Mapping[str, Any],
+        scope: tuple[str, str], data: Mapping[str, Any], *,
+        authority: str,
+        materialization: ToolResultMaterialization,
+        capabilities: tuple[ToolFactCapability, ...],
     ) -> ToolFactDescriptor:
-        artifact_refs = tuple(
+        artifact_ref_values: list[str] = [
             str(value) for value in (
                 data.get("document_ref"), data.get("canonical_url"),
             ) if isinstance(value, str) and value
-        )
+        ]
+        # A search response names potential documents but has not materialized
+        # any of them. Preserve its stable per-turn ref IDs as leads without
+        # letting result metadata masquerade as document content.
+        results = data.get("results")
+        if isinstance(results, list):
+            for result in results:
+                if not isinstance(result, Mapping):
+                    continue
+                for key in ("ref_id", "url"):
+                    value = result.get(key)
+                    if isinstance(value, str) and value:
+                        artifact_ref_values.append(value)
+        artifact_refs = tuple(dict.fromkeys(artifact_ref_values))
         observed_at = None
         provenance = data.get("provenance")
         if isinstance(provenance, Mapping):
@@ -2009,7 +2099,7 @@ class NetworkToolProvider:
             observed_at = str(value) if isinstance(value, str) and value else None
         content_hash = data.get("content_hash")
         return ToolFactDescriptor(
-            authority="external_web_document",
+            authority=authority,
             scope=(f"task:{scope[0]}", f"turn:{scope[1]}"),
             artifact_refs=artifact_refs,
             observed_at=observed_at,
@@ -2017,6 +2107,8 @@ class NetworkToolProvider:
                 str(content_hash)
                 if isinstance(content_hash, str) and content_hash else None
             ),
+            materialization=materialization,
+            capabilities=capabilities,
         )
 
     def _fetch_markdown(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:

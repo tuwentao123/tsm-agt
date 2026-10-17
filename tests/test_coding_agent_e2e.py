@@ -215,7 +215,6 @@ class CodingAgentEndToEndTest(unittest.IsolatedAsyncioTestCase):
                                     "py_compile", "calc.py",
                                 ],
                                 "cwd": ".",
-                                "mode": "foreground",
                             },
                             outcome_ref="verification_results",
                         ),

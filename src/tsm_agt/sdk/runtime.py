@@ -1636,12 +1636,25 @@ class EngineeringAgentClient:
             raise CommandInProgress(
                 f"Runtime command is already in progress: {normalized_id}"
             )
-        value = execute()
-        if asyncio.iscoroutine(value):
-            value = await value
-        encoded = dict(serialize(value))
+        try:
+            value = execute()
+            if asyncio.iscoroutine(value):
+                value = await value
+            encoded = dict(serialize(value))
+        except Exception as error:
+            # A background command must never retain an in_progress receipt
+            # forever after its coroutine has already failed.  Persist only a
+            # stable category: exception text can contain untrusted paths or
+            # provider details and belongs in the Task event stream instead.
+            await self._store().fail_runtime_command(
+                normalized_id, request_hash, {
+                    "error_code": "RUNTIME_COMMAND_FAILED",
+                    "error_type": type(error).__name__,
+                },
+            )
+            raise
         persisted = _redact_command_result(encoded)
-        completed = await self._store().complete_runtime_command(
+        await self._store().complete_runtime_command(
             normalized_id, request_hash, persisted
         )
         return RuntimeCommandResult(normalized_id, False, encoded)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -9,9 +10,12 @@ from datetime import datetime
 from pathlib import Path
 
 from tsm_agt.adapters.local_sandbox import LocalWorkspaceSandbox
+from tsm_agt.adapters.builtin import CoreProcessToolProvider
 from tsm_agt.adapters.posix_path import PosixWorkspacePath
 from tsm_agt.adapters.windows_path import WindowsWorkspacePath
-from tsm_agt.ports import AdapterContext, SandboxRequest
+from tsm_agt.bootstrap import compose_fixture_application
+from tsm_agt.core import ApprovalDecision, ApprovalRequired, ProjectTrustLevel, TaskState
+from tsm_agt.ports import AdapterContext, SandboxRequest, ToolCall, ToolRisk
 
 
 class LocalWorkspaceSandboxTest(unittest.IsolatedAsyncioTestCase):
@@ -61,10 +65,54 @@ class LocalWorkspaceSandboxTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_denies_unlisted_executable(self) -> None:
         decision = await self.sandbox.authorize(SandboxRequest(
-            ("curl", "https://example.test"), self.workspace, self.environment
+            ("wget", "https://example.test"), self.workspace, self.environment
         ))
         self.assertFalse(decision.allowed)
         self.assertIn("allowlist", decision.reason)
+
+    async def test_allows_curl_at_execution_boundary(self) -> None:
+        for executable in ("curl", "/usr/bin/curl"):
+            with self.subTest(executable=executable):
+                if executable.startswith("/") and not Path(executable).is_file():
+                    continue
+                decision = await self.sandbox.authorize(SandboxRequest(
+                    (executable, "http://localhost:5176/dashboard"),
+                    self.workspace, self.environment,
+                ))
+                self.assertTrue(decision.allowed, decision.reason)
+
+    async def test_approved_curl_starts_with_real_sandbox(self) -> None:
+        if shutil.which("curl") is None:
+            self.skipTest("curl is not installed")
+        application = compose_fixture_application(
+            sandbox_adapter=self.sandbox,
+            tool_adapters=(CoreProcessToolProvider(),),
+        )
+        await application.registry.start_all()
+        try:
+            kernel = application.kernel
+            await kernel.set_project_trust(self.workspace, ProjectTrustLevel.TRUSTED_BUILD)
+            task = await kernel.create_task("check curl", self.workspace, "task-curl")
+            for state in (
+                TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING, TaskState.EXECUTING,
+            ):
+                task = await kernel.transition_task(task.task_id, state, state.value)
+            with self.assertRaises(ApprovalRequired) as caught:
+                await kernel.invoke_tool(task.task_id, "turn-curl", ToolCall(
+                    "call-curl", "core.run_command",
+                    {"argv": ["curl", "--version"], "cwd": "."},
+                ))
+            request = caught.exception.request
+            self.assertEqual(request.risk, ToolRisk.R3)
+            result = await kernel.resolve_approval(
+                task.task_id, request.request_id, request.payload_hash,
+                ApprovalDecision.APPROVE, "approved exact curl command",
+            )
+            self.assertTrue(result.ok, result.message)
+            self.assertTrue(result.data["started"])
+        finally:
+            await application.registry.stop_all()
 
     async def test_clone_destination_must_stay_inside_the_workspace(self) -> None:
         inside = await self.sandbox.authorize(SandboxRequest(

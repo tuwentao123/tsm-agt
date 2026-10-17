@@ -432,7 +432,7 @@ class AnthropicMessagesModelProvider:
 
     def _tool_to_provider(self, tool: Any, name: str, outcome_refs: tuple[str, ...]) -> dict[str, Any]:
         parameters = dict(tool.parameters)
-        description = tool.description
+        description = tool.model_description()
         if outcome_refs:
             properties = dict(parameters.get("properties", {}))
             properties["outcome_ref"] = {"type": "string"}

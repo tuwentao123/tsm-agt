@@ -214,6 +214,19 @@ class InMemoryRuntimeStore:
         self._runtime_commands[command_id] = completed
         return completed
 
+    async def fail_runtime_command(
+        self, command_id: str, request_hash: str, result: Mapping[str, Any]
+    ) -> RuntimeCommandRecord:
+        prior = self._runtime_commands.get(command_id)
+        if prior is None or prior.request_hash != request_hash:
+            raise ValueError("Runtime command is missing or does not match")
+        failed = RuntimeCommandRecord(
+            prior.command_id, prior.command_type, prior.request_hash, "failed",
+            dict(result), prior.created_at, datetime.now().astimezone(),
+        )
+        self._runtime_commands[command_id] = failed
+        return failed
+
     async def list_sessions(
         self, subject: str, *, include_archived: bool = False
     ) -> tuple[StoredSession, ...]:

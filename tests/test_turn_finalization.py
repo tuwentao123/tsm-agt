@@ -149,7 +149,7 @@ class RuntimeFinalizationGateTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(decision.action, FinalizationAction.INCOMPLETE)
         self.assertEqual(decision.reason_code, "empty_response_budget_exhausted")
 
-    async def test_unstarted_execution_gets_one_recovery_turn(self) -> None:
+    async def test_unstarted_execution_can_end_with_a_model_visible_blocker(self) -> None:
         state = self._state()
         state.messages = [Message(
             "tool-result", MessageRole.TOOL, (ToolResultBlock(ToolResult(
@@ -165,10 +165,10 @@ class RuntimeFinalizationGateTest(unittest.IsolatedAsyncioTestCase):
                 FinishReason.STOP,
             ),
         )
-        self.assertIs(decision.action, FinalizationAction.CONTINUE)
-        self.assertEqual(decision.reason_code, "unresolved_execution_outcome")
+        self.assertIs(decision.action, FinalizationAction.ACCEPT)
+        self.assertEqual(decision.reason_code, "runtime_state_terminal")
 
-    async def test_unstarted_execution_allows_evidence_based_blocker_after_recovery(self) -> None:
+    async def test_unstarted_execution_does_not_depend_on_prior_runtime_recovery(self) -> None:
         state = self._state()
         state.runtime_continuations = 1
         state.messages = [Message(
@@ -186,9 +186,9 @@ class RuntimeFinalizationGateTest(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.assertIs(decision.action, FinalizationAction.ACCEPT)
-        self.assertEqual(decision.reason_code, "unstarted_execution_blocker_visible")
+        self.assertEqual(decision.reason_code, "runtime_state_terminal")
 
-    async def test_known_process_failure_gets_one_recovery_turn(self) -> None:
+    async def test_known_process_failure_does_not_force_a_retry_turn(self) -> None:
         state = self._state()
         state.visible_tool_by_name = {
             "core.run_command": self._spec(
@@ -212,10 +212,10 @@ class RuntimeFinalizationGateTest(unittest.IsolatedAsyncioTestCase):
                 FinishReason.STOP,
             ),
         )
-        self.assertIs(decision.action, FinalizationAction.CONTINUE)
-        self.assertEqual(decision.reason_code, "latest_delivery_action_failed")
+        self.assertIs(decision.action, FinalizationAction.ACCEPT)
+        self.assertEqual(decision.reason_code, "runtime_state_terminal")
 
-    async def test_failed_delivery_action_allows_blocker_after_one_continuation(self) -> None:
+    async def test_failed_delivery_action_can_end_even_with_no_runtime_continuation(self) -> None:
         state = self._state()
         state.runtime_continuations = 1
         state.visible_tool_by_name = {
@@ -238,11 +238,9 @@ class RuntimeFinalizationGateTest(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.assertIs(decision.action, FinalizationAction.ACCEPT)
-        self.assertEqual(
-            decision.reason_code, "latest_delivery_action_failed_blocker_visible",
-        )
+        self.assertEqual(decision.reason_code, "runtime_state_terminal")
 
-    async def test_mutation_without_post_change_verification_gets_one_turn(self) -> None:
+    async def test_mutation_without_post_change_verification_does_not_force_a_turn(self) -> None:
         state = self._state()
         state.visible_tool_by_name = {
             "core.apply_patch": self._spec(
@@ -260,12 +258,10 @@ class RuntimeFinalizationGateTest(unittest.IsolatedAsyncioTestCase):
                 FinishReason.STOP,
             ),
         )
-        self.assertIs(decision.action, FinalizationAction.CONTINUE)
-        self.assertEqual(
-            decision.reason_code, "post_mutation_verification_missing",
-        )
+        self.assertIs(decision.action, FinalizationAction.ACCEPT)
+        self.assertEqual(decision.reason_code, "runtime_state_terminal")
 
-    async def test_failed_post_change_verification_gets_one_turn(self) -> None:
+    async def test_failed_post_change_verification_does_not_force_a_turn(self) -> None:
         state = self._state()
         state.visible_tool_by_name = {
             "core.apply_patch": self._spec(
@@ -293,10 +289,8 @@ class RuntimeFinalizationGateTest(unittest.IsolatedAsyncioTestCase):
                 FinishReason.STOP,
             ),
         )
-        self.assertIs(decision.action, FinalizationAction.CONTINUE)
-        self.assertEqual(
-            decision.reason_code, "post_mutation_verification_failed",
-        )
+        self.assertIs(decision.action, FinalizationAction.ACCEPT)
+        self.assertEqual(decision.reason_code, "runtime_state_terminal")
 
 
 class CompletionReviewConfigurationTest(unittest.TestCase):

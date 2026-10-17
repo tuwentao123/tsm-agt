@@ -498,6 +498,36 @@ class SQLiteRuntimeStore:
                 connection.execute("ROLLBACK")
             raise
 
+    async def fail_runtime_command(
+        self, command_id: str, request_hash: str, result: Mapping[str, Any]
+    ) -> RuntimeCommandRecord:
+        connection = self._require_connection()
+        encoded = self._encode_mapping(result, "Runtime command result")
+        updated_at = datetime.now().astimezone()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                "SELECT * FROM runtime_commands WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if row is None or str(row["request_hash"]) != request_hash:
+                raise ValueError("Runtime command is missing or does not match")
+            connection.execute(
+                "UPDATE runtime_commands SET status='failed', result_json=?, updated_at=? WHERE command_id=?",
+                (encoded, updated_at.isoformat(), command_id),
+            )
+            failed_row = connection.execute(
+                "SELECT * FROM runtime_commands WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            connection.execute("COMMIT")
+            assert failed_row is not None
+            return self._decode_runtime_command(failed_row)
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+
     async def list_sessions(
         self, subject: str, *, include_archived: bool = False
     ) -> tuple[StoredSession, ...]:
@@ -979,6 +1009,11 @@ class SQLiteRuntimeReader(SQLiteRuntimeStore):
         raise RuntimeError("SQLite runtime reader does not allow writes")
 
     async def complete_runtime_command(
+        self, command_id: str, request_hash: str, result: Mapping[str, Any]
+    ) -> RuntimeCommandRecord:
+        raise RuntimeError("SQLite runtime reader does not allow writes")
+
+    async def fail_runtime_command(
         self, command_id: str, request_hash: str, result: Mapping[str, Any]
     ) -> RuntimeCommandRecord:
         raise RuntimeError("SQLite runtime reader does not allow writes")

@@ -4,12 +4,19 @@ import hashlib
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from tsm_agt.adapters.builtin import CoreWorkspaceMutationToolProvider
 from tsm_agt.bootstrap import compose_fixture_application, compose_readonly_application
-from tsm_agt.core import ApprovalDecision, ApprovalRequired, TaskState
-from tsm_agt.ports import ToolRecoveryKind
+from tsm_agt.core import (
+    ApprovalDecision,
+    ApprovalKind,
+    ApprovalRequired,
+    TaskSnapshot,
+    TaskState,
+)
+from tsm_agt.ports import RuntimeStorePort, RuntimeUnitOfWork, ToolRecoveryKind
 from tsm_agt.ports import ToolCall
 
 
@@ -165,6 +172,69 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.workspace / "new.txt").read_text(), "created\n")
         self.assertEqual(result.data["operation"], "create")
         self.assertIsNone(result.data["backup_ref"])
+
+    async def test_new_nested_path_is_not_misclassified_as_external_write(self) -> None:
+        call = self.call(
+            "call-create-nested", "docs/new/spec.md", None,
+            [{"old_text": "", "new_text": "# spec\n"}],
+        )
+        with self.assertRaises(ApprovalRequired) as caught:
+            await self.application.kernel.invoke_tool(
+                self.task.task_id, "turn-create-nested", call
+            )
+
+        # This is still an R1 patch approval, but it is not an imaginary
+        # cross-workspace write merely because docs/new does not exist yet.
+        self.assertIs(caught.exception.request.kind, ApprovalKind.TOOL_ACTION)
+        result = await self.application.kernel.resolve_approval(
+            self.task.task_id,
+            caught.exception.request.request_id,
+            caught.exception.request.payload_hash,
+            ApprovalDecision.APPROVE,
+            "approve the new in-workspace file",
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            (self.workspace / "docs/new/spec.md").read_text(encoding="utf-8"),
+            "# spec\n",
+        )
+
+    async def test_legacy_internal_workspace_write_approval_can_complete(self) -> None:
+        call = self.call(
+            "call-legacy-create", "docs/new/legacy.md", None,
+            [{"old_text": "", "new_text": "# legacy\n"}],
+        )
+        with self.assertRaises(ApprovalRequired) as caught:
+            await self.application.kernel.invoke_tool(
+                self.task.task_id, "turn-legacy-create", call
+            )
+        request = caught.exception.request
+        store = self.application.registry.require(RuntimeStorePort)
+        stored = await store.load_task(self.task.task_id)
+        assert stored is not None
+        # Reproduce a record created before create-path containment was fixed.
+        legacy_request = replace(
+            request,
+            kind=ApprovalKind.WORKSPACE_WRITE,
+            workspace_access_root=str(self.workspace / "docs/new"),
+        )
+        legacy_task = replace(
+            TaskSnapshot.from_data(stored.data), pending_approval=legacy_request,
+        )
+        await store.commit(RuntimeUnitOfWork(
+            self.task.task_id, stored.version, legacy_task.to_data(), (),
+        ))
+
+        result = await self.application.kernel.resolve_approval(
+            self.task.task_id,
+            request.request_id,
+            request.payload_hash,
+            ApprovalDecision.APPROVE,
+            "approve the previously reviewed exact file patch",
+        )
+        self.assertTrue(result.ok)
+        current = await self.application.kernel.get_task(self.task.task_id)
+        self.assertEqual(current.workspace_access_grants, ())
 
     async def test_user_change_after_read_is_never_overwritten(self) -> None:
         target = self.workspace / "shared.txt"

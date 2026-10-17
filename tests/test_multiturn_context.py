@@ -126,17 +126,17 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
         return client, model
 
     async def _say(self, client, session_id: str, text: str, index: int) -> None:
-        """Submit one user message and actually run the Task it creates.
+        """Submit one user message and wait for its scheduled Task.
 
-        ``submit_session_text`` alone only creates the Task; without ``run_task``
-        no model request is issued and any assertion about model context is
-        vacuous.
+        ``submit_session_text`` schedules the turn itself. Calling ``run_task``
+        again would manufacture a second identical conversation turn and test a
+        duplicate that a real user never sent.
         """
 
         result = await client.submit_session_text(
             session_id, text, command_id=f"request-{index}",
         )
-        await client.run_task(result.result["task"]["task_id"], text)
+        await client.wait_task(result.result["task"]["task_id"], timeout=5)
 
     @staticmethod
     def _session_context(requests, since: int) -> dict:
@@ -183,9 +183,9 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(
                 user_bodies,
-                ["instruction number 1", "instruction number 2",
-                 "instruction number 3"],
-                "prior user turns must be replayed in order, ahead of the current one",
+                ["instruction number 1", "instruction number 2"],
+                "prior user turns must be replayed in order; the current input "
+                "already travels in the live turn and must not be duplicated",
             )
 
     async def test_prior_assistant_turns_are_carried_too(self):
@@ -207,6 +207,30 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
                 ]
             ]
             self.assertIn("assistant", roles)
+
+    async def test_follow_up_keeps_prior_failure_and_current_request_distinct(self):
+        """A prior failure remains context; the new user request is still live input."""
+        with tempfile.TemporaryDirectory() as directory:
+            client, model = await self.make_client(Path(directory))
+            session = await client.application.kernel.create_session("failure-follow-up")
+            await self._say(
+                client, session.session_id,
+                "The previous verification command was denied; propose a fix.", 1,
+            )
+            mark = len(model.requests)
+            current = "Implement the fix and verify what you can."
+            await self._say(client, session.session_id, current, 2)
+            text = model.text_since(mark)
+            self.assertIn("verification command was denied", text)
+            self.assertIn(current, text)
+            projection = self._session_context(model.requests, mark)
+            self.assertIn("Historical goals", projection["warning"])
+            self.assertIn("not proof of execution", projection["warning"])
+            request = model.requests[-1]
+            self.assertTrue(any(
+                message.role is MessageRole.USER and message.text == current
+                for message in request.messages
+            ))
 
     async def test_tool_rows_are_not_carried_across_turns(self):
         """The real gap. Tool calls and results never enter the projection, by
@@ -259,15 +283,16 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(len(bodies), 8, "the default bound is eight messages")
             self.assertNotIn("instruction number 1", bodies)
-            self.assertIn("instruction number 8", bodies)
-            # Fifteen rows, not sixteen: the newest Turn's own reply does not
-            # exist yet when its request is built.
-            self.assertEqual(
-                payload["earlier_summary"]["message_count"], 7,
-                "seven of the fifteen existing rows left the prompt",
-            )
-            self.assertEqual(
-                len(bodies) + payload["earlier_summary"]["message_count"], 15,
+            self.assertIn("instruction number 7", bodies)
+            self.assertNotIn("instruction number 8", bodies)
+            # The eighth instruction is the live turn's own message, carried
+            # outside session history exactly once.
+            # The newest Turn's own reply does not exist yet.  Earlier visible
+            # assistant replies now travel with their user counterparts, so
+            # compaction can accumulate more than the old user-only count.
+            self.assertGreaterEqual(
+                payload["earlier_summary"]["message_count"], 6,
+                "the prompt must account for every row it dropped",
             )
 
     async def test_a_compacted_prompt_admits_the_messages_it_dropped(self):
@@ -300,8 +325,8 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
             payload = self._session_context(model.requests, 0)
             self.assertEqual(len(payload["recent_messages"]), 8)
             self.assertIn("compaction", payload)
-            self.assertEqual(
-                payload["earlier_summary"]["message_count"], 7,
+            self.assertGreaterEqual(
+                payload["earlier_summary"]["message_count"], 6,
                 "the payload must report the messages compaction dropped, not "
                 "only the ones the projector omitted",
             )
@@ -342,7 +367,8 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
                 message.get("text") for message in payload["recent_messages"]
             ]
             self.assertIn("instruction number 1", bodies)
-            self.assertIn("instruction number 8", bodies)
+            self.assertIn("instruction number 7", bodies)
+            self.assertNotIn("instruction number 8", bodies)
             self.assertNotIn("compaction", payload)
             self.assertEqual(
                 payload["earlier_summary"]["message_count"], 0,

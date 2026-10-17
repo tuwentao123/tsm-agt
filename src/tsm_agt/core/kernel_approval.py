@@ -119,7 +119,11 @@ class ApprovalMixin:
             return None
         workspace = self._dependencies.workspace_path.normalize_workspace(Path(task.workspace))
         try:
-            self._dependencies.workspace_path.resolve_mutation_path(workspace, raw_path)
+            # A new file may legitimately introduce one or more missing
+            # directories beneath the workspace.  ``resolve_mutation_path``
+            # is for an already-existing parent and would misclassify that
+            # normal create as an external write.
+            self._dependencies.workspace_path.resolve_create_path(workspace, raw_path)
             return None
         except (PermissionError, ValueError):
             return Path(raw_path).expanduser().resolve(strict=False).parent
@@ -265,6 +269,12 @@ class ApprovalMixin:
         current_decision = self._tool_policy.evaluate(
             selected_spec, request.call, task.project_trust
         )
+        # Older Runtime versions could label a relative path below the task
+        # workspace as ``WORKSPACE_WRITE`` when its parent did not exist yet.
+        # Once the resolver learns that the path is actually contained, that
+        # historical label must not strand an already-reviewed *exact* action.
+        # It is not an external grant: no extra capability is installed below.
+        legacy_internal_write_scope = False
         policy_mismatch = (
             current_decision.payload_hash != request.payload_hash
             or current_decision.effective_risk is not request.risk
@@ -279,6 +289,18 @@ class ApprovalMixin:
             except (OSError, ValueError):
                 root = None
             is_write = request.kind is ApprovalKind.WORKSPACE_WRITE
+            workspace_root = self._dependencies.workspace_path.normalize_workspace(
+                Path(task.workspace)
+            )
+            requested_root = Path(request.workspace_access_root).expanduser().resolve(
+                strict=False
+            )
+            legacy_internal_write_scope = bool(
+                is_write
+                and self._dependencies.workspace_path.is_same_or_descendant(
+                    requested_root, workspace_root
+                )
+            )
             expected_root = (
                 self._external_write_root_requiring_approval(task, request.call)
                 if is_write else
@@ -297,9 +319,16 @@ class ApprovalMixin:
                     "core.apply_patch", "core.apply_patch_v4a",
                     "core.apply_patches", "core.delete_file",
                 })
-                or root is None
-                or str(root) != request.workspace_access_root
-                or expected_root != root
+                or (root is None and not legacy_internal_write_scope)
+                or (
+                    root is not None
+                    and str(root) != request.workspace_access_root
+                    and not legacy_internal_write_scope
+                )
+                or (
+                    expected_root != root
+                    and not legacy_internal_write_scope
+                )
             )
         elif request.kind is ApprovalKind.PROJECT_TRUST:
             # The policy intentionally reports an untrusted command as DENY;
@@ -340,6 +369,7 @@ class ApprovalMixin:
         if (
             decision is ApprovalDecision.APPROVE
             and request.kind in {ApprovalKind.WORKSPACE_READ, ApprovalKind.WORKSPACE_WRITE}
+            and not legacy_internal_write_scope
         ):
             resumed = resumed.with_workspace_access_grant(WorkspaceAccessGrant(
                 grant_id=f"workspace-grant-{uuid4().hex}",
@@ -453,6 +483,16 @@ class ApprovalMixin:
             )
             return denied
 
+        # Persist the human decision before the side effect starts.  A slow or
+        # interrupted tool must never leave a granted approval represented as
+        # a still-pending request.  The existing execution ledger then owns
+        # recovery of the subsequent tool invocation.
+        await self._dependencies.store.commit(RuntimeUnitOfWork(
+            task_id=task_id,
+            expected_version=stored.version,
+            next_state=resumed.to_data(),
+            events=resolution_events,
+        ))
         return await self._execute_authorized_tool(
             task_id=task_id,
             turn_id=request.turn_id,
@@ -465,7 +505,7 @@ class ApprovalMixin:
             payload_hash=request.payload_hash,
             timeout_seconds=timeout_seconds,
             approval_request_id=request.request_id,
-            initial_events=resolution_events,
+            initial_events=(),
             next_state=resumed.to_data(),
         )
 

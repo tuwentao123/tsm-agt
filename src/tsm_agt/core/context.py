@@ -261,13 +261,15 @@ class ContextWindowManager:
             }
             if message.message_id.startswith("prompt-runtime-"):
                 bucket = "runtime_instruction"
-            elif message.message_id.startswith("task-spec-context-"):
+            elif message.message_id.startswith((
+                "task-spec-context-", "conversation-environment-context-",
+            )):
                 bucket = "project_context"
             elif message.role is MessageRole.SYSTEM:
                 bucket = "static_system"
             elif message.message_id.startswith((
                 "project-onboarding-context-", "project-memory-context-",
-                "task-spec-context-",
+                "task-spec-context-", "conversation-environment-context-",
             )):
                 bucket = "project_context"
             elif message.message_id.startswith("session-context-"):
@@ -597,7 +599,8 @@ class ContextWindowManager:
     def _is_protected_group(group: tuple[Message, ...]) -> bool:
         return any(message.message_id.startswith((
             "session-context-", "working-memory-context-",
-            "task-spec-context-", "project-instructions-context-",
+            "task-spec-context-", "conversation-environment-context-",
+            "project-instructions-context-",
         )) for message in group)
 
     @staticmethod

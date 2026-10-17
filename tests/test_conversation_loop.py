@@ -8,6 +8,7 @@ exhausted iteration budget is reported as a partial boundary rather than success
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import datetime
@@ -24,7 +25,6 @@ from tsm_agt.core import (
     TaskState,
 )
 from tsm_agt.core.conversation_loop import (
-    is_explicit_source_analysis_request,
     model_tool_exposure_profile,
     select_model_tools,
 )
@@ -262,7 +262,7 @@ async def _executing(application, root: Path, task_id: str = "task-conv"):
 
 
 class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
-    def test_source_analysis_first_sample_exposes_only_reading_tools(self):
+    def test_tool_exposure_never_uses_request_keyword_profiles(self):
         source_tools = (
             *ScriptedToolProvider._TOOLS,
             ToolSpec(
@@ -276,38 +276,34 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
         )
         request = "分析 Codex 源码是怎么实现多任务输入处理的"
 
-        self.assertTrue(is_explicit_source_analysis_request(request))
         self.assertEqual(
-            [tool.name for tool in select_model_tools(
-                source_tools, user_text=request, model_call=1,
-            )],
-            ["web.search", "source.github.get_file", "source.github.search_code"],
+            select_model_tools(source_tools, user_text=request, model_call=1),
+            source_tools,
         )
         self.assertEqual(
             model_tool_exposure_profile(
                 source_tools, user_text=request, model_call=1,
             ),
-            "source-analysis-initial",
+            "all-visible",
         )
         self.assertEqual(
             select_model_tools(source_tools, user_text=request, model_call=2),
             source_tools,
         )
 
-    def test_non_source_request_keeps_the_normal_tool_set(self):
+    def test_normal_tool_set_is_independent_of_turn_number_and_wording(self):
         request = "解释一下什么是提示词工程"
         tools = ScriptedToolProvider._TOOLS
 
-        self.assertFalse(is_explicit_source_analysis_request(request))
         self.assertEqual(
             select_model_tools(tools, user_text=request, model_call=1), tools,
         )
         self.assertEqual(
             model_tool_exposure_profile(tools, user_text=request, model_call=1),
-            "default",
+            "all-visible",
         )
 
-    def test_explicit_scenarios_expose_their_smallest_first_toolset(self):
+    def test_git_and_change_wording_do_not_hide_tools(self):
         def tool(name: str) -> ToolSpec:
             return ToolSpec(name, name, {"type": "object"}, ToolRisk.R0, True, True, ToolIdempotency.IDEMPOTENT)
         tools = tuple(tool(name) for name in (
@@ -318,15 +314,11 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
             "core.memory_list",
         ))
         git_selected = select_model_tools(tools, user_text="查看 git 提交历史和 diff", model_call=1)
-        self.assertEqual(model_tool_exposure_profile(tools, user_text="查看 git 提交历史和 diff", model_call=1), "git-inspection-initial")
-        self.assertEqual([item.name for item in git_selected], [
-            "core.search_files", "core.read_file", "git.status", "git.diff",
-            "git.log", "git.show", "git.blame", "git.branches",
-        ])
+        self.assertEqual(model_tool_exposure_profile(tools, user_text="查看 git 提交历史和 diff", model_call=1), "all-visible")
+        self.assertEqual(git_selected, tools)
         change_selected = select_model_tools(tools, user_text="修复当前项目的报错", model_call=1)
-        self.assertEqual(model_tool_exposure_profile(tools, user_text="修复当前项目的报错", model_call=1), "code-change-initial")
-        self.assertIn("core.apply_patch_v4a", [item.name for item in change_selected])
-        self.assertNotIn("core.memory_list", [item.name for item in change_selected])
+        self.assertEqual(model_tool_exposure_profile(tools, user_text="修复当前项目的报错", model_call=1), "all-visible")
+        self.assertEqual(change_selected, tools)
         self.assertEqual(select_model_tools(tools, user_text="修复当前项目的报错", model_call=2), tools)
 
     async def _application(
@@ -385,6 +377,14 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
                 types = [event.event_type for event in events]
                 self.assertNotIn("turn.intent_declared", types)
                 self.assertNotIn("tool.intent_attempted", types)
+                completed = next(event for event in events
+                                 if event.event_type == "llm.completed")
+                structure = completed.payload["prompt_message_structure"]
+                self.assertEqual(completed.payload["prompt_message_structure_stage"],
+                                 "provider_neutral_after_compaction")
+                self.assertEqual([row["role"] for row in structure],
+                                 [message.role.value for message in model.requests[0].messages])
+                self.assertNotIn("say hi", str(structure))
         finally:
             await application.registry.stop_all()
 
@@ -504,7 +504,7 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
                     event for event in session_events
                     if event.event_type == "session.task_result_recorded"
                 )
-                self.assertIs(result_event.payload["assistant_replay_eligible"], False)
+                self.assertIs(result_event.payload["assistant_replay_eligible"], True)
         finally:
             await application.registry.stop_all()
 
@@ -557,9 +557,43 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
                     event for event in session_events
                     if event.event_type == "session.task_result_recorded"
                 )
-                self.assertIs(result_event.payload["assistant_replay_eligible"], False)
+                self.assertIs(result_event.payload["assistant_replay_eligible"], True)
                 self.assertNotIn("turn.incomplete_boundary", types)
                 self.assertNotIn("tool.protocol_rejected", types)
+        finally:
+            await application.registry.stop_all()
+
+    async def test_follow_up_sees_prior_visible_assistant_reply(self):
+        """A normal conversational follow-up retains its antecedent.
+
+        Completion review is disabled in this fixture.  That must not erase a
+        reply the user has already seen from the next model request: a reply
+        such as "yes, implement it" otherwise has no usable referent.
+        """
+        model = ScriptedModel([
+            text_response("proposal", "I found two missing dashboard views; I can implement them."),
+            text_response("implementation", "I implemented the dashboard views."),
+        ])
+        application, _ = await self._application(model)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                task = await _executing(application, Path(directory))
+                await application.kernel.run_agent_turn(
+                    task.task_id, "inspect the dashboard"
+                )
+                await application.kernel.run_agent_turn(
+                    task.task_id, "yes, implement it"
+                )
+                session_message = next(
+                    message for message in model.requests[1].messages
+                    if message.message_id.startswith("session-context-")
+                )
+                history = json.loads(session_message.text)["recent_messages"]
+                self.assertIn(
+                    "I found two missing dashboard views; I can implement them.",
+                    [item["text"] for item in history
+                     if item["role"] == "assistant"],
+                )
         finally:
             await application.registry.stop_all()
 

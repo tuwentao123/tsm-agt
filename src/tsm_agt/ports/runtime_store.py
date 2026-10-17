@@ -147,6 +147,10 @@ class RuntimeStorePort(RuntimeAdapter, Protocol):
         self, command_id: str, request_hash: str, result: Mapping[str, Any]
     ) -> RuntimeCommandRecord: ...
 
+    async def fail_runtime_command(
+        self, command_id: str, request_hash: str, result: Mapping[str, Any]
+    ) -> RuntimeCommandRecord: ...
+
     async def load_session(self, session_id: str) -> StoredSession | None: ...
 
     async def list_sessions(

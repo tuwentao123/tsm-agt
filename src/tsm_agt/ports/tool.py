@@ -60,6 +60,83 @@ class ToolResultAuthority(StrEnum):
     DERIVED = "derived"
 
 
+class ToolResultMaterialization(StrEnum):
+    """How much source material a successful tool result actually exposes.
+
+    This describes the result that reached the model, not the tool's general
+    capability and never implies that the user request is complete.  In
+    particular, a search hit is a ``POINTER``/``LOCATOR`` while an opened file
+    or document is ``CONTENT``.  ``VERIFICATION`` is reserved for an explicit
+    task contract or skill; an exited command is only a runtime observation.
+    """
+
+    UNKNOWN = "unknown"
+    POINTER = "pointer"
+    METADATA = "metadata"
+    LOCATOR = "locator"
+    CONTENT = "content"
+    ACTION_RECEIPT = "action_receipt"
+    RUNTIME_OBSERVATION = "runtime_observation"
+    VERIFICATION = "verification"
+    DERIVED = "derived"
+
+
+class ToolFactCapability(StrEnum):
+    """Specific statements a result can support without interpreting it."""
+
+    LOCATE_RESOURCE = "locate_resource"
+    REPORT_METADATA = "report_metadata"
+    DESCRIBE_CONTENT = "describe_content"
+    REPORT_ACTION = "report_action"
+    REPORT_RUNTIME_STATE = "report_runtime_state"
+    REPORT_VERIFICATION = "report_verification"
+    DESCRIBE_DERIVED = "describe_derived"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelToolContract:
+    """Concise, model-visible use protocol for one tool.
+
+    Runtime policy fields remain on :class:`ToolSpec`; this contract only
+    explains selection and interpretation to the model.  It deliberately has
+    no completion field: a tool can explain what it returned without deciding
+    whether the user's task is finished.
+    """
+
+    purpose: str
+    use_when: tuple[str, ...] = ()
+    avoid_when: tuple[str, ...] = ()
+    returns: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.purpose.strip():
+            raise ValueError("model tool contract purpose must not be empty")
+        for name in ("use_when", "avoid_when", "returns"):
+            values = getattr(self, name)
+            if any(not isinstance(value, str) or not value.strip() for value in values):
+                raise ValueError(
+                    f"model tool contract {name} must contain non-empty strings"
+                )
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "purpose": self.purpose,
+            "use_when": list(self.use_when),
+            "avoid_when": list(self.avoid_when),
+            "returns": list(self.returns),
+        }
+
+    def render(self) -> str:
+        sections = [self.purpose]
+        if self.use_when:
+            sections.append("Use when: " + "; ".join(self.use_when))
+        if self.avoid_when:
+            sections.append("Do not use when: " + "; ".join(self.avoid_when))
+        if self.returns:
+            sections.append("Returns: " + "; ".join(self.returns))
+        return "\n".join(sections)
+
+
 class ToolProtocol(StrEnum):
     """How the Runtime coordinates an action with its host environment."""
 
@@ -129,6 +206,7 @@ class ToolSpec:
     effect: ToolEffect = ToolEffect.UNSPECIFIED
     result_authority: ToolResultAuthority = ToolResultAuthority.UNSPECIFIED
     protocol: ToolProtocol = ToolProtocol.IMMEDIATE
+    model_contract: ModelToolContract | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -161,9 +239,25 @@ class ToolSpec:
             raise ValueError(
                 "interaction tools must return user_intent via wait_user protocol"
             )
+        if self.model_contract is not None and not isinstance(
+            self.model_contract, ModelToolContract
+        ):
+            raise ValueError("tool model_contract must be ModelToolContract")
+
+    def model_description(self) -> str:
+        """Return the concise protocol sent to model providers.
+
+        Existing third-party tools retain their original description.  Built-in
+        tools can opt into a small, structured selection contract without
+        exposing Runtime-only approval and scheduling internals.
+        """
+        return (
+            self.model_contract.render()
+            if self.model_contract is not None else self.description
+        )
 
     def to_data(self) -> dict[str, Any]:
-        return {
+        data: dict[str, object] = {
             "name": self.name,
             "description": self.description,
             "parameters": dict(self.parameters),
@@ -180,6 +274,9 @@ class ToolSpec:
             "result_authority": self.result_authority.value,
             "protocol": self.protocol.value,
         }
+        if self.model_contract is not None:
+            data["model_contract"] = self.model_contract.to_data()
+        return data
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +399,8 @@ class ToolFactDescriptor:
     observed_at: str | None = None
     content_hash: str | None = None
     source_artifacts: tuple[SourceArtifact, ...] = ()
+    materialization: ToolResultMaterialization = ToolResultMaterialization.UNKNOWN
+    capabilities: tuple[ToolFactCapability, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.authority, str) or not self.authority.strip():
@@ -312,6 +411,12 @@ class ToolFactDescriptor:
                 raise ValueError(f"tool fact {name} must contain non-empty strings")
         if len(set(self.source_artifacts)) != len(self.source_artifacts):
             raise ValueError("tool fact source_artifacts must be unique")
+        if not isinstance(self.materialization, ToolResultMaterialization):
+            raise ValueError("tool fact materialization must be ToolResultMaterialization")
+        if any(not isinstance(value, ToolFactCapability) for value in self.capabilities):
+            raise ValueError("tool fact capabilities must contain ToolFactCapability values")
+        if len(set(self.capabilities)) != len(self.capabilities):
+            raise ValueError("tool fact capabilities must be unique")
         for name in ("observed_at", "content_hash"):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
@@ -323,6 +428,8 @@ class ToolFactDescriptor:
             "scope": list(self.scope),
             "artifact_refs": list(self.artifact_refs),
             "source_artifacts": [artifact.to_data() for artifact in self.source_artifacts],
+            "materialization": self.materialization.value,
+            "capabilities": [capability.value for capability in self.capabilities],
         }
         if self.observed_at is not None:
             data["observed_at"] = self.observed_at
@@ -354,6 +461,16 @@ class ToolFactDescriptor:
             isinstance(item, Mapping) for item in raw_artifacts
         ):
             raise ValueError("tool fact source_artifacts must be an object list")
+        raw_capabilities = data.get("capabilities", [])
+        if not isinstance(raw_capabilities, list):
+            raise ValueError("tool fact capabilities must be a list")
+        try:
+            capabilities = tuple(ToolFactCapability(str(value)) for value in raw_capabilities)
+            materialization = ToolResultMaterialization(
+                str(data.get("materialization", ToolResultMaterialization.UNKNOWN.value))
+            )
+        except ValueError as error:
+            raise ValueError("tool fact materialization or capabilities are invalid") from error
         return cls(
             authority=authority,
             scope=strings("scope"),
@@ -361,6 +478,8 @@ class ToolFactDescriptor:
             source_artifacts=tuple(SourceArtifact.from_data(item) for item in raw_artifacts),
             observed_at=optional_string("observed_at"),
             content_hash=optional_string("content_hash"),
+            materialization=materialization,
+            capabilities=capabilities,
         )
 
 

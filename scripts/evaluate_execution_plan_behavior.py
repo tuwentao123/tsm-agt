@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -39,6 +40,18 @@ def _tool_names(events) -> list[str]:
     return names
 
 
+def _file_hash(workspace: Path, relative: str) -> str | None:
+    workspace = workspace.resolve()
+    path = (workspace / relative).resolve()
+    if path == workspace or not path.is_relative_to(workspace):
+        raise ValueError("expected file must resolve within the evaluation workspace")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise ValueError(f"expected file is not a regular file: {relative}")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 async def evaluate(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).expanduser().resolve()
     if not workspace.is_dir():
@@ -48,6 +61,7 @@ async def evaluate(args: argparse.Namespace) -> int:
             "refusing to run a real agent without --allow-workspace-mutations; "
             "use a disposable evaluation workspace"
         )
+    before = {path: _file_hash(workspace, path) for path in args.expect_file_change}
 
     client = EngineeringAgentClient(workspace)
     await client.start()
@@ -82,6 +96,24 @@ async def evaluate(args: argparse.Namespace) -> int:
             ),
             "todo_list": todos or None,
             "open_todo_ids": open_items,
+            "expected_file_changes": {
+                path: {
+                    "before_sha256": previous,
+                    "after_sha256": current,
+                    "changed": current != previous,
+                }
+                for path, previous in before.items()
+                for current in [_file_hash(workspace, path)]
+            },
+            "approval_requests": sum(
+                event.event_type == "approval.requested" for event in events
+            ),
+            "successful_tool_results": sum(
+                event.event_type == "tool.completed"
+                and isinstance(event.payload.get("result"), dict)
+                and event.payload["result"].get("ok") is True
+                for event in events
+            ),
         }
         expectations = {
             "plan_created": args.expect_plan,
@@ -92,6 +124,10 @@ async def evaluate(args: argparse.Namespace) -> int:
             name for name, expected in expectations.items()
             if expected and not report[name]
         ]
+        failures.extend(
+            f"file_not_changed:{path}" for path, item in
+            report["expected_file_changes"].items() if not item["changed"]
+        )
         report["expectation_failures"] = failures
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
         return 1 if failures else 0
@@ -108,6 +144,10 @@ def main() -> int:
     parser.add_argument("--expect-plan", action="store_true")
     parser.add_argument("--expect-mutation", action="store_true")
     parser.add_argument("--expect-verification", action="store_true")
+    parser.add_argument(
+        "--expect-file-change", action="append", default=[], metavar="RELATIVE_PATH",
+        help="repeat to check changed file bytes; does not prove correctness",
+    )
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be positive")

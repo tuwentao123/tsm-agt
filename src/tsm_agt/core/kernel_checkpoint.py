@@ -137,7 +137,13 @@ class CheckpointMixin:
         configuration = task.effective_configurations[-1]
         session = await self.get_session(task.session_id)
         working_memory = await self.get_working_memory(task.task_id)
-        task_spec = await self.get_task_spec(task.task_id)
+        if task.task_kind is TaskKind.CONVERSATION:
+            task_spec_revision, task_spec_hash = 0, ""
+        else:
+            task_spec = await self.get_task_spec(task.task_id)
+            task_spec_revision, task_spec_hash = (
+                task_spec.revision, task_spec.content_hash,
+            )
         return replace(
             checkpoint, workspace_fingerprint=task.project_fingerprint,
             effective_config_hash=configuration.effective_config_hash,
@@ -146,8 +152,8 @@ class CheckpointMixin:
             session_id=session.session_id,
             session_context_hash=session.context_hash,
             working_memory_hash=working_memory.content_hash,
-            task_spec_revision=task_spec.revision,
-            task_spec_hash=task_spec.content_hash,
+            task_spec_revision=task_spec_revision,
+            task_spec_hash=task_spec_hash,
             execution_focus={}, legacy_execution_focus=False,
             active_outcome_ids=(), legacy_active_outcome_ids=False,
         )
@@ -155,15 +161,21 @@ class CheckpointMixin:
     async def _save_agent_checkpoint(
         self, checkpoint: AgentTurnCheckpoint, reason: str,
     ) -> None:
-        task_spec = await self.get_task_spec(checkpoint.task_id)
+        stored = await self._require_stored_task(checkpoint.task_id)
+        task = TaskSnapshot.from_data(stored.data)
+        if task.task_kind is TaskKind.CONVERSATION:
+            task_spec_revision, task_spec_hash = 0, ""
+        else:
+            task_spec = await self.get_task_spec(checkpoint.task_id)
+            task_spec_revision, task_spec_hash = (
+                task_spec.revision, task_spec.content_hash,
+            )
         checkpoint = replace(
-            checkpoint, task_spec_revision=task_spec.revision,
-            task_spec_hash=task_spec.content_hash,
+            checkpoint, task_spec_revision=task_spec_revision,
+            task_spec_hash=task_spec_hash,
             execution_focus={}, legacy_execution_focus=False,
             active_outcome_ids=(), legacy_active_outcome_ids=False,
         )
-        stored = await self._require_stored_task(checkpoint.task_id)
-        task = TaskSnapshot.from_data(stored.data)
         updated = task.with_agent_checkpoint(checkpoint.to_data())
         event = RuntimeEvent(
             f"evt-{uuid4().hex}", checkpoint.task_id,
@@ -378,6 +390,7 @@ class CheckpointMixin:
             ))
             generated_prefixes = (
                 "project-instructions-context-", "task-spec-context-",
+                "conversation-environment-context-",
                 "project-onboarding-context-", "project-memory-context-",
                 "session-context-", "document-references-context-", "working-memory-context-",
                 )
@@ -603,6 +616,7 @@ class CheckpointMixin:
         )
         generated_prefixes = (
             "project-instructions-context-", "task-spec-context-",
+            "conversation-environment-context-",
             "project-onboarding-context-", "project-memory-context-",
             "session-context-", "working-memory-context-",
         )

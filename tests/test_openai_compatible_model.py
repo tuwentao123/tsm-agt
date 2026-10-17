@@ -21,6 +21,7 @@ from tsm_agt.ports import (
     ImageBlock,
     Message,
     MessageRole,
+    ModelToolContract,
     ModelRequest,
     ModelStreamCompleted,
     ModelTextDelta,
@@ -763,6 +764,29 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(provider_tool["strict"])
         self.assertEqual(provider_tool["name"], "core__read_file")
         self.assertEqual(provider_tool["parameters"]["type"], "object")
+
+    async def test_uses_model_tool_contract_when_encoding_schema(self) -> None:
+        provider, transport = await self._provider([{
+            "id": "chatcmpl-contract",
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        }])
+        tool = ToolSpec(
+            "core.read_file", "Long operator-only documentation.",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+            ToolRisk.R0,
+            model_contract=ModelToolContract(
+                purpose="Read one bounded text file.",
+                returns=("content window",),
+            ),
+        )
+        await provider.complete(ModelRequest("turn-contract", (), tools=(tool,)))
+        description = transport.requests[0]["payload"]["tools"][0]["function"]["description"]
+        self.assertIn("Read one bounded text file.", description)
+        self.assertNotIn("operator-only", description)
 
     @unittest.skip("provider evidence envelopes were removed")
     async def test_agent_mode_wraps_tool_schema_and_extracts_evidence_question(self) -> None:

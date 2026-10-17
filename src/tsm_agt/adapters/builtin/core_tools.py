@@ -20,13 +20,17 @@ from tsm_agt.ports import (
     AdapterDescriptor,
     HealthState,
     HealthStatus,
+    ModelToolContract,
     ResolvedWorkspacePath,
     ToolCall,
     ToolEffect,
+    ToolFactCapability,
+    ToolFactDescriptor,
     ToolIdempotency,
     ToolInvocationContext,
     ToolResult,
     ToolResultAuthority,
+    ToolResultMaterialization,
     ToolRisk,
     ToolSpec,
     is_sensitive_read_path,
@@ -88,11 +92,12 @@ class CoreReadOnlyToolProvider:
             parameters={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "recursive": {"type": "boolean"},
+                    "path": {"type": "string", "description": "Workspace-relative directory; defaults to '.'."},
+                    "recursive": {"type": "boolean", "description": "Whether to descend into child directories; defaults to false."},
                     "limit": {
                         "type": "integer", "minimum": 1,
                         "maximum": _MAX_LIST_LIMIT,
+                        "description": "Maximum returned entries; defaults to 200.",
                     },
                 },
                 "additionalProperties": False,
@@ -103,6 +108,12 @@ class CoreReadOnlyToolProvider:
             idempotency=ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
+            model_contract=ModelToolContract(
+                purpose="Survey the files and directories below one workspace path.",
+                use_when=("the project layout or candidate folders are unknown",),
+                avoid_when=("you need file contents; use core.read_file",),
+                returns=("path/type/size metadata only; entries may be truncated",),
+            ),
         ),
         ToolSpec(
             name="core.search_files",
@@ -118,31 +129,36 @@ class CoreReadOnlyToolProvider:
             parameters={
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string"},
+                    "pattern": {"type": "string", "description": "Literal text or regex to locate; required."},
                     "target": {
                         "type": "string",
                         "enum": ["content", "files"],
                         "default": "content",
+                        "description": "Search file contents (default) or only file names/paths.",
                     },
-                    "path": {"type": "string"},
-                    "file_glob": {"type": "string"},
-                    "regex": {"type": "boolean"},
-                    "case_sensitive": {"type": "boolean"},
+                    "path": {"type": "string", "description": "Workspace-relative search root; defaults to '.'."},
+                    "file_glob": {"type": "string", "description": "Optional glob limiting files for content search."},
+                    "regex": {"type": "boolean", "description": "Interpret pattern as a regex; defaults to false."},
+                    "case_sensitive": {"type": "boolean", "description": "Use case-sensitive matching; defaults to false."},
                     "limit": {
                         "type": "integer", "minimum": 1,
                         "maximum": _MAX_SEARCH_MATCHES,
+                        "description": "Maximum matches in this page; defaults to 100.",
                     },
                     "offset": {
                         "type": "integer", "minimum": 0,
                         "maximum": _MAX_SEARCH_MATCHES,
+                        "description": "Skip this many results for pagination; defaults to 0.",
                     },
                     "output_mode": {
                         "type": "string",
                         "enum": ["matches", "paths", "count"],
                         "default": "matches",
+                        "description": "Return matching lines, matching paths, or per-file counts.",
                     },
                     "context": {
                         "type": "integer", "minimum": 0, "maximum": 20,
+                        "description": "Lines of context around each content match.",
                     },
                 },
                 "required": ["pattern"],
@@ -154,6 +170,12 @@ class CoreReadOnlyToolProvider:
             idempotency=ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
+            model_contract=ModelToolContract(
+                purpose="Locate candidate source files or lines in the workspace.",
+                use_when=("you need to find a symbol, text, configuration key, UI label, or known filename",),
+                avoid_when=("you need to establish what a candidate file actually says; read it next",),
+                returns=("candidate locations or counts, not a complete source interpretation", "truncation means more candidates may exist"),
+            ),
         ),
         ToolSpec(
             name="core.find_files",
@@ -199,12 +221,13 @@ class CoreReadOnlyToolProvider:
             parameters={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "resource_ref": {"type": "string"},
-                    "start_line": {"type": "integer", "minimum": 1},
+                    "path": {"type": "string", "description": "Workspace-relative or approved external file path; provide exactly one of path/resource_ref."},
+                    "resource_ref": {"type": "string", "description": "A task-scoped reference returned by a discovery tool; provide exactly one of path/resource_ref."},
+                    "start_line": {"type": "integer", "minimum": 1, "description": "First 1-based line to return; defaults to 1."},
                     "max_lines": {
                         "type": "integer", "minimum": 1,
                         "maximum": _MAX_READ_LINES,
+                        "description": "Maximum returned lines; defaults to 200.",
                     },
                 },
                 "additionalProperties": False,
@@ -215,6 +238,12 @@ class CoreReadOnlyToolProvider:
             idempotency=ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
+            model_contract=ModelToolContract(
+                purpose="Read bounded UTF-8 content from one located workspace or approved external file.",
+                use_when=("a specific file can answer the question or must be inspected before editing",),
+                avoid_when=("the file is still unknown; search or list first",),
+                returns=("a content window with line range and whole-file hash", "truncation means unread content remains"),
+            ),
         ),
         ToolSpec(
             name="core.search_text",
@@ -392,6 +421,12 @@ class CoreReadOnlyToolProvider:
             },
             truncated=truncated,
             meta={"untrusted_data": True},
+            fact_descriptor=self._workspace_fact(
+                context,
+                resolved,
+                ToolResultMaterialization.METADATA,
+                (ToolFactCapability.REPORT_METADATA,),
+            ),
         )
 
     def _search_files(
@@ -548,6 +583,12 @@ class CoreReadOnlyToolProvider:
                 "text, use core.search_files with target='content' instead."
             ),
             meta={"untrusted_data": True},
+            fact_descriptor=self._workspace_fact(
+                context,
+                resolved,
+                ToolResultMaterialization.LOCATOR,
+                (ToolFactCapability.LOCATE_RESOURCE,),
+            ),
         )
 
     def _read_file(
@@ -626,6 +667,13 @@ class CoreReadOnlyToolProvider:
             truncated=truncated,
             hint=hint,
             meta={"untrusted_data": True},
+            fact_descriptor=self._workspace_fact(
+                context,
+                resolved,
+                ToolResultMaterialization.CONTENT,
+                (ToolFactCapability.DESCRIBE_CONTENT,),
+                content_hash="sha256:" + hashlib.sha256(raw).hexdigest(),
+            ),
         )
 
     def _search_text(
@@ -790,6 +838,12 @@ class CoreReadOnlyToolProvider:
             },
             truncated=truncated or page_truncated,
             meta={"untrusted_data": True},
+            fact_descriptor=self._workspace_fact(
+                context,
+                resolved,
+                ToolResultMaterialization.LOCATOR,
+                (ToolFactCapability.LOCATE_RESOURCE,),
+            ),
         )
 
     @staticmethod
@@ -982,6 +1036,12 @@ class CoreReadOnlyToolProvider:
             },
             truncated=truncated or page_truncated,
             meta={"untrusted_data": True},
+            fact_descriptor=self._workspace_fact(
+                context,
+                resolved,
+                ToolResultMaterialization.LOCATOR,
+                (ToolFactCapability.LOCATE_RESOURCE,),
+            ),
         )
 
     @staticmethod
@@ -1157,6 +1217,35 @@ class CoreReadOnlyToolProvider:
             "root_alias": resolved.workspace.name or str(resolved.workspace),
             "root_kind": root_kind,
         }
+
+    @staticmethod
+    def _workspace_fact(
+        context: ToolInvocationContext,
+        resolved: ResolvedWorkspacePath,
+        materialization: ToolResultMaterialization,
+        capabilities: tuple[ToolFactCapability, ...],
+        *,
+        content_hash: str | None = None,
+    ) -> ToolFactDescriptor:
+        """Describe exactly what this read exposed, without inferring an answer.
+
+        A path/search result can identify a candidate but cannot establish the
+        candidate's contents.  Keeping that distinction on the result lets a
+        future response-grounding layer reason from facts without reviving an
+        implicit completion gate in the conversation loop.
+        """
+        return ToolFactDescriptor(
+            authority="workspace_read",
+            scope=(
+                f"task:{context.task_id}",
+                f"turn:{context.turn_id}",
+                f"workspace:{resolved.canonical_key}",
+            ),
+            artifact_refs=(str(resolved.path),),
+            content_hash=content_hash,
+            materialization=materialization,
+            capabilities=capabilities,
+        )
 
     @classmethod
     def _resource_data(

@@ -12,7 +12,13 @@ from tsm_agt.adapters.posix_path import PosixWorkspacePath
 from tsm_agt.adapters.windows_path import WindowsWorkspacePath
 from tsm_agt.core.configuration import ripgrep_binary
 from tsm_agt.core.workspace import EXCLUDED_DIRECTORIES
-from tsm_agt.ports import AdapterContext, ToolCall, ToolInvocationContext
+from tsm_agt.ports import (
+    AdapterContext,
+    ToolCall,
+    ToolFactCapability,
+    ToolInvocationContext,
+    ToolResultMaterialization,
+)
 
 
 class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
@@ -80,6 +86,14 @@ class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret.pem", paths)
         self.assertGreaterEqual(result.data["omitted_sensitive"], 2)
         self.assertTrue(result.meta["untrusted_data"])
+        self.assertEqual(
+            result.fact_descriptor.materialization,
+            ToolResultMaterialization.METADATA,
+        )
+        self.assertEqual(
+            result.fact_descriptor.capabilities,
+            (ToolFactCapability.REPORT_METADATA,),
+        )
         self.assertEqual(result.data["requested_path"], ".")
         canonical_workspace = self.workspace.resolve()
         self.assertEqual(result.data["resolved_path"], str(canonical_workspace))
@@ -476,8 +490,21 @@ class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("start_line=11", partial.hint)
         self.assertFalse(final.truncated)
         self.assertIsNone(final.data["next_offset"])
+        self.assertEqual(
+            final.fact_descriptor.materialization,
+            ToolResultMaterialization.CONTENT,
+        )
+        self.assertEqual(
+            final.fact_descriptor.capabilities,
+            (ToolFactCapability.DESCRIBE_CONTENT,),
+        )
 
     async def test_searches_literal_and_regex_with_limits(self) -> None:
+        # This test asserts the walker's conservative page/truncation contract;
+        # real rg versions differ in whether they can prove another match
+        # exists after a one-hit page. Keep the implementation under test
+        # deterministic rather than depending on the developer machine.
+        self._point_ripgrep_at(self.workspace / "no-such-ripgrep")
         literal = await self.provider.invoke(
             ToolCall(
                 "call-1",
@@ -509,8 +536,16 @@ class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(regex.ok)
         self.assertEqual(regex.data["matches"][0]["path"], "src/app.py")
         self.assertTrue(regex.truncated)
+        self.assertEqual(
+            literal.fact_descriptor.materialization,
+            ToolResultMaterialization.LOCATOR,
+        )
 
     async def test_search_supports_grep_style_filters_and_context(self) -> None:
+        # Generated-directory accounting belongs to the in-tree walker. rg
+        # intentionally delegates ignore handling to the repository, so force
+        # the walker for this contract test.
+        self._point_ripgrep_at(self.workspace / "no-such-ripgrep")
         src = self.workspace / "src"
         docs = self.workspace / "docs"
         src.mkdir(exist_ok=True)

@@ -6,7 +6,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
-from tsm_agt.ports import AdapterContext, RuntimeEvent, RuntimeUnitOfWork
+from tsm_agt.ports import (
+    AdapterContext,
+    RuntimeCommandRecord,
+    RuntimeEvent,
+    RuntimeUnitOfWork,
+)
 
 
 def context() -> AdapterContext:
@@ -59,6 +64,29 @@ class SQLiteRuntimeStoreTest(unittest.IsolatedAsyncioTestCase):
 
         later = await self.store.read_events("task-1", after_sequence=1)
         self.assertEqual([event.sequence for event in later], [2, 3])
+
+    async def test_failed_runtime_command_does_not_remain_in_progress(self) -> None:
+        now = datetime.now(timezone.utc)
+        claimed = await self.store.claim_runtime_command(RuntimeCommandRecord(
+            "command-1", "approval", "request-hash", "in_progress",
+            {"claim_token": "claim-1"}, now, now,
+        ))
+        self.assertEqual(claimed.status, "in_progress")
+
+        failed = await self.store.fail_runtime_command(
+            "command-1", "request-hash", {
+                "error_code": "RUNTIME_COMMAND_FAILED",
+                "error_type": "RuntimeError",
+            },
+        )
+
+        self.assertEqual(failed.status, "failed")
+        self.assertEqual(failed.result["error_code"], "RUNTIME_COMMAND_FAILED")
+        replay = await self.store.claim_runtime_command(RuntimeCommandRecord(
+            "command-1", "approval", "request-hash", "in_progress",
+            {"claim_token": "claim-2"}, now, now,
+        ))
+        self.assertEqual(replay.status, "failed")
 
     async def test_version_conflict_does_not_modify_state_or_events(self) -> None:
         first = RuntimeUnitOfWork(

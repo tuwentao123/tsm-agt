@@ -13,13 +13,17 @@ from tsm_agt.ports import (
     BackgroundProcessStartResult,
     HealthState,
     HealthStatus,
+    ModelToolContract,
     ToolCall,
     ToolEffect,
+    ToolFactCapability,
+    ToolFactDescriptor,
     ToolIdempotency,
     ToolInvocationContext,
     ToolRecoveryKind,
     ToolResult,
     ToolResultAuthority,
+    ToolResultMaterialization,
     ToolRisk,
     ToolSpec,
 )
@@ -87,10 +91,10 @@ class CoreProcessToolProvider:
             parameters={
                 "type": "object",
                 "properties": {
-                    "argv": {"type": "array"},
-                    "cwd": {"type": "string"},
-                    "environment": {"type": "object"},
-                    "max_output_bytes": {"type": "integer"},
+                    "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Executable followed by literal arguments; no shell syntax."},
+                    "cwd": {"type": "string", "description": "Required workspace-relative working directory."},
+                    "environment": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Optional non-secret environment overrides."},
+                    "max_output_bytes": {"type": "integer", "minimum": 1, "maximum": 5000000, "description": "Retained stdout/stderr byte limit; defaults to 1000000."},
                 },
                 # Directory is part of the command identity: it must be visible
                 # to the model, approval flow, execution record, and process
@@ -109,6 +113,12 @@ class CoreProcessToolProvider:
             ),
             effect=ToolEffect.EXECUTE,
             result_authority=ToolResultAuthority.PROCESS_FACT,
+            model_contract=ModelToolContract(
+                purpose="Start one structured command under Runtime process supervision.",
+                use_when=("a local command is needed to inspect, build, test, or operate the current task",),
+                avoid_when=("you only need public web content; use web tools", "you need shell parsing; it is not available"),
+                returns=("a managed process receipt and current state", "RUNNING proves neither service readiness nor command success"),
+            ),
         ),
         ToolSpec(
             name="core.process_wait",
@@ -139,6 +149,12 @@ class CoreProcessToolProvider:
             idempotency=ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.PROCESS_FACT,
+            model_contract=ModelToolContract(
+                purpose="Observe one managed process through a bounded wait window.",
+                use_when=("a later step needs to know whether a process has exited",),
+                avoid_when=("the process was not started by this task",),
+                returns=("current state and bounded logs", "a timeout leaves the process running and is not a failure by itself"),
+            ),
         ),
         ToolSpec(
             name="core.process_status",
@@ -287,7 +303,12 @@ class CoreProcessToolProvider:
                 data = await control.stop(process_id, grace_seconds)
             else:
                 return self._error(call, "NOT_FOUND", f"unknown process tool: {call.name}")
-            return ToolResult(call.call_id, True, data=dict(data))
+            return ToolResult(
+                call.call_id,
+                True,
+                data=dict(data),
+                fact_descriptor=self._fact_descriptor(call, context, data),
+            )
         except LookupError as error:
             return self._error(call, "NOT_FOUND", str(error))
         except PermissionError as error:
@@ -342,6 +363,47 @@ class CoreProcessToolProvider:
             max_output_bytes=max_output_bytes,
             max_lifetime_seconds=self._managed_process_max_lifetime_seconds,
             stop_on_task_end=self._stop_managed_process_on_task_end,
+        )
+
+    @staticmethod
+    def _fact_descriptor(
+        call: ToolCall,
+        context: ToolInvocationContext,
+        data: Mapping[str, Any],
+    ) -> ToolFactDescriptor:
+        process_id = data.get("process_id")
+        process_ref = (
+            f"process:{process_id}"
+            if isinstance(process_id, str) and process_id else None
+        )
+        if call.name == "core.run_command":
+            capabilities: tuple[ToolFactCapability, ...] = (
+                ToolFactCapability.REPORT_ACTION,
+            )
+            # A fast command may have exited before the start result reached
+            # the model.  That additional state is observable, but still is
+            # not a test/acceptance verification without an explicit contract.
+            if data.get("execution_state") in {"succeeded", "failed_known"}:
+                capabilities += (ToolFactCapability.REPORT_RUNTIME_STATE,)
+            materialization = ToolResultMaterialization.ACTION_RECEIPT
+        elif call.name == "core.process_stop":
+            materialization = ToolResultMaterialization.ACTION_RECEIPT
+            capabilities = (ToolFactCapability.REPORT_ACTION,)
+        else:
+            materialization = ToolResultMaterialization.RUNTIME_OBSERVATION
+            capabilities = (ToolFactCapability.REPORT_RUNTIME_STATE,)
+        return ToolFactDescriptor(
+            authority="managed_process",
+            scope=tuple(
+                value for value in (
+                    f"task:{context.task_id}",
+                    f"turn:{context.turn_id}",
+                    process_ref,
+                ) if value is not None
+            ),
+            artifact_refs=((process_ref,) if process_ref is not None else ()),
+            materialization=materialization,
+            capabilities=capabilities,
         )
 
     @staticmethod

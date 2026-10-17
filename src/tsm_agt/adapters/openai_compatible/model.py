@@ -10,6 +10,8 @@ from datetime import datetime
 from typing import Any, Protocol
 from uuid import uuid4
 
+from .request_diagnostics import RequestDiagnosticCapture
+
 from tsm_agt.ports import (
     ConclusionBlock,
     ConclusionProtocolMode,
@@ -103,6 +105,7 @@ class OpenAICompatibleModelProvider:
         streaming: bool = True,
         native_structured_conclusion: bool = True,
         transport: HttpJsonTransport | None = None,
+        request_diagnostics: RequestDiagnosticCapture | None = None,
     ) -> None:
         normalized_url = base_url.strip().rstrip("/")
         if not normalized_url.startswith(("https://", "http://")):
@@ -134,6 +137,7 @@ class OpenAICompatibleModelProvider:
         self._strict_tool_schema = strict_tool_schema
         self._streaming = streaming
         self._native_structured_conclusion = native_structured_conclusion
+        self._request_diagnostics = request_diagnostics
         # `structured-conclusion` advertises a Kernel-reachable protocol, not
         # only an optional provider-native message field.  Every compatible
         # provider can receive the controlled text-block instruction below;
@@ -182,6 +186,7 @@ class OpenAICompatibleModelProvider:
         if not self._started:
             raise RuntimeError("adapter is not started")
         payload, provider_to_internal = self._build_payload(request)
+        self._capture_request(request, payload)
         response = await self._transport.post_json(
             f"{self._base_url}/chat/completions",
             {"Authorization": f"Bearer {self._api_key}"},
@@ -219,6 +224,7 @@ class OpenAICompatibleModelProvider:
         payload, provider_to_internal = self._build_payload(request)
         payload["stream"] = True
         payload["stream_options"] = {"include_usage": True}
+        self._capture_request(request, payload)
         text_parts: list[str] = []
         pending_text_parts: list[str] = []
         conclusion_tail = ""
@@ -666,6 +672,16 @@ class OpenAICompatibleModelProvider:
             response.finish_reason, response.usage, response.diagnostics,
         )
 
+    def _capture_request(self, request: ModelRequest, payload: dict[str, Any]) -> None:
+        if self._request_diagnostics is None:
+            return
+        try:
+            self._request_diagnostics.record(request, payload)
+        except Exception:
+            # A debugging aid must not change model execution or leak prompt
+            # contents through exception logging.
+            self._request_diagnostics.clear()
+
     def _build_payload(
         self, request: ModelRequest
     ) -> tuple[dict[str, Any], dict[str, str]]:
@@ -738,7 +754,7 @@ class OpenAICompatibleModelProvider:
         outcome_refs: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         parameters = dict(tool.parameters)
-        description = tool.description
+        description = tool.model_description()
         if outcome_refs:
             properties = dict(parameters.get("properties", {}))
             properties["outcome_ref"] = {

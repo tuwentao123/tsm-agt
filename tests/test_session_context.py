@@ -770,7 +770,7 @@ class SessionContextRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     [item["text"] for item in context["recent_messages"]],
                     [
                         "Use Kotlin and never Java",
-                        "Which language did I require?",
+                        "answered: Use Kotlin and never Java",
                     ],
                 )
                 self.assertEqual(request.messages[-1].text, "Which language did I require?")

@@ -93,7 +93,6 @@ from tsm_agt.ports import (
     ProcessLogs,
     ProcessResult,
     ProcessStartRequest,
-    process_result_succeeded,
     RuntimeEvent,
     RuntimeAdapter,
     RuntimeStorePort,
@@ -276,7 +275,6 @@ from .task import (
     LEGAL_TRANSITIONS, SUCCESS_PATH, TaskKind, TaskNotFound, TaskSnapshot,
     TaskState,
 )
-from .verification_command import is_verification_request
 from .task_spec import (
     TaskAcceptanceCriterion, TaskCriterionKind,
     OutcomeBindingAction, OutcomeBindingDecision, OutcomeBindingReason,
@@ -651,145 +649,6 @@ def _has_active_workspace_mutation(task: TaskSnapshot) -> bool:
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _PostMutationVerification:
-    """One inspectable read of the post-mutation verification contract."""
-
-    passed: bool = False
-    latest_argv: tuple[str, ...] = ()
-    latest_exit_code: int | None = None
-    latest_output: str = ""
-    latest_reference: str = ""
-
-
-def _matches_declared_command(
-    arguments: Mapping[str, Any], declared: Sequence[str],
-) -> bool:
-    """Whether a recorded call is the command a criterion bound itself to.
-
-    Prefix match: the criterion declares the entry point and the model may add
-    targets (``python -m pytest tests/x``). Case-insensitive because the argv
-    compare happens on a normalized command, not a filesystem path.
-    """
-
-    if not declared:
-        return True
-    raw_argv = arguments.get("argv")
-    if not isinstance(raw_argv, (list, tuple)):
-        return False
-    argv = tuple(str(item) for item in raw_argv)
-    if len(argv) < len(declared):
-        return False
-    return all(
-        actual.casefold() == expected.casefold()
-        for actual, expected in zip(argv, declared)
-    )
-
-
-def _post_mutation_verification(
-    task: TaskSnapshot, declared_command: Sequence[str] = (),
-) -> _PostMutationVerification:
-    """Read the verification contract without discarding the failure reason.
-
-    ``declared_command`` is the criterion's own structured binding. When set,
-    only a run of that command can close the criterion; when empty the legacy
-    recognizer decides, so historical criteria keep their behaviour.
-    """
-    if not task.mutation_journal:
-        return _PostMutationVerification()
-    latest_mutation = max(
-        task.mutation_journal, key=lambda item: item.created_at
-    )
-    attempts: list[tuple[ToolExecutionRecord, Mapping[str, Any]]] = []
-    for execution in task.tool_executions.values():
-        data = execution.result.data if execution.result is not None else None
-        if (
-            execution.call.name != "core.run_command"
-            or not is_verification_request(execution.call.arguments)
-            or not _matches_declared_command(
-                execution.call.arguments, declared_command,
-            )
-            or execution.updated_at < latest_mutation.created_at
-            or execution.state is not ToolCommitState.COMMITTED
-            or execution.result is None or not execution.result.ok
-            or not isinstance(data, Mapping)
-            or data.get("mode") != "foreground"
-        ):
-            continue
-        attempts.append((execution, data))
-    if not attempts:
-        return _PostMutationVerification()
-    latest, data = max(attempts, key=lambda item: item[0].updated_at)
-    if process_result_succeeded(data):
-        return _PostMutationVerification(passed=True)
-    output = ""
-    for field in ("stderr", "stdout"):
-        raw = data.get(field)
-        text = raw.get("text") if isinstance(raw, Mapping) else raw
-        if isinstance(text, str) and text.strip():
-            output = text.strip()
-            break
-    exit_code = data.get("exit_code")
-    return _PostMutationVerification(
-        latest_argv=tuple(
-            str(item) for item in latest.call.arguments.get("argv", ())
-        ),
-        latest_exit_code=exit_code if isinstance(exit_code, int) else None,
-        latest_output=output[:600],
-        latest_reference=latest.invocation_id,
-    )
-
-
-def _post_mutation_verification_description(
-    verification: _PostMutationVerification,
-    declared_command: Sequence[str] = (),
-) -> str:
-    """State the requirement in the vocabulary Runtime actually accepts."""
-    if declared_command:
-        return (
-            "The workspace changed but the command this criterion binds to has "
-            "not produced a successful run after the latest mutation. Run it in "
-            "foreground mode and let it exit 0: `"
-            + " ".join(str(item) for item in declared_command)
-            + "`. Only that command closes this criterion."
-        )
-    return (
-        "The workspace changed but no successful foreground verification "
-        "command was recorded after the latest mutation. Only a recognized "
-        "test or build command counts, and it must run in foreground mode and "
-        "exit 0. Static syntax checks such as `python -m compileall` or "
-        "`python -m py_compile` are not verification and never satisfy this. "
-        "Run the project's own test or build target, for example "
-        "`python -m pytest`, `npm test`, `cargo test`, or the equivalent "
-        "build/lint task for this project."
-    )
-
-
-def _post_mutation_verification_observed(
-    verification: _PostMutationVerification, interpreter: str,
-) -> str:
-    """Explain why the last recognized attempt did not count."""
-    parts: list[str] = []
-    if verification.latest_argv:
-        attempted = " ".join(verification.latest_argv)
-        exit_code = (
-            verification.latest_exit_code
-            if verification.latest_exit_code is not None else "unknown"
-        )
-        parts.append(f"Last recognized attempt: `{attempted}` exited {exit_code}.")
-        if verification.latest_output:
-            parts.append(f"Its output was: {verification.latest_output}")
-    else:
-        parts.append("No recognized test or build command has been run yet.")
-    if interpreter:
-        parts.append(
-            "This workspace provides its own interpreter; run the tests with "
-            f"`{interpreter}` rather than a system Python, whose environment "
-            "usually lacks the project's test dependencies."
-        )
-    return " ".join(parts)
-
-
 def _temporal_context_instruction(now: datetime | None = None) -> str:
     """Return the per-call "what day is it" anchor for the model.
 
@@ -1150,21 +1009,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                 "A required approval or clarification is still pending.", "OPEN",
             ))
 
-        if (
-            ToolEffect.EXECUTE in outcome.required_effects
-            and task.mutation_journal
-        ):
-            verification = _post_mutation_verification(task)
-            if not verification.passed:
-                gaps.append(CompletionGap(
-                    f"outcome-verification:{outcome.outcome_id}",
-                    "MISSING_VERIFICATION",
-                    _post_mutation_verification_description(verification),
-                    "MISSING", required_effects=(ToolEffect.EXECUTE,),
-                    observed=_post_mutation_verification_observed(
-                        verification, self._local_interpreter(task)
-                    ),
-                ))
         return tuple(gaps)
 
 
@@ -1648,6 +1492,7 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         generated_prefixes = (
             "project-onboarding-context-", "project-memory-context-",
             "session-context-", "working-memory-context-", "task-spec-context-",
+            "conversation-environment-context-",
             "project-instructions-context-", "completion-readiness-",
         )
         return next((

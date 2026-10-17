@@ -92,7 +92,7 @@ from .execution import (
 )
 from .memory import MemoryScope, MemorySourceKind
 from .process import ProcessPreparationError
-from .task import TaskNotFound, TaskSnapshot, TaskState
+from .task import TaskKind, TaskNotFound, TaskSnapshot, TaskState
 from .task_spec import (
     OutcomeBindingAction, OutcomeBindingDecision, OutcomeBindingReason,
     TaskAcceptanceCriterion, TaskOutcomeEligibilityCalculator,
@@ -466,6 +466,7 @@ class ToolMixin:
         """
         generated_prefixes = (
             "project-instructions-context-", "task-spec-context-",
+            "conversation-environment-context-",
             "project-onboarding-context-", "project-memory-context-",
             "session-context-", "working-memory-context-",
             "completion-readiness-", "continuation-input-", "steering-",
@@ -714,14 +715,20 @@ class ToolMixin:
         calls: tuple[ToolCall, ...],
     ) -> ToolBatchSnapshot:
         """Freeze accepted calls and their Task SPEC revision."""
-        spec = await self.get_task_spec(task_id)
+        task = await self.get_task(task_id)
+        # Conversation turns are scoped by the messages in that turn and the
+        # session history, not by a spec generated for the first input.
+        revision = (
+            0 if task.task_kind is TaskKind.CONVERSATION
+            else (await self.get_task_spec(task_id)).revision
+        )
         return ToolBatchSnapshot(
             batch_id=f"batch-{uuid4().hex}",
             source_message_id=source_message.message_id,
             calls=calls,
             pending_call_ids=tuple(call.call_id for call in calls),
             status=ToolBatchStatus.ACCEPTED,
-            task_spec_revision=spec.revision,
+            task_spec_revision=revision,
         )
 
     @staticmethod

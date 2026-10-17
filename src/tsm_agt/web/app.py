@@ -2231,6 +2231,11 @@ function renderApprovalCard(element, message) {
     done.className = 'approval-row';
     done.textContent = message.resolved === 'APPROVE' ? '已允许' : '已拒绝';
     actions.appendChild(done);
+  } else if (message.submitting) {
+    const pending = document.createElement('div');
+    pending.className = 'approval-row';
+    pending.textContent = '正在提交授权…';
+    actions.appendChild(pending);
   } else {
     const approve = document.createElement('button');
     approve.className = 'approval-btn approve';
@@ -2325,15 +2330,15 @@ async function decideApproval(message, decision) {
     && item.taskId === message.taskId
     && item.approval?.request_id === approval.request_id
   ));
-  // Keep the dock visible but make it non-actionable while the server applies
-  // the decision. Removing it here caused a visible jump and hid the Turn
-  // trace during the approval-to-execution handoff.
-  if (standalone) standalone.resolved = decision;
+  // A 202 only says the Runtime accepted the request for background work. It
+  // is not proof that the approval was committed. Keep the dock visible while
+  // awaiting the durable approval.resolved event; snapshot refresh removes it
+  // once pending_approval is actually cleared.
+  if (standalone) standalone.submitting = true;
   if (card) {
     card.task.approvalResolution = {
-      requestId: approval.request_id, decision,
+      requestId: approval.request_id, decision, submitting: true,
     };
-    card.task.waiting = decision === 'APPROVE' ? null : card.task.waiting;
   }
   renderMessages();
   if (decision === 'APPROVE') {

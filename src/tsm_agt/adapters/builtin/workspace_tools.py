@@ -9,10 +9,11 @@ from typing import Any
 from tsm_agt.core import WorkspaceMutationConflict, WorkspacePatchConflict
 from .v4a_patch import V4APatchSyntaxError, parse_v4a_update_patch
 from tsm_agt.ports import (
-    AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ToolCall,
-    ToolEffect, ToolIdempotency, ToolInvocationContext, ToolRecoveryKind,
+    AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ModelToolContract, ToolCall,
+    ToolEffect, ToolFactCapability, ToolFactDescriptor, ToolIdempotency,
+    ToolInvocationContext, ToolRecoveryKind,
     ToolResult,
-    ToolResultAuthority, ToolRisk, ToolSpec,
+    ToolResultAuthority, ToolResultMaterialization, ToolRisk, ToolSpec,
 )
 
 
@@ -47,9 +48,10 @@ class CoreWorkspaceMutationToolProvider:
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
+                "path": {"type": "string", "description": "Workspace-relative file path to change."},
                 "expected_hash": {
-                    "anyOf": [{"type": "string"}, {"type": "null"}]
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "description": "Current lowercase SHA-256 from core.read_file; null only when creating a file.",
                 },
                 "edits": {
                     "type": "array",
@@ -58,8 +60,8 @@ class CoreWorkspaceMutationToolProvider:
                     "items": {
                         "type": "object",
                         "properties": {
-                            "old_text": {"type": "string"},
-                            "new_text": {"type": "string"},
+                            "old_text": {"type": "string", "description": "Exact unique text currently in the file; empty only for file creation."},
+                            "new_text": {"type": "string", "description": "Replacement text."},
                         },
                         "required": ["old_text", "new_text"],
                         "additionalProperties": False,
@@ -76,6 +78,12 @@ class CoreWorkspaceMutationToolProvider:
         rollback="restore the journaled backup only if the current hash still matches the Agent result",
         effect=ToolEffect.MUTATE,
         result_authority=ToolResultAuthority.MUTATION_FACT,
+        model_contract=ModelToolContract(
+            purpose="Apply one exact, journaled text patch to a workspace file.",
+            use_when=("the current file content and hash have been read and the requested edit is ready",),
+            avoid_when=("the target content is unknown or stale; read it first", "you only need to describe a proposed change"),
+            returns=("a committed mutation receipt with IDs and changed paths", "the receipt does not verify behavioral correctness"),
+        ),
     )
     _v4a_patch_spec = ToolSpec(
         name="core.apply_patch_v4a",
@@ -388,7 +396,7 @@ class CoreWorkspaceMutationToolProvider:
                 if total_edits > 500:
                     raise ValueError("patches cannot contain more than 500 edits")
                 records = await control.apply_patches(tuple(patches))
-                return ToolResult(call.call_id, True, data={
+                return self._success(call, context, {
                     "patched": len(records),
                     "mutations": [dict(record) for record in records],
                 })
@@ -426,7 +434,7 @@ class CoreWorkspaceMutationToolProvider:
                 if len(set(flattened)) != len(flattened):
                     raise ValueError("mutation_groups IDs must be unique")
                 records = await control.rollback_mutation_groups(tuple(groups))
-                return ToolResult(call.call_id, True, data={
+                return self._success(call, context, {
                     "rolled_back": len(records),
                     "mutations": [dict(record) for record in records],
                 })
@@ -456,7 +464,7 @@ class CoreWorkspaceMutationToolProvider:
                     )
                 else:
                     records = await control.rollback_mutations(tuple(mutation_ids))
-                return ToolResult(call.call_id, True, data={
+                return self._success(call, context, {
                     "rolled_back": len(records),
                     "mutations": [dict(record) for record in records],
                 })
@@ -465,7 +473,7 @@ class CoreWorkspaceMutationToolProvider:
                 if not isinstance(mutation_id, str) or not mutation_id.strip():
                     raise TypeError("mutation_id must be a non-empty string")
                 data = await control.rollback_mutation(mutation_id)
-                return ToolResult(call.call_id, True, data=dict(data))
+                return self._success(call, context, dict(data))
             if call.name == self._v4a_patch_spec.name:
                 raw_patch = call.arguments.get("patch")
                 if not isinstance(raw_patch, str) or not raw_patch.strip():
@@ -480,7 +488,7 @@ class CoreWorkspaceMutationToolProvider:
                 data = await control.apply_patch(
                     parsed.path, expected_hash, parsed.edits
                 )
-                return ToolResult(call.call_id, True, data={
+                return self._success(call, context, {
                     **dict(data), "patch_format": "v4a",
                 })
             path = call.arguments.get("path")
@@ -494,10 +502,10 @@ class CoreWorkspaceMutationToolProvider:
                         "core.delete_file expected_hash must be a lowercase SHA-256 string"
                     )
                 data = await control.delete_file(path, expected_hash)
-                return ToolResult(call.call_id, True, data=dict(data))
+                return self._success(call, context, dict(data))
             edits = self._parse_edits(call.arguments.get("edits"), "edits")
             data = await control.apply_patch(path, expected_hash, tuple(edits))
-            return ToolResult(call.call_id, True, data=dict(data))
+            return self._success(call, context, dict(data))
         except PermissionError as error:
             return self._error(call, "PERMISSION_DENIED", str(error))
         except FileNotFoundError as error:
@@ -572,6 +580,46 @@ class CoreWorkspaceMutationToolProvider:
     @staticmethod
     def _error(call: ToolCall, code: str, message: str) -> ToolResult:
         return ToolResult(call.call_id, False, error_code=code, message=message)
+
+    @staticmethod
+    def _success(
+        call: ToolCall,
+        context: ToolInvocationContext,
+        data: Mapping[str, Any],
+    ) -> ToolResult:
+        """Record a committed mutation as a receipt, never as verification.
+
+        A change record can prove that the Runtime applied or rolled back the
+        requested transaction.  It cannot prove that the resulting project
+        satisfies a user request; any such verification belongs to an explicit
+        TaskContract/Skill and a separately scoped observation.
+        """
+        mutation_refs: list[str] = []
+        for key in ("mutation_id", "path"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                mutation_refs.append(f"{key}:{value}")
+        records = data.get("mutations")
+        if isinstance(records, list):
+            for record in records:
+                if not isinstance(record, Mapping):
+                    continue
+                value = record.get("mutation_id")
+                if isinstance(value, str) and value:
+                    mutation_refs.append(f"mutation_id:{value}")
+        refs = tuple(dict.fromkeys(mutation_refs))
+        return ToolResult(
+            call.call_id,
+            True,
+            data=dict(data),
+            fact_descriptor=ToolFactDescriptor(
+                authority="workspace_mutation",
+                scope=(f"task:{context.task_id}", f"turn:{context.turn_id}"),
+                artifact_refs=refs,
+                materialization=ToolResultMaterialization.ACTION_RECEIPT,
+                capabilities=(ToolFactCapability.REPORT_ACTION,),
+            ),
+        )
 
     @staticmethod
     def _validate_expected_hash(expected_hash: Any) -> None:

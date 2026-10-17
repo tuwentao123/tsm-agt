@@ -17,7 +17,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from .configuration import GitHubSourceConfiguration
-from tsm_agt.ports import (AdapterContext, AdapterDescriptor, HealthState, HealthStatus, SourceArtifact, ToolCall, ToolEffect, ToolFactDescriptor, ToolIdempotency, ToolInvocationContext, ToolRecoveryKind, ToolResult, ToolResultAuthority, ToolRisk, ToolSpec)
+from tsm_agt.ports import (AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ModelToolContract, SourceArtifact, ToolCall, ToolEffect, ToolFactCapability, ToolFactDescriptor, ToolIdempotency, ToolInvocationContext, ToolRecoveryKind, ToolResult, ToolResultAuthority, ToolResultMaterialization, ToolRisk, ToolSpec)
 
 _SHA = re.compile(r"^[0-9a-f]{40,64}$", re.I)
 _REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -93,7 +93,50 @@ class GitHubSourceToolProvider:
 
     def _spec(self, name: str, description: str, properties: Mapping[str, Any]) -> ToolSpec:
         required = {"source.github.get_file": ["repo", "path", "ref"], "source.github.list_tree": ["repo", "ref"], "source.github.get_commit": ["repo", "sha"], "source.github.get_pull_request": ["repo", "number"], "source.github.get_issue": ["repo", "number"]}.get(name, ["query", "repo"])
-        return ToolSpec(name, description, {"type":"object", "properties":properties, "required":required, "additionalProperties":False}, self._risk, True, True, ToolIdempotency.IDEMPOTENT, 2000, True, "configured GitHub API host and repository identifiers", "read-only GitHub GET request; no remote mutation", False, ToolEffect.OBSERVE, ToolResultAuthority.EXTERNAL_SERVICE)
+        parameter_descriptions = {
+            "query": "Literal case-insensitive code substring to locate.",
+            "repo": "Repository identity in owner/repository form.",
+            "ref": "Branch, tag, or commit to resolve before reading.",
+            "path": "Repository-relative file or tree path.",
+            "sha": "Commit SHA to inspect.",
+            "number": "Positive pull-request or issue number.",
+            "page": "One-based result page; defaults to 1.",
+            "per_page": "Maximum results in this page.",
+        }
+        enriched_properties = {
+            key: {**dict(value), "description": parameter_descriptions[key]}
+            for key, value in properties.items()
+        }
+        return ToolSpec(name, description, {"type":"object", "properties":enriched_properties, "required":required, "additionalProperties":False}, self._risk, True, True, ToolIdempotency.IDEMPOTENT, 2000, True, "configured GitHub API host and repository identifiers", "read-only GitHub GET request; no remote mutation", False, ToolEffect.OBSERVE, ToolResultAuthority.EXTERNAL_SERVICE, model_contract=self._model_contract(name))
+
+    @staticmethod
+    def _model_contract(name: str) -> ModelToolContract:
+        if name == "source.github.get_file":
+            return ModelToolContract(
+                purpose="Read one GitHub file after resolving it to an immutable commit.",
+                use_when=("an exact repository path is known",),
+                avoid_when=("the path is unknown; search code or list the tree first",),
+                returns=("file content pinned to repo/ref/blob identity",),
+            )
+        if name == "source.github.search_code":
+            return ModelToolContract(
+                purpose="Locate candidate GitHub source files by literal code text.",
+                use_when=("the repository is known but the file path is not",),
+                avoid_when=("you need to explain an implementation; read a candidate file next",),
+                returns=("candidate paths at an immutable commit, not source content",),
+            )
+        if name == "source.github.list_tree":
+            return ModelToolContract(
+                purpose="List candidate paths in a GitHub repository at an immutable commit.",
+                use_when=("the repository layout or exact path is unknown",),
+                avoid_when=("you need a file's content; use source.github.get_file",),
+                returns=("path metadata only",),
+            )
+        return ModelToolContract(
+            purpose="Read immutable GitHub metadata for one known repository object.",
+            use_when=("commit, pull-request, or issue metadata is needed",),
+            returns=("bounded metadata for the named object",),
+        )
 
     async def start(self, context: AdapterContext) -> None: self._started = True
     async def stop(self, deadline: datetime) -> None: self._cache.clear(); self._started = False
@@ -116,6 +159,7 @@ class GitHubSourceToolProvider:
                     canonical_url=str(data["url"]),
                     content_hash=str(data["content_hash"]),
                 ),)
+            materialization, capabilities = self._fact_semantics(call.name)
             return ToolResult(
                 call.call_id,
                 True,
@@ -128,12 +172,33 @@ class GitHubSourceToolProvider:
                     (str(data["url"]),),
                     source_artifacts=source_artifacts,
                     content_hash=str(data["content_hash"]),
+                    materialization=materialization,
+                    capabilities=capabilities,
                 ),
             )
         except _GitHubFailure as error:
             return ToolResult(call.call_id, False, error_code=error.code, message=error.message, retryable=error.retryable, recovery_kind=error.recovery_kind)
         except (TypeError, ValueError) as error:
             return ToolResult(call.call_id, False, error_code="INVALID_PARAM", message=str(error))
+
+    @staticmethod
+    def _fact_semantics(
+        name: str,
+    ) -> tuple[ToolResultMaterialization, tuple[ToolFactCapability, ...]]:
+        if name == "source.github.get_file":
+            return (
+                ToolResultMaterialization.CONTENT,
+                (ToolFactCapability.DESCRIBE_CONTENT,),
+            )
+        if name in {"source.github.search_code", "source.github.list_tree"}:
+            return (
+                ToolResultMaterialization.LOCATOR,
+                (ToolFactCapability.LOCATE_RESOURCE,),
+            )
+        return (
+            ToolResultMaterialization.METADATA,
+            (ToolFactCapability.REPORT_METADATA,),
+        )
 
     def _invoke(self, name: str, args: Mapping[str, Any], context: ToolInvocationContext) -> Mapping[str, Any]:
         repo = self._repo(args.get("repo"))

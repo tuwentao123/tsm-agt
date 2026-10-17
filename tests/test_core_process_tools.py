@@ -24,8 +24,10 @@ from tsm_agt.ports import (
     SandboxDecision,
     SandboxRequest,
     ToolCall,
+    ToolFactCapability,
     ToolIdempotency,
     ToolRecoveryKind,
+    ToolResultMaterialization,
     ToolRisk,
     RuntimeStorePort,
 )
@@ -125,6 +127,14 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.data["mode"], "managed")
         self.assertTrue(result.data["started"])
+        self.assertEqual(
+            result.fact_descriptor.materialization,
+            ToolResultMaterialization.ACTION_RECEIPT,
+        )
+        self.assertIn(
+            ToolFactCapability.REPORT_ACTION,
+            result.fact_descriptor.capabilities,
+        )
         waited = await self.application.kernel.invoke_tool(
             self.task.task_id, "turn-command-wait",
             ToolCall("call-command-wait", "core.process_wait", {
@@ -133,6 +143,10 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(waited.ok)
         self.assertEqual(waited.data["status"], "exited")
+        self.assertEqual(
+            waited.fact_descriptor.materialization,
+            ToolResultMaterialization.RUNTIME_OBSERVATION,
+        )
         self.assertEqual(waited.data["exit_code"], 0)
         self.assertIn("$(touch must-not-exist)", waited.data["stdout"]["text"])
         self.assertTrue(waited.data["stdout"]["truncated"])

@@ -44,6 +44,14 @@ class CommandRiskPolicyTest(unittest.TestCase):
                 self.assertEqual(decision.action, PolicyAction.REQUIRE_APPROVAL)
                 self.assertFalse(decision.requires_network)
 
+    def test_curl_still_requires_network_approval(self) -> None:
+        for url in ("http://localhost:5176/dashboard", "https://example.test"):
+            with self.subTest(url=url):
+                decision = self.decision(["curl", url])
+                self.assertEqual(decision.effective_risk, ToolRisk.R3)
+                self.assertEqual(decision.action, PolicyAction.REQUIRE_APPROVAL)
+                self.assertTrue(decision.requires_network)
+
     def test_reading_a_public_repository_needs_no_approval(self) -> None:
         for argv in (
             ["git", "clone", "https://github.com/openai/codex"],

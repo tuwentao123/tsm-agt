@@ -67,7 +67,7 @@ from ..agent_loop import (
 from ..approval import ApprovalNotPending
 from ..clarification import ClarificationNotPending
 from ..context import ContextWindowExceeded
-from ..task import TaskSnapshot, TaskState
+from ..task import TaskKind, TaskSnapshot, TaskState
 from ..turn import InvalidModelResponse, InvalidTurnState, ModelInvocationFailed
 from .finalizer import ITERATION_BUDGET_EXHAUSTED, ConversationFinalizer
 from .finalization import ConversationFinalizationPipeline
@@ -79,6 +79,7 @@ from .state import build_turn_state
 #: dropped and rebuilt so a stale context projection is never sent twice.
 _GENERATED_CONTEXT_PREFIXES = (
     "project-instructions-context-", "task-spec-context-",
+    "conversation-environment-context-",
     "project-onboarding-context-", "project-memory-context-",
     "session-context-", "document-references-context-",
     "working-memory-context-",
@@ -86,101 +87,6 @@ _GENERATED_CONTEXT_PREFIXES = (
 
 #: Runtime-owned outcome bookkeeping is never exposed as a model tool.
 _NON_MODEL_TOOLS = frozenset({"core.task_outcome_complete"})
-
-# These are exposure profiles, not an intent classifier or completion gate.
-# They use only explicit request words to reduce the first model sample's choice
-# set. The Runtime retains every registered tool for validation and execution;
-# after the first sample the ordinary full model tool set is restored.
-_SOURCE_ANALYSIS_TOOL_NAMES = frozenset({
-    "core.search_files", "core.read_file",
-    "web.search", "web.fetch_markdown",
-    "source.github.resolve", "source.github.list_tree",
-    "source.github.search_code", "source.github.get_file",
-})
-_WORKSPACE_INSPECTION_TOOL_NAMES = frozenset({
-    "core.list_files", "core.search_files", "core.read_file",
-    "code.symbol_overview", "code.definition", "code.references",
-    "code.implementations", "code.workspace_symbols", "code.diagnostics",
-    "git.status", "git.diff", "git.log", "git.show", "git.blame",
-    "git.branches",
-})
-_CODE_CHANGE_TOOL_NAMES = frozenset({
-    "core.list_files", "core.search_files", "core.read_file",
-    "code.definition", "code.references", "code.diagnostics",
-    "git.status", "git.diff", "core.apply_patch_v4a", "core.apply_patches",
-    "core.delete_file", "core.run_command", "core.process_wait", "core.process_status",
-    "core.process_logs", "core.process_stop", "core.todo_list",
-})
-_WEB_RESEARCH_TOOL_NAMES = frozenset({
-    "web.search", "web.fetch_markdown", "web.open", "web.find_in_page",
-    "web.read", "content.summarize", "source.github.resolve",
-    "source.github.list_tree", "source.github.search_code",
-    "source.github.get_file",
-})
-_GIT_INSPECTION_TOOL_NAMES = frozenset({
-    "git.status", "git.diff", "git.log", "git.show", "git.blame",
-    "git.branches", "core.read_file", "core.search_files",
-})
-_SOURCE_ANALYSIS_TERMS = (
-    "源码", "源代码", "代码实现", "实现机制", "代码里怎么", "仓库实现",
-    "source code", "implementation", "repository implementation",
-)
-_SOURCE_ANALYSIS_REQUEST_TERMS = (
-    "分析", "怎么", "如何", "机制", "原理", "比较", "对比", "实现",
-    "analyze", "analyse", "how", "compare", "implement",
-)
-_WORKSPACE_INSPECTION_TERMS = (
-    "当前项目", "这个项目", "本地项目", "当前仓库", "这个仓库", "本地代码",
-    "项目代码", "仓库代码", "project code", "local repository",
-)
-_CODE_CHANGE_TERMS = (
-    "修复", "修改", "实现", "新增", "重构", "改一下", "fix ", "implement ",
-    "add ", "refactor ", "change ",
-)
-_INSPECTION_REQUEST_TERMS = (
-    "分析", "查看", "解释", "定位", "怎么", "如何", "analyze", "inspect ",
-    "explain ", "how ",
-)
-_WEB_RESEARCH_TERMS = (
-    "搜索", "查一下", "查找", "最新", "新闻", "search ", "look up ",
-    "latest ", "news ", "release ",
-)
-_GIT_INSPECTION_TERMS = (
-    "git", "commit", "branch", "diff", "blame", "提交记录", "提交历史",
-    "版本历史", "代码差异",
-)
-
-
-def is_explicit_source_analysis_request(user_text: str) -> bool:
-    """Recognise only an explicit request to analyse source implementation."""
-
-    normalized = user_text.casefold()
-    return (
-        any(term in normalized for term in _SOURCE_ANALYSIS_TERMS)
-        and any(term in normalized for term in _SOURCE_ANALYSIS_REQUEST_TERMS)
-    )
-
-
-def _has_any(user_text: str, terms: tuple[str, ...]) -> bool:
-    return any(term in user_text.casefold() for term in terms)
-
-
-def _initial_toolset_profile(user_text: str) -> tuple[str, frozenset[str], frozenset[str]] | None:
-    """Choose an explicit, auditable first-sample profile in precedence order."""
-    if is_explicit_source_analysis_request(user_text):
-        return ("source-analysis-initial", _SOURCE_ANALYSIS_TOOL_NAMES, frozenset({"core.read_file", "source.github.get_file"}))
-    if _has_any(user_text, _GIT_INSPECTION_TERMS):
-        return ("git-inspection-initial", _GIT_INSPECTION_TOOL_NAMES, frozenset({"git.status", "git.diff", "git.log", "git.show", "git.blame", "git.branches"}))
-    if _has_any(user_text, _WORKSPACE_INSPECTION_TERMS) and _has_any(user_text, _INSPECTION_REQUEST_TERMS):
-        return ("workspace-inspection-initial", _WORKSPACE_INSPECTION_TOOL_NAMES, frozenset({"core.read_file", "core.search_files"}))
-    if _has_any(user_text, _CODE_CHANGE_TERMS) and _has_any(user_text, _WORKSPACE_INSPECTION_TERMS):
-        return ("code-change-initial", _CODE_CHANGE_TOOL_NAMES, frozenset({"core.read_file", "core.search_files", "core.apply_patch_v4a"}))
-    if _has_any(user_text, _WEB_RESEARCH_TERMS):
-        return ("web-research-initial", _WEB_RESEARCH_TOOL_NAMES, frozenset({"web.search", "web.fetch_markdown"}))
-    if _has_any(user_text, _WORKSPACE_INSPECTION_TERMS):
-        return ("workspace-inspection-initial", _WORKSPACE_INSPECTION_TOOL_NAMES, frozenset({"core.read_file", "core.search_files"}))
-    return None
-
 
 def model_visible_tools(visible_tools: tuple[ToolSpec, ...]) -> tuple[ToolSpec, ...]:
     """The tool schemas the conversation loop actually shows the model."""
@@ -193,49 +99,23 @@ def model_visible_tools(visible_tools: tuple[ToolSpec, ...]) -> tuple[ToolSpec, 
 def select_model_tools(
     visible_tools: tuple[ToolSpec, ...], *, user_text: str, model_call: int,
 ) -> tuple[ToolSpec, ...]:
-    """Return schemas advertised for one model sample.
+    """Return every runtime-approved tool for every model sample.
 
-    The first sample of an explicit scenario sees its smallest useful toolset.
-    Later samples recover the ordinary tool set, so a profile can never lock a
-    task out of a legitimate second-step capability.
+    The harness must not infer an intent from request keywords and then hide
+    alternatives.  Tool selection is a model decision informed by stable tool
+    contracts; provider capability and policy validation remain runtime-owned.
+    ``user_text`` and ``model_call`` stay in this compatibility signature so
+    callers cannot accidentally reintroduce a first-turn classifier.
     """
-
-    normal = model_visible_tools(visible_tools)
-    if model_call != 1:
-        return normal
-    profile = _initial_toolset_profile(user_text)
-    if profile is None:
-        return normal
-    _name, names, required_any = profile
-    narrowed = tuple(
-        tool for tool in normal if tool.name in names
-    )
-    # Do not leave a deployment with none of a profile's anchor capabilities.
-    if not any(tool.name in required_any for tool in narrowed):
-        return normal
-    # A change profile must contain both an inspection capability and a safe
-    # mutation capability. Otherwise presenting it would make a read-only
-    # deployment look as if it could fulfill a requested edit.
-    if _name == "code-change-initial" and not (
-        any(tool.name in {"core.read_file", "core.search_files"} for tool in narrowed)
-        and any(tool.name in {"core.apply_patch_v4a", "core.apply_patches", "core.delete_file"} for tool in narrowed)
-    ):
-        return normal
-    if narrowed:
-        return narrowed
-    return normal
+    del user_text, model_call
+    return model_visible_tools(visible_tools)
 
 
 def model_tool_exposure_profile(
     visible_tools: tuple[ToolSpec, ...], *, user_text: str, model_call: int,
 ) -> str:
-    selected = select_model_tools(
-        visible_tools, user_text=user_text, model_call=model_call,
-    )
-    if len(selected) == len(model_visible_tools(visible_tools)):
-        return "default"
-    profile = _initial_toolset_profile(user_text) if model_call == 1 else None
-    return profile[0] if profile is not None else "default"
+    del visible_tools, user_text, model_call
+    return "all-visible"
 
 
 class ConversationAgentLoop:
@@ -702,18 +582,13 @@ class ConversationAgentLoop:
                         "review_continuations": state.review_continuations,
                     },
                 ),))
-                # A final-looking response is not session history merely because
-                # the runtime can stop.  Only an actual reviewer ACCEPT is safe
-                # to replay as a future model premise.  In particular, preserve
-                # the answer for UI/audit when review is disabled, but do not let
-                # it become implicit evidence in a later turn.
-                replay_eligible = (
-                    state.reviewer_call_count > 0
-                    and review.reason_code not in {
-                        "reviewer_failure_accepted",
-                        "reviewer_failure_visible_unverified",
-                    }
-                )
+                # A response already shown to the user is conversational
+                # history, even when completion review is disabled or failed.
+                # Hiding it makes a natural follow-up ("yes, implement it")
+                # lose its referent.  This flag controls only history replay;
+                # it never upgrades prose into tool evidence or acceptance.
+                task = await kernel.get_task(state.task_id)
+                replay_eligible = task.task_kind is TaskKind.CONVERSATION
                 result = await self._finalizer.persist_text_completion(
                     state, response,
                     assistant_replay_eligible=replay_eligible,

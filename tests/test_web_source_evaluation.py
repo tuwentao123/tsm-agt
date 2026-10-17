@@ -7,12 +7,12 @@ from tsm_agt.web.app import _turn_progress_item
 
 
 class SourceEvaluationProgressTest(unittest.TestCase):
-    def test_source_exposure_and_review_survive_event_projection(self) -> None:
+    def test_all_visible_exposure_and_review_survive_event_projection(self) -> None:
         started = _turn_progress_item(RuntimeEvent(
             "event-1", "task-1", 1, "turn.started", {
                 "turn_id": "turn-1",
                 "input_character_count": 30,
-                "tool_exposure_profile": "source-analysis-initial",
+                "tool_exposure_profile": "all-visible",
                 "visible_tools": ["web.search", "source.github.get_file"],
             }, turn_id="turn-1",
         ))
@@ -23,7 +23,7 @@ class SourceEvaluationProgressTest(unittest.TestCase):
             }, turn_id="turn-1",
         ))
 
-        self.assertEqual(started["tool_exposure_profile"], "source-analysis-initial")
+        self.assertEqual(started["tool_exposure_profile"], "all-visible")
         self.assertEqual(started["visible_tool_count"], 2)
         self.assertEqual(reviewed["kind"], "completion_review")
         self.assertEqual(reviewed["review_action"], "CONTINUE")

@@ -1644,18 +1644,23 @@ class SessionMixin:
             return
     async def _session_context_message(self, task_id: str) -> Message | None:
         task = await self.get_task(task_id)
+        turn_id = None
+        if task.active_agent_checkpoint is not None:
+            turn_id = AgentTurnCheckpoint.from_data(
+                task.active_agent_checkpoint
+            ).turn_id
         return (await self.get_session_prompt_projection(
-            task.session_id, exclude_task_id=task_id
+            task.session_id, exclude_task_id=task_id, exclude_turn_id=turn_id,
         )).message
     async def get_session_prompt_projection(
         self, session_id: str, *, exclude_task_id: str | None = None,
+        exclude_turn_id: str | None = None,
     ) -> SessionPromptProjection:
         """Build the unified bounded Session view used by model and UI.
 
-        ``exclude_task_id`` removes the Task that owns the current prompt. Its
-        live messages and authoritative checkpoint are already in the turn, so
-        projecting the Task into its own Session context only duplicates state
-        and describes the current turn as if it were prior work.
+        The optional excluded Task/Turn pair removes only the live Turn's input:
+        it is already in the checkpoint sent to the model. Earlier messages from
+        that same Conversation remain ordinary history for follow-up turns.
         """
         projection = await self.get_session_conversation(session_id)
         projector = self._dependencies.session_context_projector
@@ -1695,6 +1700,8 @@ class SessionMixin:
             projection, recent_executions=recent_executions,
             active_checkpoint=active_checkpoint,
             suspended_tasks=suspended_tasks,
+            exclude_task_id=exclude_task_id,
+            exclude_turn_id=exclude_turn_id,
         )
     async def get_session_active_checkpoint(
         self, session_id: str,

@@ -171,7 +171,10 @@ from .investigation_flow import (
 )
 from .tool import (
     SourceArtifact,
+    ModelToolContract,
+    ToolFactCapability,
     ToolFactDescriptor,
+    ToolResultMaterialization,
     OutcomeBindingMode,
     WebEgressMode,
     ToolCall,
@@ -215,8 +218,11 @@ __all__ = [
     "ConclusionBlock",
     "ConclusionProtocolMode",
     "ImageBlock",
+    "ModelToolContract",
     "SourceArtifact",
+    "ToolFactCapability",
     "ToolFactDescriptor",
+    "ToolResultMaterialization",
     "WebEgressMode",
     "ToolEffect",
     "ToolResultAuthority",
