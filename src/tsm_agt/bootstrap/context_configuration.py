@@ -1,17 +1,8 @@
-"""Project-local configuration for model-visible history bounds.
+"""Model history configuration. Conversation Loop uses one token/Turn budget.
 
-Two independent bounds live here, both measured against the same thing -- what a
-Turn renders from Session history:
-
-* *when to compact* (``compaction_ratio`` / ``latency_soft_tokens``), consumed by
-  ``core/context.py``'s ``ContextWindowManager``, which is token-budget driven;
-* *how much Session history a Turn renders* (``session_recent_messages`` /
-  ``session_task_summaries``), consumed by ``core/session_context.py``'s
-  ``SessionContextProjector``, which is a **fixed count** and is therefore
-  window-independent -- it plateaus after ``session_recent_messages``/2 turns no
-  matter how large the provider window is.
-
-Neither is a tool budget.
+Legacy count knobs remain for scoped work-item projections, not as a second
+Conversation cutoff. The json/native switch enables isolated representation
+comparisons without changing permission policy or the static prompt.
 """
 
 from __future__ import annotations
@@ -30,24 +21,14 @@ CONTEXT_ENV_NAMES = (
     "TSM_AGT_SESSION_RECENT_MESSAGES",
     "TSM_AGT_SESSION_TASK_SUMMARIES",
     "TSM_AGT_CONTEXT_RECENT_MESSAGE_FLOOR",
+    "TSM_AGT_SESSION_HISTORY_FORMAT",
+    "TSM_AGT_CONTEXT_HISTORY_SOFT_TOKENS",
 )
 
 
 @dataclass(frozen=True, slots=True)
 class ContextConfiguration:
-    """How much model-visible history a Turn renders, and when it is compacted.
-
-    ``session_recent_messages`` counts *messages*, so a user/assistant round trip
-    costs two; the historic default of 8 therefore keeps four round trips. The
-    defaults are the values the projector hard-coded before they were reachable
-    from configuration, so leaving the settings unset changes nothing.
-
-    ``recent_message_floor`` is the *second*, independent cap, applied by
-    ``ContextWindowManager`` only once estimated input passes the compaction
-    trigger. Raising only ``session_recent_messages`` therefore does nothing on a
-    small provider window: the floor trims the payload back down. Both are
-    exposed because both bind.
-    """
+    """Token budgeting plus legacy scoped-projection compatibility settings."""
 
     compaction_ratio: float = 0.80
     latency_soft_tokens: int = 0
@@ -55,8 +36,12 @@ class ContextConfiguration:
     session_task_summaries: int = 4
     recent_message_floor: int = 8
     sources: Mapping[str, str] | None = None
+    conversation_history_format: str = "native"
+    history_soft_tokens: int = 16384
 
     def __post_init__(self) -> None:
+        if self.conversation_history_format not in {"native", "json"}:
+            raise ValueError("TSM_AGT_SESSION_HISTORY_FORMAT must be native or json")
         if not 0 < self.compaction_ratio < 1:
             raise ValueError(
                 "TSM_AGT_CONTEXT_COMPACTION_RATIO must be between 0 and 1"
@@ -65,6 +50,8 @@ class ContextConfiguration:
             raise ValueError(
                 "TSM_AGT_CONTEXT_LATENCY_SOFT_TOKENS must be zero or positive"
             )
+        if self.history_soft_tokens < 0:
+            raise ValueError("TSM_AGT_CONTEXT_HISTORY_SOFT_TOKENS must be zero or positive")
         if self.session_recent_messages < 1:
             raise ValueError(
                 "TSM_AGT_SESSION_RECENT_MESSAGES must be positive"
@@ -82,38 +69,27 @@ class ContextConfiguration:
 def context_window_manager(
     configuration: ContextConfiguration,
 ) -> ContextWindowManager:
-    """Build the token-budget compactor from configuration.
+    """Build the shared budget; the floor applies to live tool groups only.
 
-    **Project-specific, not inherited.** The reference agent has per-tool caps,
-    a spill-to-file layer and ``enforce_turn_budget``, but no single "keep at
-    least N recent messages" knob; this only exposes a value this project
-    already hard-coded.
+    Native Conversation history is trimmed by whole Turn and tokens, not by
+    this live-message floor. Scoped legacy JSON retains its compatibility path.
     """
 
     return ContextWindowManager(
         trigger_ratio=configuration.compaction_ratio,
         latency_soft_input_tokens=configuration.latency_soft_tokens,
         recent_message_floor=configuration.recent_message_floor,
+        history_soft_tokens=configuration.history_soft_tokens,
     )
 
 
 def session_context_projector(
     configuration: ContextConfiguration,
 ) -> SessionContextProjector:
-    """Build the Session-history renderer from configuration.
-
-    Only the two *count* bounds are configurable here. The remaining projector
-    limits (executions, resources, questions, per-Task breadth) are untouched:
-    they bound other sections and were never the subject of the multi-turn
-    fidelity question.
-
-    **Project-specific, not inherited.** The reference agent replays its whole
-    ``messages`` table each turn and has no equivalent count bound, so there is
-    no upstream shape to copy; this only exposes a bound this project already
-    enforced internally.
-    """
+    """Build a model renderer while retaining legacy scoped-count settings."""
 
     return SessionContextProjector(
+        conversation_history_format=configuration.conversation_history_format,
         recent_visible_message_limit=configuration.session_recent_messages,
         detailed_task_summary_limit=configuration.session_task_summaries,
     )
@@ -138,12 +114,19 @@ def load_context_configuration(
     floor_raw, floor_source = _selected(
         "TSM_AGT_CONTEXT_RECENT_MESSAGE_FLOOR", values, environment, "8"
     )
+    history_format, history_source = _selected(
+        "TSM_AGT_SESSION_HISTORY_FORMAT", values, environment, "native"
+    )
+    history_tokens_raw, history_tokens_source = _selected(
+        "TSM_AGT_CONTEXT_HISTORY_SOFT_TOKENS", values, environment, "16384"
+    )
     try:
         ratio = float(ratio_raw)
         soft_tokens = int(soft_raw)
         session_recent_messages = int(messages_raw)
         session_task_summaries = int(summaries_raw)
         recent_message_floor = int(floor_raw)
+        history_soft_tokens = int(history_tokens_raw)
     except ValueError as error:
         raise ValueError("context compaction settings must be numeric") from error
     return ContextConfiguration(
@@ -152,12 +135,16 @@ def load_context_configuration(
         session_recent_messages=session_recent_messages,
         session_task_summaries=session_task_summaries,
         recent_message_floor=recent_message_floor,
+        conversation_history_format=history_format,
+        history_soft_tokens=history_soft_tokens,
         sources={
             "context.compaction_ratio": ratio_source,
             "context.latency_soft_tokens": soft_source,
             "context.recent_message_floor": floor_source,
             "session.recent_messages": messages_source,
             "session.task_summaries": summaries_source,
+            "session.history_format": history_source,
+            "context.history_soft_tokens": history_tokens_source,
         },
     )
 

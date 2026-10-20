@@ -38,6 +38,8 @@ MODEL_MODEL_ENV_NAMES = (
 )
 
 MODEL_OPTIONAL_ENV_NAMES = (
+    "TSM_AGT_OPEN_API_MODE",
+    "TSM_AGT_REASONING_EFFORT",
     "TSM_AGT_ANTHROPIC_VERSION",
     "TSM_AGT_MODEL_TIMEOUT_SECONDS",
     "TSM_AGT_MODEL_MAX_RETRIES",
@@ -127,6 +129,8 @@ class ModelConfiguration:
     anthropic_version: str = "2023-06-01"
     strict_tool_schema: bool = True
     streaming: bool = True
+    open_api_mode: str = "chat"
+    reasoning_effort: str | None = None
 
     @property
     def effective_output_token_parameter(self) -> str:
@@ -260,6 +264,12 @@ def load_model_configuration(
     if raw_streaming not in {"true", "false"}:
         raise ValueError(
             "TSM_AGT_MODEL_STREAMING must be 'true' or 'false'")
+    api_mode = values["TSM_AGT_OPEN_API_MODE"] or "chat"
+    if api_mode not in {"chat", "responses"}:
+        raise ValueError("TSM_AGT_OPEN_API_MODE must be 'chat' or 'responses'")
+    reasoning_effort = values["TSM_AGT_REASONING_EFFORT"] or None
+    if reasoning_effort is not None and reasoning_effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
+        raise ValueError("TSM_AGT_REASONING_EFFORT has an invalid value")
     return ModelConfiguration(
         base_url=values[MODEL_BASE_URL_ENV_NAME],
         model=model,
@@ -275,6 +285,8 @@ def load_model_configuration(
         anthropic_version=anthropic_version,
         strict_tool_schema=(raw_strict_tool_schema == "true"),
         streaming=(raw_streaming == "true"),
+        open_api_mode=api_mode,
+        reasoning_effort=reasoning_effort,
     )
 
 

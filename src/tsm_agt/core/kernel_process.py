@@ -270,7 +270,7 @@ class ProcessMixin:
         return record
 
     async def get_background_process_status(
-        self, task_id: str, process_id: str
+        self, task_id: str, process_id: str, *, enforce_deadline: bool = True
     ) -> BackgroundProcessRecord:
         record = await self._get_background_process(task_id, process_id)
         if record.state.is_terminal:
@@ -278,7 +278,7 @@ class ProcessMixin:
         executor = self._require_process_executor()
         if not executor.owns_process(record.handle):
             return await self._mark_background_orphaned(task_id, record)
-        if datetime.now(timezone.utc) >= record.deadline_at:
+        if enforce_deadline and datetime.now(timezone.utc) >= record.deadline_at:
             return await self._stop_background_record(
                 task_id, record, ProcessExitStatus.TIMED_OUT, 2.0
             )

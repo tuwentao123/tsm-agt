@@ -18,7 +18,10 @@ _STRING_ARRAY = {
 _STATE_SCHEMA = {
     "type": "object",
     "properties": {
-        "goal": {"type": "string"},
+        "goal": {
+            "type": "string",
+            "description": "Optional scratchpad topic for compatibility; not a fixed user objective.",
+        },
         "constraints": _STRING_ARRAY, "facts": _STRING_ARRAY,
         "decisions": _STRING_ARRAY,
         "hypotheses": _STRING_ARRAY, "open_questions": _STRING_ARRAY,
@@ -58,7 +61,7 @@ _STATE_SCHEMA = {
         },
     },
     "required": [
-        "goal", "constraints", "facts", "decisions", "hypotheses",
+        "constraints", "facts", "decisions", "hypotheses",
         "open_questions", "plan", "completed_work",
         "remaining_work", "evidence",
     ],
@@ -76,9 +79,10 @@ class CoreWorkingMemoryToolProvider:
     _tools = (
         ToolSpec(
             "core.working_memory_read",
-            "Read the current Task scratchpad: goal, constraints, concise facts, "
+            "Read the current scratchpad: constraints, concise facts, "
             "decisions, hypotheses, open questions, plan, progress, and evidence references. "
-            "This is inspectable temporary state, not durable user/project memory.",
+            "This is revisable working state, not a fixed completion contract or "
+            "durable user/project memory.",
             {"type": "object", "properties": {}, "additionalProperties": False},
             ToolRisk.R0, True, True, ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.INTERNAL,

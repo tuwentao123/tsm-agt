@@ -394,7 +394,7 @@ class AnthropicMessagesModelProvider:
                 "content": [{
                     "type": "tool_result",
                     "tool_use_id": result.call_id,
-                    "content": json.dumps(result.to_data(), ensure_ascii=False, separators=(",", ":")),
+                    "content": json.dumps(result.to_model_data(), ensure_ascii=False, separators=(",", ":")),
                     "is_error": not result.ok,
                 }],
             }

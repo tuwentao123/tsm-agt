@@ -72,7 +72,8 @@ class ApprovalContextContinuityTest(unittest.IsolatedAsyncioTestCase):
                 request = model.requests[2]
                 history = next(message for message in request.messages
                                if message.message_id.startswith("session-context-"))
-                history_data = json.loads(history.text)
+                from tests.history_helpers import session_history_view
+                history_data = session_history_view(request)
                 self.assertTrue(any(row.get("text") == "I can implement change A and change B."
                                     for row in history_data["recent_messages"]))
                 self.assertTrue(any(message.role is MessageRole.USER and

@@ -212,7 +212,10 @@ def _merge_todos(
 def _working_memory_state(
     current: Mapping[str, Any], todos: Sequence[Mapping[str, str]],
 ) -> dict[str, Any]:
-    state = {field: current[field] for field in _AUTHORED_STATE_FIELDS}
+    state = {
+        field: current[field] for field in _AUTHORED_STATE_FIELDS
+        if field != "goal" or field in current
+    }
     state["plan"] = [
         {
             "step_id": todo["id"],

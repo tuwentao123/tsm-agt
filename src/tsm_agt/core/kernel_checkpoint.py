@@ -55,6 +55,52 @@ from .trust import workspace_fingerprint
 
 
 class CheckpointMixin:
+    async def _refresh_conversation_configuration(
+        self, task_id: str, turn_id: str,
+    ) -> TaskSnapshot:
+        """Bind a NEW Turn to live configuration, never refresh a resume.
+
+        A conversation reuses its Task across deployments. Archived revisions
+        remain immutable; only changed configuration gets a new revision before
+        the first model/tool action. Pending approvals cannot enter this path.
+        """
+        for attempt in range(4):
+            stored = await self._require_stored_task(task_id)
+            current = TaskSnapshot.from_data(stored.data)
+            if current.state is not TaskState.EXECUTING or current.pending_approval is not None:
+                raise AgentCheckpointConflict("new Turn configuration requires an executing Task without a pending approval")
+            configuration = await self._build_effective_configuration(
+                current, len(current.effective_configurations) + 1,
+            )
+            previous = current.effective_configurations[-1] if current.effective_configurations else None
+            if previous is not None:
+                def content(snapshot):
+                    return {key: value for key, value in snapshot.to_data().items()
+                            if key not in {"captured_at", "revision", "effective_config_hash"}}
+                if content(configuration) == content(previous):
+                    return current
+            updated = current.with_effective_configuration(configuration)
+            event = RuntimeEvent(
+                f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
+                "config.snapshot", {
+                    "turn_id": turn_id, "reason": "new_conversation_turn",
+                    "revision": configuration.revision,
+                    "effective_config_hash": configuration.effective_config_hash,
+                    "toolset_hash": configuration.toolset_hash,
+                    "adapter_lock_hash": configuration.adapter_lock_hash,
+                    "policy_hash": configuration.policy_hash,
+                    "provider_capabilities_hash": configuration.provider_capabilities_hash,
+                }, turn_id=turn_id,
+            )
+            try:
+                await self._dependencies.store.commit(RuntimeUnitOfWork(
+                    task_id, stored.version, updated.to_data(), (event,),
+                ))
+                return updated
+            except ValueError as error:
+                if "version conflict" not in str(error) or attempt == 3:
+                    raise
+
     async def start_fresh_conversation_turn(self, task_id: str) -> None:
         """Move an interrupted conversation Task into a new, checkpoint-free turn.
 
@@ -132,6 +178,8 @@ class CheckpointMixin:
         self, task: TaskSnapshot, checkpoint: AgentTurnCheckpoint,
         visible_tools: tuple[ToolSpec, ...],
     ) -> AgentTurnCheckpoint:
+        if task.task_kind is TaskKind.CONVERSATION:
+            task = await self._refresh_conversation_configuration(task.task_id, checkpoint.turn_id)
         if not task.effective_configurations:
             raise RuntimeError("Agent checkpoint requires Effective Configuration")
         configuration = task.effective_configurations[-1]
@@ -272,6 +320,7 @@ class CheckpointMixin:
             and execution.idempotency is ToolIdempotency.NON_IDEMPOTENT
             for execution in task.tool_executions.values()
         )
+        execution_count, mutation_count, process_count = self._checkpoint_execution_counts(task, checkpoint)
         return await policy.evaluate(CheckpointCompatibilityProbe(
             differences=differences,
             reconcilable_differences=(
@@ -292,12 +341,40 @@ class CheckpointMixin:
                 }
             ),
             pending_tool_call_count=len(checkpoint.pending_tool_calls),
-            tool_execution_count=len(task.tool_executions),
+            tool_execution_count=execution_count,
             unknown_outcome_count=unknown,
             running_non_idempotent_count=running_non_idempotent,
-            mutation_count=len(task.mutation_journal),
-            background_process_count=len(task.background_processes),
+            mutation_count=mutation_count,
+            background_process_count=process_count,
         ))
+
+    @staticmethod
+    def _checkpoint_execution_counts(
+        task: TaskSnapshot, checkpoint: AgentTurnCheckpoint,
+    ) -> tuple[int, int, int]:
+        """Exclude only provably settled PRIOR Turns from upgrade guards.
+
+        Unknown attribution, unresolved executions and live processes remain
+        conservative blockers. Unknown outcomes/non-idempotent running calls
+        are additionally checked Task-wide by the compatibility probe above.
+        """
+        if task.task_kind is not TaskKind.CONVERSATION:
+            return len(task.tool_executions), len(task.mutation_journal), len(task.background_processes)
+        settled_prior = tuple(
+            execution for execution in task.tool_executions.values()
+            if execution.turn_id and execution.turn_id != checkpoint.turn_id
+            and ((execution.result is not None
+                  and execution.state in {ToolCommitState.COMMITTED, ToolCommitState.FAILED, ToolCommitState.CANCELLED})
+                 or execution.reconciled_outcome is not None)
+        )
+        historical_invocations = {execution.invocation_id for execution in settled_prior if execution.invocation_id}
+        return (
+            len(task.tool_executions) - len(settled_prior),
+            sum(mutation.step_id not in historical_invocations for mutation in task.mutation_journal),
+            sum(not process.turn_id or process.turn_id == checkpoint.turn_id
+                or not process.state.is_terminal or process.state.value == "ORPHANED"
+                for process in task.background_processes.values()),
+        )
 
     async def _reconcilable_checkpoint_differences(
         self, task: TaskSnapshot, checkpoint: AgentTurnCheckpoint,
@@ -562,7 +639,9 @@ class CheckpointMixin:
                 stored.last_event_sequence + len(events) + 1,
                 "approval.invalidated",
                 {"request_id": current.pending_approval.request_id,
+                 "turn_id": current.pending_approval.turn_id,
                  "reason": "checkpoint_identity_conflict"},
+                turn_id=current.pending_approval.turn_id,
             ))
         events.append(RuntimeEvent(
             f"evt-{uuid4().hex}", task_id,
@@ -586,7 +665,7 @@ class CheckpointMixin:
             raise AgentCheckpointConflict(
                 "Agent checkpoint compatibility policy did not allow rebase"
             )
-        if checkpoint.pending_tool_calls or task.tool_executions:
+        if checkpoint.pending_tool_calls or self._checkpoint_execution_counts(task, checkpoint)[0]:
             raise AgentCheckpointConflict(
                 "Agent checkpoint with Tool execution state cannot be rebased"
             )
@@ -662,14 +741,9 @@ class CheckpointMixin:
         prose look like durable evidence. Tool-call messages and ToolResult
         messages remain paired and intact for protocol recovery.
 
-        When the history still holds retryable tool failures, the continuation
-        says so and asks for the retry by name. The generic "continue from
-        durable ToolResults" wording let a model answer the same way again, so
-        the Task parked, the user pressed 继续, and nothing changed
-        (``task-a20b6734f28b4870be666e7c14561e76``).
+        Tool results remain paired with their calls. The model chooses the next
+        action; retry classifications do not mandate a particular tool call.
         """
-        from .kernel import Kernel
-
         retained = [
             message for message in messages
             if not message.message_id.startswith("completion-readiness-")
@@ -690,26 +764,6 @@ class CheckpointMixin:
             ),
             "text": user_text,
         }
-        recovery_batch = Kernel._latest_recoverable_tool_batch(messages)
-        if recovery_batch:
-            payload["instruction"] = (
-                "Continue the current Task from durable ToolResults and "
-                "workspace facts. These tool calls did not complete and are "
-                "retryable: call the same tool again with corrected arguments "
-                "now, or state concretely why it cannot be retried. Prior "
-                "assistant prose is not evidence and must not be repeated as a "
-                "conclusion."
-            )
-            payload["unresolved_tool_failures"] = [
-                {
-                    "call_id": result.call_id,
-                    "error_code": result.error_code,
-                    "message": result.message,
-                    "recovery_kind": result.effective_recovery_kind.value,
-                    "recovery_action": dict(result.recovery_action),
-                }
-                for result in recovery_batch
-            ]
         retained.append(Message(
             f"continuation-input-{input_id}", MessageRole.USER,
             (TextBlock(json.dumps(

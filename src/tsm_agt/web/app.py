@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import ipaddress
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -23,6 +24,8 @@ from tsm_agt.core import (
     ProjectTrustLevel, note_stream_released,
 )
 from tsm_agt.local_api import LocalEventApiServer
+from tsm_agt.adapters.openai_compatible.model import OpenAICompatibleModelProvider
+from tsm_agt.adapters.openai_compatible.request_diagnostics import TurnRequestDiagnostics
 from tsm_agt.ports import ImageBlock, MessageRole
 
 app = FastAPI(title="tsm-agt-web")
@@ -449,6 +452,24 @@ textarea::placeholder{color:#94a3b8}
 
     <div class=\"composer\">
       <div id=\"preview-list\" class=\"preview-list\"></div>
+      <div class=\"composer-meta\" style=\"margin-bottom:6px;display:flex;align-items:center;gap:12px;justify-content:space-between;\">
+        <div class=\"composer-title\">会话输入</div>
+        <div style=\"display:flex;align-items:center;gap:8px;\">
+          <label for=\"reasoning-effort\" style=\"font-size:11px;color:#64748b;display:flex;align-items:center;gap:6px;\">
+            推理强度
+            <select id=\"reasoning-effort\" style=\"font-size:11px;padding:2px 6px;border-radius:6px;border:1px solid #cbd5e1;background:#ffffff;color:#334155;\">
+              <option value=\"\">跟随服务配置</option>
+              <option value=\"none\">关闭（none）</option>
+              <option value=\"minimal\">极低（minimal）</option>
+              <option value=\"low\">低（low）</option>
+              <option value=\"medium\">中（medium）</option>
+              <option value=\"high\">高（high）</option>
+              <option value=\"xhigh\">极高（xhigh）</option>
+              <option value=\"max\">最大（max）</option>
+            </select>
+          </label>
+        </div>
+      </div>
       <div id=\"image-preview-modal\" class=\"image-preview-modal\">
         <div class=\"image-preview-content\">
           <button id=\"image-preview-close\" class=\"image-preview-close\" title=\"关闭预览\">×</button>
@@ -463,6 +484,8 @@ textarea::placeholder{color:#94a3b8}
         </div>
         <div class=\"composer-actions\" style=\"display:flex;align-items:center;margin-top:0;\">
           <div class=\"composer-action-buttons\" style=\"display:flex;align-items:center;gap:8px;\">
+            <button id=\"diagnostic-toggle\" class=\"icon-btn\" onclick=\"toggleTurnDiagnostic()\">诊断下一轮</button>
+            <button class=\"icon-btn\" onclick=\"showTurnDiagnostic()\">查看诊断</button>
             <button class=\"icon-btn\" onclick=\"document.getElementById('image-input').click()\" title=\"上传图片\">＋ 图片</button>
             <input id=\"image-input\" type=\"file\" accept=\"image/*\" multiple onchange=\"handleImages(event)\" style=\"display:none\" />
             <button id=\"send-btn\" class=\"send-btn\" onclick=\"runTask()\">发送</button>
@@ -472,10 +495,42 @@ textarea::placeholder{color:#94a3b8}
     </div>
   </main>
 </div>
+<dialog id=\"diagnostic-dialog\" style=\"max-width:90vw;max-height:85vh;width:1000px\"><button onclick=\"document.getElementById('diagnostic-dialog').close()\">关闭</button><p>请求内容可能包含敏感信息；脱敏不保证完整。过期后服务端自动清除。</p><div id=\"diagnostic-summary\"></div><details><summary>查看敏感请求正文</summary><pre id=\"diagnostic-output\" style=\"white-space:pre-wrap;word-break:break-all\"></pre></details></dialog>
 
 <script>
 """ + r"""
 const selectedImages = [];
+let diagnoseNextInput = false;
+let diagnosticSessionId = null;
+let latestDiagnostic = null;
+
+function toggleTurnDiagnostic() {
+  if (!diagnoseNextInput && !confirm('诊断将暂存下一轮发送给模型的请求，可能包含代码、对话、工具结果和未识别的密钥。仅在本机内存保存最多 1 小时；脱敏不保证完整。确认启用？')) return;
+  diagnoseNextInput = !diagnoseNextInput;
+  diagnosticSessionId = diagnoseNextInput ? activeConversationId : null;
+  document.getElementById('diagnostic-toggle').textContent = diagnoseNextInput ? '取消诊断' : '诊断下一轮';
+}
+
+async function showTurnDiagnostic() {
+  if (!latestDiagnostic || latestDiagnostic.sessionId !== activeConversationId) {
+    showError('当前会话没有可查看的诊断，或已刷新页面。'); return;
+  }
+  try {
+    const response = await fetch('/turn-diagnostics/read', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({key: latestDiagnostic.key, session_id: latestDiagnostic.sessionId})
+    });
+    if (!response.ok) throw new Error('诊断已过期或不可用');
+    const data = await response.json();
+    document.getElementById('diagnostic-summary').textContent = `Turn：${data.turn_id || '尚未开始'}；已采集 ${data.requests.length} 次；超限遗漏 ${data.dropped} 次；约 ${data.expires_in_seconds} 秒后过期。`;
+    document.getElementById('diagnostic-output').textContent = JSON.stringify(data, null, 2);
+    document.getElementById('diagnostic-dialog').showModal();
+  } catch (error) { showError(String(error.message || error)); }
+}
+document.getElementById('diagnostic-dialog').addEventListener('close', () => {
+  document.getElementById('diagnostic-output').textContent = '';
+  document.getElementById('diagnostic-dialog').querySelector('details').open = false;
+});
 // Approval cards can be created after a long-running Turn.  Reveal each new
 // request once, but do not fight the user's own scrolling while they inspect
 // its preview.
@@ -2144,6 +2199,42 @@ function appendTaskProgress(taskId, progress, conversationId) {
   if (!text) return;
   const lines = message.task.progress;
   if (lines.some((item) => item.sequence === sequence && sequence > 0)) return;
+  if (['execution_note', 'stage_summary'].includes(progressData.kind)) {
+    const conversation = getConversationById(conversationId);
+    const currentInput = [...(conversation?.messages || [])].reverse()
+      .find((item) => item.role === 'user' && item.taskId === taskId && item.turnId);
+    const turn = currentInput && conversation?.turnCalls?.get(currentInput.turnId);
+    if (turn) {
+      turn.progress ||= [];
+      turn.progress.push({kind: progressData.kind, model_call: progressData.model_call, activity: progressData.activity, phase: progressData.phase});
+    }
+  }
+  if (progressData.kind === 'reasoning_delta') {
+    const fragment = progressData.reasoning_text || '';
+    const conversation = getConversationById(conversationId);
+    const currentInput = [...(conversation?.messages || [])].reverse()
+      .find((item) => item.role === 'user' && item.taskId === taskId && item.turnId);
+    const turn = currentInput && conversation?.turnCalls?.get(currentInput.turnId);
+    if (turn) {
+      turn.progress ||= [];
+      const last = turn.progress[turn.progress.length - 1];
+      if (last?.kind === 'reasoning_delta' && last.model_call === progressData.model_call) {
+        last.reasoning_text += fragment;
+      } else {
+        turn.progress.push({kind: 'reasoning_delta', model_call: progressData.model_call, reasoning_text: fragment});
+      }
+    }
+    const previous = lines[lines.length - 1];
+    if (previous?.progressData?.kind === 'reasoning_delta'
+        && previous.progressData.model_call === progressData.model_call) {
+      previous.text += fragment;
+      previous.sequence = sequence;
+    } else {
+      lines.push({ sequence, text, progressData });
+    }
+    if (conversationId === activeConversationId) renderMessages();
+    return;
+  }
   if (
     lines[lines.length - 1]?.text === text
     && lines[lines.length - 1]?.progressData?.kind === progressData.kind
@@ -2577,6 +2668,9 @@ function describeFailure(reason) {
 function describeProgress(progress) {
   if (!progress) return '';
   const kind = progress.kind;
+  if (kind === 'execution_note') return progress.activity || '';
+  if (kind === 'stage_summary') return progress.activity ? `${progress.phase === 'runtime' ? '工具状态' : '阶段进展'}：${progress.activity}` : '';
+  if (kind === 'reasoning_delta') return progress.reasoning_text ? `推理摘要：${progress.reasoning_text}` : '';
   if (kind === 'model_started') return '正在思考…';
   if (kind === 'model_completed') return '已生成一轮回复';
   if (kind === 'tool_started') {
@@ -2706,6 +2800,10 @@ async function runTask() {
   setLoading(true);
   updateComposerButtonState();
   const requestId = crypto.randomUUID();
+  const diagnosticRequested = diagnoseNextInput && (!diagnosticSessionId || diagnosticSessionId === conversationId);
+  const diagnosticSessionMismatch = diagnoseNextInput && !diagnosticRequested;
+  diagnoseNextInput = false;
+  document.getElementById('diagnostic-toggle').textContent = '诊断下一轮';
   try {
     const response = await fetch('/session-input', {
       method:'POST',
@@ -2715,6 +2813,7 @@ async function runTask() {
         request_id: requestId,
         workspace_id: workspaceId,
         session_id: conversationId,
+        diagnose_request: diagnosticRequested,
         images,
       })
     });
@@ -2730,6 +2829,10 @@ async function runTask() {
     }
 
     const data = await response.json();
+    if (diagnosticSessionMismatch) showError('会话已切换，未为本轮开启诊断。');
+    if (data.diagnostic_key) {
+      latestDiagnostic = {key: data.diagnostic_key, sessionId: conversationId};
+    }
     if (data.kind === 'answer') {
       appendMessage('assistant', data.answer || '未返回回答。', [], conversationId);
       setLoading(false);
@@ -2919,6 +3022,9 @@ function renderLiveTurnPanel(task) {
 function turnProgressLines(items) {
   const names = new Map();
   const lines = [];
+  const closedApprovals = new Set((items || [])
+    .filter((item) => ['approval_resolved', 'approval_invalidated'].includes(item?.kind))
+    .map((item) => item.request_id).filter(Boolean));
   (items || []).forEach((item) => {
     const kind = item?.kind || '';
     if (kind === 'turn_started') {
@@ -2962,20 +3068,30 @@ function turnProgressLines(items) {
       });
       return;
     }
-    if (kind === 'turn_interrupted' || kind === 'turn_failed') {
-      const what = kind === 'turn_interrupted' ? '本轮中断' : '本轮失败';
+    if (kind === 'turn_interrupted' || kind === 'turn_failed' || kind === 'turn_conflict') {
+      const what = kind === 'turn_conflict' ? '本轮执行冲突'
+        : kind === 'turn_interrupted' ? '本轮中断' : '本轮失败';
       lines.push({
         text: `${what}${item.detail ? `：${item.detail}` : ''}`,
         tone: 'failed',
       });
       return;
     }
+    if (kind === 'approval_invalidated' || kind === 'approval_resolved') {
+      lines.push({
+        text: kind === 'approval_invalidated' ? '原授权请求已失效，未获得本次执行许可'
+          : item.decision === 'approve' ? '已允许本次操作' : '已拒绝本次操作',
+        tone: kind === 'approval_invalidated' ? 'failed' : '',
+      });
+      return;
+    }
     if (kind === 'waiting') {
+      const closed = closedApprovals.has(item.request_id);
       lines.push({
         text: item.waiting_kind === 'approval'
-          ? `等待授权${item.action ? `：${item.action}` : ''}`
+          ? `${closed ? '曾请求授权（已处理）' : '等待授权'}${item.action ? `：${item.action}` : ''}`
           : '等待用户输入',
-        tone: 'active',
+        tone: closed ? '' : 'active',
       });
       return;
     }
@@ -3160,7 +3276,12 @@ async function renderFinalResult(taskId, state, conversationId) {
   // Keep the live trace mounted until its durable Turn projection has been
   // loaded. Updating the card to a terminal state and rendering first creates
   // a blank interval because terminal Tasks no longer own a live panel.
-  const assistantText = String(state.assistant_text || '').trim();
+  // On a conflict the SDK may still expose the previous Turn's archived
+  // answer. It is not a response to this failed approval/resume.
+  const assistantText = state.state === 'CONFLICT' ? '' : String(state.assistant_text || '').trim();
+  if (state.failure_reason && conversationId === activeConversationId) {
+    showError(describeFailure(state.failure_reason));
+  }
   if (assistantText) {
     appendTaskAssistantText(taskId, assistantText, conversationId);
   } else if (state.clarification?.question) {
@@ -3168,13 +3289,10 @@ async function renderFinalResult(taskId, state, conversationId) {
       'assistant', state.clarification.question, [], conversationId, taskId,
     );
   } else if (state.failure_reason) {
-    if (conversationId === activeConversationId) {
-      showError(describeFailure(state.failure_reason));
-    }
     appendTaskProgress(taskId, {
       sequence: 0,
       progress: {
-        activity: `任务失败：${describeFailure(state.failure_reason)}`,
+        activity: `本轮已停止：${describeFailure(state.failure_reason)}`,
       },
     }, conversationId);
   }
@@ -3241,7 +3359,7 @@ function followTask(taskId, conversationId) {
     if (!response.ok) return false;
     const state = await response.json();
     const current = taskMessage(conversationId, taskId) || card;
-    const appendedText = appendTaskAssistantText(
+    const appendedText = state.state === 'CONFLICT' ? false : appendTaskAssistantText(
       taskId, state.assistant_text, conversationId,
     );
     if (current) {
@@ -3682,6 +3800,7 @@ runtime_error: str | None = None
 configuration_issues: list[str] = []
 workspace_registry: list[dict[str, str]] = []
 session_workspace_bindings: dict[str, str] = {}
+turn_request_diagnostics: TurnRequestDiagnostics | None = None
 
 # These runs are deliberately Web-local: the evaluated Agent Tasks themselves
 # are durable Runtime records, while this small index only groups independent
@@ -3862,12 +3981,17 @@ def recover_workspace_registry_from_runtime() -> None:
 
 @app.on_event("startup")
 async def startup() -> None:
-    global runtime_server, runtime_error, configuration_issues
+    global runtime_server, runtime_error, configuration_issues, turn_request_diagnostics
     load_workspace_registry()
     load_session_workspace_bindings()
     runtime_server = LocalEventApiServer(Path.cwd())
     try:
         runtime_server.start()
+        model = runtime_server._client.application.kernel.dependencies.model
+        physical = getattr(model, '_provider', model)
+        if isinstance(physical, OpenAICompatibleModelProvider):
+            turn_request_diagnostics = TurnRequestDiagnostics()
+            physical._request_diagnostics = turn_request_diagnostics
         recover_workspace_registry_from_runtime()
         runtime_error = None
         configuration_issues = list(getattr(
@@ -3881,6 +4005,8 @@ async def startup() -> None:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    global turn_request_diagnostics
+    turn_request_diagnostics = None
     if runtime_server is not None:
         runtime_server.stop()
 
@@ -4092,8 +4218,33 @@ async def set_workspace_trust(workspace_id: str, payload: dict) -> dict:
     return {**workspace, "trust_level": binding.level.value, "trust": binding.to_data()}
 
 
+def _require_local_diagnostic_request(request: Request | None) -> None:
+    if request is None or request.client is None:
+        raise HTTPException(status_code=403, detail='diagnostics require a local request')
+    try:
+        peer_is_local = ipaddress.ip_address(request.client.host).is_loopback
+    except ValueError:
+        peer_is_local = False
+    if not peer_is_local or request.url.hostname not in {'localhost', '127.0.0.1', '::1'}:
+        raise HTTPException(status_code=403, detail='diagnostics require loopback access')
+    origin = request.headers.get('origin')
+    if origin and origin.rstrip('/') != str(request.base_url).rstrip('/'):
+        raise HTTPException(status_code=403, detail='diagnostic origin mismatch')
+
+
+@app.post("/turn-diagnostics/read")
+async def read_turn_diagnostics(payload: dict, request: Request) -> Response:
+    _require_local_diagnostic_request(request)
+    key = str(payload.get('key', ''))
+    session_id = str(payload.get('session_id', ''))
+    data = turn_request_diagnostics.read(key, session_id) if turn_request_diagnostics else None
+    if data is None:
+        raise HTTPException(status_code=404, detail='diagnostic unavailable or expired')
+    return JSONResponse(content=data, headers={'Cache-Control': 'no-store'})
+
+
 @app.post("/session-input")
-async def submit_session_input(payload: dict) -> dict:
+async def submit_session_input(payload: dict, request: Request = None) -> dict:
     """Web's high-level normal-message ingress; `/tasks` stays low-level."""
     if runtime_server is None:
         raise HTTPException(
@@ -4130,14 +4281,32 @@ async def submit_session_input(payload: dict) -> dict:
     # past the Task SPEC goal limit and fail task creation outright.
     image_blocks = _normalize_image_blocks(payload.get("images"))
     intent = _explicit_user_input_intent(payload.get("intent"))
+    diagnostic_key = None
+    if payload.get('diagnose_request') is True:
+        _require_local_diagnostic_request(request)
+        if turn_request_diagnostics is None:
+            raise HTTPException(status_code=400, detail='当前模型不支持请求诊断')
+        try:
+            diagnostic_key = turn_request_diagnostics.start(session_id)
+        except ValueError as error:
+            raise HTTPException(status_code=429, detail=str(error)) from error
+
+    async def submit_with_diagnostics():
+        token = turn_request_diagnostics.activate(diagnostic_key) if diagnostic_key else None
+        try:
+            return await runtime_server._client.submit_user_input(
+                session_id, text, input_id=request_id, explicit_intent=intent,
+                images=tuple(image_blocks), workspace=Path(workspace['path']),
+            )
+        finally:
+            if token is not None:
+                turn_request_diagnostics.reset(token)
+
     try:
-        result = runtime_server._call(runtime_server._client.submit_user_input(
-            session_id, text, input_id=request_id,
-            explicit_intent=intent,
-            images=tuple(image_blocks),
-            workspace=Path(workspace["path"]),
-        ))
+        result = runtime_server._call(submit_with_diagnostics())
     except AgentLoopLimitExceeded as error:
+        if diagnostic_key:
+            turn_request_diagnostics.delete(diagnostic_key)
         # A spent call budget is a bounded Runtime outcome with a known cause,
         # not an internal fault. Reporting it as 500 hides the only actionable
         # detail the user has: how much was spent and what blocked last.
@@ -4145,10 +4314,14 @@ async def submit_session_input(payload: dict) -> dict:
             status_code=409, detail=_describe_loop_limit(error),
         ) from error
     except ValueError as error:
+        if diagnostic_key:
+            turn_request_diagnostics.delete(diagnostic_key)
         # A rejected workspace is a caller-visible conflict, most often a
         # Session whose earlier Tasks ran in a different directory.
         raise HTTPException(status_code=409, detail=str(error)) from error
     except Exception as error:
+        if diagnostic_key:
+            turn_request_diagnostics.delete(diagnostic_key)
         # Never let an unexpected runtime failure terminate the HTTP response.
         # Browsers surface a dropped response as the opaque "Failed to fetch",
         # which hides the session and task context needed to diagnose it.
@@ -4162,6 +4335,8 @@ async def submit_session_input(payload: dict) -> dict:
             headers={"X-Request-Id": request_id},
         ) from error
     data = dict(result.result)
+    if diagnostic_key:
+        data['diagnostic_key'] = diagnostic_key
     status = 202 if data.get("kind") == "task" else 200
     return JSONResponse(content=data, status_code=status)
 
@@ -4560,15 +4735,21 @@ async def get_session(session_id: str) -> dict:
         if task_id and turn_id and not turn.get("settled"):
             unfinished_turn_by_task[task_id] = turn_id
     for task_id in snapshot.task_ids:
+        approval_turns: dict[str, str] = {}
         for event in runtime_server._call(
             kernel.dependencies.store.read_events(
                 task_id, event_types=_TURN_PROGRESS_EVENT_TYPES,
             )
         ):
-            item = _turn_progress_item(event)
+            payload = event.payload if isinstance(event.payload, Mapping) else {}
+            item = _turn_progress_item(
+                event, fallback_turn_id=approval_turns.get(str(payload.get("request_id") or "")),
+            )
             if item is None:
                 continue
             turn_id = str(item.pop("turn_id"))
+            if item.get("kind") == "waiting" and item.get("request_id"):
+                approval_turns[item["request_id"]] = turn_id
             if turn_id == "sdk-background":
                 turn_id = unfinished_turn_by_task.get(task_id, turn_id)
             turn_progress.setdefault(turn_id, []).append(item)
@@ -4603,6 +4784,10 @@ async def get_session(session_id: str) -> dict:
                 runtime_server._client.latest_progress_sequence(task_id)
             ),
             "waiting": _waiting_payload(result),
+            "failure_reason": (
+                _task_failure_reason(task_id)
+                if result.phase1_state in {"FAILED", "INTERRUPTED"} else None
+            ),
             "assistant_text": result.assistant_text,
             "projection": dict(result.projection) if result.projection else None,
             "todo_list": (
@@ -4673,6 +4858,8 @@ _TURN_PROGRESS_EVENT_TYPES = (
     "model.attempt_failed",
     "model.recovery_decided",
     "conversation.model_response_recorded",
+    "conversation.execution_note",
+    "conversation.stage_summary",
     "tool.requested",
     "tool.completed",
     "tool.failed",
@@ -4684,6 +4871,9 @@ _TURN_PROGRESS_EVENT_TYPES = (
     "turn.completion_review_skipped",
     "turn.completion_review_bypassed",
     "approval.requested",
+    "approval.resolved",
+    "approval.invalidated",
+    "checkpoint.conflict",
 )
 
 #: Argument keys a progress line may name as the call's target. Same rule as
@@ -4696,7 +4886,7 @@ _TURN_PROGRESS_TARGET_KEYS = (
 _TURN_PROGRESS_TEXT_LIMIT = 200
 
 
-def _turn_progress_item(event) -> dict | None:
+def _turn_progress_item(event, *, fallback_turn_id: str | None = None) -> dict | None:
     """Normalize one durable event into a Turn progress item.
 
     The shapes mirror the live ``AgentProgress`` items the page already renders,
@@ -4705,12 +4895,21 @@ def _turn_progress_item(event) -> dict | None:
 
     payload = event.payload if isinstance(event.payload, Mapping) else {}
     turn_id = str(
-        payload.get("turn_id") or getattr(event, "turn_id", "") or ""
+        payload.get("turn_id") or getattr(event, "turn_id", "") or fallback_turn_id or ""
     )
     if not turn_id:
         return None
     kind = event.event_type
     base: dict[str, Any] = {"turn_id": turn_id, "sequence": event.sequence}
+    if kind == "checkpoint.conflict":
+        conflicts = [item[:80] for item in (payload.get("conflicts") or []) if isinstance(item, str)][:12]
+        return {**base, "kind": "turn_conflict", "conflicts": conflicts,
+                "diagnostic_code": "checkpoint_identity_conflict",
+                "detail": _checkpoint_conflict_reason(conflicts)}
+    if kind in {"approval.resolved", "approval.invalidated"}:
+        return {**base, "kind": kind.replace(".", "_"),
+                "request_id": str(payload.get("request_id") or ""),
+                "decision": payload.get("decision"), "reason": _bounded_text(payload.get("reason"))}
     if kind == "turn.started":
         return {
             **base, "kind": "turn_started",
@@ -4742,6 +4941,13 @@ def _turn_progress_item(event) -> dict | None:
             "model_call": payload.get("model_call"),
             "tool_call_count": payload.get("tool_call_count"),
             "finish_reason": payload.get("finish_reason"),
+        }
+    if kind in {"conversation.execution_note", "conversation.stage_summary"}:
+        return {
+            **base, "kind": kind.removeprefix("conversation."),
+            "model_call": payload.get("model_call"),
+            "activity": str(payload.get("text") or ""),
+            "phase": str(payload.get("source") or "model"),
         }
     if kind == "tool.requested":
         call = payload.get("call")
@@ -4984,7 +5190,7 @@ async def get_task(task_id: str) -> dict:
         )
     result = runtime_server._call(runtime_server._client.get_task_result(task_id))
     data = result.to_data()
-    if result.phase1_state == "FAILED":
+    if result.phase1_state in {"FAILED", "INTERRUPTED"}:
         data["failure_reason"] = _task_failure_reason(task_id)
     return data
 
@@ -5030,11 +5236,24 @@ def _task_failure_reason(task_id: str) -> str | None:
     except Exception:
         return None
     for event in reversed(events):
+        if event.event_type == "turn.started":
+            break  # Never reuse an older Turn's failure for this Turn.
+        if event.event_type == "checkpoint.conflict":
+            return _checkpoint_conflict_reason(event.payload.get("conflicts") or [])
+        if event.event_type == "turn.interrupted":
+            message = str(event.payload.get("message", "")).strip()
+            if message:
+                return _bounded_text(message)
         if event.event_type.endswith(".failed"):
             message = str(event.payload.get("message", "")).strip()
             if message:
                 return message
     return None
+
+
+def _checkpoint_conflict_reason(conflicts) -> str:
+    keys = ", ".join(item[:80] for item in conflicts[:12] if isinstance(item, str))
+    return f"执行检查点冲突（{keys or 'checkpoint_identity_conflict'}），本轮已停止，不能继续使用旧检查点或旧审批。"
 
 
 @app.get("/stream/{task_id}")
@@ -5134,10 +5353,12 @@ async def stream(
                                 if result.conclusion_validation is not None else None
                             ),
                             "phase1_state": result.phase1_state,
+                            "state": result.state,
+                            "status": result.status,
                             "assistant_text": result.assistant_text,
                             "clarification": result.clarification,
                             "failure_reason": _task_failure_reason(task_id)
-                            if result.phase1_state == "FAILED" else None,
+                            if result.phase1_state in {"FAILED", "INTERRUPTED"} else None,
                         },
                         ensure_ascii=False,
                     )

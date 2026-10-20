@@ -670,6 +670,58 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
             self.task.task_id, process.process_id, grace_seconds=0.01
         )
 
+    async def test_session_process_list_and_control_respect_ownership(self) -> None:
+        kernel = self.application.kernel
+        process = await kernel.start_background_process(
+            self.task.task_id, "turn-start", (sys.executable, "-c", "import time; time.sleep(30)"),
+            max_lifetime_seconds=30,
+        )
+        other = await self._executing_task("task-foreign-process-list")
+        try:
+            found = await kernel.invoke_tool(self.task.task_id, "turn-later", ToolCall(
+                "list-own", "core.process_list", {}))
+            self.assertTrue(found.ok, found.message)
+            self.assertEqual(found.data["processes"][0]["process_id"], process.process_id)
+            self.assertEqual(found.data["processes"][0]["creator_turn_id"], "turn-start")
+            self.assertNotIn("pid", found.data["processes"][0])
+            foreign = await kernel.invoke_tool(other.task_id, "turn-other", ToolCall(
+                "list-foreign", "core.process_list", {}))
+            self.assertEqual(foreign.data["processes"], [])
+            denied = await kernel.invoke_tool(other.task_id, "turn-other", ToolCall(
+                "status-foreign", "core.process_status", {"process_id": process.process_id}))
+            self.assertEqual(denied.error_code, "NOT_FOUND")
+        finally:
+            await kernel.stop_background_process(self.task.task_id, process.process_id, grace_seconds=0.01)
+
+    async def test_process_list_discovers_and_controls_same_session_other_task(self) -> None:
+        kernel = self.application.kernel
+        process = await kernel.start_background_process(
+            self.task.task_id, "turn-original", (sys.executable, "-c", "import time; time.sleep(30)"),
+            max_lifetime_seconds=30,
+        )
+        other = await kernel.create_task("same session", Path(self.temporary.name),
+                                         "task-same-session", session_id=self.task.session_id)
+        for state in (TaskState.INTAKE, TaskState.RESOLVING_PROJECT, TaskState.SELECTING_EXTENSIONS,
+                      TaskState.ROUTING, TaskState.EXECUTING):
+            other = await kernel.transition_task(other.task_id, state, state.value)
+        try:
+            listing = await kernel.invoke_tool(other.task_id, "turn-new", ToolCall("list-session", "core.process_list", {}))
+            self.assertTrue(listing.ok, listing.message)
+            self.assertEqual(listing.data["processes"][0]["task_id"], self.task.task_id)
+            scoped = await kernel.invoke_tool(other.task_id, "turn-new", ToolCall("list-task", "core.process_list", {"scope": "task"}))
+            self.assertEqual(scoped.data["processes"], [])
+            status = await kernel.invoke_tool(other.task_id, "turn-new", ToolCall("same-status", "core.process_status", {"process_id": process.process_id}))
+            self.assertTrue(status.ok, status.message)
+            with self.assertRaises(ApprovalRequired) as pending:
+                await kernel.invoke_tool(other.task_id, "turn-new", ToolCall("same-stop", "core.process_stop", {"process_id": process.process_id}))
+            request = pending.exception.request
+            result = await kernel.resolve_approval(other.task_id, request.request_id, request.payload_hash,
+                                                   ApprovalDecision.APPROVE, "stop exact process")
+            self.assertTrue(result.ok, result.message)
+            self.assertEqual(result.data["state"], "CANCELLED")
+        finally:
+            await kernel.stop_background_process(self.task.task_id, process.process_id, grace_seconds=0.01)
+
 
 if __name__ == "__main__":
     unittest.main()

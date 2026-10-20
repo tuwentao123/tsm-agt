@@ -50,10 +50,9 @@ def working_state(goal: str = "Ship the feature") -> dict[str, object]:
 
 
 class WorkingMemoryModel(EchoModelProvider):
-    # Keep enough slack for the protected prompt plus the Working Memory, Todo,
-    # Task Spec, and interaction tool schemas, including the V4A patch tool,
-    # advertised by this composition.
-    capabilities = ProviderCapabilities(tools=True, context_window=5000)
+    # This fixture checks scratchpad continuity, not a minimum context window.
+    # Allow the protected prompt, tool schemas, tool result and projected notes.
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
     descriptor = AdapterDescriptor(
         "fixture.working-memory-model", "1.0", "ModelProviderPort", "1.0"
     )
@@ -210,7 +209,12 @@ class WorkingMemoryTest(unittest.IsolatedAsyncioTestCase):
                 context = await application.kernel._session_context_message(second.task_id)
                 assert context is not None
                 body = json.loads(context.text)
-                self.assertEqual(body["work_state"]["goal"], "Ship the feature")
+                self.assertNotIn("goal", body["work_state"])
+                self.assertNotIn("completed_work", body["work_state"])
+                self.assertNotIn("remaining_work", body["work_state"])
+                self.assertEqual(
+                    body["work_state"]["decisions"], ["Use deterministic event projection"]
+                )
                 self.assertEqual(
                     [item["task_id"] for item in body["recent_task_summaries"]],
                     [task.task_id],

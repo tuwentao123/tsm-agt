@@ -499,6 +499,70 @@ class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
             (ToolFactCapability.DESCRIBE_CONTENT,),
         )
 
+    async def test_read_file_character_limit_continues_without_missing_lines(self) -> None:
+        source = "".join(f"{number:04d}:" + "字" * 100 + "\n" for number in range(110))
+        (self.workspace / "src" / "long.py").write_text(source, encoding="utf-8")
+        first = await self.provider.invoke(
+            ToolCall("first", "core.read_file", {"path": "src/long.py"}), self.context
+        )
+        self.assertTrue(first.truncated)
+        self.assertEqual(first.data["next_cursor"]["start_line"], first.data["end_line"] + 1)
+        second = await self.provider.invoke(
+            ToolCall("second", "core.read_file", {
+                "path": "src/long.py", **first.data["next_cursor"],
+            }), self.context
+        )
+        self.assertFalse(second.truncated)
+        self.assertEqual(first.data["content"] + second.data["content"], source)
+
+    async def test_read_file_long_single_line_cursor_preserves_every_character(self) -> None:
+        source = "开头\n" + "字" * 17000 + "\n末尾\n"
+        (self.workspace / "src" / "long.py").write_text(source, encoding="utf-8")
+        cursor = {"start_line": 1, "start_column": 1}
+        parts = []
+        for page in range(10):
+            result = await self.provider.invoke(
+                ToolCall(f"page-{page}", "core.read_file", {
+                    "path": "src/long.py", **cursor,
+                }), self.context
+            )
+            self.assertTrue(result.ok)
+            parts.append(result.data["content"])
+            if not result.truncated:
+                break
+            cursor = result.data["next_cursor"]
+            self.assertIn(f"start_column={cursor['start_column']}", result.hint)
+        else:
+            self.fail("pagination did not terminate")
+        self.assertEqual("".join(parts), source)
+
+    async def test_read_file_rejects_invalid_column(self) -> None:
+        result = await self.provider.invoke(
+            ToolCall("bad-column", "core.read_file", {
+                "path": "src/app.py", "start_line": 1, "start_column": 999,
+            }), self.context
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "INVALID_PARAM")
+
+    async def test_read_file_exact_character_boundary_and_line_limit(self) -> None:
+        source = "a" * 7999 + "\n" + "tail\n"
+        (self.workspace / "src" / "long.py").write_text(source, encoding="utf-8")
+        first = await self.provider.invoke(
+            ToolCall("boundary", "core.read_file", {
+                "path": "src/long.py", "max_lines": 1,
+            }), self.context
+        )
+        self.assertEqual(first.data["content"], source[:8000])
+        self.assertEqual(first.data["next_cursor"], {"start_line": 2, "start_column": 1})
+        second = await self.provider.invoke(
+            ToolCall("tail", "core.read_file", {
+                "path": "src/long.py", **first.data["next_cursor"],
+            }), self.context
+        )
+        self.assertFalse(second.truncated)
+        self.assertEqual(first.data["content"] + second.data["content"], source)
+
     async def test_searches_literal_and_regex_with_limits(self) -> None:
         # This test asserts the walker's conservative page/truncation contract;
         # real rg versions differ in whether they can prove another match

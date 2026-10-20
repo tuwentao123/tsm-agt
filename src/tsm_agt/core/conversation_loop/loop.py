@@ -43,6 +43,7 @@ from tsm_agt.ports import (
     RuntimeUnitOfWork,
     TextBlock,
     ToolCall,
+    ToolCallBlock,
     ToolRecoveryKind,
     ToolResult,
     ToolResultBlock,
@@ -98,17 +99,26 @@ def model_visible_tools(visible_tools: tuple[ToolSpec, ...]) -> tuple[ToolSpec, 
 
 def select_model_tools(
     visible_tools: tuple[ToolSpec, ...], *, user_text: str, model_call: int,
+    task_kind: TaskKind | None = None,
 ) -> tuple[ToolSpec, ...]:
-    """Return every runtime-approved tool for every model sample.
+    """Return the tools applicable to this execution kind on every sample.
 
     The harness must not infer an intent from request keywords and then hide
     alternatives.  Tool selection is a model decision informed by stable tool
     contracts; provider capability and policy validation remain runtime-owned.
     ``user_text`` and ``model_call`` stay in this compatibility signature so
     callers cannot accidentally reintroduce a first-turn classifier.
+    Fixed work-item contracts are not capabilities of a conversation container.
     """
     del user_text, model_call
-    return model_visible_tools(visible_tools)
+    tools = model_visible_tools(visible_tools)
+    if task_kind is TaskKind.CONVERSATION:
+        # These describe a fixed work-item contract, not a persistent chat.
+        # Keep the runtime registry/checkpoint toolset intact for recovery.
+        tools = tuple(tool for tool in tools if tool.name not in {
+            "core.task_spec_read", "core.task_spec_update",
+        })
+    return tools
 
 
 def model_tool_exposure_profile(
@@ -148,6 +158,7 @@ class ConversationAgentLoop:
         visible_tools = await kernel.list_tools()
         initial_model_tools = select_model_tools(
             visible_tools, user_text=user_text, model_call=1,
+            task_kind=task.task_kind,
         )
         initial_exposure_profile = model_tool_exposure_profile(
             visible_tools, user_text=user_text, model_call=1,
@@ -383,7 +394,13 @@ class ConversationAgentLoop:
             parsed_calls: tuple[ToolCall, ...] = ()
             try:
                 response = await kernel._complete_agent_model_request(
-                    state.request, buffered_text_deltas.append
+                    state.request, buffered_text_deltas.append,
+                    lambda text: kernel._notify_agent_progress(
+                        state.on_progress,
+                        AgentProgress(AgentProgressKind.REASONING_DELTA,
+                                      model_call=state.model_call_number,
+                                      reasoning_text=text),
+                    ),
                 )
                 kernel._notify_agent_progress(state.on_progress, AgentProgress(
                     AgentProgressKind.MODEL_COMPLETED,
@@ -466,6 +483,57 @@ class ConversationAgentLoop:
             await self._finalizer.record_model_response(
                 state, response, len(parsed_calls)
             )
+            if parsed_calls:
+                previous = state.messages[:-1]
+                prior_assistant_index = next(
+                    (i for i in range(len(previous) - 1, -1, -1)
+                     if previous[i].role is MessageRole.ASSISTANT), None,
+                )
+                recent = previous[prior_assistant_index + 1:] if prior_assistant_index is not None else ()
+                results = [block.result for message in recent if message.role is MessageRole.TOOL
+                           for block in message.content if isinstance(block, ToolResultBlock)]
+                follows_tool_result = bool(results)
+                note = "\n".join(
+                    block.text.strip() for block in response.message.content
+                    if isinstance(block, TextBlock) and block.text.strip()
+                )
+                note_source = "model"
+                if follows_tool_result and not note:
+                    note_source = "runtime"
+                    calls_by_id = {
+                        block.call.call_id: block.call.name
+                        for block in previous[prior_assistant_index].content
+                        if isinstance(block, ToolCallBlock)
+                    }
+                    outcomes = [
+                        f"{calls_by_id.get(result.call_id, '工具')}"
+                        + ("执行成功" if result.ok else "执行失败")
+                        + (f"（{result.error_code}）" if result.error_code else "")
+                        for result in results
+                    ]
+                    next_tools = "、".join(call.name for call in parsed_calls)
+                    note = f"{'；'.join(outcomes)}。接下来调用 {next_tools}。"
+                if note:
+                    event_name = (
+                        "conversation.stage_summary" if follows_tool_result
+                        else "conversation.execution_note"
+                    )
+                    progress_kind = (
+                        AgentProgressKind.STAGE_SUMMARY if follows_tool_result
+                        else AgentProgressKind.EXECUTION_NOTE
+                    )
+                    await kernel._append_events(state.task_id, ((
+                        event_name, {
+                            "turn_id": state.turn_id,
+                            "model_call": state.model_call_count,
+                            "text": note,
+                            "source": note_source,
+                        },
+                    ),))
+                    kernel._notify_agent_progress(state.on_progress, AgentProgress(
+                        progress_kind,
+                        model_call=state.model_call_count, activity=note, phase=note_source,
+                    ))
             if not parsed_calls:
                 candidate = await self._finalization.build_candidate(state, response)
                 runtime_decision = await self._finalization.runtime_gate(
@@ -754,10 +822,12 @@ class ConversationAgentLoop:
         state.messages.extend(await kernel._project_context_messages(state.task_id))
         state.checkpoint = replace(state.checkpoint, messages=tuple(state.messages))
         source_user = kernel._source_user_message(state.checkpoint.messages)
+        task = await kernel.get_task(state.task_id)
         model_tools = select_model_tools(
             state.visible_tools,
             user_text=source_user.text if source_user is not None else "",
             model_call=model_call,
+            task_kind=task.task_kind,
         )
         runtime_instruction = latest_tool_result_instruction(
             kernel, state, model_tools,

@@ -66,6 +66,7 @@ def tool_pair(call_id: str, payload: str) -> tuple[Message, Message]:
 class ContextWindowManagerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.template = PromptTemplate.default()
+        self.static_tokens = ContextWindowManager.estimate_input_tokens((), (), self.template)
 
     def conversation(self) -> tuple[Message, ...]:
         first = text("goal", MessageRole.USER, "keep the original goal")
@@ -80,7 +81,7 @@ class ContextWindowManagerTest(unittest.TestCase):
         conversation = self.conversation()
         prepared = manager.prepare(
             conversation=conversation, tools=(), prompt_template=self.template,
-            context_window=1300 + STATIC_PROMPT_GROWTH_TOKENS - FILTERED_PROMPT_SHRINK_TOKENS,
+            context_window=self.static_tokens + 1000,
             max_output_tokens=128,
         )
 
@@ -247,7 +248,7 @@ class ContextWindowManagerTest(unittest.TestCase):
         )
         prepared = manager.prepare(
             conversation=conversation, tools=(), prompt_template=self.template,
-            context_window=1500 + SOURCE_READ_GUIDANCE_TOKENS, max_output_tokens=128,
+            context_window=self.static_tokens + 1000, max_output_tokens=128,
         )
 
         self.assertIsNotNone(prepared.compaction)
@@ -367,13 +368,13 @@ class ContextWindowManagerTest(unittest.TestCase):
         # exact size of the prompt template.
         first = manager.prepare(
             conversation=self.conversation(), tools=(), prompt_template=self.template,
-            context_window=1200 + STATIC_PROMPT_GROWTH_TOKENS,
+            context_window=self.static_tokens + 700,
             max_output_tokens=128,
         )
         extended = first.messages + tool_pair("call-3", "new data " * 40)
         second = manager.prepare(
             conversation=extended, tools=(), prompt_template=self.template,
-            context_window=1200 + STATIC_PROMPT_GROWTH_TOKENS,
+            context_window=self.static_tokens + 700,
             max_output_tokens=128,
         )
 
@@ -394,7 +395,7 @@ class GrowingContextModel(EchoModelProvider):
     # and its durable ToolResult protocol, which are visible every agent call.
     capabilities = ProviderCapabilities(
         tools=True,
-        context_window=2200 + STATIC_PROMPT_GROWTH_TOKENS,
+        context_window=ContextWindowManager.estimate_input_tokens((), (), PromptTemplate.default()) + 2500,
     )
 
     def __init__(self) -> None:

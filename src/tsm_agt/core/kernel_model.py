@@ -38,7 +38,7 @@ import hashlib
 from collections.abc import Mapping
 from tsm_agt.ports import (
     FinishReason, Message, MessageRole, ModelResponse,
-    ModelStreamCompleted, ModelTextDelta, RecoverableToolProtocolError,
+    ModelStreamCompleted, ModelTextDelta, ModelReasoningDelta, RecoverableToolProtocolError,
     RuntimeEvent, RuntimeUnitOfWork, StreamingModelProviderPort,
     ToolCall, ToolCallBlock, ToolResultBlock
 )
@@ -159,7 +159,8 @@ class ModelMixin:
         ))
 
     async def _complete_agent_model_request(
-        self, request: ModelRequest, on_text_delta: Callable[[str], None] | None
+        self, request: ModelRequest, on_text_delta: Callable[[str], None] | None,
+        on_reasoning_delta: Callable[[str], None] | None = None,
     ) -> ModelResponse:
         model = self._dependencies.model
         if not isinstance(model, StreamingModelProviderPort):
@@ -177,6 +178,11 @@ class ModelMixin:
                 text_parts.append(event.text)
                 if on_text_delta is not None:
                     on_text_delta(event.text)
+            elif isinstance(event, ModelReasoningDelta):
+                if completed is not None or not event.text:
+                    raise InvalidModelResponse("invalid reasoning summary delta")
+                if on_reasoning_delta is not None:
+                    on_reasoning_delta(event.text)
             elif isinstance(event, ModelStreamCompleted):
                 if completed is not None:
                     raise InvalidModelResponse(

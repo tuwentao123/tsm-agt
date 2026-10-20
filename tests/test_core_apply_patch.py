@@ -58,7 +58,7 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
         })
 
     def v4a_call(
-        self, call_id: str, expected_hash: str, patch: str,
+        self, call_id: str, expected_hash: str | None, patch: str,
     ) -> ToolCall:
         return ToolCall(call_id, "core.apply_patch_v4a", {
             "expected_hash": expected_hash, "patch": patch,
@@ -123,6 +123,213 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
             target.read_text(encoding="utf-8"), "title = 'new'\nbody = 'keep'\n"
         )
 
+    async def test_v4a_context_only_anchor_sections_locate_a_trailing_insertion(self) -> None:
+        # A real Codex/V4A patch uses several @@ sections as pure location
+        # anchors (no +/- lines) before the section that actually changes the
+        # file. The parser must treat context-only sections as anchors instead
+        # of rejecting them as malformed hunks.
+        target = self.workspace / "spec.md"
+        before = (
+            "# Title\n"
+            "\n"
+            "## Section Two\n"
+            "\n"
+            "export interface Summary {\n"
+            "  id: string;\n"
+            "  title: string;\n"
+            "\n"
+            "  members: Member[];\n"
+            "}\n"
+        )
+        target.write_text(before, encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: spec.md\n"
+            "@@\n"
+            " ## Section Two\n"
+            "@@\n"
+            " export interface Summary {\n"
+            "   id: string;\n"
+            "@@\n"
+            "   members: Member[];\n"
+            " }\n"
+            "+\n"
+            "+### Extension\n"
+            "+New appended content.\n"
+            "*** End Patch"
+        )
+
+        result = await self.approve(
+            self.v4a_call("call-anchor", sha256(before), patch), "turn-anchor"
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["patch_format"], "v4a")
+        self.assertEqual(
+            target.read_text(encoding="utf-8"),
+            before + "\n### Extension\nNew appended content.\n",
+        )
+
+    async def test_v4a_anchor_disambiguates_between_duplicate_regions(self) -> None:
+        # Codex-style matching advances a cursor, so a @@ anchor before the
+        # change selects the intended one of two identical regions instead of
+        # refusing. The anchor "# second region" moves the cursor past the
+        # first "x = 0", so the edit lands on the second one.
+        target = self.workspace / "dup.py"
+        before = "# first region\nx = 0\n# second region\nx = 0\n"
+        target.write_text(before, encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dup.py\n"
+            "@@ # second region\n"
+            "-x = 0\n"
+            "+x = 1\n"
+            "*** End Patch"
+        )
+
+        result = await self.approve(
+            self.v4a_call("call-dup", sha256(before), patch), "turn-dup"
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"),
+            "# first region\nx = 0\n# second region\nx = 1\n",
+        )
+
+    async def test_v4a_without_anchor_edits_the_first_match(self) -> None:
+        # Without a disambiguating anchor, Codex matching applies at the first
+        # occurrence from the cursor rather than rejecting. This is the chosen
+        # tradeoff versus a strict unique-match applier.
+        target = self.workspace / "dup2.py"
+        before = "x = 0\ny = 1\nx = 0\n"
+        target.write_text(before, encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dup2.py\n"
+            "@@\n"
+            "-x = 0\n"
+            "+x = 2\n"
+            "*** End Patch"
+        )
+
+        result = await self.approve(
+            self.v4a_call("call-dup2", sha256(before), patch), "turn-dup2"
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), "x = 2\ny = 1\nx = 0\n"
+        )
+
+    async def test_v4a_tolerates_blank_lines_the_patch_omitted(self) -> None:
+        # A frequent model imperfection: the quoted context drops blank lines
+        # that the file actually contains. The matcher skips and preserves
+        # those file blanks instead of failing to locate.
+        target = self.workspace / "blank.ts"
+        before = (
+            "interface A {\n"
+            "  id: string;\n"
+            "\n"
+            "  name: string;\n"
+            "}\n"
+        )
+        target.write_text(before, encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: blank.ts\n"
+            "@@\n"
+            " interface A {\n"
+            " id: string;\n"
+            " name: string;\n"
+            " }\n"
+            "+// appended\n"
+            "*** End Patch"
+        )
+
+        result = await self.approve(
+            self.v4a_call("call-blank", sha256(before), patch), "turn-blank"
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), before + "// appended\n"
+        )
+
+    async def test_v4a_conflict_names_the_unmatched_context_line(self) -> None:
+        # When the model mis-quotes a context line (e.g. truncates it), the
+        # failure must name that exact line so the next attempt can fix it,
+        # rather than guessing a location.
+        target = self.workspace / "quote.md"
+        before = "alpha\nthe full original line of text here\nomega\n"
+        target.write_text(before, encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: quote.md\n"
+            "@@\n"
+            " the full original line\n"
+            "+inserted\n"
+            "*** End Patch"
+        )
+
+        result = await self.approve(
+            self.v4a_call("call-quote", sha256(before), patch), "turn-quote"
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "PATCH_CONFLICT")
+        self.assertIn("the full original line", result.message)
+        self.assertIn("quote it exactly", result.message)
+        self.assertEqual(target.read_text(encoding="utf-8"), before)
+
+    async def test_v4a_tolerates_trailing_whitespace_differences(self) -> None:
+        # The matcher falls back to whitespace-insensitive context matching so
+        # a minor indentation drift in the quoted context still locates.
+        target = self.workspace / "ws.py"
+        before = "def run():\n    value = 1\n    return value\n"
+        target.write_text(before, encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: ws.py\n"
+            "@@\n"
+            " def run():\n"
+            "-    value = 1\n"
+            "+    value = 2\n"
+            "*** End Patch"
+        )
+
+        result = await self.approve(
+            self.v4a_call("call-ws", sha256(before), patch), "turn-ws"
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"),
+            "def run():\n    value = 2\n    return value\n",
+        )
+
+    async def test_v4a_rejects_patch_with_no_change_hunk(self) -> None:
+        # A patch that is only context anchors changes nothing and must be
+        # rejected without writing instead of silently succeeding.
+        target = self.workspace / "noop.md"
+        before = "alpha\nbeta\n"
+        target.write_text(before, encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: noop.md\n"
+            "@@\n"
+            " alpha\n"
+            "*** End Patch"
+        )
+
+        result = await self.approve(
+            self.v4a_call("call-noop", sha256(before), patch), "turn-noop"
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "PATCH_INVALID_V4A")
+        self.assertEqual(target.read_text(encoding="utf-8"), before)
+
     async def test_literal_newline_escape_gets_a_specific_recovery_hint(self) -> None:
         target = self.workspace / "multiline.html"
         content = "<div>\n  <button>cancel</button>\n</div>\n"
@@ -144,6 +351,24 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
             "reissue_v4a_with_actual_newlines",
         )
         self.assertEqual(target.read_text(encoding="utf-8"), content)
+
+    async def test_v4a_syntax_error_reports_no_mutation_and_corrected_call_needs_approval(self) -> None:
+        target = self.workspace / "syntax.txt"
+        before = "first\nsecond\n"
+        target.write_text(before, encoding="utf-8")
+        # An illegal line prefix is a genuine syntax error (a context-only @@
+        # anchor is now valid, so it can no longer stand in for one here).
+        invalid = "*** Begin Patch\n*** Update File: syntax.txt\n@@\n first\n!second\n*** End Patch"
+        result = await self.approve(self.v4a_call("bad", sha256(before), invalid), "turn-syntax")
+        self.assertEqual(result.error_code, "PATCH_INVALID_V4A")
+        self.assertEqual(result.data["execution_state"], "not_started")
+        self.assertIn("before any file mutation", result.hint)
+        self.assertEqual(target.read_text(encoding="utf-8"), before)
+
+        corrected = "*** Begin Patch\n*** Update File: syntax.txt\n@@\n first\n-second\n+changed\n*** End Patch"
+        result = await self.approve(self.v4a_call("good", sha256(before), corrected), "turn-syntax")
+        self.assertTrue(result.ok)
+        self.assertEqual(target.read_text(encoding="utf-8"), "first\nchanged\n")
 
     async def test_v4a_literal_newline_escape_is_rejected_without_write(self) -> None:
         target = self.workspace / "literal-v4a.txt"
@@ -172,6 +397,67 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.workspace / "new.txt").read_text(), "created\n")
         self.assertEqual(result.data["operation"], "create")
         self.assertIsNone(result.data["backup_ref"])
+
+    async def test_v4a_add_creates_after_approval_and_journals(self) -> None:
+        patch = "*** Begin Patch\n*** Add File: nested/new.txt\n+first\n+\n+last\n*** End Patch"
+        call = self.v4a_call("v4a-add", None, patch)
+        with self.assertRaises(ApprovalRequired) as caught:
+            await self.application.kernel.invoke_tool(self.task.task_id, "turn-add", call)
+        self.assertFalse((self.workspace / "nested/new.txt").exists())
+        request = caught.exception.request
+        result = await self.application.kernel.resolve_approval(
+            self.task.task_id, request.request_id, request.payload_hash,
+            ApprovalDecision.APPROVE, "approve creation",
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual((self.workspace / "nested/new.txt").read_text(), "first\n\nlast\n")
+        self.assertEqual(result.data["operation"], "create")
+        self.assertEqual(result.data["patch_format"], "v4a")
+        self.assertEqual(len((await self.application.kernel.get_task(self.task.task_id)).mutation_journal), 1)
+
+    async def test_v4a_add_does_not_overwrite_file_created_before_approval(self) -> None:
+        patch = "*** Begin Patch\n*** Add File: existing.txt\n+replacement\n*** End Patch"
+        with self.assertRaises(ApprovalRequired) as caught:
+            await self.application.kernel.invoke_tool(
+                self.task.task_id, "turn-add-conflict", self.v4a_call("v4a-conflict", None, patch)
+            )
+        target = self.workspace / "existing.txt"
+        target.write_text("original\n")
+        request = caught.exception.request
+        result = await self.application.kernel.resolve_approval(
+            self.task.task_id, request.request_id, request.payload_hash,
+            ApprovalDecision.APPROVE, "approve creation",
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "CONFLICT")
+        self.assertEqual(target.read_text(), "original\n")
+        self.assertEqual(len((await self.application.kernel.get_task(self.task.task_id)).mutation_journal), 0)
+
+    async def test_v4a_add_rejects_invalid_body_and_wrong_hash(self) -> None:
+        invalid = "*** Begin Patch\n*** Add File: new.txt\n+ok\n*** Update File: other.txt\n*** End Patch"
+        result = await self.approve(self.v4a_call("v4a-bad-add", None, invalid), "turn-bad-add")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "PATCH_INVALID_V4A")
+        valid = "*** Begin Patch\n*** Add File: new.txt\n+ok\n*** End Patch"
+        result = await self.approve(self.v4a_call("v4a-add-hash", "0" * 64, valid), "turn-add-hash")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "INVALID_PARAM")
+        self.assertFalse((self.workspace / "new.txt").exists())
+
+    async def test_v4a_add_supports_an_empty_file(self) -> None:
+        patch_text = "*** Begin Patch\n*** Add File: empty.txt\n*** End Patch"
+        result = await self.approve(self.v4a_call("v4a-empty", None, patch_text), "turn-empty")
+        self.assertTrue(result.ok)
+        self.assertEqual((self.workspace / "empty.txt").read_bytes(), b"")
+
+    async def test_v4a_update_still_requires_a_hash(self) -> None:
+        target = self.workspace / "update.txt"
+        target.write_text("before\n")
+        patch_text = "*** Begin Patch\n*** Update File: update.txt\n@@\n-before\n+after\n*** End Patch"
+        result = await self.approve(self.v4a_call("v4a-update-null", None, patch_text), "turn-null-update")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "INVALID_PARAM")
+        self.assertEqual(target.read_text(), "before\n")
 
     async def test_new_nested_path_is_not_misclassified_as_external_write(self) -> None:
         call = self.call(
@@ -264,10 +550,63 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
             "refresh_resource_then_retry",
         )
         self.assertFalse(result.recovery_action["same_call_safe"])
+        self.assertEqual(result.data, {"execution_state": "not_started"})
+        self.assertIn("version mismatch", result.message)
+        self.assertIn("stale or belong to another file", result.hint)
+        self.assertIn("do not merely substitute", result.hint)
         self.assertEqual(target.read_text(encoding="utf-8"), "user-write\n")
         self.assertEqual(
             (await self.application.kernel.get_task(self.task.task_id)).mutation_journal, ()
         )
+
+    async def test_wrong_file_hash_is_reported_and_corrected_patch_needs_approval(self) -> None:
+        target = self.workspace / "target.txt"
+        other = self.workspace / "other.txt"
+        target.write_text("target old\n", encoding="utf-8")
+        other.write_text("other content\n", encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n*** Update File: target.txt\n@@\n"
+            "-target old\n+target new\n*** End Patch"
+        )
+        result = await self.approve(
+            self.v4a_call("wrong-hash", sha256("other content\n"), patch),
+            "turn-wrong-hash",
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "CONFLICT")
+        self.assertEqual(target.read_text(encoding="utf-8"), "target old\n")
+        model_result = result.to_model_data()
+        self.assertEqual(model_result["data"]["execution_state"], "not_started")
+        self.assertEqual(model_result["error_details"]["resource"], "target.txt")
+        self.assertEqual(model_result["error_details"]["actual_hash"], sha256("target old\n"))
+        self.assertIn("Read the target's current content", model_result["hint"])
+        self.assertNotIn("recovery_kind", model_result)
+        self.assertNotIn("retryable", model_result)
+
+        # A corrected call is a new mutation and independently needs approval.
+        result = await self.approve(
+            self.v4a_call("correct-hash", sha256(target.read_text(encoding="utf-8")), patch),
+            "turn-wrong-hash",
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(target.read_text(encoding="utf-8"), "target new\n")
+
+    async def test_refreshed_hash_cannot_make_stale_patch_match(self) -> None:
+        target = self.workspace / "target.txt"
+        target.write_text("already updated\n", encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n*** Update File: target.txt\n@@\n"
+            "-old content\n+updated content\n*** End Patch"
+        )
+        result = await self.approve(
+            self.v4a_call("stale-patch", sha256("already updated\n"), patch),
+            "turn-stale-patch",
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "PATCH_CONFLICT")
+        self.assertEqual(result.data, {"execution_state": "not_started"})
+        self.assertIn("whether the change is still needed", result.hint)
+        self.assertEqual(target.read_text(encoding="utf-8"), "already updated\n")
 
     async def test_missing_and_ambiguous_exact_text_are_recoverable_conflicts(self) -> None:
         for suffix, content, old_text, message in (

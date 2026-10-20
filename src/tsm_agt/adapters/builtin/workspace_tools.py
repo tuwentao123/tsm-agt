@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from tsm_agt.core import WorkspaceMutationConflict, WorkspacePatchConflict
-from .v4a_patch import V4APatchSyntaxError, parse_v4a_update_patch
+from tsm_agt.core.v4a import V4APatchFormatError, parse_v4a_add, parse_v4a_patch
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ModelToolContract, ToolCall,
     ToolEffect, ToolFactCapability, ToolFactDescriptor, ToolIdempotency,
@@ -39,7 +39,8 @@ class CoreWorkspaceMutationToolProvider:
         name="core.apply_patch",
         description=(
             "Apply exact text replacements to one workspace file. Read the file first "
-            "and pass its sha256 as expected_hash. Each old_text must occur exactly once "
+            "and pass that same file's latest read sha256 as expected_hash; never use "
+            "a different file's hash or a historical hash. Each old_text must occur exactly once "
             "at the time it is applied; ambiguous or stale patches fail without writing. "
             "To create a file, pass expected_hash=null and exactly one edit with empty "
             "old_text. Missing ordinary parent directories are created inside the "
@@ -88,19 +89,55 @@ class CoreWorkspaceMutationToolProvider:
     _v4a_patch_spec = ToolSpec(
         name="core.apply_patch_v4a",
         description=(
-            "Apply one multi-line workspace update using strict Codex/V4A patch text. "
-            "Read the file first and pass its sha256 as expected_hash. patch must use "
-            "actual newline characters and this exact shape: *** Begin Patch, *** Update "
-            "File: path, one or more @@ hunks with lines prefixed by space/-/+, then "
-            "*** End Patch. Only one Update File block is supported. This R1 action "
-            "requires approval and is journaled. Prefer this over core.apply_patch for "
-            "multi-line HTML, CSS, or code edits."
+            "Create or update one workspace file using Codex/V4A patch text. "
+            "For a new file use '*** Add File: <path>', prefix each content line "
+            "with '+', and set expected_hash to null. Creation fails if the path "
+            "already exists. For an existing file use '*** Update File: <path>'. "
+            "First read the update target with core.read_file and pass "
+            "its sha256 as expected_hash. Wait for that read result before generating "
+            "the patch; a read and an edit dependent on it cannot be prepared in the "
+            "same tool-call batch. Wrap the patch in '*** Begin Patch' and "
+            "'*** End Patch' with one Add File or Update File header; use real newline characters, never the "
+            "literal two characters backslash-n; prefix every content line with exactly "
+            "one marker. For an update, use a single space for an unchanged context line, '-' to remove a "
+            "line, or '+' to add a line -- and put '@@' on its own line to anchor a "
+            "location; copy context and removed lines verbatim from the current file, "
+            "including blank lines and each line's full text, without shortening, "
+            "paraphrasing, or dropping blank lines; include at least one '+' or '-' line, "
+            "because a patch of only context/@@ anchors changes nothing and is rejected; "
+            "and give enough surrounding context that the edit locates uniquely. Only one "
+            "file operation is supported (no Delete, Move, or multiple files). Example "
+            "with real newlines:\n"
+            "*** Begin Patch\n"
+            "*** Update File: src/app.py\n"
+            "@@\n"
+            " def greet(name):\n"
+            "-    return 'hi'\n"
+            "+    return 'hello ' + name\n"
+            "*** End Patch\n"
+            "This R1 action requires approval and is journaled; prefer it over "
+            "core.apply_patch for multi-line edits."
         ),
         parameters={
             "type": "object",
             "properties": {
-                "patch": {"type": "string"},
-                "expected_hash": {"type": "string"},
+                "patch": {
+                    "type": "string",
+                    "description": (
+                        "Full Codex/V4A patch text with real newlines. Add File uses "
+                        "only '+' content lines; Update File must contain at least one '+' or '-' line. Copy context and removed lines "
+                        "verbatim from a fresh read, including blank lines, so the edit "
+                        "can be located."
+                    ),
+                },
+                "expected_hash": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "description": (
+                        "Null for Add File; for Update File use the lowercase whole-file SHA-256 from the latest core.read_file "
+                        "result for the exact Update File path, not another file or "
+                        "an older conversation. A mismatch rejects the write."
+                    ),
+                },
             },
             "required": ["patch", "expected_hash"],
             "additionalProperties": False,
@@ -480,14 +517,18 @@ class CoreWorkspaceMutationToolProvider:
                     raise TypeError("patch must be a non-empty string")
                 expected_hash = call.arguments.get("expected_hash")
                 self._validate_expected_hash(expected_hash)
-                if expected_hash is None:
-                    raise TypeError(
-                        "core.apply_patch_v4a expected_hash must be a lowercase SHA-256 string"
-                    )
-                parsed = parse_v4a_update_patch(raw_patch)
-                data = await control.apply_patch(
-                    parsed.path, expected_hash, parsed.edits
-                )
+                addition = parse_v4a_add(raw_patch)
+                if addition is not None:
+                    if expected_hash is not None:
+                        raise TypeError("Add File requires expected_hash=null")
+                    parsed_path, content = addition
+                    edits = ({"old_text": "", "new_text": content},)
+                else:
+                    if expected_hash is None:
+                        raise TypeError("Update File requires the target's SHA-256 expected_hash")
+                    parsed_path = parse_v4a_patch(raw_patch)
+                    edits = ({"v4a_patch": raw_patch},)
+                data = await control.apply_patch(parsed_path, expected_hash, edits)
                 return self._success(call, context, {
                     **dict(data), "patch_format": "v4a",
                 })
@@ -510,12 +551,13 @@ class CoreWorkspaceMutationToolProvider:
             return self._error(call, "PERMISSION_DENIED", str(error))
         except FileNotFoundError as error:
             return self._error(call, "NOT_FOUND", str(error))
-        except V4APatchSyntaxError as error:
+        except V4APatchFormatError as error:
             if "literal \\n" in str(error):
                 return ToolResult(
                     call.call_id, False,
                     error_code="PATCH_LITERAL_NEWLINE_ESCAPE",
                     message=str(error),
+                    data={"execution_state": "not_started"},
                     hint=(
                         "Patch text contains literal \\n instead of actual newline "
                         "characters. Reissue core.apply_patch_v4a with a real multi-line "
@@ -527,7 +569,14 @@ class CoreWorkspaceMutationToolProvider:
                         "same_call_safe": False,
                     },
                 )
-            return self._error(call, "PATCH_INVALID_V4A", str(error))
+            return ToolResult(
+                call.call_id, False, error_code="PATCH_INVALID_V4A",
+                message=str(error), data={"execution_state": "not_started"},
+                hint=(
+                    "The patch was rejected during syntax validation before any "
+                    "file mutation. Check the V4A format and the reported error."
+                ),
+            )
         except WorkspacePatchConflict as error:
             literal_newline_escape = "literal \\n" in error.reason
             return ToolResult(
@@ -538,14 +587,16 @@ class CoreWorkspaceMutationToolProvider:
                     if literal_newline_escape else "PATCH_CONFLICT"
                 ),
                 message=str(error),
+                data={"execution_state": "not_started"},
                 hint=(
                     "old_text contains literal \\n instead of actual newline characters. "
                     "Reissue a real multi-line core.apply_patch_v4a patch, or submit "
                     "actual newlines in old_text; do not double-escape line breaks."
                     if literal_newline_escape else
-                    "Read the current file content, locate the exact text, and "
-                    "re-issue core.apply_patch with an old_text that occurs "
-                    "exactly once."
+                    "The edit could not be matched and no requested workspace "
+                    "edit was applied. Read the current target content, check whether "
+                    "the change is still needed, and if so prepare a new edit against "
+                    "that content and its freshly read hash."
                 ),
                 recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
                 recovery_action={
@@ -562,12 +613,34 @@ class CoreWorkspaceMutationToolProvider:
         except (TypeError, ValueError) as error:
             return self._error(call, "INVALID_PARAM", str(error))
         except WorkspaceMutationConflict as error:
+            is_workspace_edit = call.name in {
+                self._patch_spec.name, self._v4a_patch_spec.name,
+                self._patch_many_spec.name, self._delete_spec.name,
+            }
+            create_conflict = is_workspace_edit and error.expected_hash is None
             return ToolResult(
                 call.call_id, False, error_code="CONFLICT",
                 message=str(error),
+                data={"execution_state": "not_started"} if is_workspace_edit else None,
+                hint=(
+                    "The creation target already exists; no workspace edit was applied. "
+                    "Inspect the existing target before deciding whether an update is needed."
+                    if create_conflict else
+                    "The supplied expected_hash does not match this target's current "
+                    "version; it may be stale or belong to another file. No requested "
+                    "workspace edit was applied. Read the target's current content and "
+                    "sha256, then determine whether the requested change is still needed. "
+                    "If it is, prepare a new edit against that content and use that same "
+                    "file's freshly read sha256; do not merely substitute the reported "
+                    "actual_hash into the old edit."
+                    if is_workspace_edit else None
+                ),
                 recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
                 recovery_action={
-                    "required_change": "refresh_resource_then_retry",
+                    "required_change": (
+                        "inspect_existing_target" if create_conflict
+                        else "refresh_resource_then_retry"
+                    ),
                     "resource": error.path,
                     "expected_hash": error.expected_hash,
                     "actual_hash": error.actual_hash,

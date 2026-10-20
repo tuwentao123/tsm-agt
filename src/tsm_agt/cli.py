@@ -750,6 +750,10 @@ def _render_agent_progress_lines(
     progress: AgentProgress, *, verbose: bool = False,
 ) -> tuple[str, ...]:
     """Render one live event without repeating lifecycle details."""
+    if progress.kind is AgentProgressKind.EXECUTION_NOTE:
+        return (progress.activity,) if progress.activity else ()
+    if progress.kind is AgentProgressKind.STAGE_SUMMARY:
+        return (f"[阶段进展] {progress.activity}",) if progress.activity else ()
     if progress.kind is AgentProgressKind.MODEL_STARTED:
         counter = (
             f"{progress.model_call}/{progress.max_model_calls}"

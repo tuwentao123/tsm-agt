@@ -186,8 +186,8 @@ class SessionContextProjectorTest(unittest.TestCase):
             datetime(2026, 1, 1, tzinfo=timezone.utc),
         ).bump_context().bump_context().bump_context()
         first = self._event(1, "inspect service", "found entry")
-        # A later visible Turn in the same Task replaces its durable summary but
-        # both message pairs still belong to one historical handoff.
+        # The Task index is the latest aggregate; its separate per-Turn
+        # summaries must not overwrite one another.
         second = SessionEvent(
             "event-2", "session-1", 2, "session.task_result_recorded", {
                 **first.payload,
@@ -324,6 +324,58 @@ class SessionContextProjectorTest(unittest.TestCase):
         self.assertNotIn("secret-value", encoded)
         self.assertNotIn("secret-output", encoded)
         self.assertNotIn("--token", encoded)
+
+    def test_failed_execution_preserves_bounded_redacted_facts_and_matching_approval(self) -> None:
+        projector = SessionContextProjector()
+        record = ToolExecutionRecord.start(
+            task_id="task-1", turn_id="turn-1", invocation_id="inv-1",
+            call=ToolCall("call-1", "core.apply_patch_v4a", {"patch": "private patch"}),
+            payload_hash="payload", policy_decision_id="policy",
+            effective_risk=ToolRisk.R1, approval_request_id="approval-1",
+            idempotency=ToolIdempotency.IDEMPOTENT,
+        ).mark_running().finish(ToolCommitState.FAILED, ToolResult(
+            "call-1", False, error_code="PATCH_INVALID_V4A",
+            message="every V4A hunk must contain a + or - line",
+            hint="password=topsecret " + "x" * 600,
+            data={"execution_state": "not_started"},
+        ))
+        projected = projector.project_recent_executions(
+            {"task-1": (record,)}, {("task-1", "approval-1"): "approve"}
+        )["task-1"][0]
+        self.assertEqual(projected["result"]["message"],
+                         "every V4A hunk must contain a + or - line")
+        self.assertTrue(projected["result"]["hint_truncated"])
+        self.assertEqual(len(projected["result"]["hint"]), 500)
+        # A recoverable syntax failure that never mutated a file must project
+        # its execution stage so the model does not read an approved-but-failed
+        # patch as a permission denial that forbids all later writes.
+        self.assertEqual(projected["result"]["execution_state"], "not_started")
+        self.assertNotIn("topsecret", json.dumps(projected))
+        self.assertNotIn("private patch", json.dumps(projected))
+        self.assertEqual(projected["historical_approval"]["decision"], "approve")
+        self.assertIn("not authorization", projected["historical_approval"]["scope"])
+        unmatched = projector.project_recent_executions(
+            {"task-1": (record,)}, {("other-task", "approval-1"): "approve"}
+        )["task-1"][0]
+        self.assertNotIn("historical_approval", unmatched)
+
+    def test_failed_other_tool_and_legacy_record_without_error_detail(self) -> None:
+        record = ToolExecutionRecord.start(
+            task_id="task-1", turn_id="turn-1", invocation_id="inv-2",
+            call=ToolCall("call-2", "external.tool", {"token": "private"}),
+            payload_hash="payload", policy_decision_id="policy",
+            effective_risk=ToolRisk.R1, approval_request_id=None,
+            idempotency=ToolIdempotency.IDEMPOTENT,
+        ).mark_running().finish(ToolCommitState.FAILED, ToolResult(
+            "call-2", False, error_code="FAILED", message="Bearer abc123",
+        ))
+        event = SessionContextProjector().project_recent_executions(
+            {"task-1": (record,)}
+        )["task-1"][0]
+        self.assertEqual(event["result"]["message"], "Bearer [REDACTED]")
+        self.assertNotIn("hint", event["result"])
+        self.assertNotIn("private", json.dumps(event))
+        self.assertNotIn("historical_approval", event)
 
     def test_projection_keeps_text_but_drops_tool_protocol_and_authority(self) -> None:
         snapshot = SessionSnapshot.create(
@@ -765,7 +817,8 @@ class SessionContextRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     if message.message_id.startswith("session-context-")
                 ]
                 self.assertEqual(len(context_messages), 1)
-                context = json.loads(context_messages[0].text)
+                from tests.history_helpers import session_history_view
+                context = session_history_view(request)
                 self.assertEqual(
                     [item["text"] for item in context["recent_messages"]],
                     [

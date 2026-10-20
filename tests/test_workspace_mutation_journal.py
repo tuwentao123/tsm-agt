@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tsm_agt.adapters.fixture import InMemoryRuntimeStore
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
@@ -214,6 +215,23 @@ class WorkspaceMutationJournalTest(unittest.IsolatedAsyncioTestCase):
             commit_prepared_workspace_mutation(prepared, self.filesystem)
         self.assertEqual(target.read_text(encoding="utf-8"), "user-raced\n")
         self.assertEqual(list(self.workspace.glob(".race.txt.tsm-agt-*")), [])
+
+    async def test_create_does_not_overwrite_file_created_during_publish(self) -> None:
+        target = self.workspace / "new-race.txt"
+        prepared = prepare_workspace_text_write(
+            self.workspace, "new-race.txt", "agent\n", None, self.path_service,
+        )
+        real_link = os.link
+
+        def race(source, destination):
+            target.write_text("user-raced\n", encoding="utf-8")
+            return real_link(source, destination)
+
+        with patch("tsm_agt.core.workspace.os.link", side_effect=race):
+            with self.assertRaises(WorkspaceMutationConflict):
+                commit_prepared_workspace_mutation(prepared, self.filesystem)
+        self.assertEqual(target.read_text(encoding="utf-8"), "user-raced\n")
+        self.assertEqual(list(self.workspace.glob(".new-race.txt.tsm-agt-*")), [])
 
     async def test_rejects_escape_sensitive_runtime_and_symlink_paths(self) -> None:
         task = await self._executing_task()

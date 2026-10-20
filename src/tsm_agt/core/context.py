@@ -14,6 +14,7 @@ from tsm_agt.ports import (
 
 from .configuration import canonical_hash
 from .prompt import PromptTemplate
+from .session_history import MANAGED_HISTORY_BUDGETS, compact_history_body, history_turn_groups
 
 
 class ContextWindowExceeded(RuntimeError):
@@ -42,6 +43,7 @@ class ContextBudget:
     estimated_input_tokens: int
     estimation_method: str = "utf8-bytes-div-4-conservative-v1"
     allocations: tuple[ContextBudgetAllocation, ...] = ()
+    history_soft_tokens: int = 0
 
     @property
     def should_compact(self) -> bool:
@@ -51,6 +53,7 @@ class ContextBudget:
         return [item.to_data() for item in self.allocations]
 
     def event_data(self) -> dict[str, Any]:
+        history_tokens = sum(item.estimated_tokens for item in self.allocations if item.name == "session_history")
         return {
             "context_window": self.context_window,
             "trigger_tokens": self.trigger_tokens,
@@ -62,6 +65,10 @@ class ContextBudget:
             ),
             "estimation_method": self.estimation_method,
             "allocations": self.allocation_data(),
+            "history_soft_tokens": self.history_soft_tokens,
+            "history_budget_algorithm": "turn-token-v2",
+            "history_estimated_tokens": history_tokens,
+            "history_soft_limit_exceeded": bool(self.history_soft_tokens and history_tokens > self.history_soft_tokens),
         }
 
 
@@ -123,6 +130,9 @@ class ContextWindowManager:
     #: Ceiling for the union of recency-selected and pinned messages. Pinning
     #: decides eligibility; this only bounds the result.
     pinned_message_ceiling: int = 32
+    # One allocation for all authored history, runtime facts and read payloads.
+    # Zero disables this soft cap, not the Provider hard-window protection.
+    history_soft_tokens: int = 16384
 
     def __post_init__(self) -> None:
         if not 0 < self.trigger_ratio < 1:
@@ -137,6 +147,8 @@ class ContextWindowManager:
             raise ValueError(
                 "pinned_message_ceiling must be at least recent_message_floor"
             )
+        if self.history_soft_tokens < 0:
+            raise ValueError("history_soft_tokens must be zero or positive")
 
     def snapshot_data(self) -> dict[str, Any]:
         return {
@@ -146,6 +158,7 @@ class ContextWindowManager:
             "recent_message_floor": self.recent_message_floor,
             "latency_soft_input_tokens": self.latency_soft_input_tokens,
             "pinned_message_ceiling": self.pinned_message_ceiling,
+            "history_soft_tokens": self.history_soft_tokens,
             "estimation_method": "utf8-bytes-div-4-conservative-v1",
             "preserve_first_user_goal": True,
             "preserve_session_and_working_memory": True,
@@ -167,14 +180,18 @@ class ContextWindowManager:
             estimated, allocations = self.estimate_input_budget(
                 conversation, tools, prompt_template, runtime_instruction
             )
-            return PreparedContext(
-                conversation, ContextBudget(
-                    0, max_output_tokens, 0, 0,
-                    estimated,
-                    "disabled-provider-window-unknown",
-                    allocations,
-                )
+            budget = ContextBudget(
+                0, max_output_tokens, 0, 0, estimated,
+                "disabled-provider-window-unknown",
+                allocations, self.history_soft_tokens,
             )
+            compacted, changed = self._compact_turn_history(
+                conversation, tools, prompt_template, budget, runtime_instruction,
+            )
+            after, allocations = self.estimate_input_budget(compacted, tools, prompt_template, runtime_instruction)
+            receipt = self._compaction_receipt(conversation, compacted, budget, changed, ()) if changed else None
+            return PreparedContext(compacted, replace(budget, estimated_input_tokens=after, allocations=allocations),
+                                   replace(receipt, after_estimated_tokens=after) if receipt else None)
         if max_output_tokens >= context_window:
             raise ContextWindowExceeded(
                 "max_output_tokens must be smaller than provider context_window"
@@ -194,8 +211,18 @@ class ContextWindowManager:
             hard_input_tokens=context_window - max_output_tokens,
             estimated_input_tokens=before,
             allocations=before_allocations,
+            history_soft_tokens=self.history_soft_tokens,
         )
-        if not budget.should_compact:
+        managed_history = any(
+            (body := self._session_body(message)) is not None
+            and body.get("history_budget") in MANAGED_HISTORY_BUDGETS
+            for message in conversation
+        )
+        history_pressure = self.history_soft_tokens and managed_history and any(
+            item.name == "session_history" and item.estimated_tokens > self.history_soft_tokens
+            for item in before_allocations
+        )
+        if not budget.should_compact and not history_pressure:
             return PreparedContext(conversation, budget)
 
         compacted, receipt = self._compact(
@@ -226,6 +253,7 @@ class ContextWindowManager:
                 context_window, max_output_tokens, budget.trigger_tokens,
                 budget.hard_input_tokens, after, budget.estimation_method,
                 after_allocations,
+                self.history_soft_tokens,
             ), receipt,
         )
 
@@ -272,7 +300,7 @@ class ContextWindowManager:
                 "task-spec-context-", "conversation-environment-context-",
             )):
                 bucket = "project_context"
-            elif message.message_id.startswith("session-context-"):
+            elif message.message_id.startswith(("session-context-", "session-history-", "session-facts-")):
                 bucket = "session_history"
             elif message.message_id.startswith("working-memory-context-"):
                 bucket = "working_memory"
@@ -323,9 +351,19 @@ class ContextWindowManager:
         runtime_instruction: str | None = None,
     ) -> tuple[tuple[Message, ...], ContextCompactionReceipt | None]:
         source_conversation = conversation
+        conversation, turn_history_items = self._compact_turn_history(
+            conversation, tools, prompt_template, budget, runtime_instruction,
+        )
         conversation, compacted_session_items = self._compact_session_messages(
             conversation
         )
+        compacted_session_items += turn_history_items
+        target = min(budget.hard_input_tokens, budget.trigger_tokens - budget.max_output_tokens)
+        if self.estimate_input_tokens(conversation, tools, prompt_template, runtime_instruction) <= target:
+            # History pressure alone must not compact the live tool exchange.
+            return conversation, (self._compaction_receipt(
+                source_conversation, conversation, budget, compacted_session_items, (),
+            ) if compacted_session_items else None)
         groups = self._atomic_groups(conversation)
         if len(groups) <= 2:
             if compacted_session_items == 0:
@@ -376,6 +414,80 @@ class ContextWindowManager:
         )
         return preserved, receipt
 
+    def _compact_turn_history(
+        self, conversation: tuple[Message, ...], tools: tuple[ToolSpec, ...],
+        template: PromptTemplate, budget: ContextBudget, instruction: str | None,
+    ) -> tuple[tuple[Message, ...], int]:
+        """One token budget, whole historical Turns, no second count cutoff.
+
+        The immediate prior Turn is kept verbatim. If it and the protected live
+        exchange cannot fit, the existing explicit window error is safer than
+        silently cutting off the proposal the user just accepted.
+        """
+        removed = 0
+        target = (max(1, min(budget.hard_input_tokens, budget.trigger_tokens - budget.max_output_tokens))
+                  if budget.context_window else math.inf)
+
+        def fits(candidate_messages: tuple[Message, ...]) -> bool:
+            total, allocations = self.estimate_input_budget(candidate_messages, tools, template, instruction)
+            history = sum(item.estimated_tokens for item in allocations if item.name == "session_history")
+            return total <= target and (not self.history_soft_tokens or history <= self.history_soft_tokens)
+
+        for index, message in enumerate(conversation):
+            body = self._session_body(message)
+            if body is None or body.get("history_budget") not in MANAGED_HISTORY_BUDGETS:
+                continue
+            groups = history_turn_groups(body.get("recent_messages", []))
+            if not groups:
+                continue
+            if fits(conversation):
+                continue
+
+            def candidate(keep: int, previews: bool, omit_reads: bool = True) -> tuple[Message, ...]:
+                data = compact_history_body(body, keep, include_previews=previews, omit_read_bodies=omit_reads)
+                replacement = Message(
+                    message.message_id.removesuffix("-compacted") + "-compacted", message.role,
+                    (TextBlock(json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))),),
+                )
+                return (*conversation[:index], replacement, *conversation[index + 1:])
+
+            # Exact read bodies are expendable before authored dialogue. Try
+            # retaining every Turn with their execution/error facts intact.
+            all_turns = candidate(len(groups), False)
+            if fits(all_turns):
+                conversation = all_turns
+                removed += 1
+                continue
+            # Binary-search the largest complete recent suffix that fits. Keep
+            # provenance-only summaries when older excerpts would crowd it out.
+            best_keep = 1
+            best = candidate(best_keep, False)
+            low, high = 1, len(groups) - 1
+            while low <= high:
+                keep = (low + high) // 2
+                proposed = candidate(keep, False)
+                if fits(proposed):
+                    best, best_keep = proposed, keep
+                    low = keep + 1
+                else:
+                    high = keep - 1
+            # Excerpts use only spare budget; they never displace a complete
+            # recent turn that already fit in the provenance-only version.
+            with_previews = candidate(best_keep, True)
+            if fits(with_previews):
+                best = with_previews
+            # Read payloads can use remaining space, but never displace text or
+            # execution facts. The latest full Turn may exceed the soft cap;
+            # prepare() still enforces the Provider hard input limit.
+            with_reads = candidate(best_keep, fits(with_previews), omit_reads=False)
+            if fits(with_reads):
+                best = with_reads
+            kept_body = self._session_body(best[index])
+            assert kept_body is not None
+            removed += max(1, len(body.get("recent_messages", [])) - len(kept_body.get("recent_messages", [])))
+            conversation = best
+        return conversation, removed
+
     def _compact_session_messages(
         self, messages: tuple[Message, ...],
     ) -> tuple[tuple[Message, ...], int]:
@@ -399,6 +511,9 @@ class ContextWindowManager:
             if not isinstance(body, dict) or body.get("boundary") != (
                 "session_conversation_projection"
             ):
+                projected.append(message)
+                continue
+            if body.get("history_budget") in MANAGED_HISTORY_BUDGETS:
                 projected.append(message)
                 continue
             raw_messages = body.get("recent_messages") or []
@@ -597,7 +712,13 @@ class ContextWindowManager:
 
     @staticmethod
     def _is_protected_group(group: tuple[Message, ...]) -> bool:
-        return any(message.message_id.startswith((
+        return any((message.role is MessageRole.USER
+                    and (not message.is_scaffolding or message.scaffolding in {"steering", "continuation-input"})
+                    and not message.message_id.startswith((
+                        "context-summary-", "project-onboarding-context-",
+                        "project-memory-context-", "document-references-context-",
+                    )))
+                   or message.message_id.startswith((
             "session-context-", "working-memory-context-",
             "task-spec-context-", "conversation-environment-context-",
             "project-instructions-context-",
@@ -701,9 +822,13 @@ class ContextWindowManager:
         if result.error_code is not None:
             summary["error_code"] = result.error_code
         if not result.ok:
-            summary["recovery_kind"] = result.effective_recovery_kind.value
-            if result.recovery_action:
-                summary["recovery_action"] = dict(result.recovery_action)
+            if result.message:
+                summary["message"] = result.message[:500]
+            if result.hint:
+                summary["hint"] = result.hint[:500]
+            details = result.to_model_data().get("error_details")
+            if details:
+                summary["error_details"] = details
         if result.truncated:
             summary["truncated"] = True
         if call_summary is not None:

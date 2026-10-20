@@ -810,7 +810,10 @@ class TaskMixin:
         ).with_project_trust(
             trust.level, trust.fingerprint, trust.subject
         ).with_workspace_baseline(baseline)
-        task_spec = TaskSpecSnapshot.initial(snapshot.task_id, snapshot.goal)
+        task_spec = (
+            None if task_kind is TaskKind.CONVERSATION
+            else TaskSpecSnapshot.initial(snapshot.task_id, snapshot.goal)
+        )
         document_references = extract_document_references(normalized_goal)
         visible_tool_names = {tool.name for tool in await self.list_tools()}
         document_fetch_failure = (
@@ -862,7 +865,7 @@ class TaskMixin:
                 "project_trust": snapshot.project_trust.value,
                 "project_fingerprint": snapshot.project_fingerprint,
                 "trust_subject": snapshot.trust_subject,
-                "task_spec": task_spec.to_data(),
+                **({"task_spec": task_spec.to_data()} if task_spec is not None else {}),
                 "document_references": list(document_references),
                 "document_fetch_failure": (
                     document_fetch_failure.to_data()

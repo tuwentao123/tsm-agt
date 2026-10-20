@@ -262,7 +262,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                     "runtime.inspect_session", "runtime.search_history",
                     "web.search", "web.fetch_markdown", "web.open",
                     "web.find_in_page", "web.read", "content.summarize",
-                    "core.run_command", "core.process_wait",
+                    "core.run_command", "core.process_list", "core.process_wait",
                     "core.process_status", "core.process_logs",
                     "core.process_stop", "core.apply_patch",
                     "core.apply_patch_v4a", "core.apply_patches", "core.delete_file",

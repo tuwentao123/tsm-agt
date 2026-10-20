@@ -545,6 +545,26 @@ class ToolResult:
             result["fact_descriptor"] = self.fact_descriptor.to_data()
         return result
 
+    def to_model_data(self) -> dict[str, Any]:
+        """Project invocation facts for the model, not runtime retry policy.
+
+        The durable representation remains unchanged for approval recovery,
+        safety checks and older checkpoints.  Known explanatory details must
+        not be lost just because an adapter stored them in recovery_action.
+        """
+        result = self.to_data()
+        result.pop("retryable", None)
+        result.pop("recovery_kind", None)
+        action = result.pop("recovery_action", {})
+        if isinstance(action, dict):
+            details = {
+                key: value for key, value in action.items()
+                if key not in {"required_change", "same_call_safe", "action"}
+            }
+            if details:
+                result["error_details"] = details
+        return result
+
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> ToolResult:
         meta = data.get("meta", {})
@@ -589,6 +609,8 @@ class ToolResultGovernorPort(Protocol):
 
 class ToolProcessControl(Protocol):
     """Task-scoped process operations exposed to an authorized tool call."""
+
+    async def list_processes(self, scope: str, states: tuple[str, ...], limit: int, cursor: int) -> Mapping[str, Any]: ...
 
     async def run(
         self,

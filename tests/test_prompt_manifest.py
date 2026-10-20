@@ -28,6 +28,7 @@ def tool(name: str, schema_type: str = "string") -> ToolSpec:
 ALL_SEGMENTS = [
     # Layer 1: the boundary every turn obeys.
     "system-safety", "request-pipeline-guidance", "delivery-mode-guidance",
+    "tool-feedback-guidance",
     # Layer 2: request handling -- understand, shape, route, close.
     "response-format-guidance", "execution-discipline",
     "completion-behavior-examples",
@@ -113,10 +114,11 @@ class PromptManifestTest(unittest.TestCase):
         self.assertEqual(gated["task-plan-guidance"], ["core.todo_list"])
 
     def test_externalized_prompt_preserves_existing_manifest(self) -> None:
-        # Preserve the full assembled static content, ordering, versions and gates.
+        # Preserve the assembled static content, ordering, versions and gates.
+        # The edit guidance intentionally changed for read/hash dependencies.
         self.assertEqual(
             self.template.manifest().manifest_hash,
-            "a1dfe326b8b850418963875368d2ded9f998f24d00a1bf38e5423e94b59ce5f2",
+            "0f471253fba04074b704dc762e0fb3292bd9fe3176620b684da0fc0daa21566b",
         )
 
     def test_packaged_prompt_rejects_duplicate_sections(self) -> None:
@@ -146,6 +148,7 @@ class PromptManifestTest(unittest.TestCase):
             [
                 MessageRole.SYSTEM, MessageRole.SYSTEM, MessageRole.SYSTEM,
                 MessageRole.SYSTEM, MessageRole.SYSTEM, MessageRole.SYSTEM,
+                MessageRole.SYSTEM,
                 MessageRole.USER,
             ],
         )
@@ -174,7 +177,7 @@ class PromptManifestTest(unittest.TestCase):
         ids = [message.message_id for message in assembled.messages]
         self.assertLess(ids.index("project-instructions-context-project"), ids.index("prompt-runtime-r42"))
         self.assertLess(ids.index("task-spec-context-task"), ids.index("prompt-runtime-r42"))
-        self.assertEqual(assembled.receipt.static_segment_count, 6)
+        self.assertEqual(assembled.receipt.static_segment_count, 7)
 
     def test_cache_fingerprints_distinguish_order_from_dynamic_messages(self) -> None:
         tools = (tool("fixture.first"), tool("fixture.second"))
@@ -239,7 +242,8 @@ class PromptManifestTest(unittest.TestCase):
         self.assertEqual(
             data["prompt_role_order"],
             [
-                "system", "system", "system", "system", "system", "system", "user",
+                "system", "system", "system", "system", "system", "system",
+                "system", "user",
             ],
         )
         self.assertNotIn("inspect the project", str(data))
@@ -292,7 +296,7 @@ class PromptManifestTest(unittest.TestCase):
         segment = self.segment("request-pipeline-guidance")
         content = segment.content
 
-        self.assertEqual(segment.version, "4.0")
+        self.assertEqual(segment.version, "4.2")
         self.assertIn("# Working with the user\n", content)
         self.assertIn("# Evidence and verification\n", content)
         self.assertIn("analyze or review without changing files", content)
@@ -372,17 +376,31 @@ class PromptManifestTest(unittest.TestCase):
         self.assertIn("say what is unverified", read)
         self.assertIn("core.apply_patch_v4a", edit)
         self.assertIn("literal \\n", edit)
+        self.assertIn("path, content, and hash from the same current read", edit)
+        self.assertIn("do not issue that read and its dependent edit", edit)
+        self.assertIn("whether the change is still needed", edit)
+        self.assertIn("Report only committed edits as changes made in", edit)
 
     def test_delivery_guidance_is_static_and_requires_a_write_tool(self) -> None:
         segment = self.segment("delivery-mode-guidance")
 
-        self.assertEqual(segment.version, "3.1")
-        self.assertIn("brief confirmation", segment.content)
-        self.assertIn("does not implement a requested change", segment.content)
-        self.assertIn("does not by itself require a file change", segment.content)
-        self.assertIn("verify it when feasible", segment.content)
+        self.assertEqual(segment.version, "4.1")
+        # Completion-first posture: do the work now, do not yield with a plan,
+        # keep going until done, confirm each change, never claim unverified work.
+        self.assertIn("carry out the edits now", segment.content)
+        self.assertIn("do not end the turn with only a plan", segment.content)
+        self.assertIn("a read is preparation, not the deliverable", segment.content)
+        self.assertIn(
+            "keep going across steps until the work is actually done", segment.content
+        )
         self.assertIn("concrete blocker", segment.content)
-        self.assertIn("Do not repeat unnecessary exploratory reads", segment.content)
+        self.assertIn("materially changes scope", segment.content)
+        # Verify-after-edit is now a default step, not optional.
+        self.assertIn("After each change, confirm it took", segment.content)
+        self.assertIn("a receipt, not proof the goal is met", segment.content)
+        self.assertIn(
+            "never present unperformed or unverified work as done", segment.content
+        )
         self.assertEqual(
             segment.requires_any_tools,
             (
@@ -401,8 +419,51 @@ class PromptManifestTest(unittest.TestCase):
             "delivery mode", "\n".join(message.text for message in without_write.messages),
         )
         rendered = "\n".join(message.text for message in with_write.messages)
-        self.assertIn("When the user requests implementation", rendered)
-        self.assertIn("does not by itself require a file change", rendered)
+        self.assertIn("When the user asks you to implement", rendered)
+        self.assertIn("carry out the edits now", rendered)
+
+    def test_tool_feedback_guidance_is_stable_base_and_capability_free(self) -> None:
+        segment = self.segment("tool-feedback-guidance")
+        content = segment.content
+
+        self.assertEqual(segment.version, "1.2")
+        # Stable base layer: it ships to every session regardless of toolset.
+        self.assertEqual(segment.requires_any_tools, ())
+        self.assertIn("# Working from tool results\n", content)
+        # Route-A multi-step persistence: finish all implied steps in the turn.
+        self.assertIn("carry them all out in the same turn", content)
+        # A result, including a failure, is a step fact, not whole-task success.
+        self.assertIn("not as success or failure of the whole request", content)
+        # Persistence: a single failure does not end the task; keep working.
+        self.assertIn("does not end the task and does not forbid later work", content)
+        self.assertIn("keep working the current request", content)
+        # Stopping and reporting a blocker is the genuine-exception case.
+        self.assertIn("no permitted way forward remains", content)
+        self.assertIn("report a blocker only in that genuine case", content)
+        self.assertIn("other goals or their verification are complete", content)
+        # Denials are not bypassed; unknown effects are not blindly retried.
+        self.assertIn("Do not bypass a user or policy denial", content)
+        self.assertIn("blindly repeat a call whose effect is unknown", content)
+        self.assertIn("continue the independent work you are allowed to do", content)
+        # A general disposition, not a scenario patch: it names no capability
+        # and enumerates no specific failure category to react to.
+        for capability in (
+            "core.run_command", "core.read_file", "core.apply_patch", "web.search",
+        ):
+            self.assertNotIn(capability, content)
+        for scenario in ("expected_hash", "syntax", "argument", "ambiguous"):
+            self.assertNotIn(scenario, content)
+
+    def test_tool_feedback_guidance_ships_without_any_tools(self) -> None:
+        assembled = self.template.assemble((self.user,), ())
+        rendered = "\n".join(message.text for message in assembled.messages)
+        self.assertIn(
+            "Read each tool result, including a failure, as a fact about that step",
+            rendered,
+        )
+        self.assertIn(
+            "never present failed, unverified, or abandoned work as done", rendered,
+        )
 
     def test_request_and_evidence_guidance_applies_without_write_tools(self) -> None:
         assembled = self.template.assemble((self.user,), ())
@@ -425,6 +486,14 @@ class PromptManifestTest(unittest.TestCase):
             "Complete feasible in-scope work rather than offering to do it later. "
             "Ask for a decision only when a material ambiguity, authorization, or "
             "blocker prevents safe progress.\n\n"
+            "During multi-step work, when useful, briefly tell the user what you learned or what you will do "
+            "next in normal assistant text alongside your tool calls. Continue the work in the same response; "
+            "do not substitute an update for a tool call. Describe observations and uncertainty accurately, "
+            "and do not claim an action succeeded before its result. These notes are not hidden reasoning. "
+            "After receiving tool results, if another tool call is needed, include a concise progress update "
+            "in the same assistant message as that call: summarize what the results actually established, "
+            "mention a failure or uncertainty when relevant, and say what you will check or do next. Continue "
+            "with the tool call; do not claim an unverified outcome or repeat the update in the final answer.\n\n"
             "# Evidence and verification\n"
             "Distinguish user reports, tool observations, prior assistant conclusions, "
             "and hypotheses. Prior conclusions can be wrong or stale: reconsider them "
@@ -443,8 +512,7 @@ class PromptManifestTest(unittest.TestCase):
     def test_workspace_command_guidance_keeps_cwd_in_workspace(self) -> None:
         segment = self.segment("workspace-command-guidance")
 
-        self.assertEqual(segment.version, "1.4")
-        self.assertIn("not independent authorized work", segment.content)
+        self.assertEqual(segment.version, "1.5")
         self.assertEqual(
             segment.requires_any_tools, ("core.run_command", "core.process_wait"),
         )
@@ -452,13 +520,17 @@ class PromptManifestTest(unittest.TestCase):
         self.assertIn("Use '.' for the task workspace root", segment.content)
         self.assertIn("workspace-relative", segment.content)
         self.assertIn("host absolute path", segment.content)
-        self.assertIn("structured recovery", segment.content)
-        self.assertIn("never call failed work completed", segment.content.lower())
         self.assertIn("exact workspace-relative path in cwd", segment.content)
         self.assertIn("retry once with that verified child cwd", segment.content)
         self.assertIn("managed-process start fact", segment.content)
         self.assertIn("manual user instructions", segment.content)
         self.assertIn("core.process_wait", segment.content)
+        # The command-specific unknown-outcome fact stays here; the generic
+        # cross-tool failure/denial guidance moved to tool-feedback-guidance.
+        self.assertIn("has an unknown outcome", segment.content)
+        self.assertNotIn("structured recovery", segment.content)
+        self.assertNotIn("never call failed work completed", segment.content.lower())
+        self.assertNotIn("not independent authorized work", segment.content)
 
     def test_task_plan_guidance_is_capability_bound(self) -> None:
         segment = self.segment("task-plan-guidance")
@@ -470,7 +542,9 @@ class PromptManifestTest(unittest.TestCase):
         self.assertIn("skip it for straightforward tasks", segment.content)
         self.assertIn("failed verification does not complete", segment.content)
         self.assertIn("current request can change its scope", segment.content)
-        self.assertEqual(segment.version, "3.0")
+        # Lean toward completion: work the list, do not stop after one item.
+        self.assertIn("until the list is complete", segment.content)
+        self.assertEqual(segment.version, "3.1")
 
     def test_execution_discipline_keeps_looking_until_grounded(self) -> None:
         segment = self.segment("execution-discipline")

@@ -19,6 +19,7 @@ from tsm_agt.ports import (
 
 from ..agent_loop import TurnState
 from ..task_spec import TaskCriterionKind
+from ..task import TaskKind
 from ..tool_result_governor import _sanitize_value
 
 
@@ -272,6 +273,12 @@ class ConversationFinalizationPipeline:
         hidden classifier for ordinary messages.  Runtime-authored goal
         alignment alone is intentionally insufficient.
         """
+        task = await self._kernel.get_task(task_id)
+        if task.task_kind is TaskKind.CONVERSATION:
+            # Historical work-item criteria never become the acceptance
+            # contract of a later conversational input. ALWAYS remains an
+            # explicitly configured, current-Turn quality review.
+            return False
         spec = await self._kernel.get_task_spec(task_id)
         required_kinds = frozenset({
             TaskCriterionKind.WORKSPACE_INTEGRITY,

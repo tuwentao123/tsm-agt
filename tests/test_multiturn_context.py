@@ -1,26 +1,10 @@
-"""Multi-turn context: what the model actually sees on the second and third turn.
+"""Inspect actual SDK-issued multi-turn requests, not only a projection helper.
 
-**Corrected.** An earlier revision of this file asserted that a later turn could
-not see an earlier turn's user text, and marked that assertion
-``expectedFailure``. The assertion was wrong, and so was the diagnosis behind
-it: the tests drove the session with ``submit_session_text`` alone, which
-*creates* a Task but never runs it, so no model request was ever issued and the
-assertion failed for that reason rather than for missing context.
-
-Driving the turn properly -- ``submit_session_text`` then ``run_task`` -- shows
-that prior turns **are** carried: each turn's model request includes a
-``session-context-*`` message whose ``recent_messages`` holds the earlier user
-*and* assistant rows in order. Multi-turn text continuity works.
-
-What is genuinely absent, and is characterized below, is everything that is not
-user/assistant text: tool calls and tool results never enter that projection.
-That is a deliberate safety decision recorded at ``Kernel._session_task_summary`` in ``core/kernel_session.py``
-("Never copy command argv/environment, patch bodies or arbitrary third-party
-Tool arguments into Session context"), not an oversight.
-
-The lesson kept in this docstring: a characterization test that fails for the
-wrong reason looks exactly like one that fails for the right reason. Drive the
-real path before trusting either.
+Authored dialogue uses native roles with text-free Session metadata. Bounded,
+attributed execution observations are descriptive facts, never fabricated
+native historical tool calls. Conversation history is limited by tokens and
+whole Turns, not a fixed eight-message ceiling. Submission schedules the Turn;
+calling run_task again would manufacture a duplicate user input.
 """
 
 from __future__ import annotations
@@ -38,6 +22,7 @@ from tsm_agt.ports import (
     ModelResponse, ProviderCapabilities,
 )
 from tsm_agt.sdk import EngineeringAgentClient
+from tests.history_helpers import session_history_view
 
 
 class RecordingModelProvider(EchoModelProvider):
@@ -45,14 +30,8 @@ class RecordingModelProvider(EchoModelProvider):
     what the model was shown -- which is the only observable that matters for a
     context-continuity claim.
 
-    ``context_window`` is settable because the Session-history bound has two
-    independent caps and only the second one is window-driven: a small window
-    keeps the token-budget compactor in play, a large one lets the projector's own
-    count bound be the only limit. Tests need to choose.
-
-    The 4363 default is 4096 raised by the protected static prompt growth from
-    the ``mandatory-tool-use`` and ``tool-failure-recovery`` segments, so the
-    default window keeps the slack these tests were calibrated against.
+    Small windows exercise token-driven compaction; continuity-only tests use
+    a larger window so they do not accidentally assert that no trimming occurs.
     """
 
     descriptor = AdapterDescriptor(
@@ -145,7 +124,7 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
         for request in reversed(requests[since:]):
             for message in request.messages:
                 if message.message_id.startswith("session-context-"):
-                    return json.loads(message.text)
+                    return session_history_view(request)
         raise AssertionError("no session-context message was projected")
 
     async def test_second_turn_sees_the_first_turn_user_text(self):
@@ -164,7 +143,7 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_third_turn_sees_both_earlier_turns_in_order(self):
         with tempfile.TemporaryDirectory() as directory:
-            client, model = await self.make_client(Path(directory))
+            client, model = await self.make_client(Path(directory), context_window=32768)
             session = await client.application.kernel.create_session("continuity")
 
             for index in (1, 2):
@@ -258,18 +237,11 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
                     "only user and assistant text may cross a turn boundary today",
                 )
 
-    async def test_the_default_bound_plateaus_and_drops_early_turns(self):
-        """Pins the measured plateau: with the default 8-message bound the
-        projection stops growing after four round trips, and turn 1's words leave
-        the prompt entirely -- they survive only as event references in
-        ``earlier_summary``.
-
-        This is a *bound*, not a break: the same turns were verified reachable
-        above. It is pinned here so that changing it is deliberate.
-        """
+    async def test_default_count_knob_does_not_drop_history_when_token_budget_fits(self):
+        """Conversation history no longer plateaus at four round trips."""
 
         with tempfile.TemporaryDirectory() as directory:
-            client, model = await self.make_client(Path(directory))
+            client, model = await self.make_client(Path(directory), context_window=32768)
             session = await client.application.kernel.create_session("plateau")
 
             for index in range(1, 9):
@@ -281,8 +253,8 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
             bodies = [
                 message.get("text") for message in payload["recent_messages"]
             ]
-            self.assertEqual(len(bodies), 8, "the default bound is eight messages")
-            self.assertNotIn("instruction number 1", bodies)
+            self.assertEqual(len(bodies), 14)
+            self.assertIn("instruction number 1", bodies)
             self.assertIn("instruction number 7", bodies)
             self.assertNotIn("instruction number 8", bodies)
             # The eighth instruction is the live turn's own message, carried
@@ -290,23 +262,10 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
             # The newest Turn's own reply does not exist yet.  Earlier visible
             # assistant replies now travel with their user counterparts, so
             # compaction can accumulate more than the old user-only count.
-            self.assertGreaterEqual(
-                payload["earlier_summary"]["message_count"], 6,
-                "the prompt must account for every row it dropped",
-            )
+            self.assertEqual(payload["earlier_summary"]["message_count"], 0)
 
     async def test_a_compacted_prompt_admits_the_messages_it_dropped(self):
-        """Two layers drop history and only one of them used to say so.
-
-        ``SessionContextProjector`` counts what it omits into
-        ``earlier_summary.message_count``. ``ContextWindowManager`` then trims the
-        already-projected list again -- and did not fold those drops into the same
-        count, so on a small provider window the payload could report
-        ``message_count: 0`` beside a prompt that had just lost eight messages.
-
-        Raising only the projector's bound puts the two layers in disagreement on
-        purpose: the projector omits nothing, the compactor drops eight.
-        """
+        """The shared budget accounts for every omitted row in whole Turns."""
 
         with tempfile.TemporaryDirectory() as directory:
             client, model = await self.make_client(
@@ -323,35 +282,22 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
                 )
 
             payload = self._session_context(model.requests, 0)
-            self.assertEqual(len(payload["recent_messages"]), 8)
+            self.assertEqual(len(payload["recent_messages"]) % 2, 0)
             self.assertIn("compaction", payload)
-            self.assertGreaterEqual(
-                payload["earlier_summary"]["message_count"], 6,
-                "the payload must report the messages compaction dropped, not "
-                "only the ones the projector omitted",
-            )
+            self.assertEqual(len(payload["recent_messages"]) +
+                             payload["earlier_summary"]["message_count"], 14)
 
-    async def test_raising_both_bounds_keeps_early_turns_in_the_prompt(self):
-        """The payoff of the newly-configurable bounds: turning them up actually
-        keeps an early turn's words in a later turn's prompt, so "the bound is too
-        small" is fixable by configuration rather than by re-architecting.
-
-        Both knobs are needed, and the provider window is a third constraint.
-        ``ContextWindowManager`` applies ``recent_message_floor`` on top of the
-        projector's bound, so raising only the projector changes nothing on a
-        small window -- the compactor trims straight back down. And keeping the
-        history at all needs a window big enough to hold it. The two runs above
-        are the controls.
-        """
+    async def test_small_legacy_count_knobs_cannot_override_provider_token_budget(self):
+        """Only the shared token budget limits Conversation history."""
 
         with tempfile.TemporaryDirectory() as directory:
             client, model = await self.make_client(
                 Path(directory),
                 projector=SessionContextProjector(
-                    recent_visible_message_limit=64,
+                    recent_visible_message_limit=1,
                 ),
                 context_manager=ContextWindowManager(
-                    recent_message_floor=64, pinned_message_ceiling=64,
+                    recent_message_floor=1,
                 ),
                 context_window=32768,
             )

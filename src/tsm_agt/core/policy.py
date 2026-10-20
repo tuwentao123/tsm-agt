@@ -85,9 +85,9 @@ class PolicyDecision:
 class CoreToolPolicy:
     """Fail closed; risky calls pause until the kernel resolves approval."""
 
-    _POLICY_VERSION = 2
+    _POLICY_VERSION = 3
     _INTERNAL_STATE_TOOLS = frozenset({
-        "core.working_memory_update", "core.task_spec_update",
+        "core.working_memory_update", "core.task_spec_update", "core.todo_list",
     })
 
     @classmethod

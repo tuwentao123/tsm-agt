@@ -126,7 +126,7 @@ class WorkspaceMutationConflict(RuntimeError):
         self, path: str, expected_hash: str | None, actual_hash: str | None
     ) -> None:
         super().__init__(
-            f"workspace file changed before write: {path}; expected "
+            f"workspace file version mismatch: {path}; expected "
             f"{expected_hash or '<missing>'}, got {actual_hash or '<missing>'}"
         )
         self.path = path
@@ -466,7 +466,17 @@ def commit_prepared_workspace_mutation(
         if mutation.result_mode is not None:
             os.chmod(temporary, mutation.result_mode)
         _assert_precondition(mutation)
-        filesystem.replace(temporary, mutation.path)
+        if mutation.before_hash is None:
+            # A hard link publishes the fully written file atomically without
+            # replacing a path created after the last precondition check.
+            try:
+                os.link(temporary, mutation.path)
+            except FileExistsError as error:
+                raise WorkspaceMutationConflict(
+                    mutation.relative_path, None, file_sha256(mutation.path)
+                ) from error
+        else:
+            filesystem.replace(temporary, mutation.path)
         filesystem.sync_directory(mutation.path.parent)
         if file_sha256(mutation.path) != mutation.after_hash:
             raise OSError(

@@ -41,6 +41,7 @@ from .configuration import (
     canonical_hash,
 )
 from .conversation_orchestration import (
+    OrchestrationMode,
     TaskBindingDecision, TaskBindingKind,
     TaskBindingRequest,
     TaskBindingTask,
@@ -74,7 +75,7 @@ from .session_resources import (
     SessionResourceKind, SessionResourceReference,
 )
 from .task import (
-    TaskNotFound, TaskSnapshot, TaskState,
+    TaskKind, TaskNotFound, TaskSnapshot, TaskState,
 )
 from .task_spec import (
     TaskSpecSnapshot,
@@ -1673,12 +1674,17 @@ class SessionMixin:
         ):
             active_checkpoint = None
         executions_by_task: dict[str, tuple[Any, ...]] = {}
+        approval_decisions: dict[tuple[str, str], str] = {}
         excluded = (
             (active_checkpoint.task_id,)
             if active_checkpoint is not None else ()
         )
         for recent_task_id in projector.recent_task_ids(
-            projection, exclude_task_ids=excluded
+            projection, exclude_task_ids=excluded,
+            conversation_mode=(
+                self._dependencies.orchestration_mode
+                is OrchestrationMode.CONVERSATION_LOOP
+            ),
         ):
             try:
                 recent_task = await self.get_task(recent_task_id)
@@ -1687,8 +1693,26 @@ class SessionMixin:
             executions_by_task[recent_task_id] = tuple(
                 recent_task.tool_executions.values()
             )
+            approval_ids = {
+                execution.approval_request_id
+                for execution in executions_by_task[recent_task_id]
+                if execution.approval_request_id
+            }
+            if approval_ids:
+                for event in await self._dependencies.store.read_events(recent_task_id):
+                    if event.event_type != "approval.resolved":
+                        continue
+                    request_id = event.payload.get("request_id")
+                    decision = event.payload.get("decision")
+                    if request_id in approval_ids and decision in {"approve", "deny"}:
+                        approval_decisions[(recent_task_id, request_id)] = decision
         recent_executions = projector.project_recent_executions(
-            executions_by_task
+            executions_by_task, approval_decisions,
+            exclude_task_id=exclude_task_id, exclude_turn_id=exclude_turn_id,
+            conversation_mode=(
+                self._dependencies.orchestration_mode
+                is OrchestrationMode.CONVERSATION_LOOP
+            ),
         )
         suspended_tasks = tuple(
             candidate for candidate in await self.list_session_resume_candidates(
@@ -1702,6 +1726,10 @@ class SessionMixin:
             suspended_tasks=suspended_tasks,
             exclude_task_id=exclude_task_id,
             exclude_turn_id=exclude_turn_id,
+            conversation_mode=(
+                self._dependencies.orchestration_mode
+                is OrchestrationMode.CONVERSATION_LOOP
+            ),
         )
     async def get_session_active_checkpoint(
         self, session_id: str,
@@ -1804,7 +1832,10 @@ class SessionMixin:
         resource_catalog, question_catalog = await self._session_reference_catalogs(
             task.task_id
         )
-        task_spec = await self.get_task_spec(task.task_id)
+        task_spec = (
+            None if task.task_kind is TaskKind.CONVERSATION
+            else await self.get_task_spec(task.task_id)
+        )
         task_summary = self._session_task_summary(
             task, turn_id, working_memory, resource_catalog,
             effective_remaining_work=effective_memory.remaining_work,

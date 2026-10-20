@@ -86,6 +86,25 @@ class TextBlock:
         return {"type": "text", "text": self.text}
 
 
+@dataclass(frozen=True, slots=True)
+class ReasoningBlock:
+    """Provider-owned reasoning needed to resume a tool-use response.
+
+    This is not assistant answer text. The opaque signature and redacted data
+    must be returned unchanged to the provider and must not be shown as text.
+    """
+
+    provider: str
+    kind: str
+    text: str = ""
+    signature: str = ""
+    data: str = ""
+
+    def to_data(self) -> dict[str, str]:
+        return {"type": "reasoning", "provider": self.provider, "kind": self.kind,
+                "text": self.text, "signature": self.signature, "data": self.data}
+
+
 IMAGE_DETAIL_LEVELS = ("auto", "low", "high")
 
 
@@ -159,7 +178,7 @@ class ConclusionBlock:
 
 
 MessageBlock = (
-    TextBlock | ImageBlock | ToolCallBlock | ToolResultBlock | ConclusionBlock
+    TextBlock | ReasoningBlock | ImageBlock | ToolCallBlock | ToolResultBlock | ConclusionBlock
 )
 
 
@@ -259,6 +278,14 @@ class Message:
             block_type = raw_block.get("type")
             if block_type == "text":
                 blocks.append(TextBlock(str(raw_block.get("text", ""))))
+            elif block_type == "reasoning":
+                blocks.append(ReasoningBlock(
+                    provider=str(raw_block.get("provider", "")),
+                    kind=str(raw_block.get("kind", "")),
+                    text=str(raw_block.get("text", "")),
+                    signature=str(raw_block.get("signature", "")),
+                    data=str(raw_block.get("data", "")),
+                ))
             elif block_type == "input_image":
                 blocks.append(ImageBlock(
                     image_url=str(raw_block.get("image_url", "")),
@@ -384,6 +411,13 @@ class ModelTextDelta:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelReasoningDelta:
+    """Provider-supplied, user-visible reasoning summary fragment."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class ModelStreamCompleted:
     """The single normalized, fully validated result ending one stream.
 
@@ -395,7 +429,7 @@ class ModelStreamCompleted:
     response: ModelResponse
 
 
-ModelStreamEvent = ModelTextDelta | ModelStreamCompleted
+ModelStreamEvent = ModelTextDelta | ModelReasoningDelta | ModelStreamCompleted
 
 
 @runtime_checkable

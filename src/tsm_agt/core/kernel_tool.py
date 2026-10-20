@@ -104,6 +104,7 @@ from .tool import (
 )
 from .turn import InvalidModelResponse, InvalidTurnState
 from .verification_command import is_verification_request
+from .v4a import apply_v4a_update
 from .workspace import WorkspacePatchConflict, prepare_workspace_text_write
 
 
@@ -111,6 +112,21 @@ def _render_workspace_patch(
     path: str, before_bytes: bytes | None,
     edits: tuple[Mapping[str, str], ...],
 ) -> str:
+    if len(edits) == 1 and "v4a_patch" in edits[0]:
+        # The V4A tool carries its raw patch here so Codex-style context
+        # matching can run against the current file content rather than the
+        # flat, globally-unique old_text replacement used by core.apply_patch.
+        if before_bytes is None:
+            raise WorkspacePatchConflict(
+                path, 0, "cannot apply a V4A update to a file that does not exist"
+            )
+        try:
+            text = before_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                "core.apply_patch_v4a supports UTF-8 text files only"
+            ) from error
+        return apply_v4a_update(path, text, str(edits[0]["v4a_patch"]))
     if before_bytes is None:
         if len(edits) != 1 or edits[0]["old_text"] != "":
             raise ValueError(
@@ -152,12 +168,49 @@ def _render_workspace_patch(
 
 @dataclass(frozen=True, slots=True)
 class _TaskProcessControl(ToolProcessControl):
-    """Narrow capability: process tools can act only on one current Task."""
+    """Process capability scoped to the current session, or Task without one."""
 
     kernel: Kernel
     task_id: str
     turn_id: str
     invocation_id: str
+
+    async def _accessible_tasks(self, scope: str = "session"):
+        current = await self.kernel.get_task(self.task_id)
+        if scope == "task" or not current.session_id:
+            return (current,)
+        session = await self.kernel.get_session(current.session_id)
+        tasks = []
+        for task_id in dict.fromkeys((self.task_id, *session.task_ids)):
+            task = await self.kernel.get_task(task_id)
+            if task.session_id == current.session_id:
+                tasks.append(task)
+        return tuple(tasks)
+
+    async def _owner(self, process_id: str) -> str:
+        for task in await self._accessible_tasks():
+            if process_id in task.background_processes:
+                return task.task_id
+        raise LookupError("background process not found")
+
+    async def list_processes(self, scope: str, states: tuple[str, ...], limit: int, cursor: int) -> Mapping[str, Any]:
+        tasks = await self._accessible_tasks(scope)
+        entries = []
+        for task in tasks:
+            for old in task.background_processes.values():
+                record = await self.kernel.get_background_process_status(
+                    task.task_id, old.process_id, enforce_deadline=False
+                )
+                if states and record.state.value not in states:
+                    continue
+                data = self.kernel._background_record_data(record)
+                data.update({"task_id": task.task_id, "session_id": task.session_id,
+                             "creator_turn_id": record.turn_id, "cwd": record.handle.cwd,
+                             "control_state": "MANAGED" if record.state.value == "RUNNING" else "UNAVAILABLE"})
+                entries.append(data)
+        entries.sort(key=lambda row: (row["started_at"], row["process_id"]), reverse=True)
+        page = entries[cursor:cursor + limit]
+        return {"processes": page, "next_cursor": cursor + limit if cursor + limit < len(entries) else None}
 
     async def run(
         self, argv: tuple[str, ...], *, cwd: str,
@@ -194,12 +247,12 @@ class _TaskProcessControl(ToolProcessControl):
         self, process_id: str, wait_seconds: float
     ) -> ProcessWaitResult:
         return await self.kernel.wait_background_process(
-            self.task_id, process_id, wait_seconds=wait_seconds
+            await self._owner(process_id), process_id, wait_seconds=wait_seconds
         )
 
     async def status(self, process_id: str) -> Mapping[str, Any]:
         record = await self.kernel.get_background_process_status(
-            self.task_id, process_id
+            await self._owner(process_id), process_id
         )
         return self.kernel._background_record_data(record)
 
@@ -207,7 +260,7 @@ class _TaskProcessControl(ToolProcessControl):
         self, process_id: str, stdout_cursor: int, stderr_cursor: int
     ) -> Mapping[str, Any]:
         logs = await self.kernel.read_background_process_logs(
-            self.task_id, process_id,
+            await self._owner(process_id), process_id,
             stdout_cursor=stdout_cursor, stderr_cursor=stderr_cursor,
         )
         return {
@@ -230,7 +283,7 @@ class _TaskProcessControl(ToolProcessControl):
         self, process_id: str, grace_seconds: float
     ) -> Mapping[str, Any]:
         record = await self.kernel.stop_background_process(
-            self.task_id, process_id, grace_seconds=grace_seconds
+            await self._owner(process_id), process_id, grace_seconds=grace_seconds
         )
         return self.kernel._background_record_data(record)
 
@@ -394,9 +447,18 @@ class _TaskWorkingMemoryControl(ToolWorkingMemoryControl):
     idempotency_key: str
 
     async def read(self) -> Mapping[str, Any]:
-        return (
+        data = (
             await self.kernel.get_effective_working_memory(self.task_id)
         ).to_data()
+        return await self._model_data(data)
+
+    async def _model_data(self, data: Mapping[str, Any]) -> Mapping[str, Any]:
+        task = await self.kernel.get_task(self.task_id)
+        if task.task_kind is TaskKind.CONVERSATION:
+            # The scratchpad's legacy storage goal is not a chat objective.
+            # Authored plan/progress remain notes the model may revise.
+            return {key: value for key, value in data.items() if key != "goal"}
+        return data
 
     async def update(
         self, expected_revision: int, state: Mapping[str, Any], operation_id: str,
@@ -407,10 +469,11 @@ class _TaskWorkingMemoryControl(ToolWorkingMemoryControl):
             "tool_idempotency_key": self.idempotency_key,
             "supplied_operation_id": operation_id,
         })
-        return (await self.kernel.update_working_memory(
+        data = (await self.kernel.update_working_memory(
             self.task_id, expected_revision, state, scoped_operation,
             self.invocation_id,
         )).to_data()
+        return await self._model_data(data)
 
 
 @dataclass(frozen=True, slots=True)

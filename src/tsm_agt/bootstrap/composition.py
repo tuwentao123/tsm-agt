@@ -52,6 +52,7 @@ from tsm_agt.adapters.rule_based_investigation_flow import (
     RuleBasedInvestigationFlowProjector,
 )
 from tsm_agt.adapters.openai_compatible import OpenAICompatibleModelProvider
+from tsm_agt.adapters.openai_compatible.responses import OpenAIResponsesModelProvider
 from tsm_agt.adapters.anthropic_messages import AnthropicMessagesModelProvider
 from tsm_agt.adapters.resilient_model import ResilientModelProvider
 from tsm_agt.adapters.rule_based_model_recovery import (
@@ -205,6 +206,8 @@ def _physical_model_provider(
     output_token_parameter: str,
     strict_tool_schema: bool,
     streaming: bool,
+    open_api_mode: str = "chat",
+    reasoning_effort: str | None = None,
 ):
     """Select the wire adapter while preserving one Kernel model contract."""
     if protocol == MODEL_PROTOCOL_ANTHROPIC_MESSAGES:
@@ -216,7 +219,9 @@ def _physical_model_provider(
             timeout_seconds=timeout_seconds,
             streaming=streaming,
         )
-    return OpenAICompatibleModelProvider(
+    provider_class = OpenAIResponsesModelProvider if open_api_mode == "responses" else OpenAICompatibleModelProvider
+    options = {"reasoning_effort": reasoning_effort}
+    return provider_class(
         base_url,
         model,
         api_key,
@@ -226,6 +231,7 @@ def _physical_model_provider(
         output_token_parameter=output_token_parameter,
         strict_tool_schema=strict_tool_schema,
         streaming=streaming,
+        **options,
     )
 
 
@@ -856,6 +862,8 @@ def compose_openai_compatible_readonly_application(
     model_anthropic_version: str = "2023-06-01",
     model_strict_tool_schema: bool = True,
     model_streaming: bool = True,
+    model_open_api_mode: str = "chat",
+    model_reasoning_effort: str | None = None,
     context_configuration: ContextConfiguration | None = None,
     web_egress_configuration: WebEgressConfiguration | None = None,
     search_configuration: SearchConfiguration | None = None,
@@ -885,6 +893,8 @@ def compose_openai_compatible_readonly_application(
         output_token_parameter=model_output_token_parameter,
         strict_tool_schema=model_strict_tool_schema,
         streaming=model_streaming,
+        open_api_mode=model_open_api_mode,
+        reasoning_effort=model_reasoning_effort,
     )
     recovery_policy = RuleBasedModelRecoveryPolicy(
         model_retry_backoff_seconds
@@ -1047,6 +1057,8 @@ def compose_openai_compatible_engineering_application(
     model_anthropic_version: str = "2023-06-01",
     model_strict_tool_schema: bool = True,
     model_streaming: bool = True,
+    model_open_api_mode: str = "chat",
+    model_reasoning_effort: str | None = None,
     context_configuration: ContextConfiguration | None = None,
     web_egress_configuration: WebEgressConfiguration | None = None,
     search_configuration: SearchConfiguration | None = None,
@@ -1077,6 +1089,8 @@ def compose_openai_compatible_engineering_application(
         output_token_parameter=model_output_token_parameter,
         strict_tool_schema=model_strict_tool_schema,
         streaming=model_streaming,
+        open_api_mode=model_open_api_mode,
+        reasoning_effort=model_reasoning_effort,
     )
     recovery_policy = RuleBasedModelRecoveryPolicy(
         model_retry_backoff_seconds
@@ -1274,6 +1288,8 @@ def compose_openai_compatible_readonly_application_from_env(
         model_anthropic_version=configuration.anthropic_version,
         model_strict_tool_schema=configuration.strict_tool_schema,
         model_streaming=configuration.streaming,
+        model_open_api_mode=configuration.open_api_mode,
+        model_reasoning_effort=configuration.reasoning_effort,
         context_configuration=context,
         web_egress_configuration=egress,
         search_configuration=search,
@@ -1287,6 +1303,8 @@ def compose_openai_compatible_readonly_application_from_env(
 
 def compose_openai_compatible_engineering_application_from_env(
     env_file: Path | None = None, database_path: Path | None = None,
+    *, session_history_format: str | None = None,
+    history_soft_tokens: int | None = None,
 ) -> Application:
     """Load local model settings and compose the engineering Agent."""
 
@@ -1299,6 +1317,10 @@ def compose_openai_compatible_engineering_application_from_env(
     context = load_context_configuration(
         env_file or Path.cwd() / ".env", os.environ
     )
+    if session_history_format is not None:
+        context = replace(context, conversation_history_format=session_history_format)
+    if history_soft_tokens is not None:
+        context = replace(context, history_soft_tokens=history_soft_tokens)
     egress = load_web_egress_configuration(
         env_file or Path.cwd() / ".env", os.environ
     )
@@ -1329,6 +1351,8 @@ def compose_openai_compatible_engineering_application_from_env(
         model_anthropic_version=configuration.anthropic_version,
         model_strict_tool_schema=configuration.strict_tool_schema,
         model_streaming=configuration.streaming,
+        model_open_api_mode=configuration.open_api_mode,
+        model_reasoning_effort=configuration.reasoning_effort,
         context_configuration=context,
         web_egress_configuration=egress,
         search_configuration=search,

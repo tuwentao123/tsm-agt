@@ -12,6 +12,7 @@ from typing import Any
 from tsm_agt.ports import Message, MessageRole, TextBlock, ToolResultBlock, ToolSpec
 
 from .configuration import canonical_hash
+from .session_history import render_session_history
 
 
 _PROMPT_MARKER = re.compile(r"^<!-- prompt: ([a-z0-9-]+) -->$", re.MULTILINE)
@@ -182,7 +183,7 @@ class PromptTemplate:
                 # the only place that says how a request becomes an answer, so a
                 # capability-gated segment never has to carry routing rules.
                 PromptTemplateSegment(
-                    "request-pipeline-guidance", "harness", "4.0",
+                    "request-pipeline-guidance", "harness", "4.2",
                     prompt_text["request-pipeline-guidance"],
                 ),
                 # This is deliberately a stable, tool-capability-gated contract:
@@ -190,12 +191,20 @@ class PromptTemplate:
                 # work from its full conversational context.  Runtime does not
                 # classify user text or inject a per-turn implementation label.
                 PromptTemplateSegment(
-                    "delivery-mode-guidance", "harness", "3.1",
+                    "delivery-mode-guidance", "harness", "4.1",
                     prompt_text["delivery-mode-guidance"],
                     requires_any_tools=(
                         "core.apply_patch", "core.apply_patch_v4a",
                         "core.apply_patches", "core.delete_file",
                     ),
+                ),
+                # Cross-tool work-loop guidance in the stable base layer: it
+                # applies to every advertised tool, so it is ungated and must
+                # not duplicate the command-specific facts kept in
+                # workspace-command-guidance.
+                PromptTemplateSegment(
+                    "tool-feedback-guidance", "harness", "1.2",
+                    prompt_text["tool-feedback-guidance"],
                 ),
                 PromptTemplateSegment(
                     "response-format-guidance", "harness", "1.6",
@@ -223,12 +232,12 @@ class PromptTemplate:
                     requires_any_tools=("core.read_file", "core.search_files"),
                 ),
                 PromptTemplateSegment(
-                    "code-edit-guidance", "harness", "1.0",
+                    "code-edit-guidance", "harness", "1.3",
                     prompt_text["code-edit-guidance"],
                     requires_any_tools=("core.apply_patch_v4a",),
                 ),
                 PromptTemplateSegment(
-                    "workspace-command-guidance", "harness", "1.4",
+                    "workspace-command-guidance", "harness", "1.5",
                     prompt_text["workspace-command-guidance"],
                     requires_any_tools=("core.run_command", "core.process_wait"),
                 ),
@@ -270,7 +279,7 @@ class PromptTemplate:
                     requires_any_tools=("core.working_memory_update",),
                 ),
                 PromptTemplateSegment(
-                    "task-plan-guidance", "harness", "3.0",
+                    "task-plan-guidance", "harness", "3.1",
                     prompt_text["task-plan-guidance"],
                     requires_any_tools=("core.todo_list",),
                 ),
@@ -417,8 +426,10 @@ class PromptTemplate:
             system_messages + project_instruction_messages + task_spec_messages
             + conversation_environment_messages
             + runtime_messages + onboarding_messages
-            + memory_messages + session_messages + document_reference_messages
-            + working_memory_messages
+            + memory_messages
+            + tuple(row for message in session_messages
+                    for row in render_session_history(message))
+            + document_reference_messages + working_memory_messages
             + ordinary_conversation
         )
         manifest = self.manifest()
@@ -465,7 +476,7 @@ class PromptTemplate:
 def _message_structure(message: Message) -> dict[str, Any]:
     """Describe request shape without storing message text or tool arguments."""
     prefixes = (
-        "prompt-", "session-context-", "project-instructions-context-",
+        "prompt-", "session-context-", "session-history-", "session-facts-", "project-instructions-context-",
         "task-spec-context-", "conversation-environment-context-",
         "project-onboarding-context-", "project-memory-context-",
         "document-references-context-", "working-memory-context-",
@@ -493,7 +504,7 @@ def _message_structure(message: Message) -> dict[str, Any]:
         except (ValueError, TypeError, RecursionError):
             body = None
         if isinstance(body, dict):
-            history = body.get("recent_messages")
+            history = body.get("history_entries") or body.get("recent_messages")
             if isinstance(history, list):
                 item["history_roles"] = [
                     row.get("role", "unknown") if row.get("role") in

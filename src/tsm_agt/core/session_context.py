@@ -1,16 +1,16 @@
 """Deterministic, user-visible Session conversation projection.
 
 The projection is rebuilt from Session events.  It deliberately carries only
-user-visible text and explicit structured state; approvals, tool protocol,
-process handles, credentials, and hidden reasoning never become conversation
-history.
+user-visible text and explicit structured state. Historical approval decisions
+may be included as non-authorizing facts; tool protocol, process handles,
+credentials, and hidden reasoning never become conversation history.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -18,11 +18,31 @@ from tsm_agt.ports import Message, MessageRole, SessionEvent, TextBlock
 
 from .configuration import canonical_hash
 from .execution import ToolExecutionRecord
+from .tool_result_governor import sanitize_historical_error_text
 from .session import SessionSnapshot
 from .session_resources import (
     SessionQuestionReference, SessionResourceKind, SessionResourceReference,
 )
 from .runtime_input import SessionResumeCandidate
+
+
+def _conversation_runtime_data(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Project archived Task accounting without a conversational contract.
+
+    The stored goal and completion fields remain readable for audit and old
+    clients. They are not the objective or acceptance state of a later Turn.
+    This only removes known protocol fields, never user/assistant prose.
+    """
+    excluded = {
+        "goal", "completed_work", "remaining_work", "verification_status",
+        "task_spec", "task_spec_revision", "continuation_mode", "outcomes",
+        "conclusion",
+    }
+    data = {key: item for key, item in value.items() if key not in excluded}
+    for key in ("recorded_task_state", "task_state", "status"):
+        if key in data:
+            data["runtime_state"] = data.pop(key)
+    return data
 
 
 def _restricted_event_ref(value: Any) -> str | None:
@@ -373,6 +393,7 @@ class SessionTaskSummary:
 
     def prompt_data(
         self, execution_events: Sequence[Mapping[str, Any]] = (),
+        *, conversation_mode: bool = False,
     ) -> dict[str, Any]:
         """Render one non-redundant, bounded model view of this Task handoff."""
         data = self.to_data()
@@ -387,13 +408,20 @@ class SessionTaskSummary:
             self.conclusion_validation,
             self.answer_event_ref,
         )
+        if conversation_mode:
+            # These snapshots predate turn-scoped history and contain a Task's
+            # cumulative journal/scratchpad. They cannot prove a change happened
+            # in this particular Turn, including in old runtime.db files.
+            for key in ("mutations", "confirmed", "workspace_roots"):
+                data.pop(key)
+            data["task_scope_ref"] = self.task_id
         if execution_events:
             # Paired recent execution facts supersede the older coarse action
             # list. Keep important_actions only as a durable compatibility
             # fallback for old databases or unavailable Task ledgers.
             data.pop("important_actions", None)
             data["execution_events"] = [dict(item) for item in execution_events]
-        return data
+        return _conversation_runtime_data(data) if conversation_mode else data
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> SessionTaskSummary:
@@ -651,8 +679,13 @@ class SessionContextProjector:
     #: Cap for messages that passed the provenance filter. It is a size bound,
     #: not an eligibility rule: recency decides order, never membership.
     scoped_visible_message_limit: int = 32
+    # Kept after existing positional fields for construction compatibility.
+    # JSON is a representation comparison, never a user-intent classifier.
+    conversation_history_format: str = "native"
 
     def __post_init__(self) -> None:
+        if self.conversation_history_format not in {"native", "json"}:
+            raise ValueError("conversation_history_format must be native or json")
         if min(
             self.recent_execution_limit, self.recent_execution_per_task_limit,
             self.execution_result_item_limit, self.small_read_content_characters,
@@ -673,7 +706,7 @@ class SessionContextProjector:
         explicit_state: dict[str, Any] = {}
         resources: dict[str, SessionResourceReference] = {}
         questions: dict[str, SessionQuestionReference] = {}
-        task_summaries: dict[str, SessionTaskSummary] = {}
+        task_summaries: dict[tuple[str, str], SessionTaskSummary] = {}
         # ``session.task_attached`` carries the user message for a Task's FIRST
         # turn. A conversation Task keeps taking turns on the same Task, and
         # every later turn records its own ``user_message`` on a result event,
@@ -736,6 +769,13 @@ class SessionContextProjector:
                         and task_id in unconsumed_attachment_input
                     ):
                         # The attachment already carried the real input.
+                        # Bind that legacy row to its explicitly recorded first
+                        # result Turn. Otherwise later live-Turn exclusion would
+                        # keep dropping it merely because turn_id was None.
+                        for index, prior_message in enumerate(messages):
+                            if prior_message.message_id == f"msg-session-input-{task_id}":
+                                messages[index] = replace(prior_message, turn_id=turn_id or None)
+                                break
                         continue
                     if role is MessageRole.USER and (task_id, turn_id) in seen_user_turns:
                         # Modern records persist the input at turn start; the
@@ -787,8 +827,9 @@ class SessionContextProjector:
                         event.payload, task_id, turn_id, messages, resources
                     )
                 if summary is not None:
-                    task_summaries.pop(summary.task_id, None)
-                    task_summaries[summary.task_id] = summary
+                    identity = (summary.task_id, summary.turn_id)
+                    task_summaries.pop(identity, None)
+                    task_summaries[identity] = summary
             elif event.event_type == "session.chat_turn_recorded":
                 for key, role in (("user_message", MessageRole.USER),
                                   ("assistant_message", MessageRole.ASSISTANT)):
@@ -824,9 +865,12 @@ class SessionContextProjector:
             elif event.event_type == "session.task_state_updated":
                 task_id = str(event.payload.get("task_id") or "")
                 state = str(event.payload.get("task_state") or "")
-                prior = task_summaries.get(task_id)
+                identity = next((
+                    key for key in reversed(task_summaries) if key[0] == task_id
+                ), None)
+                prior = task_summaries.get(identity) if identity is not None else None
                 if prior is not None and state:
-                    task_summaries[task_id] = SessionTaskSummary(
+                    task_summaries[identity] = SessionTaskSummary(
                         task_id=prior.task_id, turn_id=prior.turn_id,
                         goal=prior.goal, recorded_task_state=state,
                         tool_counts=prior.tool_counts,
@@ -897,7 +941,11 @@ class SessionContextProjector:
         include_background: bool = True,
         exclude_task_id: str | None = None,
         exclude_turn_id: str | None = None,
+        conversation_mode: bool = False,
     ) -> SessionPromptProjection:
+        work_state = projection.working_state.to_data()
+        if conversation_mode:
+            work_state = _conversation_runtime_data(work_state)
         if not projection.messages and not any((
             projection.working_state.goal, projection.working_state.constraints,
             projection.working_state.decisions, projection.working_state.open_questions,
@@ -916,7 +964,7 @@ class SessionContextProjector:
                 "recent_messages": [],
                 "recent_task_summaries": [],
                 "task_index": [],
-                "work_state": projection.working_state.to_data(),
+                "work_state": work_state,
                 "scoped_messages": [],
                 "background_messages": [],
                 "pinned_task_ids": [],
@@ -959,8 +1007,11 @@ class SessionContextProjector:
         # Keep the originating user message so an explicit follow-up remains
         # intelligible, and retain successful/active Task results as before.
         terminal_failure_task_ids = {
-            summary.task_id for summary in projection.task_summaries
-            if summary.recorded_task_state in {"FAILED", "CANCELLED"}
+            summary.task_id for summary in {
+                item.task_id: item for item in projection.task_summaries
+            }.values()
+            if not conversation_mode
+            and summary.recorded_task_state in {"FAILED", "CANCELLED"}
         }
         prompt_messages = tuple(
             message for message in projection.messages
@@ -997,9 +1048,10 @@ class SessionContextProjector:
             # the single ``recent_messages`` alias so its size is unchanged.
             scoped_messages: tuple[SessionConversationMessage, ...] = ()
             background_messages: tuple[SessionConversationMessage, ...] = ()
-            visible_messages = prompt_messages[
-                -self.recent_visible_message_limit:
-            ]
+            visible_messages = (
+                prompt_messages if conversation_mode else
+                prompt_messages[-self.recent_visible_message_limit:]
+            )
         else:
             in_scope = select_messages_by_scope(prompt_messages, scope)
             scoped_messages = in_scope[-self.scoped_visible_message_limit:]
@@ -1013,11 +1065,19 @@ class SessionContextProjector:
                 if include_background else ()
             )
             visible_messages = scoped_messages + background_messages
-        recent_task_ids = list(reversed(list(dict.fromkeys(
+        task_candidates = list(dict.fromkeys(
             message.task_id for message in reversed(visible_messages)
             if message.task_id is not None
-        ))[:self.detailed_task_summary_limit]))
-        summaries_by_id = {item.task_id: item for item in projection.task_summaries}
+        ))
+        recent_task_ids = list(reversed(
+            task_candidates if conversation_mode else
+            task_candidates[:self.detailed_task_summary_limit]
+        ))
+        eligible_summaries = tuple(
+            item for item in projection.task_summaries
+            if (item.task_id, item.turn_id) != (exclude_task_id, exclude_turn_id)
+        )
+        summaries_by_id = {item.task_id: item for item in eligible_summaries}
         pinned_ids = [
             task_id for task_id in dict.fromkeys(pinned_task_ids)
             if task_id in summaries_by_id
@@ -1027,10 +1087,17 @@ class SessionContextProjector:
             *pinned_ids,
         ]))
         recent_task_id_set = set(combined_task_ids)
-        visible_task_summaries = tuple(
-            summaries_by_id[task_id]
-            for task_id in combined_task_ids
-            if task_id in summaries_by_id
+        visible_turns = {(item.task_id, item.turn_id) for item in visible_messages}
+        visible_task_summaries = (
+            tuple(
+                item for item in eligible_summaries
+                if item.task_id in recent_task_id_set
+                and ((item.task_id, item.turn_id) in visible_turns
+                     or item.task_id in pinned_ids)
+            ) if conversation_mode else tuple(
+                summaries_by_id[task_id] for task_id in combined_task_ids
+                if task_id in summaries_by_id
+            )
         )
         visible_task_ids = {item.task_id for item in visible_task_summaries}
         # Only current conversational work belongs in the model prompt. Durable
@@ -1041,13 +1108,19 @@ class SessionContextProjector:
             prompt_task_ids.add(active_checkpoint.task_id)
         prompt_task_ids.update(item.task_id for item in suspended_tasks)
         task_index = self._task_index(projection, prompt_task_ids)
+        if conversation_mode:
+            task_index = [{**_conversation_runtime_data(item), "view_scope": "task_aggregate"}
+                          for item in task_index]
+            for item in task_index:
+                item.pop("confirmed", None)  # Included once in the Task aggregate below.
         if active_checkpoint is not None:
             # The checkpoint is fresher than a visible-result summary for the
             # same Task. Keep recent user-visible messages, but do not repeat
             # the Task's progress in two structured sections.
             visible_task_summaries = tuple(
                 item for item in visible_task_summaries
-                if item.task_id != active_checkpoint.task_id
+                if (item.task_id, item.turn_id) != (active_checkpoint.task_id, active_checkpoint.turn_id)
+                if conversation_mode or item.task_id != active_checkpoint.task_id
             )
         eligible_sequences = {
             item.source_event_sequence for item in prompt_messages
@@ -1068,7 +1141,7 @@ class SessionContextProjector:
                 if item["task_id"] not in recent_task_ids
             ],
             "omitted_task_count": (
-                len(projection.task_summaries) - len(task_index)
+                len({item.task_id for item in projection.task_summaries}) - len(task_index)
             ),
         }
         summary_hash = canonical_hash(summary_source)
@@ -1081,14 +1154,22 @@ class SessionContextProjector:
                 "and summaries describe prior work, not the current request. "
                 "Assistant statements are past claims, not proof of execution or "
                 "verification. Interpret the latest user input in its full context."
+                + (
+                    " Runtime states describe execution lifecycle, not acceptance "
+                    "or completion of the current request."
+                    if conversation_mode else ""
+                )
             ),
             "session_id": projection.session_id,
             "revision": projection.revision,
             "content_hash": projection.content_hash,
             "source_event_sequences": list(projection.source_event_sequences),
-            "work_state": projection.working_state.to_data(),
+            "work_state": work_state,
             "active_checkpoint": (
-                active_checkpoint.to_data()
+                (
+                    _conversation_runtime_data(active_checkpoint.to_data())
+                    if conversation_mode else active_checkpoint.to_data()
+                )
                 if active_checkpoint is not None else None
             ),
             "suspended_tasks": {
@@ -1098,12 +1179,28 @@ class SessionContextProjector:
                     "refers to prior work. Runtime alone validates and resumes a "
                     "selected checkpoint."
                 ),
-                "items": [item.to_data() for item in suspended_tasks[:10]],
+                "items": [
+                    _conversation_runtime_data(item.to_data())
+                    if conversation_mode else item.to_data()
+                    for item in suspended_tasks[:10]
+                ],
             },
             "task_index": task_index,
             "recent_task_summaries": [
-                item.prompt_data((recent_executions or {}).get(item.task_id, ()))
+                item.prompt_data(
+                    tuple(
+                        event for event in (recent_executions or {}).get(item.task_id, ())
+                        if event.get("task_id") == item.task_id
+                        and event.get("turn_id") == item.turn_id
+                    ),
+                    conversation_mode=conversation_mode,
+                )
                 for item in visible_task_summaries
+            ],
+            "unattributed_execution_events": [
+                dict(event) for task_id, events in (recent_executions or {}).items()
+                if task_id in prompt_task_ids for event in events
+                if not event.get("turn_id")
             ],
             "historical_investigation": {
                 "instruction": (
@@ -1184,6 +1281,24 @@ class SessionContextProjector:
                 ),
             },
         }
+        if conversation_mode:
+            from .session_history import normalize_history_body
+
+            body_data["history_format"] = self.conversation_history_format
+            body_data["history_budget"] = "turn-token-v2"
+            body_data["task_scope_observations"] = [
+                {
+                    "boundary": "task_aggregate_not_turn_result",
+                    "task_id": item.task_id, "source_turn_id": item.turn_id,
+                    "mutations": [dict(value) for value in item.mutations],
+                    "confirmed": [dict(value) for value in item.confirmed],
+                    "workspace_roots": list(item.workspace_roots),
+                }
+                for item in summaries_by_id.values() if item.task_id in prompt_task_ids
+            ]
+            # Do not attribute the separately protected live input to history.
+            body_data["source_event_sequences"] = sorted(visible_sequences)
+            body_data = normalize_history_body(body_data)
         body = json.dumps(
             body_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
@@ -1274,43 +1389,57 @@ class SessionContextProjector:
     def recent_task_ids(
         self, projection: SessionConversationProjection, *,
         exclude_task_ids: Sequence[str] = (),
+        conversation_mode: bool = False,
     ) -> tuple[str, ...]:
         """Return newest Tasks whose detailed Tool observations may enter."""
         excluded = set(exclude_task_ids)
         selected: list[str] = []
         for message in reversed(projection.messages):
-            if message.task_id in excluded or message.task_id in selected:
+            if (message.task_id is None or message.task_id in excluded
+                    or message.task_id in selected):
                 continue
             selected.append(message.task_id)
-            if len(selected) >= self.recent_execution_limit:
+            if not conversation_mode and len(selected) >= self.recent_execution_limit:
                 break
         return tuple(reversed(selected))
 
     def project_recent_executions(
         self,
         executions_by_task: Mapping[str, Sequence[ToolExecutionRecord]],
+        approval_decisions: Mapping[tuple[str, str], str] | None = None,
+        *, exclude_task_id: str | None = None, exclude_turn_id: str | None = None,
+        conversation_mode: bool = False,
     ) -> dict[str, tuple[dict[str, Any], ...]]:
         """Build bounded atomic call/result observations for recent Tasks.
 
         The returned objects are descriptive Session data, never native Provider
         tool-protocol messages and never capabilities. Raw bodies remain in the
         Task ledger. Small read-only observations may be copied transiently into
-        the prompt; commands, mutations and third-party Tools expose status only.
+        the prompt. Failed calls may include bounded, redacted diagnostic text;
+        commands, mutations and third-party tools never expose raw payloads.
         """
         candidates: list[tuple[str, ToolExecutionRecord]] = []
         for task_id, values in executions_by_task.items():
-            ordered = sorted(
-                values, key=lambda item: (item.updated_at, item.execution_id)
-            )[-self.recent_execution_per_task_limit:]
-            candidates.extend((task_id, item) for item in ordered)
+            by_turn: dict[str, list[ToolExecutionRecord]] = {}
+            for item in values:
+                if (task_id, item.turn_id) == (exclude_task_id, exclude_turn_id):
+                    continue
+                by_turn.setdefault(item.turn_id, []).append(item)
+            for turn_values in by_turn.values():
+                ordered = sorted(
+                    turn_values, key=lambda item: (item.updated_at, item.execution_id)
+                )
+                if not conversation_mode:
+                    ordered = ordered[-self.recent_execution_per_task_limit:]
+                candidates.extend((task_id, item) for item in ordered)
         candidates.sort(key=lambda item: (
             item[1].updated_at, item[1].execution_id
         ))
-        selected = candidates[-self.recent_execution_limit:]
+        selected = candidates if conversation_mode else candidates[-self.recent_execution_limit:]
         projected: dict[str, list[dict[str, Any]]] = {}
         for task_id, execution in selected:
             projected.setdefault(task_id, []).append(
-                self._execution_event(execution)
+                self._execution_event(task_id, execution, approval_decisions or {})
             )
         return {task_id: tuple(items) for task_id, items in projected.items()}
 
@@ -1335,7 +1464,8 @@ class SessionContextProjector:
                 resource.canonical_path
             )
         entries: list[dict[str, Any]] = []
-        for summary in projection.task_summaries:
+        latest_summaries = {item.task_id: item for item in projection.task_summaries}
+        for summary in latest_summaries.values():
             if summary.task_id not in included_task_ids:
                 continue
             artifacts = list(dict.fromkeys(
@@ -1377,7 +1507,8 @@ class SessionContextProjector:
         return entries
 
     def _execution_event(
-        self, execution: ToolExecutionRecord,
+        self, task_id: str, execution: ToolExecutionRecord,
+        approval_decisions: Mapping[tuple[str, str], str],
     ) -> dict[str, Any]:
         call = execution.call
         safe_tool = call.name in {
@@ -1409,14 +1540,63 @@ class SessionContextProjector:
                 "ok": result.ok, "error_code": result.error_code,
                 "truncated": result.truncated,
             })
+            if not result.ok:
+                for field in ("message", "hint"):
+                    value = getattr(result, field, None)
+                    if isinstance(value, str) and value.strip():
+                        # Limit after redaction so truncation cannot expose a
+                        # partial credential that would otherwise match.
+                        text = sanitize_historical_error_text(value)
+                        result_data[field] = text[:500]
+                        if len(text) > 500:
+                            result_data[f"{field}_truncated"] = True
+            if isinstance(result.data, Mapping):
+                # Transport success is not command/business success. Preserve
+                # explicit scalar outcomes without copying stdout, argv or env.
+                for field in ("succeeded", "timed_out", "cancelled"):
+                    value = result.data.get(field)
+                    if isinstance(value, bool):
+                        result_data[field] = value
+                for field in ("exit_code", "return_code"):
+                    value = result.data.get(field)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        result_data[field] = value
+                failure_code = result.data.get("failure_code")
+                if isinstance(failure_code, str):
+                    result_data["failure_code"] = sanitize_historical_error_text(failure_code)[:120]
+                # Project the execution stage for every tool, not only the
+                # read/search observations below. A recoverable input/syntax
+                # failure before any mutation (execution_state=not_started)
+                # must not read like a permission or policy denial, which the
+                # model would otherwise over-generalize into "writes are
+                # forbidden here". The value is a Runtime enum, never content.
+                execution_state = result.data.get("execution_state")
+                if isinstance(execution_state, str) and execution_state in {
+                    "not_started", "running", "succeeded", "failed_known",
+                }:
+                    result_data["execution_state"] = execution_state
             if safe_tool and isinstance(result.data, Mapping):
                 result_data["observation"] = self._safe_read_observation(
                     call.name, result.data
                 )
-        return {
+        projected = {
             "boundary": "prior_untrusted_tool_observation",
+            "task_id": task_id, "turn_id": execution.turn_id or None,
+            "turn_attribution": "known" if execution.turn_id else "unknown",
+            "effect": execution.effect.value,
+            "result_authority": execution.result_authority.value,
             "call": call_data, "result": result_data,
         }
+        if execution.approval_request_id:
+            decision = approval_decisions.get(
+                (task_id, execution.approval_request_id)
+            )
+            if decision in {"approve", "deny"}:
+                projected["historical_approval"] = {
+                    "decision": decision,
+                    "scope": "this historical invocation only; not authorization for new calls",
+                }
+        return projected
 
     def _safe_read_observation(
         self, tool_name: str, data: Mapping[str, Any],

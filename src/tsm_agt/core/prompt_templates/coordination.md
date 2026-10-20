@@ -13,5 +13,7 @@ Use core.todo_list when a plan helps coordinate substantive, multi-step work; sk
 straightforward tasks. Read the current list before changing it and keep exactly one item
 in_progress. A follow-up may continue an open plan, but the user's current request can change its
 scope. Update progress honestly: a read is not an implementation, and a failed verification does not
-complete its item. Continue feasible work, and record concrete blockers when necessary.
+complete its item. Work through the recorded steps until the list is complete or a step is genuinely
+blocked, continuing rather than stopping after a single item, and record concrete blockers when
+necessary.
 

@@ -262,6 +262,103 @@ async def _executing(application, root: Path, task_id: str = "task-conv"):
 
 
 class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
+    async def test_stage_summary_uses_tool_outcome_when_model_has_no_text(self):
+        from tsm_agt.web.app import _turn_progress_item
+        model = ScriptedModel([
+            tool_response("first", "first-call", "fixture.fail", {"text": "test"}),
+            tool_response("second", "second-call", "web.search", {"query": "example"}),
+            text_response("final", "done"),
+        ])
+        application, _ = await self._application(model)
+        progress = []
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                task = await _executing(application, Path(directory))
+                await application.kernel.run_agent_turn(task.task_id, "执行两个步骤", on_progress=progress.append)
+                events = await application.registry.require(RuntimeStorePort).read_events(task.task_id)
+                event = next(event for event in events if event.event_type == "conversation.stage_summary")
+                item = _turn_progress_item(event)
+                self.assertEqual(item["phase"], "runtime")
+                self.assertIn("fixture.fail执行失败（UPSTREAM_FAILED）", item["activity"])
+                self.assertIn("接下来调用 web.search", item["activity"])
+                self.assertEqual([p.activity for p in progress if p.kind.value == "stage_summary"], [item["activity"]])
+        finally:
+            await application.registry.stop_all()
+
+    async def test_model_stage_summary_is_distinguished_from_runtime_status(self):
+        call = ToolCall("second-call", "web.open", {"url": "https://news.example/nba"})
+        model = ScriptedModel([
+            tool_response("first", "first-call", "web.search", {"query": "NBA"}),
+            ModelResponse(Message("second", MessageRole.ASSISTANT, (
+                TextBlock("找到一篇摘要，接下来查看正文。"), ToolCallBlock(call),
+            )), FinishReason.TOOL_CALL, ModelUsage(6, 3)),
+            text_response("final", "done"),
+        ])
+        application, _ = await self._application(model)
+        progress = []
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                task = await _executing(application, Path(directory))
+                await application.kernel.run_agent_turn(task.task_id, "执行两个步骤", on_progress=progress.append)
+                stages = [p for p in progress if p.kind.value == "stage_summary"]
+                self.assertEqual([(p.phase, p.activity) for p in stages], [("model", "找到一篇摘要，接下来查看正文。")])
+        finally:
+            await application.registry.stop_all()
+
+    async def test_invalid_tool_response_does_not_publish_its_note(self):
+        call = ToolCall("duplicate", "web.search", {"query": "example"})
+        model = ScriptedModel([ModelResponse(
+            Message("invalid", MessageRole.ASSISTANT, (
+                TextBlock("这段说明不应显示。"), ToolCallBlock(call), ToolCallBlock(call),
+            )), FinishReason.TOOL_CALL, ModelUsage(6, 3),
+        )])
+        application, _ = await self._application(model)
+        progress = []
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                task = await _executing(application, Path(directory))
+                with self.assertRaises(Exception):
+                    await application.kernel.run_agent_turn(task.task_id, "查资料", on_progress=progress.append)
+                events = await application.registry.require(RuntimeStorePort).read_events(task.task_id)
+                self.assertFalse(any(event.event_type == "conversation.execution_note" for event in events))
+                self.assertFalse(any(item.kind.value == "execution_note" for item in progress))
+        finally:
+            await application.registry.stop_all()
+
+    async def test_tool_call_note_is_progress_and_survives_as_event(self):
+        from tsm_agt.web.app import _turn_progress_item
+
+        call = ToolCall("call-note", "web.search", {"query": "example"})
+        model = ScriptedModel([
+            ModelResponse(
+                Message("with-note", MessageRole.ASSISTANT, (
+                    TextBlock("先查找相关资料。"), ToolCallBlock(call),
+                )), FinishReason.TOOL_CALL, ModelUsage(6, 3),
+            ),
+            text_response("final", "这是最终答复。"),
+        ])
+        application, _ = await self._application(model)
+        progress = []
+        final_deltas = []
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                task = await _executing(application, Path(directory))
+                await application.kernel.run_agent_turn(
+                    task.task_id, "查资料", on_progress=progress.append,
+                    on_text_delta=final_deltas.append,
+                )
+                events = await application.registry.require(RuntimeStorePort).read_events(task.task_id)
+                note = next(event for event in events if event.event_type == "conversation.execution_note")
+                requested = next(event for event in events if event.event_type == "tool.requested")
+                self.assertLess(note.sequence, requested.sequence)
+                self.assertEqual(_turn_progress_item(note)["activity"], "先查找相关资料。")
+                notes = [item for item in progress if item.kind.value == "execution_note"]
+                self.assertEqual([item.activity for item in notes], ["先查找相关资料。"])
+                self.assertNotIn("先查找相关资料。", "".join(final_deltas))
+                self.assertEqual(sum(event.event_type == "conversation.execution_note" for event in events), 1)
+        finally:
+            await application.registry.stop_all()
+
     def test_tool_exposure_never_uses_request_keyword_profiles(self):
         source_tools = (
             *ScriptedToolProvider._TOOLS,
@@ -588,7 +685,8 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
                     message for message in model.requests[1].messages
                     if message.message_id.startswith("session-context-")
                 )
-                history = json.loads(session_message.text)["recent_messages"]
+                from tests.history_helpers import session_history_view
+                history = session_history_view(model.requests[1])["recent_messages"]
                 self.assertIn(
                     "I found two missing dashboard views; I can implement them.",
                     [item["text"] for item in history
@@ -798,7 +896,9 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
                     message.text for message in second
                     if message.role is MessageRole.SYSTEM
                 )
-                self.assertIn("recoverable", rendered)
+                self.assertIn("latest durable tool result is a failure", rendered)
+                self.assertNotIn("recovery_kind", rendered)
+                self.assertNotIn("call the same tool again", rendered)
                 self.assertNotIn(
                     "EXTERNAL_READ_MISSING",
                     "\n".join(message.text for message in second),

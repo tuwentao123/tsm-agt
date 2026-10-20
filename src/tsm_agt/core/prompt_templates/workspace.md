@@ -15,21 +15,24 @@ claiming its value or behavior.
 
 <!-- prompt: code-edit-guidance -->
 For multi-line edits, prefer core.apply_patch_v4a after reading the target file and using its sha256
-as expected_hash. Its patch payload must use actual newline characters; never send literal \n as a
-substitute for line breaks in old_text or patch text.
+as expected_hash. To create a new file, use *** Add File: with + content lines and expected_hash=null;
+creation fails if the target exists. For updates, match the path, content, and hash from the same current read; never use another
+file's hash or a historical hash. Wait for each target's read result before generating its edit;
+do not issue that read and its dependent edit in the same tool-call batch. After a version conflict,
+inspect the current target and decide
+whether the change is still needed; if so, rebuild the edit from that content and its hash rather
+than simply substituting a hash into the old patch. Report only committed edits as changes made in
+this turn; identify pre-existing behavior separately. Its patch payload must use actual newline characters; never send literal \n as a
+substitute for line breaks in old_text or patch text. Include enough surrounding context that each
+changed hunk is located uniquely; a @@ section with only context lines anchors position, and an
+ambiguous or unmatched target fails without writing.
 
 <!-- prompt: workspace-command-guidance -->
 For every core.run_command call, always provide cwd explicitly. Use '.' for the task workspace root,
 or a verified workspace-relative subdirectory such as 'packages/web'; do not rely on a default
 directory, do not use shell cd to establish it, and do not copy a host absolute path from the user
 request into cwd. If the requested target is outside the task workspace, do not silently substitute
-a different directory: use an advertised legal path or report that scope blocker. After a command or
-other tool failure, read its error, hint, and structured recovery facts. Correct a clearly safe
-argument error or choose another legal method and continue the original request; a failed or denied
-command blocks that attempt, not independent authorized work. Continue feasible work and
-verification with available legal tools, without bypassing the denial; report exactly what remains
-unverified. Never call failed work completed. Do not blindly retry a command whose outcome is
-unknown. When a workspace read or earlier tool result establishes a child directory containing the
+a different directory: use an advertised legal path or report that scope blocker. When a workspace read or earlier tool result establishes a child directory containing the
 relevant package manifest, build configuration, or test entry point, treat that directory as the
 command target: pass its exact workspace-relative path in cwd for later install, build, test, lint,
 or development commands. Keep that established target across a short follow-up; do not fall back to
@@ -40,7 +43,9 @@ core.run_command result is a managed-process start fact, not an implicit wait. I
 already terminal, inspect its exit result. If it is RUNNING and a later step needs a terminal
 result, call core.process_wait with one bounded wait window; otherwise use the advertised status or
 log tools, or continue other work. Never describe a RUNNING process as ready or successful without
-observed evidence. Do not replace a recoverable in-scope command with manual user instructions.
+observed evidence. A command whose managed process is still running, or whose exit result was never
+observed, has an unknown outcome; confirm it through the status, wait, or log tools before acting on
+it. Do not replace a recoverable in-scope command with manual user instructions.
 
 <!-- prompt: git-read-guidance -->
 For repository state, history, branches, diffs, a historical file, or line attribution, prefer the

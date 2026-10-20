@@ -12,7 +12,7 @@ from tsm_agt.ports import (
     ModelFailureCategory, ModelAttemptFailure, ModelProviderPort, ModelRequest,
     ModelResponse, ModelRecoveryAction, ModelRecoveryExhausted,
     ModelRecoveryPolicyPort, ModelRecoveryProbe, ModelRetrySafety,
-    ModelStreamCompleted, ModelStreamEvent, ModelTextDelta,
+    ModelStreamCompleted, ModelStreamEvent, ModelTextDelta, ModelReasoningDelta,
     ModelTransportProgress, StreamingModelProviderPort,
     RecoverableToolProtocolError,
 )
@@ -158,7 +158,7 @@ class ResilientModelProvider:
                     yield ModelStreamCompleted(response)
                 else:
                     async for event in self._provider.stream_complete(request):
-                        if isinstance(event, ModelTextDelta):
+                        if isinstance(event, (ModelTextDelta, ModelReasoningDelta)):
                             visible = True
                         yield event
                 await self._notify(request, ModelTransportProgress(

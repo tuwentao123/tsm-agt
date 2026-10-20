@@ -55,7 +55,7 @@ class CoreProcessToolProvider:
         port_version="1.0",
         capabilities=frozenset(
             {
-                "core.run_command", "core.process_status",
+                "core.run_command", "core.process_status", "core.process_list",
                 "core.process_logs", "core.process_stop", "core.process_wait",
             }
         ),
@@ -121,9 +121,21 @@ class CoreProcessToolProvider:
             ),
         ),
         ToolSpec(
+            name="core.process_list",
+            description=("List managed processes accessible to the current session or task, including their origin turn, working directory, current state and control availability. By default lists RUNNING and ORPHANED; pass an empty states array to include all states. Results use an offset cursor and may shift while processes change. Use process IDs to inspect logs or request a stop. RUNNING does not prove service readiness. ORPHANED means the runtime cannot prove control, not that the OS process exited."),
+            parameters={"type": "object", "properties": {
+                "scope": {"type": "string", "enum": ["session", "task"]},
+                "states": {"type": "array", "items": {"type": "string", "enum": ["RUNNING", "EXITED", "CANCELLED", "TIMED_OUT", "ORPHANED"]}},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "cursor": {"type": "integer", "minimum": 0}}, "additionalProperties": False},
+            risk=ToolRisk.R0, is_read_only=True, is_concurrency_safe=True,
+            idempotency=ToolIdempotency.IDEMPOTENT, effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.PROCESS_FACT,
+        ),
+        ToolSpec(
             name="core.process_wait",
             description=(
-                "Wait once, for a bounded number of seconds, for one task-owned "
+                "Wait once, for a bounded number of seconds, for one session-owned "
                 "managed process. wait_seconds must be from 0.01 through 30 and is "
                 "one observation window, not the process resource lease. For a longer "
                 "exit-bound task, make later wait calls with windows no greater than 30. "
@@ -152,14 +164,14 @@ class CoreProcessToolProvider:
             model_contract=ModelToolContract(
                 purpose="Observe one managed process through a bounded wait window.",
                 use_when=("a later step needs to know whether a process has exited",),
-                avoid_when=("the process was not started by this task",),
+                avoid_when=("the process is not managed by this session",),
                 returns=("current state and bounded logs", "a timeout leaves the process running and is not a failure by itself"),
             ),
         ),
         ToolSpec(
             name="core.process_status",
             description=(
-                "Get the current state of one managed process owned by this task. "
+                "Get the current state of one managed process owned by this session. "
                 "Returns RUNNING, EXITED, CANCELLED, TIMED_OUT, or ORPHANED plus "
                 "lifecycle timestamps and exit information."
             ),
@@ -179,7 +191,7 @@ class CoreProcessToolProvider:
         ToolSpec(
             name="core.process_logs",
             description=(
-                "Read retained stdout and stderr from one task-owned managed "
+                "Read retained stdout and stderr from one session-owned managed "
                 "process. Pass the returned next cursors on the next call to receive "
                 "only new output. Output is bounded and may report truncation."
             ),
@@ -203,7 +215,7 @@ class CoreProcessToolProvider:
         ToolSpec(
             name="core.process_stop",
             description=(
-                "Stop one managed process owned by this task. The supervisor sends "
+                "Stop one managed process owned by this session. The supervisor sends "
                 "TERM to its process group, waits for the grace period, and uses KILL "
                 "only if needed. This action requires approval."
             ),
@@ -271,12 +283,23 @@ class CoreProcessToolProvider:
         if control is None:
             return self._error(
                 call, "CAPABILITY_UNAVAILABLE",
-                "this runtime did not grant task-scoped process management",
+                "this runtime did not grant process management",
             )
         try:
             if call.name == "core.run_command":
                 command = await self._run_command(call.arguments, control)
                 data = command.to_data()
+            elif call.name == "core.process_list":
+                scope = call.arguments.get("scope", "session")
+                states = call.arguments.get("states", ["RUNNING", "ORPHANED"])
+                if scope not in ("session", "task"):
+                    raise ValueError("scope must be session or task")
+                allowed = {"RUNNING", "EXITED", "CANCELLED", "TIMED_OUT", "ORPHANED"}
+                if not isinstance(states, list) or any(not isinstance(s, str) or s not in allowed for s in states):
+                    raise ValueError("states must contain valid process states")
+                limit = self._bounded_int(call.arguments, "limit", 50, 1, 100)
+                cursor = self._non_negative_int(call.arguments, "cursor", 0)
+                data = await control.list_processes(scope, tuple(states), limit, cursor)
             elif call.name == "core.process_status":
                 process_id = self._non_empty_string(call.arguments, "process_id")
                 data = await control.status(process_id)

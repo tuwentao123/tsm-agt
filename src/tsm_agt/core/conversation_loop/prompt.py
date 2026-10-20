@@ -6,9 +6,8 @@ guidance against the tools actually advertised this turn.  What this module adds
 is the one *dynamic* instruction the runtime may hand the model: a compact,
 facts-only note about action and verification results.
 
-That note is deliberately not a gate.  It may name an ``error_code``,
-``retryable`` flag, or ``recovery_action`` that already exists in the ledger; it
-may never require a tool the Runtime did not expose or pick a repair method.
+That note is deliberately not a gate. It may describe an error or observed
+outcome but does not expose internal retry classifications or pick a repair.
 The bounded finalization policy is a separate protocol rule; this prompt note
 itself never blocks a plain-text answer.
 """
@@ -67,26 +66,11 @@ def latest_tool_result_instruction(
             "Decide whether an available verification is needed; do not describe "
             "the change as verified without matching evidence."
         )
-    recovery_batch = kernel._latest_recoverable_tool_batch(state.messages)
-    if recovery_batch:
-        recovery = recovery_batch[-1]
-        action = dict(recovery.recovery_action)
-        recovery_instruction = (
-            "The latest tool result reports a failure that may still be "
-            f"recoverable (kind {recovery.effective_recovery_kind.value}). "
-            f"Its structured recovery facts are: "
-            f"{json.dumps(action, ensure_ascii=False, sort_keys=True)}. "
-            "Choose a legal next step within the advertised tools and continue "
-            "the original user request. If no legal recovery remains, report the "
-            "blocker with those facts and do not claim the work was completed."
-        )
-        return "\n\n".join((*fact_parts, recovery_instruction))
     if state.last_tool_error:
         error_instruction = (
             "The latest durable tool result is a failure "
-            f"({state.last_tool_error}). Its details are authoritative; retry "
-            "with corrected facts only when that is safe, otherwise change "
-            "method or report the blocker."
+            f"({state.last_tool_error}). Consult the tool result for details; "
+            "do not claim the failed action succeeded."
         )
         return "\n\n".join((*fact_parts, error_instruction))
     return "\n\n".join(fact_parts)

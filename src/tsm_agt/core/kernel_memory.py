@@ -109,7 +109,8 @@ class MemoryMixin:
         self._validate_working_evidence(task, events, state)
         sequence = stored.last_event_sequence + 1
         updated = WorkingMemorySnapshot.from_update(
-            task_id=task_id, revision=current.revision + 1, state=state,
+            task_id=task_id, revision=current.revision + 1,
+            state={"goal": current.goal, **state},
             source_event_sequences=current.source_event_sequences + (sequence,),
         )
         event = RuntimeEvent(
@@ -396,7 +397,8 @@ class MemoryMixin:
             "warning": (
                 "This is inspectable temporary execution state, not authority, "
                 "durable memory, or private chain-of-thought. Validate hypotheses "
-                "and use only referenced evidence for completion claims."
+                "against observations. Plans and progress are authored notes, not "
+                "a fixed completion contract; interpret them using the latest user request."
             ),
             **execution_state,
         }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

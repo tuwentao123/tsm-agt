@@ -215,7 +215,9 @@ class CoreReadOnlyToolProvider:
                 "credentials, and key material remain unavailable. "
                 "start_line defaults to 1 and max_lines defaults to 200 (maximum 1000). "
                 "Success returns the authoritative resolved path/root, whole-file sha256, "
-                "content, actual line range, total lines, and truncation. "
+                "content, actual line range, total lines, and truncation. A page is "
+                "limited to 8000 characters. When truncated, continue with the "
+                "returned next_cursor (start_line and start_column). "
                 "Example: {\"path\": \"src/app.py\", \"start_line\": 1, \"max_lines\": 120}."
             ),
             parameters={
@@ -224,6 +226,7 @@ class CoreReadOnlyToolProvider:
                     "path": {"type": "string", "description": "Workspace-relative or approved external file path; provide exactly one of path/resource_ref."},
                     "resource_ref": {"type": "string", "description": "A task-scoped reference returned by a discovery tool; provide exactly one of path/resource_ref."},
                     "start_line": {"type": "integer", "minimum": 1, "description": "First 1-based line to return; defaults to 1."},
+                    "start_column": {"type": "integer", "minimum": 1, "description": "First 1-based Unicode character in start_line; defaults to 1. Use next_cursor to continue a split long line."},
                     "max_lines": {
                         "type": "integer", "minimum": 1,
                         "maximum": _MAX_READ_LINES,
@@ -598,6 +601,9 @@ class CoreReadOnlyToolProvider:
         start_line = self._bounded_int(
             call.arguments, "start_line", default=1, minimum=1
         )
+        start_column = self._bounded_int(
+            call.arguments, "start_column", default=1, minimum=1
+        )
         max_lines = self._bounded_int(
             call.arguments,
             "max_lines",
@@ -634,18 +640,47 @@ class CoreReadOnlyToolProvider:
         except UnicodeDecodeError:
             return self._error(call, "INVALID_PARAM", f"file is not UTF-8 text: {raw_path}")
         lines = text.splitlines(keepends=True)
-        selected = lines[start_line - 1 : start_line - 1 + max_lines]
-        content = "".join(selected)
-        char_truncated = len(content) > _MAX_READ_CHARS
-        if char_truncated:
-            content = content[:_MAX_READ_CHARS]
-        actual_end = start_line + len(selected) - 1 if selected else start_line - 1
-        truncated = char_truncated or actual_end < len(lines)
-        # A partial read is the normal way to read a long file, so the next call
-        # is named instead of leaving the model to guess that more exists.
+        if start_column > 1 and (
+            start_line > len(lines) or start_column > len(lines[start_line - 1])
+        ):
+            return self._error(call, "INVALID_PARAM", "start_column is beyond the requested line")
+
+        parts: list[str] = []
+        remaining = _MAX_READ_CHARS
+        index = start_line - 1
+        actual_end = start_line - 1
+        next_column = 1
+        while index < len(lines) and index < start_line - 1 + max_lines:
+            column = start_column if index == start_line - 1 else 1
+            line = lines[index][column - 1 :]
+            if len(line) > remaining:
+                # Prefer whole lines; split only when a single line exceeds the
+                # page size so the line/column cursor always makes progress.
+                if not parts:
+                    parts.append(line[:remaining])
+                    actual_end = index + 1
+                    next_column = column + remaining
+                break
+            parts.append(line)
+            remaining -= len(line)
+            actual_end = index + 1
+            index += 1
+            if remaining == 0:
+                break
+        content = "".join(parts)
+        truncated = index < len(lines)
+        next_cursor = (
+            {"start_line": index + 1, "start_column": next_column}
+            if truncated else None
+        )
+        target_hint = (
+            f"resource_ref={call.arguments['resource_ref']}"
+            if call.arguments.get("resource_ref") else f"path={raw_path}"
+        )
         hint = (
-            f"Truncated at line {actual_end} of {len(lines)}: continue with "
-            f"core.read_file path={raw_path} start_line={actual_end + 1} before "
+            f"Read through line {actual_end} of {len(lines)} (a line may be partial): continue with "
+            f"core.read_file {target_hint} start_line={next_cursor['start_line']} "
+            f"start_column={next_cursor['start_column']} before "
             "concluding from this file."
             if truncated else None
         )
@@ -657,11 +692,13 @@ class CoreReadOnlyToolProvider:
                 **self._resolved_path_data(context, raw_path, resolved),
                 "sha256": hashlib.sha256(raw).hexdigest(),
                 "start_line": start_line,
+                "start_column": start_column,
                 "end_line": actual_end,
                 "total_lines": len(lines),
-                # A machine-readable continuation cursor, so paging a long file
-                # does not depend on re-deriving it from end_line.
-                "next_offset": actual_end + 1 if truncated else None,
+                # Keep the legacy line offset; next_cursor also handles a line
+                # longer than the character limit.
+                "next_offset": next_cursor["start_line"] if next_cursor else None,
+                "next_cursor": next_cursor,
                 "content": content,
             },
             truncated=truncated,

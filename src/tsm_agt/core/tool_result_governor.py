@@ -25,6 +25,16 @@ _BEARER_PATTERN = re.compile(r"(?i)(\bbearer\s+)[a-z0-9._~+/=-]+")
 _GITHUB_TOKEN_PATTERN = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b")
 _OPENAI_TOKEN_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b")
 _URL_PATTERN = re.compile(r"https?://[^\s\]\[\"'<>]+", re.IGNORECASE)
+_TEXT_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|"
+    r"password|passwd|secret|credential)\b\s*[:=]\s*[\"']?)[^\s,;\"']+"
+)
+
+
+def sanitize_historical_error_text(value: str) -> str:
+    """Best-effort redaction for bounded, untrusted historical error text."""
+    sanitized, _ = _sanitize_text(value)
+    return _TEXT_SECRET_ASSIGNMENT.sub(r"\1" + _REDACTED, sanitized)
 
 
 

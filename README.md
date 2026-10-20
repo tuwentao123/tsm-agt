@@ -4,7 +4,9 @@
 
 当前 Agent Loop 可以完成“模型提出 Tool Call → Runtime 执行 → Tool Result 回填 → 模型继续回答”的 ReAct 闭环。工程版提供受控文件读取/搜索、结构化命令、后台进程、Patch/删除和安全回滚工具，并支持 OpenAI-compatible Chat Completions API。Git 可按需通过受控命令使用，不作为独立核心 Tool。并行 Tool Call、完整实时 Web UI、MCP 和领域扩展仍待后续步骤实现。
 
-Coding Agent 主闭环已经加入可信收口：Chat 不会因为模型说“完成”就直接把 Task 标成成功。只读 Task 由 Verifier 确认没有待核验 Mutation；写入 Task 必须同时满足当前文件 Hash 仍与 Mutation Journal 一致，以及最后一次写入后最新的、被识别为构建/测试/静态检查的前台命令 `exit_code=0`。任一准则失败或缺失时 Task 进入 FAILED，并显示 `verification: failed/blocked`，不会冒充成功。
+Conversation Loop 中的 Task 是持续的运行容器，保存审批、断点、工具账本、进程、目录授权和文件修改记录。每次输入开启一个 Turn；正常回复结束后 Task 返回 `AWAITING_INPUT`，不表示用户工作已经全部完成。初始 `goal` 仅保留作审计元数据，不作为后续输入的固定目标或验收条件。
+
+会话模型上下文不注入 Task 的固定目标、完成清单、验收状态或 Outcomes，也不提供 `core.task_spec_read/update`。工作记忆和 TODO 仍可记录模型主动维护的计划与进度。旧数据库中的契约保留兼容读取，但不会触发 Conversation 的 `REQUIRED` 完成审查；显式配置的 `ALWAYS` 审查仍针对当前 Turn。工具结果、权限、审批、未知执行结果保护和协议完整性检查保持有效。
 
 Event Log 已可通过纯 Core `FlowProjector` 投影为 Task/Phase/Turn/Model/Tool/Approval/Process/Mutation/Memory/Onboarding 流程节点，并支持 cursor 增量更新和首个可行动失败定位。CLI 支持流程树、泳道时间线、静态/实时 TUI、下钻、筛选以及 JSON/JSONL/离线 HTML 脱敏导出；Replay 支持定位、范围自动播放、交互单步和断点游标恢复。Task 首次进入执行态时还会在同一 SQLite 事务中保存脱敏、不可变的 Effective Configuration revision 1。基础 Prompt Manifest 与确定性装配也已接入，每次模型调用记录不含正文的 `effective_prompt_hash`。完整实时 Web UI 与重新执行模型/副作用的 `--rerun` 仍待其他安全前置能力完成。
 
@@ -210,9 +212,9 @@ tsm-agt chat --workspace .
 
 Prompt 目前按固定顺序装配 `System Safety → Harness Instructions → Untrusted Project Onboarding（若有）→ Untrusted Project Memory（若有）→ Session Conversation Projection（若有）→ Task Working Memory（非空时）→ Conversation → Current User Input`。系统段以独立 `system` 消息发送，Onboarding/Memory/Session/Working Memory 使用明确边界的 `user` 数据消息，用户输入和 Tool Result 保持各自角色，不可信数据不能被拼接进系统指令。Manifest 保存段 ID、来源、版本、信任等级和正文 Hash，不保存正文；每次 `llm.completed`/`llm.failed` 只记录最终 Prompt Hash、Manifest Hash、角色顺序、消息数和 Toolset Hash。空白 Working Memory 不进入 Prompt，避免浪费小上下文窗口。由于尚未接入 Provider tokenizer，静态段 token 数明确标记为 unavailable，不使用字符数冒充 token。Trusted Project Instructions、Workflow、Skill 和精确 Provider tokenizer 属于后续步骤。
 
-上下文预算/压缩已接入 Agent Loop：Provider 声明窗口时，默认在“估算输入 + 预留输出”达到窗口 80% 后触发；固定 Token 延迟门槛默认关闭，可通过 `TSM_AGT_CONTEXT_LATENCY_SOFT_TOKENS` 显式开启。低于阈值时，Session 不再按固定字符数提前裁掉 Task；每个 Task 都进入模型候选上下文。达到阈值后，统一压缩器保留全量 Task 最小索引（Task ID、目标、状态、产物路径、完成/剩余工作、确认事实、Outcome 和来源 Event），同时保留最近至少 8 条消息及完整 Tool Call/Tool Result 原子组，只压缩较早的对话详情与冗长执行记录。旧历史摘要带 `untrusted_historical_data` 边界，不让旧文件中的指令升级为 system 内容。`context.compacted` Event 与 Flow 节点显示压缩前后估算、消息数和 Hash，不保存摘要/旧正文；压缩后仍无法安全装入窗口时以 F7 明确失败。当前估算方法是保守的 UTF-8 字节启发式，不是精确 Provider tokenizer；完整旧正文的私有 Scratchpad 归档和按需历史检索仍待后续实现。
+上下文预算/压缩已接入 Agent Loop：总输入受 Provider 窗口、输出预留和默认 80% 压缩比例约束。Conversation 的历史原文、执行事实、Task 索引和读取正文共同使用 `TSM_AGT_CONTEXT_HISTORY_SOFT_TOKENS` 软分配，默认 16384，不等大窗口接近装满才压缩。累计 Task 事实只保留一份，相同读取正文合并；超预算先省略历史读取正文，再按完整 Turn 保留最近后缀。当前输入和上一轮原文不静默截断，工具调用/结果原子组不拆分。旧 Task 的目标和完成结论不作为当前轮验收标准。`context.compacted` 记录体积和来源范围；估算仍是 UTF-8 字节启发式，不是 Provider 精确 tokenizer。详见 [多轮历史迁移说明](docs/conversation-history-migration.md)。
 
-大型上下文即使没有接近 Provider 硬窗口，也可能拖慢模型，但默认不再用固定 `40k` 提前压缩。`TSM_AGT_CONTEXT_COMPACTION_RATIO` 默认 `0.80`；`TSM_AGT_CONTEXT_LATENCY_SOFT_TOKENS` 默认 `0`，表示只按窗口比例触发。如用户更重视延迟，可显式设置正整数作为性能软门槛。摘要保留工具名、查询、目标路径、候选文件和命中数量，省略源码正文、日志正文和命中行文本；后续模型仍知道“查过什么、哪些文件值得读”，不会只剩无意义 Hash。
+`TSM_AGT_CONTEXT_LATENCY_SOFT_TOKENS` 默认 0，仅表示没有额外的总输入性能门槛，不关闭历史软分配。历史软分配设为 0 可用于隔离对照，仍受 Provider 硬窗口限制。最近一轮原文单独超过软分配时允许保留并记录超软限；受保护内容超过硬窗口时明确失败。历史工具结果中的路径、调用身份、错误和退出状态不会被正文去重改写，也不继承旧审批权限。
 
 搜索路线遵循“先宽后窄”：首次工作区搜索可以发现候选，出现大量命中后要求读取候选或缩小目录；只有真正读取源码文件才锁定源码范围，Markdown/日志等说明材料只作为线索，不会把 Agent 困在文档目录。锁定源码后无理由返回全仓搜索会被阻止。Monorepo 全仓搜索优先源码根和源码文件，并在多个同级源码根之间轮流扫描，避免 `codeBase`、`modules`、`packages` 中字母靠前的一份耗尽 5000 文件额度。已知多个独立文件时，提示模型在一个响应中提交多个只读调用，Runtime 按现有安全边界逐个执行。
 

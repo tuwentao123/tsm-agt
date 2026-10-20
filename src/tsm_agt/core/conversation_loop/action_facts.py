@@ -112,8 +112,6 @@ class RuntimeActionFact:
             data["execution_state"] = self.execution_state
         if self.failure_code:
             data["failure_code"] = self.failure_code
-        if self.recovery_kind:
-            data["recovery_kind"] = self.recovery_kind
         if self.exit_code is not None:
             data["exit_code"] = self.exit_code
         if self.is_recognized_verification:
