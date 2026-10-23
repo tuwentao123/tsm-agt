@@ -8,13 +8,15 @@ import ipaddress
 import subprocess
 import sys
 from collections.abc import Mapping
+from contextlib import aclosing
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import (
     HTMLResponse, JSONResponse, Response, StreamingResponse,
 )
@@ -23,6 +25,7 @@ from tsm_agt.core import (
     AgentLoopLimitExceeded, ApprovalDecision, RuntimeInputIntent,
     ProjectTrustLevel, note_stream_released,
 )
+from tsm_agt.sdk.ui_events import _TURN_PROGRESS_EVENT_TYPES, _turn_progress_item, _bounded_text, _incomplete_reason
 from tsm_agt.local_api import LocalEventApiServer
 from tsm_agt.adapters.openai_compatible.model import OpenAICompatibleModelProvider
 from tsm_agt.adapters.openai_compatible.request_diagnostics import TurnRequestDiagnostics
@@ -83,7 +86,10 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .turn-marker.copied{color:#0f766e}
 .topbar .icon-btn{font-size:12px}
 .chat-shell{flex:1 1 0;min-height:0;height:0;display:flex;flex-direction:column;overflow:hidden;padding:18px 22px 14px}
-.workspace-stage{flex:1 1 0;min-height:0;height:100%;width:100%;display:grid;grid-template-columns:minmax(0,1.18fr) minmax(320px,.82fr);gap:14px;align-items:stretch;overflow:hidden}
+.workspace-stage{flex:1 1 0;min-height:0;height:100%;width:100%;display:grid;grid-template-columns:minmax(0,1.18fr) minmax(320px,.82fr);gap:14px;align-items:stretch;overflow:hidden;position:relative}
+.workspace-resizer{position:absolute;top:0;bottom:0;width:14px;cursor:col-resize;z-index:10;touch-action:none;outline:none}.workspace-resizer[hidden]{display:none}.workspace-stage.resizing{user-select:none;cursor:col-resize}
+.workspace-resizer-handle{position:absolute;top:0;bottom:0;width:2px;background-color:rgba(148,163,184,.9);left:6px}
+.workspace-resizer:hover .workspace-resizer-handle,.workspace-resizer:focus-visible .workspace-resizer-handle{background-color:rgba(59,130,246,1)}
 .pane-shell{position:relative;min-height:0;height:100%;display:flex;flex-direction:column;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.72);border-radius:24px;overflow:hidden;backdrop-filter:blur(10px);box-shadow:none}
 .pane-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:14px 18px 10px;border-bottom:1px solid rgba(237,242,247,.75);background:rgba(255,255,255,.78)}
 .pane-title{font-size:15px;font-weight:700;color:#111827}
@@ -95,26 +101,26 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .approval-dock.visible{display:block}
 .approval-dock .message.approval{width:100%;max-width:none;min-height:0;max-height:min(48vh,420px);overflow:auto;pointer-events:auto;padding:9px 11px;gap:6px;box-shadow:0 12px 28px rgba(15,23,42,.16)}
 .approval-dock .approval-title{font-size:14px}.approval-dock .approval-subtitle{display:none}.approval-dock .approval-risk{padding:3px 8px;font-size:10px}.approval-dock .approval-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.approval-dock .approval-item{padding:5px 7px}.approval-dock .approval-label{margin-bottom:2px;font-size:9px}.approval-dock .approval-value{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.approval-dock .approval-actions{gap:7px}.approval-dock .approval-btn{min-height:32px;padding:7px 13px;border-radius:10px;font-size:12px}.approval-details{border-top:1px solid #e5edf5;padding-top:5px}.approval-details>summary{cursor:pointer;font-size:11px;color:#64748b;user-select:none}.approval-details[open]>summary{margin-bottom:6px}.approval-details .approval-preview{max-height:140px}
-.trace-pane{gap:8px;background:rgba(255,255,255,.2)}
-.trace-live-board{display:flex;flex-direction:column;gap:6px}
-.trace-future-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
-.trace-future-card{border:1px dashed #dde6f0;border-radius:10px;padding:7px 9px;background:rgba(255,255,255,.72)}
-.trace-future-title{font-size:12px;font-weight:700;color:#334155;margin-bottom:4px}
-.trace-future-copy{font-size:11px;color:#64748b;line-height:1.5}
-.trace-board{display:grid;grid-template-columns:minmax(0,1fr) 208px;gap:8px;align-items:start}
-.trace-main{display:flex;flex-direction:column;gap:6px}
-.trace-sidebar{position:sticky;top:8px;display:flex;flex-direction:column;gap:6px;opacity:.94}
-.trace-overview-panel{background:linear-gradient(180deg,rgba(255,255,255,.78),rgba(248,251,255,.88));border:1px solid rgba(226,232,240,.72);border-radius:14px;padding:9px;display:flex;flex-direction:column;gap:6px}
-.trace-panel-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}
-.trace-panel-title{font-size:12px;font-weight:700;color:#0f172a}
+.trace-pane{gap:10px;padding:12px;background:linear-gradient(180deg,rgba(248,250,252,.96),rgba(241,245,249,.96));border-radius:18px;box-shadow:0 10px 20px rgba(15,23,42,.06)}
+.trace-live-board{display:flex;flex-direction:column;gap:8px}
+.trace-future-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.trace-future-card{border:1px solid #e2e8f0;border-radius:12px;padding:8px 10px;background:rgba(255,255,255,.96)}
+.trace-future-title{font-size:12px;font-weight:600;color:#1f2937;margin-bottom:4px}
+.trace-future-copy{font-size:11px;color:#6b7280;line-height:1.6}
+.trace-board{display:grid;grid-template-columns:minmax(0,1fr) 220px;gap:10px;align-items:start}
+.trace-main{display:flex;flex-direction:column;gap:8px}
+.trace-sidebar{position:sticky;top:8px;display:flex;flex-direction:column;gap:8px;opacity:.98}
+.trace-overview-panel{background:linear-gradient(180deg,rgba(255,255,255,.94),rgba(248,250,252,.98));border:1px solid rgba(226,232,240,.9);border-radius:14px;padding:10px;display:flex;flex-direction:column;gap:8px}
+.trace-panel-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px}
+.trace-panel-title{font-size:12px;font-weight:600;color:#0f172a}
 .trace-panel-caption{font-size:11px;color:#64748b}
 .trace-summary-strip{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
-.trace-metric{background:rgba(255,255,255,.88);border:1px solid #e2e8f0;border-radius:9px;padding:7px 8px;min-height:44px}
+.trace-metric{background:rgba(255,255,255,.98);border:1px solid #e2e8f0;border-radius:10px;padding:7px 8px;min-height:46px}
 .trace-metric-label{font-size:9px;color:#6b7280;text-transform:uppercase;letter-spacing:.04em}
 .trace-metric-value{font-size:14px;font-weight:700;margin-top:2px;color:#111827}
 .trace-legend-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px}
-.trace-legend-item{display:flex;align-items:center;gap:5px;color:var(--text-soft);font-size:10px;padding:4px 6px;border-radius:8px;background:rgba(251,253,255,.82);border:1px solid #e7edf5}
-.trace-dot{width:10px;height:10px;border-radius:50%;box-shadow:0 0 0 4px rgba(255,255,255,.06)}
+.trace-legend-item{display:flex;align-items:center;gap:5px;color:var(--text-soft);font-size:10px;padding:4px 6px;border-radius:8px;background:rgba(251,253,255,.96);border:1px solid #e7edf5}
+.trace-dot{width:10px;height:10px;border-radius:50%;box-shadow:0 0 0 4px rgba(255,255,255,.1)}
 .trace-dot.running{background:#1677ff}.trace-dot.waiting{background:#faad14}.trace-dot.done{background:#52c41a}.trace-dot.failed{background:#ff4d4f}
 .message{display:flex;flex-direction:column;position:relative;max-width:min(920px,100%);word-break:break-word;gap:8px}
 .message.assistant{align-self:flex-start;width:100%;padding:18px 8px 22px;background:linear-gradient(180deg,rgba(255,255,255,.72),rgba(248,250,252,.58));border:none;border-radius:0;box-shadow:none}
@@ -354,6 +360,12 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .empty-state h2{margin:0;font-size:15px;font-weight:500;color:var(--text)}
 .link-btn{color:var(--accent)}
 .composer{flex:0 0 auto;position:relative;z-index:30;padding:8px 20px 10px;display:flex;flex-direction:column;gap:6px;background:#f7f9fc;border-top:1px solid #e2e8f0}
+.todo-dock[hidden]{display:none}
+.todo-dock .todo-panel{gap:7px;padding:9px 12px;border-radius:12px;background:#fff}
+.todo-dock .todo-list{max-height:180px;overflow-y:auto;gap:4px}
+.todo-dock .todo-item{padding:5px 7px;background:transparent;border-color:transparent}
+.todo-dock .todo-item.in_progress{background:#eff6ff}
+.todo-dock .todo-item.blocked{background:#fff1f2}
 .composer-box{border:none;border-radius:16px;padding:10px 12px;background:#f3f4f6;box-shadow:none}
 .composer-box:focus-within{border-color:#91caff;box-shadow:0 0 0 2px rgba(22,119,255,.08)}
 .composer-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
@@ -417,26 +429,38 @@ textarea::placeholder{color:#94a3b8}
       </div>
       <div>
         <span id=\"workspace-status\" class=\"section-title\"></span>
+        <button class=\"icon-btn\" onclick=\"openSkillSettings()\">设置</button>
         <button class=\"icon-btn\" onclick=\"clearMessages()\">清空</button>
       </div>
     </div>
 
+    <dialog id="skill-settings-dialog" style="width:min(720px,92vw);max-height:85vh;overflow:auto;border:1px solid #e2e8f0;border-radius:18px;padding:24px;color:#1f2937;">
+      <div style="display:flex;justify-content:space-between;align-items:center;"><h2 style="margin:0;">设置</h2><button onclick="document.getElementById('skill-settings-dialog').close()" aria-label="关闭设置">×</button></div>
+      <h3>Skill 安装目录</h3>
+      <div id="skill-install-directory" style="overflow-wrap:anywhere;"></div>
+      <p style="color:#64748b;">新安装的 Skill 保存在用户目录，对所有项目和会话可用。</p>
+      <button class="new-session-btn" data-skill-install onclick="const input = document.getElementById('settings-skill-upload'); input.value = ''; input.click()">从本地目录安装 Skill</button>
+      <input type="file" id="settings-skill-upload" webkitdirectory hidden onchange="uploadSkillDirectoryAndInstall(this.files, this)" />
+      <p style="color:#64748b;">保存后自动在最近使用的工作区新建安装会话，由模型按 Skill 文档检查、按需准备并验证环境。</p>
+      <div id="skill-installations" role="status" style="overflow-wrap:anywhere;"></div>
+      <h3>可发现 Skills 目录</h3>
+      <p style="color:#64748b;">默认包含安装目录。可添加多个目录，例如 ~/.kiro/skills；外部目录仅用于发现和读取。</p>
+      <ul id="skill-discovery-list" style="padding-left:20px;"></ul>
+      <div style="display:flex;gap:8px;"><input id="skill-directory-path" placeholder="输入目录路径，如 ~/.kiro/skills" style="flex:1;min-width:0;padding:8px;" /><button onclick="addSkillDirectoryPath()">添加</button></div>
+      <div style="display:flex;gap:16px;margin-top:14px;"><button onclick="pickSkillDirectories()">选择多个目录…</button><button id="save-skill-settings" onclick="saveSkillSettings()">保存并刷新</button></div>
+      <p id="skill-settings-status" role="status" style="white-space:pre-wrap;"></p>
+      <div id="skill-discovered-catalog" style="overflow-wrap:anywhere;"></div>
+    </dialog>
     <div id=\"error-banner\" class=\"error-banner\"></div>
     <div id=\"config-banner\" class=\"config-banner\"></div>
     <div id=\"loading\" class=\"loading\">正在等待运行结果…</div>
     <div class=\"chat-shell\">
       <div class=\"workspace-stage\">
         <section class=\"pane-shell\">
-          <div class=\"pane-header\">
-            <div>
-              <div class=\"pane-title\">实时对话</div>
-              <div class=\"pane-subtitle\">持续展示会话上下文、tool call 与 patch diff 输出</div>
-            </div>
-            <div class=\"pane-badge\">Conversation Live</div>
-          </div>
           <section id=\"chat-area\" class=\"chat-area\"></section>
           <section id=\"approval-dock\" class=\"approval-dock\" aria-live=\"polite\"></section>
         </section>
+        <div id=\"workspace-resizer\" class=\"workspace-resizer\" role=\"separator\" tabindex=\"0\" aria-label=\"调整对话与轨迹宽度\" aria-orientation=\"vertical\" aria-controls=\"chat-area trace-pane\" hidden><div class=\"workspace-resizer-handle\"></div></div>
         <aside class=\"pane-shell\">
           <div class=\"pane-header\">
             <div>
@@ -451,6 +475,7 @@ textarea::placeholder{color:#94a3b8}
     </div>
 
     <div class=\"composer\">
+      <div id=\"todo-dock\" class=\"todo-dock\" hidden role=\"region\" aria-label=\"任务清单\"></div>
       <div id=\"preview-list\" class=\"preview-list\"></div>
       <div class=\"composer-meta\" style=\"margin-bottom:6px;display:flex;align-items:center;gap:12px;justify-content:space-between;\">
         <div class=\"composer-title\">会话输入</div>
@@ -565,6 +590,79 @@ function removeBrowserStorage(storageName, key) {
   }
 }
 
+function setupWorkspaceResizer() {
+  const stage = document.querySelector('.workspace-stage');
+  const resizer = document.getElementById('workspace-resizer');
+  if (!stage || !resizer) return;
+  const desktop = window.matchMedia('(min-width: 1281px)');
+  const storageKey = 'tsm-agt.workspace-split';
+  const stored = Number(readBrowserStorage('localStorage', storageKey));
+  let ratio = stored > 0 && stored < 1 ? stored : 0.59;
+  let activePointer = null;
+  const bounds = () => {
+    const rect = stage.getBoundingClientRect();
+    const width = Math.max(0, rect.width - 14);
+    const minimum = Math.min(320, width / 2);
+    return { rect, width, minimum };
+  };
+  const stop = () => {
+    const pointer = activePointer;
+    activePointer = null;
+    stage.classList.remove('resizing');
+    if (pointer !== null && resizer.hasPointerCapture(pointer)) resizer.releasePointerCapture(pointer);
+  };
+  const apply = (left, persist = false) => {
+    if (!desktop.matches) {
+      stop();
+      stage.style.gridTemplateColumns = '';
+      resizer.hidden = true;
+      return;
+    }
+    const { width, minimum } = bounds();
+    if (!width) return;
+    const clamped = Math.min(Math.max(left, minimum), width - minimum);
+    ratio = clamped / width;
+    stage.style.gridTemplateColumns = `${clamped}px minmax(0, 1fr)`;
+    resizer.style.left = `${clamped}px`;
+    resizer.hidden = false;
+    resizer.setAttribute('aria-valuemin', String(Math.round(minimum / width * 100)));
+    resizer.setAttribute('aria-valuemax', String(Math.round((width - minimum) / width * 100)));
+    resizer.setAttribute('aria-valuenow', String(Math.round(ratio * 100)));
+    if (persist) writeBrowserStorage('localStorage', storageKey, String(ratio));
+  };
+  resizer.addEventListener('pointerdown', (event) => {
+    if (!desktop.matches || event.button !== 0) return;
+    activePointer = event.pointerId;
+    resizer.setPointerCapture(activePointer);
+    stage.classList.add('resizing');
+    event.preventDefault();
+  });
+  resizer.addEventListener('pointermove', (event) => {
+    if (event.pointerId !== activePointer) return;
+    const { rect } = bounds();
+    apply(event.clientX - rect.left - 7, true);
+  });
+  resizer.addEventListener('pointerup', stop);
+  resizer.addEventListener('pointercancel', stop);
+  resizer.addEventListener('lostpointercapture', stop);
+  resizer.addEventListener('keydown', (event) => {
+    if (!desktop.matches) return;
+    const { width, minimum } = bounds();
+    let left = ratio * width;
+    if (event.key === 'ArrowLeft') left -= 24;
+    else if (event.key === 'ArrowRight') left += 24;
+    else if (event.key === 'Home') left = minimum;
+    else if (event.key === 'End') left = width - minimum;
+    else return;
+    event.preventDefault();
+    apply(left, true);
+  });
+  const resize = () => apply(ratio * bounds().width);
+  desktop.addEventListener('change', resize);
+  new ResizeObserver(resize).observe(stage);
+  resize();
+}
+
 let activeConversationId = null;
 let activeWorkspaceId = readBrowserStorage(
   'localStorage', ACTIVE_WORKSPACE_STORAGE_KEY,
@@ -638,23 +736,36 @@ function updateComposerButtonState() {
   const cancelButton = document.getElementById('cancel-btn');
   if (!sendButton || !cancelButton) return;
 
-  // Cancellation is scoped to the authoritative active Task of the visible
-  // conversation.  Searching every historical task card let an old stale
-  // PREPARING/RUNNING card keep the composer cancel button alive after the
-  // current Turn had already completed.
+  // Cancellation is scoped to the *current Turn* of the authoritative active
+  // Task on the visible conversation.
+  //
+  // Earlier implementations searched every historical task card and only
+  // looked at Task.phase1State, which let an old stale PREPARING/RUNNING card
+  // keep the composer cancel button alive after the current Turn had already
+  // completed. The session snapshot already carries turn-level facts, so the
+  // button now follows the latest unsettled Turn instead.
   const active = getActiveConversation();
-  const runningTask = active?.activeTaskId
-    ? taskMessage(active.id, active.activeTaskId)
-    : null;
+  const activeTaskId = active?.activeTaskId || null;
+  const activeTask = activeTaskId && taskMessage(active.id, activeTaskId)?.task;
+  const taskIsRunning = activeTask && ['PREPARING', 'RUNNING'].includes(activeTask.phase1State);
+  let runningTurn = null;
+
+  if (active && activeTaskId && taskIsRunning && active.turnCalls instanceof Map) {
+    active.turnCalls.forEach((turn) => {
+      if (!turn || turn.task_id !== activeTaskId) return;
+      // A settled Turn has completed; cancellation only applies to an
+      // unsettled Turn that is still running or cancelling.
+      if (turn.settled) return;
+      if (!runningTurn) runningTurn = turn;
+    });
+  }
 
   sendButton.disabled = !getActiveWorkspace();
 
-  if (
-    runningTask?.task?.taskId
-    && !TERMINAL_STATES.includes(runningTask.task.phase1State)
-  ) {
+  if (runningTurn && activeTaskId) {
     cancelButton.classList.remove('hidden');
-    cancelButton.dataset.taskId = runningTask.task.taskId;
+    cancelButton.dataset.taskId = activeTaskId;
+    cancelButton.dataset.turnId = runningTurn.turn_id || '';
     cancelButton.disabled = false;
     return;
   }
@@ -662,6 +773,7 @@ function updateComposerButtonState() {
   cancelButton.classList.add('hidden');
   cancelButton.disabled = false;
   cancelButton.dataset.taskId = '';
+  cancelButton.dataset.turnId = '';
 }
 
 function updateWorkspaceState() {
@@ -739,6 +851,7 @@ function renderWorkspaceList() {
         item.onclick = () => {
           persistActiveDraft();
           activeWorkspaceId = workspace.id;
+          rememberWorkspaceUse(workspace.id);
           writeBrowserStorage(
             'localStorage', ACTIVE_WORKSPACE_STORAGE_KEY, workspace.id,
           );
@@ -763,9 +876,15 @@ function renderWorkspaceList() {
   });
 }
 
+function rememberWorkspaceUse(workspaceId) {
+  fetch(`/workspaces/${encodeURIComponent(workspaceId)}/activate`, {method: 'POST'})
+    .catch(error => console.error('记录最近工作区失败', error));
+}
+
 function activateWorkspace(workspaceId) {
   persistActiveDraft();
   activeWorkspaceId = workspaceId;
+  rememberWorkspaceUse(workspaceId);
   writeBrowserStorage(
     'localStorage', ACTIVE_WORKSPACE_STORAGE_KEY, workspaceId,
   );
@@ -1271,6 +1390,7 @@ document.addEventListener('click', (event) => {
 
 function renderMessages(forceScrollToBottom = false) {
   const active = getActiveConversation();
+  renderConversationTodo(activeWorkspaceId ? active : null);
   const chatArea = document.getElementById('chat-area');
   const approvalDock = document.getElementById('approval-dock');
   const previousScrollTop = chatArea.scrollTop;
@@ -1709,10 +1829,89 @@ function renderTraceView(tracePane, conversation) {
   if (tasks.length === 0) {
     main.innerHTML = `<div class='empty-state'><h2>暂无执行链路</h2><div>发送任务后会生成 Agent Trace Timeline</div></div>`;
   } else {
+    // 选出一个“主任务”承载整条 Timeline：优先运行中，其次最新一个
+    const runningTaskIds = tasks
+      .filter((item) => (
+        item.task?.projection?.execution_status === 'running'
+        || (!item.task?.projection && item.task?.phase1State === 'RUNNING')
+      ))
+      .map((item) => item.task?.taskId)
+      .filter(Boolean);
+    const primaryTaskId = runningTaskIds[0]
+      || tasks[tasks.length - 1]?.task?.taskId
+      || null;
+
     tasks.forEach((message) => {
       const wrapper = document.createElement('div');
       wrapper.className = 'message task';
-      renderTaskCard(wrapper, message, conversation.id, 'trace');
+
+      // 只有主任务卡片打开 Trace 模式，其余任务只展示对话/摘要，不再各自带一条独立 Timeline
+      const mode = (primaryTaskId && message.task?.taskId === primaryTaskId)
+        ? 'trace'
+        : 'conversation';
+      renderTaskCard(wrapper, message, conversation.id, mode);
+
+      // 只要该轮有阶段性思考（execution_note / stage_summary），就在轨迹中单独渲染一块
+      const task = message.task || {};
+      const conversationTurns = conversation.turnCalls || new Map();
+      const turn = task.turnId && conversationTurns.get(task.turnId);
+      const stageItems = (turn?.progress || []).filter((item) => (
+        item.kind === 'execution_note' || item.kind === 'stage_summary'
+      ));
+      if (stageItems.length) {
+        const stageBlock = document.createElement('div');
+        stageBlock.className = 'trace-stage-block';
+
+        const header = document.createElement('div');
+        header.className = 'trace-stage-header';
+        const title = document.createElement('div');
+        title.className = 'trace-stage-title';
+        title.textContent = '阶段性思考';
+        const caption = document.createElement('div');
+        caption.className = 'trace-stage-caption';
+        caption.textContent = '本轮模型的计划与阶段总结，仅在有阶段性思考时显示。';
+        header.append(title, caption);
+        stageBlock.appendChild(header);
+
+        const list = document.createElement('div');
+        list.className = 'trace-stage-list';
+        stageItems.forEach((item) => {
+          const card = document.createElement('div');
+          card.className = 'trace-stage-card';
+
+          const kindLabel = document.createElement('div');
+          kindLabel.className = 'trace-stage-kind';
+          kindLabel.textContent = item.kind === 'execution_note' ? '执行说明 / 计划' : '阶段性总结';
+
+          const body = document.createElement('div');
+          body.className = 'trace-stage-body';
+          body.textContent = item.activity || '';
+
+          card.append(kindLabel, body);
+
+          // 如果文案太长，提供折叠按钮避免占满轨迹
+          if (body.textContent && body.textContent.length > 120) {
+            const toggle = document.createElement('button');
+            toggle.type = 'button';
+            toggle.className = 'trace-stage-toggle';
+            toggle.textContent = '展开详情';
+            let expanded = false;
+            body.classList.add('collapsed');
+            toggle.addEventListener('click', () => {
+              expanded = !expanded;
+              body.classList.toggle('collapsed', !expanded);
+              toggle.textContent = expanded ? '收起' : '展开详情';
+            });
+            card.appendChild(toggle);
+          }
+
+          list.appendChild(card);
+        });
+
+        stageBlock.appendChild(list);
+        wrapper.appendChild(stageBlock);
+      }
+
       main.appendChild(wrapper);
     });
   }
@@ -1753,6 +1952,7 @@ function renderTraceView(tracePane, conversation) {
   `;
   sidebar.append(overview);
   sidebar.append(renderSourceEvaluationRunner());
+  sidebar.append(renderSkillInstallButton());
   board.append(main, sidebar);
   tracePane.appendChild(board);
 }
@@ -1774,6 +1974,326 @@ function renderSourceEvaluationRunner() {
     <div class='trace-panel-caption' id='source-evaluation-status'>不会自动开启 tool_choice=required。</div>`;
   panel.querySelector('#start-source-evaluation')?.addEventListener('click', startSourceEvaluation);
   return panel;
+}
+
+function renderSkillInstallButton() {
+  const panel = document.createElement('section');
+  panel.className = 'trace-overview-panel';
+  panel.id = 'skill-install-runner';
+  panel.innerHTML = `
+    <div class='trace-panel-heading'><div><div class='trace-panel-title'>Skill 安装</div><div class='trace-panel-caption'>用户级别 · 所有项目和会话可用</div></div></div>
+    <button class='new-session-btn' id='install-plan-skill' data-skill-install ${skillInstallInFlight ? 'disabled' : ''}>从本地目录安装 PLAN Skill</button>
+    <input type='file' id='skill-dir-input' webkitdirectory style='display:none' />
+    <div class='trace-panel-caption' id='skill-install-status' role='status'>保存到 ~/.tsm-agent/skills，自动在最近工作区新建安装会话并验证准备情况。</div>`;
+
+  const button = panel.querySelector('#install-plan-skill');
+  const input = panel.querySelector('#skill-dir-input');
+
+  button?.addEventListener('click', () => {
+    if (!input) return;
+    input.value = '';
+    input.click();
+  });
+
+  input?.addEventListener('change', async (event) => {
+    const files = event.target?.files;
+    if (!files || files.length === 0) {
+      return;
+    }
+    await uploadSkillDirectoryAndInstall(files, event.target);
+  });
+
+  return panel;
+}
+
+let skillInstallInFlight = false;
+let skillSettingsDirectories = [];
+let skillDefaultDirectory = '';
+const skillInstallations = new Map();
+const skillInstallationStreams = new Map();
+const skillInstallationAutoOpen = new Set();
+
+function renderSkillInstallations(jobs = []) {
+  for (const job of jobs) skillInstallations.set(job.id, job);
+  const panel = document.getElementById('skill-installations');
+  if (!panel) return;
+  panel.replaceChildren();
+  const labels = {
+    pending: '文件已保存，准备待启动', starting: '正在创建安装会话', running: '正在准备和验证',
+    ready: '安装成功，验证通过', blocked: '准备受阻', failed: '准备失败',
+    awaiting_approval: '等待审批', awaiting_user: '等待补充信息',
+    unverified: '尚未完成验证', interrupted: '准备已中断', needs_review: '需要复核',
+  };
+  for (const job of [...skillInstallations.values()].slice(-30).reverse()) {
+    const row = document.createElement('div');
+    row.style.cssText = 'border:1px solid #e2e8f0;border-radius:10px;padding:10px;margin-top:10px;';
+    const text = document.createElement('p');
+    text.textContent = `${job.skill_name} · ${labels[job.status] || job.status}：${job.summary}`;
+    row.append(text);
+    if (job.workspace_path) {
+      const workspace = document.createElement('p');
+      workspace.textContent = `安装会话工作区：${job.workspace_path}`;
+      row.append(workspace);
+    }
+    for (const check of job.checks || []) {
+      const item = document.createElement('p');
+      item.textContent = check;
+      row.append(item);
+    }
+    if (job.session_id && job.task_id) {
+      const open = document.createElement('button');
+      open.textContent = '打开安装会话';
+      open.onclick = () => openSkillInstallationConversation(job);
+      row.append(open);
+    }
+    if (['pending', 'failed', 'interrupted', 'unverified', 'needs_review'].includes(job.status)) {
+      const retry = document.createElement('button');
+      retry.textContent = '重试准备';
+      retry.onclick = async () => {
+        retry.disabled = true;
+        try {
+          const next = await readSkillResponse(await fetch(`/skills/installations/${encodeURIComponent(job.id)}/retry`, {method: 'POST'}), '启动准备失败');
+          skillInstallationAutoOpen.add(next.id);
+          renderSkillInstallations([next]);
+        } catch (error) { setSkillInstallFeedback(error.message, true); }
+        finally { retry.disabled = false; }
+      };
+      row.append(retry);
+    }
+    panel.append(row);
+    if (skillInstallationAutoOpen.has(job.id) && job.task_id) {
+      skillInstallationAutoOpen.delete(job.id);
+      openSkillInstallationConversation(job).catch(error => setSkillInstallFeedback(`文件已保存；打开安装会话失败：${error.message}`));
+    }
+    if (['starting', 'running', 'awaiting_approval', 'awaiting_user'].includes(job.status)) {
+      watchSkillInstallation(job.id);
+    } else if (skillInstallationStreams.has(job.id)) {
+      skillInstallationStreams.get(job.id).close();
+      skillInstallationStreams.delete(job.id);
+    }
+  }
+}
+
+function watchSkillInstallation(id) {
+  if (skillInstallationStreams.has(id)) return;
+  const source = new EventSource(`/skills/installations/${encodeURIComponent(id)}/events`);
+  skillInstallationStreams.set(id, source);
+  source.onmessage = event => {
+    if (skillInstallationStreams.get(id) !== source) return;
+    try {
+      const packet = JSON.parse(event.data);
+      if (!packet.installation) return;
+      renderSkillInstallations([packet.installation]);
+      if (!packet.watching) {
+        source.close();
+        skillInstallationStreams.delete(id);
+      }
+    } catch (error) { console.error(error); }
+  };
+  source.onerror = () => {
+    if (skillInstallationStreams.get(id) === source) {
+      setSkillInstallFeedback('安装进度连接中断，正在重连；任务仍在后台运行。');
+    }
+  };
+}
+
+async function openSkillInstallationConversation(job) {
+  if (!job.session_id || !job.task_id) return;
+  persistActiveDraft();
+  if (!workspaces.some(item => item.id === job.workspace_id)) {
+    workspaces.push({id: job.workspace_id, name: job.workspace_path, path: job.workspace_path});
+  }
+  if (!getConversationById(job.session_id)) {
+    conversations.push({id: job.session_id, workspaceId: job.workspace_id,
+      title: `安装 Skill：${job.skill_name}`, createdAt: new Date(job.created_at).toLocaleTimeString(),
+      messages: [], draft: '', loaded: false, latestTaskId: job.task_id});
+  }
+  activeWorkspaceId = job.workspace_id;
+  writeBrowserStorage('localStorage', ACTIVE_WORKSPACE_STORAGE_KEY, job.workspace_id);
+  activeConversationId = job.session_id;
+  rememberWorkspaceUse(job.workspace_id);
+  document.getElementById('skill-settings-dialog')?.close();
+  updateWorkspaceState();
+  renderConversations();
+  renderMessages();
+  restoreConversationDraft();
+  const conversation = getConversationById(job.session_id);
+  conversation.loaded = false;
+  await ensureConversationLoaded(job.session_id);
+}
+
+function renderSkillDirectories() {
+  const list = document.getElementById('skill-discovery-list');
+  list.replaceChildren();
+  for (const directory of skillSettingsDirectories) {
+    const item = document.createElement('li');
+    item.style.overflowWrap = 'anywhere';
+    item.append(document.createTextNode(directory));
+    if (directory === skillDefaultDirectory) {
+      item.append(document.createTextNode('（默认安装目录）'));
+    } else {
+      const remove = document.createElement('button');
+      remove.textContent = '移除';
+      remove.onclick = () => {
+        skillSettingsDirectories = skillSettingsDirectories.filter(path => path !== directory);
+        renderSkillDirectories();
+      };
+      item.append(remove);
+    }
+    list.append(item);
+  }
+}
+
+function renderSkillCatalog(data) {
+  const catalog = document.getElementById('skill-discovered-catalog');
+  catalog.replaceChildren();
+  const heading = document.createElement('p');
+  heading.textContent = `已发现 ${(data.skills || []).length} 个 Skill`;
+  catalog.append(heading);
+  for (const skill of data.skills || []) {
+    const row = document.createElement('p');
+    row.textContent = `${skill.name} — ${skill.description} (${skill.plan_path || '代码注册'})`;
+    catalog.append(row);
+  }
+  renderSkillInstallations(data.installations || []);
+}
+
+function applySkillSettings(data) {
+  skillDefaultDirectory = data.install_directory;
+  skillSettingsDirectories = data.discovery_directories || [];
+  document.getElementById('skill-install-directory').textContent = data.install_directory;
+  renderSkillDirectories();
+  renderSkillCatalog(data);
+  document.getElementById('skill-settings-status').textContent = (data.issues || []).join(String.fromCodePoint(10));
+}
+
+async function readSkillResponse(response, action) {
+  let data;
+  try {
+    data = await response.json();
+  } catch (error) {
+    throw new Error(`${action}：服务器返回非 JSON 响应（HTTP ${response.status}）`);
+  }
+  if (!response.ok) {
+    const detail = typeof data?.detail === 'string' ? data.detail : JSON.stringify(data?.detail || {});
+    throw new Error(`${action}：${detail}（HTTP ${response.status}）`);
+  }
+  return data;
+}
+
+function setSkillInstallFeedback(message, failed = false) {
+  const status = document.getElementById('skill-install-status');
+  if (status) status.textContent = message;
+  const settings = document.getElementById('skill-settings-status');
+  if (settings) settings.textContent = message;
+  if (failed) showError(message);
+}
+
+async function openSkillSettings() {
+  const dialog = document.getElementById('skill-settings-dialog');
+  if (!dialog.open) dialog.showModal();
+  try {
+    const response = await fetch('/settings/skills');
+    const data = await readSkillResponse(response, '读取 Skills 设置失败');
+    applySkillSettings(data);
+  } catch (error) {
+    document.getElementById('skill-settings-status').textContent = error.message;
+  }
+}
+
+function addSkillDirectoryPath() {
+  const input = document.getElementById('skill-directory-path');
+  const path = input.value.trim();
+  if (path && !skillSettingsDirectories.includes(path)) skillSettingsDirectories.push(path);
+  input.value = '';
+  renderSkillDirectories();
+}
+
+async function pickSkillDirectories() {
+  try {
+    const response = await fetch('/settings/skills/pick', {method: 'POST'});
+    const data = await readSkillResponse(response, '选择目录失败');
+    skillSettingsDirectories = [...new Set([...skillSettingsDirectories, ...(data.paths || [])])];
+    renderSkillDirectories();
+  } catch (error) {
+    document.getElementById('skill-settings-status').textContent = error.message;
+  }
+}
+
+async function saveSkillSettings() {
+  const button = document.getElementById('save-skill-settings');
+  button.disabled = true;
+  try {
+    addSkillDirectoryPath();
+    const response = await fetch('/settings/skills', {
+      method: 'PUT', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({discovery_directories: skillSettingsDirectories.filter(path => path !== skillDefaultDirectory)}),
+    });
+    const data = await readSkillResponse(response, '保存设置失败');
+    applySkillSettings(data);
+    const status = document.getElementById('skill-settings-status');
+    status.textContent = '已保存，后续对话请求使用刷新后的 Skill 目录。' + (status.textContent ? String.fromCharCode(10) + status.textContent : '');
+  } catch (error) {
+    document.getElementById('skill-settings-status').textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function uploadSkillDirectoryAndInstall(fileList, input = null) {
+  const files = Array.from(fileList || []).filter(file => !(
+    (file.webkitRelativePath || file.name).split('/').some(part => (
+      ['.DS_Store', '__MACOSX', '.git', 'Thumbs.db', 'desktop.ini'].includes(part)
+    ))
+  ));
+  if (!files.length || skillInstallInFlight) return;
+  skillInstallInFlight = true;
+  document.querySelectorAll('[data-skill-install]').forEach(button => { button.disabled = true; });
+  clearError();
+  setSkillInstallFeedback('正在安装到用户 Skill 目录…');
+  try {
+    const formData = new FormData();
+    files.forEach(file => formData.append('files', file, file.webkitRelativePath || file.name));
+    if (typeof activeWorkspaceId !== 'undefined' && activeWorkspaceId) formData.append('workspace_id', activeWorkspaceId);
+    let response;
+    try {
+      response = await fetch('/skills/upload', {method: 'POST', body: formData});
+    } catch (error) {
+      throw new Error('安装请求中断，结果尚未确认；可以重新选择同一目录重试，相同文件不会重复安装。');
+    }
+    const data = await readSkillResponse(response, '安装 Skill 失败');
+    if (data?.installed !== true || !data.skill?.name || !data.skill?.plan_path) {
+      throw new Error('安装响应缺少结果信息，请在设置中检查安装状态后重试。');
+    }
+    const message = data.installation
+      ? `文件已保存 ${data.skill.name}：${data.skill.plan_path}。${data.installation.summary}`
+      : data.preparation_required
+        ? `文件已保存 ${data.skill.name}：${data.skill.plan_path}。安装准备未启动。`
+        : `已安装 ${data.skill.name}：${data.skill.plan_path}`;
+    const warnings = Array.isArray(data.warnings) ? [...data.warnings] : [];
+    // The upload has committed. A later catalog refresh failure must not be
+    // presented as a failed installation or lose the successful receipt.
+    if (document.getElementById('skill-settings-dialog')?.open) {
+      try {
+        const refreshed = await readSkillResponse(await fetch('/settings/skills'), '刷新目录失败');
+        renderSkillCatalog(refreshed);
+        warnings.push(...(refreshed.issues || []));
+      } catch (error) {
+        warnings.push(`安装已完成，但目录列表刷新失败：${error.message}`);
+      }
+    }
+    setSkillInstallFeedback([message, ...new Set(warnings)].join(String.fromCodePoint(10)));
+    if (data.installation) {
+      skillInstallationAutoOpen.add(data.installation.id);
+      renderSkillInstallations([data.installation]);
+    }
+  } catch (error) {
+    setSkillInstallFeedback(error.message || '安装 Skill 失败', true);
+  } finally {
+    skillInstallInFlight = false;
+    document.querySelectorAll('[data-skill-install]').forEach(button => { button.disabled = false; });
+    if (input) input.value = '';
+  }
 }
 
 async function startSourceEvaluation() {
@@ -1832,7 +2352,24 @@ function isMarkdownProgress(text) {
     });
 }
 
-function renderTodoPanel(todoList) {
+function renderConversationTodo(conversation) {
+  const dock = document.getElementById('todo-dock');
+  if (!dock) return;
+  // Use only the current Task. Never resurrect an older unfinished list when
+  // the latest Task has no plan, or when its plan has been completed/cleared.
+  const messages = conversation?.messages || [];
+  const current = messages.find(message => message.task
+    && message.task.taskId === conversation?.activeTaskId)
+    || [...messages].reverse().find(message => message.task);
+  const todoList = current?.task?.todoList;
+  const todos = Array.isArray(todoList?.todos) ? todoList.todos : [];
+  const visible = todos.length > 0 && !todos.every(todo => todo.status === 'completed');
+  dock.replaceChildren();
+  dock.hidden = !visible;
+  if (visible) dock.appendChild(renderTodoPanel(todoList, true));
+}
+
+function renderTodoPanel(todoList, compact = false) {
   const todos = Array.isArray(todoList?.todos) ? todoList.todos : [];
   if (todos.length === 0) return null;
   const panel = document.createElement('section');
@@ -1841,12 +2378,13 @@ function renderTodoPanel(todoList) {
   header.className = 'todo-panel-header';
   const title = document.createElement('div');
   title.className = 'todo-panel-title';
-  title.textContent = '执行步骤';
+  title.textContent = compact ? '任务清单' : '执行步骤';
   const summary = document.createElement('div');
   summary.className = 'todo-panel-summary';
-  const completed = Number(todoList.summary?.completed || 0);
-  const total = Number(todoList.summary?.total || todos.length);
-  summary.textContent = `${completed}/${total} 已完成 · rev ${Number(todoList.revision || 0)}`;
+  const completed = todos.filter(todo => todo.status === 'completed').length;
+  const total = todos.length;
+  summary.textContent = compact ? `${completed}/${total} 已完成`
+    : `${completed}/${total} 已完成 · rev ${Number(todoList.revision || 0)}`;
   header.append(title, summary);
   panel.appendChild(header);
 
@@ -1864,13 +2402,16 @@ function renderTodoPanel(todoList) {
     const marker = document.createElement('div');
     marker.className = 'todo-marker';
     marker.textContent = markers[status];
+    marker.setAttribute('role', 'checkbox');
+    marker.setAttribute('aria-checked', String(status === 'completed'));
+    marker.setAttribute('aria-label', `${String(todo?.content || todo?.id || '未命名步骤')}：${({pending: '待处理', in_progress: '进行中', completed: '已完成', blocked: '受阻'})[status]}`);
     const body = document.createElement('div');
     const content = document.createElement('div');
     content.className = 'todo-content';
     content.textContent = String(todo?.content || todo?.id || '未命名步骤');
     body.appendChild(content);
     const criteriaText = String(todo?.completion_criteria || '').trim();
-    if (criteriaText && criteriaText !== content.textContent) {
+    if (!compact && criteriaText && criteriaText !== content.textContent) {
       const criteria = document.createElement('div');
       criteria.className = 'todo-criteria';
       criteria.textContent = `完成条件：${criteriaText}`;
@@ -2014,16 +2555,44 @@ function renderTaskCard(element, message, conversationId, mode = 'conversation')
     steps.forEach((step) => {
       const item = document.createElement('div');
       item.className = `trace-step ${step.state}`;
-      item.innerHTML = `
-        <div class='trace-step-header'>
-          <div>
-            <div class='trace-step-title'>${step.title}</div>
-            <div class='trace-step-meta'>${step.meta}</div>
-          </div>
-          <div class='task-phase-badge'>${step.state}</div>
-        </div>
-        <div class='trace-step-body'>${step.body}</div>
-      `;
+
+      const header = document.createElement('div');
+      header.className = 'trace-step-header';
+
+      const left = document.createElement('div');
+      const title = document.createElement('div');
+      title.className = 'trace-step-title';
+      title.textContent = step.title;
+      const meta = document.createElement('div');
+      meta.className = 'trace-step-meta';
+      meta.textContent = step.meta;
+      left.appendChild(title);
+      left.appendChild(meta);
+
+      const right = document.createElement('div');
+      right.className = 'trace-step-status';
+      const status = document.createElement('span');
+      status.className = `task-phase-badge trace-step-state-${step.state}`;
+      status.textContent = step.state === 'running'
+        ? '执行中'
+        : step.state === 'done'
+          ? '完成'
+          : step.state === 'failed'
+            ? '失败'
+            : step.state === 'waiting'
+              ? '等待中'
+              : step.state;
+      right.appendChild(status);
+
+      header.appendChild(left);
+      header.appendChild(right);
+
+      const body = document.createElement('div');
+      body.className = 'trace-step-body';
+      body.textContent = step.body;
+
+      item.appendChild(header);
+      item.appendChild(body);
       timeline.appendChild(item);
     });
     timelineScroll.appendChild(timeline);
@@ -2184,8 +2753,35 @@ function upsertTaskCard(conversationId, rawTask) {
     applyTaskProjection(message.task, rawTask.projection);
     applyTaskProtocol(message.task, rawTask);
   }
-  if (conversationId === activeConversationId) renderMessages();
+
+  // 当 Runtime 报告当前轮次进入终态（final 或终态 phase1_state），将对应的 Turn 标记为已结算，
+  // 以便取消按钮逻辑正确识别“没有可取消的轮次”。
+  const isFinal = rawTask.final === true
+    || ['INTERRUPTED', 'DONE', 'FAILED', 'CANCELLED', 'NEEDS_REVIEW']
+      .includes(rawTask.phase1_state || '');
+  const turnId = rawTask.active_turn_id || rawTask.turn_id || message.task.streamTurnId;
+  if (isFinal && turnId && conversation.turnCalls instanceof Map) {
+    const turn = conversation.turnCalls.get(turnId);
+    if (turn && turn.settled === false) {
+      turn.settled = true;
+    }
+  }
+
+  if (conversationId === activeConversationId) {
+    renderMessages();
+    updateComposerButtonState();
+  }
   return message;
+}
+
+let progressRenderPending = false;
+function scheduleProgressRender(conversationId) {
+  if (conversationId !== activeConversationId || progressRenderPending) return;
+  progressRenderPending = true;
+  requestAnimationFrame(() => {
+    progressRenderPending = false;
+    renderMessages();
+  });
 }
 
 function appendTaskProgress(taskId, progress, conversationId) {
@@ -2199,14 +2795,17 @@ function appendTaskProgress(taskId, progress, conversationId) {
   if (!text) return;
   const lines = message.task.progress;
   if (lines.some((item) => item.sequence === sequence && sequence > 0)) return;
-  if (['execution_note', 'stage_summary'].includes(progressData.kind)) {
+  // Once a durable Turn panel exists renderMessages hides the volatile panel.
+  // Feed every durable SSE progress item into that same panel, not just notes.
+  if (progressData.kind !== 'reasoning_delta') {
     const conversation = getConversationById(conversationId);
-    const currentInput = [...(conversation?.messages || [])].reverse()
-      .find((item) => item.role === 'user' && item.taskId === taskId && item.turnId);
-    const turn = currentInput && conversation?.turnCalls?.get(currentInput.turnId);
+    const turnId = progress.turn_id || message.task.streamTurnId;
+    const turn = conversation?.turnCalls?.get(turnId);
     if (turn) {
       turn.progress ||= [];
-      turn.progress.push({kind: progressData.kind, model_call: progressData.model_call, activity: progressData.activity, phase: progressData.phase});
+      if (!sequence || !turn.progress.some((item) => Number(item.sequence) === sequence)) {
+        turn.progress.push({...progressData, sequence});
+      }
     }
   }
   if (progressData.kind === 'reasoning_delta') {
@@ -2232,7 +2831,7 @@ function appendTaskProgress(taskId, progress, conversationId) {
     } else {
       lines.push({ sequence, text, progressData });
     }
-    if (conversationId === activeConversationId) renderMessages();
+    scheduleProgressRender(conversationId);
     return;
   }
   if (
@@ -2241,7 +2840,7 @@ function appendTaskProgress(taskId, progress, conversationId) {
   ) return;
   lines.push({ sequence, text, progressData });
   if (lines.length > 30) lines.splice(0, lines.length - 30);
-  if (conversationId === activeConversationId) renderMessages();
+  scheduleProgressRender(conversationId);
 }
 
 function renderApprovalCard(element, message) {
@@ -2668,19 +3267,69 @@ function describeFailure(reason) {
 function describeProgress(progress) {
   if (!progress) return '';
   const kind = progress.kind;
-  if (kind === 'execution_note') return progress.activity || '';
-  if (kind === 'stage_summary') return progress.activity ? `${progress.phase === 'runtime' ? '工具状态' : '阶段进展'}：${progress.activity}` : '';
-  if (kind === 'reasoning_delta') return progress.reasoning_text ? `推理摘要：${progress.reasoning_text}` : '';
-  if (kind === 'model_started') return '正在思考…';
-  if (kind === 'model_completed') return '已生成一轮回复';
-  if (kind === 'tool_started') {
-    return `调用工具：${progress.tool_name}${progress.operation_presentation ? ' · ' + progress.operation_presentation : ''}`;
+  if (kind === 'completion_review') {
+    if (progress.review_action === 'STARTED') return '正在进行完成复核，最终答复尚未发布…';
+    if (progress.review_action === 'FAILED') return `完成复核失败：${progress.review_reason_code || '未知错误'}`;
+    return `完成复核：${progress.review_action || '状态更新'}`;
   }
+  if (kind === 'turn_interrupted') return `本轮未完成：${progress.detail || progress.diagnostic_code || '执行已中断'}`;
+  // 直接显示执行备注，通常已经是中文。
+  if (kind === 'execution_note') return progress.activity || '';
+  // 阶段进展：统一用中文 Tag 包裹 activity，和 CLI 样式保持一致。
+  if (kind === 'stage_summary') {
+    return progress.activity ? `[阶段进展] ${progress.activity}` : '';
+  }
+  // 推理增量：保持原有中文前缀。
+  if (kind === 'reasoning_delta') {
+    return progress.reasoning_text ? `推理摘要：${progress.reasoning_text}` : '';
+  }
+  // 模型调用：用 Codex 风格的 "思考" 标签，若有计数则展示 "当前/上限"。
+  if (kind === 'model_started') {
+    const call = typeof progress.model_call === 'number' ? progress.model_call : null;
+    const maxCalls = typeof progress.max_model_calls === 'number' ? progress.max_model_calls : null;
+    const counter = call !== null && maxCalls !== null
+      ? `${call}/${maxCalls}`
+      : (call !== null ? String(call) : '');
+    return counter ? `[思考 ${counter}] 模型正在分析…` : '正在思考…';
+  }
+  if (kind === 'model_completed') {
+    return '已生成一轮回复';
+  }
+  // 工具调用开始：采用 "[操作 n] 工具名：参数" 的中文样式。
+  if (kind === 'tool_started') {
+    const call = typeof progress.tool_call === 'number' ? progress.tool_call : null;
+    const maxCalls = typeof progress.max_tool_calls === 'number' ? progress.max_tool_calls : null;
+    const counter = call !== null && maxCalls !== null
+      ? `${call}/${maxCalls}`
+      : (call !== null ? String(call) : '');
+    const heading = counter
+      ? `[操作 ${counter}] ${progress.tool_name}`
+      : `调用工具：${progress.tool_name}`;
+    const rendered = progress.operation_presentation || '';
+    return rendered ? `${heading}：${rendered}` : heading;
+  }
+  // 工具完成：使用 "[完成 n] 工具名：状态（耗时；证据增量）" 的中文样式。
   if (kind === 'tool_completed') {
+    const call = typeof progress.tool_call === 'number' ? progress.tool_call : null;
+    const heading = call !== null
+      ? `[完成 ${call}] ${progress.tool_name}`
+      : `工具 ${progress.tool_name}`;
     const status = progress.ok === false
-      ? `失败${progress.error_code ? '（' + progress.error_code + '）' : ''}`
+      ? `失败${progress.error_code ? `（${progress.error_code}）` : ''}`
       : '完成';
-    return `工具 ${progress.tool_name} ${status}`;
+    const details = [];
+    if (typeof progress.elapsed_seconds === 'number') {
+      details.push(`${progress.elapsed_seconds.toFixed(1)} 秒`);
+    }
+    if (progress.evidence_delta != null) {
+      if (progress.evidence_delta) {
+        details.push(`新增证据 ${progress.evidence_delta} 项`);
+      } else {
+        details.push('没有新增证据');
+      }
+    }
+    const detailText = details.length ? `（${details.join('；')}）` : '';
+    return `${heading}：${status}${detailText}`;
   }
   if (kind === 'model_retry' || kind === 'model_transport') {
     const attempt = progress.transport_attempt || 1;
@@ -2800,6 +3449,12 @@ async function runTask() {
   setLoading(true);
   updateComposerButtonState();
   const requestId = crypto.randomUUID();
+  const reasoningEffortSelect = document.getElementById('reasoning-effort');
+  const reasoningEffort = (
+    reasoningEffortSelect && typeof reasoningEffortSelect.value === 'string'
+      ? reasoningEffortSelect.value.trim()
+      : ''
+  ) || null;
   const diagnosticRequested = diagnoseNextInput && (!diagnosticSessionId || diagnosticSessionId === conversationId);
   const diagnosticSessionMismatch = diagnoseNextInput && !diagnosticRequested;
   diagnoseNextInput = false;
@@ -2813,6 +3468,7 @@ async function runTask() {
         request_id: requestId,
         workspace_id: workspaceId,
         session_id: conversationId,
+        reasoning_effort: reasoningEffort,
         diagnose_request: diagnosticRequested,
         images,
       })
@@ -3096,7 +3752,11 @@ function turnProgressLines(items) {
       return;
     }
     if (kind === 'completion_review') {
-      if (item.review_action === 'UNVERIFIED') {
+      if (item.review_action === 'STARTED') {
+        lines.push({text: '正在进行完成复核，最终答复尚未发布…', tone: 'active'});
+      } else if (item.review_action === 'FAILED') {
+        lines.push({text: `完成复核失败：${item.review_reason_code || '未知错误'}`, tone: 'failed'});
+      } else if (item.review_action === 'UNVERIFIED') {
         lines.push({
           text: '完成审查暂不可用；回答已展示为未核验草稿',
           tone: 'active',
@@ -3330,190 +3990,132 @@ function followTask(taskId, conversationId) {
   if (existing) existing.stop();
   stopConversationFollowers(conversationId, taskId);
   const card = taskMessage(conversationId, taskId)
-    || upsertTaskCard(conversationId, { task_id: taskId, phase1_state: 'RUNNING' });
+    || upsertTaskCard(conversationId, {task_id: taskId, phase1_state: 'RUNNING'});
   const follower = {
-    conversationId,
-    attempts: 0, stopped: false, source: null, timer: null,
+    conversationId, source: null, timer: null, attempts: 0, stopped: false,
+    turnId: null, turnSequence: 0, queue: Promise.resolve(),
     stop() {
       this.stopped = true;
       if (this.source) this.source.close();
-      if (this.timer) clearInterval(this.timer);
-      followers.delete(taskId);
+      if (this.timer) clearTimeout(this.timer);
+      if (followers.get(taskId) === this) followers.delete(taskId);
     },
   };
   followers.set(taskId, follower);
-
-  const finish = async (state) => {
-    // Stop transport first so its polling/render callbacks cannot race the
-    // authoritative Session rebuild performed by renderFinalResult.
+  const currentFollower = () => !follower.stopped && followers.get(taskId) === follower;
+  const finish = async state => {
+    if (!currentFollower()) return;
     follower.stop();
-    try {
-      await renderFinalResult(taskId, state, conversationId);
-    } finally {
-      setLoading(false);
-    }
+    try { await renderFinalResult(taskId, state, conversationId); }
+    finally { if (conversationId === activeConversationId) setLoading(false); }
   };
-
-  const reconcile = async () => {
-    const response = await fetch(`/tasks/${taskId}`);
-    if (!response.ok) return false;
-    const state = await response.json();
+  const applyState = async state => {
+    if (!currentFollower()) return;
+    // A Task can carry several turns. Only its current snapshot may settle the
+    // foreground turn; old replayed completion events are history, not commands.
+    if (state.turn_id && follower.turnId && state.turn_id !== follower.turnId) return;
     const current = taskMessage(conversationId, taskId) || card;
-    const appendedText = state.state === 'CONFLICT' ? false : appendTaskAssistantText(
-      taskId, state.assistant_text, conversationId,
-    );
     if (current) {
       applyTaskProjection(current.task, state.projection);
       applyTaskProtocol(current.task, state);
       current.task.todoList = state.todo_list || null;
-      if (!state.projection) {
-        current.task.phase1State = state.phase1_state;
-        current.task.status = state.status;
-      }
-      current.task.waiting = state.approval
-        ? { kind: 'APPROVAL', approval: state.approval }
-        : state.status === 'awaiting_user'
-          ? { kind: state.clarification?.kind || 'INPUT', ...state.clarification }
-          : null;
+      current.task.cursor = Math.max(Number(current.task.cursor || 0), Number(state.cursor || 0));
+      current.task.phase1State = state.phase1_state;
+      current.task.status = state.status;
+      current.task.waiting = state.waiting || (state.approval
+        ? {kind: 'APPROVAL', approval: state.approval}
+        : state.status === 'awaiting_user' ? {kind: 'INPUT', ...state.clarification} : null);
     }
+    if (state.installations) renderSkillInstallations(state.installations);
     if (state.approval) {
-      bindLatestInputToTask(conversationId, taskId, state.approval.turn_id || null);
+      bindLatestInputToTask(conversationId, taskId, state.approval.turn_id || state.turn_id || null);
       upsertApprovalMessage(taskId, state.approval, conversationId);
-    } else {
-      clearApprovalMessage(taskId, conversationId);
-    }
-    if (TERMINAL_STATES.includes(state.phase1_state)) {
-      await finish(state);
-      return true;
-    }
-    const submittedApprovalIsSettling = Boolean(
-      state.approval
+    } else clearApprovalMessage(taskId, conversationId);
+    const submittedApprovalIsSettling = Boolean(state.approval
       && current?.task?.approvalResolution?.decision === 'APPROVE'
-      && current.task.approvalResolution.requestId === state.approval.request_id
-    );
-    if (
-      (state.phase1_state === 'WAITING' || state.status === 'awaiting_user')
-      && !submittedApprovalIsSettling
-    ) {
-      // Rebuilding here is what gives the settled Turn its call panel. It runs
-      // only for a Turn that produced a new durable answer: an accepted
-      // continuation that has not started yet looks identical to an idle Task,
-      // and rebuilding over it would drop the input the user just sent.
-      if (appendedText) {
-        await refreshConversationHistory(conversationId).catch(
-          (error) => console.error(error),
-        );
-        // The rebuilt history is authoritative, but never let a rebuild that
-        // lagged the Turn cost the answer that was already shown.
-        const rebuilt = getConversationById(conversationId);
-        const kept = (rebuilt?.messages || []).some(
-          (item) => item.role === 'assistant'
-            && item.content === String(state.assistant_text || '').trim(),
-        );
-        if (!kept) {
-          appendTaskAssistantText(taskId, state.assistant_text, conversationId);
-        }
-      }
-      if (conversationId === activeConversationId) renderMessages();
+      && current.task.approvalResolution.requestId === state.approval.request_id);
+    if (state.final || TERMINAL_STATES.includes(state.phase1_state)) {
+      await finish(state);
+    } else if (state.status === 'awaiting_input' && !submittedApprovalIsSettling) {
+      // Ordinary completed conversations use WAITING/awaiting_input too.
+      // Keep their delivered answer if the history refresh is stale or fails,
+      // just as for DONE/FAILED; otherwise the refresh can erase the answer.
+      await finish(state);
+    } else if ((state.waiting || state.status === 'awaiting_user') && !submittedApprovalIsSettling) {
       follower.stop();
-      setLoading(false);
-      return true;
-    }
-    if (conversationId === activeConversationId) renderMessages();
-    return false;
+      if (state.assistant_text && state.state !== 'CONFLICT') appendTaskAssistantText(taskId, state.assistant_text, conversationId);
+      await refreshConversationHistory(conversationId).catch(error => console.error(error));
+      if (conversationId === activeConversationId) setLoading(false);
+    } else if (conversationId === activeConversationId) renderMessages();
   };
-
+  const accept = async payload => {
+    if (!currentFollower()) return;
+    const current = taskMessage(conversationId, taskId) || card;
+    if (payload.type === 'stream.reset_required') {
+      if (current) { current.task.cursor = 0; current.task.progress = []; }
+      follower.turnId = null;
+      return;
+    }
+    if (payload.type === 'stream.open') {
+      follower.turnId = payload.active_turn_id || null;
+      follower.turnSequence = Number(payload.active_turn_sequence || 0);
+      if (current && current.task.streamTurnId !== follower.turnId) {
+        current.task.progress = [];
+        current.task.streamTurnId = follower.turnId;
+      }
+      return;
+    }
+    if (payload.type === 'task.snapshot') { await applyState(payload); return; }
+    const sequence = Number(payload.sequence || 0);
+    if (sequence && sequence <= Number(current?.task?.cursor || 0)) return;
+    if (current && sequence) current.task.cursor = sequence;
+    if (sequence && sequence < follower.turnSequence) return;
+    if (payload.progress?.kind === 'turn_started') {
+      follower.turnId = payload.turn_id;
+      if (current && current.task.streamTurnId !== follower.turnId) {
+        current.task.progress = [];
+        current.task.streamTurnId = follower.turnId;
+      }
+      bindLatestInputToTask(conversationId, taskId, payload.turn_id);
+    }
+    if (payload.turn_id && follower.turnId && payload.turn_id !== follower.turnId) return;
+    if (payload.progress) appendTaskProgress(taskId, payload, conversationId);
+  };
   const connect = () => {
-    if (follower.stopped) return;
+    if (!currentFollower()) return;
     const current = taskMessage(conversationId, taskId) || card;
     const after = Number(current?.task?.cursor || 0);
     const source = new EventSource(`/stream/${taskId}?after=${after}`);
     follower.source = source;
-    source.onopen = () => { follower.attempts = 0; };
-    source.onmessage = (event) => {
+    source.onmessage = event => {
+      if (!currentFollower() || follower.source !== source) return;
       let payload;
-      try {
-        payload = JSON.parse(event.data);
-      } catch (error) {
-        console.error(error);
-        return;
-      }
-      const sequence = Number(event.lastEventId || payload.sequence || 0);
-      if (sequence > 0) {
-        const currentCard = taskMessage(conversationId, taskId);
-        if (currentCard) {
-          currentCard.task.cursor = Math.max(
-            Number(currentCard.task.cursor || 0), sequence,
-          );
-        }
-      }
-      if (payload.waiting) {
-        appendTaskAssistantText(taskId, payload.assistant_text, conversationId);
-        const currentCard = taskMessage(conversationId, taskId);
-        if (currentCard) {
-          applyTaskProjection(currentCard.task, payload.projection);
-          applyTaskProtocol(currentCard.task, payload);
-          if (!payload.projection) currentCard.task.phase1State = 'WAITING';
-          currentCard.task.waiting = payload.waiting;
-        }
-        if (payload.waiting.kind === 'APPROVAL' && payload.waiting.approval) {
-          bindLatestInputToTask(
-            conversationId, taskId, payload.waiting.approval.turn_id || null,
-          );
-          upsertApprovalMessage(taskId, payload.waiting.approval, conversationId);
-        } else {
-          clearApprovalMessage(taskId, conversationId);
-        }
-        if (conversationId === activeConversationId) renderMessages();
-        const submittedApprovalIsSettling = Boolean(
-          payload.waiting.kind === 'APPROVAL'
-          && currentCard?.task?.approvalResolution?.decision === 'APPROVE'
-          && currentCard.task.approvalResolution.requestId
-            === payload.waiting.approval?.request_id
-        );
-        if (!submittedApprovalIsSettling) {
-          follower.stop();
-          setLoading(false);
-        }
-        return;
-      }
-      if (payload.final) {
-        finish(payload).catch((error) => console.error(error));
-        return;
-      }
-      appendTaskProgress(taskId, payload, conversationId);
-      const progress = payload.progress || {};
-      if (
-        progress.kind === 'tool_completed'
-        && progress.tool_name === 'core.todo_list'
-        && progress.ok === true
-      ) {
-        reconcile().catch((error) => console.error(error));
-      }
+      try { payload = JSON.parse(event.data); }
+      catch (error) { console.error(error); return; }
+      follower.attempts = 0;
+      follower.queue = follower.queue.then(() => accept(payload)).catch(error => console.error(error));
     };
-    source.onerror = async () => {
+    source.onerror = () => {
       source.close();
-      if (follower.stopped) return;
-      if (await reconcile()) return;
+      if (!currentFollower() || follower.source !== source) return;
       follower.attempts += 1;
       if (follower.attempts > MAX_STREAM_RETRIES) {
-        appendTaskProgress(taskId, {
-          sequence: 0,
-          progress: {
-            activity: '实时输出连接已断开；任务仍在后台运行，可刷新页面查看结果。',
-          },
-        }, conversationId);
-        follower.stop();
-        setLoading(false);
+        // One recovery read after bounded reconnect failures. Healthy streams
+        // never issue periodic GET /tasks requests.
+        fetch(`/tasks/${taskId}`).then(response => response.ok ? response.json() : null)
+          .then(state => { if (state && currentFollower()) return applyState(state); })
+          .catch(error => console.error(error)).finally(() => {
+            if (currentFollower()) {
+              appendTaskProgress(taskId, {progress: {activity: '实时输出连接已断开；任务仍在后台运行，可刷新页面查看结果。'}}, conversationId);
+              follower.stop(); if (conversationId === activeConversationId) setLoading(false);
+            }
+          });
         return;
       }
-      setTimeout(connect, Math.min(1000 * follower.attempts, 5000));
+      const delay = Math.min(1000 * 2 ** (follower.attempts - 1), 15000);
+      follower.timer = setTimeout(connect, delay);
     };
   };
-
-  follower.timer = setInterval(() => {
-    reconcile().catch((error) => console.error(error));
-  }, 2500);
   connect();
 }
 
@@ -3550,13 +4152,18 @@ async function ensureConversationLoaded(conversationId) {
   const conversation = getConversationById(conversationId);
   if (!conversation || conversation.loaded) return false;
   conversation.loaded = true;
+  const loadGeneration = (conversation.historyLoadGeneration || 0) + 1;
+  conversation.historyLoadGeneration = loadGeneration;
   try {
     const response = await fetch(`/sessions/${conversationId}`);
     if (!response.ok) {
-      conversation.loaded = false;
+      if (conversation.historyLoadGeneration === loadGeneration) conversation.loaded = false;
       return false;
     }
     const data = await response.json();
+    // A history request started before a Turn finished may return afterwards.
+    // Only the newest refresh can replace the transcript or reopen a follower.
+    if (conversation.historyLoadGeneration !== loadGeneration) return false;
     const tasksById = new Map(
       (data.tasks || []).map((task) => [task.task_id, task]),
     );
@@ -3564,8 +4171,12 @@ async function ensureConversationLoaded(conversationId) {
     // rendered historical cards are deliberately not an authority signal.
     // Set it before rendering, because rendering also refreshes composer state.
     conversation.activeTaskId = data.active_task_id || null;
+    const turns = data.turns || [];
+    // Stopped is not completed: an interrupted Turn may have no answer.
+    // Preserve its Session settlement flag so its trace stays under the input.
+    // Cancellation visibility follows the Task state independently.
     conversation.turnCalls = new Map(
-      (data.turns || [])
+      turns
         .filter((turn) => turn && turn.turn_id)
         .map((turn) => [turn.turn_id, turn]),
     );
@@ -3656,10 +4267,46 @@ async function ensureConversationLoaded(conversationId) {
       || left.order - right.order
       || left.insertionOrder - right.insertionOrder
     ));
-    conversation.messages = [
+
+    // Preserve any local-only fields (such as images) on existing messages
+    // when rebuilding the transcript from the Session timeline. The
+    // authoritative Session record does not currently project inline image
+    // attachments, so a naive replacement would drop them after a Turn
+    // settles and refreshConversationHistory runs.
+    const previousMessages = Array.isArray(conversation.messages)
+      ? conversation.messages
+      : [];
+
+    const rebuiltMessages = [
       ...timeline.map((item) => item.message),
       ...pendingApprovals,
     ];
+
+    // For now we keep this mapping deliberately simple and resilient:
+    // if a previous message had inline images, we attach them to the first
+    // rebuilt message with the same role and content that does not already
+    // carry images. This handles the transition from a local, pre-Turn
+    // user message (no turnId/taskId yet) to the authoritative Session
+    // message (with ids) while keeping the attachments visible.
+    previousMessages.forEach((previous) => {
+      if (!previous?.images || !previous.images.length) return;
+      const role = previous.role || '';
+      const content = previous.content || '';
+      const images = previous.images;
+
+      const target = rebuiltMessages.find((message) => (
+        message
+        && (message.role || '') === role
+        && (message.content || '') === content
+        && (!message.images || !message.images.length)
+      ));
+
+      if (target) {
+        target.images = images;
+      }
+    });
+
+    conversation.messages = rebuiltMessages;
     renderConversations();
     renderMessages();
 
@@ -3677,7 +4324,7 @@ async function ensureConversationLoaded(conversationId) {
     }
     return true;
   } catch (error) {
-    conversation.loaded = false;
+    if (conversation.historyLoadGeneration === loadGeneration) conversation.loaded = false;
     console.error(error);
     return false;
   }
@@ -3787,6 +4434,7 @@ async function loadDiagnostics() {
   }
 }
 
+setupWorkspaceResizer();
 loadDiagnostics();
 loadWorkspaces();
 """ + """
@@ -3879,6 +4527,7 @@ def load_workspace_registry() -> None:
             "id": workspace_identifier(path),
             "name": str(item.get("name") or Path(path).name or path),
             "path": path,
+            **({"last_used_at": item["last_used_at"]} if isinstance(item.get("last_used_at"), str) else {}),
         })
 
 
@@ -3956,7 +4605,7 @@ def recover_workspace_registry_from_runtime() -> None:
     except Exception:
         return
     changed = False
-    for session in sessions:
+    for session in sorted(sessions, key=lambda item: item.updated_at, reverse=True):
         for task_id in reversed(session.task_ids):
             try:
                 task = runtime_server._call(kernel.get_task(task_id))
@@ -3964,6 +4613,10 @@ def recover_workspace_registry_from_runtime() -> None:
                 continue
             path = str(task.workspace)
             if path in known:
+                existing = next(item for item in workspace_registry if item["path"] == path)
+                if "last_used_at" not in existing:
+                    existing["last_used_at"] = session.updated_at.isoformat()
+                    changed = True
                 break
             if not Path(path).is_dir():
                 continue
@@ -3971,6 +4624,7 @@ def recover_workspace_registry_from_runtime() -> None:
                 "id": workspace_identifier(path),
                 "name": Path(path).name or path,
                 "path": path,
+                "last_used_at": session.updated_at.isoformat(),
             })
             known.add(path)
             changed = True
@@ -4088,15 +4742,31 @@ def register_workspace(raw_path: str) -> dict[str, str]:
         None,
     )
     if existing is not None:
+        touch_workspace(existing)
         return existing
 
     workspace = {
         "id": workspace_identifier(workspace_path),
         "name": resolved.name or workspace_path,
         "path": workspace_path,
+        "last_used_at": datetime.now(timezone.utc).isoformat(),
     }
     workspace_registry.append(workspace)
     save_workspace_registry()
+    return workspace
+
+
+def touch_workspace(workspace: dict) -> None:
+    workspace["last_used_at"] = datetime.now(timezone.utc).isoformat()
+    save_workspace_registry()
+
+
+@app.post("/workspaces/{workspace_id}/activate")
+async def activate_workspace(workspace_id: str) -> dict:
+    workspace = next((item for item in workspace_registry if item["id"] == workspace_id), None)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="工作区不存在")
+    touch_workspace(workspace)
     return workspace
 
 
@@ -4255,6 +4925,12 @@ async def submit_session_input(payload: dict, request: Request = None) -> dict:
     session_id = str(payload.get("session_id", "")).strip()
     request_id = str(payload.get("request_id", "")).strip()
     text = str(payload.get("text", "")).strip()
+    reasoning_effort_raw = payload.get("reasoning_effort")
+    reasoning_effort = (
+        str(reasoning_effort_raw).strip().lower()
+        if reasoning_effort_raw is not None
+        else None
+    ) or None
     workspace = next(
         (item for item in workspace_registry if item["id"] == workspace_id), None
     )
@@ -4267,14 +4943,27 @@ async def submit_session_input(payload: dict, request: Request = None) -> dict:
         )
 
     bind_session_to_workspace(session_id, workspace_id)
+    touch_workspace(workspace)
 
     async def ensure_session() -> None:
+        kernel = runtime_server._client.application.kernel
         try:
-            await runtime_server._client.application.kernel.get_session(session_id)
+            await kernel.get_session(session_id)
         except LookupError:
-            await runtime_server._client.application.kernel.create_session(
-                text[:120], session_id=session_id
-            )
+            await kernel.create_session(text[:120], session_id=session_id)
+        # Session-level reasoning-effort is a durable preference: when the
+        # caller supplies a value, keep the Session as the single source of
+        # truth and update its snapshot. Failure must not block the input.
+        if reasoning_effort is not None:
+            try:
+                await kernel.update_session_reasoning_effort(
+                    session_id, reasoning_effort,
+                )
+            except Exception:
+                logger.exception(
+                    "failed to update session reasoning_effort session_id=%s",
+                    session_id,
+                )
 
     runtime_server._call(ensure_session())
     # Attachments stay structured. Inlining base64 into the text would blow
@@ -4297,6 +4986,7 @@ async def submit_session_input(payload: dict, request: Request = None) -> dict:
             return await runtime_server._client.submit_user_input(
                 session_id, text, input_id=request_id, explicit_intent=intent,
                 images=tuple(image_blocks), workspace=Path(workspace['path']),
+                reasoning_effort=reasoning_effort,
             )
         finally:
             if token is not None:
@@ -4339,6 +5029,325 @@ async def submit_session_input(payload: dict, request: Request = None) -> dict:
         data['diagnostic_key'] = diagnostic_key
     status = 202 if data.get("kind") == "task" else 200
     return JSONResponse(content=data, status_code=status)
+
+
+def user_skills_store():
+    from tsm_agt.adapters.builtin.skill_tools import CoreSkillToolProvider
+    from tsm_agt.adapters.local_skills import UserSkillsStore
+
+    if runtime_server is not None:
+        for provider in runtime_server._client.application.kernel._dependencies.tools:
+            if isinstance(provider, CoreSkillToolProvider):
+                return provider.store
+    return UserSkillsStore()
+
+
+def refresh_skill_catalog(store=None) -> tuple:
+    store = store or user_skills_store()
+    if runtime_server is None:
+        return store.discover()
+
+    async def refresh():
+        registry = runtime_server._client.application.kernel._dependencies.skill_registry
+        store.refresh(registry)
+        return registry.list_all()
+
+    return runtime_server._call(refresh())
+
+
+def skill_data(skill) -> dict:
+    return {
+        "id": skill.id, "name": skill.name, "description": skill.description,
+        "kind": skill.kind.value, "plan_path": skill.plan_path,
+        "tags": list(skill.tags), "safety_level": skill.safety_level,
+        "approval_required": skill.approval_required,
+    }
+
+
+def skill_install_receipt(skill, store) -> dict:
+    """Disk commit is successful even if a subsequent catalog refresh fails."""
+    warnings = []
+    try:
+        refresh_skill_catalog(store)
+    except Exception:
+        logger.exception("Skill installed but runtime catalog refresh failed: %s", skill.name)
+        warnings.append("文件已安装，但运行时目录刷新失败；请稍后刷新设置或重启服务。")
+    installation = None
+    try:
+        installation = start_skill_preparation(store, store.installations.create(skill))
+    except Exception:
+        logger.exception("Skill files saved but preparation could not start: %s", skill.name)
+        warnings.append("文件已保存，但安装准备未启动；请在设置中重试准备。")
+    return {
+        "installed": True, "scope": "user", "skill": skill_data(skill),
+        "plan_path": skill.plan_path, "skill_id": skill.id,
+        "skill_name": skill.name, "description": skill.description,
+        "warnings": warnings,
+        "installation": installation,
+        "preparation_required": True,
+        "ready": bool(installation and installation["status"] == "ready"),
+    }
+
+
+_skill_install_launches: set[str] = set()
+
+
+def start_skill_preparation(store, job: dict) -> dict:
+    """Dispatch through the normal Runtime, never execute uploaded instructions here."""
+    if job["status"] != "pending":
+        return job
+    if runtime_server is None:
+        return store.installations.update(job["id"], summary="文件已保存；运行时不可用，等待重试准备。")
+    candidates = [item for item in workspace_registry if Path(item["path"]).is_dir()]
+    if not candidates:
+        return store.installations.update(job["id"], summary="文件已保存；请先选择工作区，再重试准备。")
+    # Legacy entries have no timestamp; use the last registered directory until
+    # the user activates a workspace or sends a message.
+    workspace = max(enumerate(candidates), key=lambda pair: (pair[1].get("last_used_at", ""), pair[0]))[1]
+    session_id = job.get("session_id") or f"session-{uuid4().hex}"
+    bind_session_to_workspace(session_id, workspace["id"])
+    job = store.installations.update(
+        job["id"], status="starting", session_id=session_id,
+        workspace_id=workspace["id"], workspace_path=workspace["path"],
+        summary="已创建安装会话，正在读取 Skill 并检查准备条件。",
+    )
+    server = runtime_server
+    _skill_install_launches.add(job["id"])
+
+    async def launch():
+        from tsm_agt.adapters.skill_installations import installation_prompt
+
+        try:
+            kernel = server._client.application.kernel
+            try:
+                await kernel.get_session(session_id)
+            except LookupError:
+                await kernel.create_session(f"安装 Skill：{job['skill_name']}", session_id=session_id)
+            result = await server._client.submit_user_input(
+                session_id, installation_prompt(job), input_id=job["id"],
+                explicit_intent=RuntimeInputIntent.NEW_TASK, workspace=Path(workspace["path"]),
+            )
+            task_id = (result.result.get("task") or {}).get("task_id") or result.result.get("routed_task_id")
+            if not task_id:
+                raise RuntimeError("安装会话未返回任务 ID")
+            # A fast model may already have reported ready during submission.
+            store.installations.update(job["id"], task_id=task_id)
+            store.installations.update(job["id"], expected_status="starting", status="running")
+        except Exception as error:
+            logger.exception("Skill preparation dispatch failed: %s", job["id"])
+            store.installations.update(job["id"], status="pending", summary=f"安装会话启动失败，可重试准备：{error}")
+        finally:
+            _skill_install_launches.discard(job["id"])
+            server._client.application.kernel.dependencies.store.notify(session_id, scope="session")
+
+    coroutine = launch()
+    try:
+        server.submit_background(coroutine)
+    except Exception as error:
+        coroutine.close()
+        _skill_install_launches.discard(job["id"])
+        return store.installations.update(job["id"], status="pending", summary=f"安装会话未启动，可重试准备：{error}")
+    return store.installations.get(job["id"])
+
+
+def refresh_skill_installation(store, job: dict) -> dict:
+    if runtime_server is None or job["status"] in {"pending", "ready", "blocked", "failed"}:
+        return job
+
+    async def status():
+        task_id = job.get("task_id")
+        if not task_id:
+            session = await runtime_server._client.application.kernel.get_session(job["session_id"])
+            task_id = session.active_task_id or (session.task_ids[-1] if session.task_ids else None)
+        return await runtime_server._client.get_task_result(task_id) if task_id else None
+
+    try:
+        result = runtime_server._call(status())
+    except LookupError:
+        result = None
+    if result is None:
+        if job["id"] not in _skill_install_launches:
+            return store.installations.update(job["id"], status="pending", summary="安装会话未开始，可重试准备。")
+        return job
+    # The reporting tool is authoritative for readiness. A stopped turn without
+    # a receipt must not be mistaken for successful environment verification.
+    current = store.installations.get(job["id"])
+    if current["status"] in {"ready", "blocked", "failed"}:
+        return current
+    state = result.status
+    summaries = {
+        "awaiting_approval": "等待审批，请打开安装会话处理。",
+        "awaiting_user": "等待登录或补充信息，请打开安装会话继续。",
+        "awaiting_input": "安装会话已停止，尚未报告准备完成；请打开会话继续验证。",
+        "completed": "安装会话已结束，尚未报告准备完成；请打开会话查看。",
+        "failed": "安装任务失败，请打开会话查看错误或重试准备。",
+        "interrupted": "安装任务已中断，请打开会话继续或重试准备。",
+        "needs_review": "安装任务需要复核，请打开会话查看。",
+    }
+    mapped = {"completed": "unverified", "awaiting_input": "unverified"}.get(state, state)
+    return store.installations.update(job["id"], expected_status=current["status"], task_id=result.task_id, status=mapped,
+                                      summary=summaries.get(state, "正在按 Skill 文档检查和准备环境。"))
+
+
+@app.get("/skills/installations/{installation_id}")
+async def get_skill_installation(installation_id: str) -> dict:
+    store = user_skills_store()
+    try:
+        return refresh_skill_installation(store, store.installations.get(installation_id))
+    except StopIteration:
+        raise HTTPException(status_code=404, detail="安装记录不存在") from None
+
+
+@app.get("/skills/installations/{installation_id}/events")
+async def stream_skill_installation(installation_id: str):
+    from tsm_agt.sdk.ui_events import subscribe_installation
+    receipts = user_skills_store().installations
+    try:
+        job = receipts.get(installation_id)
+    except StopIteration:
+        raise HTTPException(status_code=404, detail="安装记录不存在") from None
+    server = runtime_server
+
+    async def frames():
+        yield ": open\n\n"
+        if server is None:
+            yield "data: " + json.dumps({"installation": job, "watching": False}, ensure_ascii=False) + "\n\n"
+            return
+        iterator = subscribe_installation(server._client, receipts, installation_id)
+        async with aclosing(server.iterate_runtime(iterator)) as packets:
+            async for packet in packets:
+                if packet.get("type") == "stream.heartbeat":
+                    yield ": heartbeat\n\n"
+                else:
+                    yield "data: " + json.dumps(packet, ensure_ascii=False) + "\n\n"
+    return StreamingResponse(frames(), media_type="text/event-stream", headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
+
+
+@app.post("/skills/installations/{installation_id}/retry")
+async def retry_skill_preparation(installation_id: str) -> dict:
+    store = user_skills_store()
+    try:
+        job = refresh_skill_installation(store, store.installations.get(installation_id))
+    except StopIteration:
+        raise HTTPException(status_code=404, detail="安装记录不存在") from None
+    if job["status"] in {"starting", "running", "awaiting_approval", "awaiting_user"}:
+        return job
+    if job["status"] != "pending":
+        job = store.installations.create(store.parse(Path(job["plan_path"])), retry=True)
+    return start_skill_preparation(store, job)
+
+
+@app.get("/settings/skills")
+async def get_skill_settings() -> dict:
+    store = user_skills_store()
+    skills = refresh_skill_catalog(store)
+    try:
+        directories = store.discovery_directories()
+    except (OSError, ValueError):
+        directories = (store.install_directory.resolve(),)
+    return {
+        "install_directory": str(store.install_directory),
+        "discovery_directories": [str(path) for path in directories],
+        "skills": [skill_data(skill) for skill in skills],
+        "issues": list(store.issues),
+        "installations": [refresh_skill_installation(store, row) for row in store.installations.list()[-30:]],
+    }
+
+
+@app.put("/settings/skills")
+async def save_skill_settings(payload: dict) -> dict:
+    try:
+        user_skills_store().save_directories(payload.get("discovery_directories"))
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return await get_skill_settings()
+
+
+@app.post("/settings/skills/pick")
+async def pick_skill_directories() -> dict:
+    return {"paths": await asyncio.to_thread(choose_skill_directories)}
+
+
+def choose_skill_directories() -> list[str]:
+    if sys.platform != "darwin":
+        raise HTTPException(status_code=501, detail="当前系统请手动输入目录路径")
+    script = (
+        'set chosen to choose folder with prompt "选择可发现 Skills 目录（可多选）" with multiple selections allowed\n'
+        'set resultText to ""\n'
+        'repeat with itemPath in chosen\n'
+        'set resultText to resultText & POSIX path of itemPath & linefeed\n'
+        'end repeat\n'
+        'return resultText'
+    )
+    try:
+        completed = subprocess.run(
+            ["osascript", "-e", script], capture_output=True, text=True, check=False,
+        )
+    except OSError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    if completed.returncode:
+        if "-128" in completed.stderr or "User canceled" in completed.stderr:
+            return []
+        raise HTTPException(status_code=503, detail=completed.stderr.strip())
+    return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+
+
+@app.post("/skills/upload")
+async def upload_skill_directory(
+    files: list[UploadFile] = File(...),
+    session_id: str | None = Form(None),
+    workspace_id: str | None = Form(None),
+) -> dict:
+    """Install one uploaded directory into the user catalog, across all chats."""
+    try:
+        store = user_skills_store()
+        files = [file for file in files if not store.ignored_upload_file(file.filename or "")]
+        uploaded: dict[str, bytes] = {}
+        remaining = 20_000_000
+        if len(files) > 500:
+            raise ValueError("Skill 上传最多 500 个文件")
+        for file in files:
+            if not file.filename or file.filename in uploaded:
+                raise ValueError("上传文件名为空或重复")
+            content = await file.read(remaining + 1)
+            remaining -= len(content)
+            if remaining < 0:
+                raise ValueError("Skill 上传不能超过 20 MB")
+            uploaded[file.filename] = content
+        skill = store.install_upload(uploaded)
+        # Awaiting this upload also orders it after a workspace selection; a
+        # separate browser activation request may still be in flight.
+        if isinstance(workspace_id, str):
+            workspace = next((row for row in workspace_registry if row["id"] == workspace_id), None)
+            if workspace is not None:
+                touch_workspace(workspace)
+        return skill_install_receipt(skill, store)
+    except FileExistsError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.post("/skills/install")
+async def install_skill_endpoint(payload: dict) -> dict:
+    """Install a local manifest; metadata comes from SKILL.md, not the chat."""
+    raw_path = payload.get("plan_path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise HTTPException(status_code=400, detail="请提供 SKILL.md 路径")
+    try:
+        store = user_skills_store()
+        manifest = Path(raw_path).expanduser().resolve()
+        if manifest.name != "SKILL.md" or not manifest.is_file():
+            raise ValueError("请选择存在的 SKILL.md 文件")
+        if manifest.is_relative_to(store.install_directory.resolve()):
+            skill = store.parse(manifest)
+        else:
+            skill = store.install_path(manifest)
+        return skill_install_receipt(skill, store)
+    except FileExistsError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 def _cancel_on_disconnect() -> bool:
@@ -4780,9 +5789,7 @@ async def get_session(session_id: str) -> dict:
             "attached_sequence": task_attach_sequences.get(task_id, 0),
             "phase1_state": result.phase1_state,
             "status": result.status,
-            "progress_cursor": (
-                runtime_server._client.latest_progress_sequence(task_id)
-            ),
+            "progress_cursor": result.cursor,
             "waiting": _waiting_payload(result),
             "failure_reason": (
                 _task_failure_reason(task_id)
@@ -4849,200 +5856,6 @@ _TURN_CALL_KEYS = (
     "tool", "state", "ok", "error_code", "succeeded", "failure_code",
     "path", "query", "pattern", "target", "file_glob",
 )
-
-#: The durable events that describe how one Turn progressed. Reading only these
-#: keeps whole model messages and patch bodies out of the per-Turn view.
-_TURN_PROGRESS_EVENT_TYPES = (
-    "turn.started",
-    "model.attempt_started",
-    "model.attempt_failed",
-    "model.recovery_decided",
-    "conversation.model_response_recorded",
-    "conversation.execution_note",
-    "conversation.stage_summary",
-    "tool.requested",
-    "tool.completed",
-    "tool.failed",
-    "turn.completed",
-    "turn.interrupted",
-    "llm.failed",
-    "turn.completion_review_completed",
-    "turn.completion_review_exhausted",
-    "turn.completion_review_skipped",
-    "turn.completion_review_bypassed",
-    "approval.requested",
-    "approval.resolved",
-    "approval.invalidated",
-    "checkpoint.conflict",
-)
-
-#: Argument keys a progress line may name as the call's target. Same rule as
-#: ``_TURN_CALL_KEYS``: navigation metadata only, never command or patch bodies.
-_TURN_PROGRESS_TARGET_KEYS = (
-    "path", "query", "pattern", "target", "file_glob", "url",
-)
-
-#: Bound for any single string copied into a progress line.
-_TURN_PROGRESS_TEXT_LIMIT = 200
-
-
-def _turn_progress_item(event, *, fallback_turn_id: str | None = None) -> dict | None:
-    """Normalize one durable event into a Turn progress item.
-
-    The shapes mirror the live ``AgentProgress`` items the page already renders,
-    so one renderer covers both the in-flight Turn and its durable record.
-    """
-
-    payload = event.payload if isinstance(event.payload, Mapping) else {}
-    turn_id = str(
-        payload.get("turn_id") or getattr(event, "turn_id", "") or fallback_turn_id or ""
-    )
-    if not turn_id:
-        return None
-    kind = event.event_type
-    base: dict[str, Any] = {"turn_id": turn_id, "sequence": event.sequence}
-    if kind == "checkpoint.conflict":
-        conflicts = [item[:80] for item in (payload.get("conflicts") or []) if isinstance(item, str)][:12]
-        return {**base, "kind": "turn_conflict", "conflicts": conflicts,
-                "diagnostic_code": "checkpoint_identity_conflict",
-                "detail": _checkpoint_conflict_reason(conflicts)}
-    if kind in {"approval.resolved", "approval.invalidated"}:
-        return {**base, "kind": kind.replace(".", "_"),
-                "request_id": str(payload.get("request_id") or ""),
-                "decision": payload.get("decision"), "reason": _bounded_text(payload.get("reason"))}
-    if kind == "turn.started":
-        return {
-            **base, "kind": "turn_started",
-            "input_characters": payload.get("input_character_count"),
-            "tool_exposure_profile": payload.get("tool_exposure_profile"),
-            "visible_tool_count": len(payload.get("visible_tools") or ()),
-        }
-    if kind in {"model.attempt_started", "model.attempt_failed",
-                "model.recovery_decided"}:
-        event_kind = {
-            "model.attempt_started": "attempt_started",
-            "model.attempt_failed": "attempt_failed",
-            "model.recovery_decided": "recovery_decided",
-        }[kind]
-        return {
-            **base, "kind": "model_transport",
-            "transport_event": event_kind,
-            "transport_attempt": payload.get("provider_attempt"),
-            "max_transport_attempts": payload.get("max_provider_attempts"),
-            "transport_mode": payload.get("transport_mode"),
-            "diagnostic_code": payload.get("diagnostic_code"),
-            "diagnostic_detail": _bounded_text(payload.get("diagnostic_detail")),
-            "recovery_action": payload.get("recovery_action"),
-            "retry_delay_seconds": payload.get("delay_seconds"),
-        }
-    if kind == "conversation.model_response_recorded":
-        return {
-            **base, "kind": "model_completed",
-            "model_call": payload.get("model_call"),
-            "tool_call_count": payload.get("tool_call_count"),
-            "finish_reason": payload.get("finish_reason"),
-        }
-    if kind in {"conversation.execution_note", "conversation.stage_summary"}:
-        return {
-            **base, "kind": kind.removeprefix("conversation."),
-            "model_call": payload.get("model_call"),
-            "activity": str(payload.get("text") or ""),
-            "phase": str(payload.get("source") or "model"),
-        }
-    if kind == "tool.requested":
-        call = payload.get("call")
-        call = call if isinstance(call, Mapping) else {}
-        arguments = call.get("arguments")
-        arguments = arguments if isinstance(arguments, Mapping) else {}
-        target = next(
-            (
-                str(arguments[key]).strip()
-                for key in _TURN_PROGRESS_TARGET_KEYS
-                if isinstance(arguments.get(key), str)
-                and str(arguments[key]).strip()
-            ),
-            "",
-        )
-        return {
-            **base, "kind": "tool_started",
-            "tool_name": str(call.get("name") or ""),
-            "tool_call_id": str(call.get("call_id") or ""),
-            "target": target[:_TURN_PROGRESS_TEXT_LIMIT],
-        }
-    if kind in {"tool.completed", "tool.failed"}:
-        result = payload.get("result")
-        result = result if isinstance(result, Mapping) else {}
-        return {
-            **base, "kind": "tool_completed",
-            "tool_call_id": str(result.get("call_id") or ""),
-            "ok": bool(result.get("ok")),
-            "error_code": result.get("error_code"),
-        }
-    if kind == "turn.completed":
-        return {
-            **base, "kind": "turn_completed",
-            "model_calls": payload.get("model_calls"),
-            "tool_calls": payload.get("tool_calls"),
-        }
-    if kind == "turn.interrupted":
-        return {
-            **base, "kind": "turn_interrupted",
-            "diagnostic_code": payload.get("failure_category"),
-            "detail": _bounded_text(payload.get("message")),
-        }
-    if kind == "approval.requested":
-        request = payload.get("request")
-        request = request if isinstance(request, Mapping) else {}
-        return {
-            **base,
-            "kind": "waiting",
-            "waiting_kind": "approval",
-            "action": _bounded_text(request.get("action") or payload.get("action")),
-            "request_id": str(
-                request.get("request_id") or payload.get("request_id") or ""
-            ),
-        }
-    if kind == "turn.completion_review_completed":
-        return {
-            **base, "kind": "completion_review",
-            "review_action": payload.get("action"),
-            "review_reason_code": payload.get("reason_code"),
-        }
-    if kind == "turn.completion_review_exhausted":
-        return {
-            **base, "kind": "completion_review",
-            "review_action": "EXHAUSTED",
-            "review_reason_code": payload.get("reason_code"),
-        }
-    if kind == "turn.completion_review_skipped":
-        return {
-            **base, "kind": "completion_review",
-            "review_action": "SKIPPED",
-            "review_reason_code": payload.get("reason_code"),
-        }
-    if kind == "turn.completion_review_bypassed":
-        return {
-            **base, "kind": "completion_review",
-            "review_action": "UNVERIFIED",
-            "review_reason_code": payload.get("reason_code"),
-        }
-    if kind == "llm.failed":
-        # A recoverable stop also writes ``turn.interrupted``; that one line is
-        # the whole story, so the duplicate is dropped.
-        if payload.get("recoverable"):
-            return None
-        return {
-            **base, "kind": "turn_failed",
-            "error_type": payload.get("error_type"),
-            "diagnostic_code": payload.get("failure_category"),
-            "detail": _bounded_text(payload.get("message")),
-        }
-    return None
-
-
-def _bounded_text(value: Any) -> str:
-    text = str(value).strip() if value is not None else ""
-    return text[:_TURN_PROGRESS_TEXT_LIMIT]
 
 
 def _session_turn_calls(session_events) -> list[dict]:
@@ -5240,6 +6053,8 @@ def _task_failure_reason(task_id: str) -> str | None:
             break  # Never reuse an older Turn's failure for this Turn.
         if event.event_type == "checkpoint.conflict":
             return _checkpoint_conflict_reason(event.payload.get("conflicts") or [])
+        if event.event_type == "turn.incomplete_boundary":
+            return _incomplete_reason(event.payload)
         if event.event_type == "turn.interrupted":
             message = str(event.payload.get("message", "")).strip()
             if message:
@@ -5258,129 +6073,46 @@ def _checkpoint_conflict_reason(conflicts) -> str:
 
 @app.get("/stream/{task_id}")
 async def stream(
-    task_id: str, after: int = 0, request: Request = None,  # type: ignore[assignment]
+    task_id: str, after: int = 0, request: Request = None,
 ):
     if runtime_server is None:
-        raise HTTPException(
-            status_code=503,
-            detail=runtime_error or "runtime unavailable",
-        )
+        raise HTTPException(status_code=503, detail=runtime_error or "runtime unavailable")
+    if request is not None and getattr(request, "headers", {}).get("last-event-id"):
+        try:
+            after = int(request.headers["last-event-id"])
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid Last-Event-ID") from None
     if after < 0:
         raise HTTPException(status_code=400, detail="after must not be negative")
+    server = runtime_server
 
     async def event_generator():
-        cursor = after
-        announced_wait: str | None = None
-        while True:
-            # Spec D6: check the connection before every yield. A disconnect
-            # always releases this stream; it only cancels the Task when
-            # explicitly configured, because durable sessions are the point.
-            if request is not None and await request.is_disconnected():
-                note_stream_released(task_id)
-                if _cancel_on_disconnect():
-                    await runtime_server._client.cancel(
-                        task_id, command_id=f"disconnect-{task_id}",
-                        reason="client disconnected",
-                    )
-                return
-            items = runtime_server._client.read_progress(task_id, after=cursor)
-            for item in items:
-                cursor = max(cursor, item.sequence)
-                yield (
-                    f"id: {item.sequence}\n"
-                    f"data: {json.dumps(item.to_data(), ensure_ascii=False)}\n\n"
-                )
+        # Preserve the explicit opt-in cancellation policy. A normal disconnect
+        # only releases the subscriber and never replays or cancels execution.
+        if request is not None and await request.is_disconnected():
+            note_stream_released(task_id)
+            if _cancel_on_disconnect():
+                await server._client.cancel(task_id, command_id=f"disconnect-{task_id}", reason="client disconnected")
+            return
+        iterator = server._client.subscribe_task_ui(task_id, after=after)
+        try:
+            yield ": open\n\n"
+            async with aclosing(server.iterate_runtime(iterator)) as packets:
+                async for packet in packets:
+                    if packet["type"] == "stream.heartbeat":
+                        yield ": heartbeat\n\n"
+                        continue
+                    sequence = packet.get("sequence")
+                    identity = f"id: {sequence}\n" if sequence is not None else ""
+                    yield identity + "data: " + json.dumps(packet, ensure_ascii=False) + "\n\n"
+        finally:
+            note_stream_released(task_id)
+            if _cancel_on_disconnect() and request is not None and await request.is_disconnected():
+                server.submit_background(server._client.cancel(task_id, command_id=f"disconnect-{task_id}", reason="client disconnected"))
 
-            result = runtime_server._call(
-                runtime_server._client.get_task_result(task_id)
-            )
-            # A suspended Turn produces no further progress until the user acts,
-            # so the wait itself has to reach the page; otherwise the UI shows a
-            # spinner over a Task that is asking for a decision.
-            waiting = _waiting_payload(result)
-            signature = json.dumps(
-                {"waiting": waiting, "assistant_text": result.assistant_text},
-                ensure_ascii=False, sort_keys=True,
-            )
-            if waiting is not None and signature != announced_wait:
-                announced_wait = signature
-                yield (
-                    "data: "
-                    + json.dumps(
-                        {
-                            "task_id": task_id,
-                            "waiting": waiting,
-                            "projection": result.projection,
-                            "latest_answer_event_ref": result.latest_answer_event_ref,
-                            "conclusion_claims": [
-                                dict(item) for item in result.conclusion_claims
-                            ],
-                            "conclusion_validation": (
-                                dict(result.conclusion_validation)
-                                if result.conclusion_validation is not None else None
-                            ),
-                            # A Task may generate a useful response and then
-                            # suspend for clarification or continuation. Waiting
-                            # must not hide that already durable response.
-                            "assistant_text": result.assistant_text,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n\n"
-                )
-            elif waiting is None:
-                announced_wait = None
-            if result.phase1_state in {
-                "INTERRUPTED", "DONE", "FAILED", "CANCELLED", "NEEDS_REVIEW",
-            }:
-                # Progress is ephemeral; the final answer only lives on the
-                # Task result, so the stream has to deliver it before closing.
-                # A failed Task has no answer at all, so surface the recorded
-                # reason instead of an empty bubble.
-                yield (
-                    "data: "
-                    + json.dumps(
-                        {
-                            "task_id": task_id,
-                            "final": True,
-                            "projection": result.projection,
-                            "latest_answer_event_ref": result.latest_answer_event_ref,
-                            "conclusion_claims": [
-                                dict(item) for item in result.conclusion_claims
-                            ],
-                            "conclusion_validation": (
-                                dict(result.conclusion_validation)
-                                if result.conclusion_validation is not None else None
-                            ),
-                            "phase1_state": result.phase1_state,
-                            "state": result.state,
-                            "status": result.status,
-                            "assistant_text": result.assistant_text,
-                            "clarification": result.clarification,
-                            "failure_reason": _task_failure_reason(task_id)
-                            if result.phase1_state in {"FAILED", "INTERRUPTED"} else None,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n\n"
-                )
-                return
-            await asyncio.sleep(1)
-            # Keep idle connections observable to browsers and reverse
-            # proxies.  Without a comment frame, the server is polling but
-            # the wire is silent and common SSE timeouts tear down the stream.
-            if request is None or not await request.is_disconnected():
-                yield ": heartbeat\n\n"
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no",
+    })
 
 
 def main() -> None:

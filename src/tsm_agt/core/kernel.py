@@ -350,6 +350,8 @@ from .session_resources import (
     SessionQuestionReference, SessionResourceKind, SessionResourceReference,
 )
 from .conversation_orchestration import OrchestrationMode
+from .skill_selector import SkillSelector
+from .skills import SkillRegistry
 from .tool_result_governor import DefaultToolResultGovernor
 from .turn import (
     InvalidModelResponse, InvalidTurnState, ModelInvocationFailed,
@@ -449,6 +451,8 @@ class KernelDependencies:
     effective_working_memory_projector: EffectiveWorkingMemoryProjector = field(
         default_factory=EffectiveWorkingMemoryProjector
     )
+    skill_registry: SkillRegistry = field(default_factory=SkillRegistry)
+    skill_selector: SkillSelector | None = None
 
 
 #: Who may drive a Task into each terminal state. "runtime" enforces limits and

@@ -268,7 +268,6 @@ class EngineeringAgentClient:
         self._latest_results: dict[str, RuntimeTaskResult] = {}
         self._progress_history: dict[str, list[RuntimeProgressEnvelope]] = {}
         self._progress_sequences: dict[str, int] = {}
-        self._progress_changed = asyncio.Condition()
         self._submit_lock = asyncio.Lock()
         # One foreground Task per Session: serialize inputs per Session id.
         self._session_input_locks: dict[str, asyncio.Lock] = {}
@@ -367,9 +366,7 @@ class EngineeringAgentClient:
                 )
                 self._run_tasks[task.task_id] = runner
                 runner.add_done_callback(
-                    lambda _done, task_id=task.task_id: self._run_tasks.pop(
-                        task_id, None
-                    )
+                    lambda _done, task_id=task.task_id: self._runner_finished(task_id)
                 )
         return await self.get_task_result(task.task_id)
 
@@ -400,7 +397,7 @@ class EngineeringAgentClient:
                 )
                 self._run_tasks[task_id] = runner
                 runner.add_done_callback(
-                    lambda _done, tid=task_id: self._run_tasks.pop(tid, None)
+                    lambda _done, tid=task_id: self._runner_finished(tid)
                 )
         # Report the turn as started, not the conversation's idle state it is
         # leaving: a caller (the Web UI) that sees AWAITING_INPUT would treat
@@ -745,6 +742,7 @@ class EngineeringAgentClient:
         target_task_id: str | None = None,
         images: tuple[ImageBlock, ...] = (),
         workspace: Path | None = None,
+        reasoning_effort: str | None = None,
     ) -> RuntimeCommandResult:
         """One entry point for every client (Web / CLI / SDK).
 
@@ -765,6 +763,7 @@ class EngineeringAgentClient:
                 explicit_intent=explicit_intent,
                 target_task_id=target_task_id,
                 image_blocks=image_blocks, workspace=resolved_workspace,
+                reasoning_effort=reasoning_effort,
             )
 
     async def _route_user_input(
@@ -773,6 +772,7 @@ class EngineeringAgentClient:
         target_task_id: str | None,
         image_blocks: tuple[ImageBlock, ...],
         workspace: Path,
+        reasoning_effort: str | None,
     ) -> RuntimeCommandResult:
         session = await self._ensure_session(session_id, text)
         active = await self._active_task(target_task_id or session.active_task_id)
@@ -1199,8 +1199,19 @@ class EngineeringAgentClient:
             await self.application.kernel.get_effective_working_memory(task_id)
         )
         status = _status_for_state(task.state)
+        partial = (
+            _current_incomplete_boundary(events)
+            if task.state is TaskState.EXECUTING else None
+        )
+        if partial is not None:
+            # Partial boundaries keep the execution checkpoint resumable. Read
+            # their durable status rather than losing it on the next GET or a
+            # restart and claiming there is still a running model exchange.
+            status = "incomplete"
+            assistant_text = None
         return RuntimeTaskResult(
-            task_id, task.state.value, task.state.phase1_state.value,
+            task_id, task.state.value,
+            "INTERRUPTED" if partial is not None else task.state.phase1_state.value,
             status, stored.last_event_sequence,
             assistant_text=assistant_text,
             approval=_approval_data(task),
@@ -1213,7 +1224,10 @@ class EngineeringAgentClient:
             latest_answer_event_ref=projected.latest_answer_event_ref,
             conclusion_claims=projected.conclusion_claims,
             conclusion_validation=projected.conclusion_validation,
-            completion_diagnostics=_completion_diagnostics(events),
+            completion_diagnostics=(
+                {"status": "incomplete", "reason_code": partial.get("reason")}
+                if partial is not None else _completion_diagnostics(events)
+            ),
         )
 
     async def read_events(
@@ -1222,7 +1236,7 @@ class EngineeringAgentClient:
         if after < 0 or not 1 <= limit <= 1000:
             raise ValueError("after must be non-negative and limit must be 1..1000")
         await self.application.kernel.get_task(task_id)
-        events = (await self._store().read_events(task_id, after))[:limit]
+        events = await self._store().read_events(task_id, after, limit=limit)
         return tuple(RuntimeEventEnvelope(
             event.event_id, event.task_id, event.sequence, event.event_type,
             event.occurred_at.isoformat(), event.schema_version,
@@ -1244,17 +1258,34 @@ class EngineeringAgentClient:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout if timeout is not None else None
         cursor = after
-        while True:
-            events = await self.read_events(task_id, after=cursor, limit=1000)
-            for event in events:
-                cursor = event.cursor
-                yield event
-            task = await self.application.kernel.get_task(task_id)
-            if task.state.is_terminal and not events:
-                return
-            if deadline is not None and loop.time() >= deadline:
-                return
-            await asyncio.sleep(self._poll_interval)
+        with self._store().watch(task_id) as signal:
+            while True:
+                changed = signal.changed
+                events = await self.read_events(task_id, after=cursor, limit=1000)
+                for event in events:
+                    cursor = event.cursor
+                    yield event
+                task = await self.application.kernel.get_task(task_id)
+                if task.state.is_terminal and not events:
+                    return
+                if events:
+                    continue
+                remaining = None if deadline is None else deadline - loop.time()
+                if remaining is not None and remaining <= 0:
+                    return
+                try:
+                    await asyncio.wait_for(changed.wait(), remaining)
+                except TimeoutError:
+                    return
+
+    async def subscribe_task_ui(self, task_id: str, *, after: int = 0):
+        from .ui_events import subscribe_task_ui
+        iterator = subscribe_task_ui(self, task_id, after=after)
+        try:
+            async for packet in iterator:
+                yield packet
+        finally:
+            await iterator.aclose()
 
     def latest_progress_sequence(self, task_id: str) -> int:
         """Return the cursor for the ephemeral progress stream namespace."""
@@ -1281,42 +1312,40 @@ class EngineeringAgentClient:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout if timeout is not None else None
         cursor = after
-        while True:
-            items = self.read_progress(task_id, after=cursor, limit=1000)
-            for item in items:
-                cursor = item.sequence
-                yield item
-            task = await self.application.kernel.get_task(task_id)
-            runner = self._run_tasks.get(task_id)
-            running = runner is not None and not runner.done()
-            if task.state.is_terminal and not running and not items:
-                return
-            remaining = None if deadline is None else deadline - loop.time()
-            if remaining is not None and remaining <= 0:
-                return
-            wait_for = self._poll_interval if remaining is None else min(
-                self._poll_interval, remaining
-            )
-            async with self._progress_changed:
+        with self._store().watch(task_id) as signal:
+            while True:
+                changed = signal.changed
+                items = self.read_progress(task_id, after=cursor, limit=1000)
+                for item in items:
+                    cursor = item.sequence
+                    yield item
+                task = await self.application.kernel.get_task(task_id)
+                runner = self._run_tasks.get(task_id)
+                running = runner is not None and not runner.done()
+                if task.state.is_terminal and not running and not items:
+                    return
+                if items:
+                    continue
+                remaining = None if deadline is None else deadline - loop.time()
+                if remaining is not None and remaining <= 0:
+                    return
                 try:
-                    await asyncio.wait_for(
-                        self._progress_changed.wait(), timeout=wait_for
-                    )
+                    await asyncio.wait_for(changed.wait(), remaining)
                 except TimeoutError:
-                    pass
+                    return
+
+    def _runner_finished(self, task_id: str) -> None:
+        self._run_tasks.pop(task_id, None)
+        self._store().notify(task_id)
 
     def _record_progress(self, task_id: str, progress: AgentProgress) -> None:
         history = self._progress_history.setdefault(task_id, [])
         sequence = self._progress_sequences.get(task_id, 0) + 1
         self._progress_sequences[task_id] = sequence
         history.append(RuntimeProgressEnvelope(task_id, sequence, progress))
+        self._store().notify(task_id)
         if len(history) > 2000:
             del history[:-2000]
-        # Wake subscribers without making progress rendering affect execution.
-        async def notify() -> None:
-            async with self._progress_changed:
-                self._progress_changed.notify_all()
-        asyncio.create_task(notify())
 
     async def interrupt(
         self, task_id: str, *, command_id: str, reason: str,
@@ -1701,6 +1730,19 @@ def _session_decision_data(decision: SessionInputDecision) -> dict[str, Any]:
         "clarification": decision.clarification,
         "candidate_task_ids": list(decision.candidate_task_ids),
     }
+
+
+def _current_incomplete_boundary(events: tuple[Any, ...] | list[Any]) -> Mapping[str, Any] | None:
+    for event in reversed(events):
+        if event.event_type == "turn.incomplete_boundary":
+            return event.payload
+        if event.event_type in {
+            "turn.started", "turn.resumed", "turn.completed", "turn.failed",
+            "turn.interrupted", "model.attempt_started", "tool.requested",
+            "approval.resolved",
+        }:
+            return None
+    return None
 
 
 def _completion_diagnostics(

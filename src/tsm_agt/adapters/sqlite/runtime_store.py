@@ -57,6 +57,7 @@ class SQLiteRuntimeStore:
             self._database_path,
             isolation_level=None,
             timeout=5.0,
+            check_same_thread=False,
         )
         connection.row_factory = sqlite3.Row
         try:
@@ -173,9 +174,12 @@ class SQLiteRuntimeStore:
     async def read_events(
         self, task_id: str, after_sequence: int = 0,
         event_types: tuple[str, ...] | None = None,
+        *, limit: int | None = None,
     ) -> tuple[RuntimeEvent, ...]:
         if after_sequence < 0:
             raise ValueError("after_sequence must not be negative")
+        if limit is not None and not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
         connection = self._require_connection()
         event_columns = {
             str(row["name"]) for row in connection.execute(
@@ -200,6 +204,8 @@ class SQLiteRuntimeStore:
                 + ", ".join("?" for _ in event_types) + ")"
             )
             parameters.extend(event_types)
+        if limit is not None:
+            parameters.append(limit)
         rows = connection.execute(
             """
             SELECT event_id, task_id, sequence, event_type, payload_json,
@@ -208,7 +214,7 @@ class SQLiteRuntimeStore:
             FROM runtime_events
             WHERE task_id = ? AND sequence > ?""" + type_clause + """
             ORDER BY sequence ASC
-            """,
+            """ + (" LIMIT ?" if limit is not None else ""),
             tuple(parameters),
         ).fetchall()
         return tuple(

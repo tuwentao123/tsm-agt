@@ -91,6 +91,23 @@ class NativeWorkspacePathContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved.workspace, self.outside.resolve())
         self.assertEqual(resolved.relative_path, "source.txt")
 
+    async def test_executable_entry_preserves_final_link_without_granting_file_access(self) -> None:
+        target = self.outside / "actual-program"
+        target.write_text("program content\n", encoding="utf-8")
+        launcher = self.workspace / "runner"
+        try:
+            launcher.symlink_to(target)
+        except OSError as error:
+            self.skipTest(f"cannot create executable symlink: {error}")
+        resolved = self.path_service.resolve_executable_path(self.workspace, "./runner")
+        self.assertEqual(resolved.path, self.workspace.resolve() / "runner")
+        self.assertEqual(resolved.path.resolve(), target.resolve())
+        self.assertEqual(resolved.relative_path, "runner")
+        with self.assertRaisesRegex(ValueError, "escapes"):
+            self.path_service.resolve_access_path(self.workspace, "runner")
+        with self.assertRaisesRegex(ValueError, "escapes"):
+            self.path_service.resolve_executable_path(self.workspace, "../outside/actual-program")
+
     async def test_linked_parent_cannot_escape_workspace(self) -> None:
         link = self.workspace / "linked-parent"
         if os.name == "nt":
@@ -111,6 +128,10 @@ class NativeWorkspacePathContractTest(unittest.IsolatedAsyncioTestCase):
             self.path_service.resolve_access_path(
                 self.workspace, "linked-parent/escape.txt"
             )
+        with self.assertRaisesRegex(ValueError, "escapes the workspace"):
+            self.path_service.resolve_executable_path(
+                self.workspace, "linked-parent/runner"
+            )
 
     async def test_windows_ads_is_rejected(self) -> None:
         if os.name != "nt":
@@ -122,6 +143,10 @@ class NativeWorkspacePathContractTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(PermissionError, "alternate data stream"):
             self.path_service.resolve_access_path(
                 self.workspace, "ordinary.txt:hidden-stream"
+            )
+        with self.assertRaisesRegex(PermissionError, "alternate data stream"):
+            self.path_service.resolve_executable_path(
+                self.workspace, "ordinary.exe:hidden-stream"
             )
 
     async def test_windows_case_alias_has_one_canonical_key(self) -> None:

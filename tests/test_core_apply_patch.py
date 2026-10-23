@@ -197,10 +197,9 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
             "# first region\nx = 0\n# second region\nx = 1\n",
         )
 
-    async def test_v4a_without_anchor_edits_the_first_match(self) -> None:
-        # Without a disambiguating anchor, Codex matching applies at the first
-        # occurrence from the cursor rather than rejecting. This is the chosen
-        # tradeoff versus a strict unique-match applier.
+    async def test_v4a_without_anchor_rejects_duplicate_matches(self) -> None:
+        # The shared matcher requires a unique target instead of choosing the
+        # first duplicate. A named @@ anchor can disambiguate this location.
         target = self.workspace / "dup2.py"
         before = "x = 0\ny = 1\nx = 0\n"
         target.write_text(before, encoding="utf-8")
@@ -217,10 +216,10 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
             self.v4a_call("call-dup2", sha256(before), patch), "turn-dup2"
         )
 
-        self.assertTrue(result.ok)
-        self.assertEqual(
-            target.read_text(encoding="utf-8"), "x = 2\ny = 1\nx = 0\n"
-        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "PATCH_CONFLICT")
+        self.assertEqual(result.data["patch_conflict"]["match_failure"], "ambiguous")
+        self.assertEqual(target.read_text(encoding="utf-8"), before)
 
     async def test_v4a_tolerates_blank_lines_the_patch_omitted(self) -> None:
         # A frequent model imperfection: the quoted context drops blank lines
@@ -604,7 +603,8 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(result.ok)
         self.assertEqual(result.error_code, "PATCH_CONFLICT")
-        self.assertEqual(result.data, {"execution_state": "not_started"})
+        self.assertEqual(result.data["execution_state"], "not_started")
+        self.assertTrue(result.data["no_edits_applied"])
         self.assertIn("whether the change is still needed", result.hint)
         self.assertEqual(target.read_text(encoding="utf-8"), "already updated\n")
 

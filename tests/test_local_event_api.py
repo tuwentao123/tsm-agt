@@ -5,10 +5,12 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from tsm_agt.adapters.fixture import EchoModelProvider
+from tests.runtime_fixtures import RuntimeEchoModel as EchoModelProvider
+from tsm_agt.adapters.local_skills import UserSkillsStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.local_api import LocalEventApiServer
 from tsm_agt.core import TaskState
@@ -18,6 +20,10 @@ class LocalEventApiTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        patcher = patch("tsm_agt.bootstrap.composition.UserSkillsStore",
+                        return_value=UserSkillsStore(self.root / "home"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         application = compose_fixture_application(
             model_adapter=EchoModelProvider(), tool_adapters=()
         )
@@ -64,8 +70,9 @@ class LocalEventApiTest(unittest.TestCase):
         for _ in range(100):
             _, _, raw = self.request(f"/v1/tasks/{task_id}")
             task = json.loads(raw)
-            if task["state"] == "SUCCEEDED":
+            if task["state"] == TaskState.AWAITING_INPUT.value:
                 break
+        self.assertEqual(task["state"], TaskState.AWAITING_INPUT.value)
         self.assertEqual(task["assistant_text"], "hello API")
 
         _, headers, raw = self.request(

@@ -125,6 +125,7 @@ class RuntimeStorePort(RuntimeAdapter, Protocol):
     async def read_events(
         self, task_id: str, after_sequence: int = 0,
         event_types: tuple[str, ...] | None = None,
+        *, limit: int | None = None,
     ) -> tuple[RuntimeEvent, ...]: ...
 
     async def load_task(self, task_id: str) -> StoredTask | None: ...

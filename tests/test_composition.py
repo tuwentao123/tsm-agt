@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from tsm_agt.adapters.anthropic_messages import AnthropicMessagesModelProvider
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
+from tsm_agt.adapters.builtin.skill_tools import CoreSkillToolProvider
 from tsm_agt.bootstrap import (
     OrchestrationConfiguration,
     compose_local_flow_query_application,
@@ -116,7 +117,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 application.registry.all(RuntimeInputClassifierPort), ()
             )
-            self.assertEqual(len(application.registry.all(ToolProviderPort)), 1)
+            self.assertEqual(len(application.registry.all(ToolProviderPort)), 2)
             for port in (
                 ModelProviderPort,
                 ProcessExecutorPort,
@@ -139,7 +140,9 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
         application = compose_fixture_application(tool_adapters=())
         await application.registry.start_all()
         try:
-            self.assertEqual(application.registry.all(ToolProviderPort), ())
+            providers = application.registry.all(ToolProviderPort)
+            self.assertEqual(len(providers), 1)
+            self.assertIsInstance(providers[0], CoreSkillToolProvider)
             self.assertEqual(await application.kernel.list_tools(), ())
         finally:
             await application.registry.stop_all()

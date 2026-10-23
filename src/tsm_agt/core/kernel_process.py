@@ -104,7 +104,11 @@ class ProcessMixin:
             await self._record_process_preparation_failure(
                 task_id, turn_id, argv, cwd, error, invocation_id,
             )
-            raise FileNotFoundError(str(error)) from error
+            # Preserve the foreground API's argument-validation contract.
+            # Tool preflight returns the structured failure separately.
+            if error.code == "INVALID_PARAM":
+                raise ValueError(str(error)) from error
+            raise
         sandbox_request = SandboxRequest(
             prepared.argv,
             prepared.cwd,
@@ -126,7 +130,11 @@ class ProcessMixin:
                     },
                 ),),
             )
-            raise ProcessSandboxDenied(decision.reason)
+            raise ProcessSandboxDenied(decision.reason, diagnostics={
+                **prepared.to_audit_data(),
+                "requested_executable": argv[0],
+                "policy_diagnostics": dict(decision.diagnostics),
+            })
 
         process_id = f"process-{uuid4().hex}"
         request = ProcessStartRequest(
@@ -221,7 +229,7 @@ class ProcessMixin:
             await self._record_process_preparation_failure(
                 task_id, turn_id, argv, cwd, error, invocation_id,
             )
-            raise FileNotFoundError(str(error)) from error
+            raise
         decision = await self._dependencies.sandbox.authorize(
             SandboxRequest(
                 prepared.argv, prepared.cwd, prepared.environment,
@@ -233,7 +241,11 @@ class ProcessMixin:
                 "turn_id": turn_id, "argv_hash": self._argv_hash(prepared.argv),
                 "cwd": str(prepared.cwd), "reason": decision.reason,
             }),))
-            raise ProcessSandboxDenied(decision.reason)
+            raise ProcessSandboxDenied(decision.reason, diagnostics={
+                **prepared.to_audit_data(),
+                "requested_executable": argv[0],
+                "policy_diagnostics": dict(decision.diagnostics),
+            })
         process_id = f"process-{uuid4().hex}"
         request = ProcessStartRequest(
             process_id, prepared.argv, prepared.cwd, prepared.environment,
@@ -549,8 +561,9 @@ class ProcessMixin:
                 "argv_hash": self._argv_hash(argv),
                 "cwd": cwd,
                 "error_type": "FileNotFoundError",
-                "message": "process executable was unavailable before start",
+                "message": "process preparation failed before start",
                 "error_code": error.code,
+                "stage": error.stage,
                 "invocation_id": invocation_id,
             },
         ),))
@@ -566,11 +579,21 @@ class ProcessMixin:
         than an executor crash, so callers can decide a safe next step.
         """
         executor = self._require_process_executor()
-        resolved_cwd = self._resolve_process_cwd(Path(task.workspace), cwd)
-        validated_environment = self._validate_process_environment(environment)
+        try:
+            resolved_cwd = self._resolve_process_cwd(Path(task.workspace), cwd)
+        except (OSError, ValueError) as error:
+            raise ProcessPreparationError(
+                "INVALID_PARAM", str(error), executable=argv[0], stage="resolve_cwd",
+            ) from error
+        try:
+            validated_environment = self._validate_process_environment(environment)
+        except ValueError as error:
+            raise ProcessPreparationError(
+                "INVALID_PARAM", str(error), executable=argv[0], stage="validate_environment",
+            ) from error
         policy = ProcessEnvironmentPolicy(
             inherit_host_environment=True,
-            allowed_host_variables=("SSH_AUTH_SOCK", "HOME", "USER"),
+            allowed_host_variables=("PATH", "SSH_AUTH_SOCK", "HOME", "USER"),
             blocked_host_variables=("AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"),
             runtime_trust_mode="governed",
         )
@@ -580,14 +603,20 @@ class ProcessMixin:
         if os.path.sep in executable or (os.path.altsep and os.path.altsep in executable):
             candidate = Path(executable)
             candidate = candidate if candidate.is_absolute() else resolved_cwd / candidate
-            # Validate relative launchers against the workspace but preserve the
-            # lexical launcher path.  ``resolve()`` here would replace a stable
-            # wrapper identity with its implementation target after approval.
             if not Path(executable).is_absolute():
-                self._dependencies.workspace_path.resolve_access_path(
-                    resolved_cwd, executable
-                )
-            launch_path = Path(os.path.abspath(str(candidate)))
+                try:
+                    root = self._dependencies.workspace_path.normalize_workspace(Path(task.workspace))
+                    relative = os.path.relpath(candidate, root)
+                    launch_path = self._dependencies.workspace_path.resolve_executable_path(
+                        root, relative,
+                    ).path
+                except (OSError, ValueError) as error:
+                    raise ProcessPreparationError(
+                        "EXECUTABLE_PATH_INVALID", str(error), executable=executable,
+                        launch_path=str(candidate),
+                    ) from error
+            else:
+                launch_path = Path(os.path.abspath(str(candidate)))
         else:
             discovered = shutil.which(executable, path=safe_environment.get("PATH"))
             launch_path = Path(discovered) if discovered else Path()
@@ -595,14 +624,15 @@ class ProcessMixin:
             raise ProcessPreparationError(
                 "EXECUTABLE_NOT_FOUND",
                 f"command executable is unavailable in the governed environment: {executable}",
-                executable=executable,
+                executable=executable, launch_path=str(launch_path),
             )
         resolved_target = Path(os.path.realpath(launch_path))
         if not resolved_target.is_file() or not os.access(resolved_target, os.X_OK):
             raise ProcessPreparationError(
                 "EXECUTABLE_NOT_FOUND",
                 f"command executable target is unavailable in the governed environment: {executable}",
-                executable=executable,
+                executable=executable, launch_path=str(launch_path),
+                resolved_target=str(resolved_target),
             )
         return PreparedProcessExecution(
             launch_path=launch_path, resolved_target=resolved_target,

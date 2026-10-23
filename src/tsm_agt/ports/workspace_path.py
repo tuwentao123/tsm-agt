@@ -66,6 +66,16 @@ class WorkspacePathPort(RuntimeAdapter, Protocol):
         self, workspace: Path, relative_path: str,
     ) -> ResolvedWorkspacePath: ...
 
+    def resolve_executable_path(
+        self, workspace: Path, relative_path: str,
+    ) -> ResolvedWorkspacePath:
+        """Validate a contained launcher and its parent, preserving its final link.
+
+        This locates an entry point, not a grant to execute its resolved target.
+        The command sandbox separately authorizes that target.
+        """
+        ...
+
     def resolve_read_path(
         self, workspace: Path, requested_path: str,
         additional_roots: tuple[Path, ...] = (),

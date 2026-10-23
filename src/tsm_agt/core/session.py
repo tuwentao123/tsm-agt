@@ -93,6 +93,15 @@ class SessionSnapshot:
     closed_at: datetime | None = None
     close_reason: str | None = None
     pending_interaction: SessionInteractionRequest | None = None
+    #: Stable per-Session reasoning-effort preference for the main conversation
+    #: loop. When set, this value becomes the default reasoning_effort for
+    #: conversational turns in this Session; routing, planning and review calls
+    #: keep their bootstrap defaults.
+    reasoning_effort: str | None = None
+    #: Session-wide skill configuration. The Session remains the single durable
+    #: source of truth; the Kernel may cache a per-session view in the
+    #: SkillRegistry.
+    enabled_skills: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.session_id.strip() or not self.subject.strip() or not self.title.strip():
@@ -108,13 +117,28 @@ class SessionSnapshot:
 
     @classmethod
     def create(
-        cls, session_id: str, subject: str, title: str,
+        cls,
+        session_id: str,
+        subject: str,
+        title: str,
         now: datetime | None = None,
+        reasoning_effort: str | None = None,
+        enabled_skills: tuple[str, ...] = (),
     ) -> SessionSnapshot:
         timestamp = now or datetime.now(timezone.utc)
         return cls(
-            session_id, subject, title.strip(), SessionState.ACTIVE, (), None,
-            1, 1, timestamp, timestamp,
+            session_id,
+            subject,
+            title.strip(),
+            SessionState.ACTIVE,
+            (),
+            None,
+            1,
+            1,
+            timestamp,
+            timestamp,
+            reasoning_effort=reasoning_effort,
+            enabled_skills=enabled_skills,
         )
 
     @property
@@ -200,8 +224,10 @@ class SessionSnapshot:
     def to_data(self) -> dict[str, Any]:
         return {
             "schema_version": 1,
-            "session_id": self.session_id, "subject": self.subject,
-            "title": self.title, "state": self.state.value,
+            "session_id": self.session_id,
+            "subject": self.subject,
+            "title": self.title,
+            "state": self.state.value,
             "task_ids": list(self.task_ids),
             "active_task_id": self.active_task_id,
             "configuration_revision": self.configuration_revision,
@@ -213,8 +239,15 @@ class SessionSnapshot:
             "close_reason": self.close_reason,
             "pending_interaction": (
                 self.pending_interaction.to_data()
-                if self.pending_interaction is not None else None
+                if self.pending_interaction is not None
+                else None
             ),
+            # Session-level reasoning effort is optional and may be absent in
+            # older snapshots; persistence always writes the explicit key.
+            "reasoning_effort": self.reasoning_effort,
+            # Session-wide skill configuration. Older snapshots may not carry
+            # this key; persistence always writes an explicit list.
+            "enabled_skills": list(self.enabled_skills),
         }
 
     @classmethod
@@ -225,12 +258,15 @@ class SessionSnapshot:
         if not isinstance(raw_tasks, list):
             raise ValueError("session task_ids must be a list")
         snapshot = cls(
-            session_id=str(data["session_id"]), subject=str(data["subject"]),
-            title=str(data["title"]), state=SessionState(str(data["state"])),
+            session_id=str(data["session_id"]),
+            subject=str(data["subject"]),
+            title=str(data["title"]),
+            state=SessionState(str(data["state"])),
             task_ids=tuple(str(item) for item in raw_tasks),
             active_task_id=(
                 str(data["active_task_id"])
-                if data.get("active_task_id") is not None else None
+                if data.get("active_task_id") is not None
+                else None
             ),
             configuration_revision=int(data.get("configuration_revision", 1)),
             context_revision=int(data.get("context_revision", 1)),
@@ -238,15 +274,26 @@ class SessionSnapshot:
             updated_at=datetime.fromisoformat(str(data["updated_at"])),
             closed_at=(
                 datetime.fromisoformat(str(data["closed_at"]))
-                if data.get("closed_at") is not None else None
+                if data.get("closed_at") is not None
+                else None
             ),
             close_reason=(
                 str(data["close_reason"])
-                if data.get("close_reason") is not None else None
+                if data.get("close_reason") is not None
+                else None
             ),
             pending_interaction=(
                 SessionInteractionRequest.from_data(data["pending_interaction"])
-                if data.get("pending_interaction") is not None else None
+                if data.get("pending_interaction") is not None
+                else None
+            ),
+            reasoning_effort=(
+                str(data["reasoning_effort"])
+                if data.get("reasoning_effort") is not None
+                else None
+            ),
+            enabled_skills=tuple(
+                str(skill_id) for skill_id in data.get("enabled_skills", [])
             ),
         )
         if data.get("context_hash") and str(data["context_hash"]) != snapshot.context_hash:

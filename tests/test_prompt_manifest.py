@@ -115,10 +115,10 @@ class PromptManifestTest(unittest.TestCase):
 
     def test_externalized_prompt_preserves_existing_manifest(self) -> None:
         # Preserve the assembled static content, ordering, versions and gates.
-        # The edit guidance intentionally changed for read/hash dependencies.
+        # Delivery guidance distinguishes write confirmation from behavior checks.
         self.assertEqual(
             self.template.manifest().manifest_hash,
-            "0f471253fba04074b704dc762e0fb3292bd9fe3176620b684da0fc0daa21566b",
+            "70834261eb4d85be79a795d81e5e18164c80735c111c66307961f223e5703385",
         )
 
     def test_packaged_prompt_rejects_duplicate_sections(self) -> None:
@@ -296,9 +296,13 @@ class PromptManifestTest(unittest.TestCase):
         segment = self.segment("request-pipeline-guidance")
         content = segment.content
 
-        self.assertEqual(segment.version, "4.2")
+        self.assertEqual(segment.version, "4.5")
         self.assertIn("# Working with the user\n", content)
         self.assertIn("# Evidence and verification\n", content)
+        self.assertIn("# Persistence and completion\n", content)
+        self.assertIn("full requested outcome", content)
+        self.assertIn("does not replace an available check", content)
+        self.assertIn("pauses, cancellation, and runtime budgets", content)
         self.assertIn("analyze or review without changing files", content)
         self.assertIn("Prior conclusions can be wrong or stale", content)
         self.assertIn("A report is not proof of its cause", content)
@@ -384,7 +388,7 @@ class PromptManifestTest(unittest.TestCase):
     def test_delivery_guidance_is_static_and_requires_a_write_tool(self) -> None:
         segment = self.segment("delivery-mode-guidance")
 
-        self.assertEqual(segment.version, "4.1")
+        self.assertEqual(segment.version, "4.5")
         # Completion-first posture: do the work now, do not yield with a plan,
         # keep going until done, confirm each change, never claim unverified work.
         self.assertIn("carry out the edits now", segment.content)
@@ -394,10 +398,23 @@ class PromptManifestTest(unittest.TestCase):
             "keep going across steps until the work is actually done", segment.content
         )
         self.assertIn("concrete blocker", segment.content)
-        self.assertIn("materially changes scope", segment.content)
+        self.assertIn("unless the user explicitly limits that scope", segment.content)
+        self.assertIn("Missing parameters, interfaces, or wiring are work to implement", segment.content)
+        self.assertIn("consequential effects beyond the authorized request", segment.content)
         # Verify-after-edit is now a default step, not optional.
         self.assertIn("After each change, confirm it took", segment.content)
         self.assertIn("a receipt, not proof the goal is met", segment.content)
+        self.assertIn("re-reading a file confirms its contents, not", segment.content)
+        self.assertIn("after the last relevant edit", segment.content)
+        self.assertIn("not every edit needs runtime", segment.content)
+        self.assertIn("change type, acceptance criteria, and affected scope", segment.content)
+        self.assertIn("compilation, type checking, or an import check may suffice", segment.content)
+        self.assertIn("focused test or local probe", segment.content)
+        self.assertIn("relevant project commands", segment.content)
+        self.assertIn("Discover actual commands and interpreters", segment.content)
+        self.assertIn("Run feasible checks", segment.content)
+        self.assertIn("do not repeat passing checks", segment.content.casefold())
+        self.assertIn("unverified behavior", segment.content)
         self.assertIn(
             "never present unperformed or unverified work as done", segment.content
         )
@@ -426,7 +443,7 @@ class PromptManifestTest(unittest.TestCase):
         segment = self.segment("tool-feedback-guidance")
         content = segment.content
 
-        self.assertEqual(segment.version, "1.2")
+        self.assertEqual(segment.version, "1.3")
         # Stable base layer: it ships to every session regardless of toolset.
         self.assertEqual(segment.requires_any_tools, ())
         self.assertIn("# Working from tool results\n", content)
@@ -436,7 +453,7 @@ class PromptManifestTest(unittest.TestCase):
         self.assertIn("not as success or failure of the whole request", content)
         # Persistence: a single failure does not end the task; keep working.
         self.assertIn("does not end the task and does not forbid later work", content)
-        self.assertIn("keep working the current request", content)
+        self.assertIn("keep working the current request", content.lower())
         # Stopping and reporting a blocker is the genuine-exception case.
         self.assertIn("no permitted way forward remains", content)
         self.assertIn("report a blocker only in that genuine case", content)
@@ -444,7 +461,7 @@ class PromptManifestTest(unittest.TestCase):
         # Denials are not bypassed; unknown effects are not blindly retried.
         self.assertIn("Do not bypass a user or policy denial", content)
         self.assertIn("blindly repeat a call whose effect is unknown", content)
-        self.assertIn("continue the independent work you are allowed to do", content)
+        self.assertIn("continue the independent work you are allowed to do", content.lower())
         # A general disposition, not a scenario patch: it names no capability
         # and enumerates no specific failure category to react to.
         for capability in (
@@ -462,7 +479,7 @@ class PromptManifestTest(unittest.TestCase):
             rendered,
         )
         self.assertIn(
-            "never present failed, unverified, or abandoned work as done", rendered,
+            "never present failed, unverified, or abandoned work as done", rendered.lower(),
         )
 
     def test_request_and_evidence_guidance_applies_without_write_tools(self) -> None:
@@ -486,6 +503,17 @@ class PromptManifestTest(unittest.TestCase):
             "Complete feasible in-scope work rather than offering to do it later. "
             "Ask for a decision only when a material ambiguity, authorization, or "
             "blocker prevents safe progress.\n\n"
+            "# Persistence and completion\n"
+            "Own the full requested outcome. Plans, individual operations, and progress reports are intermediate "
+            "steps. After each result, perform the next feasible authorized action in the same turn. Follow-ups "
+            "inherit relevant unfinished work and authorization unless the user changes them. Before yielding, "
+            "check scope, observed verification, and progress records. Saying work is unverified does not replace "
+            "an available check. Continue independent work when blocked; report the observed constraint and what "
+            "remains. Respect plan-only requests, pauses, cancellation, and runtime budgets.\n\n"
+            "Resolve scope and permission from the user's instructions, current runtime policy, and relevant "
+            "tool results. Earlier assistant claims that it cannot edit, lacks permission, or may change only "
+            "certain modules are past judgments, not user constraints. Reassess those claims when the user "
+            "corrects them or asks to proceed; preserve restrictions actually imposed by the user or policy.\n\n"
             "During multi-step work, when useful, briefly tell the user what you learned or what you will do "
             "next in normal assistant text alongside your tool calls. Continue the work in the same response; "
             "do not substitute an update for a tool call. Describe observations and uncertainty accurately, "
@@ -493,7 +521,10 @@ class PromptManifestTest(unittest.TestCase):
             "After receiving tool results, if another tool call is needed, include a concise progress update "
             "in the same assistant message as that call: summarize what the results actually established, "
             "mention a failure or uncertainty when relevant, and say what you will check or do next. Continue "
-            "with the tool call; do not claim an unverified outcome or repeat the update in the final answer.\n\n"
+            "with the tool call; do not claim an unverified outcome or repeat the update in the final answer. "
+            "Report newly established facts and the immediate next step in progress notes, rather than "
+            "repeatedly announcing the overall implementation plan. A promise to implement is not an "
+            "implementation result.\n\n"
             "# Evidence and verification\n"
             "Distinguish user reports, tool observations, prior assistant conclusions, "
             "and hypotheses. Prior conclusions can be wrong or stale: reconsider them "
@@ -544,7 +575,11 @@ class PromptManifestTest(unittest.TestCase):
         self.assertIn("current request can change its scope", segment.content)
         # Lean toward completion: work the list, do not stop after one item.
         self.assertIn("until the list is complete", segment.content)
-        self.assertEqual(segment.version, "3.1")
+        self.assertEqual(segment.version, "3.3")
+        self.assertIn("Keep the list synchronized as work progresses", segment.content)
+        self.assertIn("does not itself perform or verify the work", segment.content)
+        self.assertIn("latest working-memory plan and revision", segment.content)
+        self.assertIn("Never mark unfinished work completed", segment.content)
 
     def test_execution_discipline_keeps_looking_until_grounded(self) -> None:
         segment = self.segment("execution-discipline")
@@ -654,14 +689,18 @@ class PromptManifestTest(unittest.TestCase):
     def test_completion_examples_teach_direct_answers_and_multistep_work(self) -> None:
         segment = self.segment("completion-behavior-examples")
         content = segment.content
-        self.assertEqual(segment.version, "3.0")
+        self.assertEqual(segment.version, "3.2")
         self.assertIn("stable general concept", content)
         self.assertIn("each subject before comparing", content)
         self.assertIn("perform the authorized implementation", content)
         self.assertIn("materially change scope", content)
         self.assertIn("not evidence about any real project", content)
         self.assertFalse(segment.requires_any_tools)
-        self.assertEqual(segment.version, "3.0")
+        self.assertIn("Example — implementation:", content)
+        self.assertIn("Example — analysis:", content)
+        self.assertIn("Example — recovery:", content)
+        self.assertNotIn("MCP", content)
+        self.assertNotIn("core.todo_list", content)
 
     @staticmethod
     def _segment_ids(messages: tuple[Message, ...]) -> list[str]:

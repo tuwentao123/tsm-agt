@@ -45,6 +45,78 @@ def _conversation_runtime_data(value: Mapping[str, Any]) -> dict[str, Any]:
     return data
 
 
+def working_goal_source(
+    events: Sequence[SessionEvent], goal: str | None,
+) -> dict[str, Any]:
+    """Identify a recorded goal without treating a copied state as an update.
+
+    Working-memory identity is distinct from the Session event that copied it.
+    Legacy records lacking an identity stay explicit about the missing source.
+    No relationship to the live request is inferred here.
+    """
+    if goal is None:
+        return {"kind": "unknown"}
+    for event in sorted(events, key=lambda item: item.sequence, reverse=True):
+        if event.event_type not in {
+            "session.task_result_recorded", "session.context_state_updated",
+        }:
+            continue
+        state = event.payload.get("working_state")
+        if not isinstance(state, Mapping) or "goal" not in state:
+            continue
+        # The projector strips surrounding whitespace from recorded goals.
+        value = state["goal"]
+        value = value.strip() if isinstance(value, str) else None
+        if value != goal:
+            # This is the latest write of the goal slot. If it cleared the
+            # value, project() fell back to dialogue; an older equal sentence
+            # must not be mistaken for the origin of that fallback.
+            return {"kind": "unknown"}
+        source: dict[str, Any] = {
+            "kind": (
+                "explicit_session_state"
+                if event.event_type == "session.context_state_updated"
+                else "recorded_working_state"
+            ),
+            "record_event_id": event.event_id,
+            "session_event_sequence": event.sequence,
+        }
+        for source_key, target_key in (
+            ("task_id", "task_id"), ("turn_id", "recorded_in_turn_id"),
+            ("working_memory_revision", "memory_revision"),
+            ("working_memory_hash", "memory_hash"),
+        ):
+            value = event.payload.get(source_key)
+            if value is not None:
+                source[target_key] = value
+        return source
+    # A goal can fall back to dialogue text instead of a recorded working state.
+    return {"kind": "unknown"}
+
+
+def _conversation_work_state(
+    value: Mapping[str, Any], goal_source: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Expose archived state with provenance, never a live completion contract."""
+    data = _conversation_runtime_data(value)
+    data["recorded_goal"] = {
+        # project() may fall back to the latest user sentence when no goal was
+        # recorded. That sentence stays in its native role, not a second copy
+        # mislabelled as historical state.
+        "text": (
+            value.get("goal") if goal_source
+            and goal_source.get("kind") != "unknown" else None
+        ),
+        "source": dict(goal_source or {"kind": "unknown"}),
+        "relationship_to_current_request": "not_assessed",
+    }
+    data["remaining_work_record_status"] = (
+        "has_recorded_items" if value.get("remaining_work") else "no_items_recorded"
+    )
+    data["request_completion_status"] = "not_assessed"
+    return data
+
+
 def _restricted_event_ref(value: Any) -> str | None:
     """Keep only a bounded opaque persisted-answer reference."""
     if not isinstance(value, str):
@@ -942,10 +1014,11 @@ class SessionContextProjector:
         exclude_task_id: str | None = None,
         exclude_turn_id: str | None = None,
         conversation_mode: bool = False,
+        goal_source: Mapping[str, Any] | None = None,
     ) -> SessionPromptProjection:
         work_state = projection.working_state.to_data()
         if conversation_mode:
-            work_state = _conversation_runtime_data(work_state)
+            work_state = _conversation_work_state(work_state, goal_source)
         if not projection.messages and not any((
             projection.working_state.goal, projection.working_state.constraints,
             projection.working_state.decisions, projection.working_state.open_questions,

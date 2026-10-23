@@ -87,6 +87,7 @@ class CoreToolPolicy:
 
     _POLICY_VERSION = 3
     _INTERNAL_STATE_TOOLS = frozenset({
+        "skill.installation_finish",
         "core.working_memory_update", "core.task_spec_update", "core.todo_list",
     })
 
@@ -99,6 +100,7 @@ class CoreToolPolicy:
             "r0_read_only": "allow",
             "r0_mutating": "deny",
             "r0_runtime_internal_state": "allow-listed",
+            "runtime_internal_state_tools": sorted(cls._INTERNAL_STATE_TOOLS),
             "r1_r3": "require_approval",
             "r4": "reserved-no-active-classification",
             "project_trust_enforced": True,

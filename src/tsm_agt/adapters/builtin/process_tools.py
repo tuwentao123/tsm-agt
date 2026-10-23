@@ -14,6 +14,7 @@ from tsm_agt.ports import (
     HealthState,
     HealthStatus,
     ModelToolContract,
+    ProcessStartError,
     ToolCall,
     ToolEffect,
     ToolFactCapability,
@@ -331,6 +332,15 @@ class CoreProcessToolProvider:
                 True,
                 data=dict(data),
                 fact_descriptor=self._fact_descriptor(call, context, data),
+            )
+        except ProcessStartError as error:
+            return ToolResult(
+                call.call_id, False, error_code=error.code, message=str(error),
+                data=error.data, hint=error.hint,
+                recovery_kind=(
+                    ToolRecoveryKind.NONE if error.code == "PERMISSION_DENIED"
+                    else ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE
+                ),
             )
         except LookupError as error:
             return self._error(call, "NOT_FOUND", str(error))

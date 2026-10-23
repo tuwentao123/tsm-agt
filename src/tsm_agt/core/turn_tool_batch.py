@@ -105,6 +105,7 @@ async def run_tool_batch(
                   if item.call_id == call.call_id), None)
             if state.checkpoint.tool_batch is not None else None
         )
+
         if frozen_call is not None:
             # Outcome bindings and normalized arguments were accepted
             # atomically with the batch. Never reinterpret them after a

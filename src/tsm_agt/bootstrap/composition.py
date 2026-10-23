@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tsm_agt.adapters.evented_runtime_store import evented_store
+
 from dataclasses import dataclass, replace
 import os
 from pathlib import Path
@@ -94,6 +96,10 @@ from tsm_agt.core import (
     ContextWindowManager, Kernel, KernelDependencies, SessionContextProjector,
 )
 from tsm_agt.core.conversation_orchestration import OrchestrationMode
+from tsm_agt.core.skill_selector import SkillSelector
+from tsm_agt.core.skills import SkillRegistry
+from tsm_agt.adapters.local_skills import UserSkillsStore
+from tsm_agt.adapters.builtin.skill_tools import CoreSkillToolProvider
 from tsm_agt.ports import (
     CrossProcessLockPort,
     FlowArtifactExportPort,
@@ -420,6 +426,11 @@ def _kernel_dependencies(
     )
     if completion_review_max_continuations < 0:
         raise ValueError("completion review max_continuations must not be negative")
+    skill_registry = SkillRegistry()
+    skill_selector = SkillSelector(skill_registry)
+    registry.register(
+        ToolProviderPort, CoreSkillToolProvider(skill_registry, UserSkillsStore(), registry.require(RuntimeStorePort))
+    )
     return KernelDependencies(
         model=registry.require(ModelProviderPort),
         store=registry.require(RuntimeStorePort),
@@ -524,6 +535,8 @@ def _kernel_dependencies(
             budget.get("verification_reserve_model_calls", 1)
         ),
         context_manager=context_manager or ContextWindowManager(),
+        skill_registry=skill_registry,
+        skill_selector=skill_selector,
     )
 
 
@@ -645,7 +658,7 @@ def compose_fixture_application(
         ModelRecoveryPolicyPort,
         model_recovery_policy_adapter or RuleBasedModelRecoveryPolicy(0),
     )
-    registry.register(RuntimeStorePort, store_adapter or InMemoryRuntimeStore())
+    registry.register(RuntimeStorePort, evented_store(store_adapter or InMemoryRuntimeStore()))
     registry.register(SandboxPort, sandbox_adapter or DenyAllSandbox())
     registry.register(
         ProcessExecutorPort, process_adapter or _platform_process_executor()
@@ -928,7 +941,7 @@ def compose_openai_compatible_readonly_application(
     )
     registry.register(
         RuntimeStorePort,
-        SQLiteRuntimeStore(database_path or Path.cwd() / ".agent" / "runtime.db"),
+        evented_store(SQLiteRuntimeStore(database_path or Path.cwd() / ".agent" / "runtime.db")),
     )
     registry.register(SandboxPort, DenyAllSandbox())
     registry.register(ProcessExecutorPort, _platform_process_executor())
@@ -1124,7 +1137,7 @@ def compose_openai_compatible_engineering_application(
     )
     registry.register(
         RuntimeStorePort,
-        SQLiteRuntimeStore(database_path or Path.cwd() / ".agent" / "runtime.db"),
+        evented_store(SQLiteRuntimeStore(database_path or Path.cwd() / ".agent" / "runtime.db")),
     )
     registry.register(SandboxPort, LocalWorkspaceSandbox(workspace_path))
     registry.register(ProcessExecutorPort, _platform_process_executor())

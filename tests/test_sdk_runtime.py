@@ -4,11 +4,13 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from tsm_agt.adapters.fixture import EchoModelProvider
+from tests.runtime_fixtures import RuntimeEchoModel as EchoModelProvider
+from tsm_agt.adapters.local_skills import UserSkillsStore
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
-from tsm_agt.core import ApprovalDecision, ModelInvocationFailed, TaskState
+from tsm_agt.core import ApprovalDecision, ModelInvocationFailed, TaskState, SessionTaskRelation
 from tsm_agt.ports import (
     AdapterDescriptor, FinishReason, Message,
     MessageRole, ModelRequest,
@@ -22,9 +24,9 @@ from tsm_agt.ports import (
     ModelRecoveryAction, ModelRecoveryDecision, ModelRecoveryExhausted,
     ModelRetrySafety,
 )
-from tsm_agt.core import OrchestrationMode
 from tsm_agt.sdk import EngineeringAgentClient
 from tsm_agt.sdk.runtime import _is_resumable_stop
+
 
 
 def fixture_client(root: Path, store=None) -> EngineeringAgentClient:
@@ -50,7 +52,7 @@ class BlockingModel(EchoModelProvider):
 
 
 class ApprovalModel(EchoModelProvider):
-    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+    capabilities = ProviderCapabilities(tools=True, context_window=32768)
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         result = next((
@@ -98,7 +100,12 @@ class ApprovalTool:
 
 
 class FailingModel(EchoModelProvider):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
     async def complete(self, request: ModelRequest) -> ModelResponse:
+        self.calls += 1
         raise RuntimeError("private provider detail must not escape")
 
 
@@ -112,6 +119,15 @@ class ContractBlockingModel(EchoModelProvider):
 
 
 class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # Installed user Skills must not change this suite's tools or budgets.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        skills = UserSkillsStore(Path(home.name))
+        patcher = patch("tsm_agt.bootstrap.composition.UserSkillsStore", return_value=skills)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     async def test_runtime_input_routes_and_command_replays(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -147,7 +163,7 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             application = compose_fixture_application(
-                model_adapter=FailingModel(), tool_adapters=()
+                model_adapter=(model := FailingModel()), tool_adapters=()
             )
             client = EngineeringAgentClient(
                 root, application_factory=lambda: application, poll_interval=0.001
@@ -158,6 +174,7 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 )
                 final = await client.wait_task(accepted.task_id, timeout=5)
                 self.assertEqual(final.state, TaskState.FAILED.value)
+                self.assertEqual(model.calls, 1)
                 self.assertNotIn(
                     "private provider detail", str(final.to_data())
                 )
@@ -227,7 +244,7 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     "hello SDK", command_id="sdk-create-1"
                 )
                 final = await client.wait_task(accepted.task_id, timeout=5)
-                self.assertEqual(final.state, TaskState.SUCCEEDED.value)
+                self.assertEqual(final.state, TaskState.AWAITING_INPUT.value)
                 self.assertEqual(final.assistant_text, "hello SDK")
                 first = await client.read_events(final.task_id, after=0, limit=2)
                 rest = await client.read_events(
@@ -250,19 +267,22 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     "hello resume", command_id="sdk-resume-create"
                 )
                 final = await client.wait_task(accepted.task_id, timeout=5)
-                self.assertEqual(final.state, TaskState.SUCCEEDED.value)
-                # A Task that is not awaiting a continuation simply returns its
-                # current result, so the explicit channel is always safe.
+                self.assertEqual(final.state, TaskState.AWAITING_INPUT.value)
+                # An idle conversation starts its next turn. Replaying the same
+                # command must not start a third turn.
                 first = await client.resume_continuation(
                     final.task_id, command_id="sdk-resume-1", text="继续"
                 )
-                self.assertIn("task_id", first.result)
+                self.assertEqual(first.result["assistant_text"], "继续")
+                before_replay = await client.read_events(final.task_id)
                 again = await client.resume_continuation(
                     final.task_id, command_id="sdk-resume-1", text="继续"
                 )
                 self.assertEqual(again.result, first.result)
+                self.assertTrue(again.replayed)
+                self.assertEqual(await client.read_events(final.task_id), before_replay)
 
-    async def test_readiness_mode_does_not_gate_the_terminal_path(self) -> None:
+    async def test_readiness_mode_does_not_gate_conversation_turn_completion(self) -> None:
         """The readiness mode only tunes in-turn nudges, never completion."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -277,14 +297,14 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     "observe completion", command_id="sdk-observe-create"
                 )
                 final = await client.wait_task(accepted.task_id, timeout=5)
-                self.assertEqual(final.state, TaskState.SUCCEEDED.value)
+                self.assertEqual(final.state, TaskState.AWAITING_INPUT.value)
                 self.assertIsNone(final.verification)
                 events = await application.registry.require(RuntimeStorePort).read_events(
                     final.task_id
                 )
                 self.assertTrue(any(
                     event.event_type == "task.state_changed"
-                    and event.payload.get("next_state") == TaskState.SUCCEEDED.value
+                    and event.payload.get("next_state") == TaskState.AWAITING_INPUT.value
                     for event in events
                 ))
                 self.assertFalse(any(
@@ -305,7 +325,7 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 ):
                     cursors.append(event.cursor)
                 final = await runner
-                self.assertEqual(final.state, TaskState.SUCCEEDED.value)
+                self.assertEqual(final.state, TaskState.AWAITING_INPUT.value)
                 self.assertEqual(cursors, list(range(1, final.cursor + 1)))
                 resumed = [event.cursor async for event in client.subscribe_events(
                     task.task_id, after=cursors[-1], timeout=0.01
@@ -328,7 +348,7 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     )
                 ]
                 final = await runner
-                self.assertEqual(final.state, TaskState.SUCCEEDED.value)
+                self.assertEqual(final.state, TaskState.AWAITING_INPUT.value)
                 self.assertTrue(progress)
                 self.assertEqual(
                     [item.sequence for item in progress],
@@ -485,7 +505,7 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     "reviewed exact fixture action",
                     command_id="sdk-approval-resolve",
                 )
-                self.assertEqual(resolved.result["state"], "SUCCEEDED")
+                self.assertEqual(resolved.result["state"], "AWAITING_INPUT")
                 replayed = await client.resolve_approval(
                     request_id, ApprovalDecision.APPROVE,
                     "reviewed exact fixture action",
@@ -610,7 +630,7 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
             "invalid_tool_batch", "core.read_file: path is required",
         )
         self.assertIn("core.read_file: path is required", retry)
-        self.assertIn("Re-issue that call with every required argument", retry)
+        self.assertIn("Correct its name or arguments using the advertised schema", retry)
         self.assertIn("Do not repeat the rejected call unchanged", retry)
 
     def test_unclassified_protocol_reason_falls_back_to_envelope_retry(self) -> None:
@@ -619,8 +639,9 @@ class PythonSdkRuntimeTest(unittest.IsolatedAsyncioTestCase):
         from tsm_agt.core.kernel import Kernel
 
         retry = Kernel._protocol_correction_text("something_new", "detail")
-        self.assertIn("invalid tool-call envelope", retry)
-        self.assertIn("evidence_question", retry)
+        self.assertIn("invalid tool-call payload", retry)
+        self.assertIn("Retry once with the tool's declared parameters", retry)
+        self.assertIn("Do not repeat or describe the invalid call", retry)
 
     def test_disabled_tools_correction_forbids_more_tool_calls(self) -> None:
         """The finalization correction must stop tool use, not invite a retry."""
@@ -677,36 +698,52 @@ def _transport_exhaustion() -> ModelRecoveryExhausted:
 class PlannerTransportFailureTest(unittest.IsolatedAsyncioTestCase):
     """A provider outage must not become a product failure.
 
-    The planner runs before any work is committed, so a gateway that dropped the
-    connection leaves nothing to report as failed: the Task stops at the
-    recoverable interruption and can be retried
+    An explicit planner call on a work item can fail at a safe model boundary.
+    A dropped connection preserves the checkpoint and can be retried
     (``task-e547187aaaac4f4b83ae9ff1d2c767b5``).
     """
 
     async def _run(self, error: Exception):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            application = compose_fixture_application(
-                task_spec_planner_adapter=_TransportFailingPlanner(error),
-                tool_adapters=(),
-                orchestration_mode=OrchestrationMode.CONVERSATION_LOOP,
-            )
+            planner = _TransportFailingPlanner(error)
+            model = EchoModelProvider()
+            with patch("tsm_agt.bootstrap.composition.UserSkillsStore",
+                       return_value=UserSkillsStore(root / "home")):
+                application = compose_fixture_application(
+                    model_adapter=model, task_spec_planner_adapter=planner,
+                    tool_adapters=(),
+                )
             client = EngineeringAgentClient(
                 root, application_factory=lambda: application,
                 poll_interval=0.001,
             )
             async with client:
-                accepted = await client.submit_task(
+                source = await client.create_task("source conversation", command_id="source")
+                # Planning is an explicit work-item operation. Conversations no
+                # longer invoke it at their first turn, nor have a fixed SPEC.
+                task = await client.create_task(
                     "查下今天的nba新闻", command_id="planner-failure",
+                    session_id=source.session_id, source_task_id=source.task_id,
+                    task_relation=SessionTaskRelation.BRANCH,
                 )
-                final = await client.wait_task(accepted.task_id, timeout=5)
-                events = await application.kernel.dependencies.store.read_events(
-                    accepted.task_id
-                )
-                return final, events, application
+
+                async def plan_at_model_boundary(request):
+                    # Enter through a real turn so there is a resumable checkpoint
+                    # before the explicit planner call. Exercise both Planner's
+                    # classification and the SDK background failure convergence.
+                    await application.kernel.plan_task_spec(task.task_id)
+                    raise AssertionError("the failing planner unexpectedly returned")
+
+                with patch.object(model, "complete", side_effect=plan_at_model_boundary) as complete:
+                    final = await client._run_submitted_task(task.task_id, task.goal)
+                    self.assertEqual(complete.await_count, 1)
+                events = await application.kernel.dependencies.store.read_events(task.task_id)
+                snapshot = await application.kernel.get_task(task.task_id)
+                return final, events, snapshot
 
     async def test_transport_exhaustion_interrupts_instead_of_failing(self) -> None:
-        final, events, application = await self._run(_transport_exhaustion())
+        final, events, interrupted = await self._run(_transport_exhaustion())
         self.assertEqual(final.state, TaskState.INTERRUPTED.value)
         planning = [
             event for event in events
@@ -714,7 +751,6 @@ class PlannerTransportFailureTest(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(planning), 1)
         self.assertTrue(planning[0].payload["recoverable"])
-        interrupted = await application.kernel.get_task(final.task_id)
         self.assertIsNotNone(interrupted.active_agent_checkpoint)
 
     async def test_a_planner_bug_still_converges_to_failed(self) -> None:

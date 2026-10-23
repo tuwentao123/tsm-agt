@@ -192,14 +192,32 @@ class CheckpointMixin:
             task_spec_revision, task_spec_hash = (
                 task_spec.revision, task_spec.content_hash,
             )
+        # Session-wide reasoning-effort acts as the default for the main
+        # conversation loop. When the checkpoint already carries an explicit
+        # per-turn value, it wins; otherwise copy the Session preference so the
+        # ConversationAgentLoop can pass it through to the ModelRequest.
+        #
+        # Session-wide skill configuration becomes the default enabled skill
+        # set for the turn when the checkpoint does not already declare one.
         return replace(
-            checkpoint, workspace_fingerprint=task.project_fingerprint,
+            checkpoint,
+            workspace_fingerprint=task.project_fingerprint,
             effective_config_hash=configuration.effective_config_hash,
             toolset_hash=effective_toolset_hash(visible_tools),
             prompt_manifest_hash=(configuration.prompt_manifest_hash or ""),
             session_id=session.session_id,
             session_context_hash=session.context_hash,
             working_memory_hash=working_memory.content_hash,
+            reasoning_effort=(
+                checkpoint.reasoning_effort
+                if getattr(checkpoint, "reasoning_effort", None) is not None
+                else session.reasoning_effort
+            ),
+            enabled_skills=(
+                checkpoint.enabled_skills
+                if getattr(checkpoint, "enabled_skills", ())
+                else session.enabled_skills
+            ),
             task_spec_revision=task_spec_revision,
             task_spec_hash=task_spec_hash,
             execution_focus={}, legacy_execution_focus=False,

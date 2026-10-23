@@ -44,6 +44,63 @@ class _Kernel:
 
 
 class RuntimeActionFactsTest(unittest.TestCase):
+    def test_verification_guidance_follows_observed_history(self) -> None:
+        patch = _spec("core.apply_patch", ToolEffect.MUTATE, ToolResultAuthority.MUTATION_FACT)
+        process = _spec("core.run_command", ToolEffect.EXECUTE, ToolResultAuthority.PROCESS_FACT)
+        read = _spec("core.read_file", ToolEffect.OBSERVE, ToolResultAuthority.RUNTIME_FACT)
+        edit = _exchange("edit", patch.name, {"path": "app.py"},
+                         ToolResult("edit", True, data={"mutation_id": "m1"}))
+        readback = _exchange("read", read.name, {"path": "app.py"},
+                             ToolResult("read", True, data={"content": "changed"}))
+        def check(call_id, data):
+            return _exchange(call_id, process.name, {"argv": ["python", "-m", "pytest"]},
+                             ToolResult(call_id, True, data=data))
+        passing = check("pass", {"succeeded": True, "exit_code": 0})
+        failing = check("fail", {"succeeded": False, "exit_code": 1,
+                                 "failure_code": "PROCESS_EXIT_NON_ZERO"})
+        running = check("running", {"state": "RUNNING", "execution_state": "running"})
+        cases = (
+            (edit + readback, "missing", "execute an appropriate available check"),
+            (passing + edit, "missing", "after the latest mutation"),
+            (edit + failing, "failed", "repair relevant failures"),
+            (edit + running, "unknown", "Do not start a duplicate check"),
+            (edit + failing + passing, "passed", "do not repeat a still-valid passing check"),
+        )
+        for messages, status, guidance in cases:
+            with self.subTest(status=status, history=[m.message_id for m in messages]):
+                checkpoint = AgentTurnCheckpoint(
+                    "task", "turn", 1, (), (), (), 1, 0, 0, 0, 3, 3, 100, 1.0,
+                )
+                state = TurnState(
+                    task_id="task", turn_id="turn", checkpoint=checkpoint,
+                    messages=list(messages), pending_tool_calls=[], model_call_count=1,
+                    visible_tool_by_name={s.name: s for s in (patch, process, read)},
+                )
+                instruction = latest_tool_result_instruction(_Kernel(), state)
+                self.assertIn('"status": "' + status + '"', instruction)
+                self.assertIn(guidance, instruction)
+                self.assertIn("Respect scope, denials, and approval boundaries", instruction)
+                self.assertNotIn("Decide whether an available verification is needed", instruction)
+                if status == "missing":
+                    self.assertIn("change type, acceptance criteria, and affected scope", instruction)
+                    self.assertIn("Runtime/end-to-end testing is not mandatory", instruction)
+                    self.assertIn("run feasible checks", instruction)
+                    self.assertIn("another tool", instruction)
+                    self.assertIn("Prose-only changes need no runtime test", instruction)
+
+    def test_read_only_work_does_not_inject_post_mutation_guidance(self) -> None:
+        read = _spec("core.read_file", ToolEffect.OBSERVE, ToolResultAuthority.RUNTIME_FACT)
+        checkpoint = AgentTurnCheckpoint(
+            "task", "turn", 1, (), (), (), 1, 0, 0, 0, 3, 3, 100, 1.0,
+        )
+        state = TurnState(
+            task_id="task", turn_id="turn", checkpoint=checkpoint,
+            messages=list(_exchange("read", read.name, {"path": "app.py"},
+                                    ToolResult("read", True, data={"content": "code"}))),
+            pending_tool_calls=[], model_call_count=1, visible_tool_by_name={read.name: read},
+        )
+        self.assertEqual(latest_tool_result_instruction(_Kernel(), state), "")
+
     def test_process_observation_preserves_invocation_and_operation_status(self) -> None:
         process = _spec(
             "core.run_command", ToolEffect.EXECUTE,

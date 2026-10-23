@@ -145,11 +145,15 @@ class WorkspacePatchConflict(ValueError):
     model input error rather than a terminal failure.
     """
 
-    def __init__(self, path: str, index: int, reason: str) -> None:
+    def __init__(
+        self, path: str, index: int, reason: str, *,
+        diagnostics: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(f"edits[{index}].{reason}")
         self.path = path
         self.index = index
         self.reason = reason
+        self.diagnostics = dict(diagnostics or {})
 
 
 @dataclass(frozen=True, slots=True)

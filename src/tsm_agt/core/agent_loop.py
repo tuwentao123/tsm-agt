@@ -289,6 +289,12 @@ class AgentTurnCheckpoint:
     max_tool_calls: int
     max_output_tokens: int
     tool_timeout_seconds: float
+    #: Per-turn reasoning-effort preference for the main conversation loop.
+    #: When set, this value is passed as ``reasoning_effort`` on the
+    #: ``ModelRequest``; routing, planning and review calls keep their
+    #: bootstrap defaults.  The Session remains the long-lived source of
+    #: truth and may be copied here when the checkpoint is bound.
+    reasoning_effort: str | None = None
     workspace_fingerprint: str = ""
     effective_config_hash: str = ""
     toolset_hash: str = ""
@@ -322,6 +328,7 @@ class AgentTurnCheckpoint:
     model_budget_total_granted: int = 0
     checkpoint_schema_version: int = 2
     finalization_state: Mapping[str, Any] = field(default_factory=dict)
+    enabled_skills: tuple[str, ...] = ()
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> AgentTurnCheckpoint:
@@ -351,6 +358,10 @@ class AgentTurnCheckpoint:
             max_tool_calls=int(data["max_tool_calls"]),
             max_output_tokens=int(data["max_output_tokens"]),
             tool_timeout_seconds=float(data["tool_timeout_seconds"]),
+            reasoning_effort=(
+                str(data["reasoning_effort"])
+                if data.get("reasoning_effort") is not None else None
+            ),
             checkpoint_schema_version=2,
             finalization_state=(
                 dict(data["finalization_state"])
@@ -412,6 +423,10 @@ class AgentTurnCheckpoint:
                 if isinstance(data.get("execution_focus"), Mapping) else {}
             ),
             legacy_execution_focus="execution_focus" in data,
+            enabled_skills=tuple(
+                str(skill_id)
+                for skill_id in data.get("enabled_skills", [])
+            ),
             tool_batch=(
                 ToolBatchSnapshot.from_data(data["tool_batch"])
                 if isinstance(data.get("tool_batch"), Mapping) else None
@@ -471,6 +486,7 @@ class AgentTurnCheckpoint:
             "max_tool_calls": self.max_tool_calls,
             "max_output_tokens": self.max_output_tokens,
             "tool_timeout_seconds": self.tool_timeout_seconds,
+            "reasoning_effort": self.reasoning_effort,
             "finalization_state": dict(self.finalization_state or {}),
             "model_budget_renewal_count": self.model_budget_renewal_count,
             "model_budget_total_granted": self.model_budget_total_granted,
@@ -642,6 +658,9 @@ class TurnState:
     #: review. They exist for an execution that never started, not to second
     #: guess a known tool outcome or consume the whole model-call budget.
     runtime_continuations: int = 0
+    #: A rejected workspace edit gets one bounded opportunity to recover before
+    #: an immediate draft-only answer becomes an explicitly partial boundary.
+    edit_recovery_continuations: int = 0
     reviewer_call_count: int = 0
     last_candidate_hash: str = ""
     last_review_reason_code: str = ""

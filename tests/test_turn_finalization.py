@@ -17,7 +17,7 @@ from tsm_agt.ports import (
     FinalizationAction, FinalizationCandidate, FinishReason, Message,
     MessageRole, ModelCallPurpose, ModelRequest, ModelResponse, TextBlock,
     ToolCall, ToolCallBlock, ToolEffect, ToolRecoveryKind, ToolResult,
-    ToolResultAuthority, ToolResultBlock, ToolRisk, ToolSpec,
+    ToolResultAuthority, ToolResultBlock, ToolRisk, ToolSpec, ToolExecutionSummary,
 )
 
 
@@ -92,8 +92,36 @@ class CompletionReviewerTest(unittest.IsolatedAsyncioTestCase):
             _message("answer", MessageRole.ASSISTANT, "y"),
             FinishReason.STOP, (), 1, 0, 0,
         )
-        with self.assertRaises(CompletionReviewError):
+        with self.assertRaises(CompletionReviewError) as caught:
             await reviewer.review(candidate)
+        self.assertEqual(caught.exception.reason_code, "reviewer_invalid_verdict")
+
+    async def test_mutation_receipt_uses_registered_tool_effect_without_meta_guessing(self):
+        for succeeded in (True, False):
+            with self.subTest(succeeded=succeeded):
+                model = _ReviewModel(
+                    '{"action":"CONTINUE","reason_code":"partial_delivery",'
+                    '"reason":"Required behavior is still described as a proposal.",'
+                    '"missing":["remaining implementation"]}'
+                )
+                reviewer = ModelCompletionReviewer(model)
+                await model.start(AdapterContext({}, lambda *_: None))
+                await reviewer.start(AdapterContext({}, lambda *_: None))
+                candidate = FinalizationCandidate(
+                    "task", "turn", _message("user", MessageRole.USER, "implement the behavior"),
+                    _message("answer", MessageRole.ASSISTANT, "One part is done; you can finish the rest."),
+                    FinishReason.STOP, (ToolExecutionSummary(
+                        "call", "plugin.update", {}, succeeded,
+                        error_code="" if succeeded else "CONFLICT",
+                        result_excerpt='{"mutation_id":"one-step"}', result_meta={},
+                    ),), 2, 1, 0, ("plugin.update",),
+                )
+                verdict = await reviewer.review(candidate)
+                payload = json.loads(model.requests[0].messages[1].text)
+                self.assertEqual(payload["has_mutation"], succeeded)
+                self.assertEqual(payload["tool_executions"][0]["result_excerpt"],
+                                 '{"mutation_id":"one-step"}')
+                self.assertIs(verdict.action, CompletionReviewAction.CONTINUE)
 
 
 class RuntimeFinalizationGateTest(unittest.IsolatedAsyncioTestCase):

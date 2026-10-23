@@ -11,6 +11,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from .request_diagnostics import RequestDiagnosticCapture
+from .reasoning_config import DEFAULT_REASONING_EFFORT_REGISTRY, ReasoningEffortRegistry
 
 from tsm_agt.ports import (
     ConclusionBlock,
@@ -70,81 +71,6 @@ from tsm_agt.adapters.http_json import (  # noqa: E402
 OpenAICompatibleProviderError = ModelProviderTransportError
 
 
-# Model-specific reasoning-effort configuration.
-#
-# This is a code-level schema, independent of environment variables and
-# Web UI wiring. The Runtime or Web front-end may pass any string as
-# `reasoning_effort`; the provider maps it through this schema before
-# deciding what to send over the wire. The mapping behavior can later be
-# replaced by configuration, a registry, or per-provider logic without
-# changing the call sites.
-MODEL_REASONING_SCHEMA: dict[str, dict[str, Any]] = {
-    # Default schema: if a model is not explicitly listed, the provider will
-    # accept any non-empty effort string and pass it through as-is.
-    #
-    # For concrete models we can constrain the allowed efforts. As an
-    # example, OpenAI GPT-5.1 currently exposes ``none``, ``low``,
-    # ``medium``, and ``high`` in the public documentation. The runtime
-    # model identifier is ``gpt-5.1-2025-11-13``; that is the name we
-    # receive in the ``model`` field and therefore the key we match here.
-    "gpt-5.1-2025-11-13": {
-        "allowed_efforts": [
-            "none",
-            "low",
-            "medium",
-            "high",
-        ],
-        # When Web or Runtime passes a value not in allowed_efforts, we
-        # fall back to this default. None means "do not send an explicit
-        # reasoning_effort field; let the upstream service choose".
-        "default": None,
-    },
-}
-
-
-def _map_reasoning_effort_for_model(model_name: str, effort: str | None) -> str | None:
-    """Normalize a requested reasoning_effort against MODEL_REASONING_SCHEMA.
-
-    The Web UI and Runtime may pass any string in ``effort``. This function
-    applies the model-specific schema before deciding what to include in the
-    outgoing payload:
-
-    * If ``effort`` is falsy (None or ""), do not send a reasoning_effort
-      field and let the upstream service apply its own default.
-    * If the model has a schema entry and ``effort`` is in its
-      ``allowed_efforts`` list, pass it through unchanged.
-    * If the model has a schema entry but ``effort`` is not allowed,
-      fall back to the schema's ``default`` value (which may be None).
-    * If the model has no explicit schema entry, accept any non-empty
-      value and pass it through.
-
-    This keeps the mapping logic in one place and makes it easy to evolve
-    toward Hermes/Kiro-style model capability schemas later.
-    """
-    if effort is None:
-        return None
-    effort = effort.strip()
-    if not effort:
-        return None
-
-    schema = MODEL_REASONING_SCHEMA.get(model_name)
-    if schema is None:
-        # No explicit schema: accept and pass through whatever the caller
-        # requested, leaving validation to the upstream provider.
-        return effort
-
-    allowed = set(schema.get("allowed_efforts", []))
-    if effort in allowed:
-        return effort
-
-    # Not in the allowed set: fall back to the schema default. ``default``
-    # may itself be None, which disables the field entirely.
-    fallback = schema.get("default")
-    if fallback is None:
-        return None
-    return str(fallback)
-
-
 class OpenAICompatibleModelProvider:
     descriptor = AdapterDescriptor(
         adapter_id="builtin.openai-compatible-model",
@@ -177,6 +103,7 @@ class OpenAICompatibleModelProvider:
         retry_backoff_seconds: float = 1.0,
         output_token_parameter: str = "max_tokens",
         reasoning_effort: str | None = None,
+        reasoning_registry: ReasoningEffortRegistry | None = None,
         strict_tool_schema: bool = True,
         streaming: bool = True,
         native_structured_conclusion: bool = True,
@@ -211,6 +138,7 @@ class OpenAICompatibleModelProvider:
         self._retry_backoff_seconds = retry_backoff_seconds
         self._output_token_parameter = output_token_parameter
         self._reasoning_effort = reasoning_effort
+        self._reasoning_registry = reasoning_registry or DEFAULT_REASONING_EFFORT_REGISTRY
         self._strict_tool_schema = strict_tool_schema
         self._streaming = streaming
         self._native_structured_conclusion = native_structured_conclusion
@@ -810,8 +738,11 @@ class OpenAICompatibleModelProvider:
         }
         if request.max_output_tokens is not None:
             payload[self._output_token_parameter] = request.max_output_tokens
-        mapped_effort = _map_reasoning_effort_for_model(
-            self._model, self._reasoning_effort,
+        # Per-turn override takes precedence over the provider's default
+        # reasoning_effort; when absent, fall back to the bootstrap value.
+        effective_effort = request.reasoning_effort or self._reasoning_effort
+        mapped_effort = self._reasoning_registry.resolve(
+            self._model, effective_effort,
         )
         if mapped_effort is not None:
             payload["reasoning_effort"] = mapped_effort

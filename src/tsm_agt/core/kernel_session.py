@@ -60,9 +60,10 @@ from .session import (
     SessionChoiceOption, SessionInteractionKind, SessionInteractionRequest,
     SessionSnapshot,
 )
+from .skills import SkillRegistry
 from .session_context import (
     SessionActiveCheckpoint, SessionConversationProjection,
-    SessionPromptProjection, SessionWorkingState,
+    SessionPromptProjection, SessionWorkingState, working_goal_source,
 )
 from .session_handoff import (
     build_session_follow_up_goal,
@@ -100,7 +101,9 @@ class SessionMixin:
             raise ValueError("session title must not be empty")
         identity = session_id or f"session-{uuid4().hex}"
         snapshot = SessionSnapshot.create(
-            identity, self._dependencies.local_identity.current_subject(), normalized
+            identity,
+            self._dependencies.local_identity.current_subject(),
+            normalized,
         )
         event = SessionEvent(
             f"sevt-{uuid4().hex}", identity, 1, "session.created",
@@ -109,7 +112,92 @@ class SessionMixin:
         await self._dependencies.store.commit_session(SessionUnitOfWork(
             identity, 0, snapshot.to_data(), (event,)
         ))
+        # Initialize the SkillRegistry view for this Session.
+        if hasattr(self._dependencies, "skill_registry"):
+            self._dependencies.skill_registry.set_session_enabled(
+                identity, snapshot.enabled_skills
+            )
         return snapshot
+
+    async def update_session_reasoning_effort(
+        self, session_id: str, reasoning_effort: str | None,
+    ) -> SessionSnapshot:
+        """Persist a Session-wide reasoning-effort preference.
+
+        The Session remains the single source of truth: callers may change the
+        preference, but they do not own the storage layout or event stream.
+        """
+        stored = await self._dependencies.store.load_session(session_id)
+        if stored is None:
+            raise LookupError(f"session not found: {session_id}")
+        snapshot = SessionSnapshot.from_data(stored.data)
+        # Enforce subject isolation exactly like ``get_session``.
+        if snapshot.subject != self._dependencies.local_identity.current_subject():
+            raise PermissionError("session belongs to another local subject")
+        updated = replace(
+            snapshot,
+            reasoning_effort=reasoning_effort,
+            updated_at=utc_now(),
+        )
+        event = SessionEvent(
+            f"sevt-{uuid4().hex}",
+            session_id,
+            stored.last_event_sequence + 1,
+            "session.reasoning_effort_updated",
+            {
+                "reasoning_effort": reasoning_effort,
+            },
+        )
+        await self._dependencies.store.commit_session(
+            SessionUnitOfWork(session_id, stored.version, updated.to_data(), (event,))
+        )
+        return updated
+
+    async def update_session_skills(
+        self,
+        session_id: str,
+        enabled_skill_ids: tuple[str, ...],
+    ) -> SessionSnapshot:
+        """Persist the Session-wide list of enabled skill IDs.
+
+        The Session remains the single durable source of truth: callers may
+        change the preference, but they do not own the storage layout or event
+        stream. Skill IDs are validated against the process-local
+        ``SkillRegistry``.
+        """
+        stored = await self._dependencies.store.load_session(session_id)
+        if stored is None:
+            raise LookupError(f"session not found: {session_id}")
+        snapshot = SessionSnapshot.from_data(stored.data)
+        # Enforce subject isolation exactly like ``get_session``.
+        if snapshot.subject != self._dependencies.local_identity.current_subject():
+            raise PermissionError("session belongs to another local subject")
+
+        registry: SkillRegistry = self._dependencies.skill_registry
+        for skill_id in enabled_skill_ids:
+            if registry.get(skill_id) is None:
+                raise LookupError(f"unknown skill id: {skill_id}")
+
+        updated = replace(
+            snapshot,
+            enabled_skills=enabled_skill_ids,
+            updated_at=utc_now(),
+        )
+        event = SessionEvent(
+            f"sevt-{uuid4().hex}",
+            session_id,
+            stored.last_event_sequence + 1,
+            "session.skills_updated",
+            {
+                "enabled_skills": list(enabled_skill_ids),
+            },
+        )
+        await self._dependencies.store.commit_session(
+            SessionUnitOfWork(session_id, stored.version, updated.to_data(), (event,))
+        )
+        # Keep the process-local Session view in sync.
+        registry.set_session_enabled(session_id, enabled_skill_ids)
+        return updated
     async def get_session(self, session_id: str) -> SessionSnapshot:
         stored = await self._dependencies.store.load_session(session_id)
         if stored is None:
@@ -1663,8 +1751,12 @@ class SessionMixin:
         it is already in the checkpoint sent to the model. Earlier messages from
         that same Conversation remain ordinary history for follow-up turns.
         """
-        projection = await self.get_session_conversation(session_id)
+        # Build dialogue and state provenance from the same event snapshot.
+        session = await self.get_session(session_id)
+        events = await self._dependencies.store.read_session_events(session_id)
         projector = self._dependencies.session_context_projector
+        projection = projector.project(session, events)
+        goal_source = working_goal_source(events, projection.working_state.goal)
         active_checkpoint = await self.get_session_active_checkpoint(
             session_id
         )
@@ -1726,6 +1818,7 @@ class SessionMixin:
             suspended_tasks=suspended_tasks,
             exclude_task_id=exclude_task_id,
             exclude_turn_id=exclude_turn_id,
+            goal_source=goal_source,
             conversation_mode=(
                 self._dependencies.orchestration_mode
                 is OrchestrationMode.CONVERSATION_LOOP

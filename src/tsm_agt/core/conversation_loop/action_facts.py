@@ -184,6 +184,14 @@ def project_runtime_action_facts(
                 error_code=result.error_code or "",
             )
             status, code = classified if classified is not None else (None, "")
+            # A successful managed-process start is an invocation receipt,
+            # not a passing check. Keep this model-facing projection honest
+            # without changing the shared execution/acceptance policy.
+            if (
+                result.ok and authority is ToolResultAuthority.PROCESS_FACT
+                and str(data.get("state", "")).upper() in {"RUNNING", "ORPHANED"}
+            ):
+                status = EffectStatus.UNKNOWN
             raw_exit_code = data.get("exit_code")
             facts.append(RuntimeActionFact(
                 ordinal=len(facts),

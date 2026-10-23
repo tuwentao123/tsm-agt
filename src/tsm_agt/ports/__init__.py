@@ -72,6 +72,7 @@ from .process import (
     ProcessOutput,
     ProcessResult,
     ProcessStartRequest,
+    ProcessStartError,
     process_result_succeeded,
 )
 from .sandbox import SandboxDecision, SandboxPort, SandboxRequest
@@ -267,6 +268,7 @@ __all__ = [
     "RecoverableToolProtocolError",
     "BackgroundProcessStartResult",
     "ProcessCommandResult",
+    "ProcessStartError",
     "ProcessWaitResult",
     "ProcessEnvironmentPolicy",
     "ProcessExecutorPort",

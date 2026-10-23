@@ -7,9 +7,9 @@ from collections.abc import Mapping
 
 from tsm_agt.ports import ProcessEnvironmentPolicy
 
-#: System paths first so an allowed tool keeps resolving to the same binary it
-#: always did; package-manager prefixes are appended because tools the sandbox
-#: allowlist accepts (``gh``, for one) live there and nowhere else.
+#: Fallback for isolated execution or hosts without PATH. Governed execution
+#: explicitly inherits PATH to resolve user-installed CLIs and their runtimes
+#: consistently with the service's launch environment.
 _BASE_ENVIRONMENT = {
     "PATH": (
         "/usr/bin:/bin:/usr/sbin:/sbin"
@@ -27,7 +27,7 @@ class ProcessEnvironmentConfiguration:
         host_environment: Mapping[str, str] | None = None,
     ) -> dict[str, str]:
         effective_policy = policy or ProcessEnvironmentPolicy()
-        host = dict(host_environment or os.environ)
+        host = dict(os.environ if host_environment is None else host_environment)
         safe = dict(_BASE_ENVIRONMENT)
 
         if effective_policy.inherit_host_environment:

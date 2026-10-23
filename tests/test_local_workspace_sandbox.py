@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import sys
 import tempfile
 import unittest
+import venv
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from tsm_agt.adapters.local_sandbox import LocalWorkspaceSandbox
 from tsm_agt.adapters.builtin import CoreProcessToolProvider
@@ -56,6 +59,75 @@ class LocalWorkspaceSandboxTest(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(decision.allowed)
                 self.assertIn("shell", decision.reason)
 
+    async def test_allowed_entry_name_cannot_hide_a_shell_target(self) -> None:
+        target = shutil.which("sh") or shutil.which("cmd.exe")
+        if target is None:
+            self.skipTest("no shell target available")
+        uppercase_target = self.workspace / "BASH.EXE"
+        uppercase_target.write_text("not executed\n", encoding="utf-8")
+        uppercase_target.chmod(0o755)
+        launcher = self.workspace / "python"
+        for actual_target in (Path(target), uppercase_target):
+            launcher.unlink(missing_ok=True)
+            try:
+                launcher.symlink_to(actual_target)
+            except OSError as error:
+                self.skipTest(f"cannot create executable symlink: {error}")
+            for entry in ("./python", str(launcher)):
+                with self.subTest(entry=entry, target=actual_target.name):
+                    decision = await self.sandbox.authorize(SandboxRequest(
+                        (entry, "-V"), self.workspace, self.environment,
+                    ))
+                    self.assertFalse(decision.allowed)
+                    self.assertIn("resolved shell executable", decision.reason)
+
+    async def test_relative_environment_entry_runs_under_its_own_prefix_after_approval(self) -> None:
+        environment = self.workspace / "environment"
+        venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(environment)
+        launcher = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        probe = self.workspace / "probe.py"
+        probe.write_text(
+            "import json, sys\nprint(json.dumps({'prefix':sys.prefix,'base_prefix':sys.base_prefix}))\n",
+            encoding="utf-8",
+        )
+        application = compose_fixture_application(
+            sandbox_adapter=self.sandbox, tool_adapters=(CoreProcessToolProvider(),),
+        )
+        await application.registry.start_all()
+        try:
+            kernel = application.kernel
+            await kernel.set_project_trust(self.workspace, ProjectTrustLevel.TRUSTED_BUILD)
+            task = await kernel.create_task("verify environment entry", self.workspace, "task-environment-entry")
+            for state in (
+                TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING, TaskState.EXECUTING,
+            ):
+                task = await kernel.transition_task(task.task_id, state, state.value)
+            call = ToolCall("call-environment-entry", "core.run_command", {
+                "argv": [launcher.relative_to(self.workspace).as_posix(), probe.name], "cwd": ".",
+            })
+            with self.assertRaises(ApprovalRequired) as caught:
+                await kernel.invoke_tool(task.task_id, "turn-environment-entry", call)
+            approval = caught.exception.request
+            self.assertEqual(approval.execution_identity["launch_path"], str(launcher))
+            self.assertEqual(approval.execution_identity["resolved_target"], str(launcher.resolve()))
+            started = await kernel.resolve_approval(
+                task.task_id, approval.request_id, approval.payload_hash,
+                ApprovalDecision.APPROVE, "approve the exact environment entry",
+            )
+            self.assertTrue(started.ok, started.message)
+            waited = await kernel.invoke_tool(task.task_id, "turn-environment-entry", ToolCall(
+                "wait-environment-entry", "core.process_wait",
+                {"process_id": started.data["process_id"], "wait_seconds": 5},
+            ))
+            self.assertTrue(waited.ok, waited.message)
+            self.assertTrue(waited.data["succeeded"], waited.data)
+            output = json.loads(waited.data["stdout"]["text"])
+            self.assertEqual(Path(output["prefix"]).resolve(), environment.resolve())
+            self.assertNotEqual(output["prefix"], output["base_prefix"])
+        finally:
+            await application.registry.stop_all()
+
     async def test_allows_the_github_cli(self) -> None:
         decision = await self.sandbox.authorize(SandboxRequest(
             ("gh", "api", "repos/openai/codex/contents/README.md"),
@@ -63,12 +135,65 @@ class LocalWorkspaceSandboxTest(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertTrue(decision.allowed, decision.reason)
 
-    async def test_denies_unlisted_executable(self) -> None:
-        decision = await self.sandbox.authorize(SandboxRequest(
-            ("wget", "https://example.test"), self.workspace, self.environment
-        ))
-        self.assertFalse(decision.allowed)
-        self.assertIn("allowlist", decision.reason)
+    async def test_program_names_do_not_require_an_allowlist(self) -> None:
+        for executable in (
+            "hbcli", "wget", "company-custom-cli", "company-custom-cli.exe",
+            "company-custom-cli.cmd", "company-custom-cli.bat",
+        ):
+            with self.subTest(executable=executable):
+                decision = await self.sandbox.authorize(SandboxRequest(
+                    (executable, "--version"), self.workspace, self.environment,
+                ))
+                self.assertTrue(decision.allowed, decision.reason)
+
+    @unittest.skipIf(os.name == "nt", "POSIX shebang regression")
+    async def test_user_installed_cli_and_its_runtime_execute_after_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            user_bin = Path(directory).resolve()
+            (user_bin / "tsm-test-runtime").symlink_to(sys.executable)
+            program = user_bin / "company-custom-cli"
+            program.write_text(
+                "#!/usr/bin/env tsm-test-runtime\n"
+                "import json, os\n"
+                "print(json.dumps({'result': 'custom CLI ran', 'token_inherited': 'GITHUB_TOKEN' in os.environ}))\n",
+                encoding="utf-8",
+            )
+            program.chmod(0o755)
+            application = compose_fixture_application(
+                sandbox_adapter=self.sandbox, tool_adapters=(CoreProcessToolProvider(),),
+            )
+            await application.registry.start_all()
+            try:
+                kernel = application.kernel
+                await kernel.set_project_trust(self.workspace, ProjectTrustLevel.TRUSTED_BUILD)
+                task = await kernel.create_task("run an installed CLI", self.workspace, "task-user-cli")
+                for state in (
+                    TaskState.INTAKE, TaskState.RESOLVING_PROJECT,
+                    TaskState.SELECTING_EXTENSIONS, TaskState.ROUTING, TaskState.EXECUTING,
+                ):
+                    task = await kernel.transition_task(task.task_id, state, state.value)
+                with patch.dict(os.environ, {"PATH": str(user_bin), "GITHUB_TOKEN": "test-not-forwarded"}):
+                    call = ToolCall("call-user-cli", "core.run_command", {"argv": [program.name, "--probe"], "cwd": "."})
+                    with self.assertRaises(ApprovalRequired) as caught:
+                        await kernel.invoke_tool(task.task_id, "turn-user-cli", call)
+                    approval = caught.exception.request
+                    self.assertEqual(approval.execution_identity["launch_path"], str(program))
+                    started = await kernel.resolve_approval(
+                        task.task_id, approval.request_id, approval.payload_hash,
+                        ApprovalDecision.APPROVE, "approve exact custom CLI invocation",
+                    )
+                    self.assertTrue(started.ok, started.message)
+                    waited = await kernel.invoke_tool(task.task_id, "turn-user-cli", ToolCall(
+                        "wait-user-cli", "core.process_wait",
+                        {"process_id": started.data["process_id"], "wait_seconds": 5},
+                    ))
+                    self.assertTrue(waited.ok, waited.message)
+                    self.assertTrue(waited.data["succeeded"], waited.data)
+                    self.assertEqual(json.loads(waited.data["stdout"]["text"]), {
+                        "result": "custom CLI ran", "token_inherited": False,
+                    })
+            finally:
+                await application.registry.stop_all()
 
     async def test_allows_curl_at_execution_boundary(self) -> None:
         for executable in ("curl", "/usr/bin/curl"):
@@ -147,6 +272,12 @@ class LocalWorkspaceSandboxTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(allowed_exe.allowed)
         self.assertFalse(denied_shell.allowed)
         self.assertFalse(denied_meta.allowed)
+        for suffix in (".cmd", ".bat"):
+            denied_custom_meta = await self.sandbox.authorize(SandboxRequest(
+                (f"company-custom-cli{suffix}", "test&whoami"),
+                self.workspace, self.environment,
+            ))
+            self.assertFalse(denied_custom_meta.allowed)
 
     async def test_denies_credential_like_environment_again(self) -> None:
         decision = await self.sandbox.authorize(SandboxRequest(

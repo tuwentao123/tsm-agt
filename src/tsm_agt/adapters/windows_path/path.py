@@ -172,6 +172,26 @@ class WindowsWorkspacePath:
         key = self._path_identity(resolved)
         return ResolvedWorkspacePath(root, resolved, relative.as_posix(), key)
 
+    def resolve_executable_path(
+        self, workspace: Path, relative_path: str,
+    ) -> ResolvedWorkspacePath:
+        self._require_started()
+        candidate = Path(relative_path)
+        if candidate.is_absolute() or candidate.drive or candidate.root:
+            raise ValueError("absolute executable entry paths are not allowed")
+        if any(":" in part for part in candidate.parts):
+            raise PermissionError("Windows alternate data stream paths are not allowed")
+        root = self.normalize_workspace(workspace)
+        launcher = Path(os.path.abspath(root / candidate))
+        try:
+            relative = launcher.relative_to(root)
+            launcher.parent.resolve(strict=False).relative_to(root)
+        except ValueError as error:
+            raise ValueError("executable entry path escapes the workspace") from error
+        return ResolvedWorkspacePath(
+            root, launcher, relative.as_posix(), self._path_identity(launcher),
+        )
+
     def resolve_read_path(
         self, workspace: Path, requested_path: str,
         additional_roots: tuple[Path, ...] = (),

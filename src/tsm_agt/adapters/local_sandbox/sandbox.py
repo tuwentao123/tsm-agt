@@ -27,15 +27,6 @@ from tsm_agt.ports import (
 )
 
 
-_ALLOWED_EXECUTABLES = frozenset(
-    {
-        "adb", "bun", "bundle", "cargo", "cmake", "curl", "dart",
-        "flutter", "gh", "git", "go", "gradle", "gradlew", "java",
-        "javac", "kotlinc", "make", "ninja", "node", "npm",
-        "npx", "pnpm", "pytest", "ruby", "ruff", "rustc",
-        "swift", "xcodebuild", "yarn",
-    }
-)
 _DENIED_SHELLS = frozenset(
     {
         "ash", "bash", "csh", "dash", "fish", "ksh", "sh",
@@ -45,9 +36,6 @@ _DENIED_SHELLS = frozenset(
 _PYTHON_NAME = re.compile(r"python(?:3(?:\.\d+)?)?\Z")
 _CREDENTIAL_FRAGMENTS = ("secret", "token", "password", "api_key", "apikey")
 _WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat")
-_ALLOWED_BATCH_LAUNCHERS = frozenset(
-    {"gradlew", "npm", "npx", "pnpm", "yarn", "bun"}
-)
 _CMD_METACHARACTERS = frozenset("&|<>^%!?\r\n")
 _TRUSTED_RUNTIME_ORIGINS = tuple(
     Path(os.path.realpath(os.path.expanduser(origin)))
@@ -97,7 +85,7 @@ def _path_is_relative_to(path: Path, root: Path) -> bool:
 
 
 class LocalWorkspaceSandbox:
-    """Allow a small engineering executable set after Kernel validation."""
+    """Validate approved structured commands without a program-name allowlist."""
 
     descriptor = AdapterDescriptor(
         adapter_id="builtin.local-workspace-command-gate",
@@ -107,7 +95,7 @@ class LocalWorkspaceSandbox:
         capabilities=frozenset(
             {
                 "structured-argv-only", "shell-deny",
-                "executable-allowlist", "credential-env-deny",
+                "credential-env-deny",
                 "workspace-cwd-precondition",
             }
         ),
@@ -159,34 +147,23 @@ class LocalWorkspaceSandbox:
             return SandboxDecision(False, f"shell executable is denied: {name}")
         if (
             suffix in {".cmd", ".bat"}
-            and (
-                normalized_name not in _ALLOWED_BATCH_LAUNCHERS
-                or any(
-                    character in _CMD_METACHARACTERS
-                    for argument in request.argv for character in argument
-                )
+            and any(
+                character in _CMD_METACHARACTERS
+                for argument in request.argv for character in argument
             )
         ):
             return SandboxDecision(
-                False, "batch launcher or argument is outside the controlled Windows subset"
+                False, "batch arguments contain command-interpreter metacharacters"
             )
-        if (
-            normalized_name not in _ALLOWED_EXECUTABLES
-            and _PYTHON_NAME.fullmatch(normalized_name) is None
-        ):
-            return SandboxDecision(False, f"executable is not in the local engineering allowlist: {name}")
-
         path = Path(executable)
         resolved_executable = None
-        if len(path.parts) > 1:
+        if path.is_absolute() or os.path.sep in executable or (os.path.altsep and os.path.altsep in executable):
             try:
-                resolved_executable = (
-                    self._workspace_path.resolve_access_path(
-                        request.cwd, executable
-                    ).path
-                    if not path.is_absolute()
-                    else Path(os.path.realpath(os.path.expanduser(executable)))
+                launcher = (
+                    self._workspace_path.resolve_executable_path(request.cwd, executable).path
+                    if not path.is_absolute() else path.expanduser()
                 )
+                resolved_executable = Path(os.path.realpath(launcher))
             except FileNotFoundError:
                 return SandboxDecision(False, "workspace executable does not exist")
             except (PermissionError, ValueError):
@@ -196,6 +173,21 @@ class LocalWorkspaceSandbox:
                 )
             if not resolved_executable.is_file():
                 return SandboxDecision(False, "workspace executable does not exist")
+            target_name = resolved_executable.name.lower()
+            target_suffix = Path(target_name).suffix
+            target_stem = (
+                target_name[:-len(target_suffix)]
+                if target_suffix in _WINDOWS_EXECUTABLE_SUFFIXES
+                else target_name
+            )
+            if target_name in _DENIED_SHELLS or target_stem in _DENIED_SHELLS:
+                return SandboxDecision(
+                    False, f"resolved shell executable is denied: {target_name}",
+                    diagnostics={
+                        "requested_executable": executable,
+                        "resolved_executable": str(resolved_executable),
+                    },
+                )
             runtime_decision = self._authorize_runtime_origin(
                 request.cwd,
                 path,

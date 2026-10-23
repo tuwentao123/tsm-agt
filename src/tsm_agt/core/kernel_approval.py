@@ -43,6 +43,8 @@ from .approval import (
 from .task import TaskNotFound, TaskSnapshot, TaskState
 from .tool import validate_tool_arguments
 from .trust import ProjectTrustLevel
+from .patch_preview import preview_text_patch, preview_v4a_patch
+from .workspace import WorkspaceMutationConflict
 from .workspace_access import (
     WorkspaceAccessCapability, WorkspaceAccessGrant
 )
@@ -411,6 +413,7 @@ class ApprovalMixin:
             task_id=task_id,
             sequence=stored.last_event_sequence + 1,
             event_type="approval.resolved",
+            turn_id=request.turn_id,
             payload={
                 "request_id": request.request_id,
                 "payload_hash": request.payload_hash,
@@ -531,5 +534,24 @@ class ApprovalMixin:
                 return f"{key}={value}"
         return "arguments supplied in the approval payload"
 
-    def _approval_preview(self, call: ToolCall) -> str:
+    def _approval_preview(self, call: ToolCall, task: TaskSnapshot | None = None) -> str:
+        if call.name in {"core.apply_patch_v4a", "core.apply_patch", "core.apply_patches"} and task is not None:
+            try:
+                workspace, paths = Path(task.workspace), self._dependencies.workspace_path
+                if call.name == "core.apply_patch_v4a":
+                    return preview_v4a_patch(workspace, call.arguments, paths)
+                if call.name == "core.apply_patches":
+                    actual_diffs = [preview_text_patch(workspace, item, paths, fallback_only=True)
+                                    for item in call.arguments["patches"]]
+                    return self._present_tool_arguments(call.name, call.arguments).text + "".join(
+                        "\n" + diff for diff in actual_diffs if diff is not None
+                    )
+                preview = preview_text_patch(workspace, call.arguments, paths, fallback_only=True)
+                if preview is not None:
+                    return preview
+            except (OSError, ValueError, WorkspaceMutationConflict) as error:
+                # Rejected patches still follow the established tool-result
+                # path; never preview guessed content after a failed hash check.
+                return (f"Actual diff unavailable: {error}. No edit has been applied.\n"
+                        + self._present_tool_arguments(call.name, call.arguments).text)
         return self._present_tool_arguments(call.name, call.arguments).text

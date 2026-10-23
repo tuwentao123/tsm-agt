@@ -25,14 +25,27 @@ Judge whether the candidate answer satisfies the current user request.
    location was found. Implementation analysis requires actual source content or
    an equivalent read result.
 4. Do not reject merely because few tools were used.
-5. A legitimate clarification, permission blocker, or unavailable-error report
-   may be accepted.
+5. A clarification or blocker report may be accepted when observations establish
+   the missing decision, permission, or unavailable prerequisite. An assistant's
+   claim of inability alone is not evidence; a single failed method is not proof
+   that all permitted progress is blocked.
 6. ``available_write_tools`` is a Runtime fact. If it is non-empty, an answer
    must not claim that no write tool or write permission exists merely because
    it did not call one. For a request to change/create a workspace artifact,
    such a claim means the requested action is unfinished: return CONTINUE.
 7. Return CONTINUE only if a step that materially changes the answer is unfinished.
 8. Describe missing facts; never prescribe a tool or tool arguments.
+9. An action receipt proves only that particular action happened. For an
+   implementation request, compare the full requested behavior with the actual
+   changes and relevant observations. One successful action does not establish
+   that all necessary parts, wiring, or verification are complete.
+10. If required work is described only as sample code, instructions for the user,
+    an offer to finish later, or a request to reconfirm authorization already
+    given, return CONTINUE with the unfinished deliverables. Do not accept a
+    partial implementation merely because the answer honestly lists the rest.
+11. Respect the current request's scope. Analysis-only requests require no edits;
+    do not demand unrelated changes, exhaustive tests, or work beyond what was
+    requested. An appropriate observed check can suffice for a small change.
 
 Return exactly one JSON object matching:
 {"action":"ACCEPT|CONTINUE","reason_code":"1..64 chars","reason":"1..1000 chars","missing":["up to 8 items"]}
@@ -65,14 +78,14 @@ class ModelCompletionReviewer:
         self, candidate: FinalizationCandidate,
     ) -> CompletionReviewVerdict:
         if not self._started:
-            raise CompletionReviewError("completion reviewer is not started")
+            raise CompletionReviewError("completion reviewer is not started", reason_code="reviewer_not_started")
         payload = {
             "user_message": candidate.source_user_message.text,
             "candidate_answer": candidate.assistant_message.text,
             "finish_reason": candidate.finish_reason.value,
             "tool_executions": [item.to_data() for item in candidate.tool_executions],
             "has_mutation": any(
-                str(item.result_meta.get("effect", "")).lower() == "mutate"
+                item.ok and item.tool_name in candidate.available_write_tools
                 for item in candidate.tool_executions
             ),
             "has_tool_failure": any(not item.ok for item in candidate.tool_executions),
@@ -102,7 +115,8 @@ class ModelCompletionReviewer:
         ))
         if response.finish_reason is not FinishReason.STOP:
             raise CompletionReviewError(
-                f"reviewer finish reason was {response.finish_reason.value}"
+                f"reviewer finish reason was {response.finish_reason.value}",
+                reason_code="reviewer_non_stop_response",
             )
         try:
             raw = json.loads(response.message.text.strip())
@@ -119,7 +133,7 @@ class ModelCompletionReviewer:
                 response.usage.input_tokens, response.usage.output_tokens,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise CompletionReviewError("reviewer returned an invalid verdict") from error
+            raise CompletionReviewError("reviewer returned an invalid verdict", reason_code="reviewer_invalid_verdict") from error
 
 
 __all__ = ["ModelCompletionReviewer"]

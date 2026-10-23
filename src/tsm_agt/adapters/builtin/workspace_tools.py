@@ -38,10 +38,17 @@ class CoreWorkspaceMutationToolProvider:
     _patch_spec = ToolSpec(
         name="core.apply_patch",
         description=(
-            "Apply exact text replacements to one workspace file. Read the file first "
+            "Apply text replacements to one workspace file. Read the file first "
             "and pass that same file's latest read sha256 as expected_hash; never use "
-            "a different file's hash or a historical hash. Each old_text must occur exactly once "
-            "at the time it is applied; ambiguous or stale patches fail without writing. "
+            "a different file's hash or a historical hash. "
+            "Use short, unique replacements for localized edits, including multi-line "
+            "blocks; use core.apply_patch_v4a when multiple contextual hunks are clearer. "
+            "Copy old_text faithfully. Exact substring matching comes first. If a multiline "
+            "quote has no exact match, the shared line matcher tries whitespace/Unicode "
+            "normalization, then unique boundary-anchored per-line similarity. Single-line "
+            "substring edits remain exact. Ambiguous or stale patches fail without writing. "
+            "Approval shows the actual diff; fallback matches return patch_matches and diff. "
+            "Inspect approximate changes and verify behavior. "
             "To create a file, pass expected_hash=null and exactly one edit with empty "
             "old_text. Missing ordinary parent directories are created inside the "
             "same transaction. This R1 action requires approval and is journaled."
@@ -80,7 +87,7 @@ class CoreWorkspaceMutationToolProvider:
         effect=ToolEffect.MUTATE,
         result_authority=ToolResultAuthority.MUTATION_FACT,
         model_contract=ModelToolContract(
-            purpose="Apply one exact, journaled text patch to a workspace file.",
+            purpose="Apply one unique, journaled text patch to a workspace file.",
             use_when=("the current file content and hash have been read and the requested edit is ready",),
             avoid_when=("the target content is unknown or stale; read it first", "you only need to describe a proposed change"),
             returns=("a committed mutation receipt with IDs and changed paths", "the receipt does not verify behavioral correctness"),
@@ -96,7 +103,11 @@ class CoreWorkspaceMutationToolProvider:
             "First read the update target with core.read_file and pass "
             "its sha256 as expected_hash. Wait for that read result before generating "
             "the patch; a read and an edit dependent on it cannot be prepared in the "
-            "same tool-call batch. Wrap the patch in '*** Begin Patch' and "
+            "same tool-call batch. Read the actual range for every changed hunk: a "
+            "whole-file hash or a truncated prefix is not evidence of unseen lines. "
+            "Keep edits focused; do not reconstruct unchanged lines from memory or "
+            "add redundant '-old/+identical old' replacements. "
+            "Wrap the patch in '*** Begin Patch' and "
             "'*** End Patch' with one Add File or Update File header; use real newline characters, never the "
             "literal two characters backslash-n; prefix every content line with exactly "
             "one marker. For an update, use a single space for an unchanged context line, '-' to remove a "
@@ -116,7 +127,24 @@ class CoreWorkspaceMutationToolProvider:
             "+    return 'hello ' + name\n"
             "*** End Patch\n"
             "This R1 action requires approval and is journaled; prefer it over "
-            "core.apply_patch for multi-line edits."
+            "core.apply_patch for multiple contextual hunks. Localized multi-line "
+            "replacements can use core.apply_patch. Matching prefers exact text, then "
+            "whitespace and Unicode normalization; an anchored similarity fallback "
+            "requires matching boundaries and one unique target. Ambiguous targets "
+            "are rejected. Approval shows the actual file diff. Successful updates "
+            "return patch_matches and diff; review approximate matches and verify "
+            "behavior rather than treating matching as proof of correctness. "
+            "On PATCH_CONFLICT, no requested "
+            "edit was applied. data.patch_conflict identifies the first failing "
+            "hunk, patch line, and patch_line_kind (deletion/context/anchor). "
+            "expected_context is the old file text quoted by the patch; actual_line "
+            "is the observed file text at the best partial match, when available. "
+            "Repair the old '-' or context lines (or @@ anchor) from a current read; "
+            "changing only '+' lines cannot fix an old-text mismatch. Bounded "
+            "candidate file locations are suggestions, not safe replacement "
+            "text or proof that the rest of the patch matches. Locate/read the "
+            "relevant current ranges, then rebuild the needed hunks and continue "
+            "the authorized edit; do not repeat an unchanged rejected patch."
         ),
         parameters={
             "type": "object",
@@ -153,7 +181,7 @@ class CoreWorkspaceMutationToolProvider:
     _patch_many_spec = ToolSpec(
         name="core.apply_patches",
         description=(
-            "Apply exact text replacements to 2 to 50 distinct workspace files. "
+            "Apply text replacements to 2 to 50 distinct workspace files. "
             "Each item follows core.apply_patch rules and includes a current sha256, "
             "or null when creating it. The runtime validates every patch before "
             "writing, safely creates missing ordinary parent directories, locks all "
@@ -579,6 +607,11 @@ class CoreWorkspaceMutationToolProvider:
             )
         except WorkspacePatchConflict as error:
             literal_newline_escape = "literal \\n" in error.reason
+            data: dict[str, Any] = {
+                "execution_state": "not_started", "no_edits_applied": True,
+            }
+            if error.diagnostics:
+                data["patch_conflict"] = error.diagnostics
             return ToolResult(
                 call.call_id,
                 False,
@@ -587,7 +620,7 @@ class CoreWorkspaceMutationToolProvider:
                     if literal_newline_escape else "PATCH_CONFLICT"
                 ),
                 message=str(error),
-                data={"execution_state": "not_started"},
+                data=data,
                 hint=(
                     "old_text contains literal \\n instead of actual newline characters. "
                     "Reissue a real multi-line core.apply_patch_v4a patch, or submit "
@@ -596,8 +629,19 @@ class CoreWorkspaceMutationToolProvider:
                     "The edit could not be matched and no requested workspace "
                     "edit was applied. Read the current target content, check whether "
                     "the change is still needed, and if so prepare a new edit against "
-                    "that content and its freshly read hash."
+                    "that content and its freshly read hash. For V4A, patch_line_kind "
+                    "identifies a deletion '-', context ' ', or '@@' anchor on the "
+                    "old-file matching side. Compare expected_context (the patch's "
+                    "quoted old text) with actual_line (file text at the best partial "
+                    "match, if available). Repair that old side; changing only '+' "
+                    "lines cannot fix this conflict. Inspect candidate_locations if "
+                    "the target is still unclear; these are "
+                    "bounded hints, not automatic replacements. Only the first "
+                    "conflict is reported, so check all intended hunks against "
+                    "observed content. This rejection applies to this patch, not "
+                    "to further authorized edits."
                 ),
+                meta={"untrusted_data": True},
                 recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
                 recovery_action={
                     "required_change": (

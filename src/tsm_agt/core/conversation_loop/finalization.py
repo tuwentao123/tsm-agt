@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import replace
 import time
 from typing import Any
@@ -14,7 +15,7 @@ from tsm_agt.ports import (
     CompletionReviewAction, CompletionReviewMode, CompletionReviewVerdict,
     FinalizationAction, FinalizationCandidate, FinalizationDecision,
     FinishReason, Message, MessageRole, TextBlock, ToolCallBlock,
-    ToolExecutionSummary, ToolResultBlock,
+    ToolExecutionSummary, ToolResultBlock, ToolEffect, ToolRecoveryKind,
 )
 
 from ..agent_loop import TurnState
@@ -72,6 +73,30 @@ class RuntimeFinalizationGate:
                 FinalizationAction.CONTINUE if has_budget else FinalizationAction.INCOMPLETE,
                 "empty_final_response" if has_budget else "empty_response_budget_exhausted",
                 _RUNTIME_CONTINUATION if has_budget else "",
+            )
+        rejected_edits = _latest_rejected_edits(state)
+        if rejected_edits:
+            # This is a narrow protocol repair: the adapter certifies that no
+            # write started. Never retry the rejected payload, relax its hash,
+            # or apply an old approval to a newly prepared edit here.
+            can_recover = has_budget and state.edit_recovery_continuations < 1
+            return FinalizationDecision(
+                FinalizationAction.CONTINUE if can_recover else FinalizationAction.INCOMPLETE,
+                "workspace_edit_recovery_required" if can_recover
+                else "workspace_edit_recovery_incomplete",
+                (
+                    "The latest workspace edit was rejected before execution: "
+                    + json.dumps(rejected_edits, ensure_ascii=False)
+                    + ". No requested edit was applied. Continue the original authorized "
+                    "request in this turn. Read the current target content and its sha256, "
+                    "check whether the change is still needed, and prepare a corrected "
+                    "edit against that observed version. Do not copy actual_hash into an "
+                    "old patch or repeat it unchanged. Any new edit follows the normal "
+                    "approval path. If the change already exists, verify it; if a real "
+                    "permission or environment blocker prevents progress, establish it "
+                    "with tool results. Do not substitute a proposed patch or user "
+                    "instructions for an available recovery action."
+                ) if can_recover else "",
             )
         return FinalizationDecision(FinalizationAction.ACCEPT, "runtime_state_terminal")
 
@@ -295,6 +320,8 @@ class ConversationFinalizationPipeline:
         self, state: TurnState, decision: FinalizationDecision,
     ) -> None:
         state.runtime_continuations += 1
+        if decision.reason_code == "workspace_edit_recovery_required":
+            state.edit_recovery_continuations += 1
         payload = {
             "type": "runtime_finalization_continuation",
             "reason": decision.reason_code,
@@ -336,6 +363,7 @@ class ConversationFinalizationPipeline:
             finalization_state={
                 "review_continuations": state.review_continuations,
                 "runtime_continuations": state.runtime_continuations,
+                "edit_recovery_continuations": state.edit_recovery_continuations,
                 "reviewer_call_count": state.reviewer_call_count,
                 "last_candidate_hash": state.last_candidate_hash,
                 "last_review_reason_code": state.last_review_reason_code,
@@ -358,6 +386,50 @@ class ConversationFinalizationPipeline:
             )),), scaffolding=kind,
         ))
         await self.persist_finalization_state(state, f"conversation-{kind}")
+
+
+def _latest_rejected_edits(state: TurnState) -> list[dict[str, str]]:
+    """Read only the latest exchange, allowing a later inspection or blocker.
+
+    A denial, an unknown outcome, or a command that actually ran must never
+    enter this repair path. The model chooses its recovery tools; the Runtime
+    only prevents immediately abandoning a declared, unstarted workspace edit.
+    """
+    specs = state.visible_tool_by_name or {}
+    for index in range(len(state.messages) - 1, -1, -1):
+        calls = {
+            block.call.call_id: block.call
+            for block in state.messages[index].content
+            if isinstance(block, ToolCallBlock)
+        }
+        if not calls:
+            continue
+        rejected = []
+        for message in state.messages[index + 1:]:
+            for block in message.content:
+                if not isinstance(block, ToolResultBlock):
+                    continue
+                result = block.result
+                call = calls.get(result.call_id)
+                spec = specs.get(call.name) if call is not None else None
+                if (
+                    spec is not None and spec.effect is ToolEffect.MUTATE
+                    and not result.ok
+                    and result.error_code in {
+                        "CONFLICT", "PATCH_CONFLICT", "PATCH_INVALID_V4A",
+                        "PATCH_LITERAL_NEWLINE_ESCAPE",
+                    }
+                    and result.effective_recovery_kind not in {
+                        ToolRecoveryKind.UNKNOWN_OUTCOME, ToolRecoveryKind.TERMINAL,
+                        ToolRecoveryKind.USER_ACTION_REQUIRED,
+                    }
+                    and isinstance(result.data, Mapping)
+                    and result.data.get("execution_state") == "not_started"
+                ):
+                    rejected.append({"call_id": call.call_id, "tool": call.name,
+                                     "error_code": result.error_code})
+        return rejected
+    return []
 
 
 def _unmatched_tool_call_ids(messages: list[Message]) -> tuple[str, ...]:

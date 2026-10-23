@@ -146,7 +146,7 @@ class _RecordingClient:
 
     async def submit_user_input(
         self, session_id, text, *, input_id, explicit_intent=None,
-        target_task_id=None, images=(), workspace=None,
+        target_task_id=None, images=(), workspace=None, reasoning_effort=None,
     ):
         self.session_calls.append({
             "session_id": session_id, "text": text, "workspace": workspace,
@@ -186,6 +186,7 @@ class WebWorkspaceForwardingTest(unittest.IsolatedAsyncioTestCase):
                 [{"id": "ws-1", "name": "AppHitchMainH5", "path": self.workspace}],
             ),
             mock.patch.object(self.web_app, "session_workspace_bindings", {}),
+            mock.patch.object(self.web_app, "save_workspace_registry", lambda: None),
             mock.patch.object(
                 self.web_app, "save_session_workspace_bindings", lambda: None
             ),

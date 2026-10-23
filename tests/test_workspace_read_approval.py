@@ -21,7 +21,9 @@ from tsm_agt.ports import (
 class ExternalReadModel(EchoModelProvider):
     """Ask for one external file, then finish from the resumed result."""
 
-    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+    # This fixture tests approval/checkpoint recovery, not context compaction.
+    # Leave room for the real system prompt, history, and local-read schemas.
+    capabilities = ProviderCapabilities(tools=True, context_window=16384)
 
     def __init__(self, path: Path) -> None:
         super().__init__()

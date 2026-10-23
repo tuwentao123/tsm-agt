@@ -58,7 +58,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tsm_agt.ports import (
-    BackgroundProcessStartResult, Message, MessageRole, ProcessWaitResult,
+    BackgroundProcessStartResult, Message, MessageRole, ProcessStartError, ProcessWaitResult,
     OutcomeBindingMode, RecoverableToolProtocolError, RuntimeEvent,
     RuntimeUnitOfWork, ToolArgumentPresentation, ToolCall, ToolCallBlock,
     ToolEffect, ToolIdempotency, ToolInvocationContext,
@@ -91,7 +91,7 @@ from .execution import (
     ToolExecutionRecord
 )
 from .memory import MemoryScope, MemorySourceKind
-from .process import ProcessPreparationError
+from .process import ProcessPreparationError, ProcessSandboxDenied
 from .task import TaskKind, TaskNotFound, TaskSnapshot, TaskState
 from .task_spec import (
     OutcomeBindingAction, OutcomeBindingDecision, OutcomeBindingReason,
@@ -104,18 +104,21 @@ from .tool import (
 )
 from .turn import InvalidModelResponse, InvalidTurnState
 from .verification_command import is_verification_request
-from .v4a import apply_v4a_update
+from .v4a import plan_v4a_update
+from .patch_preview import patch_diff
+from .patch_text import plan_text_edits
 from .workspace import WorkspacePatchConflict, prepare_workspace_text_write
 
 
 def _render_workspace_patch(
     path: str, before_bytes: bytes | None,
     edits: tuple[Mapping[str, str], ...],
+    *, matches: list[dict[str, Any]] | None = None,
 ) -> str:
     if len(edits) == 1 and "v4a_patch" in edits[0]:
         # The V4A tool carries its raw patch here so Codex-style context
         # matching can run against the current file content rather than the
-        # flat, globally-unique old_text replacement used by core.apply_patch.
+        # shared line matching used by multiline core.apply_patch replacements.
         if before_bytes is None:
             raise WorkspacePatchConflict(
                 path, 0, "cannot apply a V4A update to a file that does not exist"
@@ -126,7 +129,10 @@ def _render_workspace_patch(
             raise ValueError(
                 "core.apply_patch_v4a supports UTF-8 text files only"
             ) from error
-        return apply_v4a_update(path, text, str(edits[0]["v4a_patch"]))
+        plan = plan_v4a_update(path, text, str(edits[0]["v4a_patch"]))
+        if matches is not None:
+            matches.extend(plan.matches)
+        return plan.content
     if before_bytes is None:
         if len(edits) != 1 or edits[0]["old_text"] != "":
             raise ValueError(
@@ -137,33 +143,10 @@ def _render_workspace_patch(
         content = before_bytes.decode("utf-8")
     except UnicodeDecodeError as error:
         raise ValueError("core.apply_patch supports UTF-8 text files only") from error
-    for index, edit in enumerate(edits):
-        old_text = edit["old_text"]
-        if not old_text:
-            # The caller believed the file was absent (or did not read it), but
-            # it exists. Re-reading is the fix, not abandonment.
-            raise WorkspacePatchConflict(
-                path, index, "old_text must not be empty for an existing file"
-            )
-        matches = content.count(old_text)
-        if matches == 0:
-            if "\\n" in old_text and "\n" not in old_text:
-                literal_newline_candidate = old_text.replace("\\n", "\n")
-                if content.count(literal_newline_candidate) == 1:
-                    raise WorkspacePatchConflict(
-                        path,
-                        index,
-                        "old_text contains literal \\n; use actual newline characters",
-                    )
-            raise WorkspacePatchConflict(
-                path, index, "old_text was not found in the current file"
-            )
-        if matches > 1:
-            raise WorkspacePatchConflict(
-                path, index, f"old_text is ambiguous: found {matches} matches"
-            )
-        content = content.replace(old_text, edit["new_text"], 1)
-    return content
+    plan = plan_text_edits(path, content, edits)
+    if matches is not None:
+        matches.extend(plan.matches)
+    return plan.content
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,14 +201,19 @@ class _TaskProcessControl(ToolProcessControl):
         max_output_bytes: int, max_lifetime_seconds: float,
         stop_on_task_end: bool,
     ) -> BackgroundProcessStartResult:
-        record = await self.kernel.start_background_process(
-            self.task_id, self.turn_id, argv, cwd=cwd,
-            environment=environment,
-            max_lifetime_seconds=max_lifetime_seconds,
-            max_output_bytes=max_output_bytes,
-            stop_on_task_end=stop_on_task_end,
-            invocation_id=self.invocation_id,
-        )
+        try:
+            record = await self.kernel.start_background_process(
+                self.task_id, self.turn_id, argv, cwd=cwd,
+                environment=environment,
+                max_lifetime_seconds=max_lifetime_seconds,
+                max_output_bytes=max_output_bytes,
+                stop_on_task_end=stop_on_task_end,
+                invocation_id=self.invocation_id,
+            )
+        except (ProcessPreparationError, ProcessSandboxDenied) as error:
+            raise ProcessStartError(
+                error.code, str(error), data=error.to_data(), hint=error.hint,
+            ) from error
         # A non-blocking poll captures fast command completion without making
         # process start depend on an eventual exit.
         record = await self.kernel.get_background_process_status(
@@ -306,12 +294,17 @@ class _TaskWorkspaceControl(ToolWorkspaceControl):
             Path(task.workspace), path, "", expected_hash,
             self.kernel.dependencies.workspace_path,
         )
-        content = _render_workspace_patch(path, prepared.before_bytes, edits)
+        matches: list[dict[str, Any]] = []
+        content = _render_workspace_patch(path, prepared.before_bytes, edits, matches=matches)
 
         record = await self.kernel.write_workspace_text(
             self.task_id, self.invocation_id, path, content, expected_hash
         )
-        return record.to_data()
+        data = record.to_data()
+        if matches:
+            data["patch_matches"] = matches
+            data["diff"] = patch_diff(path, prepared.before_bytes.decode("utf-8"), content)
+        return data
 
     async def apply_patches(
         self, patches: tuple[Mapping[str, Any], ...],
@@ -320,6 +313,7 @@ class _TaskWorkspaceControl(ToolWorkspaceControl):
         task = await self.kernel.get_task(self.task_id)
         workspace = Path(task.workspace)
         writes: list[tuple[str, str, str | None]] = []
+        match_details: list[tuple[list[dict[str, Any]], str]] = []
         total_edits = 0
         for patch in patches:
             path = str(patch["path"])
@@ -330,17 +324,23 @@ class _TaskWorkspaceControl(ToolWorkspaceControl):
                 workspace, path, "", expected_hash,
                 self.kernel.dependencies.workspace_path,
             )
-            writes.append((
-                path,
-                _render_workspace_patch(path, prepared.before_bytes, edits),
-                expected_hash,
-            ))
+            matches: list[dict[str, Any]] = []
+            content = _render_workspace_patch(path, prepared.before_bytes, edits, matches=matches)
+            writes.append((path, content, expected_hash))
+            match_details.append((matches, patch_diff(path, prepared.before_bytes.decode("utf-8"), content)
+                                  if matches else ""))
         if total_edits > 500:
             raise ValueError("batch patch cannot contain more than 500 edits")
         records = await self.kernel.write_workspace_text_batch(
             self.task_id, self.invocation_id, tuple(writes)
         )
-        return tuple(record.to_data() for record in records)
+        receipts = []
+        for record, (matches, diff) in zip(records, match_details, strict=True):
+            data = record.to_data()
+            if matches:
+                data.update(patch_matches=matches, diff=diff)
+            receipts.append(data)
+        return tuple(receipts)
 
     async def delete_file(
         self, path: str, expected_hash: str
@@ -1160,14 +1160,9 @@ class ToolMixin:
         raw_environment = call.arguments.get("environment", {})
         if not isinstance(raw_cwd, str) or not isinstance(raw_environment, Mapping):
             return call, {}
-        try:
-            prepared = self._prepare_process_execution(
-                task, tuple(raw_argv), raw_cwd, raw_environment,
-            )
-        except ValueError:
-            # Preserve schema/path validation's established tool-error path.
-            # Only an executable-availability result is useful before approval.
-            return call, {}
+        prepared = self._prepare_process_execution(
+            task, tuple(raw_argv), raw_cwd, raw_environment,
+        )
         arguments = dict(call.arguments)
         arguments["argv"] = list(prepared.argv)
         return replace(call, arguments=arguments), prepared.approval_identity()
@@ -1190,10 +1185,8 @@ class ToolMixin:
                 ok=False,
                 error_code=error.code,
                 message=str(error),
-                hint=(
-                    "No process was started. Inspect the available project "
-                    "environment or choose another advertised tool."
-                ),
+                hint=error.hint,
+                data={**error.to_data(), "cwd": str(call.arguments.get("cwd", "<missing>"))},
                 recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
                 recovery_action={
                     "execution_state": "not_started",
@@ -1520,7 +1513,7 @@ class ToolMixin:
                 call=call,
                 action=selected_spec.description,
                 target=self._approval_target(call),
-                preview=self._approval_preview(call),
+                preview=self._approval_preview(call, task),
                 network_access=(
                     "required" if decision.requires_network else "not required"
                 ),

@@ -49,6 +49,21 @@ _RIPGREP_TIMEOUT_SECONDS = 20.0
 _MAX_FIND_LIMIT = 500
 _MAX_FIND_ENTRIES = 50_000
 
+# Keep path capability in the provider-visible contract, not only the longer
+# operator description: ToolSpec.model_description() selects the contract.
+_LOCAL_READ_PATH_GUIDANCE = (
+    "Accept workspace-relative paths or absolute local paths. "
+    "Relative paths use the task workspace. "
+    "Submit an outside absolute path directly; Runtime may pause "
+    "for Task-scoped directory read approval. "
+    "Pending approval is not a denial. "
+    "Explicit policy denials and sensitive-file restrictions still apply."
+)
+_LOCAL_READ_DIRECTORY_PATH = (
+    "Workspace-relative or absolute local directory path; defaults to '.'. "
+    "Outside paths may require directory read approval."
+)
+
 
 class _WorkspaceAccessError(ValueError):
     pass
@@ -79,7 +94,7 @@ class CoreReadOnlyToolProvider:
         ToolSpec(
             name="core.list_files",
             description=(
-                "List files and directories under one workspace-relative path. Use it "
+                "List files and directories under one local path. Use it "
                 "to discover project structure; do not use it to read file contents. "
                 "An absolute outside path pauses for explicit Task-scoped directory read "
                 "approval. Escaped symlinks, .git, credentials, environment files, and "
@@ -92,7 +107,7 @@ class CoreReadOnlyToolProvider:
             parameters={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative directory; defaults to '.'."},
+                    "path": {"type": "string", "description": _LOCAL_READ_DIRECTORY_PATH},
                     "recursive": {"type": "boolean", "description": "Whether to descend into child directories; defaults to false."},
                     "limit": {
                         "type": "integer", "minimum": 1,
@@ -109,7 +124,7 @@ class CoreReadOnlyToolProvider:
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
             model_contract=ModelToolContract(
-                purpose="Survey the files and directories below one workspace path.",
+                purpose="Survey local files and directories. " + _LOCAL_READ_PATH_GUIDANCE,
                 use_when=("the project layout or candidate folders are unknown",),
                 avoid_when=("you need file contents; use core.read_file",),
                 returns=("path/type/size metadata only; entries may be truncated",),
@@ -136,7 +151,7 @@ class CoreReadOnlyToolProvider:
                         "default": "content",
                         "description": "Search file contents (default) or only file names/paths.",
                     },
-                    "path": {"type": "string", "description": "Workspace-relative search root; defaults to '.'."},
+                    "path": {"type": "string", "description": _LOCAL_READ_DIRECTORY_PATH},
                     "file_glob": {"type": "string", "description": "Optional glob limiting files for content search."},
                     "regex": {"type": "boolean", "description": "Interpret pattern as a regex; defaults to false."},
                     "case_sensitive": {"type": "boolean", "description": "Use case-sensitive matching; defaults to false."},
@@ -171,7 +186,7 @@ class CoreReadOnlyToolProvider:
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
             model_contract=ModelToolContract(
-                purpose="Locate candidate source files or lines in the workspace.",
+                purpose="Locate candidate local files or lines. " + _LOCAL_READ_PATH_GUIDANCE,
                 use_when=("you need to find a symbol, text, configuration key, UI label, or known filename",),
                 avoid_when=("you need to establish what a candidate file actually says; read it next",),
                 returns=("candidate locations or counts, not a complete source interpretation", "truncation means more candidates may exist"),
@@ -181,13 +196,14 @@ class CoreReadOnlyToolProvider:
             name="core.find_files",
             description=(
                 "Legacy filename-search alias retained for checkpoint compatibility. "
-                "For new work use core.search_files with target='files'."
+                "For new work use core.search_files with target='files'. "
+                + _LOCAL_READ_PATH_GUIDANCE
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string"},
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "description": _LOCAL_READ_DIRECTORY_PATH},
                     "case_sensitive": {"type": "boolean"},
                     "limit": {
                         "type": "integer", "minimum": 1,
@@ -223,7 +239,13 @@ class CoreReadOnlyToolProvider:
             parameters={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative or approved external file path; provide exactly one of path/resource_ref."},
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Workspace-relative or absolute local file path; provide exactly "
+                            "one of path/resource_ref. Outside paths may require directory read approval."
+                        ),
+                    },
                     "resource_ref": {"type": "string", "description": "A task-scoped reference returned by a discovery tool; provide exactly one of path/resource_ref."},
                     "start_line": {"type": "integer", "minimum": 1, "description": "First 1-based line to return; defaults to 1."},
                     "start_column": {"type": "integer", "minimum": 1, "description": "First 1-based Unicode character in start_line; defaults to 1. Use next_cursor to continue a split long line."},
@@ -242,7 +264,7 @@ class CoreReadOnlyToolProvider:
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.WORKSPACE_FACT,
             model_contract=ModelToolContract(
-                purpose="Read bounded UTF-8 content from one located workspace or approved external file.",
+                purpose="Read bounded UTF-8 content from one located local file. " + _LOCAL_READ_PATH_GUIDANCE,
                 use_when=("a specific file can answer the question or must be inspected before editing",),
                 avoid_when=("the file is still unknown; search or list first",),
                 returns=("a content window with line range and whole-file hash", "truncation means unread content remains"),
@@ -252,13 +274,14 @@ class CoreReadOnlyToolProvider:
             name="core.search_text",
             description=(
                 "Legacy content-search alias retained for checkpoint compatibility. "
-                "For new work use core.search_files with target='content'."
+                "For new work use core.search_files with target='content'. "
+                + _LOCAL_READ_PATH_GUIDANCE
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "description": _LOCAL_READ_DIRECTORY_PATH},
                     "regex": {"type": "boolean"},
                     "case_sensitive": {"type": "boolean"},
                     "max_matches": {
@@ -288,13 +311,14 @@ class CoreReadOnlyToolProvider:
             name="core.grep_search",
             description=(
                 "Legacy grep-style content-search alias retained for checkpoint "
-                "compatibility. For new work use core.search_files with target='content'."
+                "compatibility. For new work use core.search_files with target='content'. "
+                + _LOCAL_READ_PATH_GUIDANCE
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "description": _LOCAL_READ_DIRECTORY_PATH},
                     "regex": {"type": "boolean"},
                     "case_sensitive": {"type": "boolean"},
                     "max_matches": {

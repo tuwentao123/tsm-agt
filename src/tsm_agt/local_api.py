@@ -132,6 +132,34 @@ class LocalEventApiServer:
         future = asyncio.run_coroutine_threadsafe(awaitable, self._loop)
         return future.result(timeout=timeout)
 
+    async def iterate_runtime(self, iterator):
+        """Pull at most one batch across loops; never block the ASGI thread.
+
+        Waiting, SQLite reads and generator cleanup all belong to the Runtime
+        loop. A slow HTTP client stops pulling without blocking the writer.
+        """
+        if self._loop is None:
+            raise RuntimeError("local Event API is not running")
+        sentinel = object()
+        pending = None
+        try:
+            while True:
+                pending = asyncio.run_coroutine_threadsafe(anext(iterator, sentinel), self._loop)
+                item = await asyncio.wrap_future(pending)
+                if item is sentinel:
+                    return
+                yield item
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
+            async def close():
+                # Let a cancelled __anext__ unwind its wait before closing.
+                await asyncio.sleep(0)
+                await iterator.aclose()
+            if self._loop.is_running():
+                cleanup = asyncio.run_coroutine_threadsafe(close(), self._loop)
+                await asyncio.shield(asyncio.wrap_future(cleanup))
+
     def submit_background(
         self, awaitable, *, on_error: Callable[[BaseException], None] | None = None,
     ) -> Future[Any]:

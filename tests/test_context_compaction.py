@@ -4,8 +4,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tsm_agt.adapters.fixture import EchoModelProvider
+from tsm_agt.adapters.local_skills import UserSkillsStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     ContextWindowExceeded, ContextWindowManager, PromptTemplate, TaskState,
@@ -307,7 +309,8 @@ class ContextWindowManagerTest(unittest.TestCase):
                 text("goal", MessageRole.USER, "current request"), session,
             ),
             tools=(), prompt_template=self.template,
-            context_window=3000 + STATIC_PROMPT_GROWTH_TOKENS,
+            # Leave the same history budget as the static prompt evolves.
+            context_window=self.static_tokens + 2500 + 256,
             max_output_tokens=256,
         )
 
@@ -423,6 +426,14 @@ class GrowingContextModel(EchoModelProvider):
 
 
 class ContextCompactionKernelTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        patcher = patch("tsm_agt.bootstrap.composition.UserSkillsStore",
+                        return_value=UserSkillsStore(Path(home.name)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     async def test_text_turn_persists_unified_budget_without_prompt_bodies(self) -> None:
         application = compose_fixture_application(tool_adapters=())
         await application.registry.start_all()
@@ -567,7 +578,10 @@ class PinnedProvenanceCompactionTest(unittest.TestCase):
                 text("goal", MessageRole.USER, "current request"), session,
             ),
             tools=(), prompt_template=self.template,
-            context_window=3000 + STATIC_PROMPT_GROWTH_TOKENS,
+            context_window=(
+                ContextWindowManager.estimate_input_tokens((), (), self.template)
+                + 2500 + 256
+            ),
             max_output_tokens=256,
         )
 

@@ -183,7 +183,7 @@ class PromptTemplate:
                 # the only place that says how a request becomes an answer, so a
                 # capability-gated segment never has to carry routing rules.
                 PromptTemplateSegment(
-                    "request-pipeline-guidance", "harness", "4.2",
+                    "request-pipeline-guidance", "harness", "4.5",
                     prompt_text["request-pipeline-guidance"],
                 ),
                 # This is deliberately a stable, tool-capability-gated contract:
@@ -191,7 +191,7 @@ class PromptTemplate:
                 # work from its full conversational context.  Runtime does not
                 # classify user text or inject a per-turn implementation label.
                 PromptTemplateSegment(
-                    "delivery-mode-guidance", "harness", "4.1",
+                    "delivery-mode-guidance", "harness", "4.5",
                     prompt_text["delivery-mode-guidance"],
                     requires_any_tools=(
                         "core.apply_patch", "core.apply_patch_v4a",
@@ -203,7 +203,7 @@ class PromptTemplate:
                 # not duplicate the command-specific facts kept in
                 # workspace-command-guidance.
                 PromptTemplateSegment(
-                    "tool-feedback-guidance", "harness", "1.2",
+                    "tool-feedback-guidance", "harness", "1.3",
                     prompt_text["tool-feedback-guidance"],
                 ),
                 PromptTemplateSegment(
@@ -215,7 +215,7 @@ class PromptTemplate:
                     prompt_text["execution-discipline"],
                 ),
                 PromptTemplateSegment(
-                    "completion-behavior-examples", "harness", "3.0",
+                    "completion-behavior-examples", "harness", "3.2",
                     prompt_text["completion-behavior-examples"],
                 ),
                 # ---- tool usage: one segment per capability, ordered by what
@@ -232,9 +232,9 @@ class PromptTemplate:
                     requires_any_tools=("core.read_file", "core.search_files"),
                 ),
                 PromptTemplateSegment(
-                    "code-edit-guidance", "harness", "1.3",
+                    "code-edit-guidance", "harness", "1.6",
                     prompt_text["code-edit-guidance"],
-                    requires_any_tools=("core.apply_patch_v4a",),
+                    requires_any_tools=("core.apply_patch", "core.apply_patch_v4a"),
                 ),
                 PromptTemplateSegment(
                     "workspace-command-guidance", "harness", "1.5",
@@ -279,7 +279,7 @@ class PromptTemplate:
                     requires_any_tools=("core.working_memory_update",),
                 ),
                 PromptTemplateSegment(
-                    "task-plan-guidance", "harness", "3.1",
+                    "task-plan-guidance", "harness", "3.3",
                     prompt_text["task-plan-guidance"],
                     requires_any_tools=("core.todo_list",),
                 ),

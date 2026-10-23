@@ -88,12 +88,15 @@ class InMemoryRuntimeStore:
     async def read_events(
         self, task_id: str, after_sequence: int = 0,
         event_types: tuple[str, ...] | None = None,
+        *, limit: int | None = None,
     ) -> tuple[RuntimeEvent, ...]:
+        if limit is not None and not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
         return tuple(
             event for event in self._events.get(task_id, ())
             if event.sequence > after_sequence
             and (not event_types or event.event_type in event_types)
-        )
+        )[:limit]
 
     async def load_task(self, task_id: str) -> StoredTask | None:
         state = self._tasks.get(task_id)

@@ -245,7 +245,8 @@ class PastedImageIngressTest(unittest.TestCase):
 class ComposerLayoutTest(unittest.TestCase):
     def test_panes_scroll_independently(self) -> None:
         html = web_app.INDEX_HTML
-        self.assertIn("height:100vh;overflow:hidden", html)
+        self.assertRegex(html, r"\.layout\{[^}]*height:100(?:d)?vh;[^}]*overflow:hidden")
+        self.assertRegex(html, r"\.chat-area,\.trace-pane\{[^}]*overflow-y:auto")
         self.assertIn("overscroll-behavior:contain", html)
 
     def test_sessions_are_nested_under_their_workspace(self) -> None:

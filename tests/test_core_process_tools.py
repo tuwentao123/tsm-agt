@@ -244,6 +244,39 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
             prepared.approval_identity()["resolved_target"],
         )
 
+    async def test_relative_entry_can_target_an_external_program_from_child_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "actual-program"
+            target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            target.chmod(0o755)
+            root = Path(self.temporary.name)
+            (root / "package").mkdir()
+            launcher = root / "runner"
+            try:
+                launcher.symlink_to(target)
+            except OSError as error:
+                self.skipTest(f"cannot create executable symlink: {error}")
+            prepared = self.application.kernel._prepare_process_execution(
+                self.task, ("../runner",), "package", {},
+            )
+            self.assertEqual(prepared.launch_path, root.resolve() / "runner")
+            self.assertEqual(prepared.resolved_target, target.resolve())
+
+    async def test_invalid_executable_entry_is_diagnosed_before_approval(self) -> None:
+        result = await self.application.kernel.invoke_tool(
+            self.task.task_id, "turn-invalid-entry", ToolCall(
+                "call-invalid-entry", "core.run_command",
+                {"argv": ["../outside/runner"], "cwd": "."},
+            ),
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "EXECUTABLE_PATH_INVALID")
+        self.assertEqual(result.data["execution_state"], "not_started")
+        self.assertEqual(result.data["stage"], "resolve_executable")
+        self.assertEqual(result.data["requested_executable"], "../outside/runner")
+        self.assertIn("No process was started", result.hint)
+        self.assertIsNone((await self.application.kernel.get_task(self.task.task_id)).pending_approval)
+
     async def test_approval_is_invalidated_when_launcher_target_changes(self) -> None:
         first_target = Path(self.temporary.name) / "first-launcher-target"
         second_target = Path(self.temporary.name) / "second-launcher-target"
@@ -256,7 +289,7 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         except OSError as error:
             self.skipTest(f"test environment cannot create symlinks: {error}")
         call = ToolCall("call-command-identity", "core.run_command", {
-            "argv": [str(launcher)], "cwd": ".",
+            "argv": ["./approved-launcher"], "cwd": ".",
         })
         with self.assertRaises(ApprovalRequired) as caught:
             await self.application.kernel.invoke_tool(
@@ -437,23 +470,27 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_run_command_rejects_workspace_escape_and_credential_environment(self) -> None:
-        escaped = await self._approve_call(ToolCall(
+        escaped = await self.application.kernel.invoke_tool(self.task.task_id, "turn-escape", ToolCall(
             "call-command-escape", "core.run_command", {
                 "argv": [sys.executable, "-V"], "cwd": "..",
             },
-        ), "turn-escape")
+        ))
         self.assertFalse(escaped.ok)
         self.assertEqual(escaped.error_code, "INVALID_PARAM")
+        self.assertEqual(escaped.data["stage"], "resolve_cwd")
 
-        secret = await self._approve_call(ToolCall(
+        secret = await self.application.kernel.invoke_tool(self.task.task_id, "turn-secret", ToolCall(
             "call-command-secret", "core.run_command", {
                 "argv": [sys.executable, "-V"],
                 "cwd": ".",
                 "environment": {"API_TOKEN": "must-not-forward"},
             },
-        ), "turn-secret")
+        ))
         self.assertFalse(secret.ok)
         self.assertEqual(secret.error_code, "INVALID_PARAM")
+        self.assertEqual(secret.data["stage"], "validate_environment")
+        self.assertNotIn("must-not-forward", str(secret.to_data()))
+        self.assertIsNone((await self.application.kernel.get_task(self.task.task_id)).pending_approval)
 
     async def test_run_command_normalizes_absolute_cwd_inside_workspace_before_approval(self) -> None:
         workspace = Path(self.temporary.name).resolve()
@@ -587,6 +624,9 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertFalse(result.ok)
             self.assertEqual(result.error_code, "PERMISSION_DENIED")
+            self.assertEqual(result.data["execution_state"], "not_started")
+            self.assertEqual(result.data["stage"], "authorize_executable")
+            self.assertIn("resolved_target", result.data)
         finally:
             await denied_application.registry.stop_all()
 

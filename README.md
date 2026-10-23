@@ -10,6 +10,20 @@ Conversation Loop 中的 Task 是持续的运行容器，保存审批、断点�
 
 Event Log 已可通过纯 Core `FlowProjector` 投影为 Task/Phase/Turn/Model/Tool/Approval/Process/Mutation/Memory/Onboarding 流程节点，并支持 cursor 增量更新和首个可行动失败定位。CLI 支持流程树、泳道时间线、静态/实时 TUI、下钻、筛选以及 JSON/JSONL/离线 HTML 脱敏导出；Replay 支持定位、范围自动播放、交互单步和断点游标恢复。Task 首次进入执行态时还会在同一 SQLite 事务中保存脱敏、不可变的 Effective Configuration revision 1。基础 Prompt Manifest 与确定性装配也已接入，每次模型调用记录不含正文的 `effective_prompt_hash`。完整实时 Web UI 与重新执行模型/副作用的 `--rerun` 仍待其他安全前置能力完成。
 
+## 用户级 Skills
+
+Web 页面右上角的「设置」提供 Skill 安装和「可发现 Skills 目录」。从本地目录安装时，文件统一保存到 `~/.tsm-agent/skills/<name>/`，其中名称和描述读取自 `SKILL.md` 的 YAML frontmatter。安装不绑定项目或会话。
+
+目录保存后，系统在最近选中或发送过消息的工作区自动创建「安装 Skill：名称」会话，并打开该会话展示执行进度。模型先读取 Skill 和必要的引用文件，自行判断是否需要环境、CLI 或插件；仅准备缺失的必需资源，再按文档验证。不需要前置资源的 Skill 可直接完成文档可用性检查。安装会话不会执行发布、数据修改等业务任务，命令仍走正常的审批、登录和澄清流程。
+
+「文件已保存」和「安装成功，验证通过」是不同状态。模型通过 `skill.installation_finish` 回报实际检查结果；只有安装会话读取过对应 `SKILL.md` 才能报告准备完成。准备进度、检查结果、工作区和会话 ID 保存于 `~/.tsm-agent/skill-installations.json`，可在设置中查看并打开原会话；没有工作区或运行时不可用时保留待准备状态，选择工作区后可重试准备。相同目录重复上传复用原安装记录，避免重复启动安装。
+
+默认发现 `~/.tsm-agent/skills`；可在设置中一次选择多个额外目录，例如 `~/.kiro/skills`、`~/.agents/skills`，也可以手动输入路径。额外目录只用于发现和读取，不接收安装写入。目录设置保存在 `~/.tsm-agent/settings.json` 的 `skill_discovery_directories` 字段，保存后刷新，下一轮对话即可使用，重启后继续生效。旧版 `uploaded_skills` 中的内容可通过重新安装或将旧目录加入发现列表使用。
+
+系统递归发现 `SKILL.md`，将名称和描述提供给模型；模型调用统一的 `skill.load(name)` 加载完整指令，再调用普通工具执行。附件可通过同一工具的 `resource` 参数读取，路径相对于 Skill 所在目录。加载不会自动执行 Markdown 或 YAML 步骤。默认安装目录优先于额外目录；其他目录按配置顺序处理，同名定义和格式错误显示在设置中的问题列表。
+
+Web 执行进度通过 `/stream/{task_id}` 的 SSE 推送：事务提交成功后唤醒订阅者，空闲时仅发送心跳，不定时查询完整任务状态。SSE `id` 使用 SQLite 持久事件序号，支持 `Last-Event-ID` 或 `after` 增量补发；实时临时片段不推进持久游标，最终消息以已提交的 Session 结果为准。恢复游标超过当前日志范围时，服务端发送 `stream.reset_required` 并重新提供事件与状态。前端按轮次隔离和去重，正常连接不再每 2.5 秒请求 `/tasks/{id}`；仅在多次重连失败后读取一次状态作恢复校准。Skill 安装进度也通过独立 SSE 订阅，不再定时查询安装状态。当前提交通知面向一个本地 Runtime 写入进程，多进程写同一数据库需要另加跨进程通知机制。
+
 ## 验证当前进度
 
 首次进入项目先同步精确锁定的运行时依赖，之后统一通过项目环境启动，避免系统 Python 绕过终端输入组件：
@@ -66,6 +80,8 @@ uv run python -m unittest discover -s tests -v
 ```
 
 ## 统一 Python / pytest / Web 启动策略
+
+本机命令不按程序名称维护执行白名单，已安装的 CLI 统一经过命令审批与执行检查。受控执行继承服务启动时的 `PATH` 及其原有顺序，使用户目录中的 CLI 和通过 `/usr/bin/env` 启动的解释器都能被找到；请从能找到这些工具的环境启动服务。其他宿主环境变量仍按既有规则筛选。直接 shell 调用、工作目录、Windows 批处理参数和审批身份等检查继续有效；本机命令使用服务进程的操作系统权限。
 
 当前 Runtime 对命令执行有两个关键限制：
 

@@ -410,7 +410,7 @@ class SessionRestoreEndpointTest(unittest.IsolatedAsyncioTestCase):
             [item["task_id"] for item in payload["tasks"]],
             ["task-old", "task-new"],
         )
-        self.assertEqual(payload["tasks"][1]["progress_cursor"], 7)
+        self.assertEqual(payload["tasks"][1]["progress_cursor"], 4)
         self.assertEqual(payload["tasks"][1]["todo_list"]["revision"], 3)
         self.assertEqual(
             payload["tasks"][1]["todo_list"]["todos"][0]["status"],
@@ -732,9 +732,8 @@ class StreamResilienceUiTest(unittest.TestCase):
         # Closing the stream on error left the page silent while the Task kept
         # running, so a retry plus a durable catch-up is the contract.
         self.assertIn("MAX_STREAM_RETRIES", html)
-        self.assertIn("const reconcile = async () =>", html)
-        self.assertIn("progress.tool_name === 'core.todo_list'", html)
-        self.assertIn("progress.ok === true", html)
+        self.assertIn("payload.type === 'task.snapshot'", html)
+        self.assertNotIn("follower.timer = setInterval", html)
         self.assertIn("current.task.todoList = state.todo_list || null", html)
         self.assertIn("setTimeout(connect,", html)
         self.assertIn("任务仍在后台运行", html)
@@ -782,6 +781,13 @@ class _StreamClient:
             status=self.status, cursor=12,
         )
 
+    async def subscribe_task_ui(self, task_id, *, after=0):
+        self.afters.append(after)
+        if after < 9:
+            yield {"type": "tool.requested", **_ProgressEnvelope().to_data()}
+        result = await self.get_task_result(task_id)
+        yield {**result.to_data(), "type": "task.snapshot", "final": True, "sequence": result.cursor}
+
 
 class _StreamServer:
     def __init__(
@@ -798,14 +804,40 @@ class _StreamServer:
             return stop.value
         raise AssertionError("fake coroutines must not await")
 
+    async def iterate_runtime(self, iterator):
+        try:
+            async for packet in iterator:
+                yield packet
+        finally:
+            await iterator.aclose()
+
 
 class StreamCursorProtocolTest(unittest.IsolatedAsyncioTestCase):
+    async def test_last_event_id_resumes_the_durable_cursor(self) -> None:
+        previous = web_app.runtime_server
+        server = _StreamServer()
+        web_app.runtime_server = server
+        class Request:
+            headers = {"last-event-id": "8"}
+            async def is_disconnected(self):
+                return False
+        try:
+            response = await web_app.stream("task-stream", after=2, request=Request())
+            self.assertEqual(await anext(response.body_iterator), ": open\n\n")
+            chunk = await anext(response.body_iterator)
+            self.assertIn("id: 9\n", chunk)
+            self.assertEqual(server._client.afters, [8])
+            await response.body_iterator.aclose()
+        finally:
+            web_app.runtime_server = previous
+
     async def test_stream_starts_after_the_requested_progress_cursor(self) -> None:
         previous = web_app.runtime_server
         server = _StreamServer()
         web_app.runtime_server = server
         try:
             response = await web_app.stream("task-stream", after=8)
+            self.assertEqual(await anext(response.body_iterator), ": open\n\n")
             chunk = await anext(response.body_iterator)
             if isinstance(chunk, bytes):
                 chunk = chunk.decode("utf-8")
@@ -838,6 +870,7 @@ class StreamCursorProtocolTest(unittest.IsolatedAsyncioTestCase):
         )
         try:
             response = await web_app.stream("task-stream", after=9)
+            self.assertEqual(await anext(response.body_iterator), ": open\n\n")
             final = await anext(response.body_iterator)
             if isinstance(final, bytes):
                 final = final.decode("utf-8")
@@ -873,7 +906,7 @@ class TaskCardIsolationUiTest(unittest.TestCase):
     def test_each_reconnect_uses_its_own_task_cursor(self) -> None:
         html = web_app.INDEX_HTML
         self.assertIn("`/stream/${taskId}?after=${after}`", html)
-        self.assertIn("event.lastEventId", html)
+        self.assertIn("payload.sequence", html)
         self.assertIn("item.task?.taskId === taskId", html)
 
     def test_trace_state_uses_structured_progress_not_display_text(self) -> None:

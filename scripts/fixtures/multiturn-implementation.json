@@ -1,0 +1,22 @@
+{
+  "files": {
+    "calculator.py": "def add(a, b):\n    raise NotImplementedError\n\ndef multiply(a, b):\n    raise NotImplementedError\n",
+    "test_calculator.py": "import unittest\nfrom calculator import add, multiply\n\nclass CalculatorTest(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n        self.assertEqual(add(-3, 1), -2)\n    def test_multiply(self):\n        self.assertEqual(multiply(2, 3), 6)\n        self.assertEqual(multiply(-3, 0), 0)\n"
+  },
+  "preserve_files": ["test_calculator.py"],
+  "turns": [
+    {
+      "input": "检查 calculator.py 和测试，说明两个函数分别需要补什么实现。本轮只分析，不修改文件。",
+      "unchanged": true
+    },
+    {
+      "input": "把刚才这两项都直接实施完并运行测试，不需要再次询问。不要修改已有测试。",
+      "files_contain": {"calculator.py": "def multiply"},
+      "verify_tests": true
+    },
+    {
+      "input": "现在只解释你实际改动了什么、测试结果是什么，不要继续修改文件。",
+      "unchanged": true
+    }
+  ]
+}

@@ -132,6 +132,10 @@ class TurnStopPolicyPort(RuntimeAdapter, Protocol):
 class CompletionReviewError(RuntimeError):
     """The reviewer could not produce a valid bounded verdict."""
 
+    def __init__(self, message: str, *, reason_code: str = "reviewer_failed") -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
 
 class TurnFinalizationFailed(RuntimeError):
     """A Runtime finalization invariant was violated."""

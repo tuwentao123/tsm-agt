@@ -15,16 +15,56 @@ from tsm_agt.ports import (
 
 
 class ProcessSandboxDenied(PermissionError):
-    pass
+    code = "PERMISSION_DENIED"
+    hint = (
+        "No process was started. Runtime rejected this command under the current "
+        "execution policy. Inspect the reason and policy diagnostics; do not "
+        "bypass the denial."
+    )
+
+    def __init__(self, message: str, *, diagnostics: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics = dict(diagnostics or {})
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "execution_state": "not_started", "stage": "authorize_executable",
+            **self.diagnostics,
+        }
 
 
 class ProcessPreparationError(FileNotFoundError):
     """A command could not start, before any process side effect occurred."""
 
-    def __init__(self, code: str, message: str, *, executable: str = "") -> None:
+    hint = (
+        "No process was started. Inspect the reported stage and the project's "
+        "available command entry points, then correct the request within the "
+        "current policy. This failure does not establish that all project "
+        "verification is unavailable."
+    )
+
+    def __init__(
+        self, code: str, message: str, *, executable: str = "",
+        stage: str = "resolve_executable", launch_path: str = "",
+        resolved_target: str = "",
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.executable = executable
+        self.stage = stage
+        self.launch_path = launch_path
+        self.resolved_target = resolved_target
+
+    def to_data(self) -> dict[str, str]:
+        data = {
+            "execution_state": "not_started", "stage": self.stage,
+            "requested_executable": self.executable,
+        }
+        if self.launch_path:
+            data["launch_path"] = self.launch_path
+        if self.resolved_target:
+            data["resolved_target"] = self.resolved_target
+        return data
 
 
 @dataclass(frozen=True, slots=True)

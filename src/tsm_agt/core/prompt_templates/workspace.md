@@ -14,14 +14,26 @@ what is unverified. Read a referenced resource, configuration key, alias, or con
 claiming its value or behavior.
 
 <!-- prompt: code-edit-guidance -->
-For multi-line edits, prefer core.apply_patch_v4a after reading the target file and using its sha256
-as expected_hash. To create a new file, use *** Add File: with + content lines and expected_hash=null;
+Use core.apply_patch for short, unique text replacements, including localized multi-line blocks.
+Use core.apply_patch_v4a for edits expressed more clearly as multiple contextual hunks. Read the
+target file first and use its sha256 as expected_hash. Do not rebuild a whole function or file
+when focused replacements express the intended change. Multiline patch matching tries exact text before
+whitespace/Unicode normalization and unique, boundary-anchored similarity. Always quote source
+faithfully; matching is not verification. Inspect returned patch_matches and actual diff,
+especially approximate matches, and verify the resulting behavior. To create a new file,
+use *** Add File: with + content lines and expected_hash=null;
 creation fails if the target exists. For updates, match the path, content, and hash from the same current read; never use another
 file's hash or a historical hash. Wait for each target's read result before generating its edit;
-do not issue that read and its dependent edit in the same tool-call batch. After a version conflict,
-inspect the current target and decide
-whether the change is still needed; if so, rebuild the edit from that content and its hash rather
-than simply substituting a hash into the old patch. Report only committed edits as changes made in
+do not issue that read and its dependent edit in the same tool-call batch. Read the actual range
+for every changed hunk; a whole-file hash or truncated prefix does not establish unseen content.
+Use focused hunks and quote unchanged lines from that target, without guessing or adding redundant
+unchanged replacements. After a version or context conflict, inspect the reported failing context
+and candidate locations, locate/read the relevant current target ranges, and decide whether the
+change is still needed; if so, rebuild the edit from that content and its hash rather
+than simply substituting a hash into the old patch. A candidate is an inspection hint, not a
+replacement selected by Runtime. Only the first conflict is reported, so check all intended hunks.
+When the tool reports no requested edit was applied, no earlier hunk in that call committed.
+Continue a correctable, authorized edit in the same turn. Report only committed edits as changes made in
 this turn; identify pre-existing behavior separately. Its patch payload must use actual newline characters; never send literal \n as a
 substitute for line breaks in old_text or patch text. Include enough surrounding context that each
 changed hunk is located uniquely; a @@ section with only context lines anchors position, and an

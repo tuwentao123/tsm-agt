@@ -387,6 +387,10 @@ class ModelRequest:
     # Process-local only: lets a streaming adapter register its worker thread /
     # stop signal with the Task's CancellationScope. Never serialized.
     cancellation_scope: object | None = None
+    # Optional per-turn override for provider-specific reasoning effort.
+    # This is a process-local hint, not part of the durable checkpoint wire,
+    # and may be ignored by adapters that do not support reasoning controls.
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

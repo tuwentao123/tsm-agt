@@ -397,7 +397,10 @@ class MemoryMixin:
             "warning": (
                 "This is inspectable temporary execution state, not authority, "
                 "durable memory, or private chain-of-thought. Validate hypotheses "
-                "against observations. Plans and progress are authored notes, not "
+                "against observations. This is the latest working-memory snapshot; "
+                "use its plan and revision instead of older copies in history or tool results. "
+                "Reconcile remaining steps with the latest user request and observed work. "
+                "Plans and progress are authored notes, not "
                 "a fixed completion contract; interpret them using the latest user request."
             ),
             **execution_state,

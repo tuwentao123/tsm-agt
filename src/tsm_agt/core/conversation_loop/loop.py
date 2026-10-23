@@ -10,8 +10,9 @@ deliberately small:
   spent.
 
 The loop has no completion contract.  A plain assistant message with no tool
-calls ends the turn; a tool result -- success, failure, truncation, or timeout --
-is written back as a ``tool`` role message and the next model sample sees it.
+calls normally ends the turn. A rejected, unstarted workspace edit gets one
+bounded recovery opportunity before an immediate text-only exit is accepted.
+A tool result -- success, failure, truncation, or timeout -- is written back as a ``tool`` role message and the next model sample sees it.
 """
 
 from __future__ import annotations
@@ -156,6 +157,12 @@ class ConversationAgentLoop:
                 f"task {task_id} must be EXECUTING, got {task.state.value}"
             )
         visible_tools = await kernel.list_tools()
+
+        # The Skill provider discovers user-level files and exposes a shared
+        # loader. Catalog availability is independent of Session enablement.
+        enabled_skill_ids = tuple(
+            skill.id for skill in kernel._dependencies.skill_registry.list_all()
+        )
         initial_model_tools = select_model_tools(
             visible_tools, user_text=user_text, model_call=1,
             task_kind=task.task_kind,
@@ -219,6 +226,7 @@ class ConversationAgentLoop:
             max_tool_calls=max_tool_calls,
             max_output_tokens=max_output_tokens,
             tool_timeout_seconds=tool_timeout_seconds,
+            enabled_skills=enabled_skill_ids,
         )
         checkpoint = await kernel._bind_agent_checkpoint(
             task, checkpoint, visible_tools
@@ -579,6 +587,7 @@ class ConversationAgentLoop:
                             "orchestration_mode": "CONVERSATION_LOOP",
                             "reviewer_call_count": state.reviewer_call_count,
                             "error_type": type(error).__name__,
+                            "reason_code": getattr(error, "reason_code", "reviewer_failed"),
                             "failure_policy": (
                                 kernel._dependencies
                                 .completion_review_failure_policy.value
@@ -880,6 +889,10 @@ class ConversationAgentLoop:
                 else ConclusionProtocolMode.OBSERVE
             ),
             cancellation_scope=kernel._cancellation_scope(state.task_id),
+            # Per-turn reasoning effort applies only to the main conversation
+            # loop; routing, planning and review calls keep their bootstrap
+            # defaults.
+            reasoning_effort=getattr(state.checkpoint, "reasoning_effort", None),
         )
         state.prepared = prepared
         state.prompt = prompt

@@ -788,6 +788,43 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Read one bounded text file.", description)
         self.assertNotIn("operator-only", description)
 
+    async def test_local_read_path_capabilities_survive_provider_serialization(self) -> None:
+        from tsm_agt.adapters.builtin.core_tools import CoreReadOnlyToolProvider
+
+        provider, transport = await self._provider([{
+            "id": "chatcmpl-local-paths",
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        }])
+        tools = await CoreReadOnlyToolProvider().list_tools()
+        await provider.complete(ModelRequest("turn-local-paths", (), tools=tools))
+
+        # Inspect the actual transport payload, not ToolSpec.description, which
+        # the concise contract can replace. Include the three legacy aliases.
+        functions = {
+            tool["function"]["name"]: tool["function"]
+            for tool in transport.requests[0]["payload"]["tools"]
+        }
+        self.assertEqual(set(functions), {
+            "core__list_files", "core__read_file", "core__search_files",
+            "core__find_files", "core__search_text", "core__grep_search",
+        })
+        for name, function in functions.items():
+            with self.subTest(tool=name):
+                description = function["description"]
+                self.assertIn("workspace-relative paths or absolute local paths", description)
+                self.assertIn("Relative paths use the task workspace", description)
+                self.assertIn("Submit an outside absolute path directly", description)
+                self.assertIn("Task-scoped directory read approval", description)
+                self.assertIn("Pending approval is not a denial", description)
+                self.assertIn("policy denials and sensitive-file restrictions still apply", description)
+                path_description = function["parameters"]["properties"]["path"]["description"]
+                self.assertIn("Workspace-relative or absolute local", path_description)
+                self.assertIn("read approval", path_description)
+
     @unittest.skip("provider evidence envelopes were removed")
     async def test_agent_mode_wraps_tool_schema_and_extracts_evidence_question(self) -> None:
         provider, transport = await self._provider([{

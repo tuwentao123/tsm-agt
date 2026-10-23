@@ -20,6 +20,19 @@ class ProcessExitStatus(StrEnum):
     FAILED_TO_START = "failed_to_start"
 
 
+class ProcessStartError(RuntimeError):
+    """Structured, not-started failure across the process-control boundary."""
+
+    def __init__(
+        self, code: str, message: str, *,
+        data: Mapping[str, object], hint: str,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.data = dict(data)
+        self.hint = hint
+
+
 def process_result_succeeded(data: Mapping[str, object]) -> bool:
     """Read command success from current or legacy serialized process data."""
     explicit = data.get("succeeded")
