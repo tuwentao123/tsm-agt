@@ -274,7 +274,7 @@ class ModelStreamingTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.assistant_message.text, "recover me")
                 self.assertEqual(
                     (await application.kernel.get_task(task.task_id)).state,
-                    TaskState.EXECUTING,
+                    TaskState.AWAITING_INPUT,
                 )
             finally:
                 await application.registry.stop_all()

@@ -1493,12 +1493,8 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
 
     @staticmethod
     def _source_user_message(messages: Sequence[Message]) -> Message | None:
-        generated_prefixes = (
-            "project-onboarding-context-", "project-memory-context-",
-            "session-context-", "working-memory-context-", "task-spec-context-",
-            "conversation-environment-context-",
-            "project-instructions-context-", "completion-readiness-",
-        )
+        from .context_messages import GENERATED_CONTEXT_PREFIXES
+        generated_prefixes = GENERATED_CONTEXT_PREFIXES + ("completion-readiness-",)
         return next((
             message for message in messages
             if message.role is MessageRole.USER

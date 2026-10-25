@@ -1,0 +1,8 @@
+{
+  "dns": "ok",
+  "tcp": "ok",
+  "tls": "failed",
+  "error_type": "SSLEOFError",
+  "ssl_reason": "UNEXPECTED_EOF_WHILE_READING",
+  "scope": "connection from the current execution environment to the configured model endpoint; no model response received"
+}

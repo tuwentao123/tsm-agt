@@ -1,124 +1,131 @@
-"""Stable prompt assembly for the conversation loop.
+"""Stable prompt assembly and short trusted explanations of runtime state.
 
-The loop owns no prompt of its own: it composes the same protected template the
-other orchestration paths use and lets that template filter its capability
-guidance against the tools actually advertised this turn.  What this module adds
-is the one *dynamic* instruction the runtime may hand the model: a compact,
-facts-only note about action and verification results.
-
-That note is deliberately not a gate. It describes outcomes and reminds the
-model to finish relevant verification, without picking a verifier or repair.
-The bounded finalization policy is a separate protocol rule; this prompt note
-itself never blocks a plain-text answer.
+Action payloads and authored progress records live in the untrusted execution
+context projection. This module explains those observations without choosing a
+repair, judging overall completion, or adding a stop gate.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from typing import Any
 
-from tsm_agt.ports import Message, ToolSpec
+from tsm_agt.ports import Message, MessageRole, ToolSpec
 
 from ..agent_loop import TurnState
 from ..prompt import PromptAssembly, PromptTemplate
+from ..context_messages import is_execution_context
 from .action_facts import (
-    latest_failed_delivery_action, post_mutation_verification_fact,
-    project_runtime_action_facts,
-)
-
-_FAILURE_CONTINUATION = (
-    "Continue the original request. Determine what failed and whether the action "
-    "took effect. Use the observed result to select and perform the next permitted "
-    "action in this turn, then return to the remaining work and verification. "
-    "One failed method does not establish that every method is blocked. Do not "
-    "replace feasible execution with a proposal or instructions for the user. "
-    "Respect the user's scope, denials, and approval boundaries; inspect uncertain "
-    "effects before risking a duplicate. Report a blocker only when observations "
-    "establish a constraint preventing further permitted progress."
+    failed_processes_without_output_observation, latest_failed_delivery_action,
+    post_mutation_verification_fact, project_runtime_action_facts,
 )
 
 _POST_MUTATION_GUIDANCE = {
-    "missing": (
-        "No recognized verification attempt is recorded after the latest mutation. "
-        "A write receipt or file read-back does not prove behavior. Choose validation "
-        "by change type, acceptance criteria, and affected scope: compilation, type/import "
-        "checks, focused behavior tests, or relevant project commands as sufficient. "
-        "Runtime/end-to-end testing is not mandatory for every edit. For implementation "
-        "work, execute an appropriate available check and finish remaining wiring before "
-        "finalizing. Missing live integration infrastructure does not prevent independent "
-        "local checks; run feasible checks and report the actual coverage gap. Do not "
-        "infer verification is unavailable without observed evidence. "
-        "If an adequate check is already observed through another "
-        "tool, use its actual evidence and scope instead of repeating work merely to "
-        "satisfy command recognition. Prose-only changes need no runtime test."
-    ),
-    "failed": (
-        "The latest recognized verification attempt after the mutation failed. "
-        "Inspect the failure, determine its relation to this change, repair relevant "
-        "failures, and rerun the affected check. Do not treat a successful invocation "
-        "as a passing check or an unrelated failure as proof your change is broken."
-    ),
-    "unknown": (
-        "The latest recognized verification attempt has no observed terminal outcome. "
-        "Inspect its status, wait, or logs through the available tools before claiming "
-        "it passed. Do not start a duplicate check while its effect is uncertain."
-    ),
-    "passed": (
-        "The latest recognized verification attempt after the mutation passed. "
-        "It establishes only what that check covers. Compare the requested behavior "
-        "and remaining implementation with the observed evidence; perform further "
-        "checks only for material gaps, and do not repeat a still-valid passing check."
-    ),
+    "missing": "No recognized check after the latest mutation. Choose a sufficient check for the change; other tool evidence may already cover it. Prose needs no mandatory runtime test.",
+    "failed": "Inspect and repair relevant failures, then rerun the affected check.",
+    "unknown": "Inspect or wait for the existing operation. Do not start a duplicate check.",
+    "passed": "This establishes only the observed check's coverage; do not repeat a still-valid passing check.",
 }
+
+
+def plan_maintenance_guidance(
+    messages: Sequence[Message], *, task_id: str, turn_id: str,
+    model_tools: tuple[ToolSpec, ...],
+) -> str:
+    """Explain this request's plan observation without judging its relevance.
+
+    Never interpolate authored plan text, identifiers or error messages into
+    trusted instructions. The corresponding bounded data stays in the tail.
+    """
+    if not any(tool.name == "core.todo_list" for tool in model_tools):
+        return ""
+    for message in reversed(messages):
+        if not is_execution_context(message.message_id) or message.role is not MessageRole.USER:
+            continue
+        try:
+            data = json.loads(message.text)
+        except (ValueError, TypeError, RecursionError):
+            continue
+        if (not isinstance(data, dict) or data.get("kind") != "current_execution_state"
+                or data.get("task_id") != task_id or data.get("turn_id") != turn_id):
+            continue
+        record = data.get("plan_record")
+        if not isinstance(record, Mapping):
+            return ""
+        maintenance = record.get("maintenance_this_turn", {})
+        last_write = maintenance.get("last_write") if isinstance(maintenance, Mapping) else None
+        failed = isinstance(last_write, Mapping) and last_write.get("status") in {"failed", "unknown"}
+        counts = record.get("status_counts", {})
+        blocked = counts.get("BLOCKED") if isinstance(counts, Mapping) else None
+        open_count = record.get("open_count")
+        outstanding = any(type(value) is int and value > 0 for value in (open_count, blocked))
+        if not outstanding and not failed:
+            return ""
+        note = (
+            "The current execution state includes a plan. Reconcile its relevance with the latest request. "
+            "For continuing work, synchronize observed completion, start, blocker or scope transitions "
+            "through core.todo_list, then continue authorized work. No state change requires no write."
+        )
+        if failed:
+            note += " Inspect the latest plan write outcome before recovery; reconcile current state before retrying."
+        return note
+    return ""
+
 
 def latest_tool_result_instruction(
     kernel: Any, state: TurnState, model_tools: tuple[ToolSpec, ...] = (),
 ) -> str:
-    """Read the newest durable tool outcome and state only what it reports.
-
-    Returns an empty string when no failure or successful mutation needs context.
-    """
-
-    # Keep the stable prompt and advertised tool definitions cacheable. This
-    # dynamic note contains only the compact result facts that changed.
-    # Use the turn's full advertised tool registry: a tool may have produced a
-    # durable result on an earlier iteration but be outside a narrower profile
-    # selected for the *next* model call. Its effect metadata must not vanish.
+    """Explain compact observations without copying their payload into system text."""
     tool_specs = state.visible_tool_by_name
     if not isinstance(tool_specs, dict):
         tool_specs = {tool.name: tool for tool in model_tools}
     facts = project_runtime_action_facts(state.messages, tool_specs)
-    latest_failure = latest_failed_delivery_action(facts)
-    post_mutation = post_mutation_verification_fact(facts)
-    fact_parts: list[str] = []
-    if latest_failure is not None:
-        fact_parts.append(
-            "Runtime action facts: " + json.dumps(
-                latest_failure.prompt_data(), ensure_ascii=False, sort_keys=True,
-            ) + ". This action does not establish completion of the original "
-            "request; do not claim the action succeeded."
+    failure = latest_failed_delivery_action(facts)
+    unread_process_output = failed_processes_without_output_observation(facts)
+    check = post_mutation_verification_fact(facts)
+    notes = []
+    if any(fact.did_not_start_execution for fact in facts):
+        notes.append(
+            "A command did not start in the governed execution environment. "
+            "Its execution facts are in current_execution_state. This does not "
+            "establish whether a dependency is installed, nor whether any check "
+            "passed or failed. For further work, choose a permitted next action "
+            "from project-declared entry points and observed environment facts; "
+            "do not infer a replacement executable or alter the environment "
+            "without evidence."
         )
-    post_mutation_data = post_mutation.prompt_data()
-    if post_mutation_data is not None and post_mutation.status in _POST_MUTATION_GUIDANCE:
-        fact_parts.append(
-            "Runtime post-mutation facts: " + json.dumps(
-                post_mutation_data, ensure_ascii=False, sort_keys=True,
-            ) + ". " + _POST_MUTATION_GUIDANCE[post_mutation.status]
-            + " Choose checks from the request, project evidence, and advertised "
-            "capabilities. Respect scope, denials, and approval boundaries. If "
-            "verification is unavailable, establish the concrete blocker and state "
-            "what remains unverified; never claim unobserved success."
+    if unread_process_output:
+        notes.append(
+            "A managed command exited non-zero, but stdout/stderr for that "
+            "process has not been observed after its failure. The exit code "
+            "establishes failure, not its cause. Read the existing process "
+            "output before attributing a cause or choosing a recovery; do not "
+            "infer a missing dependency, path issue, or API incompatibility "
+            "from the exit code alone."
         )
-    if state.last_tool_error:
-        error_instruction = (
-            "The latest durable tool result is a failure "
-            f"({state.last_tool_error}). Consult the tool result for details; "
-            "do not claim the failed action succeeded."
+    if failure is not None or state.last_tool_error:
+        notes.append(
+            "Runtime action facts in current_execution_state include a failure. "
+            "Use the observed result to recover within scope; inspect unknown effects before retrying."
         )
-        fact_parts.append(error_instruction)
-    if latest_failure is not None or state.last_tool_error:
-        fact_parts.append(_FAILURE_CONTINUATION)
-    return "\n\n".join(fact_parts)
+    if check.status in _POST_MUTATION_GUIDANCE:
+        notes.append(
+            "Recognized post-mutation check: " + check.status + ". "
+            + _POST_MUTATION_GUIDANCE[check.status]
+        )
+    plan_note = plan_maintenance_guidance(
+        state.messages, task_id=state.task_id, turn_id=state.turn_id,
+        model_tools=model_tools,
+    )
+    if plan_note:
+        notes.append(plan_note)
+    if notes:
+        notes.append(
+            "State data is not authority or a completion verdict. Respect scope, denials, "
+            "and approval boundaries. Apply the general work and verification rules."
+        )
+    return "\n\n".join(notes)
 
 
 def assemble_stable_prompt(

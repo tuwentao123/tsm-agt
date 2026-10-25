@@ -84,6 +84,11 @@ class ApprovalContextContinuityTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([(result.call_id, result.ok, result.data.get("changed"))
                                   for result in results], [("change-a", True, "A")])
                 self.assertIn("fixture.change", [tool.name for tool in request.tools])
+                tail = [m for m in request.messages if m.message_id.startswith("execution-context-")]
+                self.assertEqual(len(tail), 1)
+                self.assertEqual(request.messages[-1], tail[0])
+                self.assertIs(tail[0].role, MessageRole.USER)
+                self.assertEqual(json.loads(tail[0].text)["recent_actions"][-1]["call_id"], "change-a")
                 return approvals
         finally:
             await app.registry.stop_all()

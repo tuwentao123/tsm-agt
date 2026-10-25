@@ -31,7 +31,7 @@ from tsm_agt.ports import (
 
 
 class RuntimeInspectionModel(EchoModelProvider):
-    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+    capabilities = ProviderCapabilities(tools=True, context_window=16384)
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         has_result = any(

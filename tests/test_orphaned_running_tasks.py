@@ -409,14 +409,10 @@ class OrphanedActiveTaskInputTest(unittest.IsolatedAsyncioTestCase):
             tasks = await second.application.kernel.list_session_tasks(
                 session.session_id
             )
-            self.assertTrue(
-                any(
-                    item.task_id != task.task_id
-                    and item.state is not TaskState.INTERRUPTED
-                    for item in tasks
-                ),
-                "a new Task must be created for the message",
-            )
+            self.assertEqual(result.result["task"]["task_id"], task.task_id)
+            self.assertEqual(len(tasks), 1)
+            await second.wait_task(task.task_id, timeout=5)
+            self.assertNotEqual((await second.application.kernel.get_task(task.task_id)).state, TaskState.INTERRUPTED)
 
 
 class OrphanedPendingActionInputTest(unittest.IsolatedAsyncioTestCase):

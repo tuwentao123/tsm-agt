@@ -14,6 +14,7 @@ from .request_diagnostics import RequestDiagnosticCapture
 from .reasoning_config import DEFAULT_REASONING_EFFORT_REGISTRY, ReasoningEffortRegistry
 
 from tsm_agt.ports import (
+    AssistantMessagePhase,
     ConclusionBlock,
     ConclusionProtocolMode,
     AssistantConclusion,
@@ -672,7 +673,11 @@ class OpenAICompatibleModelProvider:
             content = (TextBlock(visible_text), *content)
         return ModelResponse(
             Message(
-                response.message.message_id, response.message.role, content,
+                response.message.message_id,
+                response.message.role,
+                content,
+                scaffolding=response.message.scaffolding,
+                phase=response.message.phase,
             ),
             response.finish_reason, response.usage, response.diagnostics,
         )
@@ -889,6 +894,15 @@ class OpenAICompatibleModelProvider:
         raw_reason = choice.get("finish_reason")
         content: list[TextBlock | ToolCallBlock | ConclusionBlock] = []
         text = provider_message.get("content")
+        raw_phase = provider_message.get("phase")
+        if raw_phase is not None and not isinstance(raw_phase, str):
+            raise OpenAICompatibleProviderError("provider message phase must be a string")
+        try:
+            phase = AssistantMessagePhase(raw_phase) if raw_phase is not None else None
+        except ValueError as error:
+            raise OpenAICompatibleProviderError(
+                f"unsupported provider message phase: {raw_phase}"
+            ) from error
         raw_conclusion = provider_message.get("conclusion")
         raw_calls = provider_message.get("tool_calls", [])
         if not isinstance(raw_calls, list):
@@ -1045,6 +1059,7 @@ class OpenAICompatibleModelProvider:
                 ),
                 role=MessageRole.ASSISTANT,
                 content=tuple(content),
+                phase=phase,
             ),
             finish_reason=finish_reason,
             usage=ModelUsage(input_tokens, output_tokens),

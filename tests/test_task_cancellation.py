@@ -366,10 +366,10 @@ class CancelInteractionMatrixTest(unittest.IsolatedAsyncioTestCase):
             await app.registry.start_all()
             try:
                 task = await _executing_task(app, Path(directory), "cancel-budget")
-                with self.assertRaises(AgentLoopLimitExceeded):
-                    await app.kernel.run_agent_turn(
-                        task.task_id, "loop", max_model_calls=1, max_tool_calls=5,
-                    )
+                result = await app.kernel.run_agent_turn(
+                    task.task_id, "loop", max_model_calls=1, max_tool_calls=5,
+                )
+                self.assertEqual(result.reason, "iteration_budget_exhausted")
                 state = (await app.kernel.get_task(task.task_id)).state
                 self.assertIsNot(state, TaskState.CANCELLED)
             finally:

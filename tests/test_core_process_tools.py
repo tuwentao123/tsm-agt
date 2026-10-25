@@ -4,23 +4,27 @@ import asyncio
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tsm_agt.adapters.builtin import CoreProcessToolProvider, CoreReadOnlyToolProvider
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
     ApprovalDecision, ApprovalPayloadMismatch,
-    ApprovalRequired,
-    BackgroundProcessState,
+    ApprovalRequired, BackgroundProcessRecord, BackgroundProcessState,
     ProjectTrustLevel,
     TaskState,
 )
+from tsm_agt.core.kernel_tool import _TaskProcessControl
 from tsm_agt.core.tool import InvalidToolArguments
 from tsm_agt.ports import (
     AdapterContext,
     AdapterDescriptor,
     HealthState,
     HealthStatus,
+    ProcessHandle,
+    ProcessLogChunk,
+    ProcessLogs,
     SandboxDecision,
     SandboxRequest,
     ToolCall,
@@ -50,6 +54,54 @@ class _AllowProcessSandbox:
 
     async def authorize(self, request: SandboxRequest) -> SandboxDecision:
         return SandboxDecision(True, "test permits process")
+
+
+class _TerminalProcessKernel:
+    """Minimal Kernel seam for the first-poll terminal observation contract."""
+
+    def __init__(self) -> None:
+        started_at = datetime.now(timezone.utc)
+        self.record = BackgroundProcessRecord(
+            process_id="process-terminal",
+            turn_id="turn-terminal",
+            handle=ProcessHandle(
+                process_id="process-terminal", pid=17, pgid=17,
+                birth_marker="fixture", argv_hash="fixture", cwd="/workspace",
+                started_at=started_at,
+            ),
+            state=BackgroundProcessState.EXITED,
+            max_lifetime_seconds=60.0,
+            deadline_at=started_at + timedelta(seconds=60),
+            stop_on_task_end=True,
+            exit_code=1,
+            finished_at=started_at + timedelta(milliseconds=1),
+        )
+        self.log_reads: list[tuple[str, int, int]] = []
+
+    async def start_background_process(self, *args, **kwargs):
+        return self.record
+
+    async def get_background_process_status(
+        self, task_id: str, process_id: str,
+    ) -> BackgroundProcessRecord:
+        self._assert_task_and_process(task_id, process_id)
+        return self.record
+
+    async def read_background_process_logs(
+        self, task_id: str, process_id: str, *, stdout_cursor: int = 0,
+        stderr_cursor: int = 0,
+    ) -> ProcessLogs:
+        self._assert_task_and_process(task_id, process_id)
+        self.log_reads.append((process_id, stdout_cursor, stderr_cursor))
+        return ProcessLogs(
+            stdout=ProcessLogChunk("", 0, 0, 0, False),
+            stderr=ProcessLogChunk("missing package detail\n", 0, 23, 23, False),
+        )
+
+    @staticmethod
+    def _assert_task_and_process(task_id: str, process_id: str) -> None:
+        if task_id != "task-terminal" or process_id != "process-terminal":
+            raise AssertionError("unexpected process lookup")
 
 
 class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
@@ -97,7 +149,53 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spec.risk, ToolRisk.R2)
         self.assertEqual(spec.idempotency, ToolIdempotency.NON_IDEMPOTENT)
         self.assertEqual(spec.parameters["properties"]["argv"]["type"], "array")
+        self.assertEqual(
+            spec.parameters["properties"]["mode"]["enum"],
+            ["foreground", "background"],
+        )
+        self.assertEqual(spec.parameters["properties"]["timeout_seconds"]["maximum"], 60)
         self.assertEqual(spec.parameters["required"], ["argv", "cwd"])
+
+    async def test_terminal_initial_poll_returns_output_in_the_run_observation(self) -> None:
+        kernel = _TerminalProcessKernel()
+        control = _TaskProcessControl(
+            kernel=kernel, task_id="task-terminal", turn_id="turn-terminal",
+            invocation_id="invocation-terminal",
+        )
+
+        result = await control.run(
+            ("fixture-command",), cwd=".", environment={},
+            max_output_bytes=1024, max_lifetime_seconds=60.0,
+            stop_on_task_end=True, mode="background", timeout_seconds=None,
+        )
+
+        self.assertEqual(kernel.log_reads, [("process-terminal", 0, 0)])
+        self.assertEqual(result.to_data(), {
+            "mode": "background",
+            "execution_state": "failed_known",
+            "started": True,
+            "process_id": "process-terminal",
+            "state": "EXITED",
+            "succeeded": False,
+            "failure_code": "PROCESS_EXIT_NON_ZERO",
+            "status": "exited",
+            "started_at": kernel.record.handle.started_at.isoformat(),
+            "deadline_at": kernel.record.deadline_at.isoformat(),
+            "max_lifetime_seconds": 60.0,
+            "stop_on_task_end": True,
+            "exit_code": 1,
+            "termination_signal": None,
+            "finished_at": kernel.record.finished_at.isoformat(),
+            "output_observed": True,
+            "stdout": {
+                "text": "", "cursor": 0, "next_cursor": 0,
+                "total_bytes": 0, "truncated": False,
+            },
+            "stderr": {
+                "text": "missing package detail\n", "cursor": 0,
+                "next_cursor": 23, "total_bytes": 23, "truncated": False,
+            },
+        })
 
     async def test_run_command_rejects_an_omitted_working_directory_before_approval(self) -> None:
         with self.assertRaisesRegex(
@@ -110,7 +208,7 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
                 }),
             )
 
-    async def test_run_command_starts_managed_process_and_wait_returns_output(self) -> None:
+    async def test_run_command_returns_one_foreground_terminal_observation(self) -> None:
         marker = Path(self.temporary.name) / "must-not-exist"
         script = Path(self.temporary.name) / "foreground_command.py"
         script.write_text(
@@ -125,32 +223,22 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
             },
         ))
         self.assertTrue(result.ok)
-        self.assertEqual(result.data["mode"], "managed")
-        self.assertTrue(result.data["started"])
+        self.assertEqual(result.data["mode"], "foreground")
+        self.assertTrue(result.data["output_observed"])
+        self.assertEqual(result.data["execution_state"], "succeeded")
+        self.assertEqual(result.data["status"], "exited")
+        self.assertEqual(result.data["exit_code"], 0)
         self.assertEqual(
             result.fact_descriptor.materialization,
-            ToolResultMaterialization.ACTION_RECEIPT,
-        )
-        self.assertIn(
-            ToolFactCapability.REPORT_ACTION,
-            result.fact_descriptor.capabilities,
-        )
-        waited = await self.application.kernel.invoke_tool(
-            self.task.task_id, "turn-command-wait",
-            ToolCall("call-command-wait", "core.process_wait", {
-                "process_id": result.data["process_id"], "wait_seconds": 1,
-            }),
-        )
-        self.assertTrue(waited.ok)
-        self.assertEqual(waited.data["status"], "exited")
-        self.assertEqual(
-            waited.fact_descriptor.materialization,
             ToolResultMaterialization.RUNTIME_OBSERVATION,
         )
-        self.assertEqual(waited.data["exit_code"], 0)
-        self.assertIn("$(touch must-not-exist)", waited.data["stdout"]["text"])
-        self.assertTrue(waited.data["stdout"]["truncated"])
-        self.assertEqual(waited.data["stderr"]["text"], "problem\n")
+        self.assertIn(
+            ToolFactCapability.REPORT_RUNTIME_STATE,
+            result.fact_descriptor.capabilities,
+        )
+        self.assertIn("$(touch must-not-exist)", result.data["stdout"]["text"])
+        self.assertTrue(result.data["stdout"]["truncated"])
+        self.assertEqual(result.data["stderr"]["text"], "problem\n")
         self.assertFalse(marker.exists())
 
         events = await self.application.registry.require(
@@ -169,13 +257,8 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [event.event_type for event in process_events],
-            ["process.started"],
+            ["process.started", "process.exited"],
         )
-        self.assertTrue(any(
-            event.event_type == "process.exited"
-            and event.payload.get("process_id") == result.data["process_id"]
-            for event in events
-        ))
         projection = await self.application.kernel.get_flow_projection(
             self.task.task_id
         )
@@ -201,6 +284,50 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         rendered = str(diagnostic.to_data())
         self.assertNotIn("$(touch must-not-exist)", rendered)
         self.assertNotIn("problem", rendered)
+
+    async def test_foreground_nonzero_returns_stderr_in_the_failed_observation(self) -> None:
+        result = await self._approve_call(ToolCall(
+            "call-command-nonzero", "core.run_command", {
+                "argv": [
+                    sys.executable, "-c",
+                    "import sys; print('dependency missing', file=sys.stderr); raise SystemExit(7)",
+                ],
+                "cwd": ".",
+            },
+        ))
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "PROCESS_EXIT_NON_ZERO")
+        self.assertEqual(result.data["mode"], "foreground")
+        self.assertTrue(result.data["output_observed"])
+        self.assertEqual(result.data["execution_state"], "failed_known")
+        self.assertEqual(result.data["status"], "exited")
+        self.assertEqual(result.data["exit_code"], 7)
+        self.assertEqual(result.data["stderr"]["text"], "dependency missing\n")
+        self.assertEqual(
+            result.fact_descriptor.materialization,
+            ToolResultMaterialization.RUNTIME_OBSERVATION,
+        )
+
+    async def test_foreground_timeout_returns_terminal_failed_observation(self) -> None:
+        result = await self._approve_call(ToolCall(
+            "call-command-timeout-terminal", "core.run_command", {
+                "argv": [
+                    sys.executable, "-c",
+                    "import time; print('started', flush=True); time.sleep(30)",
+                ],
+                "cwd": ".",
+                "timeout_seconds": 0.05,
+            },
+        ), "turn-terminal-timeout")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "PROCESS_TIMED_OUT")
+        self.assertEqual(result.data["mode"], "foreground")
+        self.assertTrue(result.data["output_observed"])
+        self.assertEqual(result.data["execution_state"], "failed_known")
+        self.assertEqual(result.data["status"], "timed_out")
+        self.assertIn("started", result.data["stdout"]["text"])
 
     async def test_missing_executable_is_a_not_started_result_without_approval(self) -> None:
         result = await self.application.kernel.invoke_tool(
@@ -314,6 +441,7 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
             "call-command-timeout", "core.run_command", {
                 "argv": [sys.executable, script.name],
                 "cwd": ".",
+                "mode": "background",
             },
         ), "turn-timeout")
         self.assertTrue(result.ok)
@@ -382,7 +510,7 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         )
         started = await self._approve_call(ToolCall(
             "call-deadline-race-start", "core.run_command", {
-                "argv": [sys.executable, script.name], "cwd": ".",
+                "argv": [sys.executable, script.name], "cwd": ".", "mode": "background",
             },
         ), "turn-deadline-race")
         self.assertTrue(started.ok)
@@ -413,10 +541,11 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
                     sys.executable, script.name,
                 ],
                 "cwd": ".",
+                "mode": "background",
             },
         ))
         self.assertTrue(result.ok)
-        self.assertEqual(result.data["mode"], "managed")
+        self.assertEqual(result.data["mode"], "background")
         self.assertEqual(result.data["state"], "RUNNING")
         process_id = result.data["process_id"]
         self.assertNotIn("pid", result.data)
@@ -452,6 +581,7 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
             "call-command-persist", "core.run_command", {
                 "argv": [sys.executable, script.name],
                 "cwd": ".",
+                "mode": "background",
             },
         ), "turn-before-approval")
         process_id = result.data["process_id"]
@@ -521,13 +651,7 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(result.ok)
-        waited = await self.application.kernel.invoke_tool(
-            self.task.task_id, "turn-absolute-cwd-wait",
-            ToolCall("call-absolute-cwd-wait", "core.process_wait", {
-                "process_id": result.data["process_id"], "wait_seconds": 1,
-            }),
-        )
-        self.assertEqual(waited.data["stdout"]["text"].strip(), str(workspace))
+        self.assertEqual(result.data["stdout"]["text"].strip(), str(workspace))
         events = await self.application.registry.require(RuntimeStorePort).read_events(
             self.task.task_id
         )
@@ -584,13 +708,7 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
             },
         ))
         self.assertTrue(result.ok)
-        waited = await self.application.kernel.invoke_tool(
-            self.task.task_id, "turn-governed-wait",
-            ToolCall("call-governed-wait", "core.process_wait", {
-                "process_id": result.data["process_id"], "wait_seconds": 1,
-            }),
-        )
-        self.assertTrue(waited.data["succeeded"])
+        self.assertTrue(result.data["succeeded"])
 
         denied_application = compose_fixture_application(
             tool_adapters=(CoreProcessToolProvider(),)

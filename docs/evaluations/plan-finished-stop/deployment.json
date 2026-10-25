@@ -1,0 +1,8 @@
+{
+  "previous_pid": 14402,
+  "pid": 11342,
+  "http_status": 200,
+  "url": "http://127.0.0.1:8080/",
+  "active_tasks_before_restart": [],
+  "database_preserved": true
+}

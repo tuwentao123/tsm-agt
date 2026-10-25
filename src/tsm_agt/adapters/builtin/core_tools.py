@@ -234,6 +234,9 @@ class CoreReadOnlyToolProvider:
                 "content, actual line range, total lines, and truncation. A page is "
                 "limited to 8000 characters. When truncated, continue with the "
                 "returned next_cursor (start_line and start_column). "
+                "In model context, unchanged with reused_from_call_id refers to "
+                "the same-version text window retained in another result; it is "
+                "not file text. Other ranges or versions return their own content. "
                 "Example: {\"path\": \"src/app.py\", \"start_line\": 1, \"max_lines\": 120}."
             ),
             parameters={
@@ -267,7 +270,9 @@ class CoreReadOnlyToolProvider:
                 purpose="Read bounded UTF-8 content from one located local file. " + _LOCAL_READ_PATH_GUIDANCE,
                 use_when=("a specific file can answer the question or must be inspected before editing",),
                 avoid_when=("the file is still unknown; search or list first",),
-                returns=("a content window with line range and whole-file hash", "truncation means unread content remains"),
+                returns=("a content window with line range and whole-file hash",
+                         "unchanged references same-version text retained in reused_from_call_id; the status is not file text",
+                         "truncation means unread content remains"),
             ),
         ),
         ToolSpec(
@@ -1012,6 +1017,7 @@ class CoreReadOnlyToolProvider:
             entries = completed.stdout.decode(
                 "utf-8", errors="replace"
             ).splitlines()
+        entries = self._ordered_ripgrep_entries(entries, root)
         for entry in entries:
             # ``--null`` separates the path from ``line:text``/``count`` so a
             # path that itself contains a colon cannot be misread.
@@ -1137,6 +1143,47 @@ class CoreReadOnlyToolProvider:
                 yield current / name
             for name in file_names:
                 yield current / name
+
+    @staticmethod
+    def _ordered_ripgrep_entries(entries: list[str], root: Path) -> list[str]:
+        """Keep capped results stable across rg's parallel traversal order.
+
+        Match the walker's source-root priority and round-robin matched files
+        across peer roots. Preserve all lines of one file in their original
+        order, so pagination never depends on the filesystem's enumeration.
+        """
+        if root.is_file():
+            return entries
+        files: dict[Path, list[str]] = {}
+        for entry in entries:
+            raw = Path(entry.partition("\x00")[0])
+            try:
+                relative = raw.relative_to(root) if raw.is_absolute() else raw
+            except ValueError:
+                relative = raw
+            files.setdefault(relative, []).append(entry)
+        def file_key(path: Path):
+            return (tuple(CoreReadOnlyToolProvider._search_directory_priority(part)
+                          for part in path.parts[:-1]),
+                    CoreReadOnlyToolProvider._search_file_priority(path.name))
+        root_files = sorted((path for path in files if len(path.parts) == 1), key=file_key)
+        ordered = [entry for path in root_files for entry in files[path]]
+        roots: dict[str, list[Path]] = {}
+        for path in files:
+            if len(path.parts) > 1:
+                roots.setdefault(path.parts[0], []).append(path)
+        for priority in (0, 1, 2):
+            peers = [iter(sorted(roots[name], key=file_key)) for name in sorted(roots)
+                     if CoreReadOnlyToolProvider._search_directory_priority(name)[0] == priority]
+            while peers:
+                remaining = []
+                for peer in peers:
+                    path = next(peer, None)
+                    if path is not None:
+                        ordered.extend(files[path])
+                        remaining.append(peer)
+                peers = remaining
+        return ordered
 
     @staticmethod
     def _walk_searchable(root: Path, stats: dict[str, int]) -> Iterable[Path]:

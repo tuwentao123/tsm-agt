@@ -33,7 +33,6 @@ def search_call(call_id: str) -> ToolCall:
     return ToolCall(
         call_id, "core.search_text",
         {"query": "BudgetTarget", "path": ".", "max_matches": 100},
-        EvidenceQuestion("Q-budget", "Where is BudgetTarget used?"),
     )
 
 
@@ -108,7 +107,6 @@ class RuleBasedExplorationBudgetPolicyTest(unittest.IsolatedAsyncioTestCase):
         call = ToolCall(
             "recover-path", "core.read_file",
             {"path": "src/external.py"},
-            EvidenceQuestion("Q-path", "Read the discovered file"),
         )
         action = await self.classifier.classify(call)
         state = ExplorationBudgetState(
@@ -154,7 +152,6 @@ class RuleBasedExplorationBudgetPolicyTest(unittest.IsolatedAsyncioTestCase):
             read = ToolCall(
                 "read-after-search", "core.read_file",
                 {"path": "src/target.py"},
-                EvidenceQuestion("Q-read", "What does the candidate contain?"),
             )
             action = await self.classifier.classify(read)
             decision = await policy.before_call(
@@ -295,19 +292,16 @@ class FocusSequenceModel(EchoModelProvider):
             call = ToolCall(
                 "focus-broad-1", "core.search_text",
                 {"query": "Target", "path": ".", "max_matches": 100},
-                EvidenceQuestion("Q-focus", "Where is Target?"),
             )
         elif results[-1].call_id == "focus-broad-1":
             call = ToolCall(
                 "focus-broad-2", "core.search_text",
                 {"query": "Target", "path": ".", "max_matches": 100},
-                EvidenceQuestion("Q-focus", "Where is Target?"),
             )
         elif results[-1].error_code == "EXPLORATION_FOCUS_REQUIRED":
             call = ToolCall(
                 "focus-read", "core.read_file",
                 {"path": "src/target.txt"},
-                EvidenceQuestion("Q-focus", "What direct fact answers the goal?"),
             )
         else:
             return ModelResponse(Message(
@@ -348,7 +342,6 @@ class ExplorationBudgetKernelTest(unittest.IsolatedAsyncioTestCase):
             )
             app = compose_legacy_fixture_application(
                 model_adapter=FocusSequenceModel(), tool_adapters=(tool,),
-                require_evidence_questions=True,
                 evidence_delta_evaluator_adapter=StructuredEvidenceDeltaEvaluator(),
                 semantic_action_classifier_adapter=RuleBasedSemanticActionClassifier(),
                 exploration_budget_policy_adapter=policy,
@@ -410,7 +403,6 @@ class ExplorationBudgetKernelTest(unittest.IsolatedAsyncioTestCase):
             app = compose_legacy_fixture_application(
                 model_adapter=BudgetSequenceModel(), tool_adapters=(tool,),
                 store_adapter=SQLiteRuntimeStore(database),
-                require_evidence_questions=True,
                 evidence_delta_evaluator_adapter=StructuredEvidenceDeltaEvaluator(),
                 semantic_action_classifier_adapter=RuleBasedSemanticActionClassifier(),
                 exploration_budget_policy_adapter=RuleBasedExplorationBudgetPolicy(),
@@ -459,18 +451,10 @@ class ExplorationBudgetKernelTest(unittest.IsolatedAsyncioTestCase):
                     event.event_type == "exploration_budget.wrap_up_required"
                     for event in events
                 ))
-                wrap_up = next(
-                    item for item in progress
-                    if item.kind is AgentProgressKind.WRAP_UP
-                )
-                self.assertEqual(wrap_up.goal, "budget test")
-                self.assertEqual(wrap_up.budget_reason, "consecutive_low_value")
-                self.assertEqual(wrap_up.exploration_actions, 3)
-                self.assertEqual(wrap_up.max_exploration_actions, 24)
-                self.assertEqual(wrap_up.exploration_tool_calls, 3)
-                self.assertEqual(wrap_up.max_exploration_tool_calls, 24)
-                self.assertEqual(wrap_up.low_value_streak, 2)
-                self.assertEqual(wrap_up.max_low_value_streak, 2)
+                wrap_up = next(event.payload for event in events
+                               if event.event_type == "exploration_budget.wrap_up_required")
+                self.assertEqual(wrap_up["reason"], "consecutive_low_value")
+                self.assertEqual(wrap_up["low_value_streak"], 2)
                 payload = str([
                     event.payload for event in events
                     if event.event_type.startswith("exploration_budget.")

@@ -12,7 +12,68 @@ from collections.abc import Mapping
 import yaml
 
 from tsm_agt.core.skills import Skill, SkillKind, SkillRegistry
-from tsm_agt.adapters.skill_installations import SkillInstallations
+from datetime import datetime, timezone
+from threading import RLock
+from uuid import uuid4
+
+
+_lock = RLock()
+
+
+class SkillInstallations:
+    def __init__(self, directory: Path) -> None:
+        self.path = directory / "skill-installations.json"
+
+    def list(self) -> list[dict]:
+        with _lock:
+            if not self.path.exists():
+                return []
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
+                raise ValueError("Invalid Skill installation receipts")
+            return data
+
+    def get(self, identity: str) -> dict:
+        return next(row for row in self.list() if row["id"] == identity)
+
+    def create(self, skill, *, retry: bool = False) -> dict:
+        with _lock:
+            rows = self.list()
+            if not retry:
+                existing = next((row for row in reversed(rows) if row["plan_path"] == skill.plan_path), None)
+                if existing:
+                    return existing
+            now = datetime.now(timezone.utc).isoformat()
+            row = {
+                "id": f"skill-install-{uuid4().hex}", "skill_name": skill.name,
+                "plan_path": skill.plan_path, "status": "pending",
+                "summary": "文件已保存，等待创建安装会话。", "checks": [],
+                "created_at": now, "updated_at": now,
+            }
+            self._save([*rows, row])
+            return row
+
+    def update(self, identity: str, *, expected_status: str | None = None, **changes) -> dict:
+        with _lock:
+            rows = self.list()
+            row = next(row for row in rows if row["id"] == identity)
+            if expected_status is not None and row["status"] != expected_status:
+                return dict(row)
+            row.update(changes, updated_at=datetime.now(timezone.utc).isoformat())
+            self._save(rows)
+            return dict(row)
+
+    def _save(self, rows: list[dict]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(dir=self.path.parent, prefix=".skill-installations-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(rows, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+            os.replace(temporary, self.path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
 
 
 class UserSkillsStore:

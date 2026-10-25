@@ -1,0 +1,20 @@
+{
+  "targeted_tests": {
+    "passed": 77,
+    "warnings": 5
+  },
+  "full_suite": {
+    "passed": 1574,
+    "skipped": 14,
+    "failed": 2,
+    "warnings": 5,
+    "seconds": 93.26
+  },
+  "source_sha256": {
+    "src/tsm_agt/core/plan_guard.py": "316a46fd51a1e59c25bf4f1d9d27a9d133e8dc5d3dc8ebb240aac5ac4c61d86b",
+    "src/tsm_agt/core/kernel_policy.py": "1ecde199ab8044df5f4e7a0ad94a1919325cfd813cfbdd499453da8612119d17",
+    "src/tsm_agt/adapters/rule_based_stop_or_pivot/policy.py": "758a6135cc951d3feb078e1705422d62d86e5c2bd0a358917044842b98020ffb",
+    "src/tsm_agt/ports/stop_or_pivot_policy.py": "de8daf61cd47a101d257906a41b80985b8a6eeb4532a334ae33384d49a9361aa"
+  },
+  "pre_fix_reproduction": "four selected regression tests failed before runtime changes"
+}

@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "kind": "real_file_read_projection",
+  "filesystem_cache": false,
+  "live_model": {
+    "attempted": true,
+    "model": "OpenAI-GPT-5.1",
+    "valid_run": true,
+    "behavior_verified": true,
+    "answer": "READ_REUSE_OK"
+  },
+  "fixture_read_count": 4,
+  "three_identical_reads": {
+    "schema_version": 1,
+    "eligible_read_count": 3,
+    "reference_count": 2,
+    "source_result_bytes": 13893,
+    "model_result_bytes": 7449,
+    "saved_result_bytes": 6444,
+    "references": [
+      {
+        "call_id": "b",
+        "source_call_id": "a"
+      },
+      {
+        "call_id": "c",
+        "source_call_id": "a"
+      }
+    ]
+  },
+  "estimated_input_tokens": {
+    "before": 6158,
+    "after": 4546,
+    "method": "utf8-bytes-div-4-conservative-v1",
+    "provider_billing": false
+  },
+  "promoted_source_references": [
+    {
+      "call_id": "c",
+      "source_call_id": "b"
+    }
+  ],
+  "changed_version_returns_full_body": true,
+  "canonical_results_keep_full_bodies": true,
+  "model_view_before": [
+    {
+      "call_id": "a",
+      "data": {
+        "path": "source.py",
+        "requested_path": "source.py",
+        "resolved_path": "/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/read-reuse-vkq33oyr/source.py",
+        "resolved_root": "/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/read-reuse-vkq33oyr",
+        "root_alias": "read-reuse-vkq33oyr",
+        "root_kind": "PRIMARY_WORKSPACE",
+        "sha256": "a7f1743273216f1c44978d2354426cbd54682ee7b3753dbc3bc9f9cc1e2f27f9",
+        "start_line": 1,
+        "start_column": 1,
+        "end_line": 101,
+        "total_lines": 101,
+        "next_offset": null,
+        "next_cursor": null,
+        "content": "MARKER = 'READ_REUSE_OK'\nvalue_000 = 'fixture source text'\nvalue_001 = 'fixture source text'\nvalue_002 = 'fixture source text'\nvalue_003 = 'fixture source text'\nvalue_004 = 'fixture source text'\nvalue_005 = 'fixture source text'\nvalue_006 = 'fixture source text'\nvalue_007 = 'fixture source text'\nvalue_008 = 'fixture source text'\nvalue_009 = 'fixture source text'\nvalue_010 = 'fixture source text'\nvalue_011 = 'fixture source text'\nvalue_012 = 'fixture source text'\nvalue_013 = 'fixture source text'\nvalue_014 = 'fixture source text'\nvalue_015 = 'fixture source text'\nvalue_016 = 'fixture source text'\nvalue_017 = 'fixture source text'\nvalue_018 = 'fixture source text'\nvalue_019 = 'fixture source text'\nvalue_020 = 'fixture source text'\nvalue_021 = 'fixture source text'\nvalue_022 = 'fixture source text'\nvalue_023 = 'fixture source text'\nvalue_024 = 'fixture source text'\nvalue_025 = 'fixture source text'\nvalue_026 = 'fixture source text'\nvalue_027 = 'fixture source text'\nvalue_028 = 'fixture source text'\nvalue_029 = 'fixture source text'\nvalue_030 = 'fixture source text'\nvalue_031 = 'fixture source text'\nvalue_032 = 'fixture source text'\nvalue_033 = 'fixture source text'\nvalue_034 = 'fixture source text'\nvalue_035 = 'fixture source text'\nvalue_036 = 'fixture source text'\nvalue_037 = 'fixture source text'\nvalue_038 = 'fixture source text'\nvalue_039 = 'fixture source text'\nvalue_040 = 'fixture source text'\nvalue_041 = 'fixture source text'\nvalue_042 = 'fixture source text'\nvalue_043 = 'fixture source text'\nvalue_044 = 'fixture source text'\nvalue_045 = 'fixture source text'\nvalue_046 = 'fixture source text'\nvalue_047 = 'fixture source text'\nvalue_048 = 'fixture source text'\nvalue_049 = 'fixture source text'\nvalue_050 = 'fixture source text'\nvalue_051 = 'fixture source text'\nvalue_052 = 'fixture source text'\nvalue_053 = 'fixture source text'\nvalue_054 = 'fixture source text'\nvalue_055 = 'fixture source text'\nvalue_056 = 'fixture source text'\nvalue_057 = 'fixture source text'\nvalue_058 = 'fixture source text'\nvalue_059 = 'fixture source text'\nvalue_060 = 'fixture source text'\nvalue_061 = 'fixture source text'\nvalue_062 = 'fixture source text'\nvalue_063 = 'fixture source text'\nvalue_064 = 'fixture source text'\nvalue_065 = 'fixture source text'\nvalue_066 = 'fixture source text'\nvalue_067 = 'fixture source text'\nvalue_068 = 'fixture source text'\nvalue_069 = 'fixture source text'\nvalue_070 = 'fixture source text'\nvalue_071 = 'fixture source text'\nvalue_072 = 'fixture source text'\nvalue_073 = 'fixture source text'\nvalue_074 = 'fixture source text'\nvalue_075 = 'fixture source text'\nvalue_076 = 'fixture source text'\nvalue_077 = 'fixture source text'\nvalue_078 = 'fixture source text'\nvalue_079 = 'fixture source text'\nvalue_080 = 'fixture source text'\nvalue_081 = 'fixture source text'\nvalue_082 = 'fixture source text'\nvalue_083 = 'fixture source text'\nvalue_084 = 'fixture source text'\nvalue_085 = 'fixture source text'\nvalue_086 = 'fixture source text'\nvalue_087 = 'fixture source text'\nvalue_088 = 'fixture source text'\nvalue_089 = 'fixture source text'\nvalue_090 = 'fixture source text'\nvalue_091 = 'fixture source text'\nvalue_092 = 'fixture source text'\nvalue_093 = 'fixture source text'\nvalue_094 = 'fixture source text'\nvalue_095 = 'fixture source text'\nvalue_096 = 'fixture source text'\nvalue_097 = 'fixture source text'\nvalue_098 = 'fixture source text'\nvalue_099 = 'fixture source text'\n"
+      },
+      "truncated": false
+    },
+    {
+      "call_id": "b",
+      "data": {
+        "path": "source.py",
+        "requested_path": "source.py",
+        "resolved_path": "/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/read-reuse-vkq33oyr/source.py",
+        "resolved_root": "/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/read-reuse-vkq33oyr",
+        "root_alias": "read-reuse-vkq33oyr",
+        "root_kind": "PRIMARY_WORKSPACE",
+        "sha256": "a7f1743273216f1c44978d2354426cbd54682ee7b3753dbc3bc9f9cc1e2f27f9",
+        "start_line": 1,
+        "start_column": 1,
+        "end_line": 101,
+        "total_lines": 101,
+        "next_offset": null,
+        "next_cursor": null,
+        "content": "MARKER = 'READ_REUSE_OK'\nvalue_000 = 'fixture source text'\nvalue_001 = 'fixture source text'\nvalue_002 = 'fixture source text'\nvalue_003 = 'fixture source text'\nvalue_004 = 'fixture source text'\nvalue_005 = 'fixture source text'\nvalue_006 = 'fixture source text'\nvalue_007 = 'fixture source text'\nvalue_008 = 'fixture source text'\nvalue_009 = 'fixture source text'\nvalue_010 = 'fixture source text'\nvalue_011 = 'fixture source text'\nvalue_012 = 'fixture source text'\nvalue_013 = 'fixture source text'\nvalue_014 = 'fixture source text'\nvalue_015 = 'fixture source text'\nvalue_016 = 'fixture source text'\nvalue_017 = 'fixture source text'\nvalue_018 = 'fixture source text'\nvalue_019 = 'fixture source text'\nvalue_020 = 'fixture source text'\nvalue_021 = 'fixture source text'\nvalue_022 = 'fixture source text'\nvalue_023 = 'fixture source text'\nvalue_024 = 'fixture source text'\nvalue_025 = 'fixture source text'\nvalue_026 = 'fixture source text'\nvalue_027 = 'fixture source text'\nvalue_028 = 'fixture source text'\nvalue_029 = 'fixture source text'\nvalue_030 = 'fixture source text'\nvalue_031 = 'fixture source text'\nvalue_032 = 'fixture source text'\nvalue_033 = 'fixture source text'\nvalue_034 = 'fixture source text'\nvalue_035 = 'fixture source text'\nvalue_036 = 'fixture source text'\nvalue_037 = 'fixture source text'\nvalue_038 = 'fixture source text'\nvalue_039 = 'fixture source text'\nvalue_040 = 'fixture source text'\nvalue_041 = 'fixture source text'\nvalue_042 = 'fixture source text'\nvalue_043 = 'fixture source text'\nvalue_044 = 'fixture source text'\nvalue_045 = 'fixture source text'\nvalue_046 = 'fixture source text'\nvalue_047 = 'fixture source text'\nvalue_048 = 'fixture source text'\nvalue_049 = 'fixture source text'\nvalue_050 = 'fixture source text'\nvalue_051 = 'fixture source text'\nvalue_052 = 'fixture source text'\nvalue_053 = 'fixture source text'\nvalue_054 = 'fixture source text'\nvalue_055 = 'fixture source text'\nvalue_056 = 'fixture source text'\nvalue_057 = 'fixture source text'\nvalue_058 = 'fixture source text'\nvalue_059 = 'fixture source text'\nvalue_060 = 'fixture source text'\nvalue_061 = 'fixture source text'\nvalue_062 = 'fixture source text'\nvalue_063 = 'fixture source text'\nvalue_064 = 'fixture source text'\nvalue_065 = 'fixture source text'\nvalue_066 = 'fixture source text'\nvalue_067 = 'fixture source text'\nvalue_068 = 'fixture source text'\nvalue_069 = 'fixture source text'\nvalue_070 = 'fixture source text'\nvalue_071 = 'fixture source text'\nvalue_072 = 'fixture source text'\nvalue_073 = 'fixture source text'\nvalue_074 = 'fixture source text'\nvalue_075 = 'fixture source text'\nvalue_076 = 'fixture source text'\nvalue_077 = 'fixture source text'\nvalue_078 = 'fixture source text'\nvalue_079 = 'fixture source text'\nvalue_080 = 'fixture source text'\nvalue_081 = 'fixture source text'\nvalue_082 = 'fixture source text'\nvalue_083 = 'fixture source text'\nvalue_084 = 'fixture source text'\nvalue_085 = 'fixture source text'\nvalue_086 = 'fixture source text'\nvalue_087 = 'fixture source text'\nvalue_088 = 'fixture source text'\nvalue_089 = 'fixture source text'\nvalue_090 = 'fixture source text'\nvalue_091 = 'fixture source text'\nvalue_092 = 'fixture source text'\nvalue_093 = 'fixture source text'\nvalue_094 = 'fixture source text'\nvalue_095 = 'fixture source text'\nvalue_096 = 'fixture source text'\nvalue_097 = 'fixture source text'\nvalue_098 = 'fixture source text'\nvalue_099 = 'fixture source text'\n"
+      },
+      "truncated": false
+    },
+    {
+      "call_id": "c",
+      "data": {
+        "path": "source.py",
+        "requested_path": "source.py",
+        "resolved_path": "/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/read-reuse-vkq33oyr/source.py",
+        "resolved_root": "/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/read-reuse-vkq33oyr",
+        "root_alias": "read-reuse-vkq33oyr",
+        "root_kind": "PRIMARY_WORKSPACE",
+        "sha256": "a7f1743273216f1c44978d2354426cbd54682ee7b3753dbc3bc9f9cc1e2f27f9",
+        "start_line": 1,
+        "start_column": 1,
+        "end_line": 101,
+        "total_lines": 101,
+        "next_offset": null,
+        "next_cursor": null,
+        "content": "MARKER = 'READ_REUSE_OK'\nvalue_000 = 'fixture source text'\nvalue_001 = 'fixture source text'\nvalue_002 = 'fixture source text'\nvalue_003 = 'fixture source text'\nvalue_004 = 'fixture source text'\nvalue_005 = 'fixture source text'\nvalue_006 = 'fixture source text'\nvalue_007 = 'fixture source text'\nvalue_008 = 'fixture source text'\nvalue_009 = 'fixture source text'\nvalue_010 = 'fixture source text'\nvalue_011 = 'fixture source text'\nvalue_012 = 'fixture source text'\nvalue_013 = 'fixture source text'\nvalue_014 = 'fixture source text'\nvalue_015 = 'fixture source text'\nvalue_016 = 'fixture source text'\nvalue_017 = 'fixture source text'\nvalue_018 = 'fixture source text'\nvalue_019 = 'fixture source text'\nvalue_020 = 'fixture source text'\nvalue_021 = 'fixture source text'\nvalue_022 = 'fixture source text'\nvalue_023 = 'fixture source text'\nvalue_024 = 'fixture source text'\nvalue_025 = 'fixture source text'\nvalue_026 = 'fixture source text'\nvalue_027 = 'fixture source text'\nvalue_028 = 'fixture source text'\nvalue_029 = 'fixture source text'\nvalue_030 = 'fixture source text'\nvalue_031 = 'fixture source text'\nvalue_032 = 'fixture source text'\nvalue_033 = 'fixture source text'\nvalue_034 = 'fixture source text'\nvalue_035 = 'fixture source text'\nvalue_036 = 'fixture source text'\nvalue_037 = 'fixture source text'\nvalue_038 = 'fixture source text'\nvalue_039 = 'fixture source text'\nvalue_040 = 'fixture source text'\nvalue_041 = 'fixture source text'\nvalue_042 = 'fixture source text'\nvalue_043 = 'fixture source text'\nvalue_044 = 'fixture source text'\nvalue_045 = 'fixture source text'\nvalue_046 = 'fixture source text'\nvalue_047 = 'fixture source text'\nvalue_048 = 'fixture source text'\nvalue_049 = 'fixture source text'\nvalue_050 = 'fixture source text'\nvalue_051 = 'fixture source text'\nvalue_052 = 'fixture source text'\nvalue_053 = 'fixture source text'\nvalue_054 = 'fixture source text'\nvalue_055 = 'fixture source text'\nvalue_056 = 'fixture source text'\nvalue_057 = 'fixture source text'\nvalue_058 = 'fixture source text'\nvalue_059 = 'fixture source text'\nvalue_060 = 'fixture source text'\nvalue_061 = 'fixture source text'\nvalue_062 = 'fixture source text'\nvalue_063 = 'fixture source text'\nvalue_064 = 'fixture source text'\nvalue_065 = 'fixture source text'\nvalue_066 = 'fixture source text'\nvalue_067 = 'fixture source text'\nvalue_068 = 'fixture source text'\nvalue_069 = 'fixture source text'\nvalue_070 = 'fixture source text'\nvalue_071 = 'fixture source text'\nvalue_072 = 'fixture source text'\nvalue_073 = 'fixture source text'\nvalue_074 = 'fixture source text'\nvalue_075 = 'fixture source text'\nvalue_076 = 'fixture source text'\nvalue_077 = 'fixture source text'\nvalue_078 = 'fixture source text'\nvalue_079 = 'fixture source text'\nvalue_080 = 'fixture source text'\nvalue_081 = 'fixture source text'\nvalue_082 = 'fixture source text'\nvalue_083 = 'fixture source text'\nvalue_084 = 'fixture source text'\nvalue_085 = 'fixture source text'\nvalue_086 = 'fixture source text'\nvalue_087 = 'fixture source text'\nvalue_088 = 'fixture source text'\nvalue_089 = 'fixture source text'\nvalue_090 = 'fixture source text'\nvalue_091 = 'fixture source text'\nvalue_092 = 'fixture source text'\nvalue_093 = 'fixture source text'\nvalue_094 = 'fixture source text'\nvalue_095 = 'fixture source text'\nvalue_096 = 'fixture source text'\nvalue_097 = 'fixture source text'\nvalue_098 = 'fixture source text'\nvalue_099 = 'fixture source text'\n"
+      },
+      "truncated": false
+    }
+  ],
+  "model_view_after": [
+    {
+      "call_id": "a",
+      "data": {
+        "path": "source.py",
+        "requested_path": "source.py",
+        "resolved_path": "/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/read-reuse-vkq33oyr/source.py",
+        "resolved_root": "/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/read-reuse-vkq33oyr",
+        "root_alias": "read-reuse-vkq33oyr",
+        "root_kind": "PRIMARY_WORKSPACE",
+        "sha256": "a7f1743273216f1c44978d2354426cbd54682ee7b3753dbc3bc9f9cc1e2f27f9",
+        "start_line": 1,
+        "start_column": 1,
+        "end_line": 101,
+        "total_lines": 101,
+        "next_offset": null,
+        "next_cursor": null,
+        "content": "MARKER = 'READ_REUSE_OK'\nvalue_000 = 'fixture source text'\nvalue_001 = 'fixture source text'\nvalue_002 = 'fixture source text'\nvalue_003 = 'fixture source text'\nvalue_004 = 'fixture source text'\nvalue_005 = 'fixture source text'\nvalue_006 = 'fixture source text'\nvalue_007 = 'fixture source text'\nvalue_008 = 'fixture source text'\nvalue_009 = 'fixture source text'\nvalue_010 = 'fixture source text'\nvalue_011 = 'fixture source text'\nvalue_012 = 'fixture source text'\nvalue_013 = 'fixture source text'\nvalue_014 = 'fixture source text'\nvalue_015 = 'fixture source text'\nvalue_016 = 'fixture source text'\nvalue_017 = 'fixture source text'\nvalue_018 = 'fixture source text'\nvalue_019 = 'fixture source text'\nvalue_020 = 'fixture source text'\nvalue_021 = 'fixture source text'\nvalue_022 = 'fixture source text'\nvalue_023 = 'fixture source text'\nvalue_024 = 'fixture source text'\nvalue_025 = 'fixture source text'\nvalue_026 = 'fixture source text'\nvalue_027 = 'fixture source text'\nvalue_028 = 'fixture source text'\nvalue_029 = 'fixture source text'\nvalue_030 = 'fixture source text'\nvalue_031 = 'fixture source text'\nvalue_032 = 'fixture source text'\nvalue_033 = 'fixture source text'\nvalue_034 = 'fixture source text'\nvalue_035 = 'fixture source text'\nvalue_036 = 'fixture source text'\nvalue_037 = 'fixture source text'\nvalue_038 = 'fixture source text'\nvalue_039 = 'fixture source text'\nvalue_040 = 'fixture source text'\nvalue_041 = 'fixture source text'\nvalue_042 = 'fixture source text'\nvalue_043 = 'fixture source text'\nvalue_044 = 'fixture source text'\nvalue_045 = 'fixture source text'\nvalue_046 = 'fixture source text'\nvalue_047 = 'fixture source text'\nvalue_048 = 'fixture source text'\nvalue_049 = 'fixture source text'\nvalue_050 = 'fixture source text'\nvalue_051 = 'fixture source text'\nvalue_052 = 'fixture source text'\nvalue_053 = 'fixture source text'\nvalue_054 = 'fixture source text'\nvalue_055 = 'fixture source text'\nvalue_056 = 'fixture source text'\nvalue_057 = 'fixture source text'\nvalue_058 = 'fixture source text'\nvalue_059 = 'fixture source text'\nvalue_060 = 'fixture source text'\nvalue_061 = 'fixture source text'\nvalue_062 = 'fixture source text'\nvalue_063 = 'fixture source text'\nvalue_064 = 'fixture source text'\nvalue_065 = 'fixture source text'\nvalue_066 = 'fixture source text'\nvalue_067 = 'fixture source text'\nvalue_068 = 'fixture source text'\nvalue_069 = 'fixture source text'\nvalue_070 = 'fixture source text'\nvalue_071 = 'fixture source text'\nvalue_072 = 'fixture source text'\nvalue_073 = 'fixture source text'\nvalue_074 = 'fixture source text'\nvalue_075 = 'fixture source text'\nvalue_076 = 'fixture source text'\nvalue_077 = 'fixture source text'\nvalue_078 = 'fixture source text'\nvalue_079 = 'fixture source text'\nvalue_080 = 'fixture source text'\nvalue_081 = 'fixture source text'\nvalue_082 = 'fixture source text'\nvalue_083 = 'fixture source text'\nvalue_084 = 'fixture source text'\nvalue_085 = 'fixture source text'\nvalue_086 = 'fixture source text'\nvalue_087 = 'fixture source text'\nvalue_088 = 'fixture source text'\nvalue_089 = 'fixture source text'\nvalue_090 = 'fixture source text'\nvalue_091 = 'fixture source text'\nvalue_092 = 'fixture source text'\nvalue_093 = 'fixture source text'\nvalue_094 = 'fixture source text'\nvalue_095 = 'fixture source text'\nvalue_096 = 'fixture source text'\nvalue_097 = 'fixture source text'\nvalue_098 = 'fixture source text'\nvalue_099 = 'fixture source text'\n"
+      },
+      "truncated": false
+    },
+    {
+      "call_id": "b",
+      "data": {
+        "path": "source.py",
+        "requested_path": "source.py",
+        "resolved_path": "/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/read-reuse-vkq33oyr/source.py",
+        "resolved_root": "/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/read-reuse-vkq33oyr",
+        "root_alias": "read-reuse-vkq33oyr",
+        "root_kind": "PRIMARY_WORKSPACE",
+        "sha256": "a7f1743273216f1c44978d2354426cbd54682ee7b3753dbc3bc9f9cc1e2f27f9",
+        "start_line": 1,
+        "start_column": 1,
+        "end_line": 101,
+        "total_lines": 101,
+        "next_offset": null,
+        "next_cursor": null,
+        "status": "unchanged",
+        "content_returned": false,
+        "reused_from_call_id": "a"
+      },
+      "truncated": false
+    },
+    {
+      "call_id": "c",
+      "data": {
+        "path": "source.py",
+        "requested_path": "source.py",
+        "resolved_path": "/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/read-reuse-vkq33oyr/source.py",
+        "resolved_root": "/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/read-reuse-vkq33oyr",
+        "root_alias": "read-reuse-vkq33oyr",
+        "root_kind": "PRIMARY_WORKSPACE",
+        "sha256": "a7f1743273216f1c44978d2354426cbd54682ee7b3753dbc3bc9f9cc1e2f27f9",
+        "start_line": 1,
+        "start_column": 1,
+        "end_line": 101,
+        "total_lines": 101,
+        "next_offset": null,
+        "next_cursor": null,
+        "status": "unchanged",
+        "content_returned": false,
+        "reused_from_call_id": "a"
+      },
+      "truncated": false
+    }
+  ]
+}

@@ -30,7 +30,7 @@ from tsm_agt.ports import (
     MessageRole, ModelRequest, ModelResponse, ModelUsage, ProviderCapabilities,
     RuntimeStorePort, TextBlock, ToolCall, ToolCallBlock, ToolResultBlock,
     ModelAttemptFailed, ModelAttemptFailure,
-    ModelFailureCategory, ModelRecoveryAction, ModelRetrySafety,
+    ModelFailureCategory, ModelRecoveryAction, ModelRetrySafety, ModelRecoveryExhausted,
 )
 
 
@@ -107,14 +107,6 @@ class ArchitectureAnalysisModel(EchoModelProvider):
             f"model-{call_id}", MessageRole.ASSISTANT,
             (ToolCallBlock(ToolCall(
                 call_id, name, arguments,
-                EvidenceQuestion(
-                    f"Q-{call_id}",
-                    "What project fact does this operation establish?",
-                    expected_scope=(
-                        str(arguments.get("path", "."))
-                        if name != "core.read_file" else "pyproject.toml"
-                    ),
-                ),
                 outcome_ref="assessment",
             )),),
         ), FinishReason.TOOL_CALL, ModelUsage(10, 5))
@@ -156,10 +148,6 @@ class CorrectingOutcomeModel(EchoModelProvider):
             (ToolCallBlock(ToolCall(
                 "provider-call-1", "core.list_files",
                 {"path": ".", "limit": 20},
-                EvidenceQuestion(
-                    "Q-corrected-read", "Which project files are present?",
-                    expected_scope=".",
-                ),
                 outcome_ref="assessment",
             )),),
         ), FinishReason.TOOL_CALL, ModelUsage(5, 5))
@@ -226,7 +214,6 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
             tool_adapters=(CoreReadOnlyToolProvider(),),
             store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
             task_spec_planner_adapter=ProductionPlanner(),
-            require_evidence_questions=True,
         )
         return app, physical
 
@@ -273,7 +260,7 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
         )
         return verification
 
-    async def test_invalid_side_effect_binding_is_corrected_without_execution(self):
+    async def test_failed_patch_is_observed_without_changing_workspace(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             marker = root / "marker.txt"
@@ -287,14 +274,13 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
                 ),
                 store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
                 task_spec_planner_adapter=ProductionPlanner(),
-                    require_evidence_questions=True,
             )
             await app.registry.start_all()
             try:
                 _, task = await self._executing_task(app, root, "Assess safely")
                 result = await app.kernel.run_agent_turn(task.task_id, task.goal)
-                self.assertEqual(result.model_calls, 3)
-                self.assertEqual(result.tool_calls, 1)
+                self.assertEqual(result.model_calls, 2)
+                self.assertEqual(result.tool_calls, 0)
                 self.assertEqual(
                     marker.read_text(encoding="utf-8"), "unchanged\n"
                 )
@@ -309,11 +295,11 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
                     event.payload["call"]["name"] for event in events
                     if event.event_type == "tool.started"
                 ]
-                self.assertEqual(started, ["core.list_files"])
+                self.assertEqual(started, [])
             finally:
                 await app.registry.stop_all()
 
-    async def test_persistent_contract_violation_is_not_reported_as_network(self):
+    async def test_invalid_patch_result_is_not_reported_as_network_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = CorrectingOutcomeModel(always_invalid=True)
@@ -325,37 +311,20 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
                 ),
                 store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
                 task_spec_planner_adapter=ProductionPlanner(),
-                require_evidence_questions=True,
             )
             await app.registry.start_all()
             try:
                 _, task = await self._executing_task(app, root, "Assess safely")
-                with self.assertRaises(ModelInvocationFailed) as caught:
-                    await app.kernel.run_agent_turn(task.task_id, task.goal)
-                self.assertEqual(
-                    caught.exception.failure_kind, "tool_protocol"
-                )
-                guidance = " ".join(
-                    _chat_error_guidance(caught.exception, root)
-                )
-                self.assertIn("connection succeeded", guidance)
-                self.assertNotIn("doctor --model-check", guidance)
-                events = await app.registry.require(
-                    RuntimeStorePort
-                ).read_events(task.task_id)
-                failed = next(
-                    event for event in events
-                    if event.event_type == "llm.failed"
-                )
-                self.assertEqual(
-                    failed.payload["failure_kind"], "tool_protocol"
-                )
-                self.assertFalse(any(
-                    event.event_type == "tool.started" for event in events
-                ))
-                interrupted = await app.kernel.get_task(task.task_id)
-                self.assertEqual(interrupted.state, TaskState.INTERRUPTED)
-                self.assertIsNotNone(interrupted.active_agent_checkpoint)
+                result = await app.kernel.run_agent_turn(task.task_id, task.goal)
+                self.assertEqual(result.model_calls, 2)
+                events = await app.registry.require(RuntimeStorePort).read_events(task.task_id)
+                self.assertFalse(any(e.event_type == "llm.failed" for e in events))
+                self.assertFalse(any(e.event_type == "tool.started" for e in events))
+                failures = [block.result for message in model.requests[-1].messages
+                            for block in message.content if isinstance(block, ToolResultBlock)]
+                self.assertTrue(failures)
+                self.assertFalse(failures[-1].ok)
+                self.assertIs((await app.kernel.get_task(task.task_id)).state, TaskState.AWAITING_INPUT)
             finally:
                 await app.registry.stop_all()
 
@@ -371,14 +340,14 @@ class ProductionJourneyTest(unittest.IsolatedAsyncioTestCase):
                 _, task = await self._executing_task(
                     app, root, "Assess the project entry point and module boundary"
                 )
-                with self.assertRaises(ModelInvocationFailed) as caught:
+                with self.assertRaises(ModelRecoveryExhausted) as caught:
                     await app.kernel.run_agent_turn(task.task_id, task.goal)
                 error = caught.exception
                 self.assertEqual(
-                    error.failure_category, ModelFailureCategory.INVALID_RESPONSE
+                    error.failure.category, ModelFailureCategory.INVALID_RESPONSE
                 )
                 self.assertEqual(
-                    error.recovery_action,
+                    error.decision.action,
                     ModelRecoveryAction.PRESERVE_AND_INTERRUPT,
                 )
                 self.assertEqual(physical.synthesis_attempts, 2)

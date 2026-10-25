@@ -58,7 +58,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tsm_agt.ports import (
-    BackgroundProcessStartResult, Message, MessageRole, ProcessStartError, ProcessWaitResult,
+    BackgroundProcessStartResult, Message, MessageRole, ProcessCommandResult,
+    ProcessStartError, ProcessWaitResult,
     OutcomeBindingMode, RecoverableToolProtocolError, RuntimeEvent,
     RuntimeUnitOfWork, ToolArgumentPresentation, ToolCall, ToolCallBlock,
     ToolEffect, ToolIdempotency, ToolInvocationContext,
@@ -200,8 +201,17 @@ class _TaskProcessControl(ToolProcessControl):
         environment: Mapping[str, str],
         max_output_bytes: int, max_lifetime_seconds: float,
         stop_on_task_end: bool,
-    ) -> BackgroundProcessStartResult:
+        mode: str, timeout_seconds: float | None,
+    ) -> BackgroundProcessStartResult | ProcessCommandResult:
         try:
+            if mode == "foreground":
+                assert timeout_seconds is not None
+                return await self.kernel.run_foreground_process(
+                    self.task_id, self.turn_id, argv, cwd=cwd,
+                    environment=environment, timeout_seconds=timeout_seconds,
+                    max_output_bytes=max_output_bytes,
+                    invocation_id=self.invocation_id,
+                )
             record = await self.kernel.start_background_process(
                 self.task_id, self.turn_id, argv, cwd=cwd,
                 environment=environment,
@@ -219,6 +229,21 @@ class _TaskProcessControl(ToolProcessControl):
         record = await self.kernel.get_background_process_status(
             self.task_id, record.process_id
         )
+        output = None
+        if record.state.is_terminal:
+            # A terminal result must be one observation: splitting its exit
+            # code from stdout/stderr forces a fragile model-only follow-up.
+            # This branch never waits; it only materializes completion the
+            # non-blocking poll has already observed.
+            try:
+                output = await self.kernel.read_background_process_logs(
+                    self.task_id, record.process_id
+                )
+            except (LookupError, OSError):
+                # The spawn and terminal state remain valid facts even when an
+                # executor has lost retained-output ownership. Do not turn a
+                # completed command into a misleading start failure.
+                output = None
         return BackgroundProcessStartResult(
             process_id=record.process_id,
             state=record.state.value,
@@ -229,6 +254,7 @@ class _TaskProcessControl(ToolProcessControl):
             exit_code=record.exit_code,
             termination_signal=record.termination_signal,
             finished_at=record.finished_at,
+            output=output,
         )
 
     async def wait(
@@ -253,6 +279,7 @@ class _TaskProcessControl(ToolProcessControl):
         )
         return {
             "process_id": process_id,
+            "output_observed": True,
             "stdout": {
                 "text": logs.stdout.text, "cursor": logs.stdout.cursor,
                 "next_cursor": logs.stdout.next_cursor,

@@ -1,0 +1,52 @@
+{
+  "turn_id": "turn-70e360cefa6d4ea1878eb62b4a9925ad",
+  "task_id": "task-097b6d819d9640ae9caab17433b0efd1",
+  "memory_revision": 8,
+  "plan_statuses": [
+    "COMPLETED",
+    "COMPLETED",
+    "COMPLETED",
+    "COMPLETED",
+    "COMPLETED",
+    "COMPLETED",
+    "COMPLETED"
+  ],
+  "replay": "read-only, each action evaluated before execution; no task state modified",
+  "observed_runtime_reason": "plan_finished",
+  "actual_tool_calls": 0,
+  "cancelled_call_count": 4,
+  "calls": [
+    {
+      "call_id": "call_LlZQTBGrKMX6HEPlQfZOgM26",
+      "tool_name": "core.read_file",
+      "path": "src/tsm_agt/adapters/mcp_client_manager.py",
+      "before_should_stop": true,
+      "after_should_stop": false,
+      "no_progress_count": 0
+    },
+    {
+      "call_id": "call_SIDWw3xAfQKACDzb1q8BUUuY",
+      "tool_name": "core.read_file",
+      "path": "src/tsm_agt/adapters/mcp_tool_provider.py",
+      "before_should_stop": true,
+      "after_should_stop": false,
+      "no_progress_count": 0
+    },
+    {
+      "call_id": "call_HpNMJfaOJ7pZ8NUWnmU1NiTw",
+      "tool_name": "core.read_file",
+      "path": "src/tsm_agt/bootstrap/composition.py",
+      "before_should_stop": true,
+      "after_should_stop": false,
+      "no_progress_count": 0
+    },
+    {
+      "call_id": "call_ndn3qcd0VJIhq8eiVRn8Cm9l",
+      "tool_name": "core.read_file",
+      "path": "src/tsm_agt/docs/mcp_integration.md",
+      "before_should_stop": true,
+      "after_should_stop": false,
+      "no_progress_count": 0
+    }
+  ]
+}

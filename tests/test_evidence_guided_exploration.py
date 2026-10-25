@@ -65,17 +65,20 @@ class EvidenceGuidedExplorationTest(unittest.IsolatedAsyncioTestCase):
         return ToolCall(
             call_id, "core.search_text",
             {"query": "Target", "path": path, "max_matches": 500},
-            EvidenceQuestion(question, "Where is Target used?"),
         )
 
-    async def test_same_question_can_follow_evidence_across_sibling_directories(self):
-        state = EvidenceRelationState(("Q1",), ("target-a",), 2)
+    async def test_observed_call_fingerprint_is_recognized_on_followup(self):
+        call = self.call("sibling", "other-module/resources")
+        update = await self.coordinator.after_result(
+            call, ToolResult(call.call_id, True, {}), None, None,
+            EvidenceRelationState(), RejectionLoopState(), ExplorationOutcomeState(),
+        )
         decision = await self.coordinator.before_call(
-            self.call("sibling", "other-module/resources"), None, state,
+            call, None, update.relation_state,
             RejectionLoopState(), EvidenceInventory(),
         )
         self.assertEqual(decision.action, ExplorationCoordinatorAction.EXECUTE)
-        self.assertEqual(decision.reason, "same_evidence_question")
+        self.assertEqual(decision.reason, "same_call_fingerprint")
 
     async def test_multiple_relation_providers_are_combined(self):
         second = SecondRelationProvider()
@@ -179,7 +182,7 @@ class EvidenceGuidedExplorationTest(unittest.IsolatedAsyncioTestCase):
         for framework in ("android", "ios", "web", "backend"):
             self.assertNotIn(framework, encoded.casefold())
 
-    async def test_web_and_backend_sibling_routes_use_same_generic_rule(self):
+    async def test_unknown_sibling_routes_get_bounded_probe_without_inventing_relation(self):
         for first_path, related_path in (
             ("src/components/PhoneDialog.tsx", "src/locales/zh-CN.json"),
             ("server/controllers/order.py", "db/sql/order_query.sql"),
@@ -191,9 +194,9 @@ class EvidenceGuidedExplorationTest(unittest.IsolatedAsyncioTestCase):
                     RejectionLoopState(), EvidenceInventory(),
                 )
                 self.assertEqual(
-                    decision.action, ExplorationCoordinatorAction.EXECUTE
+                    decision.action, ExplorationCoordinatorAction.ALLOW_BOUNDED_PROBE
                 )
-                self.assertEqual(decision.reason, "same_evidence_question")
+                self.assertEqual(decision.call.arguments["path"], related_path)
 
     def test_state_schema_version_is_explicit_and_rejects_unknown_version(self):
         self.assertEqual(EvidenceRelationState().to_data()["schema_version"], 1)

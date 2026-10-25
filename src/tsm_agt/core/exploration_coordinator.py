@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass, replace
 from enum import StrEnum
 
+from tsm_agt.core.exploration_identity import call_fingerprint
 from tsm_agt.ports import (
     EvidenceDelta, EvidenceInventory, EvidenceRelationAssessment,
     EvidenceRelationAssessmentKind, EvidenceRelationPolicyPort,
@@ -153,13 +154,7 @@ class ExplorationCoordinator:
 
     @staticmethod
     def _call_fingerprint(call: ToolCall) -> str:
-        payload = {
-            "tool_name": call.name,
-            "arguments": ExplorationCoordinator._canonical_arguments(call.arguments),
-        }
-        return hashlib.sha256(json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), default=str,
-        ).encode()).hexdigest()
+        return call_fingerprint(call)
 
     @staticmethod
     def _canonical_arguments(arguments: Mapping[str, object]) -> Mapping[str, object]:

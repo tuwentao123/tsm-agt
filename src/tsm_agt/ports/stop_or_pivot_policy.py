@@ -33,6 +33,7 @@ class StopOrPivotSignals:
     budget_reason: str = ""
     low_value_streak: int = 0
     plan_should_stop: bool = False
+    # Recorded plan is closed (possibly all blocked), not a terminal signal.
     plan_finished: bool = False
     consecutive_no_progress: int = 0
     remaining_model_calls: int = 0

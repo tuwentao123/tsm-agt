@@ -85,7 +85,7 @@ class UnifiedUserInputTest(unittest.IsolatedAsyncioTestCase):
                 final = await client.wait_task(
                     data["task"]["task_id"], timeout=5
                 )
-                self.assertEqual(final.state, TaskState.SUCCEEDED.value)
+                self.assertEqual(final.state, TaskState.AWAITING_INPUT.value)
                 self.assertEqual(final.assistant_text, "hello")
 
     async def test_running_task_receives_supplement_instead_of_new_task(self) -> None:

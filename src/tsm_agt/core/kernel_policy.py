@@ -342,14 +342,10 @@ class PolicyMixin:
         policy = self._dependencies.stop_or_pivot_policy
         if policy is None:
             if signals.plan_should_stop:
-                action = (
-                    StopOrPivotAction.SUMMARIZE_WITH_EVIDENCE
-                    if signals.plan_finished
-                    else StopOrPivotAction.STOP_NO_PROGRESS
-                )
                 return (
                     StopOrPivotDecision(
-                        action, "legacy_plan_stop", terminal=True
+                        StopOrPivotAction.STOP_NO_PROGRESS,
+                        "legacy_plan_stop", terminal=True,
                     ), dict(state_data),
                 )
             if signals.budget_wrap_up:

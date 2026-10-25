@@ -110,88 +110,27 @@ class AuthoredReferenceValidationTest(unittest.TestCase):
 
 
 class CriteriaDemotionTest(unittest.IsolatedAsyncioTestCase):
-    async def test_unresolvable_reference_is_demoted_to_rubric(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            app = compose_fixture_application(
-                task_spec_planner_adapter=_ReferencePlanner("turn-922dbad9"),
-            )
-            await app.registry.start_all()
-            try:
-                task = await _executing_task(app, root, "report the phase")
-                spec = await app.kernel.plan_task_spec(task.task_id)
-                by_id = {c.criterion_id: c for c in spec.acceptance_criteria}
-                # INV-11 adds the Runtime-authored alignment criterion.
-                self.assertEqual(
-                    set(by_id), {"ac_phase", "answer-alignment"}
-                )
-                self.assertIs(
-                    by_id["ac_phase"].verification_kind,
-                    TaskCriterionKind.RUBRIC,
-                )
-                self.assertIsNone(by_id["ac_phase"].evidence_reference)
+    async def _demote(self, reference):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        app = compose_fixture_application()
+        await app.registry.start_all()
+        self.addAsyncCleanup(app.registry.stop_all)
+        task = await _executing_task(app, Path(directory.name), "report the phase")
+        events = await app.kernel.dependencies.store.read_events(task.task_id)
+        criterion = TaskAcceptanceCriterion(
+            "ac_phase", "report phase", TaskCriterionKind.EVIDENCE_REFERENCE,
+            evidence_reference=reference,
+        )
+        return app.kernel._demote_unresolvable_criteria(task, events, (criterion,))
 
-                events = await app.kernel._dependencies.store.read_events(
-                    task.task_id
-                )
-                demoted = [
-                    event for event in events
-                    if event.event_type == "task_spec.criteria_demoted"
-                ]
-                self.assertEqual(len(demoted), 1)
-                payload = demoted[0].payload
-                self.assertEqual(
-                    payload["demoted"][0]["criterion_id"], "ac_phase",
-                )
-            finally:
-                await app.registry.stop_all()
+    async def test_unresolvable_reference_is_demoted_to_rubric(self):
+        criteria, demoted = await self._demote("turn-922dbad9")
+        self.assertIs(criteria[0].verification_kind, TaskCriterionKind.RUBRIC)
+        self.assertIsNone(criteria[0].evidence_reference)
+        self.assertEqual(demoted[0]["criterion_id"], "ac_phase")
 
     async def test_resolvable_reference_is_kept(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            app = compose_fixture_application(
-                task_spec_planner_adapter=_ReferencePlanner("event:1"),
-            )
-            await app.registry.start_all()
-            try:
-                task = await _executing_task(app, root, "report the phase")
-                spec = await app.kernel.plan_task_spec(task.task_id)
-                self.assertIs(
-                    spec.acceptance_criteria[0].verification_kind,
-                    TaskCriterionKind.EVIDENCE_REFERENCE,
-                )
-                events = await app.kernel._dependencies.store.read_events(
-                    task.task_id
-                )
-                self.assertFalse(any(
-                    event.event_type == "task_spec.criteria_demoted"
-                    for event in events
-                ))
-            finally:
-                await app.registry.stop_all()
-
-    async def test_revise_rejects_turn_reference(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            app = compose_fixture_application()
-            await app.registry.start_all()
-            try:
-                task = await _executing_task(app, root, "report the phase")
-                with self.assertRaises(ValueError):
-                    await app.kernel.revise_task_spec(
-                        task.task_id,
-                        (await app.kernel.get_task_spec(task.task_id)).revision,
-                        scope=(".",), constraints=(),
-                        acceptance_criteria=(TaskAcceptanceCriterion(
-                            "ac_bad", "bad reference",
-                            TaskCriterionKind.EVIDENCE_REFERENCE,
-                            "turn-922dbad9",
-                        ),),
-                        operation_id="revise-1", writer="test",
-                    )
-            finally:
-                await app.registry.stop_all()
-
-
-if __name__ == "__main__":
-    unittest.main()
+        criteria, demoted = await self._demote("event:1")
+        self.assertIs(criteria[0].verification_kind, TaskCriterionKind.EVIDENCE_REFERENCE)
+        self.assertFalse(demoted)

@@ -9,7 +9,9 @@ from pathlib import Path
 from tsm_agt.adapters.github_source import GitHubApiResponse, GitHubSourceToolProvider
 from tsm_agt.adapters.github_source.provider import _GitHubFailure
 from tsm_agt.adapters.github_source.configuration import GitHubSourceConfiguration, load_github_source_configuration
-from tsm_agt.ports import AdapterContext, ToolCall, ToolInvocationContext, ToolRisk
+from tsm_agt.ports import (
+    AdapterContext, ToolCall, ToolInvocationContext, ToolRecoveryKind, ToolRisk,
+)
 
 
 class _Transport:
@@ -80,22 +82,19 @@ class GitHubSourceProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.meta["untrusted_data"])
         self.assertNotIn("Authorization", result.to_data().__str__())
 
-    async def test_search_skips_an_oversized_blob_instead_of_failing(self):
-        import base64, json
-
-        small_sha, big_sha = "c" * 40, "e" * 40
-        self.transport.responses[
-            f"{self.base}/repos/{self.repo}/git/trees/{self.sha}?recursive=1"
-        ] = _response({"tree": [
-            {"path": "src/a.py", "type": "blob", "sha": small_sha},
-            {"path": "package-lock.json", "type": "blob", "sha": big_sha},
-        ]})
-        self.transport.responses[
-            f"{self.base}/repos/{self.repo}/git/blobs/{small_sha}"
-        ] = _response({"content": base64.b64encode(b"needle here\n").decode()})
-        self.transport.responses[
-            f"{self.base}/repos/{self.repo}/git/blobs/{big_sha}"
-        ] = _GitHubFailure("RESPONSE_TOO_LARGE", "GitHub response exceeded configured byte cap")
+    async def test_search_uses_github_code_search_instead_of_scanning_a_tree_prefix(self):
+        endpoint = (
+            f"{self.base}/search/code?"
+            "q=needle+in%3Afile+repo%3Aowner%2Frepo&page=1&per_page=50"
+        )
+        self.transport.responses[endpoint] = _response({
+            "total_count": 2,
+            "incomplete_results": False,
+            "items": [
+                {"path": "src/a.py", "sha": "c" * 40},
+                {"path": "src/b.py", "sha": "d" * 40},
+            ],
+        })
 
         result = await self.provider.invoke(
             ToolCall(
@@ -106,12 +105,108 @@ class GitHubSourceProviderTest(unittest.IsolatedAsyncioTestCase):
             self._context(),
         )
 
-        # A single oversized file must not fail the search; it is skipped and
-        # the result reports incomplete coverage.
         self.assertTrue(result.ok, result.to_data())
-        self.assertEqual([item["path"] for item in result.data["content"]], ["src/a.py"])
+        self.assertEqual([item["path"] for item in result.data["content"]], ["src/a.py", "src/b.py"])
+        self.assertTrue(result.data["complete"])
+        self.assertFalse(result.truncated)
+        self.assertEqual(result.data["search_status"], "matches")
+        self.assertEqual(result.data["coverage"], {
+            "backend": "github_code_search",
+            "scope": "github_default_branch_index",
+            "requested_commit": self.sha,
+            "requested_commit_verified": False,
+            "index_query_complete": True,
+            "result_page_complete": True,
+            "result_cap_reached": False,
+            "malformed_items_skipped": 0,
+        })
+        self.assertEqual(
+            [url for url, _headers in self.transport.calls],
+            [f"{self.base}/repos/{self.repo}/commits/main", endpoint],
+        )
+
+    async def test_search_exposes_pagination_as_a_structured_continuation(self):
+        endpoint = (
+            f"{self.base}/search/code?"
+            "q=needle+in%3Afile+repo%3Aowner%2Frepo&page=1&per_page=1"
+        )
+        self.transport.responses[endpoint] = _response({
+            "total_count": 2,
+            "incomplete_results": False,
+            "items": [{"path": "src/a.py", "sha": "c" * 40}],
+        })
+
+        result = await self.provider.invoke(
+            ToolCall(
+                "c",
+                "source.github.search_code",
+                {"repo": self.repo, "ref": "main", "query": "needle", "per_page": 1},
+            ),
+            self._context(),
+        )
+
+        self.assertTrue(result.ok, result.to_data())
         self.assertFalse(result.data["complete"])
-        self.assertEqual(result.data["skipped_blobs"], 1)
+        self.assertTrue(result.truncated)
+        self.assertEqual(result.data["next_page"], 2)
+        self.assertEqual(result.data["continuation"], {
+            "tool": "source.github.search_code",
+            "arguments": {
+                "repo": self.repo,
+                "ref": self.sha,
+                "query": "needle",
+                "page": 2,
+                "per_page": 1,
+            },
+        })
+
+    async def test_search_marks_an_incomplete_index_response_as_non_terminal(self):
+        endpoint = (
+            f"{self.base}/search/code?"
+            "q=needle+in%3Afile+repo%3Aowner%2Frepo&page=1&per_page=50"
+        )
+        self.transport.responses[endpoint] = _response({
+            "total_count": 0,
+            "incomplete_results": True,
+            "items": [],
+        })
+
+        result = await self.provider.invoke(
+            ToolCall(
+                "c",
+                "source.github.search_code",
+                {"repo": self.repo, "ref": "main", "query": "needle"},
+            ),
+            self._context(),
+        )
+
+        self.assertTrue(result.ok, result.to_data())
+        self.assertEqual(result.data["search_status"], "partial")
+        self.assertFalse(result.data["complete"])
+        self.assertTrue(result.truncated)
+        self.assertIn("not a no-match", result.data["hint"])
+
+    async def test_search_requires_authentication_when_github_rejects_the_index_query(self):
+        endpoint = (
+            f"{self.base}/search/code?"
+            "q=needle+in%3Afile+repo%3Aowner%2Frepo&page=1&per_page=50"
+        )
+        self.transport.responses[endpoint] = _response(
+            {"message": "Requires authentication"}, status=401,
+        )
+
+        result = await self.provider.invoke(
+            ToolCall(
+                "c",
+                "source.github.search_code",
+                {"repo": self.repo, "ref": "main", "query": "needle"},
+            ),
+            self._context(),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "AUTH_REQUIRED")
+        self.assertIn("gh auth login", result.message)
 
     async def test_rejects_traversal_before_egress(self):
         result = await self.provider.invoke(ToolCall("c", "source.github.get_file", {"repo":self.repo,"path":"../secret","ref":"main"}), self._context())
@@ -142,6 +237,41 @@ class GitHubSourceProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.error_code, "RATE_LIMITED")
         self.assertTrue(result.retryable)
         self.assertIn("TSM_AGT_GITHUB_TOKEN", result.message)
+
+    async def test_non_json_success_response_is_retryable_and_observable(self):
+        endpoint = f"{self.base}/repos/{self.repo}/commits/main"
+        body = b"<html>upstream gateway failed: Bearer ghp_secret_value token=private</html>"
+        self.transport.responses[endpoint] = (
+            200,
+            {"Content-Type": "text/html; charset=utf-8"},
+            body,
+        )
+
+        result = await self.provider.invoke(
+            ToolCall(
+                "c", "source.github.get_file",
+                {"repo": self.repo, "path": "src/a.py", "ref": "main"},
+            ),
+            self._context(),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "UPSTREAM_PROTOCOL_ERROR")
+        self.assertTrue(result.retryable)
+        self.assertEqual(result.recovery_kind, ToolRecoveryKind.RETRY_SAME)
+        self.assertEqual(result.data["upstream"]["endpoint"], "/repos/owner/repo/commits/main")
+        self.assertEqual(result.data["upstream"]["http_status"], 200)
+        self.assertEqual(result.data["upstream"]["content_type"], "text/html; charset=utf-8")
+        self.assertEqual(result.data["upstream"]["body_bytes"], len(body))
+        self.assertEqual(result.data["upstream"]["expected_shape"], "json_object")
+        self.assertEqual(result.data["upstream"]["received_shape"], "invalid_json")
+        self.assertIn("[REDACTED]", result.data["upstream"]["body_preview"])
+        self.assertNotIn("ghp_secret_value", str(result.to_data()))
+        self.assertNotIn("private", str(result.to_data()))
+        model_data = result.to_model_data()
+        self.assertEqual(model_data["data"]["upstream"]["http_status"], 200)
+        self.assertEqual(model_data["data"]["upstream"]["received_shape"], "invalid_json")
+        self.assertNotIn("retryable", model_data)
 
     async def test_blank_optional_path_means_no_filter(self):
         endpoint = f"{self.base}/repos/{self.repo}/git/trees/{self.sha}?recursive=1"

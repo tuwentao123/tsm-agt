@@ -12,6 +12,7 @@ from tsm_agt.adapters.openai_compatible import (
 from tsm_agt.ports import (
     AdapterContext,
     AssistantConclusion,
+    AssistantMessagePhase,
     ConclusionBlock,
     ConclusionProtocolMode,
     ConclusionClaim,
@@ -648,7 +649,11 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
                     "id": "chatcmpl-1",
                     "choices": [
                         {
-                            "message": {"role": "assistant", "content": "hello"},
+                            "message": {
+                                "role": "assistant",
+                                "content": "hello",
+                                "phase": "commentary",
+                            },
                             "finish_reason": "stop",
                         }
                     ],
@@ -666,6 +671,7 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.message.text, "hello")
+        self.assertIs(result.message.phase, AssistantMessagePhase.COMMENTARY)
         self.assertEqual(result.message.message_id, "chatcmpl-1")
         self.assertEqual(result.finish_reason, FinishReason.STOP)
         self.assertEqual(result.usage.input_tokens, 4)

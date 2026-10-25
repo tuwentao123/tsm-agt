@@ -78,6 +78,10 @@ class TaskState(StrEnum):
     NEEDS_REVIEW = "NEEDS_REVIEW"
 
     @property
+    def accepts_fresh_continuation(self) -> bool:
+        return self in {self.INTERRUPTED, self.CONFLICT, self.AWAITING_USER}
+
+    @property
     def is_terminal(self) -> bool:
         return self in {
             self.SUCCEEDED, self.CANCELLED, self.FAILED, self.NEEDS_REVIEW,

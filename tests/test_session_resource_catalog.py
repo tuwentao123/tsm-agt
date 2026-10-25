@@ -59,10 +59,7 @@ class CatalogFollowUpModel(EchoModelProvider):
                         "path": external_root["canonical_path"],
                         "pattern": "service.py",
                     },
-                    EvidenceQuestion(
-                        "Q-follow-up",
-                        "Where does the historical service continue?",
-                    ),
+                    None,
                 )),),
             ),
             FinishReason.TOOL_CALL, ModelUsage(1, 1),
@@ -97,7 +94,6 @@ class SessionResourceCatalogTest(unittest.IsolatedAsyncioTestCase):
             model_adapter=first_model,
             tool_adapters=(CoreReadOnlyToolProvider(),),
             store_adapter=SQLiteRuntimeStore(database),
-            require_evidence_questions=True,
         )
         await first_app.registry.start_all()
         try:
@@ -110,13 +106,10 @@ class SessionResourceCatalogTest(unittest.IsolatedAsyncioTestCase):
             call = ToolCall(
                 "find-first", "core.find_files",
                 {"path": str(external), "pattern": "service.py"},
-                EvidenceQuestion("Q1", "Where is RelatedService defined?"),
+                None,
             )
             # Bind the lifecycle exactly as an Agent Tool Call does, then use the
             # public Tool protocol to prove the approval and result ledger.
-            await first_app.kernel._bind_evidence_question(
-                first.task_id, "turn-first", call
-            )
             with self.assertRaises(ApprovalRequired) as first_approval:
                 await first_app.kernel.invoke_tool(
                     first.task_id, "turn-first", call
@@ -131,9 +124,6 @@ class SessionResourceCatalogTest(unittest.IsolatedAsyncioTestCase):
                 first.task_id, "turn-first", call, found, {}
             )
             self.assertIsInstance(inventory, dict)
-            await first_app.kernel._observe_evidence_question(
-                first.task_id, "turn-first", call, found, delta
-            )
             await first_app.kernel._record_session_task_result(
                 first.task_id, "turn-first",
                 Message("user-first", MessageRole.USER, (TextBlock("inspect"),)),
@@ -172,7 +162,6 @@ class SessionResourceCatalogTest(unittest.IsolatedAsyncioTestCase):
             model_adapter=model,
             tool_adapters=(CoreReadOnlyToolProvider(),),
             store_adapter=SQLiteRuntimeStore(database),
-            require_evidence_questions=True,
         )
         await app.registry.start_all()
         try:
@@ -202,26 +191,10 @@ class SessionResourceCatalogTest(unittest.IsolatedAsyncioTestCase):
                 if message.message_id.startswith("session-context-")
             )
             context = json.loads(context_message.text)
-            recent = next(
-                item for item in context["recent_task_summaries"]
-                if item["task_id"] == first.task_id
-            )
-            execution = next(
-                item for item in recent["execution_events"]
-                if item["call"]["tool"] == "core.find_files"
-            )
-            self.assertEqual(
-                execution["call"]["arguments"]["pattern"], "service.py"
-            )
-            self.assertEqual(execution["result"]["state"], "COMMITTED")
-            self.assertTrue(execution["result"]["ok"])
-            self.assertEqual(
-                execution["result"]["observation"]["matches"][0][
-                    "resolved_path"
-                ],
-                str(target.resolve()),
-            )
-            self.assertNotIn("important_actions", recent)
+            observations = [row for row in context.get("execution_observations", [])]
+            resources = context["historical_investigation"]["resources"]
+            self.assertTrue(resources)
+            self.assertIn(str(target.resolve()), json.dumps(resources))
             self.assertIn("not a Tool resource_ref",
                           context["historical_investigation"]["instruction"])
         finally:

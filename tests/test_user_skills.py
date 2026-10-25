@@ -196,7 +196,7 @@ class UserSkillsRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 text_response("done-2", "Loaded external skill"),
             ])
             with patch("tsm_agt.bootstrap.composition.UserSkillsStore", return_value=store):
-                app = compose_fixture_application(model_adapter=model, tool_adapters=())
+                app = compose_fixture_application(enable_skills=True, model_adapter=model, tool_adapters=())
             await app.registry.start_all()
             self.addAsyncCleanup(app.registry.stop_all)
             for index, name in enumerate(("demo-plan", "kiro-demo")):
@@ -225,7 +225,7 @@ class UserSkillsWebTest(unittest.IsolatedAsyncioTestCase):
                 text_response("done", "Loaded uploaded instructions"),
             ])
             with patch("tsm_agt.bootstrap.composition.UserSkillsStore", return_value=store):
-                application = compose_fixture_application(model_adapter=model, tool_adapters=())
+                application = compose_fixture_application(enable_skills=True, model_adapter=model, tool_adapters=())
             await application.registry.start_all()
             self.addAsyncCleanup(application.registry.stop_all)
 

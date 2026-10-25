@@ -72,7 +72,7 @@ class SkillPreparationTest(unittest.IsolatedAsyncioTestCase):
 
     async def client(self, model, tools=()):
         with patch("tsm_agt.bootstrap.composition.UserSkillsStore", return_value=self.store):
-            app = compose_fixture_application(model_adapter=model, tool_adapters=tools)
+            app = compose_fixture_application(enable_skills=True, model_adapter=model, tool_adapters=tools)
         client = EngineeringAgentClient(self.first, application_factory=lambda: app)
         await client.start()
         self.addAsyncCleanup(client.close)

@@ -1,0 +1,13 @@
+{
+  "label": "baseline",
+  "model": "OpenAI-GPT-5.1",
+  "reasoning_effort": "high",
+  "harness_sha256": "fb9e807d413fb6d5bca92986136a229c264e1ce43cbde92f5da5415789949399",
+  "source_root": "/tmp/tsm-todo-maintenance-v2-baseline/src/tsm_agt",
+  "manifest_hash": "3e6af9d468e4d985409f9d8ddbbaa09bffe5346d3f76d6c69cfa2aea33249484",
+  "source_hashes": {
+    "core/conversation_loop/execution_context.py": "ceabd8f491feaab451619e2030d4a129602bbf9808f557dc1bec420d1ab5e1e2",
+    "core/conversation_loop/prompt.py": "3db0b13e07fcd82756dc45d4dd7177c8db7e0a5a3e0e3d9aebc0e329c54e46be",
+    "adapters/builtin/todo_tools.py": "84a0f04a4c839da62d0e958024dc32446133b58ea331188f86f7be90ddafc8db"
+  }
+}

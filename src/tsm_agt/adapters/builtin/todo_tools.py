@@ -34,7 +34,10 @@ _TODO_SCHEMA: dict[str, Any] = {
         "todos": {
             "type": "array",
             "maxItems": MAX_TODO_ITEMS,
-            "description": "Task items to write.",
+            "description": (
+                "Task items to write. With merge=true, existing items need only "
+                "id and changed fields; new items require content and status."
+            ),
             "items": {
                 "type": "object",
                 "properties": {
@@ -54,7 +57,7 @@ _TODO_SCHEMA: dict[str, Any] = {
                         ),
                     },
                 },
-                "required": ["id", "content", "status"],
+                "required": ["id"],
                 "additionalProperties": False,
             },
         },
@@ -69,7 +72,8 @@ _TODO_SCHEMA: dict[str, Any] = {
         "expected_revision": {
             "type": "integer",
             "description": (
-                "Current revision returned by this tool. Required when todos is present."
+                "Latest Working Memory revision from current_execution_state or a "
+                "memory/todo result. Required when todos is present."
             ),
         },
         "operation_id": {
@@ -87,13 +91,22 @@ _TODO_DESCRIPTION = (
     "Track progress for complex multi-step work. Use this tool when the task has "
     "3 or more concrete steps, the user requests multiple independent changes, "
     "work spans multiple files or subsystems, or progress must survive interruption "
-    "or restart. Do not use it for explanations, simple searches, single-command "
-    "tasks, or one small localized change. Call with no parameters to read the "
-    "current list. Before a write, read the current list and pass its revision as "
-    "expected_revision plus a stable operation_id. List order is priority and only "
-    "one item may be in_progress. Mark an item completed only after verification. "
-    "If work cannot continue, mark it blocked and add a recovery item. Every call "
-    "returns the complete current list."
+    "or restart. Skip creating a new plan for explanations, simple searches, "
+    "single-command tasks, or one small localized change. Maintain an existing "
+    "relevant plan even when this turn's change is small. When resuming work, "
+    "reconcile the latest plan with current evidence and the user's scope; "
+    "inspection alone need not write an unchanged list. Mark an item in_progress when starting "
+    "it, and completed as soon as its completion criteria and appropriate checks "
+    "are satisfied. One write can complete the previous item and start the next; "
+    "do not defer these updates until the end. Update concrete blockers and scope "
+    "changes. Only write when the list changes, not after every read or search. "
+    "List order is priority and at most one item may be in_progress. Reuse the "
+    "latest known revision as expected_revision with a stable operation_id; "
+    "read with no parameters only when state is missing or after a revision "
+    "conflict, then reconcile before retrying. With merge=true, send only changed "
+    "items/fields; a replacement must include the complete list, never just a "
+    "shortened context preview. Every call returns the complete current list. "
+    "Updating this record does not perform the work or authorize old tasks."
 )
 
 
@@ -320,6 +333,7 @@ class CoreTodoToolProvider:
             )
         try:
             current = await control.read()
+            plan_changed = False
             raw_todos = call.arguments.get("todos")
             if raw_todos is None:
                 data = _result_data(current)
@@ -351,9 +365,10 @@ class CoreTodoToolProvider:
                         operation_id,
                     )
                     data = _result_data(updated)
+                    plan_changed = _todos_from_state(updated) != current_todos
             return ToolResult(
                 call.call_id, True, data=data,
-                meta={"runtime_internal_state": True},
+                meta={"runtime_internal_state": True, "plan_changed": plan_changed},
             )
         except (KeyError, TypeError, ValueError) as error:
             return ToolResult(

@@ -43,6 +43,8 @@ from tsm_agt.ports import (
 )
 from typing import Any
 from uuid import uuid4
+
+from .context_messages import GENERATED_CONTEXT_PREFIXES
 from .agent_loop import AgentCheckpointConflict, AgentTurnCheckpoint
 from .configuration import canonical_hash, effective_toolset_hash
 from .execution import ToolCommitState, ToolExecutionRecord
@@ -483,12 +485,7 @@ class CheckpointMixin:
                     },
                 ),),
             ))
-            generated_prefixes = (
-                "project-instructions-context-", "task-spec-context-",
-                "conversation-environment-context-",
-                "project-onboarding-context-", "project-memory-context-",
-                "session-context-", "document-references-context-", "working-memory-context-",
-                )
+            generated_prefixes = GENERATED_CONTEXT_PREFIXES
             messages = [
                 message for message in messages
                 if not message.message_id.startswith(generated_prefixes)
@@ -711,12 +708,7 @@ class CheckpointMixin:
         refreshed_project_context = await self._project_context_messages(
             current.task_id
         )
-        generated_prefixes = (
-            "project-instructions-context-", "task-spec-context-",
-            "conversation-environment-context-",
-            "project-onboarding-context-", "project-memory-context-",
-            "session-context-", "working-memory-context-",
-        )
+        generated_prefixes = GENERATED_CONTEXT_PREFIXES
         messages = tuple(
             message for message in checkpoint.messages
             if not message.message_id.startswith(generated_prefixes)

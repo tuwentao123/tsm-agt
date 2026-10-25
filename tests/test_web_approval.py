@@ -245,7 +245,7 @@ class LoopLimitReportingTest(unittest.TestCase):
 
 class ApprovalUiContractTest(unittest.TestCase):
     def test_ui_renders_an_explicit_approve_and_deny_control(self) -> None:
-        self.assertIn("payload.waiting", web_app.INDEX_HTML)
+        self.assertIn("task.approval", web_app.INDEX_HTML)
         self.assertIn("appendApproval(", web_app.INDEX_HTML)
         self.assertIn("decideApproval(message, 'APPROVE')", web_app.INDEX_HTML)
         self.assertIn("decideApproval(message, 'DENY')", web_app.INDEX_HTML)

@@ -19,6 +19,19 @@ class MessageRole(StrEnum):
     TOOL = "tool"
 
 
+class AssistantMessagePhase(StrEnum):
+    """Provider-visible role of an assistant message in a multi-step turn.
+
+    The value is intentionally carried by the provider-neutral transcript rather
+    than reconstructed from text or tool calls.  Responses providers use it to
+    distinguish a working preamble from a completed answer when the assistant
+    history is replayed on a later request.
+    """
+
+    COMMENTARY = "commentary"
+    FINAL_ANSWER = "final_answer"
+
+
 class FinishReason(StrEnum):
     STOP = "stop"
     LENGTH = "length"
@@ -224,8 +237,16 @@ class Message:
     #: ``None`` for ordinary rows. A non-None value names the scaffolding kind
     #: (see ``SCAFFOLDING_KINDS``) and marks this row as never-durable.
     scaffolding: str | None = None
+    #: Optional provider-visible label for assistant text.  It is omitted from
+    #: the checkpoint wire when absent, keeping legacy transcripts byte-stable.
+    phase: AssistantMessagePhase | None = None
 
     def __post_init__(self) -> None:
+        if self.phase is not None:
+            if not isinstance(self.phase, AssistantMessagePhase):
+                raise ValueError("assistant message phase must be an AssistantMessagePhase")
+            if self.role is not MessageRole.ASSISTANT:
+                raise ValueError("only assistant messages may carry a phase")
         if self.scaffolding is None:
             return
         # Fail closed on an unknown marker: a typo would otherwise mark nothing,
@@ -264,6 +285,8 @@ class Message:
         }
         if self.scaffolding is not None:
             data["scaffolding"] = self.scaffolding
+        if self.phase is not None:
+            data["phase"] = self.phase.value
         return data
 
     @classmethod
@@ -305,6 +328,9 @@ class Message:
             else:
                 raise ValueError(f"unsupported message block type: {block_type}")
         raw_scaffolding = data.get("scaffolding")
+        raw_phase = data.get("phase")
+        if raw_phase is not None and not isinstance(raw_phase, str):
+            raise ValueError("message phase must be a string")
         return cls(
             message_id=str(data["message_id"]),
             role=MessageRole(str(data["role"])),
@@ -312,6 +338,7 @@ class Message:
             scaffolding=(
                 str(raw_scaffolding) if raw_scaffolding is not None else None
             ),
+            phase=AssistantMessagePhase(raw_phase) if raw_phase is not None else None,
         )
 
 

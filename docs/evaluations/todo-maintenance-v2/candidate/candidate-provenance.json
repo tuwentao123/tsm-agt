@@ -1,0 +1,13 @@
+{
+  "label": "candidate",
+  "model": "OpenAI-GPT-5.1",
+  "reasoning_effort": "high",
+  "harness_sha256": "fb9e807d413fb6d5bca92986136a229c264e1ce43cbde92f5da5415789949399",
+  "source_root": "/Users/tusima/Documents/\u5b66\u4e60/tsm-agt/src/tsm_agt",
+  "manifest_hash": "71572f2fb081f9aee9cd3966754ba9cd1abda8f3ab1ed685f7ec2f042d24f4ed",
+  "source_hashes": {
+    "core/conversation_loop/execution_context.py": "8e9db9a9573062bc04fa8cb782bf1f00ac1a898f064911ed1211bb28bd8d2029",
+    "core/conversation_loop/prompt.py": "88ef33686699d594fb6ea935db25bf8efd7f56106080ca3c6b454f515a7e3f2d",
+    "adapters/builtin/todo_tools.py": "7631f9de1c5ed3dc510f00df29d54dd985ac8ac7c7bd37b4330928d5272e602c"
+  }
+}

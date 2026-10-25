@@ -390,8 +390,8 @@ class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [(item["path"], item["line"], item["text"]) for item in result.data["matches"]],
             [
-                ("src/app.py", 2, "class Kernel:"),
                 ("README.md", 1, "Kernel documentation"),
+                ("src/app.py", 2, "class Kernel:"),
             ],
         )
 
@@ -672,6 +672,29 @@ class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(
             result.data["generated_directories_skipped"], 1
         )
+
+    async def test_ripgrep_cap_is_source_first_and_fair_across_peer_roots(self) -> None:
+        files = ["docs/Target.md", "modules/A.kt", "modules/B.kt", "packages/C.py"]
+        for name in files:
+            path = self.workspace / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("Target\n", encoding="utf-8")
+        stub = self.workspace / "fake-rg-order"
+        stub.write_text(
+            "#!/usr/bin/env python3\nimport sys\n"
+            + "for path in " + repr(files) + ":\n"
+            + "    sys.stdout.write(path + '\\0' + '1:Target\\n')\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        self._point_ripgrep_at(stub)
+        result = await self.provider.invoke(
+            ToolCall("ordered", "core.search_text", {"query": "Target", "path": ".", "max_matches": 2}),
+            self.context,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["search_engine"], "ripgrep")
+        self.assertEqual([row["path"] for row in result.data["matches"]], ["modules/A.kt", "packages/C.py"])
 
     async def test_workspace_search_scans_source_roots_before_docs(self) -> None:
         docs = self.workspace / "docs"

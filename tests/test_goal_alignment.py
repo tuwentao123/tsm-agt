@@ -19,6 +19,7 @@ from tsm_agt.core import (
     TaskState,
 )
 from tsm_agt.ports import (
+    RuntimeStorePort,
     AdapterDescriptor, HealthState, HealthStatus,
 )
 
@@ -89,17 +90,12 @@ class GoalAlignmentCriterionTest(unittest.IsolatedAsyncioTestCase):
         spec = await app.kernel.plan_task_spec(task.task_id)
         return app, task, spec
 
-    async def test_answer_task_gets_goal_alignment_criterion(self) -> None:
-        _, _, spec = await self._planned("ANSWER", "task-answer")
-
-        by_id = {c.criterion_id: c for c in spec.acceptance_criteria}
-        self.assertIn("answer-alignment", by_id)
-        self.assertIs(
-            by_id["answer-alignment"].verification_kind,
-            TaskCriterionKind.GOAL_ALIGNMENT,
-        )
-        self.assertIn("explain the runtime",
-                      by_id["answer-alignment"].description)
+    async def test_conversation_keeps_advisory_spec_without_fixed_alignment_contract(self) -> None:
+        app, task, spec = await self._planned("ANSWER", "task-answer")
+        self.assertEqual(spec.acceptance_criteria, ())
+        self.assertEqual(spec.outcomes, ())
+        events = await app.registry.require(RuntimeStorePort).read_events(task.task_id)
+        self.assertFalse(any(e.event_type == "task_spec.alignment_criterion_added" for e in events))
 
     async def test_non_answer_task_gets_no_alignment_criterion(self) -> None:
         _, _, spec = await self._planned(

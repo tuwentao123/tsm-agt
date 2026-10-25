@@ -65,7 +65,6 @@ class StatusModel(EchoModelProvider):
         return ModelResponse(Message(
             "status-call", MessageRole.ASSISTANT, (ToolCallBlock(ToolCall(
                 "status-tool-call", "fixture.inspect_status", {},
-                EvidenceQuestion("Q-private-status", "Private status question?"),
             )),),
         ), FinishReason.TOOL_CALL)
 
@@ -73,7 +72,7 @@ class StatusModel(EchoModelProvider):
 def compose_status_app(store):
     return compose_fixture_application(
         model_adapter=StatusModel(), tool_adapters=(StatusTool(),),
-        store_adapter=store, require_evidence_questions=True,
+        store_adapter=store,
         evidence_delta_evaluator_adapter=StructuredEvidenceDeltaEvaluator(),
         semantic_action_classifier_adapter=RuleBasedSemanticActionClassifier(),
         exploration_budget_policy_adapter=RuleBasedExplorationBudgetPolicy(),
@@ -153,13 +152,12 @@ class InvestigationStatusKernelTest(unittest.IsolatedAsyncioTestCase):
                 status = await first.kernel.get_investigation_status(result.task_id)
                 after = await store.read_events(result.task_id)
                 self.assertEqual(len(before), len(after))
-                self.assertEqual(status.question_ref, canonical_hash("Q-private-status")[:12])
+                progress_event = next(e for e in reversed(before) if e.event_type == "agent_progress.projected")
+                self.assertEqual(status.question_ref, progress_event.payload["question_ref"])
+                self.assertEqual(len(status.question_ref), 12)
                 self.assertGreater(status.evidence_total, 0)
-                # Three calls: the stub acts before declaring anything, so it
-                # spends one call on the required intent declaration before its
-                # single tool call. The correction is offered once and the turn
-                # then proceeds, so a model that never declares cannot deadlock.
-                self.assertEqual(status.model_calls, 3)
+                # One model tool request and one final response.
+                self.assertEqual(status.model_calls, 2)
                 self.assertEqual(status.tool_calls, 1)
                 self.assertEqual(status.latest_decision, "CONTINUE")
                 encoded = str(status.to_data())

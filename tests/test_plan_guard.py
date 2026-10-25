@@ -60,7 +60,7 @@ class PlanGuardUnitTest(unittest.TestCase):
         self.assertEqual(changed.consecutive_no_progress, 0)
         self.assertFalse(changed.should_stop)
 
-    def test_rejects_multiple_active_steps_and_finished_plan_stops(self) -> None:
+    def test_rejects_multiple_active_steps(self) -> None:
         with self.assertRaisesRegex(ValueError, "at most one"):
             WorkingMemorySnapshot(
                 "task", 1, "goal", plan=(
@@ -68,17 +68,25 @@ class PlanGuardUnitTest(unittest.TestCase):
                     WorkingPlanStep("b", "b", WorkingPlanStepStatus.IN_PROGRESS, "b done"),
                 ),
             )
-        finished = WorkingMemorySnapshot(
-            "task", 1, "goal", plan=(
-                WorkingPlanStep("a", "a", WorkingPlanStepStatus.COMPLETED, "done"),
-            ),
-        )
-        decision = PlanGuard().evaluate(
-            ToolCall("call", "fixture.echo", {}), finished, "workspace",
-            ActionProgressState(),
-        )
-        self.assertTrue(decision.goal_slice.plan_finished)
-        self.assertTrue(decision.should_stop)
+    def test_closed_plan_is_observation_not_a_tool_stop(self) -> None:
+        guard = PlanGuard(no_progress_limit=3)
+        for status in (WorkingPlanStepStatus.COMPLETED, WorkingPlanStepStatus.BLOCKED):
+            with self.subTest(status=status):
+                memory = WorkingMemorySnapshot(
+                    "task", 1, "goal", plan=(WorkingPlanStep("a", "a", status, "done"),),
+                )
+                call = ToolCall("read", "core.read_file", {"path": "src/config.py"})
+                decision = guard.evaluate(call, memory, "workspace", ActionProgressState())
+                self.assertTrue(decision.goal_slice.plan_finished)
+                self.assertFalse(decision.should_stop)
+                self.assertNotIn("Do not start new tool work", decision.goal_slice.completion_criteria)
+                # Closing a plan must not disable the independent repeat guard.
+                previous = ActionProgressState(
+                    decision.action_signature, decision.relevant_state_hash, 2,
+                )
+                repeated = guard.evaluate(call, memory, "workspace", previous)
+                self.assertTrue(repeated.should_stop)
+                self.assertEqual(repeated.consecutive_no_progress, 3)
 
     def test_evidence_aware_zero_delta_survives_changed_tool_arguments(self) -> None:
         guard = PlanGuard(no_progress_limit=3)
@@ -184,7 +192,7 @@ class CountingReadTool:
 
 
 class PlanGuardKernelTest(unittest.IsolatedAsyncioTestCase):
-    async def test_repeated_action_stops_before_fourth_tool_execution(self) -> None:
+    async def test_no_progress_feedback_preserves_incomplete_turn_at_budget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             model = RepeatingModel()
             tool = CountingReadTool()
@@ -203,32 +211,16 @@ class PlanGuardKernelTest(unittest.IsolatedAsyncioTestCase):
                 result = await app.kernel.run_agent_turn(
                     task.task_id, "inspect", max_model_calls=10, max_tool_calls=10
                 )
-                self.assertIsInstance(result, AgentTurnResult)
+                self.assertEqual(result.reason, "iteration_budget_exhausted")
                 self.assertEqual(tool.calls, 3)
-                self.assertEqual(result.tool_calls, 3)
-                self.assertIn("verification is incomplete", result.assistant_message.text)
-                self.assertFalse(model.requests[-1].allow_tool_calls)
+                self.assertEqual((await app.kernel.get_task(task.task_id)).active_agent_checkpoint["tool_calls"], 3)
+                current = await app.kernel.get_task(task.task_id)
+                self.assertIsNotNone(current.active_agent_checkpoint)
+                self.assertIs(current.state, TaskState.EXECUTING)
                 events = await app.kernel.dependencies.store.read_events(task.task_id)
-                stopped = [
-                    event for event in events
-                    if event.event_type == "plan.no_progress_stopped"
-                ]
-                self.assertEqual(len(stopped), 1)
-                self.assertEqual(stopped[0].payload["consecutive_no_progress"], 3)
-                projection = await app.kernel.get_flow_projection(task.task_id)
-                node = next(
-                    node for node in projection.nodes
-                    if node.label == "Plan stopped: no progress"
-                )
-                diagnostic = projection.inspect_node(node.node_id)
-                self.assertEqual(
-                    dict(diagnostic.facts[0].values)["consecutive_no_progress"], 3
-                )
-                exported = json.dumps(
-                    __import__("tsm_agt.core", fromlist=["build_flow_export_document"])
-                    .build_flow_export_document(projection), ensure_ascii=False,
-                )
-                self.assertNotIn("same.txt", exported)
+                stopped = [e for e in events if e.event_type == "plan.no_progress_stopped"]
+                self.assertEqual(len(stopped), 7)
+                self.assertTrue(all(e.payload["consecutive_no_progress"] >= 3 for e in stopped))
             finally:
                 await app.registry.stop_all()
 

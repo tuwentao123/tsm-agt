@@ -179,7 +179,7 @@ class _WorkspaceReadProvider:
 
 
 class _ToolThenTextModel(EchoModelProvider):
-    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         if any(
@@ -204,11 +204,10 @@ class _ToolThenTextModel(EchoModelProvider):
 
 
 class ExecutionEffectShadowEventTest(unittest.IsolatedAsyncioTestCase):
-    async def test_single_loop_persists_a_non_authoritative_shadow_event(self) -> None:
+    async def test_conversation_retains_committed_observation_without_completion_shadow(self) -> None:
         application = compose_fixture_application(
             model_adapter=_ToolThenTextModel(),
             tool_adapters=(_WorkspaceReadProvider(),),
-            orchestration_mode=OrchestrationMode.SINGLE_LOOP,
         )
         await application.registry.start_all()
         directory = tempfile.TemporaryDirectory()
@@ -238,39 +237,17 @@ class ExecutionEffectShadowEventTest(unittest.IsolatedAsyncioTestCase):
         events = await application.registry.require(RuntimeStorePort).read_events(
             task.task_id
         )
-        shadows = [
-            event for event in events
-            if event.event_type == "execution.effect_shadow_projected"
-        ]
-        self.assertEqual(len(shadows), 1)
-        shadow = shadows[0].payload
-        self.assertEqual(shadow["projection_version"], 1)
-        self.assertEqual(shadow["turn_id"], result.turn_id)
-        self.assertEqual(shadow["tool_call_id"], "read-1")
-        self.assertEqual(
-            shadow["execution_fact"],
-            {
-                "execution_id": f"{result.turn_id}:read-1",
-                "tool_name": "test.workspace_read",
-                "effect": "observe",
-                "result_authority": "workspace_fact",
-                "invocation_status": "COMMITTED",
-                "effect_status": "succeeded",
-                "failure_code": "",
-                "detail": "",
-                "recovery_kind": "",
-            },
-        )
-        self.assertIsNone(shadow["effect_fact"])
-        event_types = [event.event_type for event in events]
-        self.assertIn("completion.claim_validated", event_types)
-        completion_shadow = next(
-            event for event in events
-            if event.event_type == "completion.shadow_validated"
-        )
-        self.assertEqual(completion_shadow.payload["turn_id"], result.turn_id)
-        self.assertTrue(completion_shadow.payload["diagnostic_only"])
-        self.assertEqual(completion_shadow.payload["gaps"], [])
+        # Conversation turns retain the actual committed tool record. Retired
+        # completion/shadow evaluators must not be required to execute a read.
+        current = await application.kernel.get_task(task.task_id)
+        execution = next(iter(current.tool_executions.values()))
+        fact = project_tool_execution_fact(execution)
+        self.assertIsNotNone(fact)
+        self.assertIs(fact.effect, ToolEffect.OBSERVE)
+        self.assertIs(fact.effect_status, EffectStatus.SUCCEEDED)
+        self.assertTrue(any(e.event_type == "tool.completed" for e in events))
+        self.assertFalse(any(e.event_type == "completion.shadow_validated" for e in events))
+
 
 
 if __name__ == "__main__":

@@ -1,0 +1,20 @@
+[
+  {
+    "source": "before_previous_prompt_changes",
+    "runs": 20,
+    "failures": 1,
+    "errors": 0,
+    "failure_details": [
+      "Traceback (most recent call last):\n  File \"/Users/tusima/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/asyncio/runners.py\", line 118, in run\n    return self._loop.run_until_complete(task)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/tusima/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/asyncio/base_events.py\", line 691, in run_until_complete\n    return future.result()\n           ^^^^^^^^^^^^^^^\n  File \"/Users/tusima/Documents/学习/tsm-agt/tests/test_conversation_task_flow.py\", line 381, in test_a_new_message_restarts_an_interrupted_conversation\n    self.assertEqual(len(turns), 3)\nAssertionError: 2 != 3\n"
+    ],
+    "error_details": []
+  },
+  {
+    "source": "current_fix",
+    "runs": 20,
+    "failures": 0,
+    "errors": 0,
+    "failure_details": [],
+    "error_details": []
+  }
+]

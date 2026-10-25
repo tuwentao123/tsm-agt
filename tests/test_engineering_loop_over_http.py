@@ -167,7 +167,7 @@ class EngineeringLoopOverHttpTest(unittest.IsolatedAsyncioTestCase):
                 model_timeout_seconds=20.0, model_max_retries=0,
                 model_retry_backoff_seconds=0.0,
                 orchestration_configuration=OrchestrationConfiguration(
-                    mode=OrchestrationMode.LEGACY
+                    mode=OrchestrationMode.CONVERSATION_LOOP
                 ),
             )
             await application.registry.start_all()
@@ -209,30 +209,21 @@ class EngineeringLoopOverHttpTest(unittest.IsolatedAsyncioTestCase):
             )
 
             spec = await kernel.get_task_spec(task.task_id)
-            self.assertIn(
-                "ac-durable-change",
-                [item.criterion_id for item in spec.acceptance_criteria],
-            )
+            self.assertEqual(spec.acceptance_criteria, ())
 
             # The turn ended without pending work: that IS completion. No
             # verifier runs and no verdict is mapped.
             finalized = await kernel.complete_task(
                 task.task_id, "http loop turn completed",
             )
-            self.assertIs(finalized.state, TaskState.SUCCEEDED)
+            self.assertIs(finalized.state, TaskState.AWAITING_INPUT)
 
             # The provider saw the planner call and the agent's own tool schema,
             # which is what proves the codec round-tripped over the socket.
             # The planner has a tool list of its own, so the two are separate
             # requests -- exactly the shape the real endpoint would see.
             seen = _StubModelHandler.requested_tools
-            self.assertTrue(
-                any(
-                    any("submit_task_spec" in name for name in names)
-                    for names in seen
-                ),
-                seen,
-            )
+            self.assertFalse(any(any("submit_task_spec" in name for name in names) for names in seen))
             self.assertTrue(
                 any(
                     any("apply_patch" in name for name in names)

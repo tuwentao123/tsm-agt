@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .adapter import RuntimeAdapter
-from .process import BackgroundProcessStartResult, ProcessWaitResult
+from .process import (
+    BackgroundProcessStartResult, ProcessCommandResult, ProcessWaitResult,
+)
 from .workspace_path import WorkspacePathPort
 
 
@@ -621,7 +623,9 @@ class ToolProcessControl(Protocol):
         max_output_bytes: int,
         max_lifetime_seconds: float,
         stop_on_task_end: bool,
-    ) -> BackgroundProcessStartResult: ...
+        mode: str,
+        timeout_seconds: float | None,
+    ) -> BackgroundProcessStartResult | ProcessCommandResult: ...
 
     async def wait(
         self, process_id: str, wait_seconds: float

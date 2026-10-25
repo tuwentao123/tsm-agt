@@ -1,0 +1,88 @@
+{
+  "label": "baseline",
+  "runs": 10,
+  "valid_runs": 9,
+  "behavior_passes": 5,
+  "results": [
+    {
+      "case": "implementation",
+      "mode": "baseline",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": false,
+      "error_type": null
+    },
+    {
+      "case": "continuation",
+      "mode": "baseline",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": true,
+      "error_type": null
+    },
+    {
+      "case": "analysis",
+      "mode": "baseline",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": true,
+      "error_type": null
+    },
+    {
+      "case": "blocked",
+      "mode": "baseline",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": false,
+      "error_type": null
+    },
+    {
+      "case": "small_change",
+      "mode": "baseline",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": false,
+      "error_type": null
+    },
+    {
+      "case": "stale_plan",
+      "mode": "baseline",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": true,
+      "error_type": null
+    },
+    {
+      "case": "multi_turn",
+      "mode": "baseline",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": false,
+      "error_type": null
+    },
+    {
+      "case": "scope_change",
+      "mode": "baseline",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": true,
+      "error_type": null
+    },
+    {
+      "case": "verification_failure",
+      "mode": "baseline",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": true,
+      "error_type": null
+    },
+    {
+      "case": "revision_conflict",
+      "mode": "baseline",
+      "sample": 1,
+      "valid_run": false,
+      "behavior_pass": false,
+      "error_type": null
+    }
+  ]
+}

@@ -58,17 +58,22 @@ class WebCheckpointConflictTest(unittest.IsolatedAsyncioTestCase):
     async def test_sse_terminal_conflict_delivers_failure_not_just_phase1_interrupted(self):
         server = web_fixtures._StreamServer(phase1_state="INTERRUPTED", status="interrupted")
         reason = web_app._checkpoint_conflict_reason(["policy_hash"])
-        with patch.object(web_app, "runtime_server", server), patch.object(
-            web_app, "_task_failure_reason", return_value=reason,
-        ):
+        async def packets(task_id, *, after=0):
+            yield {"type": "task.snapshot", "task_id": task_id, "sequence": 12,
+                   "state": "CONFLICT", "phase1_state": "INTERRUPTED",
+                   "final": True, "status": "interrupted", "failure_reason": reason}
+        server._client.subscribe_task_ui = packets
+        with patch.object(web_app, "runtime_server", server):
             response = await web_app.stream("task-stream", after=9)
+            self.assertEqual(await anext(response.body_iterator), ": open\n\n")
             frame = await anext(response.body_iterator)
             if isinstance(frame, bytes):
                 frame = frame.decode()
-            data = json.loads(frame.removeprefix("data: ").strip())
+            data = json.loads(next(line[6:] for line in frame.splitlines() if line.startswith("data: ")))
             self.assertTrue(data["final"])
             self.assertEqual(data["failure_reason"], reason)
             self.assertEqual(data["status"], "interrupted")
+            self.assertIn("id: 12", frame)
             with self.assertRaises(StopAsyncIteration):
                 await anext(response.body_iterator)
 
@@ -82,15 +87,18 @@ class WebCheckpointConflictTest(unittest.IsolatedAsyncioTestCase):
 
 
 class CheckpointConflictUiTest(unittest.TestCase):
-    def test_polling_conflict_does_not_append_the_old_answer_before_finalization(self):
+    def test_snapshot_conflict_does_not_append_the_old_answer_before_finalization(self):
         node = shutil.which("node")
         if node is None:
             self.skipTest("Node.js unavailable")
         source = web_app.INDEX_HTML
-        start = source.index("const reconcile = async () => {")
+        start = source.index("const applyState = async state => {")
         reconcile = source[start:source.index("\n  };", start) + 5]
         script = """
 const taskId = 'task'; const conversationId = 'session'; const card = {task: {}};
+const activeConversationId = 'session'; const follower = {turnId: null, stop() {}};
+const currentFollower = () => true; const renderMessages = () => {};
+const renderSkillInstallations = () => {};
 const answers = []; let finished = false;
 const fetch = async () => ({ok: true, json: async () => ({state: 'CONFLICT',
   phase1_state: 'INTERRUPTED', status: 'interrupted', assistant_text: 'STALE ANSWER'})});
@@ -101,7 +109,7 @@ const clearApprovalMessage = () => {};
 const TERMINAL_STATES = ['INTERRUPTED'];
 const finish = async () => { finished = true; };
 """ + reconcile + """
-reconcile().then(() => process.stdout.write(JSON.stringify({answers, finished})));
+applyState({state: 'CONFLICT', phase1_state: 'INTERRUPTED', status: 'interrupted', final: true, assistant_text: 'STALE ANSWER'}).then(() => process.stdout.write(JSON.stringify({answers, finished})));
 """
         completed = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True)
         result = json.loads(completed.stdout)

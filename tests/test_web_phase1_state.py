@@ -88,7 +88,7 @@ class WebPhase1StateTest(unittest.IsolatedAsyncioTestCase):
         for label in ("执行状态", "领域检查", "模型结论", "引用校验"):
             self.assertIn(label, web_app.INDEX_HTML)
         self.assertIn("applyTaskProtocol", web_app.INDEX_HTML)
-        self.assertIn("function renderTodoPanel(todoList)", web_app.INDEX_HTML)
+        self.assertIn("function renderTodoPanel(todoList, compact = false)", web_app.INDEX_HTML)
         self.assertIn("renderTodoPanel(task.todoList)", web_app.INDEX_HTML)
 
     async def test_ui_omits_retired_single_loop_projection(self) -> None:

@@ -1,0 +1,88 @@
+{
+  "label": "candidate",
+  "runs": 10,
+  "valid_runs": 9,
+  "behavior_passes": 7,
+  "results": [
+    {
+      "case": "implementation",
+      "mode": "candidate",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": false,
+      "error_type": null
+    },
+    {
+      "case": "continuation",
+      "mode": "candidate",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": false,
+      "error_type": null
+    },
+    {
+      "case": "analysis",
+      "mode": "candidate",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": true,
+      "error_type": null
+    },
+    {
+      "case": "blocked",
+      "mode": "candidate",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": true,
+      "error_type": null
+    },
+    {
+      "case": "small_change",
+      "mode": "candidate",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": true,
+      "error_type": null
+    },
+    {
+      "case": "stale_plan",
+      "mode": "candidate",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": true,
+      "error_type": null
+    },
+    {
+      "case": "multi_turn",
+      "mode": "candidate",
+      "sample": 1,
+      "valid_run": false,
+      "behavior_pass": false,
+      "error_type": "ModelProviderTransportError"
+    },
+    {
+      "case": "scope_change",
+      "mode": "candidate",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": true,
+      "error_type": null
+    },
+    {
+      "case": "verification_failure",
+      "mode": "candidate",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": true,
+      "error_type": null
+    },
+    {
+      "case": "revision_conflict",
+      "mode": "candidate",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": true,
+      "error_type": null
+    }
+  ]
+}

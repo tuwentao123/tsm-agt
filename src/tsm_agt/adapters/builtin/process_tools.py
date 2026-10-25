@@ -14,6 +14,7 @@ from tsm_agt.ports import (
     HealthState,
     HealthStatus,
     ModelToolContract,
+    ProcessCommandResult,
     ProcessStartError,
     ToolCall,
     ToolEffect,
@@ -67,10 +68,12 @@ class CoreProcessToolProvider:
             name="core.run_command",
             description=(
                 "Run a command as a structured argv array inside the task workspace. "
-                "No shell parses the arguments. Every command is started as a Runtime-"
-                "managed process and returns promptly with a process_id and its current "
-                "state. Use core.process_wait only when a later step needs a bounded "
-                "wait for exit; use status or logs to observe a running process. "
+                "No shell parses the arguments. Commands run in foreground mode by "
+                "default and return one bounded terminal observation: status, exit code, "
+                "stdout, stderr, and duration. Set mode='background' only for a service "
+                "or other intentionally long-lived process; that mode returns a process "
+                "id and RUNNING is not a successful command outcome. Use core.process_wait "
+                "or core.process_logs only for an explicit background process. "
                 "Prefer web.search and web.fetch_markdown for public web pages. "
                 "Reading another project's source is a normal use of this tool. "
                 "With the gh CLI, gh api -H 'Accept: application/vnd.github.raw' "
@@ -79,12 +82,15 @@ class CoreProcessToolProvider:
                 "repository paths through the web tools. A shell executable is "
                 "denied, so pass the program and its arguments directly and inspect "
                 "files with core.list_files, core.read_file, or core.search_files. "
+                "When an in-scope requested action is not covered by a dedicated "
+                "tool, use this tool with its literal argv. A required approval or "
+                "policy denial is the result of this call, not evidence that this "
+                "execution route is unavailable before calling it. "
                 "The environment starts minimal and rejects credential-like variable names. "
-                "A successful ToolResult proves only that Runtime started and supervises "
-                "the process. data.state='RUNNING' is neither service readiness nor a "
-                "terminal command result. If data.state is terminal, inspect exit_code "
-                "and succeeded. Runtime, not this call, assigns the process resource "
-                "lease and reports its deadline_at. This lease is not a wait duration. "
+                "For a foreground command, a non-zero exit or timeout is returned as a "
+                "failed command result with its captured output; do not mistake tool "
+                "dispatch for success. Runtime assigns a background process resource "
+                "lease and reports deadline_at only in background mode. "
                 "Bringing a public repository in with git clone, git fetch, or "
                 "git ls-remote is allowed without extra approval under a trusted "
                 "project; other commands require approval."
@@ -96,6 +102,8 @@ class CoreProcessToolProvider:
                     "cwd": {"type": "string", "description": "Required workspace-relative working directory."},
                     "environment": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Optional non-secret environment overrides."},
                     "max_output_bytes": {"type": "integer", "minimum": 1, "maximum": 5000000, "description": "Retained stdout/stderr byte limit; defaults to 1000000."},
+                    "mode": {"type": "string", "enum": ["foreground", "background"], "description": "foreground (default) waits for a bounded terminal result; background is only for intentionally long-lived processes."},
+                    "timeout_seconds": {"type": "number", "minimum": 0.01, "maximum": 60, "description": "Foreground execution limit in seconds; defaults to 20. Not valid for background mode."},
                 },
                 # Directory is part of the command identity: it must be visible
                 # to the model, approval flow, execution record, and process
@@ -115,10 +123,14 @@ class CoreProcessToolProvider:
             effect=ToolEffect.EXECUTE,
             result_authority=ToolResultAuthority.PROCESS_FACT,
             model_contract=ModelToolContract(
-                purpose="Start one structured command under Runtime process supervision.",
+                purpose="Run one structured command and return its terminal observation, or explicitly start a background service.",
                 use_when=("a local command is needed to inspect, build, test, or operate the current task",),
                 avoid_when=("you only need public web content; use web tools", "you need shell parsing; it is not available"),
-                returns=("a managed process receipt and current state", "RUNNING proves neither service readiness nor command success"),
+                returns=(
+                    "foreground: bounded stdout, stderr, exit outcome, and success/failure status",
+                    "background: a supervised process receipt and current state",
+                    "RUNNING proves neither service readiness nor command success",
+                ),
             ),
         ),
         ToolSpec(
@@ -212,6 +224,18 @@ class CoreProcessToolProvider:
             idempotency=ToolIdempotency.IDEMPOTENT,
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.PROCESS_FACT,
+            model_contract=ModelToolContract(
+                purpose="Read retained stdout and stderr from one managed process.",
+                use_when=(
+                    "a process is still running, its initial output was unavailable, "
+                    "or a returned stream is truncated and more retained output is needed",
+                ),
+                avoid_when=("the process is not managed by this session",),
+                returns=(
+                    "bounded stdout and stderr with continuation cursors",
+                    "output facts, not a diagnosis or a prescribed repair",
+                ),
+            ),
         ),
         ToolSpec(
             name="core.process_stop",
@@ -290,6 +314,7 @@ class CoreProcessToolProvider:
             if call.name == "core.run_command":
                 command = await self._run_command(call.arguments, control)
                 data = command.to_data()
+                return self._command_result(call, context, command, data)
             elif call.name == "core.process_list":
                 scope = call.arguments.get("scope", "session")
                 states = call.arguments.get("states", ["RUNNING", "ORPHANED"])
@@ -371,7 +396,7 @@ class CoreProcessToolProvider:
 
     async def _run_command(
         self, arguments: Mapping[str, Any], control,
-    ) -> BackgroundProcessStartResult:
+    ) -> BackgroundProcessStartResult | ProcessCommandResult:
         raw_argv = arguments.get("argv")
         if (
             not isinstance(raw_argv, (list, tuple))
@@ -391,11 +416,53 @@ class CoreProcessToolProvider:
         max_output_bytes = self._bounded_int(
             arguments, "max_output_bytes", 1_000_000, 1, 5_000_000
         )
+        mode = arguments.get("mode", "foreground")
+        if mode not in {"foreground", "background"}:
+            raise TypeError("mode must be 'foreground' or 'background'")
+        timeout_seconds: float | None = None
+        if mode == "foreground":
+            timeout_seconds = self._bounded_number(
+                arguments, "timeout_seconds", 20.0, 0.01, 60.0,
+            )
+        elif "timeout_seconds" in arguments:
+            raise TypeError("timeout_seconds is only valid when mode is 'foreground'")
         return await control.run(
             tuple(raw_argv), cwd=cwd, environment=dict(raw_environment),
             max_output_bytes=max_output_bytes,
             max_lifetime_seconds=self._managed_process_max_lifetime_seconds,
             stop_on_task_end=self._stop_managed_process_on_task_end,
+            mode=mode, timeout_seconds=timeout_seconds,
+        )
+
+    @staticmethod
+    def _command_result(
+        call: ToolCall,
+        context: ToolInvocationContext,
+        command: BackgroundProcessStartResult | ProcessCommandResult,
+        data: Mapping[str, Any],
+    ) -> ToolResult:
+        """Keep dispatch success separate from the command's real outcome.
+
+        The tool call itself reached the provider in both cases.  For a
+        terminal command, however, the only useful top-level status for the
+        model is the command result, not the fact that its launcher ran.
+        Background starts remain successful receipts until a later observation
+        reaches a terminal state.
+        """
+        if data.get("succeeded") is False:
+            failure_code = str(data.get("failure_code") or "PROCESS_EXIT_NON_ZERO")
+            return ToolResult(
+                call.call_id, False, data=dict(data), error_code=failure_code,
+                message="command reached a terminal non-success outcome",
+                fact_descriptor=CoreProcessToolProvider._fact_descriptor(
+                    call, context, data,
+                ),
+            )
+        return ToolResult(
+            call.call_id, True, data=dict(data),
+            fact_descriptor=CoreProcessToolProvider._fact_descriptor(
+                call, context, data,
+            ),
         )
 
     @staticmethod
@@ -418,7 +485,11 @@ class CoreProcessToolProvider:
             # not a test/acceptance verification without an explicit contract.
             if data.get("execution_state") in {"succeeded", "failed_known"}:
                 capabilities += (ToolFactCapability.REPORT_RUNTIME_STATE,)
-            materialization = ToolResultMaterialization.ACTION_RECEIPT
+            materialization = (
+                ToolResultMaterialization.RUNTIME_OBSERVATION
+                if data.get("mode") == "foreground"
+                else ToolResultMaterialization.ACTION_RECEIPT
+            )
         elif call.name == "core.process_stop":
             materialization = ToolResultMaterialization.ACTION_RECEIPT
             capabilities = (ToolFactCapability.REPORT_ACTION,)

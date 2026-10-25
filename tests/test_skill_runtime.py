@@ -129,7 +129,7 @@ class SkillRuntimeTest(unittest.IsolatedAsyncioTestCase):
             _text_response("final", "done"),
         ])
 
-        application = compose_fixture_application(model_adapter=model, tool_adapters=())
+        application = compose_fixture_application(model_adapter=model, tool_adapters=(), enable_skills=True)
         await application.registry.start_all()
         self.addAsyncCleanup(application.registry.stop_all)
 

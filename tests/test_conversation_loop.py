@@ -262,8 +262,7 @@ async def _executing(application, root: Path, task_id: str = "task-conv"):
 
 
 class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
-    async def test_stage_summary_uses_tool_outcome_when_model_has_no_text(self):
-        from tsm_agt.web.app import _turn_progress_item
+    async def test_runtime_never_summarizes_tool_outcomes_as_commentary(self):
         model = ScriptedModel([
             tool_response("first", "first-call", "fixture.fail", {"text": "test"}),
             tool_response("second", "second-call", "web.search", {"query": "example"}),
@@ -276,19 +275,24 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
                 task = await _executing(application, Path(directory))
                 await application.kernel.run_agent_turn(task.task_id, "执行两个步骤", on_progress=progress.append)
                 events = await application.registry.require(RuntimeStorePort).read_events(task.task_id)
-                event = next(event for event in events if event.event_type == "conversation.stage_summary")
-                item = _turn_progress_item(event)
-                self.assertEqual(item["phase"], "runtime")
-                self.assertIn("fixture.fail执行失败（UPSTREAM_FAILED）", item["activity"])
-                self.assertIn("接下来调用 web.search", item["activity"])
-                self.assertEqual([p.activity for p in progress if p.kind.value == "stage_summary"], [item["activity"]])
+                self.assertFalse(any(
+                    event.event_type == "conversation.commentary" for event in events
+                ))
+                self.assertFalse(any(
+                    item.kind.value == "commentary" for item in progress
+                ))
         finally:
             await application.registry.stop_all()
 
-    async def test_model_stage_summary_is_distinguished_from_runtime_status(self):
+    async def test_each_tool_proposal_can_publish_model_commentary(self):
         call = ToolCall("second-call", "web.open", {"url": "https://news.example/nba"})
         model = ScriptedModel([
-            tool_response("first", "first-call", "web.search", {"query": "NBA"}),
+            ModelResponse(Message("first", MessageRole.ASSISTANT, (
+                TextBlock("我会先检索相关新闻，再阅读最相关的正文。"),
+                ToolCallBlock(ToolCall(
+                    "first-call", "web.search", {"query": "NBA"},
+                )),
+            )), FinishReason.TOOL_CALL, ModelUsage(6, 3)),
             ModelResponse(Message("second", MessageRole.ASSISTANT, (
                 TextBlock("找到一篇摘要，接下来查看正文。"), ToolCallBlock(call),
             )), FinishReason.TOOL_CALL, ModelUsage(6, 3)),
@@ -300,8 +304,28 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
             with tempfile.TemporaryDirectory() as directory:
                 task = await _executing(application, Path(directory))
                 await application.kernel.run_agent_turn(task.task_id, "执行两个步骤", on_progress=progress.append)
-                stages = [p for p in progress if p.kind.value == "stage_summary"]
-                self.assertEqual([(p.phase, p.activity) for p in stages], [("model", "找到一篇摘要，接下来查看正文。")])
+                events = await application.registry.require(RuntimeStorePort).read_events(task.task_id)
+                notes = [p for p in progress if p.kind.value == "commentary"]
+                self.assertEqual(
+                    [(p.phase, p.activity) for p in notes],
+                    [
+                        ("model", "我会先检索相关新闻，再阅读最相关的正文。"),
+                        ("model", "找到一篇摘要，接下来查看正文。"),
+                    ],
+                )
+                commentary = [
+                    event for event in events
+                    if event.event_type == "conversation.commentary"
+                ]
+                requested = [
+                    event for event in events
+                    if event.event_type == "tool.requested"
+                ]
+                self.assertEqual(len(commentary), len(requested))
+                self.assertTrue(all(
+                    note.sequence < tool.sequence
+                    for note, tool in zip(commentary, requested, strict=True)
+                ))
         finally:
             await application.registry.stop_all()
 
@@ -320,12 +344,12 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(Exception):
                     await application.kernel.run_agent_turn(task.task_id, "查资料", on_progress=progress.append)
                 events = await application.registry.require(RuntimeStorePort).read_events(task.task_id)
-                self.assertFalse(any(event.event_type == "conversation.execution_note" for event in events))
-                self.assertFalse(any(item.kind.value == "execution_note" for item in progress))
+                self.assertFalse(any(event.event_type == "conversation.commentary" for event in events))
+                self.assertFalse(any(item.kind.value == "commentary" for item in progress))
         finally:
             await application.registry.stop_all()
 
-    async def test_tool_call_note_is_progress_and_survives_as_event(self):
+    async def test_first_tool_call_commentary_is_progress_and_survives_as_event(self):
         from tsm_agt.web.app import _turn_progress_item
 
         call = ToolCall("call-note", "web.search", {"query": "example"})
@@ -348,14 +372,14 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
                     on_text_delta=final_deltas.append,
                 )
                 events = await application.registry.require(RuntimeStorePort).read_events(task.task_id)
-                note = next(event for event in events if event.event_type == "conversation.execution_note")
+                note = next(event for event in events if event.event_type == "conversation.commentary")
                 requested = next(event for event in events if event.event_type == "tool.requested")
                 self.assertLess(note.sequence, requested.sequence)
                 self.assertEqual(_turn_progress_item(note)["activity"], "先查找相关资料。")
-                notes = [item for item in progress if item.kind.value == "execution_note"]
+                notes = [item for item in progress if item.kind.value == "commentary"]
                 self.assertEqual([item.activity for item in notes], ["先查找相关资料。"])
                 self.assertNotIn("先查找相关资料。", "".join(final_deltas))
-                self.assertEqual(sum(event.event_type == "conversation.execution_note" for event in events), 1)
+                self.assertEqual(sum(event.event_type == "conversation.commentary" for event in events), 1)
         finally:
             await application.registry.stop_all()
 
@@ -896,7 +920,7 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
                     message.text for message in second
                     if message.role is MessageRole.SYSTEM
                 )
-                self.assertIn("latest durable tool result is a failure", rendered)
+                self.assertIn("current_execution_state include a failure", rendered)
                 self.assertNotIn("recovery_kind", rendered)
                 self.assertNotIn("call the same tool again", rendered)
                 self.assertNotIn(

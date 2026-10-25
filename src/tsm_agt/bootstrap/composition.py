@@ -7,7 +7,7 @@ from tsm_agt.adapters.evented_runtime_store import evented_store
 from dataclasses import dataclass, replace
 import os
 from pathlib import Path
-from collections.abc import Mapping
+from collections.abc import Mapping, Awaitable, Callable
 
 from tsm_agt.adapters import AdapterRegistry
 from tsm_agt.adapters.builtin import (
@@ -100,6 +100,14 @@ from tsm_agt.core.skill_selector import SkillSelector
 from tsm_agt.core.skills import SkillRegistry
 from tsm_agt.adapters.local_skills import UserSkillsStore
 from tsm_agt.adapters.builtin.skill_tools import CoreSkillToolProvider
+from tsm_agt.adapters.mcp_client_manager import MCPClientManager, MCPServerConfig
+from tsm_agt.adapters.mcp_tool_provider import MCPToolProvider
+from tsm_agt.adapters.mcp_python_sdk_client import create_mcp_sdk_client
+from tsm_agt.bootstrap.mcp_configuration import (
+    load_mcp_servers,
+    load_mcp_servers_file,
+    merge_mcp_servers,
+)
 from tsm_agt.ports import (
     CrossProcessLockPort,
     FlowArtifactExportPort,
@@ -138,6 +146,145 @@ from tsm_agt.ports import (
     EvidenceRelationProviderPort, EvidenceRelationPolicyPort,
     RejectionLoopPolicyPort, ExplorationOutcomePolicyPort,
 )
+
+
+def compose_mcp_fixture_application(
+    servers: tuple[MCPServerConfig, ...],
+    client_factory: Callable[[MCPServerConfig], Awaitable[object]],
+    *,
+    model_adapter: ModelProviderPort | None = None,
+    store_adapter: RuntimeStorePort | None = None,
+    project_memory_adapter: ProjectMemoryPort | None = None,
+    enable_runtime_inspection: bool = False,
+) -> Application:
+    """Compose a fixture application with MCP tools wired into the registry.
+
+    This helper mirrors :func:`compose_fixture_application` but adds an
+    :class:`MCPToolProvider` constructed from a declarative
+    :class:`MCPClientManager`.  Callers are responsible for supplying
+    ``servers`` and ``client_factory`` that integrate with a concrete MCP
+    Python SDK.
+    """
+    tool_adapters: tuple[ToolProviderPort, ...] = (EchoToolProvider(),)
+
+    # Back-end MCP permission switch: when disabled, no MCP tools are
+    # registered at all, so neither the model nor the UI can see or call any
+    # mcp.* tools.
+    if _mcp_tools_enabled():
+        manager = MCPClientManager(servers=servers, client_factory=client_factory)
+        mcp_provider = MCPToolProvider(manager)
+        tool_adapters = (EchoToolProvider(), mcp_provider)
+
+    # Reuse the existing fixture composition pipeline, injecting the MCP
+    # provider alongside the default EchoToolProvider when enabled.
+    return compose_fixture_application(
+        model_adapter=model_adapter,
+        store_adapter=store_adapter,
+        project_memory_adapter=project_memory_adapter,
+        tool_adapters=tool_adapters,
+        enable_runtime_inspection=enable_runtime_inspection,
+    )
+
+
+def _mcp_tools_enabled() -> bool:
+    """Return whether MCP tools should be exposed to the Kernel.
+
+    This is a back-end level switch: when it returns ``False``,
+    :class:`MCPToolProvider` is not registered, so MCP tools are absent from the
+    tool set the model and UI can see.
+
+    The environment variable ``TSM_AGT_ENABLE_MCP_TOOLS`` controls the value:
+
+    * unset or one of ``"1"``, ``"true"``, ``"yes"``, ``"on"`` → enabled;
+    * one of ``"0"``, ``"false"``, ``"no"``, ``"off"`` → disabled.
+
+    Any other explicit value is treated as a configuration error.
+    """
+
+    raw = os.getenv("TSM_AGT_ENABLE_MCP_TOOLS", "")
+    value = raw.strip().casefold()
+    if value in ("", "1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(
+        "TSM_AGT_ENABLE_MCP_TOOLS must be one of '', '1', 'true', 'yes', 'on', "
+        "'0', 'false', 'no', or 'off'"
+    )
+
+
+async def mcp_sdk_client_factory(config: MCPServerConfig):
+    """Create the production MCP SDK client from the composition boundary."""
+    return await create_mcp_sdk_client(config)
+
+
+def compose_mcp_application_from_config(
+    client_factory: Callable[[MCPServerConfig], Awaitable[object]],
+    *,
+    model_adapter: ModelProviderPort | None = None,
+    store_adapter: RuntimeStorePort | None = None,
+    project_memory_adapter: ProjectMemoryPort | None = None,
+    enable_runtime_inspection: bool = False,
+) -> Application:
+    """Compose an application with MCP servers loaded from JSON config files.
+
+    This helper is a convenience wrapper around
+    :func:`compose_mcp_fixture_application` that discovers MCP server
+    configuration files, loads :class:`MCPServerConfig` entries and wires them
+    into the Kernel.
+
+    Server configuration discovery follows a simple layering scheme:
+
+    1. If the environment variable ``TSM_AGT_MCP_CONFIG`` is set and points to
+       an existing file, only that file is loaded.
+    2. Otherwise, the loader looks for a workspace-local file
+       ``.tsm-agt/mcp.json`` relative to the current process working
+       directory.
+    3. It also looks for a user-level file ``~/.config/tsm-agt/mcp.json``.
+
+    When both the workspace-local and user-level files exist, their contents
+    are merged using :func:`merge_mcp_servers` with later files winning for
+    duplicate server identifiers. This allows a user-global MCP configuration
+    to be overridden or extended by a specific workspace.
+
+    If no configuration files are found, the helper still composes an
+    application but with no MCP servers; in that case
+    :func:`compose_mcp_fixture_application` behaves as though MCP were
+    disabled.
+    """
+
+    config_paths: list[Path] = []
+
+    explicit_path = os.getenv("TSM_AGT_MCP_CONFIG")
+    if explicit_path:
+        path = Path(explicit_path).expanduser()
+        if path.is_file():
+            config_paths = [path]
+    else:
+        # Workspace-local configuration relative to the current working
+        # directory. Callers are responsible for setting the desired
+        # workspace root before invoking this helper.
+        workspace_path = Path(".tsm-agt/mcp.json")
+        if workspace_path.is_file():
+            config_paths.append(workspace_path)
+
+        # User-level configuration under ~/.config/tsm-agt/mcp.json. This is
+        # optional and may be shared across multiple workspaces.
+        user_path = Path("~/.config/tsm-agt/mcp.json").expanduser()
+        if user_path.is_file():
+            config_paths.append(user_path)
+
+    server_files = [load_mcp_servers_file(path) for path in config_paths]
+    servers = merge_mcp_servers(server_files)
+
+    return compose_mcp_fixture_application(
+        servers=servers,
+        client_factory=client_factory,
+        model_adapter=model_adapter,
+        store_adapter=store_adapter,
+        project_memory_adapter=project_memory_adapter,
+        enable_runtime_inspection=enable_runtime_inspection,
+    )
 from .model_configuration import (
     MODEL_PROTOCOL_ANTHROPIC_MESSAGES,
     endpoint_origin,
@@ -306,6 +453,7 @@ def _kernel_dependencies(
     context_manager: ContextWindowManager | None = None,
     *, default_max_output_tokens: int = 1024,
     session_projector: SessionContextProjector | None = None,
+    enable_skills: bool = True,
 ) -> KernelDependencies:
     classifiers = registry.all(RuntimeInputClassifierPort)
     if len(classifiers) > 1:
@@ -428,9 +576,12 @@ def _kernel_dependencies(
         raise ValueError("completion review max_continuations must not be negative")
     skill_registry = SkillRegistry()
     skill_selector = SkillSelector(skill_registry)
-    registry.register(
-        ToolProviderPort, CoreSkillToolProvider(skill_registry, UserSkillsStore(), registry.require(RuntimeStorePort))
-    )
+    if enable_skills and registry.require(ModelProviderPort).capabilities.tools:
+        registry.register(
+            ToolProviderPort, CoreSkillToolProvider(
+                skill_registry, UserSkillsStore(), registry.require(RuntimeStorePort)
+            ),
+        )
     return KernelDependencies(
         model=registry.require(ModelProviderPort),
         store=registry.require(RuntimeStorePort),
@@ -612,6 +763,7 @@ def compose_fixture_application(
     context_manager: ContextWindowManager | None = None,
     enable_working_memory: bool = False,
     enable_runtime_inspection: bool = False,
+    enable_skills: bool = False,
     runtime_input_classifier_adapter: RuntimeInputClassifierPort | None = None,
     session_input_relation_adapter: SessionInputRelationPort | None = None,
     session_input_resolver_adapter: SessionInputResolverPort | None = None,
@@ -787,6 +939,7 @@ def compose_fixture_application(
             orchestration_configuration=OrchestrationConfiguration(),
         ), context_manager,
         session_projector=session_projector,
+        enable_skills=enable_skills,
     )
     return Application(kernel=Kernel(dependencies), registry=registry)
 
@@ -1082,6 +1235,7 @@ def compose_openai_compatible_engineering_application(
     completion_review_failure_policy: CompletionReviewFailurePolicy = (
         CompletionReviewFailurePolicy.VISIBLE_UNVERIFIED
     ),
+    mcp_servers: tuple[MCPServerConfig, ...] = (),
 ) -> Application:
     """Compose the engineering Agent with workspace and process tools."""
 
@@ -1208,6 +1362,11 @@ def compose_openai_compatible_engineering_application(
             ToolProviderPort, GitHubSourceToolProvider(github_source)
         )
     registry.register(ToolProviderPort, CoreProcessToolProvider())
+    if mcp_servers and _mcp_tools_enabled():
+        registry.register(
+            ToolProviderPort,
+            MCPToolProvider(MCPClientManager(mcp_servers, mcp_sdk_client_factory)),
+        )
     registry.register(ToolProviderPort, CoreWorkspaceMutationToolProvider())
     registry.register(ToolProviderPort, CoreMemoryToolProvider())
     registry.register(ToolProviderPort, CoreWorkingMemoryToolProvider())
@@ -1347,6 +1506,7 @@ def compose_openai_compatible_engineering_application_from_env(
         selected_env_file, os.environ
     )
     review = load_completion_review_configuration(selected_env_file, os.environ)
+    mcp_servers = load_mcp_servers(selected_env_file.parent, os.environ)
     return compose_openai_compatible_engineering_application(
         base_url=configuration.base_url,
         model=configuration.model,
@@ -1374,4 +1534,33 @@ def compose_openai_compatible_engineering_application_from_env(
         completion_review_mode=review.mode,
         completion_review_max_continuations=review.max_continuations,
         completion_review_failure_policy=review.failure_policy,
+        mcp_servers=mcp_servers,
     )
+
+
+def user_skills_store_for_application(application: Application | None = None):
+    """Resolve the shared store at the composition boundary, including offline UI."""
+    if application is not None:
+        for provider in application.kernel.dependencies.tools:
+            if isinstance(provider, CoreSkillToolProvider):
+                return provider.store
+    return UserSkillsStore()
+
+
+def configure_request_diagnostics(application: Application):
+    """Attach optional provider diagnostics without exposing provider types to UI."""
+    from tsm_agt.adapters.openai_compatible.request_diagnostics import TurnRequestDiagnostics
+
+    model = application.kernel.dependencies.model
+    physical = getattr(model, "_provider", model)
+    if isinstance(physical, OpenAICompatibleModelProvider):
+        capture = TurnRequestDiagnostics()
+        physical._request_diagnostics = capture
+        return capture
+    return None
+
+
+def skill_installation_prompt(job: dict) -> str:
+    from tsm_agt.adapters.skill_installations import installation_prompt
+
+    return installation_prompt(job)

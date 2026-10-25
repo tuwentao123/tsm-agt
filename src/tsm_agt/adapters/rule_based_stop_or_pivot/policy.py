@@ -49,11 +49,8 @@ class RuleBasedStopOrPivotPolicy:
             return self._update(
                 StopOrPivotAction.NARROW_SCOPE, "unjustified_scope_expansion"
             )
-        if signals.plan_finished:
-            return self._update(
-                StopOrPivotAction.SUMMARIZE_WITH_EVIDENCE,
-                "plan_finished", terminal=True,
-            )
+        # A closed authored plan is an observation, not proof that the latest
+        # request is complete or a reason to cancel new tool work.
         if signals.plan_should_stop:
             return self._update(
                 StopOrPivotAction.STOP_NO_PROGRESS, "plan_no_progress",

@@ -166,7 +166,7 @@ class EventedUiTest(unittest.IsolatedAsyncioTestCase):
                 break
         self.assertEqual(packets[-1]["status"], "running")
         await client.application.kernel._append_events(result.task_id, ((
-            "conversation.execution_note", {"turn_id": packets[-1]["turn_id"], "text": "Still working"},
+            "conversation.commentary", {"turn_id": packets[-1]["turn_id"], "text": "Still working"},
         ),))
         packet = await asyncio.wait_for(anext(stream), 1)
         self.assertEqual(packet.get("progress", {}).get("activity"), "Still working")
@@ -214,7 +214,7 @@ class EventedUiTest(unittest.IsolatedAsyncioTestCase):
             calls += 1
             if calls == 2:
                 task = await client.application.kernel.get_task(task_id)
-                await client.application.kernel._append_events(task_id, (("conversation.execution_note", {
+                await client.application.kernel._append_events(task_id, (("conversation.commentary", {
                     "turn_id": task.active_agent_checkpoint["turn_id"], "text": "concurrent change",
                 }),))
             return await original(*args, **kwargs)

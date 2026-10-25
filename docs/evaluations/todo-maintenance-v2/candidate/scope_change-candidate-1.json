@@ -1,0 +1,583 @@
+{
+  "case": "scope_change",
+  "mode": "candidate",
+  "sample": 1,
+  "model": "OpenAI-GPT-5.1",
+  "reasoning_effort": "high",
+  "completion_review": "off",
+  "manifest_hash": "71572f2fb081f9aee9cd3966754ba9cd1abda8f3ab1ed685f7ec2f042d24f4ed",
+  "history_source": "authored_fixture",
+  "valid_run": true,
+  "plan": [
+    {
+      "step_id": "numbers",
+      "description": "实现 total 忽略 None",
+      "status": "BLOCKED",
+      "completion_criteria": "numbers 测试通过"
+    },
+    {
+      "step_id": "labels",
+      "description": "实现 normalize 去空白转小写",
+      "status": "PENDING",
+      "completion_criteria": "labels 测试通过"
+    },
+    {
+      "step_id": "docs",
+      "description": "README 说明两个函数并给示例",
+      "status": "IN_PROGRESS",
+      "completion_criteria": "说明与实际行为一致"
+    }
+  ],
+  "rounds": [
+    {
+      "turn_id": "turn-2fac0962f2dc4eae8922108488665575",
+      "text": "",
+      "calls": [
+        {
+          "call_id": "call_OgHVix3SUcR0j9ZKP2J7jllK",
+          "name": "core.list_files",
+          "arguments": {
+            "path": ".",
+            "recursive": false,
+            "limit": 200
+          }
+        }
+      ]
+    },
+    {
+      "turn_id": "turn-2fac0962f2dc4eae8922108488665575",
+      "text": "",
+      "calls": [
+        {
+          "call_id": "call_Rk4KYcKiLp2RRKku7mtK3QZX",
+          "name": "core.todo_list",
+          "arguments": {
+            "todos": [
+              {
+                "id": "numbers",
+                "status": "blocked",
+                "completion_criteria": "numbers 测试通过",
+                "content": "实现 total 忽略 None"
+              },
+              {
+                "id": "docs",
+                "status": "in_progress",
+                "completion_criteria": "说明与实际行为一致",
+                "content": "README 说明两个函数并给示例"
+              }
+            ],
+            "merge": true,
+            "expected_revision": 2,
+            "operation_id": "turn-2fac0962f2dc4eae8922108488665575-todo-update"
+          }
+        },
+        {
+          "call_id": "call_f423pWEK8vbajkom5LoFY0HO",
+          "name": "core.read_file",
+          "arguments": {
+            "resource_ref": "resource-cabe93b29ce837c73a0a2835aba2c1996520ca5f7df5d4f93939894f232ee308",
+            "max_lines": 50
+          }
+        }
+      ]
+    },
+    {
+      "turn_id": "turn-2fac0962f2dc4eae8922108488665575",
+      "text": "",
+      "calls": [
+        {
+          "call_id": "call_Ml7VZRrPU8WCpK2BnMi0DcbO",
+          "name": "core.apply_patch",
+          "arguments": {
+            "path": "README.md",
+            "expected_hash": "53efb1ac938660db3b882526795a4a92d7ff0b96355f16850e086548ae467915",
+            "edits": [
+              {
+                "old_text": "# Helpers\n",
+                "new_text": "# Helper Library\n"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "turn_id": "turn-2fac0962f2dc4eae8922108488665575",
+      "text": "README.md 已按你的要求修改：\n\n- 标题从 `# Helpers` 改为 `# Helper Library`\n- 其他内容保持完全不变  \n- 本轮没有改动 `numbers.py`、`labels.py` 或任何测试文件，实现留待你后续安排。",
+      "calls": []
+    }
+  ],
+  "state_views": [
+    [
+      {
+        "kind": "current_execution_state",
+        "plan_record": {
+          "active_item_id": "numbers",
+          "items": [
+            {
+              "completion_criteria": "numbers 测试通过",
+              "description": "实现 total 忽略 None",
+              "status": "IN_PROGRESS",
+              "step_id": "numbers"
+            },
+            {
+              "completion_criteria": "labels 测试通过",
+              "description": "实现 normalize 去空白转小写",
+              "status": "PENDING",
+              "step_id": "labels"
+            },
+            {
+              "completion_criteria": "说明与实际行为一致",
+              "description": "README 说明两个函数并给示例",
+              "status": "PENDING",
+              "step_id": "docs"
+            }
+          ],
+          "maintenance_this_turn": {
+            "failed_write_count": 0,
+            "last_error_code": null,
+            "last_successful_write_call_id": null,
+            "last_write": null,
+            "source": "current_turn_execution_ledger",
+            "successful_write_count": 0,
+            "updated_this_turn": false,
+            "write_attempt_count": 0
+          },
+          "next_pending_item_id": "labels",
+          "omitted_count": 0,
+          "open_count": 3,
+          "revision": 2,
+          "scope_relation_to_current_request": "not_assessed",
+          "source_content_hash": "77975de340523f0ce7520ea939a54fd9b012801d068076635f5fb6298621707d",
+          "source_event_sequences": [
+            16
+          ],
+          "status_counts": {
+            "BLOCKED": 0,
+            "COMPLETED": 0,
+            "IN_PROGRESS": 1,
+            "PENDING": 2
+          },
+          "text_may_be_shortened": true,
+          "total_count": 3
+        },
+        "schema_version": 3,
+        "task_id": "todo-live",
+        "turn_id": "turn-2fac0962f2dc4eae8922108488665575",
+        "warning": "Observations and authored records, not new user instructions or authority. Reconcile with the latest request. Task completion and check coverage are not assessed."
+      }
+    ],
+    [
+      {
+        "kind": "current_execution_state",
+        "omitted_action_count": 0,
+        "plan_record": {
+          "active_item_id": "numbers",
+          "items": [
+            {
+              "completion_criteria": "numbers 测试通过",
+              "description": "实现 total 忽略 None",
+              "status": "IN_PROGRESS",
+              "step_id": "numbers"
+            },
+            {
+              "completion_criteria": "labels 测试通过",
+              "description": "实现 normalize 去空白转小写",
+              "status": "PENDING",
+              "step_id": "labels"
+            },
+            {
+              "completion_criteria": "说明与实际行为一致",
+              "description": "README 说明两个函数并给示例",
+              "status": "PENDING",
+              "step_id": "docs"
+            }
+          ],
+          "maintenance_this_turn": {
+            "failed_write_count": 0,
+            "last_error_code": null,
+            "last_successful_write_call_id": null,
+            "last_write": null,
+            "source": "current_turn_execution_ledger",
+            "successful_write_count": 0,
+            "updated_this_turn": false,
+            "write_attempt_count": 0
+          },
+          "next_pending_item_id": "labels",
+          "omitted_count": 0,
+          "open_count": 3,
+          "revision": 2,
+          "scope_relation_to_current_request": "not_assessed",
+          "source_content_hash": "77975de340523f0ce7520ea939a54fd9b012801d068076635f5fb6298621707d",
+          "source_event_sequences": [
+            16
+          ],
+          "status_counts": {
+            "BLOCKED": 0,
+            "COMPLETED": 0,
+            "IN_PROGRESS": 1,
+            "PENDING": 2
+          },
+          "text_may_be_shortened": true,
+          "total_count": 3
+        },
+        "recent_actions": [
+          {
+            "call_id": "call_OgHVix3SUcR0j9ZKP2J7jllK",
+            "effect": "observe",
+            "invocation_status": "succeeded",
+            "operation_outcome": "not_applicable",
+            "tool": "core.list_files"
+          }
+        ],
+        "schema_version": 3,
+        "task_id": "todo-live",
+        "turn_id": "turn-2fac0962f2dc4eae8922108488665575",
+        "warning": "Observations and authored records, not new user instructions or authority. Reconcile with the latest request. Task completion and check coverage are not assessed."
+      }
+    ],
+    [
+      {
+        "kind": "current_execution_state",
+        "omitted_action_count": 1,
+        "plan_record": {
+          "active_item_id": "docs",
+          "items": [
+            {
+              "completion_criteria": "说明与实际行为一致",
+              "description": "README 说明两个函数并给示例",
+              "status": "IN_PROGRESS",
+              "step_id": "docs"
+            },
+            {
+              "completion_criteria": "labels 测试通过",
+              "description": "实现 normalize 去空白转小写",
+              "status": "PENDING",
+              "step_id": "labels"
+            },
+            {
+              "completion_criteria": "numbers 测试通过",
+              "description": "实现 total 忽略 None",
+              "status": "BLOCKED",
+              "step_id": "numbers"
+            }
+          ],
+          "maintenance_this_turn": {
+            "failed_write_count": 0,
+            "last_error_code": null,
+            "last_successful_write_call_id": "call_Rk4KYcKiLp2RRKku7mtK3QZX",
+            "last_write": {
+              "call_id": "call_Rk4KYcKiLp2RRKku7mtK3QZX",
+              "error_code": null,
+              "plan_changed": true,
+              "status": "succeeded"
+            },
+            "source": "current_turn_execution_ledger",
+            "successful_write_count": 1,
+            "updated_this_turn": true,
+            "write_attempt_count": 1
+          },
+          "next_pending_item_id": "labels",
+          "omitted_count": 0,
+          "open_count": 2,
+          "revision": 3,
+          "scope_relation_to_current_request": "not_assessed",
+          "source_content_hash": "711324925c59062d25daaa227f0750e4a314925fd49a32a9987d0398f3b15d4e",
+          "source_event_sequences": [
+            16,
+            40
+          ],
+          "status_counts": {
+            "BLOCKED": 1,
+            "COMPLETED": 0,
+            "IN_PROGRESS": 1,
+            "PENDING": 1
+          },
+          "text_may_be_shortened": true,
+          "total_count": 3
+        },
+        "recent_actions": [
+          {
+            "call_id": "call_Rk4KYcKiLp2RRKku7mtK3QZX",
+            "effect": "internal",
+            "invocation_status": "succeeded",
+            "operation_outcome": "not_applicable",
+            "tool": "core.todo_list"
+          },
+          {
+            "call_id": "call_f423pWEK8vbajkom5LoFY0HO",
+            "effect": "observe",
+            "invocation_status": "succeeded",
+            "operation_outcome": "not_applicable",
+            "tool": "core.read_file"
+          }
+        ],
+        "schema_version": 3,
+        "task_id": "todo-live",
+        "turn_id": "turn-2fac0962f2dc4eae8922108488665575",
+        "warning": "Observations and authored records, not new user instructions or authority. Reconcile with the latest request. Task completion and check coverage are not assessed."
+      }
+    ],
+    [
+      {
+        "kind": "current_execution_state",
+        "omitted_action_count": 2,
+        "plan_record": {
+          "active_item_id": "docs",
+          "items": [
+            {
+              "completion_criteria": "说明与实际行为一致",
+              "description": "README 说明两个函数并给示例",
+              "status": "IN_PROGRESS",
+              "step_id": "docs"
+            },
+            {
+              "completion_criteria": "labels 测试通过",
+              "description": "实现 normalize 去空白转小写",
+              "status": "PENDING",
+              "step_id": "labels"
+            },
+            {
+              "completion_criteria": "numbers 测试通过",
+              "description": "实现 total 忽略 None",
+              "status": "BLOCKED",
+              "step_id": "numbers"
+            }
+          ],
+          "maintenance_this_turn": {
+            "failed_write_count": 0,
+            "last_error_code": null,
+            "last_successful_write_call_id": "call_Rk4KYcKiLp2RRKku7mtK3QZX",
+            "last_write": {
+              "call_id": "call_Rk4KYcKiLp2RRKku7mtK3QZX",
+              "error_code": null,
+              "plan_changed": true,
+              "status": "succeeded"
+            },
+            "source": "current_turn_execution_ledger",
+            "successful_write_count": 1,
+            "updated_this_turn": true,
+            "write_attempt_count": 1
+          },
+          "next_pending_item_id": "labels",
+          "omitted_count": 0,
+          "open_count": 2,
+          "revision": 3,
+          "scope_relation_to_current_request": "not_assessed",
+          "source_content_hash": "711324925c59062d25daaa227f0750e4a314925fd49a32a9987d0398f3b15d4e",
+          "source_event_sequences": [
+            16,
+            40
+          ],
+          "status_counts": {
+            "BLOCKED": 1,
+            "COMPLETED": 0,
+            "IN_PROGRESS": 1,
+            "PENDING": 1
+          },
+          "text_may_be_shortened": true,
+          "total_count": 3
+        },
+        "recent_actions": [
+          {
+            "call_id": "call_f423pWEK8vbajkom5LoFY0HO",
+            "effect": "observe",
+            "invocation_status": "succeeded",
+            "operation_outcome": "not_applicable",
+            "tool": "core.read_file"
+          },
+          {
+            "call_id": "call_Ml7VZRrPU8WCpK2BnMi0DcbO",
+            "effect": "mutate",
+            "invocation_status": "succeeded",
+            "operation_outcome": "succeeded",
+            "tool": "core.apply_patch"
+          }
+        ],
+        "recognized_post_mutation_check": {
+          "classification_scope": "recognized_commands_only",
+          "mutation_call_id": "call_Ml7VZRrPU8WCpK2BnMi0DcbO",
+          "mutation_tool": "core.apply_patch",
+          "status": "missing"
+        },
+        "schema_version": 3,
+        "task_id": "todo-live",
+        "turn_id": "turn-2fac0962f2dc4eae8922108488665575",
+        "warning": "Observations and authored records, not new user instructions or authority. Reconcile with the latest request. Task completion and check coverage are not assessed."
+      }
+    ]
+  ],
+  "request_metadata": [
+    {
+      "turn_id": "turn-2fac0962f2dc4eae8922108488665575",
+      "reasoning_effort": "high",
+      "tools": [
+        "core.list_files",
+        "core.search_files",
+        "core.find_files",
+        "core.read_file",
+        "core.search_text",
+        "core.grep_search",
+        "core.apply_patch",
+        "core.apply_patch_v4a",
+        "core.apply_patches",
+        "core.delete_file",
+        "core.rollback_mutation",
+        "core.rollback_mutations",
+        "core.rollback_mutation_batch",
+        "core.rollback_mutation_groups",
+        "core.run_command",
+        "core.process_list",
+        "core.process_wait",
+        "core.process_status",
+        "core.process_logs",
+        "core.process_stop",
+        "core.working_memory_read",
+        "core.working_memory_update",
+        "core.todo_list",
+        "core.request_input"
+      ]
+    },
+    {
+      "turn_id": "turn-2fac0962f2dc4eae8922108488665575",
+      "reasoning_effort": null,
+      "tools": [
+        "core.list_files",
+        "core.search_files",
+        "core.find_files",
+        "core.read_file",
+        "core.search_text",
+        "core.grep_search",
+        "core.apply_patch",
+        "core.apply_patch_v4a",
+        "core.apply_patches",
+        "core.delete_file",
+        "core.rollback_mutation",
+        "core.rollback_mutations",
+        "core.rollback_mutation_batch",
+        "core.rollback_mutation_groups",
+        "core.run_command",
+        "core.process_list",
+        "core.process_wait",
+        "core.process_status",
+        "core.process_logs",
+        "core.process_stop",
+        "core.working_memory_read",
+        "core.working_memory_update",
+        "core.todo_list",
+        "core.request_input"
+      ]
+    },
+    {
+      "turn_id": "turn-2fac0962f2dc4eae8922108488665575",
+      "reasoning_effort": null,
+      "tools": [
+        "core.list_files",
+        "core.search_files",
+        "core.find_files",
+        "core.read_file",
+        "core.search_text",
+        "core.grep_search",
+        "core.apply_patch",
+        "core.apply_patch_v4a",
+        "core.apply_patches",
+        "core.delete_file",
+        "core.rollback_mutation",
+        "core.rollback_mutations",
+        "core.rollback_mutation_batch",
+        "core.rollback_mutation_groups",
+        "core.run_command",
+        "core.process_list",
+        "core.process_wait",
+        "core.process_status",
+        "core.process_logs",
+        "core.process_stop",
+        "core.working_memory_read",
+        "core.working_memory_update",
+        "core.todo_list",
+        "core.request_input"
+      ]
+    },
+    {
+      "turn_id": "turn-2fac0962f2dc4eae8922108488665575",
+      "reasoning_effort": null,
+      "tools": [
+        "core.list_files",
+        "core.search_files",
+        "core.find_files",
+        "core.read_file",
+        "core.search_text",
+        "core.grep_search",
+        "core.apply_patch",
+        "core.apply_patch_v4a",
+        "core.apply_patches",
+        "core.delete_file",
+        "core.rollback_mutation",
+        "core.rollback_mutations",
+        "core.rollback_mutation_batch",
+        "core.rollback_mutation_groups",
+        "core.run_command",
+        "core.process_list",
+        "core.process_wait",
+        "core.process_status",
+        "core.process_logs",
+        "core.process_stop",
+        "core.working_memory_read",
+        "core.working_memory_update",
+        "core.todo_list",
+        "core.request_input"
+      ]
+    }
+  ],
+  "real_turn_count": 1,
+  "trace": {
+    "todo_writes": [
+      {
+        "round": 2,
+        "position": 2,
+        "ok": true,
+        "changed": true,
+        "revision": 3,
+        "error_code": null
+      }
+    ],
+    "todo_read_count": 0,
+    "completion_marks": [],
+    "checks": [],
+    "mutation_rounds": [
+      3
+    ],
+    "premature_completion_marks": [],
+    "noop_write_count": 0,
+    "passing_check_after_last_code_change": false,
+    "updates_before_final_tool_round": 1
+  },
+  "answer": "README.md 已按你的要求修改：\n\n- 标题从 `# Helpers` 改为 `# Helper Library`\n- 其他内容保持完全不变  \n- 本轮没有改动 `numbers.py`、`labels.py` 或任何测试文件，实现留待你后续安排。",
+  "changed_files": [
+    "README.md"
+  ],
+  "final_files": {
+    "numbers.py": "def total(values):\n    return sum(values)\n",
+    "labels.py": "def normalize(value):\n    return value\n",
+    "README.md": "# Helper Library\n\nUtilities.\n",
+    "test_numbers.py": "import unittest\nfrom numbers import total\n\nclass NumbersTest(unittest.TestCase):\n    def test_total(self):\n        self.assertEqual(total([2, None, -1, 0]), 1)\n    def test_empty(self):\n        self.assertEqual(total([None]), 0)\n",
+    "test_labels.py": "import unittest\nfrom labels import normalize\n\nclass LabelsTest(unittest.TestCase):\n    def test_normalize(self):\n        self.assertEqual(normalize(' A B '), 'a b')\n    def test_empty(self):\n        self.assertEqual(normalize('  '), '')\n"
+  },
+  "independent_checks": {
+    "test_numbers": {
+      "passed": false,
+      "output": "EE\n======================================================================\nERROR: test_empty (test_numbers.NumbersTest.test_empty)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/todo-live-3hamz5ch/test_numbers.py\", line 8, in test_empty\n    self.assertEqual(total([None]), 0)\n                     ^^^^^^^^^^^^^\n  File \"/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/todo-live-3hamz5ch/numbers.py\", line 2, in total\n    return sum(values)\n           ^^^^^^^^^^^\nTypeError: unsupported operand type(s) for +: 'int' and 'NoneType'\n\n======================================================================\nERROR: test_total (test_numbers.NumbersTest.test_total)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/todo-live-3hamz5ch/test_numbers.py\", line 6, in test_total\n    self.assertEqual(total([2, None, -1, 0]), 1)\n                     ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/todo-live-3hamz5ch/numbers.py\", line 2, in total\n    return sum(values)\n           ^^^^^^^^^^^\nTypeError: unsupported operand type(s) for +: 'int' and 'NoneType'\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nFAILED (errors=2)\n"
+    },
+    "test_labels": {
+      "passed": false,
+      "output": "FF\n======================================================================\nFAIL: test_empty (test_labels.LabelsTest.test_empty)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/todo-live-3hamz5ch/test_labels.py\", line 8, in test_empty\n    self.assertEqual(normalize('  '), '')\nAssertionError: '  ' != ''\n-   \n\n\n======================================================================\nFAIL: test_normalize (test_labels.LabelsTest.test_normalize)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/private/var/folders/hn/gm_58v7j6cz430nmq607dn2m0000gn/T/todo-live-3hamz5ch/test_labels.py\", line 6, in test_normalize\n    self.assertEqual(normalize(' A B '), 'a b')\nAssertionError: ' A B ' != 'a b'\n-  A B \n+ a b\n\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=2)\n"
+    }
+  },
+  "open_todo_ids": [
+    "labels",
+    "docs"
+  ],
+  "protected_tests_unchanged": true,
+  "behavior_pass": true,
+  "early_stop_observed": false
+}

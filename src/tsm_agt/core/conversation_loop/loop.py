@@ -44,7 +44,6 @@ from tsm_agt.ports import (
     RuntimeUnitOfWork,
     TextBlock,
     ToolCall,
-    ToolCallBlock,
     ToolRecoveryKind,
     ToolResult,
     ToolResultBlock,
@@ -69,23 +68,19 @@ from ..agent_loop import (
 from ..approval import ApprovalNotPending
 from ..clarification import ClarificationNotPending
 from ..context import ContextWindowExceeded
+from ..context_messages import GENERATED_CONTEXT_PREFIXES
 from ..task import TaskKind, TaskSnapshot, TaskState
 from ..turn import InvalidModelResponse, InvalidTurnState, ModelInvocationFailed
 from .finalizer import ITERATION_BUDGET_EXHAUSTED, ConversationFinalizer
 from .finalization import ConversationFinalizationPipeline
 from .prompt import assemble_stable_prompt, latest_tool_result_instruction
 from .state import build_turn_state
+from .execution_context import project_execution_context
 
 
 #: Message-id prefixes the Runtime re-projects on every model call. They are
 #: dropped and rebuilt so a stale context projection is never sent twice.
-_GENERATED_CONTEXT_PREFIXES = (
-    "project-instructions-context-", "task-spec-context-",
-    "conversation-environment-context-",
-    "project-onboarding-context-", "project-memory-context-",
-    "session-context-", "document-references-context-",
-    "working-memory-context-",
-)
+_GENERATED_CONTEXT_PREFIXES = GENERATED_CONTEXT_PREFIXES
 
 #: Runtime-owned outcome bookkeeping is never exposed as a model tool.
 _NON_MODEL_TOOLS = frozenset({"core.task_outcome_complete"})
@@ -492,55 +487,28 @@ class ConversationAgentLoop:
                 state, response, len(parsed_calls)
             )
             if parsed_calls:
-                previous = state.messages[:-1]
-                prior_assistant_index = next(
-                    (i for i in range(len(previous) - 1, -1, -1)
-                     if previous[i].role is MessageRole.ASSISTANT), None,
-                )
-                recent = previous[prior_assistant_index + 1:] if prior_assistant_index is not None else ()
-                results = [block.result for message in recent if message.role is MessageRole.TOOL
-                           for block in message.content if isinstance(block, ToolResultBlock)]
-                follows_tool_result = bool(results)
-                note = "\n".join(
+                commentary = "\n".join(
                     block.text.strip() for block in response.message.content
                     if isinstance(block, TextBlock) and block.text.strip()
                 )
-                note_source = "model"
-                if follows_tool_result and not note:
-                    note_source = "runtime"
-                    calls_by_id = {
-                        block.call.call_id: block.call.name
-                        for block in previous[prior_assistant_index].content
-                        if isinstance(block, ToolCallBlock)
-                    }
-                    outcomes = [
-                        f"{calls_by_id.get(result.call_id, '工具')}"
-                        + ("执行成功" if result.ok else "执行失败")
-                        + (f"（{result.error_code}）" if result.error_code else "")
-                        for result in results
-                    ]
-                    next_tools = "、".join(call.name for call in parsed_calls)
-                    note = f"{'；'.join(outcomes)}。接下来调用 {next_tools}。"
-                if note:
-                    event_name = (
-                        "conversation.stage_summary" if follows_tool_result
-                        else "conversation.execution_note"
-                    )
-                    progress_kind = (
-                        AgentProgressKind.STAGE_SUMMARY if follows_tool_result
-                        else AgentProgressKind.EXECUTION_NOTE
-                    )
+                # This is a display boundary, not an intent classifier.  A
+                # commentary is a model-authored text block paired with a tool
+                # proposal. Runtime emits no prose when it is absent, never
+                # summarizes tool outcomes, and does not infer stage boundaries.
+                if commentary:
                     await kernel._append_events(state.task_id, ((
-                        event_name, {
+                        "conversation.commentary", {
                             "turn_id": state.turn_id,
                             "model_call": state.model_call_count,
-                            "text": note,
-                            "source": note_source,
+                            "text": commentary,
+                            "source": "model",
                         },
                     ),))
                     kernel._notify_agent_progress(state.on_progress, AgentProgress(
-                        progress_kind,
-                        model_call=state.model_call_count, activity=note, phase=note_source,
+                        AgentProgressKind.COMMENTARY,
+                        model_call=state.model_call_count,
+                        activity=commentary,
+                        phase="model",
                     ))
             if not parsed_calls:
                 candidate = await self._finalization.build_candidate(state, response)
@@ -829,9 +797,14 @@ class ConversationAgentLoop:
             if not message.message_id.startswith(_GENERATED_CONTEXT_PREFIXES)
         ]
         state.messages.extend(await kernel._project_context_messages(state.task_id))
+        task = await kernel.get_task(state.task_id)
+        state.messages = list(project_execution_context(
+            state.messages, task_id=state.task_id, turn_id=state.turn_id,
+            tool_specs=state.visible_tool_by_name,
+            executions=tuple(task.tool_executions.values()),
+        ))
         state.checkpoint = replace(state.checkpoint, messages=tuple(state.messages))
         source_user = kernel._source_user_message(state.checkpoint.messages)
-        task = await kernel.get_task(state.task_id)
         model_tools = select_model_tools(
             state.visible_tools,
             user_text=source_user.text if source_user is not None else "",
@@ -849,12 +822,13 @@ class ConversationAgentLoop:
                 context_window=kernel._dependencies.model.capabilities.context_window,
                 max_output_tokens=state.checkpoint.max_output_tokens,
                 runtime_instruction=runtime_instruction,
+                read_reuse_task_id=state.task_id,
             )
         except ContextWindowExceeded as error:
             await kernel._record_turn_failure(state.task_id, state.turn_id, error)
             raise ModelInvocationFailed(state.turn_id, str(error)) from error
         if prepared.compaction is not None:
-            state.messages = list(prepared.messages)
+            state.messages = list(prepared.canonical_messages)
             await kernel._append_events(state.task_id, (("context.compacted", {
                 "turn_id": state.turn_id,
                 "model_call": model_call,
@@ -864,6 +838,11 @@ class ConversationAgentLoop:
             await kernel._save_agent_checkpoint(
                 state.checkpoint, "conversation-loop-context-compacted"
             )
+        if prepared.read_reuse is not None and prepared.read_reuse.references:
+            await kernel._append_events(state.task_id, (("context.read_results_reused", {
+                "turn_id": state.turn_id, "model_call": model_call,
+                **prepared.read_reuse.event_data(),
+            }),))
         prompt = assemble_stable_prompt(
             kernel._dependencies.prompt_template,
             prepared.messages,

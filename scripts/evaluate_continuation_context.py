@@ -258,7 +258,7 @@ async def evaluate(args):
                 result = await app.kernel.run_agent_turn(
                     task.task_id, current, max_model_calls=16, max_tool_calls=45, max_output_tokens=8192,
                     on_progress=lambda item: progress.append({"kind": item.kind.value, "text": item.activity})
-                    if item.kind.value in {"execution_note", "stage_summary"} else None,
+                    if item.kind.value == "commentary" else None,
                 )
                 while isinstance(result, AgentTurnSuspended):
                     call = (await app.kernel.get_task(task.task_id)).pending_approval.call

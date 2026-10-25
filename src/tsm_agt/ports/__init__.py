@@ -18,6 +18,7 @@ from .conclusion import (
     FactReference,
 )
 from .model import (
+    AssistantMessagePhase,
     ConclusionBlock,
     ConclusionProtocolMode,
     FinishReason,
@@ -75,6 +76,7 @@ from .process import (
     ProcessStartError,
     process_result_succeeded,
 )
+from .mcp import MCPClient, MCPClientFactory, MCPClientManager, MCPServerConfig
 from .sandbox import SandboxDecision, SandboxPort, SandboxRequest
 from .cross_process_lock import CrossProcessLockPort
 from .workspace_filesystem import WorkspaceFilesystemPort
@@ -246,6 +248,7 @@ __all__ = [
     "Message",
     "MessageBlock",
     "MessageRole",
+    "AssistantMessagePhase",
     "SCAFFOLDING_KINDS",
     "ModelProviderPort",
     "ModelRequest",
@@ -269,6 +272,10 @@ __all__ = [
     "BackgroundProcessStartResult",
     "ProcessCommandResult",
     "ProcessStartError",
+    "MCPClient",
+    "MCPClientFactory",
+    "MCPClientManager",
+    "MCPServerConfig",
     "ProcessWaitResult",
     "ProcessEnvironmentPolicy",
     "ProcessExecutorPort",

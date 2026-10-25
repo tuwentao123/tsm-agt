@@ -184,6 +184,55 @@ class TodoToolProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.error_code, "INVALID_PARAM")
 
+    async def test_changes_noops_and_conflicts_have_distinct_observations(self) -> None:
+        created = await self._call({
+            "todos": [_item("a", "in_progress"), _item("b")],
+            "expected_revision": 1, "operation_id": "create",
+        })
+        self.assertTrue(created.meta["plan_changed"])
+        advanced = await self._call({
+            "todos": [{"id": "a", "status": "completed"},
+                      {"id": "b", "status": "in_progress"}],
+            "merge": True, "expected_revision": created.data["revision"],
+            "operation_id": "advance-without-preread",
+        })
+        self.assertTrue(advanced.meta["plan_changed"])
+        unchanged = await self._call({
+            "todos": [{"id": "b", "status": "in_progress"}],
+            "merge": True, "expected_revision": advanced.data["revision"],
+            "operation_id": "noop",
+        })
+        self.assertFalse(unchanged.meta["plan_changed"])
+        self.assertEqual(unchanged.data["revision"], advanced.data["revision"])
+        stale = await self._call({
+            "todos": [{"id": "b", "status": "completed"}],
+            "merge": True, "expected_revision": 1, "operation_id": "stale",
+        })
+        self.assertFalse(stale.ok)
+        self.assertIn("revision conflict", stale.message)
+        self.assertNotIn("plan_changed", stale.meta)
+        self.assertFalse((await self._call({})).meta["plan_changed"])
+
+    async def test_working_memory_notes_are_not_reported_as_plan_progress(self) -> None:
+        from tsm_agt.adapters.builtin.working_memory_tools import CoreWorkingMemoryToolProvider
+
+        provider = CoreWorkingMemoryToolProvider()
+        await provider.start(AdapterContext(config={}, emit_event=lambda *args: None))
+        for index, (plan, changed) in enumerate((
+            ([], False),
+            ([{"step_id": "a", "description": "Implement", "status": "PENDING",
+               "completion_criteria": "Appropriate check passes"}], True),
+        ), 1):
+            state = deepcopy(self.control.state)
+            state["facts"] = [f"Note {index}"]
+            state["plan"] = plan
+            result = await provider.invoke(ToolCall(f"wm-{index}", "core.working_memory_update", {
+                "state": state, "expected_revision": self.control.state["revision"],
+                "operation_id": f"wm-{index}",
+            }), self._context(self.control))
+            self.assertTrue(result.ok)
+            self.assertIs(result.meta["plan_changed"], changed)
+
     async def test_missing_working_memory_control_is_unavailable(self) -> None:
         result = await self.provider.invoke(
             ToolCall(call_id="c1", name="core.todo_list", arguments={}),

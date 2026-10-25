@@ -28,7 +28,7 @@ def call(call_id: str, name: str = "core.search_text") -> ToolCall:
         if name == "core.search_text" else {"path": "src/pivot.py"}
     )
     return ToolCall(
-        call_id, name, args, EvidenceQuestion("Q-pivot", "Where is PivotTarget?")
+        call_id, name, args, None
     )
 
 
@@ -61,13 +61,24 @@ class RuleBasedStopOrPivotPolicyTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             await self._action(plan_finished=True),
-            StopOrPivotAction.SUMMARIZE_WITH_EVIDENCE,
+            StopOrPivotAction.CONTINUE,
         )
         self.assertEqual(
             await self._action(plan_should_stop=True),
             StopOrPivotAction.STOP_NO_PROGRESS,
         )
         self.assertEqual(await self._action(), StopOrPivotAction.CONTINUE)
+
+    async def test_closed_plan_does_not_override_real_stop_signals(self):
+        for signals, reason in (
+            (StopOrPivotSignals(plan_finished=True, plan_should_stop=True,
+                                consecutive_no_progress=3), "plan_no_progress"),
+            (StopOrPivotSignals(plan_finished=True, budget_wrap_up=True,
+                                budget_reason="tool_budget_exhausted"), "tool_budget_exhausted"),
+        ):
+            update = await self.policy.decide(call("stop"), signals, StopOrPivotState())
+            self.assertTrue(update.decision.terminal)
+            self.assertEqual(update.decision.reason, reason)
 
     async def test_low_value_requires_method_change_then_stops_same_method(self):
         signals = StopOrPivotSignals(
@@ -175,7 +186,6 @@ class StopOrPivotKernelTest(unittest.IsolatedAsyncioTestCase):
             app = compose_fixture_application(
                 model_adapter=ChangeMethodModel(), tool_adapters=(tool,),
                 store_adapter=SQLiteRuntimeStore(database),
-                require_evidence_questions=True,
                 evidence_delta_evaluator_adapter=StructuredEvidenceDeltaEvaluator(),
                 semantic_action_classifier_adapter=RuleBasedSemanticActionClassifier(),
                 exploration_budget_policy_adapter=RuleBasedExplorationBudgetPolicy(),
@@ -225,21 +235,13 @@ class StopOrPivotKernelTest(unittest.IsolatedAsyncioTestCase):
                 ])
                 self.assertNotIn("PivotTarget", payload)
                 self.assertNotIn("src/pivot.py", payload)
-                questions = await app.kernel.get_evidence_questions(task.task_id)
-                self.assertFalse(any(
-                    record.status.value in {"OPEN", "BLOCKED"}
-                    for record in questions.records
-                ))
                 disposed = [
                     event for event in events
                     if event.event_type == "tool.action_disposed"
                 ]
-                self.assertEqual(len(disposed), 1)
-                self.assertEqual(disposed[0].payload["disposition"], "REPLACE")
-                self.assertEqual(
-                    disposed[0].payload["reason"],
-                    "exploration_change_method_required",
-                )
+                # The model-facing correction remains in its tool result;
+                # no legacy outcome-disposal event is required.
+                self.assertFalse(disposed)
             finally:
                 await app.registry.stop_all()
 

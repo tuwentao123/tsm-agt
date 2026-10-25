@@ -161,7 +161,15 @@ class ProcessCommandResult:
         return self.result.succeeded
 
     def to_data(self) -> dict[str, object]:
-        return {"mode": "foreground", **self.result.to_data()}
+        # Foreground execution has already collected both streams.  This must
+        # be explicit: an empty stream is an observed fact, whereas a missing
+        # ``output_observed`` flag used to make the next model turn issue a
+        # redundant log read (or, worse, reason without the traceback).
+        return {
+            "mode": "foreground",
+            "output_observed": True,
+            **self.result.to_data(),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,7 +178,9 @@ class BackgroundProcessStartResult:
 
     ``core.run_command`` always returns this start fact.  A process may exit
     between ``start_process`` and the Runtime's first non-blocking poll, so
-    ``state`` is deliberately not restricted to ``RUNNING``.
+    ``state`` is deliberately not restricted to ``RUNNING``. When that first
+    poll observes terminal completion, ``output`` is the same execution
+    observation rather than a second model-requested log read.
     """
 
     process_id: str
@@ -182,6 +192,7 @@ class BackgroundProcessStartResult:
     exit_code: int | None = None
     termination_signal: str | None = None
     finished_at: datetime | None = None
+    output: ProcessLogs | None = None
 
     @property
     def started(self) -> bool:
@@ -197,13 +208,43 @@ class BackgroundProcessStartResult:
             return "succeeded"
         return "failed_known"
 
-    def to_data(self) -> dict[str, object]:
+    @property
+    def status(self) -> ProcessExitStatus | None:
         return {
-            "mode": "managed",
+            "EXITED": ProcessExitStatus.EXITED,
+            "CANCELLED": ProcessExitStatus.CANCELLED,
+            "TIMED_OUT": ProcessExitStatus.TIMED_OUT,
+        }.get(self.state)
+
+    @property
+    def succeeded(self) -> bool | None:
+        if self.status is None:
+            return None
+        return self.status is ProcessExitStatus.EXITED and self.exit_code == 0
+
+    @property
+    def failure_code(self) -> str | None:
+        if self.succeeded is not False:
+            return None
+        if self.status is ProcessExitStatus.TIMED_OUT:
+            return "PROCESS_TIMED_OUT"
+        if self.status is ProcessExitStatus.CANCELLED:
+            return "PROCESS_CANCELLED"
+        return "PROCESS_EXIT_NON_ZERO"
+
+    def to_data(self) -> dict[str, object]:
+        data: dict[str, object] = {
+            # ``managed`` described ownership, not execution behavior.  The
+            # model needs the latter to distinguish an intentionally long
+            # service from a command whose terminal outcome is still unknown.
+            "mode": "background",
             "execution_state": self.execution_state,
             "started": self.started,
             "process_id": self.process_id,
             "state": self.state,
+            "succeeded": self.succeeded,
+            "failure_code": self.failure_code,
+            "status": self.status.value if self.status is not None else None,
             "started_at": self.started_at.isoformat(),
             "deadline_at": self.deadline_at.isoformat(),
             "max_lifetime_seconds": self.max_lifetime_seconds,
@@ -214,6 +255,30 @@ class BackgroundProcessStartResult:
                 self.finished_at.isoformat() if self.finished_at else None
             ),
         }
+        if self.output is not None:
+            data.update({
+                "output_observed": True,
+                "stdout": {
+                    "text": self.output.stdout.text,
+                    "cursor": self.output.stdout.cursor,
+                    "next_cursor": self.output.stdout.next_cursor,
+                    "total_bytes": self.output.stdout.total_bytes,
+                    "truncated": self.output.stdout.truncated,
+                },
+                "stderr": {
+                    "text": self.output.stderr.text,
+                    "cursor": self.output.stderr.cursor,
+                    "next_cursor": self.output.stderr.next_cursor,
+                    "total_bytes": self.output.stderr.total_bytes,
+                    "truncated": self.output.stderr.truncated,
+                },
+            })
+        else:
+            # ``False`` is distinct from empty stdout/stderr: the latter is
+            # an observed fact, while the former means this result could not
+            # materialize retained output.
+            data["output_observed"] = False
+        return data
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +318,7 @@ class ProcessWaitResult:
             }
             data["state"] = self.state
         data["waited_seconds"] = self.waited_seconds
+        data["output_observed"] = True
         return data
 
 

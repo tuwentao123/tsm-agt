@@ -1,0 +1,8 @@
+{
+  "web_pid": 11342,
+  "command": "/Users/tusima/Documents/学习/tsm-agt/.venv/bin/python -m uvicorn tsm_agt.web.app:app --host 127.0.0.1 --port 8080 --log-level info",
+  "python_lookup_in_service_path": null,
+  "python3_lookup_in_service_path": "/opt/homebrew/bin/python3",
+  "project_venv_bin_on_service_path": false,
+  "path_available": true
+}

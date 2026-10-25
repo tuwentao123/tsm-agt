@@ -7,7 +7,7 @@ from tsm_agt.adapters.openai_compatible.responses import OpenAIResponsesModelPro
 from tsm_agt.adapters.openai_compatible.model import OpenAICompatibleProviderError
 from tsm_agt.adapters.resilient_model import ResilientModelProvider
 from tsm_agt.adapters.rule_based_model_recovery import RuleBasedModelRecoveryPolicy
-from tsm_agt.ports import (AdapterContext, Message, MessageRole, ModelRequest,
+from tsm_agt.ports import (AdapterContext, AssistantMessagePhase, Message, MessageRole, ModelRequest,
                            ModelReasoningDelta, ModelStreamCompleted, TextBlock,
                            ToolEffect, ToolIdempotency, ToolResult, ToolResultBlock,
                            ToolRisk, ToolSpec)
@@ -31,7 +31,7 @@ async def _responses_reasoning_and_tool_result_roundtrip():
     transport = Transport([
         {"type": "response.reasoning_summary_text.delta", "delta": "thinking"},
         {"type": "response.output_item.done", "item": reasoning},
-        {"type": "response.completed", "response": {"status": "completed", "id": "resp_1", "output": [{"id": "rs_1", "type": "reasoning", "summary": []}, {"type": "function_call", "call_id": "call_1", "name": "core__read_file", "arguments": '{"path":"a"}'}], "usage": {"input_tokens": 1, "output_tokens": 2}}},
+        {"type": "response.completed", "response": {"status": "completed", "id": "resp_1", "output": [{"id": "rs_1", "type": "reasoning", "summary": []}, {"id": "msg_1", "type": "message", "role": "assistant", "phase": "commentary", "content": [{"type": "output_text", "text": "我会先读取文件。"}]}, {"type": "function_call", "call_id": "call_1", "name": "core__read_file", "arguments": '{"path":"a"}'}], "usage": {"input_tokens": 1, "output_tokens": 2}}},
     ])
     provider = OpenAIResponsesModelProvider("https://example.test/v1", "model", "secret", transport=transport)
     await provider.start(AdapterContext({}, lambda *_: None))
@@ -43,11 +43,16 @@ async def _responses_reasoning_and_tool_result_roundtrip():
     assert isinstance(events[-1], ModelStreamCompleted)
     message = events[-1].response.message
     assert isinstance(message.content[0], ReasoningBlock)
+    assert message.phase is AssistantMessagePhase.COMMENTARY
     result = ToolResult("call_1", True, {"text": "x"})
     continuation = ModelRequest("turn", (user, message, Message("t", MessageRole.TOOL, (ToolResultBlock(result),))), tools=(tool,))
     payload, _ = provider._responses_payload(continuation)
     assert payload["reasoning"]["summary"] == "auto"
     assert reasoning in payload["input"]
+    assert any(
+        item.get("role") == "assistant" and item.get("phase") == "commentary"
+        for item in payload["input"]
+    )
     assert any(item.get("type") == "function_call" for item in payload["input"])
     assert any(item.get("type") == "function_call_output" and item["call_id"] == "call_1" for item in payload["input"])
 

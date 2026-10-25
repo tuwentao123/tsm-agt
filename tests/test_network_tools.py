@@ -418,6 +418,23 @@ class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.registry.stop_all()
 
+    async def test_search_contract_routes_local_engineering_work_to_local_evidence(self):
+        """The model contract expresses routing; policy still permits web search."""
+        search = next(
+            tool for tool in await self.provider.list_tools()
+            if tool.name == "web.search"
+        )
+
+        assert search.model_contract is not None
+        self.assertIn(
+            "task and repository evidence cannot answer",
+            search.model_contract.use_when[0],
+        )
+        self.assertIn(
+            "implementation, validation, diagnosis, or recovery",
+            search.model_contract.avoid_when[0],
+        )
+
 
 def _rss_item(title, link, pub_date):
     return (

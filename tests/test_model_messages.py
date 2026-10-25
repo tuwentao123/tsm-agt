@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from tsm_agt.ports import (
+    AssistantMessagePhase,
     Message,
     MessageRole,
     TextBlock,
@@ -48,6 +49,22 @@ class ModelMessageTest(unittest.TestCase):
         self.assertEqual(message.text, "checking")
         self.assertEqual(message.to_data()["content"][1]["type"], "tool_call")
         self.assertEqual(message.to_data()["content"][2]["type"], "tool_result")
+
+    def test_assistant_phase_round_trips_and_is_assistant_only(self) -> None:
+        message = Message(
+            message_id="msg-commentary",
+            role=MessageRole.ASSISTANT,
+            content=(TextBlock("我会先检查配置。"),),
+            phase=AssistantMessagePhase.COMMENTARY,
+        )
+
+        self.assertEqual(message.to_data()["phase"], "commentary")
+        self.assertEqual(Message.from_data(message.to_data()), message)
+        with self.assertRaisesRegex(ValueError, "only assistant messages"):
+            Message(
+                "not-assistant", MessageRole.USER, (TextBlock("hi"),),
+                phase=AssistantMessagePhase.COMMENTARY,
+            )
 
 
 if __name__ == "__main__":

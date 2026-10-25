@@ -1077,8 +1077,16 @@ class NetworkToolProvider:
             result_authority=ToolResultAuthority.EXTERNAL_SERVICE,
             model_contract=ModelToolContract(
                 purpose="Find public-web documents that may answer a question.",
-                use_when=("a current or external source must be located",),
-                avoid_when=("you need to claim document details from a result snippet; open or fetch the relevant result first",),
+                use_when=(
+                    "a current or external source must be located after available "
+                    "task and repository evidence cannot answer the needed question",
+                ),
+                avoid_when=(
+                    "the requested implementation, validation, diagnosis, or recovery "
+                    "can be grounded in current execution facts or workspace material",
+                    "you need to claim document details from a result snippet; open or "
+                    "fetch the relevant result first",
+                ),
                 returns=("search-result leads with URLs/ref_ids and optional publish times", "no document content is materialized"),
             ),
         ),

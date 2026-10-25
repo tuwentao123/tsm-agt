@@ -1,0 +1,88 @@
+{
+  "turn_id": "turn-bea45e99439d42b2a1beb9964328771f",
+  "replay_scope": "pure in-memory matching against the committed mutation backup; no user file, task, or session state changed",
+  "file": "src/tsm_agt/bootstrap/composition.py",
+  "read_windows": [
+    {
+      "sequence": 8751,
+      "start_line": 1,
+      "end_line": 191,
+      "sha256": "8352e109c1e76b3662e78efc7f73c9e41839ab2ebb186184c595adec1a2d8f0b",
+      "truncated": true,
+      "next_cursor": {
+        "start_column": 1,
+        "start_line": 192
+      }
+    },
+    {
+      "sequence": 8885,
+      "start_line": 192,
+      "end_line": 251,
+      "sha256": "8352e109c1e76b3662e78efc7f73c9e41839ab2ebb186184c595adec1a2d8f0b",
+      "truncated": true,
+      "next_cursor": {
+        "start_column": 1,
+        "start_line": 252
+      }
+    }
+  ],
+  "snapshot_sha256": "8352e109c1e76b3662e78efc7f73c9e41839ab2ebb186184c595adec1a2d8f0b",
+  "hash_matches_both_patch_requests": true,
+  "first_call": {
+    "call_id": "call_H1xm4jy76GzxtEl27pthYaMo",
+    "result": "PATCH_CONFLICT",
+    "diagnostics_identical_to_historical_result": true,
+    "conflict": {
+      "path": "src/tsm_agt/bootstrap/composition.py",
+      "hunk_number": 5,
+      "patch_line_number": 23,
+      "patch_line_kind": "context",
+      "patch_marker": " ",
+      "match_side": "old_file",
+      "expected_context": "            \"invalid TSM_AGT_ENABLE_MCP_TOOLS value: expected one of \"",
+      "expected_context_truncated": false,
+      "actual_line": "        \"TSM_AGT_ENABLE_MCP_TOOLS must be one of '', '1', 'true', 'yes', 'on', \"",
+      "actual_line_truncated": false,
+      "actual_line_number": 205,
+      "actual_line_at_eof": false,
+      "actual_location_basis": "partial_hunk_match",
+      "snapshot_sha256": "8352e109c1e76b3662e78efc7f73c9e41839ab2ebb186184c595adec1a2d8f0b",
+      "search_start_line": 191,
+      "candidate_locations": [
+        {
+          "match_kind": "after_matched_context",
+          "line_number": 205,
+          "start_line": 203,
+          "end_line": 207,
+          "content": "        return False\n    raise ValueError(\n        \"TSM_AGT_ENABLE_MCP_TOOLS must be one of '', '1', 'true', 'yes', 'on', \"\n        \"'0', 'false', 'no', or 'off'\"\n    )",
+          "content_truncated": false
+        }
+      ],
+      "candidates_are_suggestions": true,
+      "diagnostics_scope": "first_conflict",
+      "hunk_changes_content": true
+    }
+  },
+  "corrected_call": {
+    "call_id": "call_BUNMFdm7JBOFzejrfZ8vxfsV",
+    "result": "success",
+    "rendered_sha256": "bb1ff7d50307e5d3649900244a51644f8547eee1ab587643dd1472dde0fbc746",
+    "matches_historical_committed_sha256": true,
+    "patch_matches": [
+      {
+        "hunk_number": 1,
+        "strategy": "exact",
+        "start_line": 103,
+        "end_line": 104,
+        "approximate": false
+      },
+      {
+        "hunk_number": 3,
+        "strategy": "exact",
+        "start_line": 198,
+        "end_line": 207,
+        "approximate": false
+      }
+    ]
+  }
+}

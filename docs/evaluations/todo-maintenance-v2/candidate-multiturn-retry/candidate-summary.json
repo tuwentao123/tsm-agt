@@ -1,0 +1,16 @@
+{
+  "label": "candidate",
+  "runs": 1,
+  "valid_runs": 1,
+  "behavior_passes": 1,
+  "results": [
+    {
+      "case": "multi_turn",
+      "mode": "candidate",
+      "sample": 1,
+      "valid_run": true,
+      "behavior_pass": true,
+      "error_type": null
+    }
+  ]
+}

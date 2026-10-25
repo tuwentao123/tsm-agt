@@ -6,7 +6,7 @@ import inspect
 import json
 from datetime import datetime
 
-from tsm_agt.adapters.local_skills import UserSkillsStore
+from tsm_agt.ports.skill_files import SkillFilesPort
 from tsm_agt.core.skills import SkillKind, SkillRegistry
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ToolCall,
@@ -21,7 +21,7 @@ class CoreSkillToolProvider:
         capabilities=frozenset({"skill.load", "skill.installation_finish"}),
     )
 
-    def __init__(self, registry: SkillRegistry, store: UserSkillsStore, runtime_store=None) -> None:
+    def __init__(self, registry: SkillRegistry, store: SkillFilesPort, runtime_store=None) -> None:
         self.registry = registry
         self.store = store
         self.runtime_store = runtime_store

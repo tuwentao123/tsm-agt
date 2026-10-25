@@ -121,10 +121,8 @@ class SessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
             task_id = result.result["task"]["task_id"]
             events = await client.application.kernel.dependencies.store.read_events(task_id)
             created = next(event for event in events if event.event_type == "task.created")
-            self.assertEqual(created.payload["source_task_id"], source.task_id)
-            self.assertEqual(
-                created.payload["task_relation"], SessionTaskRelation.FOLLOW_UP.value
-            )
+            self.assertIsNone(created.payload["source_task_id"])
+            self.assertEqual((await client.application.kernel.get_task(task_id)).goal, "also cover the edge case")
 
     async def test_follow_up_history_shows_the_user_text_not_the_derived_goal(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -196,14 +194,15 @@ class SessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
             result = await client.submit_session_text(
                 session.session_id, "那个再改一下", command_id="request-clarify",
             )
-            self.assertEqual(result.result["kind"], "clarify")
+            self.assertEqual(result.result["kind"], "task")
+            await client.wait_task(result.result["task"]["task_id"], timeout=5)
 
-            # A clarification creates no Task, so only a conversation record can
-            # keep the exchange visible once the browser state is gone.
+            # Clarification content is now produced by the conversation model,
+            # not by the deprecated pre-turn route resolver.
             projection = await kernel.get_session_conversation(session.session_id)
             texts = [item.text for item in projection.messages]
             self.assertIn("那个再改一下", texts)
-            self.assertIn("指的是哪一项？", texts)
+            self.assertNotIn("指的是哪一项？", texts)
 
     async def test_input_survives_a_task_that_never_records_a_result(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -270,12 +269,7 @@ class SessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
 
             new_task_id = result.result["task"]["task_id"]
             self.assertNotEqual(new_task_id, source.task_id)
-            self.assertEqual(
-                result.result["decision"]["disposition"], "CREATE_TASK"
-            )
-            self.assertEqual(
-                result.result["decision"]["relation"], "FOLLOW_UP"
-            )
+            self.assertEqual(result.result["decision"]["binding_kind"], "NEW")
             created_events = await kernel.dependencies.store.read_events(
                 new_task_id
             )
@@ -283,32 +277,19 @@ class SessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
                 event for event in created_events
                 if event.event_type == "task.created"
             )
-            self.assertEqual(created.payload["source_task_id"], source.task_id)
-            self.assertEqual(created.payload["task_relation"], "FOLLOW_UP")
+            self.assertIsNone(created.payload["source_task_id"])
+            self.assertEqual(created.payload["task_relation"], "INDEPENDENT")
             self.assertEqual(created.payload["goal"], "continue and push now")
             # The source is named only in the non-authoritative handoff.
             self.assertNotIn(source.task_id, created.payload["goal"])
-            self.assertEqual(
-                created.payload["context_handoff"]["task_id"], source.task_id
-            )
-            self.assertEqual(
-                created.payload["context_handoff"]["authority"],
-                "SCOPED_BACKGROUND",
-            )
+            self.assertFalse(created.payload.get("context_handoff"))
             original = await kernel.get_task(source.task_id)
             self.assertEqual(original.state, TaskState.SUCCEEDED)
             self.assertIsNone(original.active_agent_checkpoint)
             session_events = await kernel.dependencies.store.read_session_events(
                 session.session_id
             )
-            derived = next(
-                event for event in session_events
-                if event.event_type == "session.task_derived"
-                and event.payload["task_id"] == new_task_id
-            )
-            self.assertIn("authority_free_session_summary", derived.payload["inherited"])
-            self.assertIn("checkpoint", derived.payload["not_inherited"])
-            self.assertIn("approval", derived.payload["not_inherited"])
+            self.assertFalse(any(event.event_type == "session.task_derived" for event in session_events))
 
     async def test_answer_and_clarify_do_not_create_tasks(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -363,14 +344,13 @@ class SessionTextFacadeTest(unittest.IsolatedAsyncioTestCase):
                 session.session_id, "and that one?", command_id="request-clarify"
             )
 
-            self.assertEqual(answer.result["kind"], "answer")
-            self.assertEqual(clarify.result["kind"], "clarify")
-            self.assertEqual(clarify.result["clarification"], "Which completed task do you mean?")
+            self.assertEqual(answer.result["kind"], "task")
+            self.assertEqual(clarify.result["kind"], "task")
+            self.assertIsNone(clarify.result.get("clarification"))
             tasks = await client.application.kernel.list_session_tasks(session.session_id)
-            self.assertEqual(
-                [task.task_id for task in tasks],
-                [history.task_id, other_history.task_id],
-            )
+            self.assertTrue({history.task_id, other_history.task_id}.issubset({task.task_id for task in tasks}))
+            self.assertIn(answer.result["task"]["task_id"], {task.task_id for task in tasks})
+            self.assertIn(clarify.result["task"]["task_id"], {task.task_id for task in tasks})
 
 
 if __name__ == "__main__":

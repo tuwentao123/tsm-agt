@@ -22,7 +22,7 @@ from tsm_agt.ports import (
 
 
 class EchoModelProvider:
-    capabilities = ProviderCapabilities(context_window=4096)
+    capabilities = ProviderCapabilities(context_window=16384)
     descriptor = AdapterDescriptor(
         adapter_id="fixture.echo-model",
         adapter_version="0.1.0",
@@ -72,7 +72,7 @@ class ToolCallingModelProvider(EchoModelProvider):
         port_version="1.0",
         capabilities=frozenset({"text", "tools"}),
     )
-    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+    capabilities = ProviderCapabilities(tools=True, context_window=16384)
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         if not self._started:

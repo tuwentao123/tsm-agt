@@ -14,6 +14,8 @@ from tsm_agt.ports import (
 
 from .configuration import canonical_hash
 from .prompt import PromptTemplate
+from .context_messages import is_execution_context
+from .read_result_reuse import ReadReuseStats, project_read_results
 from .session_history import MANAGED_HISTORY_BUDGETS, compact_history_body, history_turn_groups
 
 
@@ -120,6 +122,13 @@ class PreparedContext:
     messages: tuple[Message, ...]
     budget: ContextBudget
     compaction: ContextCompactionReceipt | None = None
+    # Canonical retained results stay recoverable; messages is the model view.
+    retained_messages: tuple[Message, ...] | None = None
+    read_reuse: ReadReuseStats | None = None
+
+    @property
+    def canonical_messages(self) -> tuple[Message, ...]:
+        return self.messages if self.retained_messages is None else self.retained_messages
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,12 +182,14 @@ class ContextWindowManager:
         prompt_template: PromptTemplate, context_window: int,
         max_output_tokens: int,
         runtime_instruction: str | None = None,
+        read_reuse_task_id: str | None = None,
     ) -> PreparedContext:
         if max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
         if context_window <= 0:
             estimated, allocations = self.estimate_input_budget(
-                conversation, tools, prompt_template, runtime_instruction
+                conversation, tools, prompt_template, runtime_instruction,
+                read_reuse_task_id=read_reuse_task_id,
             )
             budget = ContextBudget(
                 0, max_output_tokens, 0, 0, estimated,
@@ -187,17 +198,21 @@ class ContextWindowManager:
             )
             compacted, changed = self._compact_turn_history(
                 conversation, tools, prompt_template, budget, runtime_instruction,
+                read_reuse_task_id=read_reuse_task_id,
             )
-            after, allocations = self.estimate_input_budget(compacted, tools, prompt_template, runtime_instruction)
+            after, allocations = self.estimate_input_budget(compacted, tools, prompt_template, runtime_instruction,
+                                                          read_reuse_task_id=read_reuse_task_id)
             receipt = self._compaction_receipt(conversation, compacted, budget, changed, ()) if changed else None
-            return PreparedContext(compacted, replace(budget, estimated_input_tokens=after, allocations=allocations),
-                                   replace(receipt, after_estimated_tokens=after) if receipt else None)
+            return self._prepared(compacted, replace(budget, estimated_input_tokens=after, allocations=allocations),
+                                  replace(receipt, after_estimated_tokens=after) if receipt else None,
+                                  read_reuse_task_id)
         if max_output_tokens >= context_window:
             raise ContextWindowExceeded(
                 "max_output_tokens must be smaller than provider context_window"
             )
         before, before_allocations = self.estimate_input_budget(
-            conversation, tools, prompt_template, runtime_instruction
+            conversation, tools, prompt_template, runtime_instruction,
+            read_reuse_task_id=read_reuse_task_id,
         )
         budget = ContextBudget(
             context_window=context_window, max_output_tokens=max_output_tokens,
@@ -223,13 +238,15 @@ class ContextWindowManager:
             for item in before_allocations
         )
         if not budget.should_compact and not history_pressure:
-            return PreparedContext(conversation, budget)
+            return self._prepared(conversation, budget, None, read_reuse_task_id)
 
         compacted, receipt = self._compact(
-            conversation, tools, prompt_template, budget, runtime_instruction
+            conversation, tools, prompt_template, budget, runtime_instruction,
+            read_reuse_task_id=read_reuse_task_id,
         )
         after, after_allocations = self.estimate_input_budget(
-            compacted, tools, prompt_template, runtime_instruction
+            compacted, tools, prompt_template, runtime_instruction,
+            read_reuse_task_id=read_reuse_task_id,
         )
         if receipt is not None:
             receipt = replace(receipt, after_estimated_tokens=after)
@@ -248,13 +265,24 @@ class ContextWindowManager:
                 "the current request, protected state, recent tool protocol, or "
                 f"visible Tool schemas are too large; allocations: {allocation_summary}"
             )
-        return PreparedContext(
+        return self._prepared(
             compacted, ContextBudget(
                 context_window, max_output_tokens, budget.trigger_tokens,
                 budget.hard_input_tokens, after, budget.estimation_method,
                 after_allocations,
                 self.history_soft_tokens,
-            ), receipt,
+            ), receipt, read_reuse_task_id,
+        )
+
+    @staticmethod
+    def _prepared(
+        retained: tuple[Message, ...], budget: ContextBudget,
+        receipt: ContextCompactionReceipt | None, task_id: str | None,
+    ) -> PreparedContext:
+        projection = project_read_results(retained, task_id) if task_id else None
+        return PreparedContext(
+            projection.messages if projection else retained, budget, receipt,
+            retained, projection.stats if projection else None,
         )
 
     @staticmethod
@@ -262,9 +290,11 @@ class ContextWindowManager:
         conversation: tuple[Message, ...], tools: tuple[ToolSpec, ...],
         prompt_template: PromptTemplate,
         runtime_instruction: str | None = None,
+        *, read_reuse_task_id: str | None = None,
     ) -> int:
         estimated, _ = ContextWindowManager.estimate_input_budget(
-            conversation, tools, prompt_template, runtime_instruction
+            conversation, tools, prompt_template, runtime_instruction,
+            read_reuse_task_id=read_reuse_task_id,
         )
         return estimated
 
@@ -273,7 +303,10 @@ class ContextWindowManager:
         conversation: tuple[Message, ...], tools: tuple[ToolSpec, ...],
         prompt_template: PromptTemplate,
         runtime_instruction: str | None = None,
+        *, read_reuse_task_id: str | None = None,
     ) -> tuple[int, tuple[ContextBudgetAllocation, ...]]:
+        if read_reuse_task_id:
+            conversation = project_read_results(conversation, read_reuse_task_id).messages
         assembly = prompt_template.assemble(
             conversation, tools, runtime_instruction
         )
@@ -287,6 +320,8 @@ class ContextWindowManager:
                 "role": message.role.value,
                 "content": message.to_data()["content"],
             }
+            if message.phase is not None:
+                data["phase"] = message.phase.value
             if message.message_id.startswith("prompt-runtime-"):
                 bucket = "runtime_instruction"
             elif message.message_id.startswith((
@@ -302,7 +337,7 @@ class ContextWindowManager:
                 bucket = "project_context"
             elif message.message_id.startswith(("session-context-", "session-history-", "session-facts-")):
                 bucket = "session_history"
-            elif message.message_id.startswith("working-memory-context-"):
+            elif message.message_id.startswith("working-memory-context-") or is_execution_context(message.message_id):
                 bucket = "working_memory"
             else:
                 bucket = "current_turn_and_tool_protocol"
@@ -349,17 +384,20 @@ class ContextWindowManager:
         self, conversation: tuple[Message, ...], tools: tuple[ToolSpec, ...],
         prompt_template: PromptTemplate, budget: ContextBudget,
         runtime_instruction: str | None = None,
+        *, read_reuse_task_id: str | None = None,
     ) -> tuple[tuple[Message, ...], ContextCompactionReceipt | None]:
         source_conversation = conversation
         conversation, turn_history_items = self._compact_turn_history(
             conversation, tools, prompt_template, budget, runtime_instruction,
+            read_reuse_task_id=read_reuse_task_id,
         )
         conversation, compacted_session_items = self._compact_session_messages(
             conversation
         )
         compacted_session_items += turn_history_items
         target = min(budget.hard_input_tokens, budget.trigger_tokens - budget.max_output_tokens)
-        if self.estimate_input_tokens(conversation, tools, prompt_template, runtime_instruction) <= target:
+        if self.estimate_input_tokens(conversation, tools, prompt_template, runtime_instruction,
+                                      read_reuse_task_id=read_reuse_task_id) <= target:
             # History pressure alone must not compact the live tool exchange.
             return conversation, (self._compaction_receipt(
                 source_conversation, conversation, budget, compacted_session_items, (),
@@ -417,6 +455,7 @@ class ContextWindowManager:
     def _compact_turn_history(
         self, conversation: tuple[Message, ...], tools: tuple[ToolSpec, ...],
         template: PromptTemplate, budget: ContextBudget, instruction: str | None,
+        *, read_reuse_task_id: str | None = None,
     ) -> tuple[tuple[Message, ...], int]:
         """One token budget, whole historical Turns, no second count cutoff.
 
@@ -429,7 +468,8 @@ class ContextWindowManager:
                   if budget.context_window else math.inf)
 
         def fits(candidate_messages: tuple[Message, ...]) -> bool:
-            total, allocations = self.estimate_input_budget(candidate_messages, tools, template, instruction)
+            total, allocations = self.estimate_input_budget(candidate_messages, tools, template, instruction,
+                                                            read_reuse_task_id=read_reuse_task_id)
             history = sum(item.estimated_tokens for item in allocations if item.name == "session_history")
             return total <= target and (not self.history_soft_tokens or history <= self.history_soft_tokens)
 
@@ -448,6 +488,8 @@ class ContextWindowManager:
                 replacement = Message(
                     message.message_id.removesuffix("-compacted") + "-compacted", message.role,
                     (TextBlock(json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))),),
+                    scaffolding=message.scaffolding,
+                    phase=message.phase,
                 )
                 return (*conversation[:index], replacement, *conversation[index + 1:])
 
@@ -594,6 +636,8 @@ class ContextWindowManager:
             projected.append(Message(
                 message.message_id + "-compacted", message.role,
                 (TextBlock(text),),
+                scaffolding=message.scaffolding,
+                phase=message.phase,
             ))
         return tuple(projected), removed
 
@@ -719,7 +763,7 @@ class ContextWindowManager:
                         "project-memory-context-", "document-references-context-",
                     )))
                    or message.message_id.startswith((
-            "session-context-", "working-memory-context-",
+            "session-context-", "working-memory-context-", "execution-context-",
             "task-spec-context-", "conversation-environment-context-",
             "project-instructions-context-",
         )) for message in group)
@@ -886,7 +930,10 @@ class ContextWindowManager:
 
     @staticmethod
     def _message_hash_data(message: Message) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "role": message.role.value,
             "content_hash": canonical_hash(message.to_data()["content"]),
         }
+        if message.phase is not None:
+            data["phase"] = message.phase.value
+        return data

@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import replace
 
-from tsm_agt.ports import (Message, MessageRole, ModelReasoningDelta,
+from tsm_agt.ports import (AssistantMessagePhase, Message, MessageRole, ModelReasoningDelta,
                            ModelStreamCompleted, ModelTextDelta, ToolCallBlock,
                            ModelFailureCategory, ModelRetrySafety)
 from tsm_agt.ports.model import ReasoningBlock
@@ -71,7 +71,13 @@ class OpenAIResponsesModelProvider(OpenAICompatibleModelProvider):
                             image = part["image_url"]
                             converted.append({"type": "input_image", "image_url": image["url"], "detail": image.get("detail", "auto")})
                     content = converted
-                items.append({"role": role, "content": content})
+                item = {"role": role, "content": content}
+                if (
+                    original.role is MessageRole.ASSISTANT
+                    and original.phase is not None
+                ):
+                    item["phase"] = original.phase.value
+                items.append(item)
             for call in message.get("tool_calls", []):
                 function = call["function"]
                 items.append({"type": "function_call", "call_id": call["id"], "name": function["name"], "arguments": function["arguments"]})
@@ -94,20 +100,50 @@ class OpenAIResponsesModelProvider(OpenAICompatibleModelProvider):
         text = []
         calls = []
         reasoning = []
+        message_phases: set[AssistantMessagePhase] = set()
         for item in output:
             if not isinstance(item, Mapping):
                 raise OpenAICompatibleProviderError("invalid Responses output item")
             if item.get("type") == "reasoning":
                 reasoning.append(ReasoningBlock("openai_responses", "reasoning", data=json.dumps(item, ensure_ascii=False, separators=(",", ":"))))
             elif item.get("type") == "message":
+                raw_phase = item.get("phase")
+                if raw_phase is not None and not isinstance(raw_phase, str):
+                    raise OpenAICompatibleProviderError(
+                        "Responses assistant message phase must be a string"
+                    )
+                try:
+                    phase = (
+                        AssistantMessagePhase(raw_phase)
+                        if raw_phase is not None else None
+                    )
+                except ValueError as error:
+                    raise OpenAICompatibleProviderError(
+                        f"unsupported Responses assistant message phase: {raw_phase}"
+                    ) from error
+                if phase is not None:
+                    message_phases.add(phase)
                 for block in item.get("content", []):
+                    if not isinstance(block, Mapping):
+                        raise OpenAICompatibleProviderError(
+                            "Responses message content item must be an object"
+                        )
                     if block.get("type") == "output_text":
                         text.append(block.get("text", ""))
             elif item.get("type") == "function_call":
                 calls.append({"id": item.get("call_id"), "type": "function", "function": {"name": item.get("name"), "arguments": item.get("arguments")}})
+        if len(message_phases) > 1:
+            raise OpenAICompatibleProviderError(
+                "Responses output contains incompatible assistant message phases"
+            )
+        response_phase = next(iter(message_phases), None)
         usage = response.get("usage") or {}
+        assistant_message = {"role": "assistant", "content": "".join(text) or None,
+                             "tool_calls": calls}
+        if response_phase is not None:
+            assistant_message["phase"] = response_phase.value
         chat_response = {"id": response.get("id"), "model": response.get("model"),
-                         "choices": [{"message": {"role": "assistant", "content": "".join(text) or None, "tool_calls": calls},
+                         "choices": [{"message": assistant_message,
                                       "finish_reason": "tool_calls" if calls else ("length" if response.get("status") == "incomplete" else "stop")}],
                          "usage": {"prompt_tokens": usage.get("input_tokens", 0), "completion_tokens": usage.get("output_tokens", 0)}}
         result = self._normalize_response(request.turn_id, chat_response, names,

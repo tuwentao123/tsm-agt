@@ -46,8 +46,7 @@ class AgentLoopLimitExceeded(RuntimeError):
 
 class AgentProgressKind(StrEnum):
     REASONING_DELTA = "reasoning_delta"
-    EXECUTION_NOTE = "execution_note"
-    STAGE_SUMMARY = "stage_summary"
+    COMMENTARY = "commentary"
     MODEL_STARTED = "model_started"
     MODEL_COMPLETED = "model_completed"
     TOOL_STARTED = "tool_started"

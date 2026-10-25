@@ -212,8 +212,7 @@ _TURN_PROGRESS_EVENT_TYPES = (
     "model.attempt_failed",
     "model.recovery_decided",
     "conversation.model_response_recorded",
-    "conversation.execution_note",
-    "conversation.stage_summary",
+    "conversation.commentary",
     "tool.requested",
     "tool.completed",
     "tool.failed",
@@ -306,9 +305,9 @@ def _turn_progress_item(event, *, fallback_turn_id: str | None = None) -> dict |
             "tool_call_count": payload.get("tool_call_count"),
             "finish_reason": payload.get("finish_reason"),
         }
-    if kind in {"conversation.execution_note", "conversation.stage_summary"}:
+    if kind == "conversation.commentary":
         return {
-            **base, "kind": kind.removeprefix("conversation."),
+            **base, "kind": "commentary",
             "model_call": payload.get("model_call"),
             "activity": str(payload.get("text") or ""),
             "phase": str(payload.get("source") or "model"),

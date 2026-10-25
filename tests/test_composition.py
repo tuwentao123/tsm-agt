@@ -10,6 +10,7 @@ from unittest.mock import patch
 from tsm_agt.adapters.anthropic_messages import AnthropicMessagesModelProvider
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.adapters.builtin.skill_tools import CoreSkillToolProvider
+from tsm_agt.adapters.local_skills import UserSkillsStore
 from tsm_agt.bootstrap import (
     OrchestrationConfiguration,
     compose_local_flow_query_application,
@@ -58,6 +59,13 @@ from tsm_agt.ports import (
 
 
 class CompositionTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        patcher = patch("tsm_agt.bootstrap.composition.UserSkillsStore", return_value=UserSkillsStore(Path(home.name)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     async def test_flow_query_composition_exposes_artifact_export_port(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -117,7 +125,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 application.registry.all(RuntimeInputClassifierPort), ()
             )
-            self.assertEqual(len(application.registry.all(ToolProviderPort)), 2)
+            self.assertEqual(len(application.registry.all(ToolProviderPort)), 1)
             for port in (
                 ModelProviderPort,
                 ProcessExecutorPort,
@@ -141,8 +149,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
         await application.registry.start_all()
         try:
             providers = application.registry.all(ToolProviderPort)
-            self.assertEqual(len(providers), 1)
-            self.assertIsInstance(providers[0], CoreSkillToolProvider)
+            self.assertEqual(providers, ())
             self.assertEqual(await application.kernel.list_tools(), ())
         finally:
             await application.registry.stop_all()
@@ -399,13 +406,8 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                     ApprovalDecision.APPROVE, "approve exact Python smoke command",
                 )
                 self.assertTrue(result.ok)
-                waited = await application.kernel.invoke_tool(
-                    task.task_id, "turn-local-gate-wait",
-                    ToolCall("call-local-gate-wait", "core.process_wait", {
-                        "process_id": result.data["process_id"], "wait_seconds": 1,
-                    }),
-                )
-                self.assertEqual(waited.data["stdout"]["text"], "gate-ok\n")
+                self.assertEqual(result.data["mode"], "foreground")
+                self.assertEqual(result.data["stdout"]["text"], "gate-ok\n")
             finally:
                 await application.registry.stop_all()
 
@@ -657,41 +659,15 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_fixture_can_select_legacy_orchestration(self) -> None:
-        application = compose_fixture_application(
-            orchestration_mode=OrchestrationMode.CONVERSATION_LOOP
-        )
-
-        self.assertEqual(
-            application.kernel.dependencies.orchestration_mode,
-            OrchestrationMode.CONVERSATION_LOOP,
-        )
+        with self.assertRaisesRegex(TypeError, "orchestration_mode"):
+            compose_fixture_application(orchestration_mode="legacy")
 
     def test_fixture_can_select_single_loop_orchestration(self) -> None:
-        application = compose_fixture_application(
-            orchestration_mode=OrchestrationMode.CONVERSATION_LOOP
-        )
-
-        self.assertEqual(
-            application.kernel.dependencies.orchestration_mode,
-            OrchestrationMode.CONVERSATION_LOOP,
-        )
-        self.assertEqual(
-            application.kernel.dependencies.configuration_metadata[
-                "orchestration"
-            ],
-            {
-                "mode": "single_loop",
-                "single_loop_allow_fallback": False,
-                "conversation_loop_enabled": True,
-            },
-        )
+        application = compose_fixture_application()
+        self.assertEqual(application.kernel.dependencies.configuration_metadata["orchestration"], {"mode": "conversation_loop"})
 
     def test_orchestration_configuration_rejects_fallback(self) -> None:
-        self.assertEqual(
-            OrchestrationConfiguration(mode="single_loop").mode,
-            OrchestrationMode.CONVERSATION_LOOP,
-        )
-        with self.assertRaisesRegex(ValueError, "must be false"):
+        with self.assertRaisesRegex(TypeError, "single_loop_allow_fallback"):
             OrchestrationConfiguration(single_loop_allow_fallback=True)
 
     async def test_env_orchestration_configuration_is_recorded(self) -> None:
@@ -719,14 +695,9 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             application.kernel.dependencies.configuration_metadata[
                 "sources"
             ]["orchestration.mode"],
-            "env_file",
+            "fixed",
         )
-        self.assertEqual(
-            application.kernel.dependencies.configuration_metadata[
-                "sources"
-            ]["orchestration.single_loop_allow_fallback"],
-            "env_file",
-        )
+        self.assertNotIn("orchestration.single_loop_allow_fallback", application.kernel.dependencies.configuration_metadata["sources"])
 
 
 if __name__ == "__main__":
@@ -758,7 +729,7 @@ class OrchestrationEnvironmentOverrideTest(unittest.TestCase):
             application.kernel.dependencies.configuration_metadata["sources"][
                 "orchestration.mode"
             ],
-            "env_file",
+            "fixed",
         )
 
 
@@ -791,10 +762,8 @@ class ConversationLoopConfigurationTest(unittest.TestCase):
             OrchestrationMode.CONVERSATION_LOOP,
         )
         sources = application.kernel.dependencies.configuration_metadata["sources"]
-        self.assertEqual(sources["orchestration.mode"], "default")
-        self.assertEqual(
-            sources["orchestration.conversation_loop_enabled"], "default"
-        )
+        self.assertEqual(sources["orchestration.mode"], "fixed")
+        self.assertNotIn("orchestration.conversation_loop_enabled", sources)
 
     def test_deprecated_flag_cannot_disable_conversation_loop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -813,9 +782,8 @@ class ConversationLoopConfigurationTest(unittest.TestCase):
             OrchestrationMode.CONVERSATION_LOOP,
         )
         sources = application.kernel.dependencies.configuration_metadata["sources"]
-        self.assertEqual(
-            sources["orchestration.conversation_loop_enabled"], "env_file"
-        )
+        self.assertEqual(sources["orchestration.mode"], "fixed")
+        self.assertNotIn("orchestration.conversation_loop_enabled", sources)
 
     def test_explicit_mode_wins_over_the_flag(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -836,17 +804,12 @@ class ConversationLoopConfigurationTest(unittest.TestCase):
             OrchestrationMode.CONVERSATION_LOOP,
         )
         sources = application.kernel.dependencies.configuration_metadata["sources"]
-        self.assertEqual(sources["orchestration.mode"], "env_file")
+        self.assertEqual(sources["orchestration.mode"], "fixed")
 
     def test_invalid_flag_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "absent.env"
-            with self.assertRaisesRegex(
-                ValueError, "TSM_AGT_CONVERSATION_LOOP_ENABLED"
-            ):
-                load_orchestration_configuration(
-                    path, {"TSM_AGT_CONVERSATION_LOOP_ENABLED": "maybe"}
-                )
+        configuration = load_orchestration_configuration(Path("absent.env"), {"TSM_AGT_CONVERSATION_LOOP_ENABLED": "maybe"})
+        self.assertIs(configuration.mode, OrchestrationMode.CONVERSATION_LOOP)
+        self.assertEqual(configuration.sources, {"orchestration.mode": "fixed"})
 
     def test_conversation_loop_mode_value_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1,14 +1,66 @@
 # tsm-agt
 
-`tsm-agt` 是一个遵守 Ports & Adapters 的通用工程 Agent Harness。当前已具备 Task/Turn 状态机、SQLite 原子事件落盘、串行 Agent Loop、审批和幂等账本、Project Trust、受控进程、工作区 Mutation Journal/回滚，以及 macOS/Windows 平台 Adapter。
+`tsm-agt` 是一个面向“真实工程项目”的通用 Agent 运行框架，用来安全地让大模型帮你看代码、跑命令、改文件和验证结果。
 
-当前 Agent Loop 可以完成“模型提出 Tool Call → Runtime 执行 → Tool Result 回填 → 模型继续回答”的 ReAct 闭环。工程版提供受控文件读取/搜索、结构化命令、后台进程、Patch/删除和安全回滚工具，并支持 OpenAI-compatible Chat Completions API。Git 可按需通过受控命令使用，不作为独立核心 Tool。并行 Tool Call、完整实时 Web UI、MCP 和领域扩展仍待后续步骤实现。
+这份 README 只保留**最基础的使用说明**，把细节留给仓库里的文档，方便你快速上手。
 
-Conversation Loop 中的 Task 是持续的运行容器，保存审批、断点、工具账本、进程、目录授权和文件修改记录。每次输入开启一个 Turn；正常回复结束后 Task 返回 `AWAITING_INPUT`，不表示用户工作已经全部完成。初始 `goal` 仅保留作审计元数据，不作为后续输入的固定目标或验收条件。
+## 这个项目是做什么的？
 
-会话模型上下文不注入 Task 的固定目标、完成清单、验收状态或 Outcomes，也不提供 `core.task_spec_read/update`。工作记忆和 TODO 仍可记录模型主动维护的计划与进度。旧数据库中的契约保留兼容读取，但不会触发 Conversation 的 `REQUIRED` 完成审查；显式配置的 `ALWAYS` 审查仍针对当前 Turn。工具结果、权限、审批、未知执行结果保护和协议完整性检查保持有效。
+- 提供一个可配置的工程 Agent Harness：
+  - 有 Task/Turn 状态机和持久化事件日志；
+  - 有审批、幂等账本和 Project Trust；
+  - 有受控命令执行、后台进程管理和文件修改/回滚工具。
+- 支持通过 OpenAI-compatible / Anthropic 接口调用真实模型。
+- 自带 CLI 和 Web UI，用来查看任务进度、审批危险操作、回放执行过程。
 
-Event Log 已可通过纯 Core `FlowProjector` 投影为 Task/Phase/Turn/Model/Tool/Approval/Process/Mutation/Memory/Onboarding 流程节点，并支持 cursor 增量更新和首个可行动失败定位。CLI 支持流程树、泳道时间线、静态/实时 TUI、下钻、筛选以及 JSON/JSONL/离线 HTML 脱敏导出；Replay 支持定位、范围自动播放、交互单步和断点游标恢复。Task 首次进入执行态时还会在同一 SQLite 事务中保存脱敏、不可变的 Effective Configuration revision 1。基础 Prompt Manifest 与确定性装配也已接入，每次模型调用记录不含正文的 `effective_prompt_hash`。完整实时 Web UI 与重新执行模型/副作用的 `--rerun` 仍待其他安全前置能力完成。
+简单理解：你可以在本地项目里跑一个“工程助理”，它会按策略安全地使用各种工具帮你完成任务。
+
+## 快速开始
+
+1. 安装依赖并准备虚拟环境（推荐用 `uv`）：
+
+   ```bash
+   uv sync
+   ```
+
+2. 初始化一个工作区：
+
+   ```bash
+   uv run tsm-agt init --workspace .
+   # 按提示编辑生成的 .env，填入模型 endpoint / API key / model 名称
+   ```
+
+3. 检查本地环境和模型配置：
+
+   ```bash
+   uv run tsm-agt doctor --workspace . --model-check
+   ```
+
+4. 启动一个简单的工程对话：
+
+   ```bash
+   uv run tsm-agt chat --workspace .
+   ```
+
+   在对话里输入：
+
+   > "帮我看看这个项目的入口是什么"  
+   > "修一下 tests 里失败的用例"  
+   > "解释这个异常栈是怎么来的"
+
+CLI 会显示每一步的工具调用、风险提示和审批流程，你只需要在关键动作上输入 `yes` 或 `no`。
+
+## 更多功能和详细设计
+
+README 不再展开所有细节，完整设计说明和命令参考请看仓库中的文档：
+
+- `src/tsm_agt/docs/cancellation_spec.md`：任务取消与安全中断协议；
+- `src/tsm_agt/docs/mcp_integration.md`：MCP 工具集成与配置；
+- `docs/conversation-history-migration.md`：多轮历史和上下文压缩策略；
+- 以及代码中的 docstring 与类型提示。
+
+如果你只是想“先用起来”，按照上面的 **快速开始** 步骤即可；
+需要理解内部机制时，再按需阅读对应文档。
 
 ## 用户级 Skills
 

@@ -1,0 +1,6 @@
+{
+  "baseline_source": "/tmp/tsm-todo-maintenance-v2-baseline/src/tsm_agt",
+  "failures": 1,
+  "errors": 0,
+  "output": "F\n======================================================================\nFAIL: test_adapters_do_not_import_other_adapters (tests.architecture.test_dependencies.DependencyArchitectureTest.test_adapters_do_not_import_other_adapters)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/Users/tusima/Documents/学习/tsm-agt/tests/architecture/test_dependencies.py\", line 50, in test_adapters_do_not_import_other_adapters\n    self.assertEqual(violations, [])\nAssertionError: Lists differ: ['adapters/mcp_demo_fixture.py -> tsm_agt.adapters.mcp_client_manager'] != []\n\nFirst list contains 1 additional elements.\nFirst extra element 0:\n'adapters/mcp_demo_fixture.py -> tsm_agt.adapters.mcp_client_manager'\n\n- ['adapters/mcp_demo_fixture.py -> tsm_agt.adapters.mcp_client_manager']\n+ []\n\n----------------------------------------------------------------------\nRan 1 test in 0.116s\n\nFAILED (failures=1)\n"
+}

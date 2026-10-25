@@ -56,7 +56,7 @@ class SensitiveEchoToolProvider(EchoToolProvider):
 
 
 class CapturingToolResultModel(EchoModelProvider):
-    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+    capabilities = ProviderCapabilities(tools=True, context_window=16384)
     descriptor = AdapterDescriptor(
         adapter_id="fixture.capturing-tool-result-model",
         adapter_version="0.1.0",

@@ -27,8 +27,10 @@ from tsm_agt.core import (
 )
 from tsm_agt.sdk.ui_events import _TURN_PROGRESS_EVENT_TYPES, _turn_progress_item, _bounded_text, _incomplete_reason
 from tsm_agt.local_api import LocalEventApiServer
-from tsm_agt.adapters.openai_compatible.model import OpenAICompatibleModelProvider
-from tsm_agt.adapters.openai_compatible.request_diagnostics import TurnRequestDiagnostics
+from tsm_agt.bootstrap.composition import (
+    configure_request_diagnostics, user_skills_store_for_application,
+    skill_installation_prompt,
+)
 from tsm_agt.ports import ImageBlock, MessageRole
 
 app = FastAPI(title="tsm-agt-web")
@@ -1851,13 +1853,11 @@ function renderTraceView(tracePane, conversation) {
         : 'conversation';
       renderTaskCard(wrapper, message, conversation.id, mode);
 
-      // 只要该轮有阶段性思考（execution_note / stage_summary），就在轨迹中单独渲染一块
+      // 仅展示模型在首次工具调用前给出的处理说明；工具事实另由 Trace 渲染。
       const task = message.task || {};
       const conversationTurns = conversation.turnCalls || new Map();
       const turn = task.turnId && conversationTurns.get(task.turnId);
-      const stageItems = (turn?.progress || []).filter((item) => (
-        item.kind === 'execution_note' || item.kind === 'stage_summary'
-      ));
+      const stageItems = (turn?.progress || []).filter((item) => item.kind === 'commentary');
       if (stageItems.length) {
         const stageBlock = document.createElement('div');
         stageBlock.className = 'trace-stage-block';
@@ -1866,10 +1866,10 @@ function renderTraceView(tracePane, conversation) {
         header.className = 'trace-stage-header';
         const title = document.createElement('div');
         title.className = 'trace-stage-title';
-        title.textContent = '阶段性思考';
+        title.textContent = '处理说明';
         const caption = document.createElement('div');
         caption.className = 'trace-stage-caption';
-        caption.textContent = '本轮模型的计划与阶段总结，仅在有阶段性思考时显示。';
+        caption.textContent = '模型在首次工具调用前说明本轮处理方向；工具状态在执行轨迹中单独显示。';
         header.append(title, caption);
         stageBlock.appendChild(header);
 
@@ -1881,7 +1881,7 @@ function renderTraceView(tracePane, conversation) {
 
           const kindLabel = document.createElement('div');
           kindLabel.className = 'trace-stage-kind';
-          kindLabel.textContent = item.kind === 'execution_note' ? '执行说明 / 计划' : '阶段性总结';
+          kindLabel.textContent = '首次调用前说明';
 
           const body = document.createElement('div');
           body.className = 'trace-stage-body';
@@ -3273,12 +3273,8 @@ function describeProgress(progress) {
     return `完成复核：${progress.review_action || '状态更新'}`;
   }
   if (kind === 'turn_interrupted') return `本轮未完成：${progress.detail || progress.diagnostic_code || '执行已中断'}`;
-  // 直接显示执行备注，通常已经是中文。
-  if (kind === 'execution_note') return progress.activity || '';
-  // 阶段进展：统一用中文 Tag 包裹 activity，和 CLI 样式保持一致。
-  if (kind === 'stage_summary') {
-    return progress.activity ? `[阶段进展] ${progress.activity}` : '';
-  }
+  // 处理说明完全来自模型；工具状态由各自的结构化进度项显示。
+  if (kind === 'commentary') return progress.activity || '';
   // 推理增量：保持原有中文前缀。
   if (kind === 'reasoning_delta') {
     return progress.reasoning_text ? `推理摘要：${progress.reasoning_text}` : '';
@@ -3302,18 +3298,24 @@ function describeProgress(progress) {
     const counter = call !== null && maxCalls !== null
       ? `${call}/${maxCalls}`
       : (call !== null ? String(call) : '');
+    const rawName = String(progress.tool_name || '未知工具');
+    const isMcp = rawName.startsWith('mcp.');
+    const displayName = isMcp ? `${rawName}（MCP 工具）` : rawName;
     const heading = counter
-      ? `[操作 ${counter}] ${progress.tool_name}`
-      : `调用工具：${progress.tool_name}`;
+      ? `[操作 ${counter}] ${displayName}`
+      : `调用工具：${displayName}`;
     const rendered = progress.operation_presentation || '';
     return rendered ? `${heading}：${rendered}` : heading;
   }
   // 工具完成：使用 "[完成 n] 工具名：状态（耗时；证据增量）" 的中文样式。
   if (kind === 'tool_completed') {
     const call = typeof progress.tool_call === 'number' ? progress.tool_call : null;
+    const rawName = String(progress.tool_name || '未知工具');
+    const isMcp = rawName.startsWith('mcp.');
+    const displayName = isMcp ? `${rawName}（MCP 工具）` : rawName;
     const heading = call !== null
-      ? `[完成 ${call}] ${progress.tool_name}`
-      : `工具 ${progress.tool_name}`;
+      ? `[完成 ${call}] ${displayName}`
+      : `工具 ${displayName}`;
     const status = progress.ok === false
       ? `失败${progress.error_code ? `（${progress.error_code}）` : ''}`
       : '完成';
@@ -4448,7 +4450,7 @@ runtime_error: str | None = None
 configuration_issues: list[str] = []
 workspace_registry: list[dict[str, str]] = []
 session_workspace_bindings: dict[str, str] = {}
-turn_request_diagnostics: TurnRequestDiagnostics | None = None
+turn_request_diagnostics: Any | None = None
 
 # These runs are deliberately Web-local: the evaluated Agent Tasks themselves
 # are durable Runtime records, while this small index only groups independent
@@ -4641,11 +4643,9 @@ async def startup() -> None:
     runtime_server = LocalEventApiServer(Path.cwd())
     try:
         runtime_server.start()
-        model = runtime_server._client.application.kernel.dependencies.model
-        physical = getattr(model, '_provider', model)
-        if isinstance(physical, OpenAICompatibleModelProvider):
-            turn_request_diagnostics = TurnRequestDiagnostics()
-            physical._request_diagnostics = turn_request_diagnostics
+        turn_request_diagnostics = configure_request_diagnostics(
+            runtime_server._client.application
+        )
         recover_workspace_registry_from_runtime()
         runtime_error = None
         configuration_issues = list(getattr(
@@ -5032,15 +5032,9 @@ async def submit_session_input(payload: dict, request: Request = None) -> dict:
 
 
 def user_skills_store():
-    from tsm_agt.adapters.builtin.skill_tools import CoreSkillToolProvider
-    from tsm_agt.adapters.local_skills import UserSkillsStore
-
-    if runtime_server is not None:
-        for provider in runtime_server._client.application.kernel._dependencies.tools:
-            if isinstance(provider, CoreSkillToolProvider):
-                return provider.store
-    return UserSkillsStore()
-
+    return user_skills_store_for_application(
+        runtime_server._client.application if runtime_server is not None else None
+    )
 
 def refresh_skill_catalog(store=None) -> tuple:
     store = store or user_skills_store()
@@ -5115,7 +5109,6 @@ def start_skill_preparation(store, job: dict) -> dict:
     _skill_install_launches.add(job["id"])
 
     async def launch():
-        from tsm_agt.adapters.skill_installations import installation_prompt
 
         try:
             kernel = server._client.application.kernel
@@ -5124,7 +5117,7 @@ def start_skill_preparation(store, job: dict) -> dict:
             except LookupError:
                 await kernel.create_session(f"安装 Skill：{job['skill_name']}", session_id=session_id)
             result = await server._client.submit_user_input(
-                session_id, installation_prompt(job), input_id=job["id"],
+                session_id, skill_installation_prompt(job), input_id=job["id"],
                 explicit_intent=RuntimeInputIntent.NEW_TASK, workspace=Path(workspace["path"]),
             )
             task_id = (result.result.get("task") or {}).get("task_id") or result.result.get("routed_task_id")

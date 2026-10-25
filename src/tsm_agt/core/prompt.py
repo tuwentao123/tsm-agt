@@ -13,6 +13,7 @@ from tsm_agt.ports import Message, MessageRole, TextBlock, ToolResultBlock, Tool
 
 from .configuration import canonical_hash
 from .session_history import render_session_history
+from .context_messages import is_execution_context, is_generated_context
 
 
 _PROMPT_MARKER = re.compile(r"^<!-- prompt: ([a-z0-9-]+) -->$", re.MULTILINE)
@@ -173,7 +174,7 @@ class PromptTemplate:
         prompt_text = _load_prompt_text()
         template = cls(
             manifest_id="builtin.engineering-agent",
-            revision=42,
+            revision=47,
             static_segments=(
                 PromptTemplateSegment(
                     "system-safety", "core", "1.0",
@@ -183,7 +184,7 @@ class PromptTemplate:
                 # the only place that says how a request becomes an answer, so a
                 # capability-gated segment never has to carry routing rules.
                 PromptTemplateSegment(
-                    "request-pipeline-guidance", "harness", "4.5",
+                    "request-pipeline-guidance", "harness", "5.3",
                     prompt_text["request-pipeline-guidance"],
                 ),
                 # This is deliberately a stable, tool-capability-gated contract:
@@ -191,7 +192,7 @@ class PromptTemplate:
                 # work from its full conversational context.  Runtime does not
                 # classify user text or inject a per-turn implementation label.
                 PromptTemplateSegment(
-                    "delivery-mode-guidance", "harness", "4.5",
+                    "delivery-mode-guidance", "harness", "5.0",
                     prompt_text["delivery-mode-guidance"],
                     requires_any_tools=(
                         "core.apply_patch", "core.apply_patch_v4a",
@@ -203,7 +204,7 @@ class PromptTemplate:
                 # not duplicate the command-specific facts kept in
                 # workspace-command-guidance.
                 PromptTemplateSegment(
-                    "tool-feedback-guidance", "harness", "1.3",
+                    "tool-feedback-guidance", "harness", "2.0",
                     prompt_text["tool-feedback-guidance"],
                 ),
                 PromptTemplateSegment(
@@ -211,11 +212,11 @@ class PromptTemplate:
                     prompt_text["response-format-guidance"],
                 ),
                 PromptTemplateSegment(
-                    "execution-discipline", "harness", "1.3",
+                    "execution-discipline", "harness", "2.0",
                     prompt_text["execution-discipline"],
                 ),
                 PromptTemplateSegment(
-                    "completion-behavior-examples", "harness", "3.2",
+                    "completion-behavior-examples", "harness", "4.0",
                     prompt_text["completion-behavior-examples"],
                 ),
                 # ---- tool usage: one segment per capability, ordered by what
@@ -227,7 +228,7 @@ class PromptTemplate:
                     requires_any_tools=("core.search_files",),
                 ),
                 PromptTemplateSegment(
-                    "workspace-read-guidance", "harness", "1.0",
+                    "workspace-read-guidance", "harness", "1.1",
                     prompt_text["workspace-read-guidance"],
                     requires_any_tools=("core.read_file", "core.search_files"),
                 ),
@@ -237,17 +238,17 @@ class PromptTemplate:
                     requires_any_tools=("core.apply_patch", "core.apply_patch_v4a"),
                 ),
                 PromptTemplateSegment(
-                    "workspace-command-guidance", "harness", "1.5",
+                    "workspace-command-guidance", "harness", "1.8",
                     prompt_text["workspace-command-guidance"],
                     requires_any_tools=("core.run_command", "core.process_wait"),
                 ),
                 PromptTemplateSegment(
-                    "git-read-guidance", "harness", "1.0",
+                    "git-read-guidance", "harness", "1.1",
                     prompt_text["git-read-guidance"],
                     requires_any_tools=("git.status", "git.diff", "git.log"),
                 ),
                 PromptTemplateSegment(
-                    "source-read-guidance", "harness", "1.3",
+                    "source-read-guidance", "harness", "1.4",
                     prompt_text["source-read-guidance"],
                     requires_any_tools=("source.github.resolve",),
                 ),
@@ -257,7 +258,7 @@ class PromptTemplate:
                     requires_any_tools=("web.fetch_markdown",),
                 ),
                 PromptTemplateSegment(
-                    "live-fact-routing", "harness", "2.2",
+                    "live-fact-routing", "harness", "2.3",
                     prompt_text["live-fact-routing"],
                     requires_any_tools=("web.search",),
                 ),
@@ -279,7 +280,7 @@ class PromptTemplate:
                     requires_any_tools=("core.working_memory_update",),
                 ),
                 PromptTemplateSegment(
-                    "task-plan-guidance", "harness", "3.3",
+                    "task-plan-guidance", "harness", "4.2",
                     prompt_text["task-plan-guidance"],
                     requires_any_tools=("core.todo_list",),
                 ),
@@ -384,14 +385,11 @@ class PromptTemplate:
             message for message in conversation
             if message.message_id.startswith("working-memory-context-")
         )
+        execution_messages = tuple(message for message in conversation
+                                   if is_execution_context(message.message_id))
         ordinary_conversation = tuple(
             message for message in conversation
-            if not message.message_id.startswith((
-                "project-onboarding-context-", "project-memory-context-",
-                "session-context-", "document-references-context-",
-                "working-memory-context-", "project-instructions-context-",
-                "task-spec-context-", "conversation-environment-context-",
-            ))
+            if not is_generated_context(message.message_id)
         )
         if any(
             message.role is not MessageRole.SYSTEM
@@ -422,6 +420,8 @@ class PromptTemplate:
             message.role is not MessageRole.USER for message in working_memory_messages
         ):
             raise ValueError("working memory context must use the untrusted user role")
+        if any(message.role is not MessageRole.USER for message in execution_messages):
+            raise ValueError("execution context must use the untrusted user role")
         messages = (
             system_messages + project_instruction_messages + task_spec_messages
             + conversation_environment_messages
@@ -430,7 +430,7 @@ class PromptTemplate:
             + tuple(row for message in session_messages
                     for row in render_session_history(message))
             + document_reference_messages + working_memory_messages
-            + ordinary_conversation
+            + ordinary_conversation + execution_messages
         )
         manifest = self.manifest()
         tool_data = tuple(sorted((
@@ -446,8 +446,10 @@ class PromptTemplate:
             "parameters_hash": canonical_hash(dict(tool.parameters)),
         } for tool in tools)
         message_data = tuple({
-            "ordinal": index, "role": message.role.value,
+            "ordinal": index,
+            "role": message.role.value,
             "content_hash": canonical_hash(message.to_data()["content"]),
+            **({"phase": message.phase.value} if message.phase is not None else {}),
         } for index, message in enumerate(messages, start=1))
         toolset_hash = canonical_hash(tool_data)
         effective_hash = canonical_hash({
@@ -480,6 +482,7 @@ def _message_structure(message: Message) -> dict[str, Any]:
         "task-spec-context-", "conversation-environment-context-",
         "project-onboarding-context-", "project-memory-context-",
         "document-references-context-", "working-memory-context-",
+        "execution-context-",
     )
     source = next((prefix[:-1] for prefix in prefixes
                    if message.message_id.startswith(prefix)), "conversation")
@@ -492,6 +495,8 @@ def _message_structure(message: Message) -> dict[str, Any]:
                    for block in message.content],
         "text_characters": len(message.text),
     }
+    if message.phase is not None:
+        item["phase"] = message.phase.value
     results = [block.result for block in message.content
                if isinstance(block, ToolResultBlock)]
     if results:

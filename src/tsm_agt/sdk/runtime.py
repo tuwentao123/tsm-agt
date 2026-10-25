@@ -506,11 +506,7 @@ class EngineeringAgentClient:
                             decision_data,
                             task=await self.get_task_result(task.task_id),
                         )
-                    if task.state in {
-                        TaskState.INTERRUPTED,
-                        TaskState.CONFLICT,
-                        TaskState.AWAITING_USER,
-                    }:
+                    if task.state.accepts_fresh_continuation:
                         return SessionTextResult(
                             command_id,
                             "continuation",
@@ -1336,7 +1332,9 @@ class EngineeringAgentClient:
 
     def _runner_finished(self, task_id: str) -> None:
         self._run_tasks.pop(task_id, None)
-        self._store().notify(task_id)
+        # done callbacks can run after close() has released the application.
+        if self._application is not None:
+            self._store().notify(task_id)
 
     def _record_progress(self, task_id: str, progress: AgentProgress) -> None:
         history = self._progress_history.setdefault(task_id, [])

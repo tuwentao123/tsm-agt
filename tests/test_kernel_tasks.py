@@ -101,7 +101,6 @@ class KernelTaskTest(unittest.IsolatedAsyncioTestCase):
         store = InMemoryRuntimeStore()
         original = compose_fixture_application(
             store_adapter=store,
-            orchestration_mode=OrchestrationMode.CONVERSATION_LOOP,
         )
         await original.registry.start_all()
         try:
@@ -114,7 +113,6 @@ class KernelTaskTest(unittest.IsolatedAsyncioTestCase):
         reopened = compose_fixture_application(
             store_adapter=store,
             tool_adapters=(),
-            orchestration_mode=OrchestrationMode.CONVERSATION_LOOP,
         )
         await reopened.registry.start_all()
         try:
@@ -146,7 +144,6 @@ class KernelTaskTest(unittest.IsolatedAsyncioTestCase):
     async def test_single_loop_task_runs_the_single_loop(self) -> None:
         application = compose_fixture_application(
             tool_adapters=(),
-            orchestration_mode=OrchestrationMode.CONVERSATION_LOOP,
         )
         await application.registry.start_all()
         try:
@@ -325,7 +322,6 @@ class LegacyTaskCompatibilityTest(unittest.IsolatedAsyncioTestCase):
             store = InMemoryRuntimeStore()
             legacy = compose_fixture_application(
                 store_adapter=store,
-                orchestration_mode=OrchestrationMode.CONVERSATION_LOOP,
             )
             await legacy.registry.start_all()
             try:

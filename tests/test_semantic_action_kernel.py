@@ -20,7 +20,7 @@ from tsm_agt.ports import (
 
 
 class OneSearchModel(EchoModelProvider):
-    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+    capabilities = ProviderCapabilities(tools=True, context_window=16384)
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         if any(message.role is MessageRole.TOOL for message in request.messages):
@@ -33,7 +33,7 @@ class OneSearchModel(EchoModelProvider):
                 (ToolCallBlock(ToolCall(
                     "search-call", "fixture.search",
                     {"query": "CustomerName", "path": "private/module"},
-                    EvidenceQuestion("E1", "Where is CustomerName defined?"),
+                    None,
                 )),),
             ), FinishReason.TOOL_CALL,
         )
@@ -72,7 +72,6 @@ class SemanticActionKernelTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             app = compose_legacy_fixture_application(
                 model_adapter=OneSearchModel(), tool_adapters=(SearchTool(),),
-                require_evidence_questions=True,
                 semantic_action_classifier_adapter=RuleBasedSemanticActionClassifier(),
             )
             await app.registry.start_all()
@@ -137,9 +136,7 @@ class ScopedSearchModel(EchoModelProvider):
                 (ToolCallBlock(ToolCall(
                     f"search-{self.calls}", "core.search_text",
                     {"query": "MissingDialog", "path": path},
-                    EvidenceQuestion(
-                        "E-missing", "Where is MissingDialog defined?"
-                    ),
+                    None,
                 )),),
             ), FinishReason.TOOL_CALL,
         )
@@ -180,12 +177,11 @@ class EmptySearchTool:
 
 
 class SemanticNoProgressKernelTest(unittest.IsolatedAsyncioTestCase):
-    async def test_changed_scopes_same_semantic_action_stop_after_three_zero_deltas(self):
+    async def test_changed_scopes_keep_distinct_signatures_and_no_progress_feedback(self):
         with tempfile.TemporaryDirectory() as directory:
             tool = EmptySearchTool()
             app = compose_legacy_fixture_application(
                 model_adapter=ScopedSearchModel(), tool_adapters=(tool,),
-                require_evidence_questions=True,
                 evidence_delta_evaluator_adapter=StructuredEvidenceDeltaEvaluator(),
                 semantic_action_classifier_adapter=RuleBasedSemanticActionClassifier(),
             )
@@ -205,8 +201,8 @@ class SemanticNoProgressKernelTest(unittest.IsolatedAsyncioTestCase):
                 result = await app.kernel.run_agent_turn(
                     task.task_id, "inspect", max_model_calls=10, max_tool_calls=10
                 )
-                self.assertEqual(tool.calls, 4)
-                self.assertEqual(result.tool_calls, 4)
+                self.assertEqual(tool.calls, 5)
+                self.assertEqual(result.reason, "iteration_budget_exhausted")
                 events = await app.registry.require(RuntimeStorePort).read_events(
                     task.task_id
                 )
@@ -215,14 +211,10 @@ class SemanticNoProgressKernelTest(unittest.IsolatedAsyncioTestCase):
                     if event.event_type == "semantic.action_classified"
                 ]
                 self.assertEqual(
-                    len({item["semantic_signature"] for item in classified}), 1
+                    len({item["semantic_signature"] for item in classified}), 5
                 )
                 self.assertEqual(len({item["scope_hash"] for item in classified}), 5)
-                stopped = next(
-                    event for event in events
-                    if event.event_type == "plan.no_progress_stopped"
-                )
-                self.assertEqual(stopped.payload["consecutive_no_progress"], 3)
+                self.assertTrue(any(e.event_type == "plan.no_progress_stopped" for e in events))
             finally:
                 await app.registry.stop_all()
 

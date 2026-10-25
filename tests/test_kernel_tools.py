@@ -821,7 +821,6 @@ class DiscoverySearchScopeTest(unittest.IsolatedAsyncioTestCase):
             (docs / "teaching.md").write_text("# teaching\n", encoding="utf-8")
             application = compose_fixture_application(
                 tool_adapters=(CoreReadOnlyToolProvider(),),
-                require_evidence_questions=True,
             )
             await application.registry.start_all()
             try:
@@ -841,11 +840,6 @@ class DiscoverySearchScopeTest(unittest.IsolatedAsyncioTestCase):
                     ToolCall(
                         "find-docs", "core.find_files",
                         {"path": "codex-rs", "pattern": "**/docs/**", "limit": 50},
-                        EvidenceQuestion(
-                            "Q-doc-file",
-                            "does a teaching/interview system doc exist?",
-                            expected_scope="codex-rs/docs",
-                        ),
                     ),
                 )
 

@@ -9,6 +9,7 @@ dependencies = [
     "python-multipart==0.0.32",
     "uvicorn==0.30.6",
     "PyYAML>=6.0.2,<7",
+    "mcp[cli]>=1.12,<2",
 ]
 
 [project.optional-dependencies]

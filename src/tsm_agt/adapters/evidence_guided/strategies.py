@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
+from tsm_agt.core.exploration_identity import call_fingerprint
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, EvidenceInventory, EvidenceRelation,
     EvidenceRelationAssessment, EvidenceRelationAssessmentKind,
@@ -89,13 +90,7 @@ class BuiltinEvidenceRelationProvider(_Lifecycle):
         return tuple(relations)
     @staticmethod
     def _call_fingerprint(call: ToolCall) -> str:
-        payload = {
-            "tool_name": call.name,
-            "arguments": BuiltinEvidenceRelationProvider._canonical_arguments(
-                call.arguments
-            ),
-        }
-        return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        return call_fingerprint(call)
 
     @staticmethod
     def _canonical_arguments(arguments):

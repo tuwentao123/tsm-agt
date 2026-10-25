@@ -145,16 +145,19 @@ class CoreWorkingMemoryToolProvider:
                 message="working memory capability is unavailable",
             )
         try:
+            plan_changed = False
             if call.name == "core.working_memory_read":
                 data = await control.read()
             elif call.name == "core.working_memory_update":
                 state = call.arguments["state"]
                 if not isinstance(state, Mapping):
                     raise ValueError("working memory state must be an object")
+                current = await control.read()
                 data = await control.update(
                     int(call.arguments["expected_revision"]), state,
                     str(call.arguments["operation_id"]),
                 )
+                plan_changed = data.get("plan", []) != current.get("plan", [])
             else:
                 return ToolResult(
                     call.call_id, False, error_code="NOT_FOUND",
@@ -162,7 +165,7 @@ class CoreWorkingMemoryToolProvider:
                 )
             return ToolResult(
                 call.call_id, True, data=data,
-                meta={"runtime_internal_state": True},
+                meta={"runtime_internal_state": True, "plan_changed": plan_changed},
             )
         except (KeyError, TypeError, ValueError) as error:
             return ToolResult(

@@ -58,7 +58,11 @@ class RuntimeActionFact:
     failure_code: str = ""
     recovery_kind: str = ""
     execution_state: str = ""
+    stage: str = ""
+    requested_executable: str = ""
+    process_id: str = ""
     exit_code: int | None = None
+    output_observed: bool = False
     is_recognized_verification: bool = False
 
     @property
@@ -72,6 +76,19 @@ class RuntimeActionFact:
     @property
     def succeeded(self) -> bool:
         return self.effect_status is EffectStatus.SUCCEEDED
+
+    @property
+    def did_not_start_execution(self) -> bool:
+        """Whether an execute action has a Runtime-certified no-start result.
+
+        This is intentionally narrower than a failed action: it says nothing
+        about a dependency's global availability or a replacement command.
+        """
+
+        return (
+            self.effect is ToolEffect.EXECUTE
+            and self.execution_state == "not_started"
+        )
 
     @property
     def can_request_recovery(self) -> bool:
@@ -110,6 +127,12 @@ class RuntimeActionFact:
         }
         if self.execution_state:
             data["execution_state"] = self.execution_state
+        if self.stage:
+            data["stage"] = self.stage
+        if self.requested_executable:
+            data["requested_executable"] = self.requested_executable
+        if self.process_id:
+            data["process_id"] = self.process_id
         if self.failure_code:
             data["failure_code"] = self.failure_code
         if self.exit_code is not None:
@@ -193,6 +216,9 @@ def project_runtime_action_facts(
             ):
                 status = EffectStatus.UNKNOWN
             raw_exit_code = data.get("exit_code")
+            raw_process_id = data.get("process_id")
+            if not isinstance(raw_process_id, str) or not raw_process_id.strip():
+                raw_process_id = call.arguments.get("process_id")
             facts.append(RuntimeActionFact(
                 ordinal=len(facts),
                 call_id=call.call_id,
@@ -207,16 +233,61 @@ def project_runtime_action_facts(
                     if not result.ok else ""
                 ),
                 execution_state=str(data.get("execution_state", "")).strip(),
+                stage=str(data.get("stage", "")).strip(),
+                requested_executable=str(
+                    data.get("requested_executable", "")
+                ).strip(),
+                process_id=(
+                    raw_process_id.strip()
+                    if isinstance(raw_process_id, str) else ""
+                ),
                 exit_code=(
                     raw_exit_code if isinstance(raw_exit_code, int)
                     and not isinstance(raw_exit_code, bool) else None
                 ),
+                output_observed=data.get("output_observed") is True,
                 is_recognized_verification=(
                     call.name == "core.run_command"
                     and is_verification_request(call.arguments)
+                    # A command request is not a verification observation when
+                    # process preparation prevented any child from starting.
+                    # Keep this distinct from a check that ran and failed.
+                    and str(data.get("execution_state", "")).strip()
+                    != "not_started"
                 ),
             ))
     return tuple(facts)
+
+
+def failed_processes_without_output_observation(
+    facts: tuple[RuntimeActionFact, ...],
+) -> tuple[RuntimeActionFact, ...]:
+    """Return failed commands whose later stdout/stderr has not been observed.
+
+    This is a temporal projection over process identities only. It neither
+    inspects output content nor attributes a failure to a dependency, command,
+    or implementation defect. A terminal ``core.run_command`` result can
+    already carry that observation; ``core.process_wait`` and
+    ``core.process_logs`` remain later paths for running, legacy, unavailable,
+    or truncated output.
+    """
+
+    return tuple(
+        fact for fact in facts
+        if (
+            fact.tool_name == "core.run_command"
+            and fact.failed
+            and fact.process_id
+            and not fact.output_observed
+            and not any(
+                observation.ordinal > fact.ordinal
+                and observation.tool_name in {"core.process_logs", "core.process_wait"}
+                and observation.invocation_succeeded
+                and observation.process_id == fact.process_id
+                for observation in facts
+            )
+        )
+    )
 
 
 def latest_failed_delivery_action(

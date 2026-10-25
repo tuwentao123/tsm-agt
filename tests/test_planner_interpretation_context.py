@@ -134,13 +134,15 @@ class PlannerInterpretationContextTest(unittest.IsolatedAsyncioTestCase):
 
             # Authoritative: this Task's own request, and nothing else.
             self.assertEqual(
-                [item["text"] for item in session_plan["scoped_messages"]],
+                [item["text"] for item in session_plan["scoped_messages"]
+                 if item["role"] == "user"][-1:],
                 ["原因 直接写文档吧"],
             )
             # Interpretation-only: the exchange the request is answering.
             texts = [
                 item["text"] for item in session_plan["interpretation_context"]
-            ]
+            ] + [item["text"] for item in session_plan["scoped_messages"]
+                 if item["role"] == "assistant"]
             self.assertTrue(
                 any(OFFER in text for text in texts),
                 "the Planner must see the offer the user replied to",

@@ -39,7 +39,7 @@ class RecordingModelProvider(EchoModelProvider):
         frozenset({"text"}),
     )
 
-    def __init__(self, context_window: int = 4363) -> None:
+    def __init__(self, context_window: int = 16384) -> None:
         super().__init__()
         self.capabilities = ProviderCapabilities(context_window=context_window)
         self.requests: list[ModelRequest] = []
@@ -90,7 +90,7 @@ class ContextualResolver:
 class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
     async def make_client(
         self, root: Path, *, projector=None, context_manager=None,
-        context_window: int = 4363,
+        context_window: int = 16384,
     ):
         model = RecordingModelProvider(context_window)
         app = compose_fixture_application(
@@ -273,6 +273,7 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
                 projector=SessionContextProjector(
                     recent_visible_message_limit=64,
                 ),
+                context_window=4363,
             )
             session = await client.application.kernel.create_session("two-layers")
 

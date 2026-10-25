@@ -1,4 +1,8 @@
-"""Deterministic plan focus and repeated-action progress guard."""
+"""Plan focus observations and a repeated-action progress guard.
+
+Authored Todo statuses are not an execution boundary. A closed plan may still
+need verification, correction, reopening, or follow-up work in a later turn.
+"""
 
 from __future__ import annotations
 
@@ -101,9 +105,9 @@ class PlanGuard:
             )
         if memory.plan:
             return GoalSlice(
-                "plan-finished", "All explicit plan steps are finished or blocked",
-                "Do not start new tool work; report completed and blocked steps "
-                "using existing evidence.", False, True,
+                "plan-finished", "Recorded plan has no pending or in-progress steps",
+                "Reconcile recorded statuses with the latest request and observed "
+                "evidence; plan status alone does not end the turn.", False, True,
             )
         return GoalSlice(
             "implicit-goal", memory.goal,
@@ -170,6 +174,6 @@ class PlanGuard:
         )
         return PlanGuardDecision(
             goal_slice, signature, state_hash, count,
-            goal_slice.plan_finished or count >= self.no_progress_limit,
+            count >= self.no_progress_limit,
             semantic_signature, semantic_family, semantic_repeat,
         )
