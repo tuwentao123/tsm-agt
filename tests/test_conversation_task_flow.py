@@ -1,8 +1,9 @@
 """P0 behavior for conversation Tasks: one Task per Session, one Turn per input.
 
 These pin the facts-only routing contract: an idle conversation takes the next
-ordinary input as another turn, a running one is steered without asking a model,
-and only an explicit new-task intent creates a second Task.
+ordinary input as another turn, a running one is interrupted and restarted on
+the same Task without asking a model, and only an explicit new-task intent
+creates a second Task.
 """
 
 from __future__ import annotations
@@ -565,7 +566,7 @@ class ConversationTaskFlowTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
-    async def test_running_input_steers_without_a_model_judgement(self):
+    async def test_running_input_restarts_same_task_without_a_model_judgement(self):
         model = _BlockingEchoModel()
         judge = _SpyRelationJudge()
         application, client, root = await self._client(model=model, judge=judge)
@@ -574,11 +575,15 @@ class ConversationTaskFlowTest(unittest.IsolatedAsyncioTestCase):
             task_id = first["task"]["task_id"]
             await asyncio.wait_for(model.entered.wait(), timeout=5)
 
-            steered = dict((await self._send(
+            redirected = dict((await self._send(
                 client, root, "more context", input_id="i2"
             )).result)
             self.assertEqual(judge.calls, [])
-            self.assertIn(steered.get("kind"), {"steered", "continuation"})
+            self.assertEqual(redirected.get("kind"), "continuation")
+            self.assertEqual(
+                redirected.get("relation"), "INTERRUPT_AND_REDIRECT"
+            )
+            self.assertEqual(redirected.get("routed_task_id"), task_id)
 
             model.release.set()
             await client.wait_task(task_id, timeout=5)

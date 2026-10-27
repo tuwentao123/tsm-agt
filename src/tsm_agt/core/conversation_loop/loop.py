@@ -379,6 +379,15 @@ class ConversationAgentLoop:
                     )
                     return outcome
                 await self._record_new_tool_results(state, message_count_before)
+            # ``run_tool_batch`` drains an assistant batch atomically. Only once
+            # it has closed may a queued explicit STEER/REPLACE enter the model
+            # transcript; doing it inside the batch would let it split sibling
+            # tool calls. This is also the normal boundary before the next
+            # sample, so a steer queued while a tool was running is now
+            # guaranteed to be observable by that next sample.
+            await self._apply_pending_steering_at_boundary(
+                state, "before-model"
+            )
             if state.model_call_count >= state.checkpoint.max_model_calls:
                 return await self._finalizer.persist_partial_boundary(
                     state, ITERATION_BUDGET_EXHAUSTED
@@ -465,6 +474,19 @@ class ConversationAgentLoop:
             state.model_call_count += 1
             state.input_tokens += response.usage.input_tokens
             state.output_tokens += response.usage.output_tokens
+
+            # The model response has not been exposed or made conversational
+            # history yet. If explicit steering arrived while this sample was in
+            # flight, discard that stale candidate and sample again with the
+            # durable steering message. Previously this no-tool path went
+            # straight to finalization, so the Runtime claimed "steered" while
+            # the model never received the input.
+            if not parsed_calls and await self._apply_pending_steering_at_boundary(
+                state, "before-finalization"
+            ):
+                await self._record_superseded_model_response(state)
+                continue
+
             state.messages.append(response.message)
             accepted_batch = (
                 await kernel._new_tool_batch(
@@ -616,6 +638,17 @@ class ConversationAgentLoop:
                         state, review, source="completion_reviewer"
                     )
                     continue
+                # Completion review may itself take time. Run the same durable
+                # boundary immediately before committing the answer, and remove
+                # the unshown candidate if a steer arrived in that interval.
+                if state.messages and state.messages[-1] == response.message:
+                    state.messages.pop()
+                if await self._apply_pending_steering_at_boundary(
+                    state, "before-finalization-commit"
+                ):
+                    await self._record_superseded_model_response(state)
+                    continue
+                state.messages.append(response.message)
                 await self._finalization.persist_finalization_state(
                     state, "conversation-loop-text-completion"
                 )
@@ -646,6 +679,49 @@ class ConversationAgentLoop:
                 state.checkpoint, "conversation-loop-model-response"
             )
             state.pending_tool_calls = list(parsed_calls)
+
+    async def _apply_pending_steering_at_boundary(
+        self, state: TurnState, safe_point: str,
+    ) -> bool:
+        """Project accepted steering into the next model-visible transcript.
+
+        ``queue_steering`` is intentionally asynchronous to tool/model work.
+        This helper is the single conversation-loop drain point for the
+        corresponding durable queue. It carries all in-flight accounting into
+        the checkpoint before the Kernel atomically applies the queued input.
+        """
+
+        previous_sequence = state.checkpoint.last_steering_inbound_sequence
+        state.checkpoint, _ = await self._kernel._apply_pending_steering(
+            replace(
+                state.checkpoint,
+                messages=tuple(state.messages),
+                pending_tool_calls=tuple(state.pending_tool_calls),
+                seen_call_ids=tuple(sorted(state.seen_call_ids)),
+                model_calls=state.model_call_count,
+                tool_calls=state.tool_call_count,
+                input_tokens=state.input_tokens,
+                output_tokens=state.output_tokens,
+            ),
+            safe_point,
+        )
+        state.messages = list(state.checkpoint.messages)
+        state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
+        return (
+            state.checkpoint.last_steering_inbound_sequence
+            > previous_sequence
+        )
+
+    async def _record_superseded_model_response(self, state: TurnState) -> None:
+        """Leave an audit fact when an unshown sample lost to user steering."""
+
+        await self._kernel._append_events(state.task_id, ((
+            "turn.model_response_superseded", {
+                "turn_id": state.turn_id,
+                "model_call": state.model_call_count,
+                "reason_code": "steering_applied_before_finalization",
+            },
+        ),))
 
     async def _record_new_tool_results(
         self, state: TurnState, message_count_before: int,

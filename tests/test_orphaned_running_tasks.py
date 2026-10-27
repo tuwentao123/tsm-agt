@@ -22,6 +22,7 @@ from tsm_agt.bootstrap import (
     compose_fixture_application, compose_local_flow_query_application,
 )
 from tsm_agt.core import (
+    RuntimeInputIntent,
     SessionContinuationDecision, SessionContinuationMode, SessionResumeSafety,
     TaskState,
 )
@@ -247,6 +248,7 @@ class OrphanedActiveTaskInputTest(unittest.IsolatedAsyncioTestCase):
 
             await client.submit_user_input(
                 session.session_id, "排队中的指令", input_id="receipt-1",
+                explicit_intent=RuntimeInputIntent.STEER,
             )
 
             receipt = await client.get_task_result(task.task_id)
@@ -268,7 +270,7 @@ class OrphanedActiveTaskInputTest(unittest.IsolatedAsyncioTestCase):
             expired = await client.get_task_result(task.task_id)
             self.assertEqual(expired.pending_steering, ())
 
-    async def test_running_task_with_a_live_turn_is_still_steered(self) -> None:
+    async def test_running_task_with_a_live_turn_restarts_same_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             client = await self.make_client(root)
@@ -288,9 +290,11 @@ class OrphanedActiveTaskInputTest(unittest.IsolatedAsyncioTestCase):
                 session.session_id, "补充一句", input_id="live-input-1",
             )
 
-            self.assertEqual(result.result.get("kind"), "steered")
-            current = await client.application.kernel.get_task(task.task_id)
-            self.assertIs(current.state, TaskState.EXECUTING)
+            self.assertEqual(result.result.get("kind"), "continuation")
+            self.assertEqual(
+                result.result.get("relation"), "INTERRUPT_AND_REDIRECT"
+            )
+            self.assertEqual(result.result.get("routed_task_id"), task.task_id)
 
 
     async def test_task_being_started_is_not_settled_as_an_orphan(self) -> None:

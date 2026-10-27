@@ -265,6 +265,15 @@ class EngineeringAgentClient:
         self._poll_interval = poll_interval
         self._application: Application | None = None
         self._run_tasks: dict[str, asyncio.Task[RuntimeTaskResult]] = {}
+        # A redirect worker occupies the ordinary runner slot while it waits for
+        # the cancelled Turn to settle, then starts the next Turn on *that same*
+        # conversation Task. Keeping this separate marker lets a later input
+        # replace an as-yet-unstarted next Turn without mistaking it for an
+        # orphaned Task.
+        self._redirect_runners: dict[str, asyncio.Task[RuntimeTaskResult]] = {}
+        self._redirect_wait_targets: dict[
+            str, asyncio.Task[RuntimeTaskResult] | None
+        ] = {}
         self._latest_results: dict[str, RuntimeTaskResult] = {}
         self._progress_history: dict[str, list[RuntimeProgressEnvelope]] = {}
         self._progress_sequences: dict[str, int] = {}
@@ -301,9 +310,25 @@ class EngineeringAgentClient:
             except (LookupError, RuntimeError, ValueError):
                 pass
             runner.cancel()
-        if self._run_tasks:
-            await asyncio.gather(*self._run_tasks.values(), return_exceptions=True)
+        # A redirect worker shields the cancelled predecessor while it waits so
+        # a newer input cannot accidentally cancel the predecessor's cleanup.
+        # Client shutdown is different: it must cancel and await both layers.
+        retired_runners = tuple(
+            runner for runner in self._redirect_wait_targets.values()
+            if runner is not None
+        )
+        for runner in retired_runners:
+            if not runner.done():
+                runner.cancel()
+        all_runners = {
+            *self._run_tasks.values(),
+            *retired_runners,
+        }
+        if all_runners:
+            await asyncio.gather(*all_runners, return_exceptions=True)
         self._run_tasks.clear()
+        self._redirect_runners.clear()
+        self._redirect_wait_targets.clear()
         if self._application is not None:
             await self._application.registry.stop_all()
             self._application = None
@@ -364,10 +389,7 @@ class EngineeringAgentClient:
                     self._run_submitted_task(task.task_id, goal, images=images),
                     name=f"tsm-agt-sdk-{task.task_id}",
                 )
-                self._run_tasks[task.task_id] = runner
-                runner.add_done_callback(
-                    lambda _done, task_id=task.task_id: self._runner_finished(task_id)
-                )
+                self._register_runner(task.task_id, runner)
         return await self.get_task_result(task.task_id)
 
     async def _start_task_turn(
@@ -395,10 +417,7 @@ class EngineeringAgentClient:
                     ),
                     name=f"tsm-agt-sdk-turn-{task_id}",
                 )
-                self._run_tasks[task_id] = runner
-                runner.add_done_callback(
-                    lambda _done, tid=task_id: self._runner_finished(tid)
-                )
+                self._register_runner(task_id, runner)
         # Report the turn as started, not the conversation's idle state it is
         # leaving: a caller (the Web UI) that sees AWAITING_INPUT would treat
         # the accepted turn as "waiting for input" and never follow it. The turn
@@ -448,6 +467,43 @@ class EngineeringAgentClient:
         resolved_workspace = workspace or self.workspace
 
         async def execute() -> SessionTextResult:
+            # Lightweight slash-command support for steering on the currently
+            # selected Task. This relies on the caller passing
+            # ``shadow_explicit_task_id`` when a Task is active in the UI.
+            if normalized.startswith("/steer ") and shadow_explicit_task_id:
+                steering_text = normalized[len("/steer ") :].strip()
+                if not steering_text:
+                    raise ValueError("/steer command requires non-empty text")
+                await self.application.kernel.dispatch_input_event(
+                    RuntimeTextInput(
+                        shadow_explicit_task_id,
+                        steering_text,
+                        command_id,
+                        explicit_intent=RuntimeInputIntent.STEER,
+                        fallback_intent=RuntimeInputIntent.STEER,
+                    )
+                )
+                task = await self.get_task_result(shadow_explicit_task_id)
+                return SessionTextResult(
+                    command_id,
+                    "continuation",
+                    {
+                        "disposition": "RESUME_TASK",
+                        "relation": "CONTINUE",
+                        "source_task_id": shadow_explicit_task_id,
+                        "resolved_goal": None,
+                        "confidence": 1.0,
+                        "reason_code": "slash-steer",
+                        "input_grounding": "CONTEXT_DEPENDENT",
+                        "clarification": None,
+                        "resolver_version": "slash-steer-v1",
+                        "candidates": (),
+                        "task_catalog": (),
+                        "candidate_task_ids": (),
+                    },
+                    task=task,
+                )
+
             decision = await self.application.kernel.dispatch_input_event(
                 SessionTextInput(
                     session_id,
@@ -802,19 +858,29 @@ class EngineeringAgentClient:
                 session_id, text, input_id, explicit_intent, active,
                 image_blocks, workspace,
             )
-        # (2) Attachments: steering is text-only, so a running turn cannot take
-        #     them and they start a fresh work item. An idle conversation can:
-        #     its next turn carries the images.
+        # (2) A prior input may already have stopped this conversation and
+        #     scheduled its next Turn. A newer ordinary input mechanically
+        #     replaces that not-yet-started Turn; it does not create another
+        #     Task and does not ask a model to interpret either message.
+        if active is not None and self._has_pending_redirect(active.task_id):
+            return await self._interrupt_and_redirect(
+                text, input_id, active, image_blocks,
+                reason="default_redirect_replaces_pending_turn",
+            )
+
+        # (3) Attachments take the same fresh-Turn path as ordinary text when a
+        #     conversation is running. They remain structured blocks on that
+        #     Turn rather than forcing an unrelated work item.
         if image_blocks:
             if active is not None and active.state in self._RUNNING_TASK_STATES:
-                return await self._delegate_session_text(
-                    session_id, text, input_id, image_blocks, workspace, None,
-                    shadow_new_task_requested=True,
+                return await self._interrupt_and_redirect(
+                    text, input_id, active, image_blocks,
+                    reason="default_interrupt_and_redirect",
                 )
             return await self._delegate_session_text(
                 session_id, text, input_id, image_blocks, workspace, None,
             )
-        # (3) Waiting for the user: never reinterpret plain text as a new topic --
+        # (4) Waiting for the user: never reinterpret plain text as a new topic --
         #     unless the pending action can no longer be produced. Refusing then
         #     would wedge the Session on a question nothing can answer, so the
         #     ordinary routing below decides instead (rule 5).
@@ -836,17 +902,17 @@ class EngineeringAgentClient:
                 ),
                 routed_task_id=active.task_id,
             ).to_data())
-        # (4) A running Task: an ordinary input steers it. The relation is never
-        #     guessed from the text; an explicit intent is the only way to ask
-        #     for replace or stop (rule 1). _settle_if_orphaned above has already
-        #     turned a claimed-but-dead EXECUTING Task into a resumable one, so
-        #     reaching here with a running state means a live turn exists.
+        # (5) A running Task: an ordinary input deterministically interrupts its
+        #     current Turn and starts the next Turn on the same conversation
+        #     Task. This is a lifecycle rule, not a judgement about whether the
+        #     text is related. Clients that intentionally want safe-boundary
+        #     injection can still name the explicit STEER intent.
         if active is not None and active.state in self._RUNNING_TASK_STATES:
-            return await self._steer_active(
-                text, input_id, active, SessionInputRelation.SUPPLEMENT,
-                "default_steer_while_running", RuntimeInputIntent.STEER,
+            return await self._interrupt_and_redirect(
+                text, input_id, active, image_blocks,
+                reason="default_interrupt_and_redirect",
             )
-        # (5) No running Task: existing Session routing creates/answers/clarifies.
+        # (6) No running Task: existing Session routing creates/answers/clarifies.
         return await self._delegate_session_text(
             session_id, text, input_id, image_blocks, workspace, None,
         )
@@ -876,6 +942,14 @@ class EngineeringAgentClient:
 
         runner = self._run_tasks.get(task_id)
         return runner is not None and not runner.done()
+
+    def _has_pending_redirect(self, task_id: str) -> bool:
+        runner = self._redirect_runners.get(task_id)
+        return (
+            runner is not None
+            and not runner.done()
+            and task_id in self._redirect_wait_targets
+        )
 
     async def _settle_if_orphaned(self, task_id: str) -> bool:
         """Settle ``task_id`` when nothing is running it, else leave it alone.
@@ -915,6 +989,126 @@ class EngineeringAgentClient:
             "routed_task_id": active.task_id,
             "task": task.to_data(),
         })
+
+    async def _interrupt_and_redirect(
+        self,
+        text: str,
+        input_id: str,
+        active: TaskSnapshot,
+        images: tuple[ImageBlock, ...],
+        *,
+        reason: str,
+    ) -> RuntimeCommandResult:
+        """Stop the active Turn and schedule the next Turn on the same Task.
+
+        The acknowledgement is immediate. The replacement runner waits for the
+        cancelled runner to leave its cancellation scope before invoking
+        ``start_fresh_conversation_turn``; starting it earlier would race the
+        old runner and can drop the new input. No workspace mutation is rolled
+        back: cancellation only prevents unfinished work from continuing.
+        """
+
+        predecessor = self._run_tasks.get(active.task_id)
+        # Once the redirect worker has entered (or is immediately about to
+        # enter) a real Turn, the current worker itself is the barrier. Before
+        # then, retain the original cancelled runner as the barrier even when
+        # replacing an unstarted redirect.
+        prior_barrier = self._redirect_wait_targets.get(active.task_id)
+        wait_target = (
+            predecessor
+            if (
+                active.state in self._RUNNING_TASK_STATES
+                or (
+                    predecessor is self._redirect_runners.get(active.task_id)
+                    and (prior_barrier is None or prior_barrier.done())
+                )
+            )
+            else prior_barrier or predecessor
+        )
+        if active.state in self._RUNNING_TASK_STATES:
+            try:
+                await self.interrupt(
+                    active.task_id,
+                    command_id=f"{input_id}:interrupt",
+                    reason="superseded by a newer user message",
+                )
+            except (RuntimeError, ValueError):
+                # Completion can win this small race. The successor still waits
+                # for the observed runner, then starts only if the Task reached
+                # a restartable conversation state.
+                pass
+        elif predecessor is not None and not predecessor.done():
+            # The previous redirect has not started its model Turn yet. Supersede
+            # its local worker, but shield its predecessor so the original
+            # cancellation remains owned by the first redirect request.
+            predecessor.cancel()
+
+        task = await self._schedule_redirected_turn(
+            active.task_id, text, images, wait_target
+        )
+        return RuntimeCommandResult(input_id, False, {
+            "kind": "continuation",
+            "relation": "INTERRUPT_AND_REDIRECT",
+            "reason_code": reason,
+            "applied": True,
+            "routed_task_id": active.task_id,
+            "task": task.to_data(),
+        })
+
+    async def _schedule_redirected_turn(
+        self,
+        task_id: str,
+        text: str,
+        images: tuple[ImageBlock, ...],
+        predecessor: asyncio.Task[RuntimeTaskResult] | None,
+    ) -> RuntimeTaskResult:
+        """Publish a successor runner before waiting, so input stays live."""
+
+        async with self._submit_lock:
+            runner = asyncio.create_task(
+                self._run_redirected_turn(task_id, text, images, predecessor),
+                name=f"tsm-agt-sdk-redirect-{task_id}",
+            )
+            self._redirect_runners[task_id] = runner
+            self._redirect_wait_targets[task_id] = predecessor
+            self._register_runner(task_id, runner)
+        return await self.get_task_result(task_id)
+
+    async def _run_redirected_turn(
+        self,
+        task_id: str,
+        text: str,
+        images: tuple[ImageBlock, ...],
+        predecessor: asyncio.Task[RuntimeTaskResult] | None,
+    ) -> RuntimeTaskResult:
+        """Wait out one cancelled runner, then take exactly one fresh Turn."""
+
+        if predecessor is not None:
+            try:
+                await asyncio.shield(predecessor)
+            except asyncio.CancelledError:
+                # A cancelled predecessor is the normal redirect outcome. A
+                # cancellation of *this* worker instead means an even newer
+                # input superseded it and must propagate to its own successor.
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+            except Exception:
+                # ``_run_submitted_task`` has already recorded the old runner's
+                # failure. Its successor must still be allowed to start a fresh
+                # conversation turn.
+                pass
+
+        current = await self.application.kernel.get_task(task_id)
+        if current.task_kind is not TaskKind.CONVERSATION:
+            return await self.get_task_result(task_id)
+        if current.state not in {
+            TaskState.INTERRUPTED, TaskState.CONFLICT, TaskState.AWAITING_INPUT,
+        }:
+            # Another lifecycle operation won the race. Do not start a second
+            # model Turn against that Task; the durable state is authoritative.
+            return await self.get_task_result(task_id)
+        return await self._run_submitted_task(task_id, text, images=images)
 
     async def _stop_active_task(self, task_id: str, input_id: str) -> None:
         task = await self._active_task(task_id)
@@ -1330,8 +1524,28 @@ class EngineeringAgentClient:
                 except TimeoutError:
                     return
 
-    def _runner_finished(self, task_id: str) -> None:
-        self._run_tasks.pop(task_id, None)
+    def _register_runner(
+        self, task_id: str, runner: asyncio.Task[RuntimeTaskResult],
+    ) -> None:
+        """Install a runner with identity-safe cleanup.
+
+        A redirect replaces a cancelled runner in the registry before its done
+        callback fires. The old callback must never remove the replacement.
+        """
+
+        self._run_tasks[task_id] = runner
+        runner.add_done_callback(
+            lambda done, tid=task_id: self._runner_finished(tid, done)
+        )
+
+    def _runner_finished(
+        self, task_id: str, finished: asyncio.Task[RuntimeTaskResult],
+    ) -> None:
+        if self._run_tasks.get(task_id) is finished:
+            self._run_tasks.pop(task_id, None)
+        if self._redirect_runners.get(task_id) is finished:
+            self._redirect_runners.pop(task_id, None)
+            self._redirect_wait_targets.pop(task_id, None)
         # done callbacks can run after close() has released the application.
         if self._application is not None:
             self._store().notify(task_id)

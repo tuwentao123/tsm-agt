@@ -749,10 +749,12 @@ function updateComposerButtonState() {
   const active = getActiveConversation();
   const activeTaskId = active?.activeTaskId || null;
   const activeTask = activeTaskId && taskMessage(active.id, activeTaskId)?.task;
-  const taskIsRunning = activeTask && ['PREPARING', 'RUNNING'].includes(activeTask.phase1State);
   let runningTurn = null;
 
-  if (active && activeTaskId && taskIsRunning && active.turnCalls instanceof Map) {
+  // 从 authoritative Session 的 turnCalls 判断是否存在未结算的 turn，
+  // 不再依赖 Task.phase1State 是否已经更新为 PREPARING/RUNNING，避免
+  // 在新一轮会话刚开始、状态仍为 AWAITING_INPUT/WAITING 时短暂隐藏取消按钮。
+  if (active && activeTaskId && active.turnCalls instanceof Map) {
     active.turnCalls.forEach((turn) => {
       if (!turn || turn.task_id !== activeTaskId) return;
       // A settled Turn has completed; cancellation only applies to an
@@ -3462,14 +3464,26 @@ async function runTask() {
   diagnoseNextInput = false;
   document.getElementById('diagnostic-toggle').textContent = '诊断下一轮';
   try {
+    const activeConversation = getConversationById(conversationId);
+    const activeTaskId = activeConversation?.activeTaskId || null;
+    let intent = null;
+    let routedText = prompt;
+    if (prompt.startsWith('/steer ')) {
+      intent = 'STEER';
+      const trimmed = prompt.slice('/steer '.length).trim();
+      // 为空时保留原始文本，避免完全丢失用户输入。
+      if (trimmed) routedText = trimmed;
+    }
     const response = await fetch('/session-input', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
-        text: prompt,
+        text: routedText,
         request_id: requestId,
         workspace_id: workspaceId,
         session_id: conversationId,
+        target_task_id: activeTaskId,
+        intent,
         reasoning_effort: reasoningEffort,
         diagnose_request: diagnosticRequested,
         images,
@@ -4374,41 +4388,270 @@ async function loadWorkspaces() {
   renderMessages();
 }
 
-const promptComposer = document.getElementById('prompt');
+let promptComposer = null;
 let imeComposing = false;
 
-if (promptComposer) {
-  promptComposer.addEventListener('input', () => {
-    persistActiveDraft();
-  });
+// 简单的斜杠命令联想菜单：在输入框前缀为 "/" 时弹出可选命令列表。
+// 只做前端提示与前缀填充，不改变现有 /steer 路由和 Runtime 逻辑。
+const slashCommands = [
+  { prefix: '/steer ', label: '/steer <补充要求>', description: '补充当前运行中的 Task 偏好或约束' },
+  { prefix: '/queue ', label: '/queue <后续任务>', description: '在当前 Task 完成后排队一个新的任务' },
+  { prefix: '/redirect ', label: '/redirect <新目标>', description: '替换当前 Task 目标，保留已提交修改与工具结果' },
+  { prefix: '/followup ', label: '/followup steer|queue|auto', description: '固定或恢复运行中输入的默认模式' },
+];
 
-  promptComposer.addEventListener('compositionstart', () => {
-    imeComposing = true;
-  });
+let slashMenuElement = null;
+let slashMenuActiveIndex = -1;
 
-  promptComposer.addEventListener('compositionend', () => {
-    imeComposing = false;
-    persistActiveDraft();
-  });
+function ensureSlashMenu() {
+  if (slashMenuElement) return slashMenuElement;
+  const menu = document.createElement('div');
+  menu.id = 'slash-command-menu';
+  menu.style.position = 'absolute';
+  menu.style.zIndex = '30';
+  menu.style.background = 'white';
+  menu.style.border = '1px solid #e5e7eb';
+  menu.style.boxShadow = '0 4px 12px rgba(15,23,42,0.12)';
+  menu.style.borderRadius = '8px';
+  menu.style.padding = '4px 0';
+  menu.style.fontSize = '13px';
+  menu.style.minWidth = '240px';
+  menu.style.maxHeight = '240px';
+  menu.style.overflowY = 'auto';
+  menu.style.display = 'none';
 
-  promptComposer.addEventListener('keydown', (event) => {
-    const composing = imeComposing || event.isComposing || event.keyCode === 229;
-
-    if (event.key !== 'Enter' || composing) {
-      return;
-    }
-
-    if (event.shiftKey) {
-      return;
-    }
-
-    event.preventDefault();
-    persistActiveDraft();
-    runTask();
-  });
-} else {
-  console.error('未找到消息输入框，仍继续加载工作区与会话。');
+  document.body.appendChild(menu);
+  slashMenuElement = menu;
+  return menu;
 }
+
+function hideSlashMenu() {
+  if (!slashMenuElement) return;
+  slashMenuElement.style.display = 'none';
+  slashMenuActiveIndex = -1;
+}
+
+function renderSlashMenu(anchorInput) {
+  const menu = ensureSlashMenu();
+  menu.innerHTML = '';
+  slashMenuActiveIndex = -1;
+
+  slashCommands.forEach((command, index) => {
+    const item = document.createElement('div');
+    item.style.padding = '6px 10px';
+    item.style.cursor = 'pointer';
+    item.style.display = 'flex';
+    item.style.flexDirection = 'column';
+    item.style.gap = '2px';
+    item.dataset.index = String(index);
+
+    const title = document.createElement('div');
+    title.textContent = command.label;
+    title.style.fontFamily = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+    title.style.fontSize = '12px';
+    title.style.color = '#0f172a';
+
+    const desc = document.createElement('div');
+    desc.textContent = command.description;
+    desc.style.color = '#64748b';
+
+    item.appendChild(title);
+    item.appendChild(desc);
+
+    item.addEventListener('mouseenter', () => {
+      highlightSlashMenuItem(index);
+    });
+
+    item.addEventListener('mousedown', (event) => {
+      // 使用 mousedown 提前阻止失焦，再由 click 行为完成填充。
+      event.preventDefault();
+    });
+
+    item.addEventListener('click', () => {
+      applySlashCommand(command, anchorInput);
+    });
+
+    menu.appendChild(item);
+  });
+
+  const rect = anchorInput.getBoundingClientRect();
+  menu.style.left = `${rect.left}px`;
+  // 默认在输入框下方显示菜单。
+  let top = rect.bottom + 4;
+  menu.style.top = `${top}px`;
+  menu.style.display = 'block';
+
+  // 如果下方空间不足，自动改为显示在输入框上方，并做简单的视口边界收紧。
+  const menuRect = menu.getBoundingClientRect();
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || menuRect.bottom;
+  if (top + menuRect.height > viewportHeight - 8) {
+    top = rect.top - menuRect.height - 4;
+    if (top < 8) {
+      top = 8;
+    }
+    menu.style.top = `${top}px`;
+  }
+}
+
+function highlightSlashMenuItem(index) {
+  if (!slashMenuElement) return;
+  const children = Array.from(slashMenuElement.children);
+  children.forEach((child, i) => {
+    const el = child;
+    if (!(el instanceof HTMLElement)) return;
+    if (i === index) {
+      el.style.background = '#f1f5f9';
+    } else {
+      el.style.background = 'transparent';
+    }
+  });
+  slashMenuActiveIndex = index;
+}
+
+function moveSlashMenuSelection(delta) {
+  if (!slashMenuElement || slashMenuElement.style.display === 'none') return;
+  const total = slashCommands.length;
+  if (total === 0) return;
+  let next = slashMenuActiveIndex;
+  if (next < 0) {
+    next = delta > 0 ? 0 : total - 1;
+  } else {
+    next = (next + delta + total) % total;
+  }
+  highlightSlashMenuItem(next);
+}
+
+function applySlashCommand(command, input) {
+  const prefix = command.prefix;
+  const value = input.value;
+  const selectionStart = input.selectionStart ?? 0;
+  const selectionEnd = input.selectionEnd ?? selectionStart;
+  const isAtPrefix = selectionStart <= 1 && selectionEnd <= 1 && value.startsWith('/');
+
+  let nextValue;
+  let cursorPos;
+  if (isAtPrefix) {
+    // 直接用完整命令替换单个 "/"。
+    nextValue = prefix;
+    cursorPos = prefix.length;
+  } else {
+    // 在当前位置插入命令前缀。
+    nextValue = value.slice(0, selectionStart) + prefix + value.slice(selectionEnd);
+    cursorPos = selectionStart + prefix.length;
+  }
+
+  input.value = nextValue;
+  input.selectionStart = cursorPos;
+  input.selectionEnd = cursorPos;
+  persistActiveDraft();
+  hideSlashMenu();
+}
+ 
+// 等页面 DOM 就绪后再绑定到真正的输入框，避免脚本在 textarea 挂载前执行导致 promptComposer 为空。
+window.addEventListener('DOMContentLoaded', () => {
+  promptComposer = document.getElementById('prompt');
+
+  if (promptComposer) {
+    promptComposer.addEventListener('input', () => {
+      persistActiveDraft();
+
+      // 文本层级触发斜杠菜单：只要当前内容以 "/" 开头，就弹出联想列表。
+      const value = promptComposer.value;
+
+      if (value.startsWith('/')) {
+        renderSlashMenu(promptComposer);
+      } else {
+        // 离开斜杠前缀时自动收起菜单，避免一直占屏。
+        hideSlashMenu();
+      }
+    });
+
+    promptComposer.addEventListener('compositionstart', () => {
+      imeComposing = true;
+    });
+
+    promptComposer.addEventListener('compositionend', () => {
+      imeComposing = false;
+      persistActiveDraft();
+    });
+
+    promptComposer.addEventListener('keydown', (event) => {
+      const composing = imeComposing || event.isComposing || event.keyCode === 229;
+
+      // 输入 "/" 时弹出斜杠命令联想菜单。
+      if (event.key === '/' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        const value = promptComposer.value;
+        const selectionStart = promptComposer.selectionStart ?? 0;
+        const selectionEnd = promptComposer.selectionEnd ?? selectionStart;
+        const isPrefix = selectionStart <= 1 && selectionEnd <= 1;
+        const startsWithSlash = value.startsWith('/');
+        if (isPrefix || startsWithSlash) {
+          setTimeout(() => {
+            renderSlashMenu(promptComposer);
+          }, 0);
+        }
+        return;
+      }
+
+      // 斜杠命令补全：在输入框开头输入 "/s"，按 Tab 自动扩展成 "/steer "。
+      if (event.key === 'Tab' && !composing) {
+        const value = promptComposer.value;
+        const selectionStart = promptComposer.selectionStart ?? 0;
+        const selectionEnd = promptComposer.selectionEnd ?? selectionStart;
+        const isPrefix = selectionStart <= 2 && selectionEnd <= 2;
+        if (value.startsWith('/s') && isPrefix) {
+          event.preventDefault();
+          const completed = '/steer ';
+          promptComposer.value = completed + value.slice(2);
+          const cursor = completed.length;
+          promptComposer.selectionStart = cursor;
+          promptComposer.selectionEnd = cursor;
+          persistActiveDraft();
+          return;
+        }
+        return;
+      }
+
+      // 斜杠菜单中使用方向键与 Enter 选择命令。
+      if (!composing && slashMenuElement && slashMenuElement.style.display === 'block') {
+        if (event.key === 'ArrowDown') {
+          event.preventDefault();
+          moveSlashMenuSelection(1);
+          return;
+        }
+        if (event.key === 'ArrowUp') {
+          event.preventDefault();
+          moveSlashMenuSelection(-1);
+          return;
+        }
+        if (event.key === 'Enter' && slashMenuActiveIndex >= 0) {
+          event.preventDefault();
+          const command = slashCommands[slashMenuActiveIndex];
+          if (command) applySlashCommand(command, promptComposer);
+          return;
+        }
+        if (event.key === 'Escape') {
+          hideSlashMenu();
+          return;
+        }
+      }
+
+      // 保持原有 Enter 发送逻辑：在非组合态、非 Shift 的情况下发送任务。
+      if (event.key !== 'Enter' || composing) {
+        return;
+      }
+      if (event.shiftKey) {
+        return;
+      }
+
+      event.preventDefault();
+      persistActiveDraft();
+      runTask();
+    });
+  } else {
+    console.error('未找到消息输入框，仍继续加载工作区与会话。');
+  }
+});
 
 async function loadDiagnostics() {
   try {
@@ -4925,6 +5168,12 @@ async def submit_session_input(payload: dict, request: Request = None) -> dict:
     session_id = str(payload.get("session_id", "")).strip()
     request_id = str(payload.get("request_id", "")).strip()
     text = str(payload.get("text", "")).strip()
+    target_task_id_raw = payload.get("target_task_id")
+    target_task_id = (
+        str(target_task_id_raw).strip() or None
+        if target_task_id_raw is not None
+        else None
+    )
     reasoning_effort_raw = payload.get("reasoning_effort")
     reasoning_effort = (
         str(reasoning_effort_raw).strip().lower()
@@ -4984,8 +5233,13 @@ async def submit_session_input(payload: dict, request: Request = None) -> dict:
         token = turn_request_diagnostics.activate(diagnostic_key) if diagnostic_key else None
         try:
             return await runtime_server._client.submit_user_input(
-                session_id, text, input_id=request_id, explicit_intent=intent,
-                images=tuple(image_blocks), workspace=Path(workspace['path']),
+                session_id,
+                text,
+                input_id=request_id,
+                explicit_intent=intent,
+                target_task_id=target_task_id,
+                images=tuple(image_blocks),
+                workspace=Path(workspace['path']),
                 reasoning_effort=reasoning_effort,
             )
         finally:
