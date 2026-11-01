@@ -1,31 +1,9 @@
-"""Configurable, project-local limits for evidence-gathering exploration."""
+"""Configurable limits for evidence-gathering exploration."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
-
-
-EXPLORATION_ENV_NAMES = (
-    "TSM_AGT_EXPLORATION_PROFILE",
-    "TSM_AGT_AGENT_MAX_MODEL_CALLS",
-    "TSM_AGT_AGENT_MAX_TOOL_CALLS",
-    "TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS",
-    "TSM_AGT_AGENT_EXECUTION_RESERVE_MODEL_CALLS",
-    "TSM_AGT_AGENT_RECOVERY_RESERVE_MODEL_CALLS",
-    "TSM_AGT_AGENT_VERIFICATION_RESERVE_MODEL_CALLS",
-    "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_INCREMENTS",
-    "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_MAX_COUNT",
-    "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_ABSOLUTE_LIMIT",
-    "TSM_AGT_AGENT_MODEL_CALL_RENEWAL_THRESHOLD",
-    "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS",
-    "TSM_AGT_EXPLORATION_MAX_ACTIONS",
-    "TSM_AGT_EXPLORATION_MAX_TOOL_SECONDS",
-    "TSM_AGT_EXPLORATION_LOW_VALUE_STREAK",
-    "TSM_AGT_EXPLORATION_RESERVE_TOOL_CALLS",
-    "TSM_AGT_EXPLORATION_MIN_ACTIONS",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,8 +45,8 @@ class ExplorationBudgetConfiguration:
             raise ValueError("exploration budget values must be positive integers")
         if self.finalization_model_calls >= self.agent_max_model_calls:
             raise ValueError(
-                "TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS must be smaller than "
-                "TSM_AGT_AGENT_MAX_MODEL_CALLS"
+                "agent.finalization_model_calls must be smaller than "
+                "agent.max_model_calls"
             )
         if (
             self.finalization_model_calls
@@ -83,22 +61,22 @@ class ExplorationBudgetConfiguration:
             )
         if self.max_tool_calls > self.agent_max_tool_calls:
             raise ValueError(
-                "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS must not exceed "
-                "TSM_AGT_AGENT_MAX_TOOL_CALLS"
+                "exploration.max_tool_calls must not exceed "
+                "agent.max_tool_calls"
             )
         if self.reserve_tool_calls >= self.max_tool_calls:
             raise ValueError(
-                "TSM_AGT_EXPLORATION_RESERVE_TOOL_CALLS must be smaller than "
-                "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS"
+                "exploration.reserve_tool_calls must be smaller than "
+                "exploration.max_tool_calls"
             )
         if self.minimum_actions > self.max_actions:
             raise ValueError(
-                "TSM_AGT_EXPLORATION_MIN_ACTIONS must not exceed "
-                "TSM_AGT_EXPLORATION_MAX_ACTIONS"
+                "exploration.minimum_actions must not exceed "
+                "exploration.max_actions"
             )
         if self.profile not in {"balanced", "legacy"}:
             raise ValueError(
-                "TSM_AGT_EXPLORATION_PROFILE must be 'balanced' or 'legacy'"
+                "exploration.profile must be 'balanced' or 'legacy'"
             )
 
     def policy_arguments(self) -> dict[str, int]:
@@ -130,83 +108,88 @@ class ExplorationBudgetConfiguration:
         }
 
 
-_FIELD_BY_ENV = {
-    "TSM_AGT_AGENT_MAX_MODEL_CALLS": "agent_max_model_calls",
-    "TSM_AGT_AGENT_MAX_TOOL_CALLS": "agent_max_tool_calls",
-    "TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS": "finalization_model_calls",
-    "TSM_AGT_AGENT_EXECUTION_RESERVE_MODEL_CALLS": "execution_reserve_model_calls",
-    "TSM_AGT_AGENT_RECOVERY_RESERVE_MODEL_CALLS": "recovery_reserve_model_calls",
-    "TSM_AGT_AGENT_VERIFICATION_RESERVE_MODEL_CALLS": "verification_reserve_model_calls",
-    "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS": "max_tool_calls",
-    "TSM_AGT_EXPLORATION_MAX_ACTIONS": "max_actions",
-    "TSM_AGT_EXPLORATION_MAX_TOOL_SECONDS": "max_tool_seconds",
-    "TSM_AGT_EXPLORATION_LOW_VALUE_STREAK": "low_value_streak",
-    "TSM_AGT_EXPLORATION_RESERVE_TOOL_CALLS": "reserve_tool_calls",
-    "TSM_AGT_EXPLORATION_MIN_ACTIONS": "minimum_actions",
-}
-
-
 def load_exploration_budget_configuration(
-    path: Path, environment: Mapping[str, str],
+    document: Mapping[str, object],
 ) -> ExplorationBudgetConfiguration:
-    """Load optional limits; exported values override the workspace .env."""
+    """Load optional budget settings from the single private YAML document."""
 
-    env_file = path.expanduser().resolve()
-    file_values = _read_optional_values(env_file)
+    agent = _section(document, "agent")
+    exploration = _section(document, "exploration")
     defaults = ExplorationBudgetConfiguration()
-    values: dict[str, int] = {}
+    values: dict[str, int] = {
+        "agent_max_model_calls": _positive_int(
+            agent.get("max_model_calls"), "agent.max_model_calls",
+            defaults.agent_max_model_calls,
+        ),
+        "agent_max_tool_calls": _positive_int(
+            agent.get("max_tool_calls"), "agent.max_tool_calls",
+            defaults.agent_max_tool_calls,
+        ),
+        "finalization_model_calls": _positive_int(
+            agent.get("finalization_model_calls"), "agent.finalization_model_calls",
+            defaults.finalization_model_calls,
+        ),
+        "execution_reserve_model_calls": _positive_int(
+            agent.get("execution_reserve_model_calls"), "agent.execution_reserve_model_calls",
+            defaults.execution_reserve_model_calls,
+        ),
+        "recovery_reserve_model_calls": _positive_int(
+            agent.get("recovery_reserve_model_calls"), "agent.recovery_reserve_model_calls",
+            defaults.recovery_reserve_model_calls,
+        ),
+        "verification_reserve_model_calls": _positive_int(
+            agent.get("verification_reserve_model_calls"), "agent.verification_reserve_model_calls",
+            defaults.verification_reserve_model_calls,
+        ),
+        "max_tool_calls": _positive_int(
+            exploration.get("max_tool_calls"), "exploration.max_tool_calls",
+            defaults.max_tool_calls,
+        ),
+        "max_actions": _positive_int(
+            exploration.get("max_actions"), "exploration.max_actions",
+            defaults.max_actions,
+        ),
+        "max_tool_seconds": _positive_int(
+            exploration.get("max_tool_seconds"), "exploration.max_tool_seconds",
+            defaults.max_tool_seconds,
+        ),
+        "low_value_streak": _positive_int(
+            exploration.get("low_value_streak"), "exploration.low_value_streak",
+            defaults.low_value_streak,
+        ),
+        "reserve_tool_calls": _positive_int(
+            exploration.get("reserve_tool_calls"), "exploration.reserve_tool_calls",
+            defaults.reserve_tool_calls,
+        ),
+        "minimum_actions": _positive_int(
+            exploration.get("minimum_actions"), "exploration.minimum_actions",
+            defaults.minimum_actions,
+        ),
+    }
     sources: dict[str, str] = {}
-    for env_name, field_name in _FIELD_BY_ENV.items():
-        exported = environment.get(env_name, "").strip()
-        from_file = file_values.get(env_name, "").strip()
-        raw_value = exported or from_file
-        if not raw_value:
-            values[field_name] = int(getattr(defaults, field_name))
-            sources[f"exploration_budget.{field_name}"] = "default"
-            continue
-        try:
-            parsed = int(raw_value)
-        except ValueError as error:
-            raise ValueError(f"{env_name} must be a positive integer") from error
-        if parsed < 1:
-            raise ValueError(f"{env_name} must be a positive integer")
-        values[field_name] = parsed
-        sources[f"exploration_budget.{field_name}"] = (
-            "environment" if exported else "env_file"
-        )
-    exported_profile = environment.get("TSM_AGT_EXPLORATION_PROFILE", "").strip()
-    file_profile = file_values.get("TSM_AGT_EXPLORATION_PROFILE", "").strip()
-    profile = (exported_profile or file_profile or defaults.profile).casefold()
-    sources["exploration_budget.profile"] = (
-        "environment" if exported_profile else
-        "env_file" if file_profile else "default"
-    )
+    for field_name in values:
+        source_section = "agent" if field_name.startswith(("agent_", "finalization", "execution_", "recovery_", "verification_")) else "exploration"
+        sources[f"exploration_budget.{field_name}"] = "yaml" if source_section == "agent" and agent else "yaml" if source_section == "exploration" and exploration else "default"
+    raw_profile = exploration.get("profile", defaults.profile)
+    if not isinstance(raw_profile, str):
+        raise ValueError("exploration.profile must be a string")
+    profile = raw_profile.casefold()
+    sources["exploration_budget.profile"] = "yaml" if "profile" in exploration else "default"
     return ExplorationBudgetConfiguration(
         **values, profile=profile, sources=sources
     )
 
 
-def _read_optional_values(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    if not path.is_file():
-        raise ValueError(f"exploration env path is not a file: {path}")
-    values: dict[str, str] = {}
-    for line_number, raw_line in enumerate(
-        path.read_text(encoding="utf-8").splitlines(), start=1
-    ):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:].strip()
-        if "=" not in line:
-            # The model loader owns validation of unrelated lines.
-            continue
-        name, value = (part.strip() for part in line.split("=", 1))
-        if name not in EXPLORATION_ENV_NAMES:
-            continue
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        values[name] = value
-    return values
+def _section(document: Mapping[str, object], name: str) -> Mapping[str, object]:
+    value = document.get(name, {})
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{name} must be a mapping")
+    return value
+
+
+def _positive_int(value: object, name: str, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value

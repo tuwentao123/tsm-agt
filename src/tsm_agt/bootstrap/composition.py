@@ -99,14 +99,13 @@ from tsm_agt.core.conversation_orchestration import OrchestrationMode
 from tsm_agt.core.skill_selector import SkillSelector
 from tsm_agt.core.skills import SkillRegistry
 from tsm_agt.adapters.local_skills import UserSkillsStore
+from tsm_agt.adapters.skill_catalog import BUILTIN_SKILLS, SkillCatalog
 from tsm_agt.adapters.builtin.skill_tools import CoreSkillToolProvider
 from tsm_agt.adapters.mcp_client_manager import MCPClientManager, MCPServerConfig
 from tsm_agt.adapters.mcp_tool_provider import MCPToolProvider
 from tsm_agt.adapters.mcp_python_sdk_client import create_mcp_sdk_client
 from tsm_agt.bootstrap.mcp_configuration import (
-    load_mcp_servers,
-    load_mcp_servers_file,
-    merge_mcp_servers,
+    load_mcp_servers_from_configuration,
 )
 from tsm_agt.ports import (
     CrossProcessLockPort,
@@ -156,6 +155,7 @@ def compose_mcp_fixture_application(
     store_adapter: RuntimeStorePort | None = None,
     project_memory_adapter: ProjectMemoryPort | None = None,
     enable_runtime_inspection: bool = False,
+    mcp_tools_enabled: bool = True,
 ) -> Application:
     """Compose a fixture application with MCP tools wired into the registry.
 
@@ -170,7 +170,7 @@ def compose_mcp_fixture_application(
     # Back-end MCP permission switch: when disabled, no MCP tools are
     # registered at all, so neither the model nor the UI can see or call any
     # mcp.* tools.
-    if _mcp_tools_enabled():
+    if mcp_tools_enabled:
         manager = MCPClientManager(servers=servers, client_factory=client_factory)
         mcp_provider = MCPToolProvider(manager)
         tool_adapters = (EchoToolProvider(), mcp_provider)
@@ -186,33 +186,6 @@ def compose_mcp_fixture_application(
     )
 
 
-def _mcp_tools_enabled() -> bool:
-    """Return whether MCP tools should be exposed to the Kernel.
-
-    This is a back-end level switch: when it returns ``False``,
-    :class:`MCPToolProvider` is not registered, so MCP tools are absent from the
-    tool set the model and UI can see.
-
-    The environment variable ``TSM_AGT_ENABLE_MCP_TOOLS`` controls the value:
-
-    * unset or one of ``"1"``, ``"true"``, ``"yes"``, ``"on"`` → enabled;
-    * one of ``"0"``, ``"false"``, ``"no"``, ``"off"`` → disabled.
-
-    Any other explicit value is treated as a configuration error.
-    """
-
-    raw = os.getenv("TSM_AGT_ENABLE_MCP_TOOLS", "")
-    value = raw.strip().casefold()
-    if value in ("", "1", "true", "yes", "on"):
-        return True
-    if value in ("0", "false", "no", "off"):
-        return False
-    raise ValueError(
-        "TSM_AGT_ENABLE_MCP_TOOLS must be one of '', '1', 'true', 'yes', 'on', "
-        "'0', 'false', 'no', or 'off'"
-    )
-
-
 async def mcp_sdk_client_factory(config: MCPServerConfig):
     """Create the production MCP SDK client from the composition boundary."""
     return await create_mcp_sdk_client(config)
@@ -221,61 +194,15 @@ async def mcp_sdk_client_factory(config: MCPServerConfig):
 def compose_mcp_application_from_config(
     client_factory: Callable[[MCPServerConfig], Awaitable[object]],
     *,
+    configuration: Mapping[str, object] | None = None,
     model_adapter: ModelProviderPort | None = None,
     store_adapter: RuntimeStorePort | None = None,
     project_memory_adapter: ProjectMemoryPort | None = None,
     enable_runtime_inspection: bool = False,
 ) -> Application:
-    """Compose an application with MCP servers loaded from JSON config files.
+    """Compose a fixture application with an explicit YAML configuration map."""
 
-    This helper is a convenience wrapper around
-    :func:`compose_mcp_fixture_application` that discovers MCP server
-    configuration files, loads :class:`MCPServerConfig` entries and wires them
-    into the Kernel.
-
-    Server configuration discovery follows a simple layering scheme:
-
-    1. If the environment variable ``TSM_AGT_MCP_CONFIG`` is set and points to
-       an existing file, only that file is loaded.
-    2. Otherwise, the loader looks for a workspace-local file
-       ``.tsm-agt/mcp.json`` relative to the current process working
-       directory.
-    3. It also looks for a user-level file ``~/.config/tsm-agt/mcp.json``.
-
-    When both the workspace-local and user-level files exist, their contents
-    are merged using :func:`merge_mcp_servers` with later files winning for
-    duplicate server identifiers. This allows a user-global MCP configuration
-    to be overridden or extended by a specific workspace.
-
-    If no configuration files are found, the helper still composes an
-    application but with no MCP servers; in that case
-    :func:`compose_mcp_fixture_application` behaves as though MCP were
-    disabled.
-    """
-
-    config_paths: list[Path] = []
-
-    explicit_path = os.getenv("TSM_AGT_MCP_CONFIG")
-    if explicit_path:
-        path = Path(explicit_path).expanduser()
-        if path.is_file():
-            config_paths = [path]
-    else:
-        # Workspace-local configuration relative to the current working
-        # directory. Callers are responsible for setting the desired
-        # workspace root before invoking this helper.
-        workspace_path = Path(".tsm-agt/mcp.json")
-        if workspace_path.is_file():
-            config_paths.append(workspace_path)
-
-        # User-level configuration under ~/.config/tsm-agt/mcp.json. This is
-        # optional and may be shared across multiple workspaces.
-        user_path = Path("~/.config/tsm-agt/mcp.json").expanduser()
-        if user_path.is_file():
-            config_paths.append(user_path)
-
-    server_files = [load_mcp_servers_file(path) for path in config_paths]
-    servers = merge_mcp_servers(server_files)
+    enabled, servers = load_mcp_servers_from_configuration(configuration or {})
 
     return compose_mcp_fixture_application(
         servers=servers,
@@ -284,13 +211,16 @@ def compose_mcp_application_from_config(
         store_adapter=store_adapter,
         project_memory_adapter=project_memory_adapter,
         enable_runtime_inspection=enable_runtime_inspection,
+        mcp_tools_enabled=enabled,
     )
 from .model_configuration import (
     MODEL_PROTOCOL_ANTHROPIC_MESSAGES,
     endpoint_origin,
+    load_configuration_document,
     load_model_configuration,
     model_configuration_sources,
 )
+from .tool_execution_configuration import load_max_parallel_tool_calls
 from .orchestration_configuration import (
     OrchestrationConfiguration,
     load_orchestration_configuration,
@@ -361,10 +291,11 @@ def _physical_model_provider(
     streaming: bool,
     open_api_mode: str = "chat",
     reasoning_effort: str | None = None,
+    capability_overrides: Mapping[str, bool | int] | None = None,
 ):
     """Select the wire adapter while preserving one Kernel model contract."""
     if protocol == MODEL_PROTOCOL_ANTHROPIC_MESSAGES:
-        return AnthropicMessagesModelProvider(
+        provider = AnthropicMessagesModelProvider(
             base_url,
             model,
             api_key,
@@ -372,25 +303,69 @@ def _physical_model_provider(
             timeout_seconds=timeout_seconds,
             streaming=streaming,
         )
-    provider_class = OpenAIResponsesModelProvider if open_api_mode == "responses" else OpenAICompatibleModelProvider
-    options = {"reasoning_effort": reasoning_effort}
-    return provider_class(
-        base_url,
-        model,
-        api_key,
-        timeout_seconds=timeout_seconds,
-        max_retries=0,
-        retry_backoff_seconds=0,
-        output_token_parameter=output_token_parameter,
-        strict_tool_schema=strict_tool_schema,
-        streaming=streaming,
-        **options,
-    )
+    else:
+        provider_class = (
+            OpenAIResponsesModelProvider
+            if open_api_mode == "responses"
+            else OpenAICompatibleModelProvider
+        )
+        provider = provider_class(
+            base_url,
+            model,
+            api_key,
+            timeout_seconds=timeout_seconds,
+            max_retries=0,
+            retry_backoff_seconds=0,
+            output_token_parameter=output_token_parameter,
+            strict_tool_schema=strict_tool_schema,
+            streaming=streaming,
+            reasoning_effort=reasoning_effort,
+        )
+    return _apply_capability_overrides(provider, capability_overrides or {})
+
+
+def _apply_capability_overrides(provider, overrides: Mapping[str, bool | int]):
+    """Allow profiles to disable or bound—not invent—adapter capabilities.
+
+    A model profile may state that a local deployment has a smaller context or
+    unreliable tool calling.  It must never promote a feature that the chosen
+    wire adapter cannot serialize or replay correctly.
+    """
+
+    if not overrides:
+        return provider
+    baseline = provider.capabilities
+    values = baseline.to_data()
+    for name, requested in overrides.items():
+        if name not in values:
+            raise ValueError(f"unsupported model capability override: {name}")
+        available = values[name]
+        if isinstance(available, bool):
+            if not isinstance(requested, bool):
+                raise ValueError(f"model capability {name} must be boolean")
+            if requested and not available:
+                raise ValueError(
+                    f"model capability {name} cannot be enabled by this adapter"
+                )
+        else:
+            if isinstance(requested, bool) or not isinstance(requested, int):
+                raise ValueError(f"model capability {name} must be an integer")
+            if requested <= 0:
+                raise ValueError(f"model capability {name} must be positive")
+            if available and requested > available:
+                raise ValueError(
+                    f"model capability {name} cannot exceed adapter limit {available}"
+                )
+        values[name] = requested
+    provider.capabilities = replace(baseline, **values)
+    return provider
 
 
 def _configuration_metadata(
     *, provider: str, model: str, base_url: str | None = None,
     credentials_configured: bool = False,
+    model_profile_id: str | None = None,
+    model_wire_protocol: str | None = None,
     sources: Mapping[str, str] | None = None,
     exploration_budget: ExplorationBudgetConfiguration | None = None,
     context_configuration: ContextConfiguration | None = None,
@@ -416,6 +391,10 @@ def _configuration_metadata(
     }
     if base_url is not None:
         data["endpoint_origin"] = _endpoint_origin(base_url)
+    if model_profile_id is not None:
+        data["profile_id"] = model_profile_id
+    if model_wire_protocol is not None:
+        data["wire_protocol"] = model_wire_protocol
     result: dict[str, object] = {
         "model": data,
         "completion_review": {
@@ -452,6 +431,7 @@ def _kernel_dependencies(
     registry: AdapterRegistry, configuration_metadata: Mapping[str, object],
     context_manager: ContextWindowManager | None = None,
     *, default_max_output_tokens: int = 1024,
+    max_parallel_tool_calls: int = 8,
     session_projector: SessionContextProjector | None = None,
     enable_skills: bool = True,
 ) -> KernelDependencies:
@@ -577,12 +557,15 @@ def _kernel_dependencies(
     skill_registry = SkillRegistry()
     skill_selector = SkillSelector(skill_registry)
     if enable_skills and registry.require(ModelProviderPort).capabilities.tools:
+        skill_store = UserSkillsStore()
         registry.register(
             ToolProviderPort, CoreSkillToolProvider(
-                skill_registry, UserSkillsStore(), registry.require(RuntimeStorePort)
+                skill_registry, skill_store, registry.require(RuntimeStorePort),
+                catalog=SkillCatalog(skill_store),
             ),
         )
     return KernelDependencies(
+        max_parallel_tool_calls=max_parallel_tool_calls,
         model=registry.require(ModelProviderPort),
         store=registry.require(RuntimeStorePort),
         session_context_projector=(
@@ -734,7 +717,7 @@ def _register_exploration_profile(
         return selected
     if selected != "balanced":
         raise ValueError(
-            "TSM_AGT_EXPLORATION_PROFILE must be 'balanced' or 'legacy'"
+            "exploration_profile must be 'balanced' or 'legacy'"
         )
     registry.register(
         EvidenceRelationProviderPort, BuiltinEvidenceRelationProvider()
@@ -801,6 +784,7 @@ def compose_fixture_application(
     completion_review_failure_policy: CompletionReviewFailurePolicy = (
         CompletionReviewFailurePolicy.VISIBLE_UNVERIFIED
     ),
+    max_parallel_tool_calls: int = 8,
 ) -> Application:
     registry = AdapterRegistry()
     registry.register(ModelProviderPort, model_adapter or EchoModelProvider())
@@ -938,6 +922,7 @@ def compose_fixture_application(
             completion_review_failure_policy=completion_review_failure_policy,
             orchestration_configuration=OrchestrationConfiguration(),
         ), context_manager,
+        max_parallel_tool_calls=max_parallel_tool_calls,
         session_projector=session_projector,
         enable_skills=enable_skills,
     )
@@ -1030,6 +1015,8 @@ def compose_openai_compatible_readonly_application(
     model_streaming: bool = True,
     model_open_api_mode: str = "chat",
     model_reasoning_effort: str | None = None,
+    model_capability_overrides: Mapping[str, bool | int] | None = None,
+    model_profile_id: str | None = None,
     context_configuration: ContextConfiguration | None = None,
     web_egress_configuration: WebEgressConfiguration | None = None,
     search_configuration: SearchConfiguration | None = None,
@@ -1040,6 +1027,7 @@ def compose_openai_compatible_readonly_application(
     completion_review_failure_policy: CompletionReviewFailurePolicy = (
         CompletionReviewFailurePolicy.VISIBLE_UNVERIFIED
     ),
+    max_parallel_tool_calls: int = 8,
 ) -> Application:
     """Compose a real OpenAI-compatible model with built-in read-only tools."""
 
@@ -1061,6 +1049,7 @@ def compose_openai_compatible_readonly_application(
         streaming=model_streaming,
         open_api_mode=model_open_api_mode,
         reasoning_effort=model_reasoning_effort,
+        capability_overrides=model_capability_overrides,
     )
     recovery_policy = RuleBasedModelRecoveryPolicy(
         model_retry_backoff_seconds
@@ -1180,6 +1169,12 @@ def compose_openai_compatible_readonly_application(
             ),
             model=model, base_url=base_url,
             credentials_configured=bool(api_key),
+            model_profile_id=model_profile_id,
+            model_wire_protocol=(
+                "anthropic_messages"
+                if model_protocol == MODEL_PROTOCOL_ANTHROPIC_MESSAGES
+                else f"openai_{model_open_api_mode}"
+            ),
             sources={
                 **(configuration_sources or {
                     "model.provider": "composition",
@@ -1202,6 +1197,7 @@ def compose_openai_compatible_readonly_application(
         ),
         context_window_manager(context),
         default_max_output_tokens=8192,
+        max_parallel_tool_calls=max_parallel_tool_calls,
         session_projector=session_context_projector(context),
     )
     return Application(
@@ -1225,6 +1221,8 @@ def compose_openai_compatible_engineering_application(
     model_streaming: bool = True,
     model_open_api_mode: str = "chat",
     model_reasoning_effort: str | None = None,
+    model_capability_overrides: Mapping[str, bool | int] | None = None,
+    model_profile_id: str | None = None,
     context_configuration: ContextConfiguration | None = None,
     web_egress_configuration: WebEgressConfiguration | None = None,
     search_configuration: SearchConfiguration | None = None,
@@ -1236,6 +1234,8 @@ def compose_openai_compatible_engineering_application(
         CompletionReviewFailurePolicy.VISIBLE_UNVERIFIED
     ),
     mcp_servers: tuple[MCPServerConfig, ...] = (),
+    mcp_tools_enabled: bool = True,
+    max_parallel_tool_calls: int = 8,
 ) -> Application:
     """Compose the engineering Agent with workspace and process tools."""
 
@@ -1258,6 +1258,7 @@ def compose_openai_compatible_engineering_application(
         streaming=model_streaming,
         open_api_mode=model_open_api_mode,
         reasoning_effort=model_reasoning_effort,
+        capability_overrides=model_capability_overrides,
     )
     recovery_policy = RuleBasedModelRecoveryPolicy(
         model_retry_backoff_seconds
@@ -1362,7 +1363,7 @@ def compose_openai_compatible_engineering_application(
             ToolProviderPort, GitHubSourceToolProvider(github_source)
         )
     registry.register(ToolProviderPort, CoreProcessToolProvider())
-    if mcp_servers and _mcp_tools_enabled():
+    if mcp_servers and mcp_tools_enabled:
         registry.register(
             ToolProviderPort,
             MCPToolProvider(MCPClientManager(mcp_servers, mcp_sdk_client_factory)),
@@ -1385,6 +1386,12 @@ def compose_openai_compatible_engineering_application(
             ),
             model=model, base_url=base_url,
             credentials_configured=bool(api_key),
+            model_profile_id=model_profile_id,
+            model_wire_protocol=(
+                "anthropic_messages"
+                if model_protocol == MODEL_PROTOCOL_ANTHROPIC_MESSAGES
+                else f"openai_{model_open_api_mode}"
+            ),
             sources={
                 **(configuration_sources or {
                     "model.provider": "composition",
@@ -1407,6 +1414,7 @@ def compose_openai_compatible_engineering_application(
         ),
         context_window_manager(context),
         default_max_output_tokens=8192,
+        max_parallel_tool_calls=max_parallel_tool_calls,
         session_projector=session_context_projector(context),
     )
     return Application(
@@ -1415,34 +1423,22 @@ def compose_openai_compatible_engineering_application(
     )
 
 
-def compose_openai_compatible_readonly_application_from_env(
-    env_file: Path | None = None,
+def compose_openai_compatible_readonly_application_from_config(
+    configuration_file: Path | None = None,
     database_path: Path | None = None,
 ) -> Application:
-    """Load optional .env, then read the three explicit TSM_AGT_* variables."""
+    """Compose a read-only application from the single private YAML file."""
 
-    selected_env_file = env_file or Path.cwd() / ".env"
-    configuration = load_model_configuration(selected_env_file, os.environ)
+    selected_configuration_file, document = load_configuration_document(configuration_file)
+    configuration = load_model_configuration(selected_configuration_file, document)
     assert configuration is not None
-    budget = load_exploration_budget_configuration(
-        env_file or Path.cwd() / ".env", os.environ
-    )
-    context = load_context_configuration(
-        env_file or Path.cwd() / ".env", os.environ
-    )
-    egress = load_web_egress_configuration(
-        env_file or Path.cwd() / ".env", os.environ
-    )
-    search = load_search_configuration(
-        env_file or Path.cwd() / ".env", os.environ
-    )
-    github_source = load_github_source_configuration(
-        env_file or Path.cwd() / ".env", os.environ
-    )
-    orchestration = load_orchestration_configuration(
-        selected_env_file, os.environ
-    )
-    review = load_completion_review_configuration(selected_env_file, os.environ)
+    budget = load_exploration_budget_configuration(document)
+    context = load_context_configuration(document)
+    egress = load_web_egress_configuration(document)
+    search = load_search_configuration(document)
+    github_source = load_github_source_configuration(document)
+    orchestration = load_orchestration_configuration(document)
+    review = load_completion_review_configuration(document)
     return compose_openai_compatible_readonly_application(
         base_url=configuration.base_url,
         model=configuration.model,
@@ -1462,6 +1458,9 @@ def compose_openai_compatible_readonly_application_from_env(
         model_streaming=configuration.streaming,
         model_open_api_mode=configuration.open_api_mode,
         model_reasoning_effort=configuration.reasoning_effort,
+        model_capability_overrides=configuration.capability_overrides,
+        model_profile_id=configuration.profile_id,
+        max_parallel_tool_calls=load_max_parallel_tool_calls(document),
         context_configuration=context,
         web_egress_configuration=egress,
         search_configuration=search,
@@ -1473,40 +1472,28 @@ def compose_openai_compatible_readonly_application_from_env(
     )
 
 
-def compose_openai_compatible_engineering_application_from_env(
-    env_file: Path | None = None, database_path: Path | None = None,
+def compose_openai_compatible_engineering_application_from_config(
+    configuration_file: Path | None = None, database_path: Path | None = None,
     *, session_history_format: str | None = None,
     history_soft_tokens: int | None = None,
 ) -> Application:
-    """Load local model settings and compose the engineering Agent."""
+    """Load private YAML settings and compose the engineering Agent."""
 
-    selected_env_file = env_file or Path.cwd() / ".env"
-    configuration = load_model_configuration(selected_env_file, os.environ)
+    selected_configuration_file, document = load_configuration_document(configuration_file)
+    configuration = load_model_configuration(selected_configuration_file, document)
     assert configuration is not None
-    budget = load_exploration_budget_configuration(
-        env_file or Path.cwd() / ".env", os.environ
-    )
-    context = load_context_configuration(
-        env_file or Path.cwd() / ".env", os.environ
-    )
+    budget = load_exploration_budget_configuration(document)
+    context = load_context_configuration(document)
     if session_history_format is not None:
         context = replace(context, conversation_history_format=session_history_format)
     if history_soft_tokens is not None:
         context = replace(context, history_soft_tokens=history_soft_tokens)
-    egress = load_web_egress_configuration(
-        env_file or Path.cwd() / ".env", os.environ
-    )
-    search = load_search_configuration(
-        env_file or Path.cwd() / ".env", os.environ
-    )
-    github_source = load_github_source_configuration(
-        env_file or Path.cwd() / ".env", os.environ
-    )
-    orchestration = load_orchestration_configuration(
-        selected_env_file, os.environ
-    )
-    review = load_completion_review_configuration(selected_env_file, os.environ)
-    mcp_servers = load_mcp_servers(selected_env_file.parent, os.environ)
+    egress = load_web_egress_configuration(document)
+    search = load_search_configuration(document)
+    github_source = load_github_source_configuration(document)
+    orchestration = load_orchestration_configuration(document)
+    review = load_completion_review_configuration(document)
+    mcp_tools_enabled, mcp_servers = load_mcp_servers_from_configuration(document)
     return compose_openai_compatible_engineering_application(
         base_url=configuration.base_url,
         model=configuration.model,
@@ -1526,6 +1513,9 @@ def compose_openai_compatible_engineering_application_from_env(
         model_streaming=configuration.streaming,
         model_open_api_mode=configuration.open_api_mode,
         model_reasoning_effort=configuration.reasoning_effort,
+        model_capability_overrides=configuration.capability_overrides,
+        model_profile_id=configuration.profile_id,
+        max_parallel_tool_calls=load_max_parallel_tool_calls(document),
         context_configuration=context,
         web_egress_configuration=egress,
         search_configuration=search,
@@ -1535,7 +1525,19 @@ def compose_openai_compatible_engineering_application_from_env(
         completion_review_max_continuations=review.max_continuations,
         completion_review_failure_policy=review.failure_policy,
         mcp_servers=mcp_servers,
+        mcp_tools_enabled=mcp_tools_enabled,
     )
+
+
+# Kept as import-only aliases for extensions compiled against pre-YAML package
+# versions. They deliberately parse their positional path as YAML; they do not
+# restore dotenv loading or environment precedence.
+compose_openai_compatible_readonly_application_from_env = (
+    compose_openai_compatible_readonly_application_from_config
+)
+compose_openai_compatible_engineering_application_from_env = (
+    compose_openai_compatible_engineering_application_from_config
+)
 
 
 def user_skills_store_for_application(application: Application | None = None):
@@ -1545,6 +1547,20 @@ def user_skills_store_for_application(application: Application | None = None):
             if isinstance(provider, CoreSkillToolProvider):
                 return provider.store
     return UserSkillsStore()
+
+
+def skill_catalog_for_application(application: Application | None = None, store=None):
+    """Keep online and offline UI behind the concrete-adapter boundary."""
+    store = store if store is not None else user_skills_store_for_application(application)
+    if application is not None:
+        for provider in application.kernel.dependencies.tools:
+            if isinstance(provider, CoreSkillToolProvider) and provider.store is store:
+                return provider.catalog
+    return SkillCatalog(store)
+
+
+def builtin_skill_names() -> tuple[str, ...]:
+    return tuple(BUILTIN_SKILLS)
 
 
 def configure_request_diagnostics(application: Application):

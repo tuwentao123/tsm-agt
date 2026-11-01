@@ -247,7 +247,7 @@ class GitHubSourceToolProvider:
                 "RATE_LIMITED",
                 "GitHub API rate limit exhausted"
                 + (
-                    "; configure TSM_AGT_GITHUB_TOKEN to raise the limit"
+                    "; configure github_source.token to raise the limit"
                     if not self._configuration.token else ""
                 ),
                 endpoint, response, retryable=True,
@@ -256,7 +256,7 @@ class GitHubSourceToolProvider:
             raise _upstream_response_failure(
                 "AUTH_REQUIRED",
                 "GitHub code search requires an authenticated GitHub token; configure "
-                "TSM_AGT_GITHUB_TOKEN or sign in with gh auth login",
+                "github_source.token or sign in with gh auth login",
                 endpoint,
                 response,
             )

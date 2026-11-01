@@ -6,9 +6,10 @@ const page = fs.readFileSync(process.env.TSM_SKILL_TEST_SCRIPT, 'utf8');
 const constants = page.slice(page.indexOf('const TERMINAL_STATES ='), page.indexOf('function appendTaskAssistantText'));
 const follower = page.slice(page.indexOf('function followTask(taskId, conversationId)'), page.indexOf('async function loadSessions()'));
 
-function setup({realFinal = false} = {}) {
-  const streams = [], timers = [], requests = [], finishes = [], histories = [], answers = [];
+function setup({realFinal = false, realAnswers = false} = {}) {
+  const streams = [], timers = [], requests = [], finishes = [], histories = [], answers = [], frames = [];
   const cards = new Map();
+  const conversation = {messages: []};
   const card = id => {
     if (!cards.has(id)) cards.set(id, {task: {cursor: 0, progress: []}});
     return cards.get(id);
@@ -22,6 +23,8 @@ function setup({realFinal = false} = {}) {
     },
     setTimeout: (callback, delay) => { const timer = {callback, delay}; timers.push(timer); return timer; },
     clearTimeout: timer => { timer.cancelled = true; },
+    requestAnimationFrame: callback => { frames.push(callback); return frames.length; },
+    document: {getElementById: () => null},
     taskMessage: (chat, id) => card(id), upsertTaskCard: (chat, raw) => card(raw.task_id),
     appendTaskProgress: (id, packet) => card(id).task.progress.push(packet),
     applyTaskProjection: (task, projection) => { task.projection = projection; },
@@ -30,20 +33,92 @@ function setup({realFinal = false} = {}) {
     clearApprovalMessage: id => { card(id).task.approval = null; },
     renderMessages() {}, setLoading() {},
     appendTaskAssistantText: (id, text) => { answers.push(text); },
-    getConversationById: () => ({messages: []}), updateComposerButtonState() {},
+    getConversationById: () => conversation, updateComposerButtonState() {},
+    scheduleProgressRender() {},
+    appendMessage: (role, content, images, chat, taskId) => {
+      conversation.messages.push({role, content, images, taskId});
+    },
     renderFinalResult: async (id, state) => { finishes.push({id, state}); },
     refreshConversationHistory: async id => { histories.push(id); return true; },
     fetch: async url => { requests.push(url); return {ok: true, json: async () => ({status: 'running', phase1_state: 'RUNNING'})}; },
   });
   const finalRenderer = page.slice(page.indexOf('async function renderFinalResult('), page.indexOf('// Each follower owns exactly one Task card.'));
-  vm.runInContext(constants + (realFinal ? finalRenderer : '') + follower, context);
+  const answerRenderer = page.slice(page.indexOf('function appendTaskAssistantText('), page.indexOf('function renderTurnMarker('));
+  vm.runInContext(constants + (realAnswers ? answerRenderer : '') + (realFinal ? finalRenderer : '') + follower, context);
   async function emit(source, payload) {
     const current = vm.runInContext("followers.get('task')", context);
     source.emit(payload);
     if (current) await current.queue;
   }
-  return {context, streams, timers, requests, finishes, histories, answers, card, emit};
+  const animate = () => { for (let time = 0; frames.length && time < 5000; time += 16) frames.splice(0).forEach(callback => callback(time)); };
+  return {context, streams, timers, requests, finishes, histories, answers, card, emit, conversation, animate};
 }
+
+test('text fragments render before completion and the final snapshot replaces the same bubble', async () => {
+  const s = setup({realFinal: true, realAnswers: true});
+  s.context.followTask('task', 'chat');
+  const source = s.streams[0];
+  await s.emit(source, {type: 'stream.open', active_turn_id: 'turn'});
+  const frame = (kind, text, sequence, status = 'generating', phase = 'pending') => ({
+    type: 'progress.transient', turn_id: 'turn', progress: {
+      kind, text, text_id: 'text-1', text_sequence: sequence, text_status: status, phase,
+    },
+  });
+  await s.emit(source, frame('text_delta', '你好', 1));
+  assert.equal(s.conversation.messages[0].content, '你好');
+  assert.equal(source.closed, undefined);
+  await s.emit(source, frame('text_delta', ' 🌍', 2));
+  await s.emit(source, frame('text_delta', ' 🌍', 2));
+  assert.equal(s.conversation.messages[0].content, '你好 🌍');
+  await s.emit(source, frame('text_state', '', 2, 'reviewing', 'final_answer'));
+  assert.equal(s.conversation.messages[0].textStream.status, 'reviewing');
+  await s.emit(source, {type: 'task.snapshot', turn_id: 'turn', cursor: 20,
+    status: 'awaiting_input', phase1_state: 'WAITING', assistant_text: '你好 🌍'});
+  assert.equal(s.conversation.messages.length, 1);
+  assert.equal(s.conversation.messages[0].textStream, undefined);
+});
+
+test('discarded candidates disappear and reconnect snapshots replace partial text without duplication', async () => {
+  const s = setup();
+  s.context.followTask('task', 'chat');
+  const source = s.streams[0];
+  await s.emit(source, {type: 'stream.open', active_turn_id: 'turn'});
+  await s.emit(source, {type: 'progress.transient', turn_id: 'turn', progress: {
+    kind: 'text_delta', text_id: 'old', text: 'rejected', text_sequence: 1,
+  }});
+  await s.emit(source, {type: 'progress.transient', turn_id: 'turn', progress: {
+    kind: 'text_state', text_id: 'old', text_status: 'discarded',
+  }});
+  assert.equal(s.conversation.messages.length, 0);
+  await s.emit(source, {type: 'text.snapshot', turn_id: 'turn', streams: [{
+    text_id: 'new', turn_id: 'turn', text: 'restored', text_sequence: 3, phase: 'final_answer',
+  }]});
+  await s.emit(source, {type: 'progress.transient', turn_id: 'turn', progress: {
+    kind: 'text_delta', text_id: 'new', text: ' text', text_sequence: 4,
+  }});
+  assert.equal(s.conversation.messages[0].content, 'restored text');
+  await s.emit(source, {type: 'text.snapshot', turn_id: 'old-turn', streams: []});
+  assert.equal(s.conversation.messages[0].content, 'restored text');
+});
+
+test('committed commentary moves to durable progress instead of duplicating the final answer', async () => {
+  const s = setup();
+  s.context.followTask('task', 'chat');
+  const source = s.streams[0];
+  await s.emit(source, {type: 'stream.open', active_turn_id: 'turn'});
+  await s.emit(source, {type: 'progress.transient', turn_id: 'turn', progress: {
+    kind: 'text_delta', text_id: 'note', text: 'Checking files', text_sequence: 1, phase: 'commentary',
+  }});
+  assert.equal(s.conversation.messages[0].textStream.phase, 'commentary');
+  await s.emit(source, {type: 'conversation.commentary', turn_id: 'turn', sequence: 3,
+    progress: {kind: 'commentary', activity: 'Checking files'}});
+  await s.emit(source, {type: 'progress.transient', turn_id: 'turn', progress: {
+    kind: 'text_state', text_id: 'note', text_status: 'committed', phase: 'commentary',
+  }});
+  s.animate();
+  assert.equal(s.conversation.messages.length, 0);
+  assert.equal(s.card('task').task.progress.length, 1);
+});
 
 test('healthy SSE updates tools, Todo and final answer without a status GET or interval', async () => {
   const s = setup();
@@ -114,6 +189,23 @@ test('an older history response cannot erase the newest completed turn or reopen
   assert.equal(conversation.messages.length, 1);
   assert.equal(conversation.messages[0].content, 'Final answer');
   assert.equal(conversation.loaded, true);
+});
+
+test('authoritative history keeps the visible prefix of the same answer while replacing message objects', async () => {
+  const presentation = {id: 'text', visible: '回答', frame: 1};
+  const original = {role: 'assistant', taskId: 'task', turnId: 'turn',
+    content: '回答还在逐字展开', textPresentation: presentation};
+  const conversation = {loaded: false, messages: [original]};
+  const ctx = vm.createContext({console, getConversationById: () => conversation,
+    fetch: async () => ({ok: true, json: async () => ({messages: [{role: 'assistant',
+      content: original.content, task_id: 'task', turn_id: 'turn', source_event_sequence: 20}]})}),
+    renderConversations() {}, renderMessages() {},
+  });
+  vm.runInContext(page.slice(page.indexOf('async function ensureConversationLoaded('), page.indexOf('// A finished Turn is only fully described')), ctx);
+  await ctx.ensureConversationLoaded('chat');
+  assert.notEqual(conversation.messages[0], original);
+  assert.equal(conversation.messages[0].textPresentation, presentation);
+  assert.equal(conversation.messages[0].textPresentation.visible, '回答');
 });
 
 test('an interrupted task keeps its unanswered Turn trace anchored under the user input', async () => {

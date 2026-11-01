@@ -439,6 +439,9 @@ class ModelTextDelta:
     """One user-displayable text fragment from a streaming model call."""
 
     text: str
+    # A provider hint, when available; otherwise the Runtime resolves the
+    # display phase after the complete response establishes its tool boundary.
+    phase: AssistantMessagePhase | None = None
 
 
 @dataclass(frozen=True, slots=True)

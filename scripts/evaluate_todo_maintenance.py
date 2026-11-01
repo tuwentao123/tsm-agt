@@ -465,7 +465,7 @@ async def run_case(args, cfg, case, mode, sample):
 
 
 async def main(args):
-    cfg = load_model_configuration(args.env_file, os.environ)
+    cfg = load_model_configuration(args.config)
     if args.reasoning_effort:
         cfg = replace(cfg, reasoning_effort=args.reasoning_effort)
     args.report_dir.mkdir(parents=True, exist_ok=True)
@@ -498,7 +498,7 @@ async def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--env-file", type=Path, default=Path(".env"))
+    parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--report-dir", type=Path, required=True)
     parser.add_argument("--baseline-snapshot", type=Path)
     parser.add_argument("--label", choices=("baseline", "candidate"), default="candidate")

@@ -12,72 +12,67 @@ from tsm_agt.web.app import _root_cause_message
 
 
 class SearchConfigurationTest(unittest.TestCase):
-    def _load(self, env_file_text: str = "", environment=None):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / ".env"
-            if env_file_text:
-                path.write_text(env_file_text, encoding="utf-8")
-            return load_search_configuration(path, environment or {})
+    def _load(self, yaml_text: str = "", environment=None):
+        import os
+        import yaml
+        from unittest.mock import patch
+        with patch.dict(os.environ, environment or {}, clear=True):
+            return load_search_configuration({"web": {"search": yaml.safe_load(yaml_text) or {}}})
 
     def test_defaults_to_off(self):
         configuration = self._load()
         self.assertEqual(configuration.tavily_mode, "off")
         self.assertEqual(configuration.tavily_api_key, "")
 
-    def test_env_file_enables_keyless(self):
-        configuration = self._load("TSM_AGT_SEARCH_TAVILY_MODE=keyless\n")
+    def test_yaml_enables_keyless(self):
+        configuration = self._load("tavily_mode: keyless\n")
         self.assertEqual(configuration.tavily_mode, "keyless")
         self.assertEqual(
-            configuration.sources["search.tavily_mode"], "env_file"
+            configuration.sources["search.tavily_mode"], "yaml"
         )
 
     def test_inline_comment_is_not_part_of_the_value(self):
-        # `MODE=keyless  # note` is a very natural thing to write in .env; a
+        # `tavily_mode: keyless  # note` is a natural YAML setting; a
         # comment must not turn into an invalid mode and break startup.
         configuration = self._load(
-            "TSM_AGT_SEARCH_TAVILY_MODE=keyless   # 免 key 试用\n"
+            "tavily_mode: keyless   # 免 key 试用\n"
         )
         self.assertEqual(configuration.tavily_mode, "keyless")
 
     def test_quoted_value_keeps_its_hash(self):
         configuration = self._load(
-            'TSM_AGT_SEARCH_TAVILY_API_KEY="tvly-a#b"\n'
-            "TSM_AGT_SEARCH_TAVILY_MODE=key\n"
+            'tavily_api_key: "tvly-a#b"\n'
+            "tavily_mode: key\n"
         )
         self.assertEqual(configuration.tavily_api_key, "tvly-a#b")
 
-    def test_exported_environment_overrides_env_file(self):
-        configuration = self._load(
-            "TSM_AGT_SEARCH_TAVILY_MODE=keyless\n",
-            {"TSM_AGT_SEARCH_TAVILY_MODE": "off"},
-        )
-        self.assertEqual(configuration.tavily_mode, "off")
-        self.assertEqual(
-            configuration.sources["search.tavily_mode"], "environment"
-        )
+    def test_environment_does_not_override_yaml(self):
+        configuration = self._load("tavily_mode: keyless", {"TSM_AGT_SEARCH_TAVILY_MODE": "off"})
+        self.assertEqual(configuration.tavily_mode, "keyless")
+        self.assertEqual(configuration.sources["search.tavily_mode"], "yaml")
 
     def test_key_mode_without_a_key_degrades_and_reports(self):
         # Search is optional: a bad value must not take the Runtime (and the
         # whole Web UI) down with it.
-        configuration = self._load("TSM_AGT_SEARCH_TAVILY_MODE=key\n")
+        configuration = self._load("tavily_mode: key\n")
         self.assertEqual(configuration.tavily_mode, "off")
         self.assertTrue(configuration.issues)
-        self.assertIn("TSM_AGT_SEARCH_TAVILY_API_KEY", configuration.issues[0])
+        self.assertIn("web.search.tavily_api_key", configuration.issues[0])
 
     def test_unknown_mode_degrades_and_reports(self):
-        configuration = self._load("TSM_AGT_SEARCH_TAVILY_MODE=always\n")
+        configuration = self._load("tavily_mode: always\n")
         self.assertEqual(configuration.tavily_mode, "off")
         self.assertTrue(configuration.issues)
         self.assertIn("always", configuration.issues[0])
 
     def test_valid_configuration_has_no_issues(self):
-        configuration = self._load("TSM_AGT_SEARCH_TAVILY_MODE=keyless\n")
+        configuration = self._load("tavily_mode: keyless\n")
         self.assertEqual(configuration.issues, ())
 
     def test_sources_never_expose_the_secret(self):
         configuration = self._load(
-            "TSM_AGT_SEARCH_TAVILY_MODE=key\n"
-            "TSM_AGT_SEARCH_TAVILY_API_KEY=tvly-super-secret\n"
+            "tavily_mode: key\n"
+            "tavily_api_key: tvly-super-secret\n"
         )
         self.assertEqual(configuration.tavily_api_key, "tvly-super-secret")
         self.assertNotIn(
@@ -121,31 +116,18 @@ if __name__ == "__main__":
 
 
 class DocumentCacheConfigurationTest(unittest.TestCase):
-    def test_document_cache_settings_load_with_environment_precedence(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / ".env"
-            path.write_text(
-                "TSM_AGT_WEB_DOCUMENT_CACHE_MAX_ENTRIES=7\n"
-                "TSM_AGT_WEB_DOCUMENT_CACHE_MAX_BYTES=8192\n"
-                "TSM_AGT_WEB_REFERENCE_CACHE_MAX_ENTRIES=11\n"
-                "TSM_AGT_WEB_DOCUMENT_CACHE_TTL_SECONDS=42.5\n",
-                encoding="utf-8",
-            )
-            configuration = load_search_configuration(
-                path, {"TSM_AGT_WEB_DOCUMENT_CACHE_MAX_ENTRIES": "9"},
-            )
+    def test_document_cache_settings_load_from_yaml(self):
+        configuration = load_search_configuration({"web": {"search": {
+            "document_cache_max_entries": 9, "document_cache_max_bytes": 8192,
+            "reference_cache_max_entries": 11, "document_cache_ttl_seconds": 42.5,
+        }}})
         self.assertEqual(configuration.document_cache_max_entries, 9)
         self.assertEqual(configuration.document_cache_max_bytes, 8192)
         self.assertEqual(configuration.reference_cache_max_entries, 11)
         self.assertEqual(configuration.document_cache_ttl_seconds, 42.5)
-        self.assertEqual(
-            configuration.sources["web.document_cache_max_entries"], "environment",
-        )
+        self.assertEqual(configuration.sources["web.document_cache_max_entries"], "yaml")
 
     def test_invalid_document_cache_values_fall_back_without_startup_failure(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / ".env"
-            path.write_text("TSM_AGT_WEB_DOCUMENT_CACHE_MAX_ENTRIES=0\n", encoding="utf-8")
-            configuration = load_search_configuration(path, {})
+        configuration = load_search_configuration({"web": {"search": {"document_cache_max_entries": 0}}})
         self.assertEqual(configuration.document_cache_max_entries, 32)
-        self.assertIn("TSM_AGT_WEB_DOCUMENT_CACHE_MAX_ENTRIES", configuration.issues[0])
+        self.assertIn("web.search.document_cache_max_entries", configuration.issues[0])

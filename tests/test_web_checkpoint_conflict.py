@@ -151,6 +151,7 @@ const describeFailure = (text) => text;
 const applyTaskProjection = () => {}; const applyTaskProtocol = () => {};
 const clearApprovalMessage = () => {}; const updateComposerButtonState = () => {};
 const refreshConversationHistory = async () => true;
+const clearTaskTextStreams = () => {};
 """ + javascript_function("renderFinalResult") + """
 renderFinalResult('task', {state: 'CONFLICT', phase1_state: 'INTERRUPTED',
   status: 'interrupted', assistant_text: 'STALE PREVIOUS ANSWER', failure_reason: 'policy_hash changed'},

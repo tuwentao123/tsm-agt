@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import hashlib
 import os
@@ -385,7 +386,9 @@ class CoreReadOnlyToolProvider:
         if handler is None:
             return self._error(call, "NOT_FOUND", f"unknown core tool: {call.name}")
         try:
-            return handler(call, context)
+            # Reads and ripgrep are synchronous I/O. Yield the event loop so
+            # independent read-only calls can actually overlap.
+            return await asyncio.to_thread(handler, call, context)
         except _SensitivePathError as error:
             return self._error(call, "PERMISSION_DENIED", str(error))
         except _WorkspaceAccessError as error:

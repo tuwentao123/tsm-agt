@@ -20,7 +20,7 @@ from tsm_agt.ports import (
 
 
 class StreamingEchoModel(EchoModelProvider):
-    capabilities = ProviderCapabilities(stream_cancel=True, context_window=4096)
+    capabilities = ProviderCapabilities(stream_cancel=True, context_window=32768)
 
     async def stream_complete(self, request: ModelRequest):
         text = next(
@@ -168,7 +168,7 @@ class ModelStreamingTest(unittest.IsolatedAsyncioTestCase):
                 result = await application.kernel.run_agent_turn(
                     task.task_id, "atomic answer", on_text_delta=deltas.append
                 )
-                self.assertEqual(deltas, [])
+                self.assertEqual(deltas, ["atomic answer"])
                 self.assertEqual(result.assistant_message.text, "atomic answer")
             finally:
                 await application.registry.stop_all()
@@ -247,7 +247,7 @@ class ModelStreamingTest(unittest.IsolatedAsyncioTestCase):
                     await application.kernel.run_agent_turn(
                         task.task_id, "recover me", on_text_delta=deltas.append
                     )
-                self.assertEqual(deltas, [])
+                self.assertEqual(deltas, ["partial"])
                 interrupted = await application.kernel.interrupt_agent_turn(
                     task.task_id
                 )

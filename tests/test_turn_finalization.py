@@ -268,7 +268,7 @@ class RuntimeFinalizationGateTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(decision.action, FinalizationAction.ACCEPT)
         self.assertEqual(decision.reason_code, "runtime_state_terminal")
 
-    async def test_mutation_without_post_change_verification_does_not_force_a_turn(self) -> None:
+    async def test_mutation_does_not_create_a_runtime_finalization_rule(self) -> None:
         state = self._state()
         state.visible_tool_by_name = {
             "core.apply_patch": self._spec(
@@ -289,7 +289,7 @@ class RuntimeFinalizationGateTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(decision.action, FinalizationAction.ACCEPT)
         self.assertEqual(decision.reason_code, "runtime_state_terminal")
 
-    async def test_failed_post_change_verification_does_not_force_a_turn(self) -> None:
+    async def test_command_result_after_mutation_does_not_change_runtime_finalization(self) -> None:
         state = self._state()
         state.visible_tool_by_name = {
             "core.apply_patch": self._spec(
@@ -323,23 +323,13 @@ class RuntimeFinalizationGateTest(unittest.IsolatedAsyncioTestCase):
 
 class CompletionReviewConfigurationTest(unittest.TestCase):
     def test_completion_review_is_opt_in_by_default(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            configuration = load_completion_review_configuration(
-                Path(directory) / ".env", {}
-            )
+        configuration = load_completion_review_configuration({})
         self.assertEqual(configuration.mode.value, "off")
         self.assertEqual(configuration.failure_policy.value, "visible_unverified")
 
-    def test_env_file_and_environment_override_are_loaded(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / ".env"
-            path.write_text(
-                "TSM_AGT_COMPLETION_REVIEW_MODE=off\n"
-                "TSM_AGT_COMPLETION_REVIEW_MAX_CONTINUATIONS=4\n",
-                encoding="utf-8",
-            )
-            configuration = load_completion_review_configuration(
-                path, {"TSM_AGT_COMPLETION_REVIEW_MODE": "always"}
-            )
+    def test_completion_review_values_load_from_yaml(self) -> None:
+        configuration = load_completion_review_configuration({"completion_review": {
+            "mode": "always", "max_continuations": 4,
+        }})
         self.assertEqual(configuration.mode.value, "always")
         self.assertEqual(configuration.max_continuations, 4)

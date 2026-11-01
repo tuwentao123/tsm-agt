@@ -106,13 +106,19 @@ class MemoryMixin:
                 "working memory revision conflict: expected "
                 f"{expected_revision}, got {current.revision}"
             )
-        self._validate_working_evidence(task, events, state)
         sequence = stored.last_event_sequence + 1
+        candidate_state = {"goal": current.goal, **state}
+        # A progress update that does not mention diagnosis cannot erase the
+        # evidence record. An explicit diagnosis field remains replaceable.
+        if "diagnosis" not in candidate_state and current.diagnosis is not None:
+            candidate_state["diagnosis"] = current.diagnosis.to_data()
         updated = WorkingMemorySnapshot.from_update(
             task_id=task_id, revision=current.revision + 1,
-            state={"goal": current.goal, **state},
+            state=candidate_state,
             source_event_sequences=current.source_event_sequences + (sequence,),
         )
+        self._validate_working_evidence(task, events, state)
+        self._validate_diagnosis_evidence(task, events, updated.diagnosis)
         event = RuntimeEvent(
             f"evt-{uuid4().hex}", task_id, sequence, "working_memory.updated",
             {
@@ -356,6 +362,7 @@ class MemoryMixin:
             snapshot.constraints, snapshot.facts, snapshot.decisions,
             snapshot.hypotheses, snapshot.open_questions, snapshot.plan,
             snapshot.completed_work, effective.remaining_work, effective.evidence,
+            snapshot.diagnosis,
         )):
             return None
         execution_state = {
@@ -379,6 +386,10 @@ class MemoryMixin:
                 ],
             },
             "evidence": [item.to_data() for item in effective.evidence],
+            "diagnosis": (
+                snapshot.diagnosis.to_data()
+                if snapshot.diagnosis is not None else None
+            ),
             "runtime_derived": {
                 "remaining_work": list(effective.runtime_remaining_work),
                 "evidence": [

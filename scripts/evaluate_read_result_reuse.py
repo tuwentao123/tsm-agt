@@ -97,7 +97,7 @@ async def evaluate(args):
                 "model_view_after": result_views(projection.messages),
             })
             if args.live:
-                cfg = load_model_configuration(args.env_file, os.environ)
+                cfg = load_model_configuration(args.config)
                 model = _physical_model_provider(
                     base_url=cfg.base_url, model=cfg.model, api_key=cfg.api_key,
                     protocol=cfg.protocol, anthropic_version=cfg.anthropic_version,
@@ -140,7 +140,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--live", action="store_true")
-    parser.add_argument("--env-file", type=Path, default=Path(".env"))
+    parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=25)
     args = parser.parse_args()
     if args.timeout <= 0:

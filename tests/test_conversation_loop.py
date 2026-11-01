@@ -378,7 +378,9 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(_turn_progress_item(note)["activity"], "先查找相关资料。")
                 notes = [item for item in progress if item.kind.value == "commentary"]
                 self.assertEqual([item.activity for item in notes], ["先查找相关资料。"])
-                self.assertNotIn("先查找相关资料。", "".join(final_deltas))
+                self.assertEqual("".join(final_deltas), "先查找相关资料。这是最终答复。")
+                text_events = [item for item in progress if item.kind.value == "text_delta"]
+                self.assertEqual([item.phase for item in text_events], ["commentary", "final_answer"])
                 self.assertEqual(sum(event.event_type == "conversation.commentary" for event in events), 1)
         finally:
             await application.registry.stop_all()

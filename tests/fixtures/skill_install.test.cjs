@@ -33,7 +33,7 @@ class Element {
 function setup(responses, {modalOpen = true, sidebar = true} = {}) {
   const nodes = new Map([
     'error-banner', 'skill-settings-dialog', 'skill-settings-status',
-    'skill-discovered-catalog', 'skill-install-directory', 'skill-discovery-list', 'skill-installations',
+    'skill-discovered-catalog', 'skill-install-directory', 'skill-discovery-list', 'skill-installations', 'skill-builtin-catalog',
   ].map(name => [name, new Element()]));
   if (sidebar) nodes.set('skill-install-status', new Element());
   nodes.get('skill-settings-dialog').open = modalOpen;
@@ -80,6 +80,24 @@ const file = {name: 'SKILL.md', webkitRelativePath: 'demo/SKILL.md'};
 const response = (data, status = 200) => ({ok: status < 400, status, json: async () => data});
 const installed = name => response({installed: true, skill: {name, plan_path: `/home/.tsm-agent/skills/${name}/SKILL.md`}});
 const catalog = (...names) => response({skills: names.map(name => ({name, description: 'Demo'})), issues: []});
+
+test('built-in workflow controls preserve source labels and persist disablement with directory settings', async () => {
+  const data = {install_directory: '/home/skills', discovery_directories: ['/home/skills'],
+    builtin_skills: [{name: 'verify-change'}], disabled_builtin_skills: [],
+    skills: [{name: 'verify-change', description: 'Verification', source: 'builtin', plan_path: 'builtin://verify-change/SKILL.md'}]};
+  const s = setup([response({...data, skills: [], disabled_builtin_skills: ['verify-change']})]);
+  s.nodes.set('save-skill-settings', new Element());
+  s.nodes.set('skill-directory-path', new Element());
+  s.context.applySkillSettings(data);
+  assert.match(s.nodes.get('skill-discovered-catalog').children[1].textContent, /内置/);
+  const checkbox = s.nodes.get('skill-builtin-catalog').children[0].children[0];
+  assert.equal(checkbox.checked, true);
+  checkbox.checked = false; checkbox.onchange();
+  await s.context.saveSkillSettings();
+  const payload = JSON.parse(s.requests[0].options.body);
+  assert.deepEqual(payload.disabled_builtin_skills, ['verify-change']);
+  assert.equal(s.nodes.get('skill-builtin-catalog').children[0].children[0].checked, false);
+});
 
 test('saved files start preparation and open the new recent-workspace conversation when ready', async () => {
   const job = {id: 'install-one', skill_name: 'demo', status: 'starting', summary: '正在检查',

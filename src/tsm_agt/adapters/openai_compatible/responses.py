@@ -9,6 +9,7 @@ from dataclasses import replace
 from tsm_agt.ports import (AssistantMessagePhase, Message, MessageRole, ModelReasoningDelta,
                            ModelStreamCompleted, ModelTextDelta, ToolCallBlock,
                            ModelFailureCategory, ModelRetrySafety)
+from .stream_text import VisibleTextStream
 from tsm_agt.ports.model import ReasoningBlock
 from .model import OpenAICompatibleModelProvider, OpenAICompatibleProviderError
 
@@ -169,6 +170,10 @@ class OpenAIResponsesModelProvider(OpenAICompatibleModelProvider):
         self._capture_request(request, payload)
         final = None
         completed_reasoning = {}
+        text_stream = VisibleTextStream()
+        emitted = []
+        saw_text_delta = False
+        phases = {}
         async for data in self._transport.stream_sse(self._base_url + "/responses", {"Authorization": f"Bearer {self._api_key}"}, payload, request.timeout_seconds or self._timeout_seconds, cancellation_scope=request.cancellation_scope):
             if data == "[DONE]":
                 break
@@ -176,6 +181,24 @@ class OpenAIResponsesModelProvider(OpenAICompatibleModelProvider):
             kind = event.get("type")
             if kind == "response.reasoning_summary_text.delta" and event.get("delta"):
                 yield ModelReasoningDelta(event["delta"])
+            elif kind == "response.output_item.added":
+                item = event.get("item") or {}
+                if not isinstance(item, Mapping):
+                    raise OpenAICompatibleProviderError("invalid streamed Responses item")
+                if item.get("type") == "message" and item.get("phase") is not None:
+                    try:
+                        phases[item.get("id")] = AssistantMessagePhase(item["phase"])
+                    except (ValueError, TypeError) as error:
+                        raise OpenAICompatibleProviderError("invalid streamed assistant phase") from error
+            elif kind == "response.output_text.delta":
+                delta = event.get("delta")
+                if not isinstance(delta, str):
+                    raise OpenAICompatibleProviderError("Responses text delta must be a string")
+                saw_text_delta = saw_text_delta or bool(delta)
+                visible = text_stream.feed(delta)
+                if visible:
+                    emitted.append(visible)
+                    yield ModelTextDelta(visible, phase=phases.get(event.get("item_id")))
             elif kind == "response.output_item.done":
                 item = event.get("item")
                 if isinstance(item, Mapping) and item.get("type") == "reasoning" and isinstance(item.get("id"), str):
@@ -186,12 +209,21 @@ class OpenAIResponsesModelProvider(OpenAICompatibleModelProvider):
                 raise _responses_error(event, "Responses stream failed")
         if not isinstance(final, Mapping):
             raise OpenAICompatibleProviderError("Responses stream ended before completion")
+        remaining = text_stream.finish()
+        if remaining:
+            emitted.append(remaining)
+            yield ModelTextDelta(remaining)
         final = dict(final)
         if isinstance(final.get("output"), list):
             final["output"] = [completed_reasoning.get(item.get("id"), item)
                                if isinstance(item, Mapping) and item.get("type") == "reasoning" else item
                                for item in final["output"]]
         result = self._normalize_responses(request, final, names)
-        if result.message.text:
-            yield ModelTextDelta(result.message.text)
+        if saw_text_delta:
+            if "".join(emitted) != result.message.text:
+                raise OpenAICompatibleProviderError(
+                    "Responses stream text does not match the completed response"
+                )
+        elif result.message.text:
+            yield ModelTextDelta(result.message.text, phase=result.message.phase)
         yield ModelStreamCompleted(result)

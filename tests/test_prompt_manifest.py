@@ -28,6 +28,7 @@ def tool(name: str, schema_type: str = "string") -> ToolSpec:
 ALL_SEGMENTS = [
     # Layer 1: the boundary every turn obeys.
     "system-safety", "request-pipeline-guidance", "delivery-mode-guidance",
+    "skill-workflow-guidance",
     "tool-feedback-guidance",
     # Layer 2: request handling -- understand, shape, route, close.
     "response-format-guidance", "execution-discipline",
@@ -117,7 +118,7 @@ class PromptManifestTest(unittest.TestCase):
         # Pin content, ordering, section versions and capability gates together.
         self.assertEqual(
             self.template.manifest().manifest_hash,
-            "5ca8d6c2f8dcb2456829be0031598b8373a94ed43ab7fd6d8d4ba83a942c8213",
+            "c17b9c9732896f7e1109f6e60a43a4fa82913a8925fd8ffd0294067c31fe09e2",
         )
 
     def test_packaged_prompt_rejects_duplicate_sections(self) -> None:
@@ -174,8 +175,9 @@ class PromptManifestTest(unittest.TestCase):
         )
 
         ids = [message.message_id for message in assembled.messages]
-        self.assertLess(ids.index("project-instructions-context-project"), ids.index("prompt-runtime-r47"))
-        self.assertLess(ids.index("task-spec-context-task"), ids.index("prompt-runtime-r47"))
+        runtime_id = f"prompt-runtime-r{self.template.revision}"
+        self.assertLess(ids.index("project-instructions-context-project"), ids.index(runtime_id))
+        self.assertLess(ids.index("task-spec-context-task"), ids.index(runtime_id))
         self.assertEqual(assembled.receipt.static_segment_count, 7)
 
     def test_cache_fingerprints_distinguish_order_from_dynamic_messages(self) -> None:
@@ -294,7 +296,7 @@ class PromptManifestTest(unittest.TestCase):
     def test_request_pipeline_orders_understanding_before_tools(self) -> None:
         segment = self.segment("request-pipeline-guidance")
         content = segment.content
-        self.assertEqual(segment.version, "5.3")
+        self.assertEqual(segment.version, "5.6")
         headings = ["# Working with the user", "# Evidence and action", "# Persistence and completion", "# Progress communication"]
         positions = [content.index(h) for h in headings]
         self.assertEqual(positions, sorted(positions))
@@ -319,7 +321,7 @@ class PromptManifestTest(unittest.TestCase):
         # to material the turn never received.
         self.assertIn("A source is only something you", segment.content)
         self.assertIn("say so when a claim comes from memory", segment.content)
-        self.assertEqual(segment.version, "1.6")
+        self.assertEqual(segment.version, "1.7")
         self.assertIn("verification outcomes", segment.content)
         self.assertIn("Use structure only when helpful", segment.content)
         self.assertIn("Do not repeat the specification", segment.content)
@@ -339,7 +341,7 @@ class PromptManifestTest(unittest.TestCase):
         self.assertEqual(segment.version, "1.0")
         for scenario in ("news", "headline", "article", "financial", "新闻"):
             self.assertNotIn(scenario, content)
-        self.assertEqual(self.template.revision, 47)
+        self.assertEqual(self.template.revision, 55)
 
     def test_workspace_guidance_is_capability_bound(self) -> None:
         search = self.segment("workspace-search-guidance").content
@@ -377,7 +379,7 @@ class PromptManifestTest(unittest.TestCase):
 
     def test_delivery_guidance_is_static_and_requires_a_write_tool(self) -> None:
         segment = self.segment("delivery-mode-guidance")
-        self.assertEqual(segment.version, "5.0")
+        self.assertEqual(segment.version, "5.3")
         for boundary in ("carry out the edits now", "interface wiring", "receipt is not proof", "smallest sufficient verification", "after the last relevant edit", "not mandatory runtime tests", "do not repeat passing checks", "independent compilation", "never present unperformed or unverified work as done"):
             self.assertIn(boundary, segment.content)
         self.assertEqual(segment.requires_any_tools, ("core.apply_patch", "core.apply_patch_v4a", "core.apply_patches", "core.delete_file"))
@@ -485,7 +487,7 @@ class PromptManifestTest(unittest.TestCase):
         # This workspace's own notes about another system are not that system.
         self.assertIn("are not its", segment.content)
         self.assertIn("source.github.get_file", segment.content)
-        self.assertEqual(segment.version, "1.4")
+        self.assertEqual(segment.version, "1.5")
 
     def test_live_and_runtime_fact_routing_split_by_capability(self) -> None:
         live = self.segment("live-fact-routing")
@@ -503,9 +505,9 @@ class PromptManifestTest(unittest.TestCase):
         # An ambiguous name is not an invitation to describe a namesake.
         self.assertIn("not licence to describe a", live.content)
         self.assertIn("which one is meant", live.content)
-        self.assertIn("Do not use public discovery as a first step", live.content)
+        self.assertIn("Do not use public discovery as a", live.content)
         self.assertIn("implementation, validation, diagnosis, and recovery", live.content)
-        self.assertEqual(live.version, "2.3")
+        self.assertEqual(live.version, "2.4")
         self.assertNotIn("core.run_command", live.content)
 
         self.assertIn("instead of guessing from memory", runtime.content)

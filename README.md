@@ -23,11 +23,11 @@
    uv sync
    ```
 
-2. 初始化一个工作区：
+2. 初始化本机私有配置：
 
    ```bash
-   uv run tsm-agt init --workspace .
-   # 按提示编辑生成的 .env，填入模型 endpoint / API key / model 名称
+   uv run tsm-agt init
+   # 编辑 ~/.tsm-agt/config.yaml，填入 endpoint / API key / model 名称
    ```
 
 3. 检查本地环境和模型配置：
@@ -56,7 +56,7 @@ README 不再展开所有细节，完整设计说明和命令参考请看仓库�
 
 - `src/tsm_agt/docs/cancellation_spec.md`：任务取消与安全中断协议；
 - `src/tsm_agt/docs/mcp_integration.md`：MCP 工具集成与配置；
-- `docs/conversation-history-migration.md`：多轮历史和上下文压缩策略；
+- `src/tsm_agt/core/context.py` 与 `session_context.py`：多轮历史和上下文压缩策略；
 - 以及代码中的 docstring 与类型提示。
 
 如果你只是想“先用起来”，按照上面的 **快速开始** 步骤即可；
@@ -71,6 +71,12 @@ Web 页面右上角的「设置」提供 Skill 安装和「可发现 Skills 目�
 「文件已保存」和「安装成功，验证通过」是不同状态。模型通过 `skill.installation_finish` 回报实际检查结果；只有安装会话读取过对应 `SKILL.md` 才能报告准备完成。准备进度、检查结果、工作区和会话 ID 保存于 `~/.tsm-agent/skill-installations.json`，可在设置中查看并打开原会话；没有工作区或运行时不可用时保留待准备状态，选择工作区后可重试准备。相同目录重复上传复用原安装记录，避免重复启动安装。
 
 默认发现 `~/.tsm-agent/skills`；可在设置中一次选择多个额外目录，例如 `~/.kiro/skills`、`~/.agents/skills`，也可以手动输入路径。额外目录只用于发现和读取，不接收安装写入。目录设置保存在 `~/.tsm-agent/settings.json` 的 `skill_discovery_directories` 字段，保存后刷新，下一轮对话即可使用，重启后继续生效。旧版 `uploaded_skills` 中的内容可通过重新安装或将旧目录加入发现列表使用。
+
+`verify-change`（变更验证）现在随程序提供，支持工具的正常运行时默认可发现，无须安装或添加仓库目录。源文档位于 `skills/verify_change/SKILL.md`，打包时连同引用资源一起进入 wheel。设置中的「内置工作流」可以禁用它；禁用内置版本不会禁用用户自行安装的同名技能。用户安装目录、配置的额外目录优先，内置版本兜底；同名覆盖会显示来源和提示。程序不复制内置技能到用户目录，也不会为它启动安装准备会话。
+
+模型请求中独立提供技能目录及适用条件，由主模型根据当前请求、相关历史和实际修改按需调用 `skill.load`。模型读取验证工作流后，通过普通工具选择并执行检查、观察输出并处理相关失败；加载技能不自动执行命令，也不启用结束复核。纯分析、普通文字编辑不机械运行测试。该机制改善流程提示，不保证任意模型每次都能正确选择，需结合真实执行轨迹评估。
+
+`diagnose-failure`（故障排查）仍作为可选技能放在 `skills/diagnose_failure/SKILL.md`，可从本地目录安装或添加其发现目录。本项目的具体测试入口仍由项目说明和配置提供，通用技能不固定某个测试命令。
 
 系统递归发现 `SKILL.md`，将名称和描述提供给模型；模型调用统一的 `skill.load(name)` 加载完整指令，再调用普通工具执行。附件可通过同一工具的 `resource` 参数读取，路径相对于 Skill 所在目录。加载不会自动执行 Markdown 或 YAML 步骤。默认安装目录优先于额外目录；其他目录按配置顺序处理，同名定义和格式错误显示在设置中的问题列表。
 
@@ -166,14 +172,16 @@ python scripts/run_in_project_env.py module unittest discover -s tests
 ./scripts/restart.sh logs       # 跟踪日志
 ```
 
-完整说明见 [`docs/tsm-agt-restart.md`](docs/tsm-agt-restart.md)。
+启动与健康检查逻辑见 [`scripts/restart.sh`](scripts/restart.sh)。
 
 检索层（`web.search`）默认只使用无需账号的公开端点（DuckDuckGo + Google/Bing News RSS），会解析来源发布时间、按新鲜度排序，并支持 `freshness=day|week|month` 的时效过滤。如需更稳定的实时新闻与结构化 `published_date`，可显式启用 Tavily（默认关闭：启用后查询会发给第三方）：
 
 ```bash
-# .env
-TSM_AGT_SEARCH_TAVILY_MODE=keyless   # 免 key 试用；生产建议 =key + API key
-# TSM_AGT_SEARCH_TAVILY_API_KEY=tvly-...
+# ~/.tsm-agt/config.yaml
+web:
+  search:
+    tavily_mode: keyless # 免 key 试用；生产建议 key + API key
+    # tavily_api_key: tvly-...
 ```
 
 适用边界与部署说明：
@@ -252,15 +260,15 @@ tsm-agt --version
 进入要操作的工程后，首次启动按以下顺序：
 
 ```bash
-tsm-agt init --workspace .
-# 编辑新建的 .env，填写 endpoint、model 和 API key
+tsm-agt init
+# 编辑 ~/.tsm-agt/config.yaml，填写 endpoint、model 和 API key
 tsm-agt doctor --workspace . --model-check
 tsm-agt chat --workspace .
 ```
 
-`init` 只创建私有 `.env` 模板：macOS/Linux 权限为 `0600`，已有文件绝不覆盖，也不会提前创建 `.agent` 运行数据。`init --print` 可只打印模板。Windows 使用独占创建保证不覆盖，但 ACL 需要在 Windows 原生环境复核。
+`init` 只创建私有 `config.yaml` 模板：macOS/Linux 权限为 `0600`，已有文件绝不覆盖，也不会提前创建 `.agent` 运行数据。`init --print` 可只打印模板。Windows 使用独占创建保证不覆盖，但 ACL 需要在 Windows 原生环境复核。
 
-`doctor` 检查 Python 3.12、当前平台、工作区、`.agent` 可写性、平台 Adapter 和三个模型配置；默认不联网、不运行项目代码。只有显式添加 `--model-check` 才发送一条固定且不包含项目数据的最小 Chat Completions 请求。`--json` 适合脚本/CI。报告永远不显示 API Key，只显示是否配置；endpoint 仅显示 scheme、host 和 port，不显示账号、路径、query 或 fragment。任一必需检查失败时退出码为 1。
+`doctor` 检查 Python 3.12、当前平台、工作区、`.agent` 可写性、平台 Adapter 和当前模型 Profile；默认不联网、不运行项目代码。只有显式添加 `--model-check` 才按 Profile 对应的协议发送一条固定且不包含项目数据的最小请求。`--json` 适合脚本/CI。报告永远不显示 API Key，只显示是否配置；endpoint 仅显示 scheme、host 和 port，不显示账号、路径、query 或 fragment。任一必需检查失败时退出码为 1。
 
 `flow` 通过 SQLite 只读连接读取 `<workspace>/.agent/runtime.db` 中已经持久化的 Event Log，不会再次调用模型、执行工具或改变 Task/Event 记录；数据库不存在时也不会创建空文件。默认树形输出只包含节点、状态与事件序号，不展示 Goal/Prompt、工具参数、环境变量和日志正文。`--live` 只在 Event cursor 前进时刷新，任务到达终态后自动退出；尚未终结的任务可按 Ctrl+C 停止观看，这不会停止任务本身。`--live --json` 每行输出一个完整 JSON 投影，便于脚本逐条读取。
 
@@ -278,11 +286,11 @@ tsm-agt chat --workspace .
 
 `inspect --effective-config` 使用 SQLite 只读连接返回已经落盘的配置，不会读取“现在”的模型配置来伪造历史。输出包括模型公开标识、仅保留 origin 的 endpoint、凭据是否已配置及来源、Provider 能力、Tool 风险/幂等和参数 Schema hash、Adapter 版本/能力/健康、Policy/Trust/Sandbox、环境指纹、Prompt Manifest 与各类 hash。API Key、完整 endpoint 路径/参数、Prompt 正文、Tool Schema 正文和环境变量值不会保存或输出。当前实现 revision 1；Steering/config diff 自动生成后续 revision 仍待后续步骤。Extension 和 Workflow 仍以 `not_selected` 明确占位，不冒充已经实现。
 
-Prompt 目前按固定顺序装配 `System Safety → Harness Instructions → Untrusted Project Onboarding（若有）→ Untrusted Project Memory（若有）→ Session Conversation Projection（若有）→ Task Working Memory（非空时）→ Conversation → Current User Input`。系统段以独立 `system` 消息发送，Onboarding/Memory/Session/Working Memory 使用明确边界的 `user` 数据消息，用户输入和 Tool Result 保持各自角色，不可信数据不能被拼接进系统指令。Manifest 保存段 ID、来源、版本、信任等级和正文 Hash，不保存正文；每次 `llm.completed`/`llm.failed` 只记录最终 Prompt Hash、Manifest Hash、角色顺序、消息数和 Toolset Hash。空白 Working Memory 不进入 Prompt，避免浪费小上下文窗口。由于尚未接入 Provider tokenizer，静态段 token 数明确标记为 unavailable，不使用字符数冒充 token。Trusted Project Instructions、Workflow、Skill 和精确 Provider tokenizer 属于后续步骤。
+Prompt 按固定顺序装配基础系统规则、可信项目说明（若已激活）、Task Spec、运行环境与临时指令、技能目录、项目发现与记忆、会话历史、文档引用、工作记忆、当前对话和执行状态。可信项目说明使用独立 `system` 消息；技能目录、Onboarding、Memory 和 Working Memory 使用明确边界的数据消息，用户输入和 Tool Result 保持各自角色。具体顺序见 [`PromptTemplate.assemble`](src/tsm_agt/core/prompt.py)。项目说明只读取已有的 `.agent/projectInstructions.md`，不会自动生成；项目解析时登记版本，任务中途内容变化会停止注入，重新检查登记后才能采用新内容。Manifest 保存段 ID、来源、版本与正文 Hash，不保存正文。精确 Provider tokenizer 尚未接入，预算使用启发式估算。
 
-上下文预算/压缩已接入 Agent Loop：总输入受 Provider 窗口、输出预留和默认 80% 压缩比例约束。Conversation 的历史原文、执行事实、Task 索引和读取正文共同使用 `TSM_AGT_CONTEXT_HISTORY_SOFT_TOKENS` 软分配，默认 16384，不等大窗口接近装满才压缩。累计 Task 事实只保留一份，相同读取正文合并；超预算先省略历史读取正文，再按完整 Turn 保留最近后缀。当前输入和上一轮原文不静默截断，工具调用/结果原子组不拆分。旧 Task 的目标和完成结论不作为当前轮验收标准。`context.compacted` 记录体积和来源范围；估算仍是 UTF-8 字节启发式，不是 Provider 精确 tokenizer。详见 [多轮历史迁移说明](docs/conversation-history-migration.md)。
+上下文预算/压缩已接入 Agent Loop：总输入受 Provider 窗口、输出预留和默认 80% 压缩比例约束。Conversation 的历史原文、执行事实、Task 索引和读取正文共同使用 `context.history_soft_tokens` 软分配，默认 16384，不等大窗口接近装满才压缩。累计 Task 事实只保留一份，相同读取正文合并；超预算先省略历史读取正文，再按完整 Turn 保留最近后缀。当前输入和上一轮原文不静默截断，工具调用/结果原子组不拆分。旧 Task 的目标和完成结论不作为当前轮验收标准。`context.compacted` 记录体积和来源范围；估算仍是 UTF-8 字节启发式，不是 Provider 精确 tokenizer。实现见 [`ContextWindowManager`](src/tsm_agt/core/context.py)。
 
-`TSM_AGT_CONTEXT_LATENCY_SOFT_TOKENS` 默认 0，仅表示没有额外的总输入性能门槛，不关闭历史软分配。历史软分配设为 0 可用于隔离对照，仍受 Provider 硬窗口限制。最近一轮原文单独超过软分配时允许保留并记录超软限；受保护内容超过硬窗口时明确失败。历史工具结果中的路径、调用身份、错误和退出状态不会被正文去重改写，也不继承旧审批权限。
+`context.latency_soft_tokens` 默认 0，仅表示没有额外的总输入性能门槛，不关闭历史软分配。历史软分配设为 0 可用于隔离对照，仍受 Provider 硬窗口限制。最近一轮原文单独超过软分配时允许保留并记录超软限；受保护内容超过硬窗口时明确失败。历史工具结果中的路径、调用身份、错误和退出状态不会被正文去重改写，也不继承旧审批权限。
 
 搜索路线遵循“先宽后窄”：首次工作区搜索可以发现候选，出现大量命中后要求读取候选或缩小目录；只有真正读取源码文件才锁定源码范围，Markdown/日志等说明材料只作为线索，不会把 Agent 困在文档目录。锁定源码后无理由返回全仓搜索会被阻止。Monorepo 全仓搜索优先源码根和源码文件，并在多个同级源码根之间轮流扫描，避免 `codeBase`、`modules`、`packages` 中字母靠前的一份耗尽 5000 文件额度。已知多个独立文件时，提示模型在一个响应中提交多个只读调用，Runtime 按现有安全边界逐个执行。
 
@@ -308,55 +316,22 @@ Project Onboarding 会在 Task 首次进入 `RESOLVING_PROJECT` 时进行有界�
 
 ## 使用真实模型
 
-真实 Agent 使用 `TSM_AGT_MODEL` 选择协议和对应模型名，不会自动复用其他应用的 API Key。Open 与 Anthropic 可共用同一个 Base URL，Provider 会根据选择值使用不同的请求路径。可以在终端中 `export`，也可以复制 `.env.example` 为项目根目录的 `.env`；已导出的变量优先于 `.env`：
+真实 Agent 只读取本机私有的 `~/.tsm-agt/config.yaml`；不会读取项目 `.env`，也不会接受 `TSM_AGT_*` 环境变量覆盖。`tsm-agt init` 以 `0600` 创建模板，YAML 中可保存 API Key，但绝不能提交到项目仓库。需要另一份私有配置时，模型相关命令使用 `--config /absolute/path/config.yaml`。
 
-```bash
-# Open Chat Completions 模式
-export TSM_AGT_MODEL="open"
-export TSM_AGT_MODEL_BASE_URL="https://api.example.com/v1"
-export TSM_AGT_OPEN_MODEL="your-open-model-name"
-export TSM_AGT_MODEL_API_KEY="your-api-key"
-# GPT-5 类接口若拒绝 max_tokens，则改用 max_completion_tokens。
-export TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER="max_completion_tokens"
-# 兼容网关若拒绝 function.strict=true，可设为 false；Kernel 仍会本地校验参数。
-export TSM_AGT_MODEL_STRICT_TOOL_SCHEMA="true"
-export TSM_AGT_MODEL_STREAMING="true"
+当前支持 `openai_chat`（公司网关、vLLM、SGLang、Ollama 等）、`openai_responses`（官方 OpenAI Responses）和 `anthropic_messages`（官方 Claude Messages）。三者在进入 Kernel 前都会投影为相同的内部 Model Port；Profile 只能收窄 Adapter 已有能力，不能错误声明某个协议并不支持的能力。
 
-uv run tsm-agt agent \
-  "分析这个项目的入口文件" --workspace .
-```
+YAML 模板与字段校验见 [`model_configuration.py`](src/tsm_agt/bootstrap/model_configuration.py)；可用 `tsm-agt init --print` 查看完整模板。`agent`、`chat`、`resume`、`approve/reject` 和 `answer` 使用同一份配置，而 `--workspace` 只决定项目和 `.agent/runtime.db` 的位置。
 
-Anthropic 原生 Messages 模式只需将 `TSM_AGT_MODEL` 设为 `anthropic`，并设置 `TSM_AGT_ANTHROPIC_MODEL`。Base URL 与 API Key 继续使用 `TSM_AGT_MODEL_BASE_URL`、`TSM_AGT_MODEL_API_KEY`；Provider 会改为请求 `/v1/messages`。原生模式固定使用 `max_tokens`，可用 `TSM_AGT_ANTHROPIC_VERSION` 配置 API 版本。
+调查工具没有写死为 12 次。默认软上限为 60 次，Agent 仍可能因为连续无新证据、累计工具耗时或需要给最终回答预留额度而提前收尾。需要调整时，在 YAML 中使用 `agent.max_model_calls`、`agent.max_tool_calls` 与 `exploration.*` 字段。
 
-本地 `.env` 已被 Git 忽略。两种模式都需要 Base URL、API Key 和当前选择器对应的模型名；此外可显式配置超时、重试、输出 Token 参数名和严格工具 Schema。预算加载器只接受下文列出的 `TSM_AGT_AGENT_*` 和 `TSM_AGT_EXPLORATION_*` 字段，其他变量不会被注入进程环境。
-导出的环境变量优先于 `<workspace>/.env`。`agent`、`chat`、`resume`、`approve/reject` 和 `answer` 都以 `--workspace` 定位同一份配置和 `.agent/runtime.db`；配置缺失时会给出 `init`、编辑位置和 `doctor --model-check` 的可执行修复步骤，不再只输出变量名。
-
-调查工具没有写死为 12 次。默认软上限为 24 次，Agent 仍可能因为连续无新证据、累计工具耗时或需要给最终回答预留额度而提前收尾；Agent Loop 另有 40 次工具调用硬上限，负责阻止失控循环。可以在工作区 `.env` 中按项目覆盖软预算，导出的同名环境变量优先：
-
-```bash
-TSM_AGT_AGENT_MAX_MODEL_CALLS=20
-TSM_AGT_AGENT_MAX_TOOL_CALLS=50
-TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS=2
-TSM_AGT_AGENT_EXECUTION_RESERVE_MODEL_CALLS=1
-TSM_AGT_AGENT_RECOVERY_RESERVE_MODEL_CALLS=1
-TSM_AGT_AGENT_VERIFICATION_RESERVE_MODEL_CALLS=1
-TSM_AGT_EXPLORATION_PROFILE=balanced
-TSM_AGT_EXPLORATION_MAX_TOOL_CALLS=30
-TSM_AGT_EXPLORATION_MAX_ACTIONS=30
-TSM_AGT_EXPLORATION_MAX_TOOL_SECONDS=180
-TSM_AGT_EXPLORATION_LOW_VALUE_STREAK=3
-TSM_AGT_EXPLORATION_RESERVE_TOOL_CALLS=2
-TSM_AGT_EXPLORATION_MIN_ACTIONS=2
-```
-
-`TSM_AGT_EXPLORATION_PROFILE=balanced` 是默认值：调查按 Evidence Question、
+`exploration.profile: balanced` 是默认值：调查按 Evidence Question、
 语义目标和已有证据关系推进，不再把刚读文件的父目录当成硬范围。无明确关系的
 只读动作最多得到一次缩小结果量的探测，仍然必须通过 Workspace、Sandbox、
 Approval 和 Tool Risk。`legacy` 只用于兼容旧目录策略；未知 Profile 会让启动明确
 失败，不会偷偷退回宽松策略。Profile 和具体 Adapter ID/版本会进入 Effective
 Configuration，活动 Turn 恢复时仍由配置 Hash 防止无痕换策略。
 
-这些值用于新 Turn；活动 Turn 已把调用上限保存在 Checkpoint，配置变化不会在执行途中偷偷改额度，恢复校验发现规则变化时会进入冲突并要求重新开始。`AGENT_MAX_*` 是防止失控循环的最后硬上限；`FINALIZATION`、`EXECUTION`、`RECOVERY`、`VERIFICATION` 四类预留分别保护最终回答、首次实施、失败恢复和实施后验证，默认是 2/1/1/1。它们不会机械地给每个阶段各执行一次模型请求，而是在存在对应未完成 Outcome 时阻止宽泛探索提前吃光后续额度。若本 Turn 的硬额度确实用完，但工作仍可恢复，Task 会保存 Checkpoint 并进入“未完成、可继续”，不会误报 `BLOCKED`；下一次继续沿同一 Task 增加新一轮额度，不重放已完成工具。`EXPLORATION_MAX_TOOL_CALLS` 不能大于 Agent 工具硬上限。`EXPLORATION_MAX_TOOL_CALLS` 统计本 Turn 中全部已用工具，`EXPLORATION_MAX_ACTIONS` 统计被策略评分的调查动作，二者用于不同的保护维度。
+这些值用于新 Turn；活动 Turn 已把调用上限保存在 Checkpoint，配置变化不会在执行途中偷偷改额度，恢复校验发现规则变化时会进入冲突并要求重新开始。`agent.max_*` 是防止失控循环的最后硬上限；四类 reserve 字段分别保护最终回答、首次实施、失败恢复和实施后验证，默认是 2/1/1/1。它们不会机械地给每个阶段各执行一次模型请求，而是在存在对应未完成 Outcome 时阻止宽泛探索提前吃光后续额度。若本 Turn 的硬额度确实用完，但工作仍可恢复，Task 会保存 Checkpoint 并进入“未完成、可继续”，不会误报 `BLOCKED`；下一次继续沿同一 Task 增加新一轮额度，不重放已完成工具。`exploration.max_tool_calls` 不能大于 Agent 工具硬上限。`exploration.max_tool_calls` 统计本 Turn 中全部已用工具，`exploration.max_actions` 统计被策略评分的调查动作，二者用于不同的保护维度。
 
 CLI 的实时进度会明确写成“本次 Task”，并显示当前用户目标、要确认的完整问题、实际工具及参数、路径/查询范围、范围为何扩大，以及四类探索计数：动作、工具调用、累计工具耗时、连续低收益。开始收尾时不再笼统显示“预算即将耗尽”，而是显示真实触发项及“已用/上限”。这些限制只约束当前 Task，不是一整个 Session 的累计上限；Session 中下一个 Task 会得到自己的一份新预算。
 
@@ -383,7 +358,7 @@ uv run tsm-agt chat --workspace .
 
 启动后会打印 `session_id`。每条普通输入创建一个隔离的 Task，并自动完成 Intake、项目发现、Agent Loop、验证和收尾；同一 Session 的后续 Task 会获得前面用户输入和最终回复的带来源引用，但不会继承原始 Tool Result、审批权、额外目录授权或后台进程。模型请求写文件、执行受控命令等动作时，CLI 会展示 risk、action、target、preview、网络、数据传输和回滚信息，只有输入 `y/yes/approve` 才批准；其他回答默认拒绝。模型请求读取工作区外的关联项目时，CLI 会单独显示“需要额外目录访问权限”、目录、只读范围和仍然禁止的能力；批准只恢复该次只读调用，不等于批准写入或命令执行。
 
-模型给出最终回答后，CLI 还会输出可信验证结果，例如 `verification: passed (2 criteria)`。Flow 中会出现 `Verification → workspace-integrity / post-mutation-command` 节点；节点下钻只显示状态、Evidence 数量和是否全部通过，不复制测试日志正文。当前内置命令识别覆盖 Python unittest/pytest/compileall、Gradle/Maven、Node 包管理器 test/build/lint/check、Cargo、Go、Flutter/Dart、Xcode、常见编译器、CMake/Make/Ninja；普通 `git status` 或打印命令不能充当验证证据。
+对显式配置了验收契约的 Task，CLI 会输出可信验证结果，例如 `verification: passed (2 criteria)`；Flow 中会出现相应的 Verification 节点，节点下钻只显示状态、Evidence 数量和是否全部通过，不复制测试日志正文。普通会话不会由 Runtime 根据命令名识别“已经验证”或强制某种检查：模型应依据当前请求、可信项目指令、已加载 Skill 和实际工具证据选择验证方式，并如实说明覆盖范围。固定验收命令只属于项目明确声明的契约。
 
 当缺失信息会实质改变结果、权限或不可逆动作时，模型可调用 `core.request_input` 暂停当前 Task。CLI 会显示一个短问题和最多三个选项；回答后继续原来的 Turn，不会新建 Task。问题暂时不回答时，CLI 会给出带一次性恢复令牌的命令，令牌默认 24 小时有效：
 
@@ -460,11 +435,11 @@ tsm-agt api serve --workspace . --host 127.0.0.1 --port 8765
 
 `progress` 是只存在于当前 Runtime 进程内的实时 UI 通道。它通过同一个 Bearer Token 保护，直接返回完整 Goal、Evidence Question、工具名与参数、路径/查询范围、预算明细和收尾原因，不做内容脱敏，也不写 SQLite；Runtime 重启后旧的实时明文不会恢复。Web UI 应在任务执行时订阅 `progress` 显示操作内容，并使用 `events`/Flow 做可恢复历史与审计，不能再从脱敏 Event 猜当前问题或范围。两条通道都不提供模型隐藏思维链。
 
-`TSM_AGT_MODEL_BASE_URL` 应填写 `/v1` 根地址。`TSM_AGT_MODEL=open` 时，Open Provider 会请求其 `/chat/completions` 并使用 `TSM_AGT_OPEN_MODEL`；`TSM_AGT_MODEL=anthropic` 时，Anthropic Provider 会请求其 `/v1/messages` 并使用 `TSM_AGT_ANTHROPIC_MODEL`。Open 模式的 Provider 必须支持 `tools`、`tool_calls` 和 JSON Schema 参数。内部工具名如 `core.read_file` 会在 Adapter 内映射成兼容的函数名，模型结果进入 Kernel 前再还原。
+`model.providers.<id>.base_url` 应填写服务根地址；`openai_chat` 会请求 Chat Completions，`openai_responses` 会请求 Responses，`anthropic_messages` 会请求 `/v1/messages`。Open Chat Provider 必须支持 `tools`、`tool_calls` 和 JSON Schema 参数。内部工具名如 `core.read_file` 会在 Adapter 内映射成兼容的函数名，模型结果进入 Kernel 前再还原。
 
-不同 Open Chat Completions 网关可能只在可选字段上有差异：GPT-5 类模型常要求 `TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=max_completion_tokens`；部分网关收到 `function.strict=true` 会直接空断流，此时配置 `TSM_AGT_MODEL_STRICT_TOOL_SCHEMA=false`。关闭 strict 只是不向模型声明严格模式，工具调用进入 Kernel 后仍必须通过本地参数 Schema、Policy、Approval、Sandbox 和 Workspace Boundary 校验。
+不同 Open Chat Completions 网关可能只在可选字段上有差异：GPT-5 类模型常要求 Profile 设置 `options.output_token_parameter: max_completion_tokens`；部分网关收到 `function.strict=true` 会直接空断流，此时设置 `options.strict_tool_schema: false`。关闭 strict 只是不向模型声明严格模式，工具调用进入 Kernel 后仍必须通过本地参数 Schema、Policy、Approval、Sandbox 和 Workspace Boundary 校验。
 
-如果网关可以正常返回非流式 JSON，但 SSE 响应总是在缺少 `finish_reason` 的情况下结束，可在私有 `.env` 设置 `TSM_AGT_MODEL_STREAMING=false`。Agent 的工具调用和多轮循环保持不变，只是不再逐字显示模型输出。默认值为 `true`。
+如果网关可以正常返回非流式 JSON，但 SSE 响应总是在缺少 `finish_reason` 的情况下结束，可在 Profile 的 `options` 设置 `streaming: false`。Agent 的工具调用和多轮循环保持不变，只是不再逐字显示模型输出。默认值为 `true`。
 
 ## 依赖方向
 

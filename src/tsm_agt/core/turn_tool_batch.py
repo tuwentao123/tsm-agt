@@ -1,18 +1,15 @@
-"""Tool-batch phase of an agent turn, extracted from ``core/kernel.py``.
+"""Bounded tool scheduling, runtime guards, and ordered result projection.
 
-Reads and writes ``TurnState`` and calls back into the Kernel it is handed; the
-closure of the original method was exactly ``(self, state)``, so ``self`` became
-the ``kernel`` parameter and nothing else changed.
-
-No name here is defined in ``kernel.py``, so this module never imports the facade
--- the dependency runs one way, which is what keeps ``kernel.py`` free to import
-this sibling at module level.
+Safe observations share a provider-I/O window. TurnState, authorization,
+execution records, and checkpoints stay serialized by ToolExecutionGate.
+This sibling never imports the Kernel facade.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
+import asyncio
 import json
 import time
 
@@ -56,6 +53,8 @@ from .trust import (
 from tsm_agt.ports import (
     ArtifactReadAction, ExplorationBudgetAction, ExplorationBudgetObservation, ExplorationBudgetProbe, ExplorationBudgetState, ExplorationOutcomeAction, Message, MessageRole, ProgressiveScopeAction, ProgressiveScopeDecision, ReadHitsAction, StopOrPivotAction, StopOrPivotSignals, TextBlock, ToolCall, ToolRecoveryKind, ToolResult, ToolResultBlock,
 )
+from .tool_concurrency import ToolExecutionGate, supports_parallel_execution
+from .tool import InvalidToolArguments, validate_tool_arguments
 from .turn import (
     InvalidModelResponse,
 )
@@ -80,11 +79,128 @@ def _govern_runtime_result(
     return kernel._dependencies.tool_result_governor.govern(spec, call, result)
 
 
+def _reserved_tool_count(state: TurnState, gate: ToolExecutionGate | None) -> int:
+    return state.tool_call_count + (len(gate.running) if gate is not None else 0)
+
+
+def _complete_pending_call(state: TurnState, call_id: str) -> None:
+    state.pending_tool_calls[:] = [
+        call for call in state.pending_tool_calls if call.call_id != call_id
+    ]
+    _order_batch_results(state)
+
+
+def _order_batch_results(state: TurnState) -> None:
+    batch = state.checkpoint.tool_batch
+    if batch is None:
+        return
+    # Results may finish out of order. Keep both interim checkpoints and the
+    # next model request in the assistant's original call order.
+    order = {call.call_id: i for i, call in enumerate(batch.calls)}
+    source_index = next((
+        i for i, message in enumerate(state.messages)
+        if message.message_id == batch.source_message_id
+    ), None)
+    if source_index is None:
+        return
+    results = []
+    others = []
+    for message in state.messages[source_index + 1:]:
+        result_id = next((
+            block.result.call_id for block in message.content
+            if isinstance(block, ToolResultBlock)
+            and block.result.call_id in order
+        ), None)
+        if result_id is not None:
+            results.append((order[result_id], message))
+        else:
+            others.append(message)
+    state.messages[:] = (
+        state.messages[:source_index + 1]
+        + [message for _, message in sorted(results, key=lambda item: item[0])]
+        + others
+    )
+
+
+async def _parallel_prefix(kernel: Any, state: TurnState) -> tuple[ToolCall, ...]:
+    limit = min(
+        kernel._dependencies.max_parallel_tool_calls,
+        state.checkpoint.max_tool_calls - state.tool_call_count,
+    )
+    if limit <= 1:
+        return ()
+    task = await kernel.get_task(state.task_id)
+    calls = []
+    signatures = set()
+    for call in state.pending_tool_calls[:limit]:
+        spec = state.visible_tool_by_name.get(call.name)
+        if spec is None or not supports_parallel_execution(spec):
+            break
+        try:
+            validate_tool_arguments(spec, call.arguments)
+        except InvalidToolArguments:
+            break
+        decision = kernel._tool_policy.evaluate(spec, call, task.project_trust)
+        if (
+            not decision.allowed
+            or kernel._external_read_root_requiring_approval(task, call) is not None
+        ):
+            break
+        signature = canonical_hash({"name": call.name, "arguments": call.arguments})
+        if signature in signatures:
+            break
+        signatures.add(signature)
+        calls.append(call)
+    return tuple(calls) if len(calls) > 1 else ()
+
+
 async def run_tool_batch(
     kernel: Any, state: TurnState,
 ) -> AgentTurnSuspended | AgentClarificationSuspended | None:
-    """Drain pending tool calls for a ConversationAgentLoop turn."""
+    """Drain bounded read-only groups, treating every other call as a barrier."""
     while state.pending_tool_calls:
+        calls = await _parallel_prefix(kernel, state)
+        if not calls:
+            outcome = await _run_tool_call(
+                kernel, state, state.pending_tool_calls[0].call_id,
+            )
+            if outcome is not None:
+                return outcome
+            continue
+        gate = ToolExecutionGate()
+        outcomes = []
+
+        async def run(call):
+            async with gate.lock:
+                if gate.stopped:
+                    return
+                with gate.activate():
+                    outcome = await _run_tool_call(kernel, state, call.call_id, gate)
+                if outcome is not None:
+                    gate.stopped = True
+                    outcomes.append(outcome)
+
+        workers = [asyncio.create_task(run(call)) for call in calls]
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            # gather does not cancel siblings when one worker fails. Await
+            # every worker before returning, cancelling, or resuming a Task.
+            for worker in workers:
+                if not worker.done() and not worker.cancelling():
+                    worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+        if outcomes:
+            return outcomes[0]
+    return None
+
+
+async def _run_tool_call(
+    kernel: Any, state: TurnState, call_id: str,
+    gate: ToolExecutionGate | None = None,
+) -> AgentTurnSuspended | AgentClarificationSuspended | None:
+    """Run one call through the existing guards and result projections."""
+    while any(call.call_id == call_id for call in state.pending_tool_calls):
         state.checkpoint, replaced = await kernel._apply_pending_steering(
             replace(
                 state.checkpoint, messages=tuple(state.messages),
@@ -98,7 +214,11 @@ async def run_tool_batch(
         state.pending_tool_calls = list(state.checkpoint.pending_tool_calls)
         if replaced:
             break
-        call = state.pending_tool_calls[0]
+        call_index = next((i for i, item in enumerate(state.pending_tool_calls)
+                           if item.call_id == call_id), None)
+        if call_index is None:
+            break
+        call = state.pending_tool_calls[call_index]
         call_spec = state.visible_tool_by_name.get(call.name)
         frozen_call = (
             next((item for item in state.checkpoint.tool_batch.calls
@@ -111,7 +231,7 @@ async def run_tool_batch(
             # atomically with the batch. Never reinterpret them after a
             # previous call changes Task state.
             call = frozen_call
-            state.pending_tool_calls[0] = call
+            state.pending_tool_calls[call_index] = call
         elif call_spec is not None and call.outcome_ref is None:
             # Resolve the Action→Outcome edge before emitting any
             # lifecycle Event so requested/policy/approval/result all
@@ -119,7 +239,7 @@ async def run_tool_batch(
             call = await kernel._bind_tool_call_outcome(
                 state.task_id, call, call_spec
             )
-            state.pending_tool_calls[0] = call
+            state.pending_tool_calls[call_index] = call
         elif call_spec is not None:
             persisted = (await kernel.get_task(state.task_id)).tool_executions.get(
                 ToolExecutionRecord.identity(state.turn_id, call.call_id)
@@ -132,7 +252,7 @@ async def run_tool_batch(
                 # whose first result closed the shared Outcome early.
                 allow_closed_ref=True,
             )
-            state.pending_tool_calls[0] = call
+            state.pending_tool_calls[call_index] = call
         task_before_action = await kernel.get_task(state.task_id)
         memory_before_action = await kernel.get_working_memory(state.task_id)
         semantic_action = await kernel._classify_semantic_action(
@@ -168,7 +288,7 @@ async def run_tool_batch(
             )
             if exploration_decision.call != call:
                 call = exploration_decision.call
-                state.pending_tool_calls[0] = call
+                state.pending_tool_calls[call_index] = call
                 semantic_action = await kernel._classify_semantic_action(
                     state.task_id, state.turn_id, call
                 )
@@ -210,7 +330,7 @@ async def run_tool_batch(
                     role=MessageRole.TOOL,
                     content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
                 ))
-                state.pending_tool_calls.pop(0)
+                _complete_pending_call(state, call.call_id)
                 state.checkpoint = replace(
                     state.checkpoint, messages=tuple(state.messages),
                     pending_tool_calls=tuple(state.pending_tool_calls),
@@ -274,7 +394,7 @@ async def run_tool_batch(
                 role=MessageRole.TOOL,
                 content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
             ))
-            state.pending_tool_calls.pop(0)
+            _complete_pending_call(state, call.call_id)
             state.checkpoint = replace(
                 state.checkpoint, messages=tuple(state.messages),
                 pending_tool_calls=tuple(state.pending_tool_calls),
@@ -289,7 +409,7 @@ async def run_tool_batch(
             state.task_id, state.turn_id, call, semantic_action,
             ExplorationBudgetProbe(
                 state.checkpoint.max_model_calls - state.model_call_count,
-                state.checkpoint.max_tool_calls - state.tool_call_count,
+                state.checkpoint.max_tool_calls - _reserved_tool_count(state, gate),
                 state.checkpoint.max_model_calls, state.checkpoint.max_tool_calls,
             ),
             state.checkpoint.exploration_budget_state,
@@ -363,7 +483,7 @@ async def run_tool_batch(
                     role=MessageRole.TOOL,
                     content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
                 ))
-                state.pending_tool_calls.pop(0)
+                _complete_pending_call(state, call.call_id)
                 state.checkpoint = replace(
                     state.checkpoint, messages=tuple(state.messages),
                     pending_tool_calls=tuple(state.pending_tool_calls),
@@ -391,7 +511,7 @@ async def run_tool_batch(
                         state.checkpoint.max_model_calls - state.model_call_count
                     ),
                     remaining_tool_calls=(
-                        state.checkpoint.max_tool_calls - state.tool_call_count
+                        state.checkpoint.max_tool_calls - _reserved_tool_count(state, gate)
                     ),
                 ), state.checkpoint.stop_or_pivot_state,
             )
@@ -438,7 +558,7 @@ async def run_tool_batch(
                     role=MessageRole.TOOL,
                     content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
                 ))
-                state.pending_tool_calls.pop(0)
+                _complete_pending_call(state, call.call_id)
                 state.checkpoint = replace(
                     state.checkpoint, messages=tuple(state.messages),
                     pending_tool_calls=tuple(state.pending_tool_calls),
@@ -472,7 +592,7 @@ async def run_tool_batch(
                     role=MessageRole.TOOL,
                     content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
                 ))
-                state.pending_tool_calls.pop(0)
+                _complete_pending_call(state, call.call_id)
                 state.budget_wrap_up = True
                 state.budget_wrap_up_decision = budget_decision
                 state.checkpoint = replace(
@@ -536,7 +656,7 @@ async def run_tool_batch(
                 role=MessageRole.TOOL,
                 content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
             ))
-            state.pending_tool_calls.pop(0)
+            _complete_pending_call(state, call.call_id)
             state.checkpoint = replace(
                 state.checkpoint, messages=tuple(state.messages),
                 pending_tool_calls=tuple(state.pending_tool_calls),
@@ -579,7 +699,7 @@ async def run_tool_batch(
                 role=MessageRole.TOOL,
                 content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
             ))
-            state.pending_tool_calls.pop(0)
+            _complete_pending_call(state, call.call_id)
             state.checkpoint = replace(
                 state.checkpoint, messages=tuple(state.messages),
                 pending_tool_calls=tuple(state.pending_tool_calls),
@@ -639,7 +759,7 @@ async def run_tool_batch(
                     state.checkpoint.max_model_calls - state.model_call_count
                 ),
                 remaining_tool_calls=(
-                    state.checkpoint.max_tool_calls - state.tool_call_count
+                    state.checkpoint.max_tool_calls - _reserved_tool_count(state, gate)
                 ),
             ), state.checkpoint.stop_or_pivot_state,
         )
@@ -654,7 +774,12 @@ async def run_tool_batch(
             goal=task_before_action.goal,
         )
         if pivot_decision.terminal:
-            cancelled_calls = tuple(state.pending_tool_calls)
+            cancelled_calls = tuple(
+                item for item in state.pending_tool_calls
+                if gate is None or item.call_id not in gate.running
+            )
+            if gate is not None:
+                gate.stopped = True
             for cancelled in cancelled_calls:
                 state.messages.append(Message(
                     f"msg-tool-cancelled-{uuid4().hex}",
@@ -670,7 +795,12 @@ async def run_tool_batch(
                         meta={"runtime_guard": "NO_PROGRESS"},
                     )),),
                 ))
-            state.pending_tool_calls.clear()
+            cancelled_ids = {item.call_id for item in cancelled_calls}
+            state.pending_tool_calls[:] = [
+                item for item in state.pending_tool_calls
+                if item.call_id not in cancelled_ids
+            ]
+            _order_batch_results(state)
             stop_body = json.dumps({
                 "boundary": "runtime_no_progress_stop",
                 "warning": (
@@ -689,10 +819,10 @@ async def run_tool_batch(
                 MessageRole.USER, (TextBlock(stop_body),),
             ))
             state.checkpoint = replace(
-                state.checkpoint, pending_tool_calls=(), messages=tuple(state.messages),
+                state.checkpoint, pending_tool_calls=tuple(state.pending_tool_calls), messages=tuple(state.messages),
                 tool_batch=(
                     state.checkpoint.tool_batch.with_pending(
-                        (), status=ToolBatchStatus.CANCELLED
+                        tuple(state.pending_tool_calls), status=ToolBatchStatus.CANCELLED
                     ) if state.checkpoint.tool_batch is not None else None
                 ),
             )
@@ -711,7 +841,7 @@ async def run_tool_batch(
                 state.checkpoint, "plan-no-progress-stopped"
             )
             break
-        next_tool_count = state.tool_call_count + 1
+        next_tool_count = _reserved_tool_count(state, gate) + 1
         await kernel._append_events(
             state.task_id,
             ((
@@ -776,6 +906,7 @@ async def run_tool_batch(
         await kernel._save_agent_checkpoint(
             suspension, "before-tool-execution"
         )
+        state.checkpoint = suspension
         tool_started_at = time.monotonic()
         presentation = kernel._present_tool_arguments(
             call.name, call.arguments
@@ -982,7 +1113,7 @@ async def run_tool_batch(
                 and classified[0] is EffectStatus.FAILED
             ):
                 state.last_tool_error = f"{call.name}: {classified[1]}"
-        state.tool_call_count = next_tool_count
+        state.tool_call_count += 1
         state.messages.append(
             Message(
                 message_id=f"msg-tool-{uuid4().hex}",
@@ -990,14 +1121,14 @@ async def run_tool_batch(
                 content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
             )
         )
-        state.pending_tool_calls.pop(0)
+        _complete_pending_call(state, call.call_id)
         after_tool = replace(
-            suspension, messages=tuple(state.messages),
+            state.checkpoint, messages=tuple(state.messages),
             pending_tool_calls=tuple(state.pending_tool_calls),
             tool_batch=(
-                suspension.tool_batch.with_pending(
+                state.checkpoint.tool_batch.with_pending(
                     tuple(state.pending_tool_calls)
-                ) if suspension.tool_batch is not None else None
+                ) if state.checkpoint.tool_batch is not None else None
             ),
             tool_calls=state.tool_call_count,
             workspace_fingerprint=workspace_fingerprint(
@@ -1027,7 +1158,7 @@ async def run_tool_batch(
                     decision.semantic_family,
                 ).to_data()
                 if evidence_delta is not None
-                else suspension.action_progress
+                else state.checkpoint.action_progress
             ),
         )
         await kernel._save_agent_checkpoint(after_tool, "tool-result-recorded")

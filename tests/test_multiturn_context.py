@@ -273,7 +273,8 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
                 projector=SessionContextProjector(
                     recent_visible_message_limit=64,
                 ),
-                context_window=4363,
+                context_window=8192,
+                context_manager=ContextWindowManager(history_soft_tokens=500),
             )
             session = await client.application.kernel.create_session("two-layers")
 

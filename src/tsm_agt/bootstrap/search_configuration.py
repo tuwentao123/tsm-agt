@@ -1,22 +1,9 @@
-"""Project-local configuration for optional commercial search providers."""
+"""Private configuration for optional commercial search providers."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
-
-
-SEARCH_ENV_NAMES = (
-    "TSM_AGT_SEARCH_MODE",
-    "TSM_AGT_SEARCH_TAVILY_MODE",
-    "TSM_AGT_SEARCH_TAVILY_API_KEY",
-    "TSM_AGT_WEB_RENDER_URL",
-    "TSM_AGT_WEB_DOCUMENT_CACHE_MAX_ENTRIES",
-    "TSM_AGT_WEB_DOCUMENT_CACHE_MAX_BYTES",
-    "TSM_AGT_WEB_REFERENCE_CACHE_MAX_ENTRIES",
-    "TSM_AGT_WEB_DOCUMENT_CACHE_TTL_SECONDS",
-)
 
 DEFAULT_DOCUMENT_CACHE_MAX_ENTRIES = 32
 DEFAULT_DOCUMENT_CACHE_MAX_BYTES = 1_000_000
@@ -70,67 +57,60 @@ class SearchConfiguration:
     issues: tuple[str, ...] = ()
 
 
-def load_search_configuration(
-    path: Path, environment: Mapping[str, str],
-) -> SearchConfiguration:
-    values = _read_values(path.expanduser().resolve())
+def load_search_configuration(document: Mapping[str, object]) -> SearchConfiguration:
+    """Load optional search settings from ``web.search`` in the YAML config."""
+
+    web = _mapping(document.get("web", {}), "web")
+    values = _mapping(web.get("search", {}), "web.search")
     issues: list[str] = []
-    raw_search_mode, search_mode_source = _selected(
-        "TSM_AGT_SEARCH_MODE", values, environment, DEFAULT_SEARCH_MODE
-    )
+    raw_search_mode, search_mode_source = _selected(values, "mode", DEFAULT_SEARCH_MODE)
     search_mode = raw_search_mode.strip().lower()
     if search_mode not in SEARCH_MODES:
         issues.append(
-            f"TSM_AGT_SEARCH_MODE={raw_search_mode.strip()!r} is not one of "
+            f"web.search.mode={raw_search_mode.strip()!r} is not one of "
             f"{SEARCH_MODES}; search stays in {DEFAULT_SEARCH_MODE!r} mode"
         )
         search_mode = DEFAULT_SEARCH_MODE
-    raw_mode, mode_source = _selected(
-        "TSM_AGT_SEARCH_TAVILY_MODE", values, environment, "off"
-    )
+    raw_mode, mode_source = _selected(values, "tavily_mode", "off")
     mode = raw_mode.strip().lower()
     if mode not in TAVILY_MODES:
         issues.append(
-            "TSM_AGT_SEARCH_TAVILY_MODE="
+            "web.search.tavily_mode="
             f"{raw_mode.strip()!r} is not one of {TAVILY_MODES}; "
             "search fell back to the free providers"
         )
         mode = "off"
-    raw_key, key_source = _selected(
-        "TSM_AGT_SEARCH_TAVILY_API_KEY", values, environment, ""
-    )
+    raw_key, key_source = _selected(values, "tavily_api_key", "")
     api_key = raw_key.strip()
     if mode == "key" and not api_key:
         issues.append(
-            "TSM_AGT_SEARCH_TAVILY_MODE='key' requires "
-            "TSM_AGT_SEARCH_TAVILY_API_KEY; search fell back to the free "
+            "web.search.tavily_mode='key' requires web.search.tavily_api_key; "
+            "search fell back to the free "
             "providers"
         )
         mode = "off"
-    raw_render_url, render_source = _selected(
-        "TSM_AGT_WEB_RENDER_URL", values, environment, ""
-    )
+    raw_render_url, render_source = _selected(values, "render_url", "")
     render_url = raw_render_url.strip()
     if render_url and not render_url.startswith(("http://", "https://")):
         issues.append(
-            f"TSM_AGT_WEB_RENDER_URL={render_url!r} must be an absolute "
+            f"web.search.render_url={render_url!r} must be an absolute "
             "http(s) URL; page rendering stays disabled"
         )
         render_url = ""
     document_cache_max_entries, document_cache_entries_source = _positive_int(
-        "TSM_AGT_WEB_DOCUMENT_CACHE_MAX_ENTRIES", values, environment,
+        "document_cache_max_entries", values,
         DEFAULT_DOCUMENT_CACHE_MAX_ENTRIES, issues,
     )
     document_cache_max_bytes, document_cache_bytes_source = _positive_int(
-        "TSM_AGT_WEB_DOCUMENT_CACHE_MAX_BYTES", values, environment,
+        "document_cache_max_bytes", values,
         DEFAULT_DOCUMENT_CACHE_MAX_BYTES, issues,
     )
     reference_cache_max_entries, reference_cache_entries_source = _positive_int(
-        "TSM_AGT_WEB_REFERENCE_CACHE_MAX_ENTRIES", values, environment,
+        "reference_cache_max_entries", values,
         DEFAULT_REFERENCE_CACHE_MAX_ENTRIES, issues,
     )
     document_cache_ttl_seconds, document_cache_ttl_source = _positive_float(
-        "TSM_AGT_WEB_DOCUMENT_CACHE_TTL_SECONDS", values, environment,
+        "document_cache_ttl_seconds", values,
         DEFAULT_DOCUMENT_CACHE_TTL_SECONDS, issues,
     )
     return SearchConfiguration(
@@ -152,7 +132,7 @@ def load_search_configuration(
             "search.tavily_mode": mode_source,
             # Record provenance without ever exposing the secret value.
             "search.tavily_api_key": (
-                "configured" if api_key else ("environment" if key_source == "environment" else "unset")
+                "configured" if api_key else "unset"
             ),
         },
         issues=tuple(issues),
@@ -160,71 +140,43 @@ def load_search_configuration(
 
 
 def _selected(
-    name: str, file_values: Mapping[str, str], environment: Mapping[str, str],
-    default: str,
+    values: Mapping[str, object], name: str, default: str,
 ) -> tuple[str, str]:
-    exported = environment.get(name, "").strip()
-    from_file = file_values.get(name, "").strip()
-    if exported:
-        return exported, "environment"
-    if from_file:
-        return from_file, "env_file"
-    return default, "default"
+    value = values.get(name)
+    if value is None:
+        return default, "default"
+    if not isinstance(value, str):
+        raise ValueError(f"web.search.{name} must be a string")
+    return value, "yaml"
 
 
 def _positive_int(
-    name: str, file_values: Mapping[str, str], environment: Mapping[str, str],
-    default: int, issues: list[str],
+    name: str, values: Mapping[str, object], default: int, issues: list[str],
 ) -> tuple[int, str]:
-    raw, source = _selected(name, file_values, environment, str(default))
-    try:
-        value = int(raw)
-    except ValueError:
-        value = 0
-    if value <= 0:
-        issues.append(f"{name}={raw.strip()!r} must be a positive integer; using {default}")
+    raw_value = values.get(name)
+    if raw_value is None:
         return default, "default"
-    return value, source
+    value = raw_value if isinstance(raw_value, int) and not isinstance(raw_value, bool) else 0
+    if value <= 0:
+        issues.append(f"web.search.{name} must be a positive integer; using {default}")
+        return default, "default"
+    return value, "yaml"
 
 
 def _positive_float(
-    name: str, file_values: Mapping[str, str], environment: Mapping[str, str],
-    default: float, issues: list[str],
+    name: str, values: Mapping[str, object], default: float, issues: list[str],
 ) -> tuple[float, str]:
-    raw, source = _selected(name, file_values, environment, str(default))
-    try:
-        value = float(raw)
-    except ValueError:
-        value = 0.0
-    if value <= 0:
-        issues.append(f"{name}={raw.strip()!r} must be a positive number; using {default}")
+    raw_value = values.get(name)
+    if raw_value is None:
         return default, "default"
-    return value, source
+    value = float(raw_value) if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool) else 0.0
+    if value <= 0:
+        issues.append(f"web.search.{name} must be a positive number; using {default}")
+        return default, "default"
+    return value, "yaml"
 
 
-def _unquoted(value: str) -> str:
-    """Return an unquoted dotenv value with any trailing `` # comment`` removed."""
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        return value[1:-1]
-    for marker in (" #", "\t#"):
-        index = value.find(marker)
-        if index != -1:
-            value = value[:index]
-    return value.strip()
-
-
-def _read_values(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    values: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        if line.startswith("export "):
-            line = line[7:].strip()
-        name, value = (part.strip() for part in line.split("=", 1))
-        if name not in SEARCH_ENV_NAMES:
-            continue
-        values[name] = _unquoted(value)
-    return values
+def _mapping(value: object, name: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{name} must be a mapping")
+    return value

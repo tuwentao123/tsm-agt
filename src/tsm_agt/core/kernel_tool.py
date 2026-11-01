@@ -49,7 +49,6 @@ to reach them, so their home is here now:
 from __future__ import annotations
 
 
-import asyncio
 import json
 import re
 import secrets
@@ -103,8 +102,8 @@ from .tool import (
     DuplicateToolName, InvalidToolArguments, InvalidToolResult,
     ToolNotFound, validate_tool_arguments
 )
+from .tool_concurrency import invoke_tool_provider
 from .turn import InvalidModelResponse, InvalidTurnState
-from .verification_command import is_verification_request
 from .v4a import plan_v4a_update
 from .patch_preview import patch_diff
 from .patch_text import plan_text_edits
@@ -501,7 +500,6 @@ class _TaskWorkingMemoryControl(ToolWorkingMemoryControl):
             self.invocation_id,
         )).to_data()
         return await self._model_data(data)
-
 
 @dataclass(frozen=True, slots=True)
 class _TaskSpecControl(ToolTaskSpecControl):
@@ -1072,15 +1070,14 @@ class ToolMixin:
                     OutcomeBindingReason.OUTCOME_DEPENDENCY_UNSATISFIED,
                 )
             if not self._tool_effect_supports_outcome(tool.effect, target):
-                # A recognized test/build command after a workspace mutation is
-                # task-level checking, not fulfillment of the implementation
-                # Outcome. Models often copy the preceding mutation's reference;
-                # normalize that harmless bookkeeping error instead of rejecting
-                # the command before it can produce verification evidence.
+                # A command after a workspace mutation may be a check, a local
+                # probe, or an inspection aid. Runtime must not infer which
+                # from argv tokens. Models often copy the preceding mutation's
+                # reference, so normalize that bookkeeping error instead of
+                # rejecting a potentially relevant observation before it runs.
                 if (
                     call.name == "core.run_command"
                     and task.mutation_journal
-                    and is_verification_request(call.arguments)
                 ):
                     return result(
                         OutcomeBindingAction.ACCEPT,
@@ -1842,8 +1839,9 @@ class ToolMixin:
             resource_candidates=self._resource_candidates(running_task),
         )
         try:
-            async with asyncio.timeout(effective_timeout_seconds):
-                result = await provider.invoke(call, context)
+            result = await invoke_tool_provider(
+                provider, selected_spec, call, context, effective_timeout_seconds,
+            )
             if result.call_id != call.call_id:
                 raise InvalidToolResult(
                     f"tool result call_id {result.call_id!r} does not match {call.call_id!r}"
@@ -2116,8 +2114,9 @@ class ToolMixin:
             resource_candidates=self._resource_candidates(running_task),
         )
         try:
-            async with asyncio.timeout(timeout_seconds):
-                result = await provider.invoke(execution.call, context)
+            result = await invoke_tool_provider(
+                provider, spec, execution.call, context, timeout_seconds,
+            )
             if result.call_id != execution.call.call_id:
                 raise InvalidToolResult(
                     "recovered tool result call_id does not match the original call"

@@ -918,13 +918,13 @@ def validate_authored_criterion(
     the same reason: historical snapshots hold criteria that no longer validate,
     so this must not run in ``__post_init__`` or ``from_data``.
 
-    A *declared* command must be falsifiable -- ``core/verification_command.py``
-    is deliberately the single recognizer for both authoring and runtime, so
-    "what the Runtime demands" cannot drift from "what the Runtime accepts".
-    An *absent* command is not rejected here: an unbound command criterion is a
+    A *declared* command must be falsifiable. The recognizer applies only to
+    this opt-in, authored Task contract; it does not classify ordinary runtime
+    commands or decide that a conversational change requires verification. An
+    *absent* command is not rejected here: an unbound command criterion is a
     normal state that ``Kernel._demote_unresolvable_criteria`` downgrades, and
-    refusing it at authoring time would replace that bounded demotion with a hard
-    failure.
+    refusing it at authoring time would replace that bounded demotion with a
+    hard failure.
     """
 
     validate_authored_reference(kind, reference)

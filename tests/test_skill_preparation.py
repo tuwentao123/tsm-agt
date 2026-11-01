@@ -13,6 +13,7 @@ from unittest.mock import patch
 from fastapi import UploadFile
 
 from tsm_agt.adapters.local_skills import UserSkillsStore
+from tsm_agt.adapters.skill_catalog import SkillCatalog
 from tsm_agt.adapters.builtin.skill_tools import CoreSkillToolProvider
 from tsm_agt.adapters.builtin import CoreProcessToolProvider
 from tsm_agt.adapters.skill_installations import installation_prompt
@@ -187,7 +188,7 @@ class SkillPreparationTest(unittest.IsolatedAsyncioTestCase):
             async def read_events(inner, task_id):
                 return ()
         runtime = RuntimeStore()
-        provider = CoreSkillToolProvider(SkillRegistry(), self.store, runtime)
+        provider = CoreSkillToolProvider(SkillRegistry(), self.store, runtime, catalog=SkillCatalog(self.store))
         context = ToolInvocationContext("invoke", "task", "turn", self.first, datetime.now(timezone.utc))
         call = ToolCall("finish", "skill.installation_finish", {
             "installation_id": job["id"], "status": "ready", "summary": "done", "checks": ["checked"],

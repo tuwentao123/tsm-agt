@@ -96,10 +96,10 @@ class MultiTurnEvaluationRuntimeTest(unittest.IsolatedAsyncioTestCase):
             model = ScriptedModel([text_response("proposal", "I can implement A and B."),
                                    text_response("no-op", "Both are complete.")])
             app = compose_fixture_application(model_adapter=model, tool_adapters=())
-            args = argparse.Namespace(env_file=Path(directory) / ".env", history_format="native",
+            args = argparse.Namespace(config=Path(directory) / "config.yaml", history_format="native",
                                       capture_requests=False, timeout=5, run_tests=False,
                                       label="transport-only", fixture=fixture_file)
-            with patch("scripts.evaluate_multiturn_behavior.compose_openai_compatible_engineering_application_from_env", return_value=app):
+            with patch("scripts.evaluate_multiturn_behavior.compose_openai_compatible_engineering_application_from_config", return_value=app):
                 report = await run_trial(args, fixture, 1)
             first, second = report["turns"]
             self.assertEqual(first["task_id"], second["task_id"])

@@ -50,6 +50,8 @@ class Skill:
     tags: tuple[str, ...]
     safety_level: str  # e.g. "read_only", "write_local", "network", "exec"
     approval_required: bool
+    source: str = "registered"
+    overrides: tuple[str, ...] = ()
 
 
 @dataclass

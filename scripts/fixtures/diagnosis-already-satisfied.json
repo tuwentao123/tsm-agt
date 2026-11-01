@@ -1,0 +1,28 @@
+{
+  "case_id": "already-satisfied",
+  "initial_tests_pass": true,
+  "files": {
+    "README.md": "Run the existing tests with: python -m unittest discover -s . -p test_flow.py\n",
+    "formatting.py": "def render(text, uppercase=False):\n    return text.upper() if uppercase else text\n",
+    "pipeline.py": "from formatting import render\n\n\ndef process(text, uppercase=False):\n    return render(text, uppercase=uppercase)\n",
+    "endpoint.py": "from pipeline import process\n\n\ndef handle(request):\n    return process(request['text'], uppercase=request.get('uppercase', False))\n",
+    "test_flow.py": "import unittest\nfrom endpoint import handle\nfrom pipeline import process\n\n\nclass FlowTest(unittest.TestCase):\n    def test_endpoint_option(self):\n        self.assertEqual(handle({'text': 'Hello', 'uppercase': True}), 'HELLO')\n\n    def test_pipeline_option(self):\n        self.assertEqual(process('Hello', uppercase=True), 'HELLO')\n\n    def test_default(self):\n        self.assertEqual(handle({'text': 'Hello'}), 'Hello')\n        self.assertEqual(process('Hello'), 'Hello')\n\n    def test_explicit_false(self):\n        self.assertEqual(handle({'text': 'Hello', 'uppercase': False}), 'Hello')\n"
+  },
+  "preserve_files": [
+    "README.md",
+    "formatting.py",
+    "test_flow.py"
+  ],
+  "editable_files": [
+    "pipeline.py",
+    "endpoint.py"
+  ],
+  "history": [],
+  "turns": [
+    {
+      "input": "把 endpoint.handle 收到的 uppercase 选项经过 pipeline.process 完整传到 formatting.render，并保留不传时及显式 false 时的原样返回行为。直接处理并验证，不要修改 formatting.py 和测试，也不要改动无关内容。",
+      "verify_tests": true,
+      "unchanged": true
+    }
+  ]
+}

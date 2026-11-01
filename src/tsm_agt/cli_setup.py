@@ -19,7 +19,7 @@ from tsm_agt.bootstrap import (
     compose_fixture_application, compose_openai_compatible_readonly_application,
 )
 from tsm_agt.bootstrap.model_configuration import (
-    MODEL_ENV_NAMES, MODEL_ENV_TEMPLATE, ModelConfiguration,
+    CONFIGURATION_TEMPLATE, ModelConfiguration, default_configuration_path,
     inspect_model_configuration,
 )
 from tsm_agt.core.configuration import ripgrep_binary
@@ -51,18 +51,16 @@ class DiagnosticCheck:
         return data
 
 
-def initialize_workspace(workspace: Path, *, print_only: bool = False) -> int:
-    """Create one private model template without overwriting existing data."""
+def initialize_configuration(
+    path: Path | None = None, *, print_only: bool = False,
+) -> int:
+    """Create the one private YAML configuration file without overwriting it."""
 
+    target = (path or default_configuration_path()).expanduser().resolve()
     if print_only:
-        print(MODEL_ENV_TEMPLATE, end="")
+        print(CONFIGURATION_TEMPLATE, end="")
         return 0
-    root = workspace.expanduser().resolve()
-    if not root.exists():
-        raise ValueError(f"workspace does not exist: {root}")
-    if not root.is_dir():
-        raise ValueError(f"workspace is not a directory: {root}")
-    target = root / ".env"
+    target.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_BINARY"):
         flags |= os.O_BINARY
@@ -74,25 +72,25 @@ def initialize_workspace(workspace: Path, *, print_only: bool = False) -> int:
         ) from error
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
-            file.write(MODEL_ENV_TEMPLATE)
+            file.write(CONFIGURATION_TEMPLATE)
         if os.name != "nt":
             target.chmod(stat.S_IRUSR | stat.S_IWUSR)
     except BaseException:
         target.unlink(missing_ok=True)
         raise
-    print(f"created private model configuration: {target}")
+    print(f"created private tsm-agt configuration: {target}")
     print("next:")
     print(f"  1. edit {target}")
-    print(f"  2. tsm-agt doctor --workspace {root} --model-check")
-    print(f"  3. tsm-agt chat --workspace {root}")
+    print("  2. tsm-agt doctor --workspace <project> --model-check")
+    print("  3. tsm-agt chat --workspace <project>")
     if os.name == "nt":
-        print("note: verify the .env ACL in Windows; POSIX mode bits do not apply")
+        print("note: verify the YAML file ACL in Windows; POSIX mode bits do not apply")
     return 0
 
 
 async def run_doctor(
     workspace: Path, *, as_json: bool = False, model_check: bool = False,
-    environment: Mapping[str, str] | None = None,
+    configuration_file: Path | None = None,
     model_probe: Callable[[ModelConfiguration], Awaitable[None]] | None = None,
 ) -> int:
     """Inspect installation, platform adapters, workspace, and model access."""
@@ -109,22 +107,20 @@ async def run_doctor(
     config_error: str | None = None
     missing: tuple[str, ...] = ()
     try:
-        configuration, missing = inspect_model_configuration(
-            root / ".env", environment if environment is not None else os.environ
-        )
+        configuration, missing = inspect_model_configuration(configuration_file)
     except (OSError, UnicodeError, ValueError) as error:
         config_error = str(error)
 
     if config_error is not None:
         checks.append(DiagnosticCheck(
             "model_configuration", "fail", "model configuration is invalid",
-            remedy=f"fix {root / '.env'}: {config_error}",
+            remedy=f"fix {configuration_file or default_configuration_path()}: {config_error}",
         ))
     elif configuration is None:
         checks.append(DiagnosticCheck(
             "model_configuration", "fail", "model configuration is incomplete",
             remedy=(
-                f"run `tsm-agt init --workspace {root}` and configure: "
+                "run `tsm-agt init` and configure: "
                 + ", ".join(missing)
             ),
             details={"missing": list(missing)},
@@ -135,13 +131,13 @@ async def run_doctor(
             details={
                 "endpoint_origin": configuration.endpoint_origin,
                 "model": configuration.model,
+                "profile": configuration.profile_id,
+                "wire_protocol": configuration.wire_protocol,
                 "credentials_configured": True,
-                "sources": {
-                    name: configuration.sources[name] for name in MODEL_ENV_NAMES
-                },
+                "sources": dict(configuration.sources),
             },
         ))
-        checks.append(_configuration_file_permission_check(configuration.env_file))
+        checks.append(_configuration_file_permission_check(configuration.configuration_file))
 
     if model_check:
         if configuration is None:
@@ -277,7 +273,7 @@ def _configuration_file_permission_check(path: Path) -> DiagnosticCheck:
     if not path.exists():
         return DiagnosticCheck(
             "model_configuration_file", "pass",
-            "model configuration comes from exported environment variables",
+            "configuration file is not present",
             required=False,
         )
     if os.name == "nt":
@@ -345,6 +341,9 @@ async def _probe_model(configuration: ModelConfiguration) -> None:
             model_anthropic_version=configuration.anthropic_version,
             model_strict_tool_schema=configuration.strict_tool_schema,
             model_streaming=configuration.streaming,
+            model_open_api_mode=configuration.open_api_mode,
+            model_reasoning_effort=configuration.reasoning_effort,
+            model_capability_overrides=configuration.capability_overrides,
         )
         await application.start()
         try:

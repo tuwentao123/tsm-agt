@@ -427,7 +427,7 @@ class NetworkToolProviderTest(unittest.IsolatedAsyncioTestCase):
 
         assert search.model_contract is not None
         self.assertIn(
-            "task and repository evidence cannot answer",
+            "unrelated workspace exploration is not a prerequisite",
             search.model_contract.use_when[0],
         )
         self.assertIn(
@@ -666,7 +666,7 @@ class WebSearchModeTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result.ok)
         self.assertEqual(result.error_code, "SEARCH_NOT_CACHED")
-        self.assertIn("TSM_AGT_SEARCH_MODE=live", result.message)
+        self.assertIn("web.search.mode: live", result.message)
 
     async def test_off_mode_refuses_and_names_the_setting(self) -> None:
         provider = NetworkToolProvider(search_mode="off")
@@ -741,7 +741,7 @@ class WebSearchModeTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(failure)
         self.assertEqual(failure.error_code, "SEARCH_NOT_CACHED")
-        self.assertIn("TSM_AGT_SEARCH_MODE=live", failure.message)
+        self.assertIn("web.search.mode: live", failure.message)
 
 
 class _RenderResponse:

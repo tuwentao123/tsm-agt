@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import inspect
-import json
 from datetime import datetime
 
-from tsm_agt.ports.skill_files import SkillFilesPort
+from tsm_agt.ports.skill_files import SkillCatalogPort, SkillFilesPort
 from tsm_agt.core.skills import SkillKind, SkillRegistry
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ToolCall,
@@ -21,14 +20,16 @@ class CoreSkillToolProvider:
         capabilities=frozenset({"skill.load", "skill.installation_finish"}),
     )
 
-    def __init__(self, registry: SkillRegistry, store: SkillFilesPort, runtime_store=None) -> None:
+    def __init__(self, registry: SkillRegistry, store: SkillFilesPort, runtime_store=None,
+                 *, catalog: SkillCatalogPort) -> None:
         self.registry = registry
         self.store = store
+        self.catalog = catalog
         self.runtime_store = runtime_store
         self._started = False
 
     async def start(self, context: AdapterContext) -> None:
-        self.store.refresh(self.registry)
+        self.refresh_catalog()
         self._started = True
 
     async def stop(self, deadline: datetime) -> None:
@@ -36,38 +37,39 @@ class CoreSkillToolProvider:
 
     async def health(self) -> HealthStatus:
         return HealthStatus(
-            (HealthState.DEGRADED if self.store.issues else HealthState.HEALTHY)
+            (HealthState.DEGRADED if self.catalog.issues else HealthState.HEALTHY)
             if self._started else HealthState.UNHEALTHY,
-            "; ".join(self.store.issues) or "Skill catalog ready",
+            "; ".join(self.catalog.issues) or "Skill catalog ready",
         )
 
+    def refresh_catalog(self) -> tuple:
+        return self.catalog.refresh(self.registry)
+
     async def list_tools(self) -> tuple[ToolSpec, ...]:
-        self.store.refresh(self.registry)
-        skills = self.registry.list_all()
+        skills = self.refresh_catalog()
         plans = [skill for skill in skills if skill.kind is SkillKind.PLAN]
         tools: list[ToolSpec] = []
         if plans:
-            catalog = json.dumps([
-                {"name": skill.name, "description": skill.description}
-                for skill in plans
-            ], ensure_ascii=False)
+            model_data = self.catalog.model_data(skills)
             tools.append(ToolSpec(
                 name="skill.load",
                 description=(
                     "Load reusable Skill instructions and then follow them using normal tools. "
-                    "When the user names a Skill, load it before performing their task. "
-                    "For relevant tasks, choose from this available catalog: " + catalog
-                    + ". The optional resource reads a text file relative to the Skill directory."
+                    "Load a named or clearly relevant Skill, including verification workflows for implementation tasks. "
+                    "Choose from the Available Skills catalog in the request context. "
+                    "The optional resource reads a text file relative to the Skill directory."
                 ),
                 parameters={
                     "type": "object", "properties": {
                         "name": {"type": "string", "enum": [skill.name for skill in plans]},
                         "resource": {"type": "string"},
+                        "catalog_revision": {"type": "string"},
                     }, "required": ["name"], "additionalProperties": False,
                 },
                 risk=ToolRisk.R0, is_read_only=True, is_concurrency_safe=True,
                 idempotency=ToolIdempotency.IDEMPOTENT, max_result_tokens=100_000,
                 effect=ToolEffect.OBSERVE, result_authority=ToolResultAuthority.NONE,
+                model_context=model_data,
             ))
         for skill in skills:
             if skill.kind is SkillKind.CODE:
@@ -97,7 +99,13 @@ class CoreSkillToolProvider:
             raise RuntimeError("Skill provider is not started")
         if call.name == "skill.installation_finish":
             return await self._finish_installation(call, context)
-        self.store.refresh(self.registry)
+        skills = self.refresh_catalog()
+        expected_revision = call.arguments.get("catalog_revision")
+        if expected_revision is not None:
+            current = self.catalog.model_data(skills)
+            if expected_revision != current["revision"]:
+                return ToolResult(call.call_id, False, error_code="SKILL_CATALOG_CHANGED",
+                                  message="Skill catalog changed; use the refreshed catalog before loading.", data=current)
         name = call.arguments.get("name") if call.name == "skill.load" else call.name
         skill = next((item for item in self.registry.list_all() if item.name == name), None)
         if skill is None:
@@ -108,7 +116,7 @@ class CoreSkillToolProvider:
                 resource = call.arguments.get("resource", "SKILL.md")
                 if not isinstance(resource, str):
                     raise ValueError("resource must be a string")
-                data = self.store.read(skill, resource)
+                data = self.catalog.read(skill, resource)
             elif skill.kind is SkillKind.CODE and skill.handler is not None:
                 data = skill.handler(call.arguments)
                 if inspect.isawaitable(data):

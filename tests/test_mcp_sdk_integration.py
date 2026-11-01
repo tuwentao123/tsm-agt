@@ -75,29 +75,30 @@ class MCPSDKIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def test_production_composition_loads_workspace_mcp_config(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
-            env_file = workspace / ".env"
-            env_file.write_text(
-                "TSM_AGT_MODEL=open\n"
-                "TSM_AGT_MODEL_BASE_URL=http://127.0.0.1:5580\n"
-                "TSM_AGT_OPEN_MODEL=test-model\n"
-                "TSM_AGT_MODEL_API_KEY=test-secret\n",
+            configuration_file = workspace / "config.yaml"
+            configuration_file.write_text(
+                '''
+version: 1
+model:
+  default_profile: primary
+  providers:
+    local:
+      protocol: openai_chat
+      base_url: http://127.0.0.1:5580
+      auth:
+        api_key: test-secret
+  profiles:
+    primary:
+      provider: local
+      model: test-model
+''',
                 encoding="utf-8",
             )
-            config_dir = workspace / ".tsm-agt"
-            config_dir.mkdir()
-            (config_dir / "mcp.json").write_text(json.dumps({
-                "mcpServers": {
-                    "demo": {
-                        "kind": "executable",
-                        "command": [
-                            "python", "-m", "tsm_agt.adapters.mcp_demo_server_stdio",
-                        ],
-                    },
-                },
-            }), encoding="utf-8")
+            with configuration_file.open("a", encoding="utf-8") as stream:
+                stream.write("\nmcp:\n  servers:\n    demo:\n      kind: executable\n      command: [python, -m, tsm_agt.adapters.mcp_demo_server_stdio]\n")
             with patch.dict(os.environ, {}, clear=True):
                 application = compose_openai_compatible_engineering_application_from_env(
-                    env_file, database_path=workspace / ".agent" / "runtime.db",
+                    configuration_file, database_path=workspace / ".agent" / "runtime.db",
                 )
             await application.start()
             try:

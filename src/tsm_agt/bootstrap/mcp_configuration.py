@@ -35,10 +35,9 @@ Only ``"mcpServers"`` and the per-server entries are required. Unknown
 keys are ignored. Each server entry is mapped to :class:`MCPServerConfig` and
 returned as a tuple.
 
-Callers typically combine this helper with the environment variable
-``TSM_AGT_MCP_CONFIG`` and/or well-known config locations (for example a
-workspace-local ``.tsm-agt/mcp.json`` file) to select which MCP servers to
-enable.
+The production composition root instead reads the ``mcp.servers`` mapping in
+the single private YAML configuration file. JSON parsing remains available as
+an explicit import/export helper only.
 """
 
 from __future__ import annotations
@@ -106,6 +105,31 @@ def _parse_server_entry(server_id: str, raw: dict) -> MCPServerConfig:
     )
 
 
+def load_mcp_servers_from_configuration(
+    document: Mapping[str, object],
+) -> tuple[bool, tuple[MCPServerConfig, ...]]:
+    """Read MCP enablement and servers from the private YAML document."""
+
+    mcp = document.get("mcp", {})
+    if not isinstance(mcp, Mapping) or any(not isinstance(key, str) for key in mcp):
+        raise ValueError("mcp must be a mapping")
+    enabled = mcp.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("mcp.enabled must be true or false")
+    raw_servers = mcp.get("servers", {})
+    if not isinstance(raw_servers, Mapping) or any(not isinstance(key, str) for key in raw_servers):
+        raise ValueError("mcp.servers must be a mapping")
+    servers: list[MCPServerConfig] = []
+    for server_id, raw in raw_servers.items():
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"mcp.servers.{server_id} must be a mapping")
+        item = dict(raw)
+        if item.get("enabled", True) is False:
+            continue
+        servers.append(_parse_server_entry(server_id, item))
+    return enabled, tuple(servers)
+
+
 def load_mcp_servers_file(path: Path) -> MCPServersFile:
     """Load one JSON MCP servers configuration file.
 
@@ -154,35 +178,9 @@ def merge_mcp_servers(files: Iterable[MCPServersFile]) -> tuple[MCPServerConfig,
     return tuple(merged.values())
 
 
-def load_mcp_servers(
-    workspace: Path, environment: Mapping[str, str],
-) -> tuple[MCPServerConfig, ...]:
-    """Load effective MCP servers for one engineering workspace.
-
-    An explicit ``TSM_AGT_MCP_CONFIG`` is authoritative and must point at a
-    real file; silently ignoring a typo would make configured tools disappear
-    from the model. Without it, workspace configuration takes precedence over
-    the optional user configuration by being merged last.
-    """
-    explicit = environment.get("TSM_AGT_MCP_CONFIG", "").strip()
-    if explicit:
-        path = Path(explicit).expanduser()
-        if not path.is_file():
-            raise ValueError(f"TSM_AGT_MCP_CONFIG does not name a file: {path}")
-        return load_mcp_servers_file(path).servers
-
-    paths = [
-        path for path in (
-            Path.home() / ".config" / "tsm-agt" / "mcp.json",
-            workspace / ".tsm-agt" / "mcp.json",
-        ) if path.is_file()
-    ]
-    return merge_mcp_servers(load_mcp_servers_file(path) for path in paths)
-
-
 __all__ = [
     "MCPServersFile",
-    "load_mcp_servers",
+    "load_mcp_servers_from_configuration",
     "load_mcp_servers_file",
     "merge_mcp_servers",
 ]

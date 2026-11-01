@@ -87,6 +87,7 @@ class EffectiveConfigurationSnapshot:
         sources: Mapping[str, str], revision: int = 1,
         prompt_manifest: Mapping[str, Any] | None = None,
         context: Mapping[str, Any] | None = None,
+        max_parallel_tool_calls: int = 8,
     ) -> EffectiveConfigurationSnapshot:
         tool_data = tuple(sorted(
             (cls._tool_data(tool) for tool in tools), key=lambda item: item["name"]
@@ -102,8 +103,12 @@ class EffectiveConfigurationSnapshot:
             "revision": None,
         }
         execution = {
-            "mode": "serial-agent-loop",
-            "parallel_tools": capabilities.parallel_tools,
+            "mode": (
+                "bounded-parallel-agent-loop"
+                if max_parallel_tool_calls > 1 else "serial-agent-loop"
+            ),
+            "parallel_tools": max_parallel_tool_calls > 1,
+            "max_parallel_tool_calls": max_parallel_tool_calls,
             "checkpoint_resume": True,
             "context": dict(context or {"status": "not_configured"}),
         }

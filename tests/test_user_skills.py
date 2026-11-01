@@ -110,6 +110,13 @@ class UserSkillsStoreTest(unittest.TestCase):
         self.assertIn("## 执行步骤", content)
         self.assertTrue((Path(skill.plan_path).parent / "README.md").is_file())
 
+    def test_repository_verify_change_installs_as_an_instruction_skill(self):
+        source = Path(__file__).resolve().parents[1] / "skills/verify_change"
+        skill = self.store.install_path(source / "SKILL.md")
+        content = self.store.read(skill)["content"]
+        self.assertEqual(skill.name, "verify-change")
+        self.assertIn("Choose the smallest verification", content)
+
     def test_multiple_sources_deduplicate_paths_and_keep_external_files_unchanged(self):
         kiro = self.root / ".kiro/skills"
         other = self.root / "other-skills"
@@ -208,8 +215,9 @@ class UserSkillsRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 loaded = [event for event in events if event.event_type == "tool.completed" and event.payload.get("result", {}).get("meta", {}).get("runtime_kind") == "skill"]
                 self.assertTrue(loaded)
             advertised = next(tool for tool in model.requests[0].tools if tool.name == "skill.load")
-            self.assertIn("demo-plan", advertised.description)
-            self.assertIn("kiro-demo", advertised.description)
+            names = [entry["name"] for entry in advertised.model_context["skills"]]
+            self.assertIn("demo-plan", names)
+            self.assertIn("kiro-demo", names)
             results = [block.result for request in model.requests for message in request.messages for block in message.content if isinstance(block, ToolResultBlock)]
             self.assertTrue(any(result.ok and result.data.get("content") == "example" for result in results))
 

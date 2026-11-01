@@ -16,8 +16,8 @@ from tsm_agt.bootstrap import (
     compose_local_flow_query_application,
     compose_openai_compatible_engineering_application,
     compose_fixture_application,
-    compose_openai_compatible_engineering_application_from_env,
-    compose_openai_compatible_readonly_application_from_env,
+    compose_openai_compatible_engineering_application_from_config,
+    compose_openai_compatible_readonly_application_from_config,
     compose_readonly_application,
 )
 from tsm_agt.bootstrap.exploration_configuration import (
@@ -173,10 +173,10 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await application.registry.stop_all()
 
-    async def test_real_provider_composition_requires_explicit_tsm_agt_variables(self) -> None:
+    async def test_real_provider_composition_requires_private_configuration(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            with self.assertRaisesRegex(ValueError, "TSM_AGT_MODEL_BASE_URL"):
-                compose_openai_compatible_readonly_application_from_env(
+            with self.assertRaisesRegex(ValueError, "configuration file"):
+                compose_openai_compatible_readonly_application_from_config(
                     Path("/definitely/missing/tsm-agt.env")
                 )
 
@@ -190,25 +190,37 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             },
             clear=True,
         ):
-            with self.assertRaisesRegex(ValueError, "TSM_AGT_MODEL_API_KEY"):
-                compose_openai_compatible_readonly_application_from_env(
+            with self.assertRaisesRegex(ValueError, "configuration file"):
+                compose_openai_compatible_readonly_application_from_config(
                     Path("/definitely/missing/tsm-agt.env")
                 )
 
     async def test_github_source_tools_are_registered_with_the_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_MODEL_BASE_URL=https://models.example.test/v1\n"
-                "TSM_AGT_MODEL=open\n"
-                "TSM_AGT_OPEN_MODEL=test-model\n"
-                "TSM_AGT_MODEL_API_KEY=test-secret\n"
-                "TSM_AGT_GITHUB_SOURCE_ENABLED=true\n",
+            configuration_file = Path(directory) / "config.yaml"
+            configuration_file.write_text(
+                '''
+version: 1
+model:
+  default_profile: primary
+  providers:
+    local:
+      protocol: openai_chat
+      base_url: https://models.example.test/v1
+      auth:
+        api_key: test-secret
+  profiles:
+    primary:
+      provider: local
+      model: test-model
+github_source:
+  enabled: true
+''',
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):
-                application = compose_openai_compatible_engineering_application_from_env(
-                    env_file
+                application = compose_openai_compatible_engineering_application_from_config(
+                    configuration_file
                 )
         await application.registry.start_all()
         self.addAsyncCleanup(application.registry.stop_all)
@@ -223,20 +235,31 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_provider_engineering_composition_has_process_tools(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            # Hermetic by construction: without an explicit env file this test
-            # would read the developer's real `.env`, so an unrelated local
+            configuration_file = Path(directory) / "config.yaml"
+            # Hermetic by construction: without an explicit configuration file this test
+            # would read the developer's real private configuration, so an unrelated local
             # setting could decide (or reject) the composition under test.
-            env_file.write_text(
-                "TSM_AGT_MODEL_BASE_URL=https://models.example.test/v1\n"
-                "TSM_AGT_MODEL=open\n"
-                "TSM_AGT_OPEN_MODEL=test-model\n"
-                "TSM_AGT_MODEL_API_KEY=test-secret\n",
+            configuration_file.write_text(
+                '''
+version: 1
+model:
+  default_profile: primary
+  providers:
+    local:
+      protocol: openai_chat
+      base_url: https://models.example.test/v1
+      auth:
+        api_key: test-secret
+  profiles:
+    primary:
+      provider: local
+      model: test-model
+''',
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):
-                application = compose_openai_compatible_engineering_application_from_env(
-                    env_file
+                application = compose_openai_compatible_engineering_application_from_config(
+                    configuration_file
                 )
         await application.registry.start_all()
         try:
@@ -289,7 +312,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                     "code.symbol_overview", "code.definition",
                     "code.references", "code.implementations",
                     "code.workspace_symbols", "code.diagnostics",
-                    "code.rename_preview", "core.request_input",
+                    "code.rename_preview", "core.request_input", "skill.load",
                 ],
             )
             self.assertIsNotNone(
@@ -411,21 +434,30 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await application.registry.stop_all()
 
-    async def test_local_env_file_loads_only_explicit_model_settings(self) -> None:
+    async def test_private_yaml_does_not_mutate_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "# local settings\n"
-                "TSM_AGT_MODEL=open\n"
-                "TSM_AGT_MODEL_BASE_URL='http://127.0.0.1:5580'\n"
-                "export TSM_AGT_OPEN_MODEL=local-model\n"
-                "TSM_AGT_MODEL_API_KEY=local-secret\n"
-                "UNRELATED_SECRET=must-not-load\n",
+            configuration_file = Path(directory) / "config.yaml"
+            configuration_file.write_text(
+                '''
+version: 1
+model:
+  default_profile: primary
+  providers:
+    local:
+      protocol: openai_chat
+      base_url: http://127.0.0.1:5580
+      auth:
+        api_key: local-secret
+  profiles:
+    primary:
+      provider: local
+      model: local-model
+''',
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):
-                application = compose_openai_compatible_readonly_application_from_env(
-                    env_file
+                application = compose_openai_compatible_readonly_application_from_config(
+                    configuration_file
                 )
                 self.assertNotIn("TSM_AGT_OPEN_MODEL", os.environ)
                 self.assertNotIn("UNRELATED_SECRET", os.environ)
@@ -433,24 +465,36 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_model_transport_settings_are_optional_and_configurable(self):
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_MODEL_BASE_URL=http://127.0.0.1:5580\n"
-                "TSM_AGT_OPEN_MODEL=test-model\n"
-                "TSM_AGT_MODEL_API_KEY=test-secret\n"
-                "TSM_AGT_MODEL_TIMEOUT_SECONDS=240\n"
-                "TSM_AGT_MODEL_MAX_RETRIES=4\n"
-                "TSM_AGT_MODEL_RETRY_BACKOFF_SECONDS=0.5\n"
-                "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=max_tokens\n"
-                "TSM_AGT_MODEL=open\n"
-                "TSM_AGT_MODEL_STRICT_TOOL_SCHEMA=false\n"
-                "TSM_AGT_MODEL_STREAMING=false\n",
+            configuration_file = Path(directory) / "config.yaml"
+            configuration_file.write_text(
+                '''
+version: 1
+model:
+  default_profile: primary
+  providers:
+    local:
+      protocol: openai_chat
+      base_url: http://127.0.0.1:5580
+      auth:
+        api_key: test-secret
+  profiles:
+    primary:
+      provider: local
+      model: test-model
+      options:
+        timeout_seconds: 240
+        max_retries: 4
+        retry_backoff_seconds: 0.5
+        output_token_parameter: max_tokens
+        strict_tool_schema: false
+        streaming: false
+''',
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):
                 application = (
-                    compose_openai_compatible_engineering_application_from_env(
-                        env_file
+                    compose_openai_compatible_engineering_application_from_config(
+                        configuration_file
                     )
                 )
             provider = application.registry.require(ModelProviderPort)
@@ -469,18 +513,30 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_native_anthropic_protocol_selects_messages_provider(self):
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_MODEL_BASE_URL=https://gateway.example.test\n"
-                "TSM_AGT_ANTHROPIC_MODEL=claude-gateway-model\n"
-                "TSM_AGT_MODEL_API_KEY=test-secret\n"
-                "TSM_AGT_MODEL=anthropic\n"
-                "TSM_AGT_ANTHROPIC_VERSION=2023-06-01\n"
-                "TSM_AGT_MODEL_STREAMING=false\n",
+            configuration_file = Path(directory) / "config.yaml"
+            configuration_file.write_text(
+                '''
+version: 1
+model:
+  default_profile: primary
+  providers:
+    local:
+      protocol: anthropic_messages
+      base_url: https://gateway.example.test
+      auth:
+        api_key: test-secret
+  profiles:
+    primary:
+      provider: local
+      model: claude-gateway-model
+      options:
+        anthropic_version: '2023-06-01'
+        streaming: false
+''',
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):
-                application = compose_openai_compatible_engineering_application_from_env(env_file)
+                application = compose_openai_compatible_engineering_application_from_config(configuration_file)
             provider = application.registry.require(ModelProviderPort)
             self.assertIsInstance(provider._provider, AnthropicMessagesModelProvider)
             self.assertEqual(provider._provider._anthropic_version, "2023-06-01")
@@ -490,22 +546,32 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_context_compaction_settings_enter_effective_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_MODEL_BASE_URL=http://127.0.0.1:5580\n"
-                "TSM_AGT_OPEN_MODEL=test-model\n"
-                "TSM_AGT_MODEL_API_KEY=test-secret\n"
-                "TSM_AGT_CONTEXT_COMPACTION_RATIO=0.75\n"
-                "TSM_AGT_CONTEXT_LATENCY_SOFT_TOKENS=60000\n"
-                # Protocol selector is required alongside the per-protocol model
-                # name (see .env.example).
-                "TSM_AGT_MODEL=open\n",
+            configuration_file = Path(directory) / "config.yaml"
+            configuration_file.write_text(
+                '''
+version: 1
+model:
+  default_profile: primary
+  providers:
+    local:
+      protocol: openai_chat
+      base_url: http://127.0.0.1:5580
+      auth:
+        api_key: test-secret
+  profiles:
+    primary:
+      provider: local
+      model: test-model
+context:
+  compaction_ratio: 0.75
+  latency_soft_tokens: 60000
+''',
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):
                 application = (
-                    compose_openai_compatible_engineering_application_from_env(
-                        env_file
+                    compose_openai_compatible_engineering_application_from_config(
+                        configuration_file
                     )
                 )
             manager = application.kernel.dependencies.context_manager
@@ -515,7 +581,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                 application.kernel.dependencies.configuration_metadata["sources"][
                     "context.compaction_ratio"
                 ],
-                "env_file",
+                "yaml",
             )
 
     async def test_session_history_bounds_enter_configuration_and_the_projector(
@@ -530,21 +596,34 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
         """
 
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_MODEL_BASE_URL=http://127.0.0.1:5580\n"
-                "TSM_AGT_OPEN_MODEL=test-model\n"
-                "TSM_AGT_MODEL_API_KEY=test-secret\n"
-                "TSM_AGT_SESSION_RECENT_MESSAGES=20\n"
-                "TSM_AGT_SESSION_TASK_SUMMARIES=9\n"
-                "TSM_AGT_CONTEXT_RECENT_MESSAGE_FLOOR=20\n"
-                "TSM_AGT_MODEL=open\n",
+            configuration_file = Path(directory) / "config.yaml"
+            configuration_file.write_text(
+                '''
+version: 1
+model:
+  default_profile: primary
+  providers:
+    local:
+      protocol: openai_chat
+      base_url: http://127.0.0.1:5580
+      auth:
+        api_key: test-secret
+  profiles:
+    primary:
+      provider: local
+      model: test-model
+session:
+  recent_messages: 20
+  task_summaries: 9
+context:
+  recent_message_floor: 20
+''',
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):
                 application = (
-                    compose_openai_compatible_engineering_application_from_env(
-                        env_file
+                    compose_openai_compatible_engineering_application_from_config(
+                        configuration_file
                     )
                 )
             projector = application.kernel.dependencies.session_context_projector
@@ -558,23 +637,34 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                 application.kernel.dependencies.configuration_metadata["sources"][
                     "session.recent_messages"
                 ],
-                "env_file",
+                "yaml",
             )
 
     async def test_absent_session_bounds_keep_the_historic_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_MODEL_BASE_URL=http://127.0.0.1:5580\n"
-                "TSM_AGT_OPEN_MODEL=test-model\n"
-                "TSM_AGT_MODEL_API_KEY=test-secret\n"
-                "TSM_AGT_MODEL=open\n",
+            configuration_file = Path(directory) / "config.yaml"
+            configuration_file.write_text(
+                '''
+version: 1
+model:
+  default_profile: primary
+  providers:
+    local:
+      protocol: openai_chat
+      base_url: http://127.0.0.1:5580
+      auth:
+        api_key: test-secret
+  profiles:
+    primary:
+      provider: local
+      model: test-model
+''',
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):
                 application = (
-                    compose_openai_compatible_engineering_application_from_env(
-                        env_file
+                    compose_openai_compatible_engineering_application_from_config(
+                        configuration_file
                     )
                 )
             projector = application.kernel.dependencies.session_context_projector
@@ -591,48 +681,51 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             ContextConfiguration(recent_message_floor=0)
 
-    async def test_exported_environment_overrides_local_env_file(self) -> None:
+    async def test_environment_cannot_override_private_yaml(self) -> None:
+        from tests.test_model_profiles import _configuration
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_MODEL_BASE_URL=http://file.example\n"
-                "TSM_AGT_MODEL=file-model\n"
-                "TSM_AGT_MODEL_API_KEY=file-secret\n",
-                encoding="utf-8",
-            )
-            exported = {
-                "TSM_AGT_MODEL_BASE_URL": "http://exported.example",
-                "TSM_AGT_MODEL": "exported-model",
-                "TSM_AGT_MODEL_API_KEY": "exported-secret",
-            }
+            path = Path(directory) / "config.yaml"
+            path.write_text(_configuration(), encoding="utf-8")
+            exported = {"TSM_AGT_MODEL_BASE_URL": "http://exported.example", "TSM_AGT_MODEL": "exported-model", "TSM_AGT_MODEL_API_KEY": "exported-secret"}
             with patch.dict(os.environ, exported, clear=True):
-                compose_openai_compatible_readonly_application_from_env(env_file)
-                self.assertEqual(
-                    os.environ["TSM_AGT_MODEL_BASE_URL"], "http://exported.example"
-                )
+                application = compose_openai_compatible_readonly_application_from_config(path)
+                provider = application.registry.require(ModelProviderPort)._provider
+                self.assertEqual(provider._model, "local-model")
+                self.assertEqual(provider._base_url, "http://127.0.0.1:8000/v1")
                 self.assertEqual(os.environ["TSM_AGT_MODEL"], "exported-model")
 
     async def test_engineering_composition_applies_project_budget_settings(self):
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_MODEL_BASE_URL=http://127.0.0.1:5580\n"
-                "TSM_AGT_OPEN_MODEL=test-model\n"
-                "TSM_AGT_MODEL_API_KEY=test-secret\n"
-                "TSM_AGT_AGENT_MAX_MODEL_CALLS=18\n"
-                "TSM_AGT_AGENT_MAX_TOOL_CALLS=48\n"
-                "TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS=3\n"
-                "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS=32\n"
-                "TSM_AGT_EXPLORATION_MAX_ACTIONS=31\n"
-                # Protocol selector is required alongside the per-protocol model
-                # name (see .env.example).
-                "TSM_AGT_MODEL=open\n",
+            configuration_file = Path(directory) / "config.yaml"
+            configuration_file.write_text(
+                '''
+version: 1
+model:
+  default_profile: primary
+  providers:
+    local:
+      protocol: openai_chat
+      base_url: http://127.0.0.1:5580
+      auth:
+        api_key: test-secret
+  profiles:
+    primary:
+      provider: local
+      model: test-model
+agent:
+  max_model_calls: 18
+  max_tool_calls: 48
+  finalization_model_calls: 3
+exploration:
+  max_tool_calls: 32
+  max_actions: 31
+''',
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):
                 application = (
-                    compose_openai_compatible_engineering_application_from_env(
-                        env_file
+                    compose_openai_compatible_engineering_application_from_config(
+                        configuration_file
                     )
                 )
             policy = application.registry.require(ExplorationBudgetPolicyPort)
@@ -648,7 +741,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(
                 metadata["sources"]["exploration_budget.max_tool_calls"],
-                "env_file",
+                "yaml",
             )
     def test_fixture_defaults_to_single_loop_orchestration(self) -> None:
         application = compose_fixture_application()
@@ -670,21 +763,30 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(TypeError, "single_loop_allow_fallback"):
             OrchestrationConfiguration(single_loop_allow_fallback=True)
 
-    async def test_env_orchestration_configuration_is_recorded(self) -> None:
+    async def test_yaml_orchestration_configuration_is_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_MODEL_BASE_URL=https://models.example.test/v1\n"
-                "TSM_AGT_MODEL=open\n"
-                "TSM_AGT_OPEN_MODEL=test-model\n"
-                "TSM_AGT_MODEL_API_KEY=test-secret\n"
-                "TSM_AGT_ORCHESTRATION_MODE=single_loop\n"
-                "TSM_AGT_SINGLE_LOOP_ALLOW_FALLBACK=false\n",
+            configuration_file = Path(directory) / "config.yaml"
+            configuration_file.write_text(
+                '''
+version: 1
+model:
+  default_profile: primary
+  providers:
+    local:
+      protocol: openai_chat
+      base_url: https://models.example.test/v1
+      auth:
+        api_key: test-secret
+  profiles:
+    primary:
+      provider: local
+      model: test-model
+''',
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):
-                application = compose_openai_compatible_engineering_application_from_env(
-                    env_file
+                application = compose_openai_compatible_engineering_application_from_config(
+                    configuration_file
                 )
 
         self.assertEqual(
@@ -705,20 +807,30 @@ if __name__ == "__main__":
 
 
 class OrchestrationEnvironmentOverrideTest(unittest.TestCase):
-    def test_explicit_legacy_environment_overrides_single_loop_default(self) -> None:
+    def test_legacy_mode_cannot_override_the_fixed_conversation_loop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_MODEL_BASE_URL=https://models.example.test/v1\n"
-                "TSM_AGT_MODEL=open\n"
-                "TSM_AGT_OPEN_MODEL=test-model\n"
-                "TSM_AGT_MODEL_API_KEY=test-secret\n"
-                "TSM_AGT_ORCHESTRATION_MODE=legacy\n",
+            configuration_file = Path(directory) / "config.yaml"
+            configuration_file.write_text(
+                '''
+version: 1
+model:
+  default_profile: primary
+  providers:
+    local:
+      protocol: openai_chat
+      base_url: https://models.example.test/v1
+      auth:
+        api_key: test-secret
+  profiles:
+    primary:
+      provider: local
+      model: test-model
+''',
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):
-                application = compose_openai_compatible_engineering_application_from_env(
-                    env_file
+                application = compose_openai_compatible_engineering_application_from_config(
+                    configuration_file
                 )
 
         self.assertEqual(
@@ -736,24 +848,19 @@ class OrchestrationEnvironmentOverrideTest(unittest.TestCase):
 class ConversationLoopConfigurationTest(unittest.TestCase):
     """The feature flag that selects the model-led loop for new Tasks."""
 
-    def _env_file(self, directory: str, extra: str = "") -> Path:
-        env_file = Path(directory) / ".env"
-        env_file.write_text(
-            "TSM_AGT_MODEL_BASE_URL=https://models.example.test/v1\n"
-            "TSM_AGT_MODEL=open\n"
-            "TSM_AGT_OPEN_MODEL=test-model\n"
-            "TSM_AGT_MODEL_API_KEY=test-secret\n" + extra,
-            encoding="utf-8",
-        )
-        return env_file
+    def _configuration_file(self, directory: str, extra: str = "") -> Path:
+        from tests.test_model_profiles import _configuration
+        path = Path(directory) / "config.yaml"
+        path.write_text(_configuration() + extra, encoding="utf-8")
+        return path
 
     def test_default_selects_the_conversation_loop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            env_file = self._env_file(directory)
+            configuration_file = self._configuration_file(directory)
             with patch.dict(os.environ, {}, clear=True):
                 application = (
-                    compose_openai_compatible_engineering_application_from_env(
-                        env_file
+                    compose_openai_compatible_engineering_application_from_config(
+                        configuration_file
                     )
                 )
 
@@ -767,13 +874,13 @@ class ConversationLoopConfigurationTest(unittest.TestCase):
 
     def test_deprecated_flag_cannot_disable_conversation_loop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            env_file = self._env_file(
-                directory, "TSM_AGT_CONVERSATION_LOOP_ENABLED=false\n"
+            configuration_file = self._configuration_file(
+                directory, "orchestration: {conversation_loop_enabled: false}\n"
             )
             with patch.dict(os.environ, {}, clear=True):
                 application = (
-                    compose_openai_compatible_engineering_application_from_env(
-                        env_file
+                    compose_openai_compatible_engineering_application_from_config(
+                        configuration_file
                     )
                 )
 
@@ -787,15 +894,14 @@ class ConversationLoopConfigurationTest(unittest.TestCase):
 
     def test_explicit_mode_wins_over_the_flag(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            env_file = self._env_file(
+            configuration_file = self._configuration_file(
                 directory,
-                "TSM_AGT_ORCHESTRATION_MODE=single_loop\n"
-                "TSM_AGT_CONVERSATION_LOOP_ENABLED=true\n",
+                "orchestration: {mode: single_loop, conversation_loop_enabled: true}\n",
             )
             with patch.dict(os.environ, {}, clear=True):
                 application = (
-                    compose_openai_compatible_engineering_application_from_env(
-                        env_file
+                    compose_openai_compatible_engineering_application_from_config(
+                        configuration_file
                     )
                 )
 
@@ -806,17 +912,11 @@ class ConversationLoopConfigurationTest(unittest.TestCase):
         sources = application.kernel.dependencies.configuration_metadata["sources"]
         self.assertEqual(sources["orchestration.mode"], "fixed")
 
-    def test_invalid_flag_is_rejected(self) -> None:
-        configuration = load_orchestration_configuration(Path("absent.env"), {"TSM_AGT_CONVERSATION_LOOP_ENABLED": "maybe"})
+    def test_obsolete_flags_do_not_change_the_fixed_mode(self) -> None:
+        configuration = load_orchestration_configuration({"orchestration": {"conversation_loop_enabled": "maybe"}})
         self.assertIs(configuration.mode, OrchestrationMode.CONVERSATION_LOOP)
         self.assertEqual(configuration.sources, {"orchestration.mode": "fixed"})
 
     def test_conversation_loop_mode_value_is_accepted(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "absent.env"
-            configuration = load_orchestration_configuration(
-                path, {"TSM_AGT_ORCHESTRATION_MODE": "conversation_loop"}
-            )
-        self.assertEqual(
-            configuration.mode, OrchestrationMode.CONVERSATION_LOOP
-        )
+        configuration = load_orchestration_configuration({"orchestration": {"mode": "conversation_loop"}})
+        self.assertEqual(configuration.mode, OrchestrationMode.CONVERSATION_LOOP)

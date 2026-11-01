@@ -24,6 +24,8 @@ from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
+from .text_stream import ResponseTextStream
+
 from tsm_agt.ports import (
     CompletionReviewAction,
     CompletionReviewFailurePolicy,
@@ -368,7 +370,13 @@ class ConversationAgentLoop:
         )
         while True:
             if state.pending_tool_calls:
-                message_count_before = len(state.messages)
+                batch_call_ids = frozenset(
+                    call.call_id for call in (
+                        state.checkpoint.tool_batch.calls
+                        if state.checkpoint.tool_batch is not None
+                        else state.pending_tool_calls
+                    )
+                )
                 outcome = await kernel._run_tool_batch(state)
                 if outcome is not None:
                     # Approval, clarification, or a completed-unit continuation
@@ -378,7 +386,7 @@ class ConversationAgentLoop:
                         state, f"suspended:{type(outcome).__name__}"
                     )
                     return outcome
-                await self._record_new_tool_results(state, message_count_before)
+                await self._record_new_tool_results(state, batch_call_ids)
             # ``run_tool_batch`` drains an assistant batch atomically. Only once
             # it has closed may a queued explicit STEER/REPLACE enter the model
             # transcript; doing it inside the batch would let it split sibling
@@ -393,292 +401,292 @@ class ConversationAgentLoop:
                     state, ITERATION_BUDGET_EXHAUSTED
                 )
             await self._prepare_model_call(state)
-            buffered_text_deltas: list[str] = []
-            kernel._notify_agent_progress(state.on_progress, AgentProgress(
-                AgentProgressKind.MODEL_STARTED,
-                model_call=state.model_call_number,
-                max_model_calls=state.checkpoint.max_model_calls,
-                tool_call=state.tool_call_count,
-                max_tool_calls=state.checkpoint.max_tool_calls,
-                goal=(await kernel.get_task(state.task_id)).goal,
-            ))
-            response = None
-            parsed_calls: tuple[ToolCall, ...] = ()
-            try:
-                response = await kernel._complete_agent_model_request(
-                    state.request, buffered_text_deltas.append,
-                    lambda text: kernel._notify_agent_progress(
-                        state.on_progress,
-                        AgentProgress(AgentProgressKind.REASONING_DELTA,
-                                      model_call=state.model_call_number,
-                                      reasoning_text=text),
-                    ),
-                )
+            current_goal = (await kernel.get_task(state.task_id)).goal
+            with ResponseTextStream(kernel, state, goal=current_goal) as text_stream:
                 kernel._notify_agent_progress(state.on_progress, AgentProgress(
-                    AgentProgressKind.MODEL_COMPLETED,
+                    AgentProgressKind.MODEL_STARTED,
                     model_call=state.model_call_number,
                     max_model_calls=state.checkpoint.max_model_calls,
                     tool_call=state.tool_call_count,
                     max_tool_calls=state.checkpoint.max_tool_calls,
-                    elapsed_seconds=time.monotonic() - state.model_started_at,
-                    goal=(await kernel.get_task(state.task_id)).goal,
+                    goal=current_goal,
                 ))
-                parsed_calls = kernel._validate_agent_response(
-                    response.message,
-                    response.finish_reason,
-                )
-                duplicate = [
-                    call.call_id for call in parsed_calls
-                    if call.call_id in state.seen_call_ids
-                ]
-                if duplicate:
-                    raise ModelInvocationFailed(
-                        state.turn_id,
-                        "tool call_id must be unique within a turn: "
-                        + ", ".join(duplicate),
-                    )
-                parsed_calls = tuple(
-                    replace(
-                        call,
-                        outcome_ref=None,
-                        outcome_binding_mode=OutcomeBindingMode.FULFILLMENT,
-                    )
-                    for call in parsed_calls
-                )
-                kernel._validate_tool_batch_proposal(
-                    parsed_calls, state.visible_tool_by_name, state.seen_call_ids
-                )
-            except RecoverableToolProtocolError as error:
-                await self._record_recoverable_protocol_error(
-                    state, response, parsed_calls, error
-                )
-                continue
-            except Exception as error:
-                # A conversation turn must never be the one path that leaves the
-                # Task EXECUTING with no recorded outcome: without this the
-                # exception escaped as an unretrieved background task and the
-                # Web waited forever on a turn that had already stopped. The
-                # classification mirrors the single-loop turn phases.
-                await self._record_model_failure(state, error)
-                raise
-            if state.tool_call_count + len(parsed_calls) > checkpoint.max_tool_calls:
-                raise AgentLoopLimitExceeded(
-                    state.turn_id, "max_tool_calls", checkpoint.max_tool_calls,
-                    model_calls=state.model_call_count,
-                    tool_calls=state.tool_call_count,
-                    max_model_calls=checkpoint.max_model_calls,
-                    max_tool_calls=checkpoint.max_tool_calls,
-                    last_tool_error=state.last_tool_error,
-                )
-            state.seen_call_ids.update(call.call_id for call in parsed_calls)
-            state.model_call_count += 1
-            state.input_tokens += response.usage.input_tokens
-            state.output_tokens += response.usage.output_tokens
-
-            # The model response has not been exposed or made conversational
-            # history yet. If explicit steering arrived while this sample was in
-            # flight, discard that stale candidate and sample again with the
-            # durable steering message. Previously this no-tool path went
-            # straight to finalization, so the Runtime claimed "steered" while
-            # the model never received the input.
-            if not parsed_calls and await self._apply_pending_steering_at_boundary(
-                state, "before-finalization"
-            ):
-                await self._record_superseded_model_response(state)
-                continue
-
-            state.messages.append(response.message)
-            accepted_batch = (
-                await kernel._new_tool_batch(
-                    state.task_id, response.message, parsed_calls
-                )
-                if parsed_calls else None
-            )
-            state.checkpoint = replace(
-                state.checkpoint,
-                messages=tuple(state.messages),
-                pending_tool_calls=parsed_calls,
-                tool_batch=accepted_batch,
-                seen_call_ids=tuple(sorted(state.seen_call_ids)),
-                model_calls=state.model_call_count,
-                tool_calls=state.tool_call_count,
-                input_tokens=state.input_tokens,
-                output_tokens=state.output_tokens,
-            )
-            await self._finalizer.record_model_response(
-                state, response, len(parsed_calls)
-            )
-            if parsed_calls:
-                commentary = "\n".join(
-                    block.text.strip() for block in response.message.content
-                    if isinstance(block, TextBlock) and block.text.strip()
-                )
-                # This is a display boundary, not an intent classifier.  A
-                # commentary is a model-authored text block paired with a tool
-                # proposal. Runtime emits no prose when it is absent, never
-                # summarizes tool outcomes, and does not infer stage boundaries.
-                if commentary:
-                    await kernel._append_events(state.task_id, ((
-                        "conversation.commentary", {
-                            "turn_id": state.turn_id,
-                            "model_call": state.model_call_count,
-                            "text": commentary,
-                            "source": "model",
-                        },
-                    ),))
-                    kernel._notify_agent_progress(state.on_progress, AgentProgress(
-                        AgentProgressKind.COMMENTARY,
-                        model_call=state.model_call_count,
-                        activity=commentary,
-                        phase="model",
-                    ))
-            if not parsed_calls:
-                candidate = await self._finalization.build_candidate(state, response)
-                runtime_decision = await self._finalization.runtime_gate(
-                    state, response
-                )
-                if runtime_decision.action is FinalizationAction.CONTINUE:
-                    await self._finalization.append_runtime_continuation(
-                        state, runtime_decision
-                    )
-                    continue
-                if runtime_decision.action is FinalizationAction.INCOMPLETE:
-                    return await self._finalizer.persist_partial_boundary(
-                        state, runtime_decision.reason_code
-                    )
-                if runtime_decision.action is FinalizationAction.FAILED:
-                    raise TurnFinalizationFailed(runtime_decision.reason_code)
-
-                stop_decision = await self._finalization.run_stop_policies(candidate)
-                if (
-                    stop_decision is not None
-                    and stop_decision.action is CompletionReviewAction.CONTINUE
-                ):
-                    if self._finalization.can_continue(state):
-                        await self._finalization.append_review_continuation(
-                            state, stop_decision, source="stop_policy"
-                        )
-                        continue
-                    return await self._finalizer.persist_partial_boundary(
-                        state, "stop_policy_continuation_exhausted"
-                    )
-
-                candidate_hash = self._finalization.candidate_hash(candidate)
-                repeated_candidate = (
-                    bool(state.last_candidate_hash)
-                    and state.last_candidate_hash == candidate_hash
-                )
+                response = None
+                parsed_calls: tuple[ToolCall, ...] = ()
                 try:
-                    review = await self._finalization.review(state, candidate)
-                except Exception as error:
-                    await kernel._append_events(state.task_id, ((
-                        "turn.completion_review_failed", {
-                            "turn_id": state.turn_id,
-                            "orchestration_mode": "CONVERSATION_LOOP",
-                            "reviewer_call_count": state.reviewer_call_count,
-                            "error_type": type(error).__name__,
-                            "reason_code": getattr(error, "reason_code", "reviewer_failed"),
-                            "failure_policy": (
-                                kernel._dependencies
-                                .completion_review_failure_policy.value
-                            ),
-                        },
-                    ),))
-                    if (
-                        kernel._dependencies.completion_review_failure_policy
-                        is CompletionReviewFailurePolicy.INCOMPLETE
-                    ):
-                        return await self._finalizer.persist_partial_boundary(
-                            state, "completion_reviewer_unavailable"
+                    response = await kernel._complete_agent_model_request(
+                        state.request, None,
+                        lambda text: kernel._notify_agent_progress(
+                            state.on_progress,
+                            AgentProgress(AgentProgressKind.REASONING_DELTA,
+                                          model_call=state.model_call_number,
+                                          reasoning_text=text),
+                        ),
+                        on_text_event=text_stream.delta,
+                    )
+                    kernel._notify_agent_progress(state.on_progress, AgentProgress(
+                        AgentProgressKind.MODEL_COMPLETED,
+                        model_call=state.model_call_number,
+                        max_model_calls=state.checkpoint.max_model_calls,
+                        tool_call=state.tool_call_count,
+                        max_tool_calls=state.checkpoint.max_tool_calls,
+                        elapsed_seconds=time.monotonic() - state.model_started_at,
+                        goal=(await kernel.get_task(state.task_id)).goal,
+                    ))
+                    parsed_calls = kernel._validate_agent_response(
+                        response.message,
+                        response.finish_reason,
+                    )
+                    duplicate = [
+                        call.call_id for call in parsed_calls
+                        if call.call_id in state.seen_call_ids
+                    ]
+                    if duplicate:
+                        raise ModelInvocationFailed(
+                            state.turn_id,
+                            "tool call_id must be unique within a turn: "
+                            + ", ".join(duplicate),
                         )
-                    if (
-                        kernel._dependencies.completion_review_failure_policy
-                        is CompletionReviewFailurePolicy.VISIBLE_UNVERIFIED
-                    ):
-                        await kernel._append_events(state.task_id, ((
-                            "turn.completion_review_bypassed", {
-                                "turn_id": state.turn_id,
-                                "orchestration_mode": "CONVERSATION_LOOP",
-                                "reason_code": "reviewer_unavailable",
-                                "answer_visibility": "unverified",
-                            },
-                        ),))
-                        review = CompletionReviewVerdict(
-                            CompletionReviewAction.ACCEPT,
-                            "reviewer_failure_visible_unverified",
-                            "completion reviewer was unavailable; answer is visible but unverified",
+                    parsed_calls = tuple(
+                        replace(
+                            call,
+                            outcome_ref=None,
+                            outcome_binding_mode=OutcomeBindingMode.FULFILLMENT,
                         )
-                    else:
-                        review = CompletionReviewVerdict(
-                            CompletionReviewAction.ACCEPT,
-                            "reviewer_failure_accepted",
-                            "completion reviewer failure was accepted by configuration",
-                        )
-                if review.action is CompletionReviewAction.CONTINUE:
-                    exhausted_reason = ""
-                    if repeated_candidate:
-                        exhausted_reason = "repeated_rejected_candidate"
-                    elif not self._finalization.can_continue(state):
-                        exhausted_reason = "completion_review_exhausted"
-                    if exhausted_reason:
-                        await kernel._append_events(state.task_id, ((
-                            "turn.completion_review_exhausted", {
-                                "turn_id": state.turn_id,
-                                "orchestration_mode": "CONVERSATION_LOOP",
-                                "reason_code": exhausted_reason,
-                                "reviewer_call_count": state.reviewer_call_count,
-                                "review_continuations": state.review_continuations,
-                            },
-                        ),))
-                        return await self._finalizer.persist_partial_boundary(
-                            state, exhausted_reason
-                        )
-                    state.last_candidate_hash = candidate_hash
-                    await self._finalization.append_review_continuation(
-                        state, review, source="completion_reviewer"
+                        for call in parsed_calls
+                    )
+                    kernel._validate_tool_batch_proposal(
+                        parsed_calls, state.visible_tool_by_name, state.seen_call_ids
+                    )
+                except RecoverableToolProtocolError as error:
+                    await self._record_recoverable_protocol_error(
+                        state, response, parsed_calls, error
                     )
                     continue
-                # Completion review may itself take time. Run the same durable
-                # boundary immediately before committing the answer, and remove
-                # the unshown candidate if a steer arrived in that interval.
-                if state.messages and state.messages[-1] == response.message:
-                    state.messages.pop()
-                if await self._apply_pending_steering_at_boundary(
-                    state, "before-finalization-commit"
+                except Exception as error:
+                    # A conversation turn must never be the one path that leaves the
+                    # Task EXECUTING with no recorded outcome: without this the
+                    # exception escaped as an unretrieved background task and the
+                    # Web waited forever on a turn that had already stopped. The
+                    # classification mirrors the single-loop turn phases.
+                    await self._record_model_failure(state, error)
+                    raise
+                if state.tool_call_count + len(parsed_calls) > checkpoint.max_tool_calls:
+                    raise AgentLoopLimitExceeded(
+                        state.turn_id, "max_tool_calls", checkpoint.max_tool_calls,
+                        model_calls=state.model_call_count,
+                        tool_calls=state.tool_call_count,
+                        max_model_calls=checkpoint.max_model_calls,
+                        max_tool_calls=checkpoint.max_tool_calls,
+                        last_tool_error=state.last_tool_error,
+                    )
+                text_stream.resolve(response, has_tools=bool(parsed_calls))
+                state.seen_call_ids.update(call.call_id for call in parsed_calls)
+                state.model_call_count += 1
+                state.input_tokens += response.usage.input_tokens
+                state.output_tokens += response.usage.output_tokens
+
+                # Displayed fragments are still provisional. If steering arrived
+                # in flight, retract this candidate and sample again with the
+                # durable steering message before committing any answer.
+                if not parsed_calls and await self._apply_pending_steering_at_boundary(
+                    state, "before-finalization"
                 ):
                     await self._record_superseded_model_response(state)
                     continue
+
                 state.messages.append(response.message)
-                await self._finalization.persist_finalization_state(
-                    state, "conversation-loop-text-completion"
+                accepted_batch = (
+                    await kernel._new_tool_batch(
+                        state.task_id, response.message, parsed_calls
+                    )
+                    if parsed_calls else None
                 )
-                await kernel._append_events(state.task_id, ((
-                    "turn.finalization_accepted", {
-                        "turn_id": state.turn_id,
-                        "review_reason_code": review.reason_code,
-                        "reviewer_call_count": state.reviewer_call_count,
-                        "review_continuations": state.review_continuations,
-                    },
-                ),))
-                # A response already shown to the user is conversational
-                # history, even when completion review is disabled or failed.
-                # Hiding it makes a natural follow-up ("yes, implement it")
-                # lose its referent.  This flag controls only history replay;
-                # it never upgrades prose into tool evidence or acceptance.
-                task = await kernel.get_task(state.task_id)
-                replay_eligible = task.task_kind is TaskKind.CONVERSATION
-                result = await self._finalizer.persist_text_completion(
-                    state, response,
-                    assistant_replay_eligible=replay_eligible,
+                state.checkpoint = replace(
+                    state.checkpoint,
+                    messages=tuple(state.messages),
+                    pending_tool_calls=parsed_calls,
+                    tool_batch=accepted_batch,
+                    seen_call_ids=tuple(sorted(state.seen_call_ids)),
+                    model_calls=state.model_call_count,
+                    tool_calls=state.tool_call_count,
+                    input_tokens=state.input_tokens,
+                    output_tokens=state.output_tokens,
                 )
-                if state.on_text_delta is not None:
-                    for text in buffered_text_deltas:
-                        state.on_text_delta(text)
-                return result
-            await kernel._save_agent_checkpoint(
-                state.checkpoint, "conversation-loop-model-response"
-            )
-            state.pending_tool_calls = list(parsed_calls)
+                await self._finalizer.record_model_response(
+                    state, response, len(parsed_calls)
+                )
+                if parsed_calls:
+                    commentary = "\n".join(
+                        block.text.strip() for block in response.message.content
+                        if isinstance(block, TextBlock) and block.text.strip()
+                    )
+                    # This is a display boundary, not an intent classifier.  A
+                    # commentary is a model-authored text block paired with a tool
+                    # proposal. Runtime emits no prose when it is absent, never
+                    # summarizes tool outcomes, and does not infer stage boundaries.
+                    if commentary:
+                        await kernel._append_events(state.task_id, ((
+                            "conversation.commentary", {
+                                "turn_id": state.turn_id,
+                                "model_call": state.model_call_count,
+                                "text": commentary,
+                                "source": "model",
+                                "text_id": text_stream.text_id,
+                            },
+                        ),))
+                        kernel._notify_agent_progress(state.on_progress, AgentProgress(
+                            AgentProgressKind.COMMENTARY,
+                            model_call=state.model_call_count,
+                            activity=commentary,
+                            phase="model", text_id=text_stream.text_id,
+                        ))
+                    text_stream.commit()
+                if not parsed_calls:
+                    candidate = await self._finalization.build_candidate(state, response)
+                    runtime_decision = await self._finalization.runtime_gate(
+                        state, response
+                    )
+                    if runtime_decision.action is FinalizationAction.CONTINUE:
+                        await self._finalization.append_runtime_continuation(
+                            state, runtime_decision
+                        )
+                        continue
+                    if runtime_decision.action is FinalizationAction.INCOMPLETE:
+                        return await self._finalizer.persist_partial_boundary(
+                            state, runtime_decision.reason_code
+                        )
+                    if runtime_decision.action is FinalizationAction.FAILED:
+                        raise TurnFinalizationFailed(runtime_decision.reason_code)
+
+                    stop_decision = await self._finalization.run_stop_policies(candidate)
+                    if (
+                        stop_decision is not None
+                        and stop_decision.action is CompletionReviewAction.CONTINUE
+                    ):
+                        if self._finalization.can_continue(state):
+                            await self._finalization.append_review_continuation(
+                                state, stop_decision, source="stop_policy"
+                            )
+                            continue
+                        return await self._finalizer.persist_partial_boundary(
+                            state, "stop_policy_continuation_exhausted"
+                        )
+
+                    candidate_hash = self._finalization.candidate_hash(candidate)
+                    repeated_candidate = (
+                        bool(state.last_candidate_hash)
+                        and state.last_candidate_hash == candidate_hash
+                    )
+                    try:
+                        review = await self._finalization.review(state, candidate)
+                    except Exception as error:
+                        await kernel._append_events(state.task_id, ((
+                            "turn.completion_review_failed", {
+                                "turn_id": state.turn_id,
+                                "orchestration_mode": "CONVERSATION_LOOP",
+                                "reviewer_call_count": state.reviewer_call_count,
+                                "error_type": type(error).__name__,
+                                "reason_code": getattr(error, "reason_code", "reviewer_failed"),
+                                "failure_policy": (
+                                    kernel._dependencies
+                                    .completion_review_failure_policy.value
+                                ),
+                            },
+                        ),))
+                        if (
+                            kernel._dependencies.completion_review_failure_policy
+                            is CompletionReviewFailurePolicy.INCOMPLETE
+                        ):
+                            return await self._finalizer.persist_partial_boundary(
+                                state, "completion_reviewer_unavailable"
+                            )
+                        if (
+                            kernel._dependencies.completion_review_failure_policy
+                            is CompletionReviewFailurePolicy.VISIBLE_UNVERIFIED
+                        ):
+                            await kernel._append_events(state.task_id, ((
+                                "turn.completion_review_bypassed", {
+                                    "turn_id": state.turn_id,
+                                    "orchestration_mode": "CONVERSATION_LOOP",
+                                    "reason_code": "reviewer_unavailable",
+                                    "answer_visibility": "unverified",
+                                },
+                            ),))
+                            review = CompletionReviewVerdict(
+                                CompletionReviewAction.ACCEPT,
+                                "reviewer_failure_visible_unverified",
+                                "completion reviewer was unavailable; answer is visible but unverified",
+                            )
+                        else:
+                            review = CompletionReviewVerdict(
+                                CompletionReviewAction.ACCEPT,
+                                "reviewer_failure_accepted",
+                                "completion reviewer failure was accepted by configuration",
+                            )
+                    if review.action is CompletionReviewAction.CONTINUE:
+                        exhausted_reason = ""
+                        if repeated_candidate:
+                            exhausted_reason = "repeated_rejected_candidate"
+                        elif not self._finalization.can_continue(state):
+                            exhausted_reason = "completion_review_exhausted"
+                        if exhausted_reason:
+                            await kernel._append_events(state.task_id, ((
+                                "turn.completion_review_exhausted", {
+                                    "turn_id": state.turn_id,
+                                    "orchestration_mode": "CONVERSATION_LOOP",
+                                    "reason_code": exhausted_reason,
+                                    "reviewer_call_count": state.reviewer_call_count,
+                                    "review_continuations": state.review_continuations,
+                                },
+                            ),))
+                            return await self._finalizer.persist_partial_boundary(
+                                state, exhausted_reason
+                            )
+                        state.last_candidate_hash = candidate_hash
+                        await self._finalization.append_review_continuation(
+                            state, review, source="completion_reviewer"
+                        )
+                        continue
+                    # Completion review may itself take time. Run the same durable
+                    # boundary immediately before committing the answer, and remove
+                    # the provisional candidate if a steer arrived in that interval.
+                    if state.messages and state.messages[-1] == response.message:
+                        state.messages.pop()
+                    if await self._apply_pending_steering_at_boundary(
+                        state, "before-finalization-commit"
+                    ):
+                        await self._record_superseded_model_response(state)
+                        continue
+                    state.messages.append(response.message)
+                    await self._finalization.persist_finalization_state(
+                        state, "conversation-loop-text-completion"
+                    )
+                    await kernel._append_events(state.task_id, ((
+                        "turn.finalization_accepted", {
+                            "turn_id": state.turn_id,
+                            "review_reason_code": review.reason_code,
+                            "reviewer_call_count": state.reviewer_call_count,
+                            "review_continuations": state.review_continuations,
+                        },
+                    ),))
+                    # A response already shown to the user is conversational
+                    # history, even when completion review is disabled or failed.
+                    # Hiding it makes a natural follow-up ("yes, implement it")
+                    # lose its referent.  This flag controls only history replay;
+                    # it never upgrades prose into tool evidence or acceptance.
+                    task = await kernel.get_task(state.task_id)
+                    replay_eligible = task.task_kind is TaskKind.CONVERSATION
+                    result = await self._finalizer.persist_text_completion(
+                        state, response,
+                        assistant_replay_eligible=replay_eligible,
+                    )
+                    text_stream.commit()
+                    return result
+                await kernel._save_agent_checkpoint(
+                    state.checkpoint, "conversation-loop-model-response"
+                )
+                state.pending_tool_calls = list(parsed_calls)
 
     async def _apply_pending_steering_at_boundary(
         self, state: TurnState, safe_point: str,
@@ -713,7 +721,7 @@ class ConversationAgentLoop:
         )
 
     async def _record_superseded_model_response(self, state: TurnState) -> None:
-        """Leave an audit fact when an unshown sample lost to user steering."""
+        """Leave an audit fact when a provisional sample lost to user steering."""
 
         await self._kernel._append_events(state.task_id, ((
             "turn.model_response_superseded", {
@@ -724,13 +732,24 @@ class ConversationAgentLoop:
         ),))
 
     async def _record_new_tool_results(
-        self, state: TurnState, message_count_before: int,
+        self, state: TurnState, batch_call_ids: frozenset[str],
     ) -> None:
-        for message in state.messages[message_count_before:]:
+        # A resumed parallel batch can insert an earlier result before an
+        # already-checkpointed sibling. List offsets cannot identify its new
+        # results. Audit the closed batch once, including recovered siblings.
+        batch = state.checkpoint.tool_batch
+        source_index = next((
+            i for i, message in enumerate(state.messages)
+            if batch is not None and message.message_id == batch.source_message_id
+        ), -1)
+        for message in state.messages[source_index + 1:]:
             if message.role is not MessageRole.TOOL:
                 continue
             for block in message.content:
-                if isinstance(block, ToolResultBlock):
+                if (
+                    isinstance(block, ToolResultBlock)
+                    and block.result.call_id in batch_call_ids
+                ):
                     await self._finalizer.record_tool_result(state, block.result)
 
     async def _record_model_failure(
@@ -864,6 +883,16 @@ class ConversationAgentLoop:
 
     async def _prepare_model_call(self, state: TurnState) -> None:
         kernel = self._kernel
+        latest_tool_message = next(
+            (message for message in reversed(state.messages) if message.role is MessageRole.TOOL), None,
+        )
+        if latest_tool_message and any(
+            isinstance(block, ToolResultBlock) and block.result.error_code == "SKILL_CATALOG_CHANGED"
+            for block in latest_tool_message.content
+        ):
+            allowed = {tool.name for tool in state.visible_tools}
+            state.visible_tools = tuple(tool for tool in await kernel.list_tools() if tool.name in allowed)
+            state.visible_tool_by_name = {tool.name: tool for tool in state.visible_tools}
         state.messages = list(kernel._normalize_and_validate_model_boundary(
             tuple(state.messages)
         ))

@@ -29,7 +29,7 @@ from tsm_agt.sdk.ui_events import _TURN_PROGRESS_EVENT_TYPES, _turn_progress_ite
 from tsm_agt.local_api import LocalEventApiServer
 from tsm_agt.bootstrap.composition import (
     configure_request_diagnostics, user_skills_store_for_application,
-    skill_installation_prompt,
+    skill_installation_prompt, skill_catalog_for_application, builtin_skill_names,
 )
 from tsm_agt.ports import ImageBlock, MessageRole
 
@@ -130,6 +130,10 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .message-body{width:min(88ch,100%);margin:0 auto;white-space:normal;font-size:15px;line-height:1.68;letter-spacing:-.003em;color:var(--text);font-family:Inter,"SF Pro Display","Segoe UI",sans-serif}
 .message-body > *:first-child{margin-top:0}
 .message-body > *:last-child{margin-bottom:0}
+.stream-text-label{width:min(88ch,100%);margin:0 auto 6px;color:var(--muted);font-size:12px}
+.message-body.streaming-text{white-space:pre-wrap;overflow-wrap:anywhere}
+.message.stream-commentary{background:transparent;padding-top:8px;padding-bottom:8px}
+.message.stream-commentary .message-body{font-size:14px}
 .message-body p{margin:.42em 0;color:var(--text-soft);max-width:88ch}
 .message-body h1,.message-body h2,.message-body h3{line-height:1.24;font-weight:650;letter-spacing:-.022em;color:var(--text)}
 .message-body h1{margin:1.1em 0 .42em;font-size:28px}
@@ -445,6 +449,8 @@ textarea::placeholder{color:#94a3b8}
       <input type="file" id="settings-skill-upload" webkitdirectory hidden onchange="uploadSkillDirectoryAndInstall(this.files, this)" />
       <p style="color:#64748b;">保存后自动在最近使用的工作区新建安装会话，由模型按 Skill 文档检查、按需准备并验证环境。</p>
       <div id="skill-installations" role="status" style="overflow-wrap:anywhere;"></div>
+      <h3>内置工作流</h3>
+      <div id="skill-builtin-catalog"></div>
       <h3>可发现 Skills 目录</h3>
       <p style="color:#64748b;">默认包含安装目录。可添加多个目录，例如 ~/.kiro/skills；外部目录仅用于发现和读取。</p>
       <ul id="skill-discovery-list" style="padding-left:20px;"></ul>
@@ -738,46 +744,42 @@ function updateComposerButtonState() {
   const cancelButton = document.getElementById('cancel-btn');
   if (!sendButton || !cancelButton) return;
 
-  // Cancellation is scoped to the *current Turn* of the authoritative active
-  // Task on the visible conversation.
-  //
-  // Earlier implementations searched every historical task card and only
-  // looked at Task.phase1State, which let an old stale PREPARING/RUNNING card
-  // keep the composer cancel button alive after the current Turn had already
-  // completed. The session snapshot already carries turn-level facts, so the
-  // button now follows the latest unsettled Turn instead.
+  sendButton.disabled = !getActiveWorkspace();
+
+  // 取消按钮优先跟 Turn 状态绑定：
+  // - 只要当前会话的当前任务存在“未结算的前台 Turn”，就显示取消；
+  // - 只要该 Turn 在 Session 视角下进入终态（包括 awaiting_input/awaiting_user
+  //   这类本轮已结束但任务挂起的状态），就隐藏取消按钮。
+  // 但是在 Runtime 还没分配 turn_id 的窗口期（卡片已进入 PREPARING/RUNNING，
+  // turnCalls 里还没有未结算 turn）也需要立即展示取消按钮，否则“一轮正在开始”
+  // 时用户看不到可取消入口。
+
   const active = getActiveConversation();
   const activeTaskId = active?.activeTaskId || null;
-  const activeTask = activeTaskId && taskMessage(active.id, activeTaskId)?.task;
   let runningTurn = null;
 
-  // 从 authoritative Session 的 turnCalls 判断是否存在未结算的 turn，
-  // 不再依赖 Task.phase1State 是否已经更新为 PREPARING/RUNNING，避免
-  // 在新一轮会话刚开始、状态仍为 AWAITING_INPUT/WAITING 时短暂隐藏取消按钮。
+  // 从 authoritative Session 的 turnCalls 判断是否存在未结算的 turn。
+  // 如果有多个未结算的 turn，选择最后一个（最新一轮）。
   if (active && activeTaskId && active.turnCalls instanceof Map) {
     active.turnCalls.forEach((turn) => {
       if (!turn || turn.task_id !== activeTaskId) return;
-      // A settled Turn has completed; cancellation only applies to an
-      // unsettled Turn that is still running or cancelling.
       if (turn.settled) return;
-      if (!runningTurn) runningTurn = turn;
+      // 覆盖之前的 runningTurn，最终得到最后一个未结算的 turn。
+      runningTurn = turn;
     });
   }
-
-  sendButton.disabled = !getActiveWorkspace();
 
   if (runningTurn && activeTaskId) {
     cancelButton.classList.remove('hidden');
     cancelButton.dataset.taskId = activeTaskId;
-    cancelButton.dataset.turnId = runningTurn.turn_id || '';
+    cancelButton.dataset.turnId = runningTurn?.turn_id || '';
     cancelButton.disabled = false;
-    return;
+  } else {
+    cancelButton.classList.add('hidden');
+    cancelButton.disabled = false;
+    cancelButton.dataset.taskId = '';
+    cancelButton.dataset.turnId = '';
   }
-
-  cancelButton.classList.add('hidden');
-  cancelButton.disabled = false;
-  cancelButton.dataset.taskId = '';
-  cancelButton.dataset.turnId = '';
 }
 
 function updateWorkspaceState() {
@@ -1493,12 +1495,29 @@ function renderMessages(forceScrollToBottom = false) {
       // Follow a coding agent's transcript order: the Turn's work (what it
       // thought, which tools it used, how it ended) reads above, and the final
       // conclusion is the last thing under it.
-      const callPanel = renderTurnCallPanel(active, message);
+      const callPanel = message.textStream ? null : renderTurnCallPanel(active, message);
       if (callPanel && message.role === 'assistant') element.appendChild(callPanel);
+
+      if (message.textStream) {
+        const stream = message.textStream;
+        if (stream.phase === 'commentary') element.classList.add('stream-commentary');
+        const label = document.createElement('div');
+        label.className = 'stream-text-label';
+        label.textContent = stream.status === 'committed' ? ''
+          : stream.status === 'reviewing' ? '正在确认回答…'
+          : stream.phase === 'commentary' ? '处理说明 · 正在生成…' : '正在生成…';
+        element.appendChild(label);
+      }
 
       const body = document.createElement('div');
       body.className = 'message-body';
-      body.innerHTML = renderMarkdown(text);
+      if (message.textPresentation) {
+        element.dataset.textStreamId = message.textPresentation.id;
+        paintTaskTextBody(body, message);
+        scheduleTaskTextRender(message, active.id);
+      } else {
+        body.innerHTML = renderMarkdown(text);
+      }
       element.appendChild(body);
 
       // Do not nest an in-flight trace in the user bubble: its full-width
@@ -2011,6 +2030,7 @@ function renderSkillInstallButton() {
 let skillInstallInFlight = false;
 let skillSettingsDirectories = [];
 let skillDefaultDirectory = '';
+let disabledBuiltinSkills = [];
 const skillInstallations = new Map();
 const skillInstallationStreams = new Map();
 const skillInstallationAutoOpen = new Set();
@@ -2154,13 +2174,33 @@ function renderSkillCatalog(data) {
   catalog.append(heading);
   for (const skill of data.skills || []) {
     const row = document.createElement('p');
-    row.textContent = `${skill.name} — ${skill.description} (${skill.plan_path || '代码注册'})`;
+    const source = skill.source === 'builtin' ? '内置' : skill.source === 'user' ? '用户目录' : '代码注册';
+    const override = skill.overrides?.includes('builtin') ? '，覆盖内置版本' : '';
+    row.textContent = `${skill.name} — ${skill.description} [${source}${override}] (${skill.plan_path || '代码注册'})`;
     catalog.append(row);
+  }
+  const builtins = document.getElementById('skill-builtin-catalog');
+  if (builtins) {
+    builtins.replaceChildren();
+    for (const skill of data.builtin_skills || []) {
+      const label = document.createElement('label');
+      label.style.display = 'block';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = !disabledBuiltinSkills.includes(skill.name);
+      checkbox.onchange = () => {
+        disabledBuiltinSkills = disabledBuiltinSkills.filter(name => name !== skill.name);
+        if (!checkbox.checked) disabledBuiltinSkills.push(skill.name);
+      };
+      label.append(checkbox, document.createTextNode(` ${skill.name}（随程序提供；保存后生效）`));
+      builtins.append(label);
+    }
   }
   renderSkillInstallations(data.installations || []);
 }
 
 function applySkillSettings(data) {
+  disabledBuiltinSkills = data.disabled_builtin_skills || [];
   skillDefaultDirectory = data.install_directory;
   skillSettingsDirectories = data.discovery_directories || [];
   document.getElementById('skill-install-directory').textContent = data.install_directory;
@@ -2229,7 +2269,7 @@ async function saveSkillSettings() {
     addSkillDirectoryPath();
     const response = await fetch('/settings/skills', {
       method: 'PUT', headers: {'content-type': 'application/json'},
-      body: JSON.stringify({discovery_directories: skillSettingsDirectories.filter(path => path !== skillDefaultDirectory)}),
+      body: JSON.stringify({discovery_directories: skillSettingsDirectories.filter(path => path !== skillDefaultDirectory), disabled_builtin_skills: disabledBuiltinSkills}),
     });
     const data = await readSkillResponse(response, '保存设置失败');
     applySkillSettings(data);
@@ -2684,6 +2724,12 @@ function bindLatestInputToTask(conversationId, taskId, turnId = null) {
         turn_id: turnId, task_id: taskId, settled: false, progress: [],
       });
     }
+    // 一旦当前输入成功绑定到具有 turnId 的 Turn，就视为“本轮已开始”。
+    // 如果这是当前活动会话，则立刻根据最新的 turnCalls 视角刷新取消按钮，
+    // 避免出现卡片显示“本轮进行中”但取消按钮仍然隐藏的窗口期。
+    if (conversationId === activeConversationId) {
+      updateComposerButtonState();
+    }
   }
   return input;
 }
@@ -2759,7 +2805,7 @@ function upsertTaskCard(conversationId, rawTask) {
   // 当 Runtime 报告当前轮次进入终态（final 或终态 phase1_state），将对应的 Turn 标记为已结算，
   // 以便取消按钮逻辑正确识别“没有可取消的轮次”。
   const isFinal = rawTask.final === true
-    || ['INTERRUPTED', 'DONE', 'FAILED', 'CANCELLED', 'NEEDS_REVIEW']
+    || ['INTERRUPTED', 'DONE', 'FAILED', 'CANCELLED', 'NEEDS_REVIEW', 'WAITING']
       .includes(rawTask.phase1_state || '');
   const turnId = rawTask.active_turn_id || rawTask.turn_id || message.task.streamTurnId;
   if (isFinal && turnId && conversation.turnCalls instanceof Map) {
@@ -3405,6 +3451,17 @@ async function cancelRunningTask(taskId) {
     // the button cannot remain visible merely because this card is stale.
     const active = getActiveConversation();
     if (active && taskId === active.activeTaskId) {
+      // 当前活动会话的 Turn 被取消，相当于本轮 Turn 已结束：
+      // 直接在前端视角中结束这一轮，立刻隐藏取消按钮，避免依赖滞后的 settled 状态。
+      const cancelButton = document.getElementById('cancel-btn');
+      if (cancelButton) {
+        cancelButton.classList.add('hidden');
+        cancelButton.disabled = false;
+        cancelButton.dataset.taskId = '';
+        cancelButton.dataset.turnId = '';
+      }
+
+      // 继续跟随任务终态事件，保证其它状态仍然按 authoritative Session 同步。
       followTask(taskId, active.id);
     } else {
       updateComposerButtonState();
@@ -3596,6 +3653,155 @@ const TERMINAL_STATES = [
 const MAX_STREAM_RETRIES = 6;
 const followers = new Map();
 
+// Keep received text authoritative; only its presentation is paced. A large
+// network chunk must not rebuild the transcript or replace already drawn text.
+const textGraphemes = typeof Intl.Segmenter === 'function'
+  ? new Intl.Segmenter(undefined, {granularity: 'grapheme'}) : null;
+
+function paintTaskTextBody(body, message) {
+  const view = message.textPresentation;
+  if (view && (message.textStream || view.visible !== message.content)) {
+    const previous = body.textContent || '';
+    if (body.classList.contains('streaming-text') && view.visible.startsWith(previous)
+        && body.firstChild?.nodeType === 3) {
+      body.firstChild.appendData(view.visible.slice(previous.length));
+    } else {
+      body.textContent = view.visible;
+    }
+    body.classList.add('streaming-text');
+  } else {
+    body.classList.remove('streaming-text');
+    body.innerHTML = renderMarkdown(String(message.content || '').trim());
+  }
+}
+
+function scheduleTaskTextRender(message, conversationId) {
+  const view = message.textPresentation;
+  if (!view || view.frame != null || conversationId !== activeConversationId) return;
+  view.frame = requestAnimationFrame(now => {
+    view.frame = null;
+    const conversation = getConversationById(conversationId);
+    // History refresh may replace the message object while keeping its view.
+    const current = conversation?.messages.find(item => item.textPresentation === view);
+    if (!current || conversationId !== activeConversationId) { view.lastTime = null; return; }
+    const remaining = current.content.slice(view.visible.length);
+    if (remaining) {
+      const elapsed = view.lastTime == null ? 16 : Math.min(64, Math.max(0, now - view.lastTime));
+      // Roughly one character per frame for small chunks. Catch up adaptively
+      // after bursts instead of spending seconds replaying an already finished answer.
+      view.credit += elapsed * Math.max(60, remaining.length / 0.35) / 1000;
+      const budget = Math.floor(view.credit);
+      const units = textGraphemes ? textGraphemes.segment(remaining) : remaining;
+      let count = 0;
+      for (const unit of units) {
+        if (count >= budget) break;
+        view.visible += textGraphemes ? unit.segment : unit;
+        count += 1;
+      }
+      view.credit -= count;
+    }
+    view.lastTime = now;
+    if (view.visible === current.content) {
+      view.lastTime = null;
+      view.credit = 0;
+      if (view.removeAfter) {
+        conversation.messages = conversation.messages.filter(item => item !== current);
+        scheduleProgressRender(conversationId);
+        return;
+      }
+    }
+    const chatArea = document.getElementById('chat-area');
+    const element = Array.from(chatArea?.querySelectorAll('[data-text-stream-id]') || [])
+      .find(item => item.dataset.textStreamId === view.id);
+    if (element) {
+      const follow = shouldAutoFollowChat || isNearChatBottom(chatArea);
+      paintTaskTextBody(element.querySelector('.message-body'), current);
+      element.classList.toggle('stream-commentary', current.textStream?.phase === 'commentary');
+      const label = element.querySelector('.stream-text-label');
+      if (label) label.textContent = current.textStream?.status === 'reviewing' ? '正在确认回答…'
+        : !current.textStream || current.textStream.status === 'committed' ? ''
+        : current.textStream.phase === 'commentary' ? '处理说明 · 正在生成…' : '正在生成…';
+      if (follow) {
+        chatArea.scrollTop = chatArea.scrollHeight;
+        lastConversationScrollTop = chatArea.scrollTop;
+      }
+    }
+    if (!current.textStream && view.visible === current.content) {
+      delete current.textPresentation;
+      return;
+    }
+    if (view.visible !== current.content) scheduleTaskTextRender(current, conversationId);
+  });
+}
+
+function clearTaskTextStreams(taskId, conversationId) {
+  const conversation = getConversationById(conversationId);
+  if (!conversation) return;
+  conversation.messages = conversation.messages.filter(
+    item => !(item.taskId === taskId && item.textStream),
+  );
+  scheduleProgressRender(conversationId);
+}
+
+function applyTaskText(taskId, progress, conversationId, replaceText = false) {
+  const conversation = getConversationById(conversationId);
+  if (!conversation || !progress.text_id) return;
+  const identity = progress.text_id;
+  const status = progress.text_status || 'generating';
+  let message = conversation.messages.find(
+    item => item.taskId === taskId && item.textStream?.id === identity,
+  );
+  if (status === 'committed' && progress.phase === 'commentary' && message
+      && message.textPresentation.visible !== message.content) {
+    message.textStream.status = status;
+    message.textStream.phase = 'commentary';
+    message.textPresentation.removeAfter = true;
+    scheduleTaskTextRender(message, conversationId);
+    return;
+  }
+  if (['discarded', 'interrupted'].includes(status)
+      || (status === 'committed' && progress.phase === 'commentary')) {
+    conversation.messages = conversation.messages.filter(
+      item => !(item.taskId === taskId && item.textStream?.id === identity),
+    );
+    scheduleProgressRender(conversationId);
+    return;
+  }
+  const isNew = !message;
+  if (!message) {
+    if (!progress.text) return;
+    message = {role: 'assistant', content: '', images: [], taskId,
+      turnId: progress.turn_id,
+      textPresentation: {id: identity, visible: '', credit: 0, lastTime: null, frame: null},
+      textStream: {id: identity, sequence: 0, phase: 'pending', status}};
+    conversation.messages.push(message);
+  }
+  const sequence = Number(progress.text_sequence || 0);
+  const previousPhase = message.textStream.phase;
+  const phase = progress.phase || previousPhase;
+  const phaseChangedToFinal = previousPhase === 'commentary' && phase === 'final_answer';
+  // When a commentary stream becomes a final answer stream, drop the commentary
+  // text from the answer bubble so the final answer is not prepended with
+  // processing notes. The commentary itself remains in the execution history.
+  if (!replaceText && phaseChangedToFinal) {
+    message.content = '';
+    message.textPresentation.visible = '';
+  }
+  if (replaceText) {
+    message.content = String(progress.text || '');
+    message.textStream.sequence = sequence;
+    // Recovered history is already read: do not replay it character by character.
+    message.textPresentation.visible = message.content;
+  } else if (progress.kind === 'text_delta' && sequence > message.textStream.sequence) {
+    message.content += progress.text || '';
+    message.textStream.sequence = sequence;
+  }
+  message.textStream.phase = phase;
+  message.textStream.status = status;
+  if (isNew) scheduleProgressRender(conversationId);
+  scheduleTaskTextRender(message, conversationId);
+}
+
 function stopConversationFollowers(conversationId, exceptTaskId = null) {
   followers.forEach((follower, taskId) => {
     if (follower.conversationId === conversationId && taskId !== exceptTaskId) {
@@ -3608,6 +3814,19 @@ function appendTaskAssistantText(taskId, text, conversationId) {
   const assistantText = String(text || '').trim();
   if (!assistantText) return false;
   const conversation = getConversationById(conversationId);
+  const draft = [...(conversation?.messages || [])].reverse().find(
+    item => item.taskId === taskId && item.textStream
+      && item.textStream.phase !== 'commentary',
+  );
+  if (draft) {
+    if (draft.textPresentation) {
+      const shown = draft.textPresentation.visible.trimStart().slice(0, assistantText.length);
+      draft.textPresentation.visible = assistantText.startsWith(shown) ? shown : assistantText;
+    }
+    draft.content = assistantText;
+    delete draft.textStream;
+    return true;
+  }
   const duplicate = conversation?.messages.some(
     (item) => item.role === 'assistant'
       && item.taskId === taskId
@@ -3667,7 +3886,7 @@ function renderLiveTurnPanel(task) {
         : '正在思考…';
     panel.appendChild(pending);
   } else {
-    lines.slice(-12).forEach((item) => {
+    lines.forEach((item) => {
       const kind = item.progressData?.kind || '';
       const row = document.createElement('div');
       row.className = 'live-turn-line';
@@ -3955,6 +4174,7 @@ async function renderFinalResult(taskId, state, conversationId) {
   // On a conflict the SDK may still expose the previous Turn's archived
   // answer. It is not a response to this failed approval/resume.
   const assistantText = state.state === 'CONFLICT' ? '' : String(state.assistant_text || '').trim();
+  if (!assistantText) clearTaskTextStreams(taskId, conversationId);
   if (state.failure_reason && conversationId === activeConversationId) {
     showError(describeFailure(state.failure_reason));
   }
@@ -4058,11 +4278,22 @@ function followTask(taskId, conversationId) {
       // just as for DONE/FAILED; otherwise the refresh can erase the answer.
       await finish(state);
     } else if ((state.waiting || state.status === 'awaiting_user') && !submittedApprovalIsSettling) {
+      // 澄清 / 等待用户输入视为“当前 Turn 结束但任务挂起”：
+      // 在前端视角中结束这一轮 Turn，并刷新历史，同时让取消按钮跟随
+      // 最新 Session turnCalls 视角收起。
       follower.stop();
-      if (state.assistant_text && state.state !== 'CONFLICT') appendTaskAssistantText(taskId, state.assistant_text, conversationId);
-      await refreshConversationHistory(conversationId).catch(error => console.error(error));
-      if (conversationId === activeConversationId) setLoading(false);
-    } else if (conversationId === activeConversationId) renderMessages();
+      if (state.assistant_text && state.state !== 'CONFLICT') {
+        appendTaskAssistantText(taskId, state.assistant_text, conversationId);
+      }
+      await refreshConversationHistory(conversationId).catch((error) => console.error(error));
+      if (conversationId === activeConversationId) {
+        setLoading(false);
+        updateComposerButtonState();
+      }
+    } else if (conversationId === activeConversationId) {
+      renderMessages();
+      updateComposerButtonState();
+    }
   };
   const accept = async payload => {
     if (!currentFollower()) return;
@@ -4081,6 +4312,16 @@ function followTask(taskId, conversationId) {
       }
       return;
     }
+    if (payload.type === 'text.snapshot') {
+      if (payload.turn_id && follower.turnId && payload.turn_id !== follower.turnId) return;
+      clearTaskTextStreams(taskId, conversationId);
+      for (const stream of payload.streams || []) {
+        if (!follower.turnId || stream.turn_id === follower.turnId) {
+          applyTaskText(taskId, stream, conversationId, true);
+        }
+      }
+      return;
+    }
     if (payload.type === 'task.snapshot') { await applyState(payload); return; }
     const sequence = Number(payload.sequence || 0);
     if (sequence && sequence <= Number(current?.task?.cursor || 0)) return;
@@ -4094,8 +4335,35 @@ function followTask(taskId, conversationId) {
       }
       bindLatestInputToTask(conversationId, taskId, payload.turn_id);
     }
+    // 进度事件只属于当前跟踪的 Turn；避免旧事件影响当前按钮状态。
     if (payload.turn_id && follower.turnId && payload.turn_id !== follower.turnId) return;
+    if (['text_delta', 'text_state'].includes(payload.progress?.kind)) {
+      applyTaskText(taskId, {...payload.progress, turn_id: payload.turn_id}, conversationId);
+      return;
+    }
     if (payload.progress) appendTaskProgress(taskId, payload, conversationId);
+
+    // 一次性绑定：只要本轮 Turn 收到终态进度事件，就在前端视角中结束它，
+    // 立刻收起取消按钮，而不是完全依赖后端何时更新 turn.settled。
+    if (payload.progress && ['turn_completed', 'turn_failed', 'turn_suspended'].includes(payload.progress.kind)) {
+      const active = getActiveConversation();
+      if (active && active.id === conversationId && active.activeTaskId === taskId) {
+        const cancelButton = document.getElementById('cancel-btn');
+        if (cancelButton) {
+          // 有些终态事件可能不携带 turn_id，此时以当前 follower.turnId 为准，
+          // 避免因为缺少 turn_id 导致按钮一直不收起。
+          const effectiveTurnId = payload.turn_id || follower.turnId || '';
+          const currentTurnId = cancelButton.dataset.turnId || '';
+          // 仅在按钮还指向当前 Turn，或事件缺少明确 turnId（视为当前 Turn）时收起。
+          if (!currentTurnId || !effectiveTurnId || currentTurnId === String(effectiveTurnId)) {
+            cancelButton.classList.add('hidden');
+            cancelButton.disabled = false;
+            cancelButton.dataset.taskId = '';
+            cancelButton.dataset.turnId = '';
+          }
+        }
+      }
+    }
   };
   const connect = () => {
     if (!currentFollower()) return;
@@ -4322,6 +4590,13 @@ async function ensureConversationLoaded(conversationId) {
       }
     });
 
+    previousMessages.forEach(previous => {
+      if (!previous.textPresentation) return;
+      const target = rebuiltMessages.find(message => message.role === 'assistant'
+        && message.taskId === previous.taskId && message.turnId === previous.turnId
+        && message.content === previous.content);
+      if (target) target.textPresentation = previous.textPresentation;
+    });
     conversation.messages = rebuiltMessages;
     renderConversations();
     renderMessages();
@@ -5292,13 +5567,18 @@ def user_skills_store():
 
 def refresh_skill_catalog(store=None) -> tuple:
     store = store or user_skills_store()
+    application = runtime_server._client.application if runtime_server is not None else None
+    catalog = skill_catalog_for_application(application, store)
     if runtime_server is None:
-        return store.discover()
+        skills = catalog.discover()
+        store.issues = list(catalog.issues)
+        return skills
 
     async def refresh():
         registry = runtime_server._client.application.kernel._dependencies.skill_registry
-        store.refresh(registry)
-        return registry.list_all()
+        skills = catalog.refresh(registry)
+        store.issues = list(catalog.issues)
+        return skills
 
     return runtime_server._call(refresh())
 
@@ -5309,6 +5589,7 @@ def skill_data(skill) -> dict:
         "kind": skill.kind.value, "plan_path": skill.plan_path,
         "tags": list(skill.tags), "safety_level": skill.safety_level,
         "approval_required": skill.approval_required,
+        "source": skill.source, "overrides": list(skill.overrides),
     }
 
 
@@ -5496,6 +5777,8 @@ async def get_skill_settings() -> dict:
         "install_directory": str(store.install_directory),
         "discovery_directories": [str(path) for path in directories],
         "skills": [skill_data(skill) for skill in skills],
+        "builtin_skills": [{"name": name} for name in builtin_skill_names()],
+        "disabled_builtin_skills": store.settings().get("disabled_builtin_skills", []),
         "issues": list(store.issues),
         "installations": [refresh_skill_installation(store, row) for row in store.installations.list()[-30:]],
     }
@@ -5504,7 +5787,13 @@ async def get_skill_settings() -> dict:
 @app.put("/settings/skills")
 async def save_skill_settings(payload: dict) -> dict:
     try:
-        user_skills_store().save_directories(payload.get("discovery_directories"))
+        store = user_skills_store()
+        disabled = payload.get("disabled_builtin_skills", store.settings().get("disabled_builtin_skills", []))
+        if (not isinstance(disabled, list) or any(not isinstance(name, str) or name not in builtin_skill_names() for name in disabled)):
+            raise ValueError("disabled_builtin_skills 包含未知内置 Skill")
+        store.save_directories(payload.get("discovery_directories"))
+        if "disabled_builtin_skills" in payload:
+            store.save_disabled_builtin_skills(disabled)
     except (OSError, ValueError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return await get_skill_settings()

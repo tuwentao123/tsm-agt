@@ -236,7 +236,7 @@ class GitHubSourceProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.error_code, "RATE_LIMITED")
         self.assertTrue(result.retryable)
-        self.assertIn("TSM_AGT_GITHUB_TOKEN", result.message)
+        self.assertIn("github_source.token", result.message)
 
     async def test_non_json_success_response_is_retryable_and_observable(self):
         endpoint = f"{self.base}/repos/{self.repo}/commits/main"
@@ -361,13 +361,13 @@ class GitHubSourceProviderTest(unittest.IsolatedAsyncioTestCase):
 
 class GitHubSourceConfigurationTest(unittest.TestCase):
     def test_private_access_requires_token_and_exact_repository_allowlist(self):
-        configuration = load_github_source_configuration(Path("/missing.env"), {"TSM_AGT_GITHUB_SOURCE_ENABLED":"true", "TSM_AGT_GITHUB_PRIVATE_ACCESS":"true"})
+        configuration = load_github_source_configuration({'github_source': {'enabled': True, 'private_access': True}})
         self.assertFalse(configuration.enabled)
         self.assertTrue(configuration.issues)
 
     def test_token_source_is_redacted_from_snapshot(self):
-        configuration = load_github_source_configuration(Path("/missing.env"), {"TSM_AGT_GITHUB_TOKEN":"github_pat_example"})
-        self.assertEqual(configuration.sources["github_source.token"], "environment")
+        configuration = load_github_source_configuration({'github_source': {'token': 'github_pat_example'}})
+        self.assertEqual(configuration.sources["github_source.token"], "yaml")
         self.assertNotIn("github_pat_example", str(configuration.sources))
 
     def test_enabling_the_adapter_adopts_an_existing_gh_login(self):
@@ -375,8 +375,7 @@ class GitHubSourceConfigurationTest(unittest.TestCase):
         # because they run inside the developer's authenticated shell. The
         # adapter adopts that same credential instead of demanding a second one.
         adopted = load_github_source_configuration(
-            Path("/missing.env"),
-            {"TSM_AGT_GITHUB_SOURCE_ENABLED": "true"},
+            {'github_source': {'enabled': True}},
             cli_token_resolver=lambda: "gh" * 20,
         )
         self.assertEqual(adopted.sources["github_source.token"], "gh_cli")
@@ -384,8 +383,7 @@ class GitHubSourceConfigurationTest(unittest.TestCase):
 
     def test_a_missing_gh_login_leaves_the_adapter_anonymous(self):
         configuration = load_github_source_configuration(
-            Path("/missing.env"),
-            {"TSM_AGT_GITHUB_SOURCE_ENABLED": "true"},
+            {'github_source': {'enabled': True}},
             cli_token_resolver=lambda: "",
         )
         self.assertTrue(configuration.enabled)
@@ -394,12 +392,8 @@ class GitHubSourceConfigurationTest(unittest.TestCase):
 
     def test_an_explicit_token_wins_over_the_gh_login(self):
         configuration = load_github_source_configuration(
-            Path("/missing.env"),
-            {
-                "TSM_AGT_GITHUB_SOURCE_ENABLED": "true",
-                "TSM_AGT_GITHUB_TOKEN": "github_pat_example",
-            },
+            {'github_source': {'enabled': True, 'token': 'github_pat_example'}},
             cli_token_resolver=lambda: "gh" * 20,
         )
-        self.assertEqual(configuration.sources["github_source.token"], "environment")
+        self.assertEqual(configuration.sources["github_source.token"], "yaml")
         self.assertEqual(configuration.token, "github_pat_example")

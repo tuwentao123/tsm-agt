@@ -316,7 +316,7 @@ class PendingBatchCancelTest(unittest.IsolatedAsyncioTestCase):
 
 
 class _ToolCallingModel(EchoModelProvider):
-    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
 
     async def complete(self, request) -> ModelResponse:
         return ModelResponse(

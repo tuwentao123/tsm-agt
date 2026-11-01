@@ -12,15 +12,14 @@ from tsm_agt.ports import ModelRequest
 
 
 def _configuration(effort=None):
-    env = {
-        "TSM_AGT_MODEL": "open",
-        "TSM_AGT_MODEL_BASE_URL": "https://example.test/v1",
-        "TSM_AGT_OPEN_MODEL": "test-model",
-        "TSM_AGT_MODEL_API_KEY": "secret",
-    }
+    document = {"model": {
+        "default_profile": "primary",
+        "providers": {"local": {"protocol": "openai_chat", "base_url": "https://example.test/v1", "auth": {"api_key": "secret"}}},
+        "profiles": {"primary": {"provider": "local", "model": "test-model", "options": {}}},
+    }}
     if effort is not None:
-        env["TSM_AGT_REASONING_EFFORT"] = effort
-    return load_model_configuration(Path("/nonexistent/tsm-env"), env)
+        document["model"]["profiles"]["primary"]["options"]["reasoning_effort"] = effort
+    return load_model_configuration(Path("/nonexistent/config.yaml"), document)
 
 
 def _provider(configuration, mode="chat"):
@@ -53,7 +52,7 @@ def test_responses_default_remains_medium():
 
 
 def test_invalid_effort_is_rejected():
-    with pytest.raises(ValueError, match="TSM_AGT_REASONING_EFFORT"):
+    with pytest.raises(ValueError, match="reasoning_effort"):
         _configuration("HIGH")
 
 

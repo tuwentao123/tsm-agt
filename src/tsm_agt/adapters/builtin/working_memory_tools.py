@@ -20,7 +20,7 @@ _STATE_SCHEMA = {
     "properties": {
         "goal": {
             "type": "string",
-            "description": "Optional scratchpad topic for compatibility; not a fixed user objective.",
+            "description": "Scratchpad topic, not a fixed user objective.",
         },
         "constraints": _STRING_ARRAY, "facts": _STRING_ARRAY,
         "decisions": _STRING_ARRAY,
@@ -45,6 +45,7 @@ _STATE_SCHEMA = {
             },
         },
         "completed_work": _STRING_ARRAY, "remaining_work": _STRING_ARRAY,
+        "diagnosis": {"type": "object"},
         "evidence": {
             "type": "array", "maxItems": 50,
             "items": {
@@ -68,7 +69,6 @@ _STATE_SCHEMA = {
     "additionalProperties": False,
 }
 
-
 class CoreWorkingMemoryToolProvider:
     descriptor = AdapterDescriptor(
         "builtin.core-working-memory-tools", "0.1.0",
@@ -90,10 +90,9 @@ class CoreWorkingMemoryToolProvider:
         ),
         ToolSpec(
             "core.working_memory_update",
-            "Replace the current Task scratchpad using its revision. Keep only concise, "
-            "user-inspectable conclusions and progress. Never write chain-of-thought, "
-            "credentials, raw logs, source file bodies, or durable preferences. Facts "
-            "are confirmed observations; uncertain ideas belong in hypotheses. Evidence "
+            "Update scratchpad by revision. Keep concise, "
+            "user-inspectable state. Never write chain-of-thought, credentials, raw "
+            "logs, source bodies, or durable preferences. Evidence "
             "must reference an existing event:<seq>, tool_call:<id>, or mutation:<id>."
             " A new Task starts at expected_revision=1; after any update, use the "
             "revision returned by this tool or core.working_memory_read.",

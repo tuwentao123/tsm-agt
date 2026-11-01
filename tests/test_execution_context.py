@@ -166,11 +166,9 @@ def test_process_start_and_non_command_evidence_are_not_completion_verdicts():
                     ToolResult("run", True, {"state": "RUNNING", "execution_state": "running"}))
     data = json.loads(project((*edit, *run), (patch, process))[-1].text)
     assert data["recent_actions"][-1]["operation_outcome"] == "unknown"
-    assert data["recognized_post_mutation_check"]["status"] == "unknown"
     observation = _exchange("browser", browser.name, {}, ToolResult("browser", True, {"text": "checked UI"}))
     data = json.loads(project((*edit, *observation), (patch, browser))[-1].text)
-    assert data["recognized_post_mutation_check"]["status"] == "missing"
-    assert data["recognized_post_mutation_check"]["classification_scope"] == "recognized_commands_only"
+    assert "recognized_post_mutation_check" not in data
     assert "check coverage are not assessed" in data["warning"]
     assert "completion" not in set(data)
 
@@ -270,8 +268,7 @@ def test_compacted_actions_rebuild_from_current_turn_ledger_only():
         tool_specs={s.name: s for s in (patch, process)}, executions=(old, edit))
     assert projected[:-1] == check  # no fake native exchanges added to request
     data = json.loads(projected[-1].text)
-    assert data["recognized_post_mutation_check"]["mutation_call_id"] == "edit"
-    assert data["recognized_post_mutation_check"]["status"] == "passed"
+    assert "recognized_post_mutation_check" not in data
     assert [row["call_id"] for row in data["recent_actions"]] == ["edit", "check"]
 
 

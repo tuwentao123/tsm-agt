@@ -253,45 +253,26 @@ class WebFetchTransportContractTest(unittest.TestCase):
 
 class WebEgressConfigurationTest(unittest.TestCase):
     def test_default_is_direct_so_deployments_validate_in_process(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            configuration = load_web_egress_configuration(
-                Path(directory) / ".env", {}
-            )
+        configuration = load_web_egress_configuration({})
         self.assertEqual(configuration.mode, WebEgressMode.DIRECT)
         self.assertEqual(configuration.sources["web.egress_mode"], "default")
         self.assertEqual(WebEgressConfiguration().mode, WebEgressMode.DIRECT)
 
-    def test_environment_and_env_file_can_delegate_egress(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_WEB_EGRESS_MODE=delegated\n", encoding="utf-8"
-            )
-            from_file = load_web_egress_configuration(env_file, {})
-            exported = load_web_egress_configuration(
-                env_file, {"TSM_AGT_WEB_EGRESS_MODE": "DIRECT"}
-            )
-        self.assertEqual(from_file.mode, WebEgressMode.DELEGATED)
-        self.assertEqual(from_file.sources["web.egress_mode"], "env_file")
-        self.assertEqual(exported.mode, WebEgressMode.DIRECT)
-        self.assertEqual(exported.sources["web.egress_mode"], "environment")
+    def test_yaml_can_delegate_egress(self) -> None:
+        delegated = load_web_egress_configuration({"web": {"egress_mode": "delegated"}})
+        direct = load_web_egress_configuration({"web": {"egress_mode": "DIRECT"}})
+        self.assertEqual(delegated.mode, WebEgressMode.DELEGATED)
+        self.assertEqual(delegated.sources["web.egress_mode"], "yaml")
+        self.assertEqual(direct.mode, WebEgressMode.DIRECT)
+        self.assertEqual(direct.sources["web.egress_mode"], "yaml")
 
     def test_unknown_mode_fails_instead_of_silently_weakening_egress(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(ValueError, "TSM_AGT_WEB_EGRESS_MODE"):
-                load_web_egress_configuration(
-                    Path(directory) / ".env",
-                    {"TSM_AGT_WEB_EGRESS_MODE": "off"},
-                )
+        with self.assertRaisesRegex(ValueError, "web.egress_mode"):
+            load_web_egress_configuration({"web": {"egress_mode": "off"}})
 
     def test_inline_comment_is_not_part_of_the_mode(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_WEB_EGRESS_MODE=delegated  # behind the tunnel\n",
-                encoding="utf-8",
-            )
-            configuration = load_web_egress_configuration(env_file, {})
+        import yaml
+        configuration = load_web_egress_configuration(yaml.safe_load("web: {egress_mode: delegated} # behind the tunnel"))
         self.assertEqual(configuration.mode, WebEgressMode.DELEGATED)
 
 
@@ -306,21 +287,14 @@ class WebEgressCompositionTest(unittest.IsolatedAsyncioTestCase):
         }
 
     def _compose(self, **extra: str) -> NetworkToolProvider:
-        from tsm_agt.bootstrap import (
-            compose_openai_compatible_engineering_application_from_env,
-        )
+        from tsm_agt.bootstrap import compose_openai_compatible_engineering_application_from_config
+        from tests.test_model_profiles import _configuration
         with tempfile.TemporaryDirectory() as directory:
-            with patch.dict(os.environ, self._environment(**extra), clear=True):
-                application = (
-                    compose_openai_compatible_engineering_application_from_env(
-                        env_file=Path(directory) / ".env"
-                    )
-                )
+            path = Path(directory) / "config.yaml"
+            path.write_text(_configuration() + ("\nweb:\n  egress_mode: " + extra["egress_mode"] if extra else ""), encoding="utf-8")
+            application = compose_openai_compatible_engineering_application_from_config(path)
         from tsm_agt.ports import ToolProviderPort
-        return next(
-            provider for provider in application.registry.all(ToolProviderPort)
-            if isinstance(provider, NetworkToolProvider)
-        )
+        return next(provider for provider in application.registry.all(ToolProviderPort) if isinstance(provider, NetworkToolProvider))
 
     async def test_default_composition_validates_addresses_in_process(self) -> None:
         provider = self._compose()
@@ -332,7 +306,7 @@ class WebEgressCompositionTest(unittest.IsolatedAsyncioTestCase):
     async def test_configured_delegation_selects_the_delegating_transport(
         self,
     ) -> None:
-        provider = self._compose(TSM_AGT_WEB_EGRESS_MODE="DELEGATED")
+        provider = self._compose(egress_mode="DELEGATED")
         self.assertEqual(provider.egress_mode, WebEgressMode.DELEGATED)
         self.assertIsInstance(provider._fetch_transport, UrllibWebFetchTransport)
 

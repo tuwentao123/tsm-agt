@@ -1,4 +1,10 @@
-"""Safe loading and redacted inspection of local model configuration."""
+"""YAML-only model configuration for the local tsm-agt installation.
+
+The application deliberately has no dotenv or process-environment model
+configuration path. A model name alone does not identify its wire protocol,
+so each named profile selects a provider and that provider declares its
+protocol explicitly.
+"""
 
 from __future__ import annotations
 
@@ -7,109 +13,106 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import yaml
+
 
 MODEL_PROTOCOL_OPEN = "open"
 MODEL_PROTOCOL_ANTHROPIC = "anthropic"
-MODEL_PROTOCOLS = frozenset({
-    MODEL_PROTOCOL_OPEN,
-    MODEL_PROTOCOL_ANTHROPIC,
-})
-
-MODEL_BASE_URL_ENV_NAME = "TSM_AGT_MODEL_BASE_URL"
-# The selector determines both the active model variable and the wire provider.
-MODEL_SELECTOR_ENV_NAME = "TSM_AGT_MODEL"
-MODEL_OPEN_MODEL_ENV_NAME = "TSM_AGT_OPEN_MODEL"
-MODEL_ANTHROPIC_MODEL_ENV_NAME = "TSM_AGT_ANTHROPIC_MODEL"
-
-MODEL_ENV_NAMES = (
-    MODEL_BASE_URL_ENV_NAME,
-    MODEL_SELECTOR_ENV_NAME,
-    MODEL_OPEN_MODEL_ENV_NAME,
-    "TSM_AGT_MODEL_API_KEY",
-)
-MODEL_COMMON_ENV_NAMES = (
-    MODEL_BASE_URL_ENV_NAME,
-    MODEL_SELECTOR_ENV_NAME,
-    "TSM_AGT_MODEL_API_KEY",
-)
-MODEL_MODEL_ENV_NAMES = (
-    MODEL_OPEN_MODEL_ENV_NAME,
-    MODEL_ANTHROPIC_MODEL_ENV_NAME,
-)
-
-MODEL_OPTIONAL_ENV_NAMES = (
-    "TSM_AGT_OPEN_API_MODE",
-    "TSM_AGT_REASONING_EFFORT",
-    "TSM_AGT_ANTHROPIC_VERSION",
-    "TSM_AGT_MODEL_TIMEOUT_SECONDS",
-    "TSM_AGT_MODEL_MAX_RETRIES",
-    "TSM_AGT_MODEL_RETRY_BACKOFF_SECONDS",
-    "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER",
-    "TSM_AGT_MODEL_STRICT_TOOL_SCHEMA",
-    "TSM_AGT_MODEL_STREAMING",
-)
-MODEL_SUPPORTED_ENV_NAMES = (
-    MODEL_COMMON_ENV_NAMES + MODEL_MODEL_ENV_NAMES + MODEL_OPTIONAL_ENV_NAMES
-)
-
-# Keep this import name for composition callers while exposing a two-mode
-# configuration surface. The native Messages adapter is selected by
-# ``MODEL_PROTOCOL_ANTHROPIC``.
 MODEL_PROTOCOL_ANTHROPIC_MESSAGES = MODEL_PROTOCOL_ANTHROPIC
 
-MODEL_ENV_TEMPLATE = """# tsm-agt model configuration. Keep this file private.
-# Exported TSM_AGT_* variables override values in this file.
-# Select open (Chat Completions) or anthropic (native Messages API).
-TSM_AGT_MODEL=open
-TSM_AGT_MODEL_BASE_URL=http://127.0.0.1:5580
-TSM_AGT_OPEN_MODEL=your-open-model-name
-# Used when TSM_AGT_MODEL=anthropic.
-# TSM_AGT_ANTHROPIC_MODEL=your-anthropic-model-name
-TSM_AGT_MODEL_API_KEY=your-api-key
-# Used only when TSM_AGT_MODEL=anthropic.
-# TSM_AGT_ANTHROPIC_VERSION=2023-06-01
-# TSM_AGT_MODEL_TIMEOUT_SECONDS=180
-# TSM_AGT_MODEL_MAX_RETRIES=2
-# TSM_AGT_MODEL_RETRY_BACKOFF_SECONDS=1
-# TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=max_tokens
-# TSM_AGT_MODEL_STRICT_TOOL_SCHEMA=true
-# TSM_AGT_MODEL_STREAMING=true
+WIRE_PROTOCOL_OPENAI_CHAT = "openai_chat"
+WIRE_PROTOCOL_OPENAI_RESPONSES = "openai_responses"
+WIRE_PROTOCOL_ANTHROPIC_MESSAGES = "anthropic_messages"
+WIRE_PROTOCOLS = frozenset({
+    WIRE_PROTOCOL_OPENAI_CHAT,
+    WIRE_PROTOCOL_OPENAI_RESPONSES,
+    WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+})
 
-# Optional Agent-loop hard limits and exploration soft limits.
-# TSM_AGT_AGENT_MAX_MODEL_CALLS=15
-# TSM_AGT_AGENT_MAX_TOOL_CALLS=40
-# TSM_AGT_EXPLORATION_MAX_TOOL_CALLS=24
-# TSM_AGT_EXPLORATION_MAX_ACTIONS=24
-# TSM_AGT_EXPLORATION_MAX_TOOL_SECONDS=120
-# TSM_AGT_EXPLORATION_LOW_VALUE_STREAK=2
-# TSM_AGT_EXPLORATION_RESERVE_TOOL_CALLS=2
-# TSM_AGT_EXPLORATION_MIN_ACTIONS=2
+CONFIGURATION_TEMPLATE = """# Private tsm-agt configuration. Keep this file outside every repository.
+# The file can hold credentials and is created with mode 0600 on POSIX systems.
+version: 1
+
+model:
+  default_profile: local-model
+  providers:
+    local-openai-compatible:
+      # One of: openai_chat, openai_responses, anthropic_messages
+      protocol: openai_chat
+      base_url: http://127.0.0.1:5580/v1
+      auth:
+        api_key: your-api-key
+  profiles:
+    local-model:
+      provider: local-openai-compatible
+      model: your-model-name
+      options:
+        streaming: true
+        timeout_seconds: 180
+        max_retries: 2
+        strict_tool_schema: false
+      # Declare only known limitations. A profile can reduce, never add,
+      # adapter capabilities.
+      # capabilities:
+      #   parallel_tools: false
+
+# All following sections are optional. Omitted values use the built-in defaults.
+# agent:
+#   max_model_calls: 90
+#   max_tool_calls: 120
+# execution:
+#   max_parallel_tool_calls: 8
+# exploration:
+#   profile: balanced
+#   max_tool_calls: 60
+#   max_actions: 60
+#   max_tool_seconds: 300
+# context:
+#   compaction_ratio: 0.80
+#   latency_soft_tokens: 0
+#   recent_message_floor: 8
+#   history_soft_tokens: 16384
+# session:
+#   recent_messages: 8
+#   task_summaries: 4
+#   history_format: native
+# web:
+#   egress_mode: DIRECT
+#   search:
+#     mode: live
+#     tavily_mode: off
+#     # tavily_api_key: your-tavily-key
+# mcp:
+#   enabled: true
+#   servers:
+#     example:
+#       kind: executable
+#       command: ["python", "-m", "example_mcp"]
+# completion_review:
+#   mode: off
+#   max_continuations: 1
+#   failure_policy: visible_unverified
 """
 
-_PLACEHOLDER_VALUES = {
-    MODEL_OPEN_MODEL_ENV_NAME: {"your-open-model-name"},
-    MODEL_ANTHROPIC_MODEL_ENV_NAME: {"your-anthropic-model-name"},
-    "TSM_AGT_MODEL_API_KEY": {"your-api-key"},
-}
+_PLACEHOLDER_API_KEYS = {"your-api-key", ""}
 
 
 class ModelConfigurationError(ValueError):
-    """The selected model cannot be composed from the available settings."""
+    """The selected model profile is incomplete."""
 
-    def __init__(self, missing: tuple[str, ...], env_file: Path) -> None:
+    def __init__(self, missing: tuple[str, ...], configuration_file: Path) -> None:
         self.missing = missing
-        self.env_file = env_file
+        self.configuration_file = configuration_file
         super().__init__(self._message())
 
     def _message(self) -> str:
-        workspace = self.env_file.parent
         return (
             "Model configuration is incomplete.\n"
             f"Missing: {', '.join(self.missing)}\n"
-            "Create a private template with:\n"
-            f"  tsm-agt init --workspace {workspace}\n"
-            f"Then edit {self.env_file} or export the missing variables, and run:\n"
-            f"  tsm-agt doctor --workspace {workspace} --model-check"
+            "Create a private YAML template with:\n"
+            "  tsm-agt init\n"
+            f"Then edit {self.configuration_file} and run:\n"
+            "  tsm-agt doctor --workspace <project> --model-check"
         )
 
 
@@ -119,236 +122,239 @@ class ModelConfiguration:
     model: str
     api_key: str = field(repr=False)
     sources: Mapping[str, str]
-    env_file: Path
+    configuration_file: Path
     timeout_seconds: float = 180.0
     max_retries: int = 2
     retry_backoff_seconds: float = 1.0
     output_token_parameter: str = "max_tokens"
     protocol: str = MODEL_PROTOCOL_OPEN
-    model_env_name: str = MODEL_OPEN_MODEL_ENV_NAME
     anthropic_version: str = "2023-06-01"
     strict_tool_schema: bool = True
     streaming: bool = True
     open_api_mode: str = "chat"
     reasoning_effort: str | None = None
+    profile_id: str | None = None
+    capability_overrides: Mapping[str, bool | int] = field(default_factory=dict)
 
     @property
     def effective_output_token_parameter(self) -> str:
-        if self.protocol == MODEL_PROTOCOL_ANTHROPIC:
-            return "max_tokens"
-        return self.output_token_parameter
+        return "max_tokens" if self.protocol == MODEL_PROTOCOL_ANTHROPIC else self.output_token_parameter
 
     @property
     def endpoint_origin(self) -> str:
         return endpoint_origin(self.base_url)
 
+    @property
+    def wire_protocol(self) -> str:
+        if self.protocol == MODEL_PROTOCOL_ANTHROPIC:
+            return WIRE_PROTOCOL_ANTHROPIC_MESSAGES
+        return WIRE_PROTOCOL_OPENAI_RESPONSES if self.open_api_mode == "responses" else WIRE_PROTOCOL_OPENAI_CHAT
+
+
+def default_configuration_path() -> Path:
+    """Return the private, user-level configuration location."""
+
+    return Path.home() / ".tsm-agt" / "config.yaml"
+
 
 def endpoint_origin(base_url: str) -> str:
-    """Return only scheme/host/port so paths, queries, and credentials stay hidden."""
+    """Return only scheme/host/port so diagnostics never expose paths or keys."""
 
     parsed = urlsplit(base_url.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ValueError("TSM_AGT_MODEL_BASE_URL must be an http(s) URL")
-    hostname = parsed.hostname
-    if ":" in hostname:
-        hostname = f"[{hostname}]"
+        raise ValueError("model.providers.<id>.base_url must be an http(s) URL")
+    hostname = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
     try:
         port = f":{parsed.port}" if parsed.port is not None else ""
     except ValueError as error:
-        raise ValueError(
-            "TSM_AGT_MODEL_BASE_URL contains an invalid port"
-        ) from error
+        raise ValueError("model provider base_url contains an invalid port") from error
     return f"{parsed.scheme}://{hostname}{port}"
 
 
+def load_configuration_document(path: Path | None = None) -> tuple[Path, Mapping[str, object]]:
+    """Read the one private YAML configuration file without any fallback layer."""
+
+    configuration_file = (path or default_configuration_path()).expanduser().resolve()
+    if not configuration_file.exists():
+        raise ModelConfigurationError(("configuration file",), configuration_file)
+    if not configuration_file.is_file():
+        raise ValueError(f"configuration path is not a file: {configuration_file}")
+    try:
+        data = yaml.safe_load(configuration_file.read_text(encoding="utf-8"))
+    except yaml.YAMLError as error:
+        raise ValueError(f"invalid YAML in {configuration_file}: {error}") from error
+    if not isinstance(data, Mapping) or any(not isinstance(key, str) for key in data):
+        raise ValueError(f"configuration YAML must be a mapping: {configuration_file}")
+    if data.get("version", 1) != 1:
+        raise ValueError("configuration YAML supports only version: 1")
+    return configuration_file, data
+
+
 def load_model_configuration(
-    path: Path, environment: Mapping[str, str], *, require_complete: bool = True,
+    path: Path | None = None,
+    document: Mapping[str, object] | None = None,
+    *,
+    require_complete: bool = True,
 ) -> ModelConfiguration | None:
-    """Load the selected protocol model without mutating the process environment."""
+    """Load the selected YAML model profile.
 
-    env_file = path.expanduser().resolve()
-    file_values = _read_model_env_file(env_file)
-    values: dict[str, str] = {}
-    sources: dict[str, str] = {}
-    for name in MODEL_SUPPORTED_ENV_NAMES:
-        exported = environment.get(name, "").strip()
-        from_file = file_values.get(name, "").strip()
-        if exported:
-            values[name] = exported
-            sources[name] = "environment"
-        elif from_file:
-            values[name] = from_file
-            sources[name] = "env_file"
-        else:
-            values[name] = ""
+    ``document`` exists so the application configuration is parsed once by the
+    composition root. It is configuration data, never an environment overlay.
+    """
 
-    selector = values[MODEL_SELECTOR_ENV_NAME]
-    if selector in MODEL_PROTOCOLS:
-        protocol = selector
-        model_env_name = (
-            MODEL_ANTHROPIC_MODEL_ENV_NAME
-            if protocol == MODEL_PROTOCOL_ANTHROPIC
-            else MODEL_OPEN_MODEL_ENV_NAME
-        )
-        model = values[model_env_name]
-    elif values[MODEL_OPEN_MODEL_ENV_NAME] or values[MODEL_ANTHROPIC_MODEL_ENV_NAME]:
-        raise ValueError("TSM_AGT_MODEL must be 'open' or 'anthropic'")
+    if document is None:
+        configuration_file, document = load_configuration_document(path)
     else:
-        # Migration fallback for existing private configuration files where
-        # TSM_AGT_MODEL contained the OpenAI-compatible model name.
-        protocol = MODEL_PROTOCOL_OPEN
-        model_env_name = MODEL_SELECTOR_ENV_NAME
-        model = selector
-
-    missing_names: list[str] = []
-    if not values[MODEL_BASE_URL_ENV_NAME]:
-        missing_names.append(MODEL_BASE_URL_ENV_NAME)
-    if selector in MODEL_PROTOCOLS:
-        if (
-            not model
-            or model in _PLACEHOLDER_VALUES.get(model_env_name, set())
-        ):
-            missing_names.append(model_env_name)
-    elif not selector:
-        missing_names.append(MODEL_SELECTOR_ENV_NAME)
-    if not values["TSM_AGT_MODEL_API_KEY"] or values[
-        "TSM_AGT_MODEL_API_KEY"
-    ] in _PLACEHOLDER_VALUES["TSM_AGT_MODEL_API_KEY"]:
-        missing_names.append("TSM_AGT_MODEL_API_KEY")
-    missing = tuple(missing_names)
+        configuration_file = (path or default_configuration_path()).expanduser().resolve()
+    model_data = _mapping(document.get("model"), "model")
+    providers = _mapping(model_data.get("providers"), "model.providers")
+    profiles = _mapping(model_data.get("profiles"), "model.profiles")
+    profile_id = _string(model_data.get("default_profile"), "model.default_profile")
+    profile = _mapping(profiles.get(profile_id), f"model.profiles.{profile_id}")
+    provider_id = _string(profile.get("provider"), f"model.profiles.{profile_id}.provider")
+    provider = _mapping(providers.get(provider_id), f"model.providers.{provider_id}")
+    wire_protocol = _choice(provider.get("protocol"), f"model.providers.{provider_id}.protocol", WIRE_PROTOCOLS)
+    auth = _mapping(provider.get("auth"), f"model.providers.{provider_id}.auth")
+    api_key = _string(auth.get("api_key"), f"model.providers.{provider_id}.auth.api_key")
+    model = _string(profile.get("model"), f"model.profiles.{profile_id}.model")
+    missing: list[str] = []
+    if api_key in _PLACEHOLDER_API_KEYS:
+        missing.append(f"model.providers.{provider_id}.auth.api_key")
+    if model == "your-model-name":
+        missing.append(f"model.profiles.{profile_id}.model")
     if missing:
         if require_complete:
-            raise ModelConfigurationError(missing, env_file)
+            raise ModelConfigurationError(tuple(missing), configuration_file)
         return None
-    endpoint_origin(values[MODEL_BASE_URL_ENV_NAME])
-    try:
-        timeout_seconds = float(
-            values["TSM_AGT_MODEL_TIMEOUT_SECONDS"] or "180"
-        )
-        max_retries = int(values["TSM_AGT_MODEL_MAX_RETRIES"] or "2")
-        retry_backoff_seconds = float(
-            values["TSM_AGT_MODEL_RETRY_BACKOFF_SECONDS"] or "1"
-        )
-    except ValueError as error:
-        raise ValueError("model retry settings must be numeric") from error
-    if timeout_seconds <= 0:
-        raise ValueError("TSM_AGT_MODEL_TIMEOUT_SECONDS must be positive")
-    if max_retries < 0 or max_retries > 10:
-        raise ValueError("TSM_AGT_MODEL_MAX_RETRIES must be between 0 and 10")
-    if retry_backoff_seconds < 0 or retry_backoff_seconds > 60:
-        raise ValueError(
-            "TSM_AGT_MODEL_RETRY_BACKOFF_SECONDS must be between 0 and 60"
-        )
-    output_token_parameter = (
-        values["TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER"] or "max_tokens"
-    )
-    if output_token_parameter not in {
-        "max_tokens", "max_completion_tokens"
-    }:
-        raise ValueError(
-            "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER must be 'max_tokens' or "
-            "'max_completion_tokens'"
-        )
-    anthropic_version = values["TSM_AGT_ANTHROPIC_VERSION"] or "2023-06-01"
-    if not anthropic_version:
-        raise ValueError("TSM_AGT_ANTHROPIC_VERSION must not be empty")
-    raw_strict_tool_schema = (
-        values["TSM_AGT_MODEL_STRICT_TOOL_SCHEMA"] or "true"
-    ).casefold()
-    if raw_strict_tool_schema not in {"true", "false"}:
-        raise ValueError(
-            "TSM_AGT_MODEL_STRICT_TOOL_SCHEMA must be 'true' or 'false'"
-        )
-    # An override, not a required setting: load cleanly when it is absent.
-    raw_streaming = (values["TSM_AGT_MODEL_STREAMING"] or "true").casefold()
-    if raw_streaming not in {"true", "false"}:
-        raise ValueError(
-            "TSM_AGT_MODEL_STREAMING must be 'true' or 'false'")
-    api_mode = values["TSM_AGT_OPEN_API_MODE"] or "chat"
-    if api_mode not in {"chat", "responses"}:
-        raise ValueError("TSM_AGT_OPEN_API_MODE must be 'chat' or 'responses'")
-    reasoning_effort = values["TSM_AGT_REASONING_EFFORT"] or None
-    if reasoning_effort is not None and reasoning_effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
-        raise ValueError("TSM_AGT_REASONING_EFFORT has an invalid value")
+    base_url = _string(provider.get("base_url"), f"model.providers.{provider_id}.base_url")
+    endpoint_origin(base_url)
+    provider_options = _optional_mapping(provider.get("options"), f"model.providers.{provider_id}.options")
+    profile_options = _optional_mapping(profile.get("options"), f"model.profiles.{profile_id}.options")
+    options = {**provider_options, **profile_options}
+    _validate_option_names(options, profile_id)
+    capability_overrides = _capability_overrides(profile.get("capabilities"), profile_id)
+    protocol = MODEL_PROTOCOL_ANTHROPIC if wire_protocol == WIRE_PROTOCOL_ANTHROPIC_MESSAGES else MODEL_PROTOCOL_OPEN
+    sources = {name: "yaml" for name in (
+        "model.provider", "model.endpoint_origin", "model.model",
+        "model.credentials_configured", "model.protocol", "model.profile",
+        "model.wire_protocol", "model.options",
+    )}
     return ModelConfiguration(
-        base_url=values[MODEL_BASE_URL_ENV_NAME],
+        base_url=base_url,
         model=model,
-        api_key=values["TSM_AGT_MODEL_API_KEY"],
+        api_key=api_key,
         sources=sources,
-        env_file=env_file,
-        timeout_seconds=timeout_seconds,
-        max_retries=max_retries,
-        retry_backoff_seconds=retry_backoff_seconds,
-        output_token_parameter=output_token_parameter,
+        configuration_file=configuration_file,
+        timeout_seconds=_positive_number(options.get("timeout_seconds", 180), "model options.timeout_seconds"),
+        max_retries=_int_range(options.get("max_retries", 2), "model options.max_retries", 0, 10),
+        retry_backoff_seconds=_number_range(options.get("retry_backoff_seconds", 1), "model options.retry_backoff_seconds", 0, 60),
+        output_token_parameter=_choice(options.get("output_token_parameter", "max_tokens"), "model options.output_token_parameter", {"max_tokens", "max_completion_tokens"}),
         protocol=protocol,
-        model_env_name=model_env_name,
-        anthropic_version=anthropic_version,
-        strict_tool_schema=(raw_strict_tool_schema == "true"),
-        streaming=(raw_streaming == "true"),
-        open_api_mode=api_mode,
-        reasoning_effort=reasoning_effort,
+        anthropic_version=_string_or_default(options.get("anthropic_version"), "model options.anthropic_version", "2023-06-01"),
+        strict_tool_schema=_bool(options.get("strict_tool_schema", True), "model options.strict_tool_schema"),
+        streaming=_bool(options.get("streaming", True), "model options.streaming"),
+        open_api_mode="responses" if wire_protocol == WIRE_PROTOCOL_OPENAI_RESPONSES else "chat",
+        reasoning_effort=_optional_choice(options.get("reasoning_effort"), "model options.reasoning_effort", {"none", "minimal", "low", "medium", "high", "xhigh", "max"}),
+        profile_id=profile_id,
+        capability_overrides=capability_overrides,
     )
 
 
-def inspect_model_configuration(
-    path: Path, environment: Mapping[str, str],
-) -> tuple[ModelConfiguration | None, tuple[str, ...]]:
-    """Return complete configuration or only the missing variable names."""
-
+def inspect_model_configuration(path: Path | None = None) -> tuple[ModelConfiguration | None, tuple[str, ...]]:
     try:
-        return load_model_configuration(path, environment), ()
+        return load_model_configuration(path), ()
     except ModelConfigurationError as error:
         return None, error.missing
 
 
-def model_configuration_sources(
-    configuration: ModelConfiguration,
-) -> dict[str, str]:
-    return {
-        "model.provider": "composition",
-        "model.endpoint_origin": configuration.sources[MODEL_BASE_URL_ENV_NAME],
-        "model.model": configuration.sources[configuration.model_env_name],
-        "model.credentials_configured": configuration.sources[
-            "TSM_AGT_MODEL_API_KEY"
-        ],
-        "model.output_token_parameter": configuration.sources.get(
-            "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER", "default"
-        ) or "default",
-        "model.protocol": configuration.sources.get(
-            MODEL_SELECTOR_ENV_NAME, "default"
-        ) or "default",
-        "model.anthropic_version": configuration.sources.get(
-            "TSM_AGT_ANTHROPIC_VERSION", "default"
-        ) or "default",
-        "model.strict_tool_schema": configuration.sources.get(
-            "TSM_AGT_MODEL_STRICT_TOOL_SCHEMA", "default"
-        ) or "default",
-        "model.streaming": configuration.sources.get(
-            "TSM_AGT_MODEL_STREAMING", "default"
-        ) or "default",
+def model_configuration_sources(configuration: ModelConfiguration) -> dict[str, str]:
+    return dict(configuration.sources)
+
+
+def _mapping(value: object, name: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{name} must be a mapping")
+    return value
+
+
+def _optional_mapping(value: object, name: str) -> Mapping[str, object]:
+    return {} if value is None else _mapping(value, name)
+
+
+def _string(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value.strip()
+
+
+def _string_or_default(value: object, name: str, default: str) -> str:
+    return default if value is None else _string(value, name)
+
+
+def _bool(value: object, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be true or false")
+    return value
+
+
+def _number_range(value: object, name: str, minimum: float, maximum: float | None) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    number = float(value)
+    if number < minimum or (maximum is not None and number > maximum):
+        message = f"{name} must be >= {minimum}"
+        if maximum is not None:
+            message += f" and <= {maximum}"
+        raise ValueError(message)
+    return number
+
+
+def _positive_number(value: object, name: str) -> float:
+    number = _number_range(value, name, 0, None)
+    if number <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return number
+
+
+def _int_range(value: object, name: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+    return value
+
+
+def _choice(value: object, name: str, choices: frozenset[str] | set[str]) -> str:
+    selected = _string(value, name)
+    if selected not in choices:
+        raise ValueError(f"{name} must be one of: {', '.join(sorted(choices))}")
+    return selected
+
+
+def _optional_choice(value: object, name: str, choices: set[str]) -> str | None:
+    return None if value is None else _choice(value, name, choices)
+
+
+def _validate_option_names(options: Mapping[str, object], profile_id: str) -> None:
+    supported = {
+        "timeout_seconds", "max_retries", "retry_backoff_seconds",
+        "output_token_parameter", "anthropic_version", "strict_tool_schema",
+        "streaming", "reasoning_effort",
     }
+    unknown = sorted(set(options) - supported)
+    if unknown:
+        raise ValueError(f"model.profiles.{profile_id}.options has unsupported keys: {', '.join(unknown)}")
 
 
-def _read_model_env_file(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    if not path.is_file():
-        raise ValueError(f"model env path is not a file: {path}")
-    values: dict[str, str] = {}
-    for line_number, raw_line in enumerate(
-        path.read_text(encoding="utf-8").splitlines(), start=1
-    ):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:].strip()
-        if "=" not in line:
-            raise ValueError(f"invalid model env line {line_number} in {path}")
-        name, value = (part.strip() for part in line.split("=", 1))
-        if name not in MODEL_SUPPORTED_ENV_NAMES:
-            continue
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        values[name] = value
-    return values
+def _capability_overrides(value: object, profile_id: str) -> Mapping[str, bool | int]:
+    capabilities = _optional_mapping(value, f"model.profiles.{profile_id}.capabilities")
+    boolean_names = {
+        "tools", "parallel_tools", "strict_json_schema", "reasoning_blocks",
+        "vision", "prompt_cache", "stream_cancel", "structured_conclusion",
+    }
+    allowed = boolean_names | {"context_window"}
+    unknown = sorted(set(capabilities) - allowed)
+    if unknown:
+        raise ValueError(f"model.profiles.{profile_id}.capabilities has unsupported keys: {', '.join(unknown)}")
+    normalized: dict[str, bool | int] = {}
+    for name, item in capabilities.items():
+        normalized[name] = _int_range(item, f"model.profiles.{profile_id}.capabilities.context_window", 1, 10_000_000) if name == "context_window" else _bool(item, f"model.profiles.{profile_id}.capabilities.{name}")
+    return normalized

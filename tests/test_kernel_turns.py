@@ -30,14 +30,14 @@ from tsm_agt.ports import (
 
 
 class FailingModelProvider(EchoModelProvider):
-    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         raise RuntimeError("provider unavailable")
 
 
 class InvalidRoleModelProvider(EchoModelProvider):
-    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         return ModelResponse(
@@ -50,7 +50,7 @@ class InvalidRoleModelProvider(EchoModelProvider):
 
 
 class ConclusionModelProvider(EchoModelProvider):
-    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         return ModelResponse(Message(
@@ -68,7 +68,7 @@ class ConclusionModelProvider(EchoModelProvider):
 
 class StructuredConclusionRecordingModel(EchoModelProvider):
     capabilities = ProviderCapabilities(
-        tools=True, structured_conclusion=True, context_window=4096,
+        tools=True, structured_conclusion=True, context_window=8192,
     )
 
     def __init__(self) -> None:
@@ -146,7 +146,7 @@ class ControlledConclusionTransport:
 
 
 class ConversationEchoModel(EchoModelProvider):
-    capabilities = ProviderCapabilities(tools=True, context_window=4096)
+    capabilities = ProviderCapabilities(tools=True, context_window=8192)
 
 
 class KernelTurnTest(unittest.IsolatedAsyncioTestCase):

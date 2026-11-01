@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 
 from tsm_agt.core.conversation_orchestration import OrchestrationMode
 
@@ -21,9 +20,12 @@ class OrchestrationConfiguration:
 
 
 def load_orchestration_configuration(
-    path: Path,
-    environment: Mapping[str, str],
+    document: Mapping[str, object],
 ) -> OrchestrationConfiguration:
-    """Return the sole supported mode; path and environment are read-only inputs."""
-    del path, environment
+    """Return the sole supported mode.
+
+    The argument keeps all configuration loaders uniform; orchestration has no
+    user-selectable alternative yet.
+    """
+    del document
     return OrchestrationConfiguration(sources={"orchestration.mode": "fixed"})

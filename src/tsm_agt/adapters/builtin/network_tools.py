@@ -154,8 +154,8 @@ def _search_outage_failure(
             call_id, False, error_code="SEARCH_NOT_CACHED",
             message=(
                 "web search is in cached-only mode "
-                f"(TSM_AGT_SEARCH_MODE={mode}) and this query is not cached; "
-                "set TSM_AGT_SEARCH_MODE=live to search the public web"
+                f"(web.search.mode={mode}) and this query is not cached; "
+                "set web.search.mode: live in the private YAML configuration"
             ),
             data=data,
         )
@@ -1045,9 +1045,12 @@ class NetworkToolProvider:
                 "with source URLs, and publish times when the source exposes "
                 "one. Set freshness for time-sensitive requests such as "
                 "'today's news'. This finds where something is; it does not read "
-                "it. Use it to locate the repository a request names, then read "
-                "that repository's source with the advertised GitHub source tools "
-                "or core.run_command -- a snippet is a lead, not evidence."
+                "it. When a request names an external source or project whose "
+                "location is unknown, use it to locate that source without "
+                "exhausting unrelated workspace material. Read an already "
+                "identified source or that project's own local checkout directly. "
+                "After discovery, read the relevant source -- a snippet is a "
+                "lead, not evidence."
             ),
             parameters={
                 "type": "object",
@@ -1076,14 +1079,20 @@ class NetworkToolProvider:
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.EXTERNAL_SERVICE,
             model_contract=ModelToolContract(
-                purpose="Find public-web documents that may answer a question.",
+                purpose="Locate public-web sources, including a named project's repository.",
                 use_when=(
-                    "a current or external source must be located after available "
-                    "task and repository evidence cannot answer the needed question",
+                    "the request requires an external source or named project's "
+                    "implementation whose location is unknown; unrelated workspace "
+                    "exploration is not a prerequisite",
+                    "a current or external fact cannot be established from "
+                    "relevant evidence for that target",
                 ),
                 avoid_when=(
                     "the requested implementation, validation, diagnosis, or recovery "
-                    "can be grounded in current execution facts or workspace material",
+                    "is confined to the active project and its current execution "
+                    "facts or workspace material suffice",
+                    "the requested source is already identified and can be read "
+                    "directly, including that project's own local checkout",
                     "you need to claim document details from a result snippet; open or "
                     "fetch the relevant result first",
                 ),
@@ -1336,7 +1345,7 @@ class NetworkToolProvider:
             )
         if mode == "key" and not search_tavily_api_key.strip():
             raise ValueError(
-                "search_tavily_mode='key' requires TSM_AGT_SEARCH_TAVILY_API_KEY"
+                "search_tavily_mode='key' requires web.search.tavily_api_key"
             )
         self._enable_fetch = enable_fetch
         self._github_source_tools = github_source_tools
@@ -1424,7 +1433,7 @@ class NetworkToolProvider:
                 if self._search_mode == "off":
                     return ToolResult(
                         call.call_id, False, error_code="SEARCH_DISABLED",
-                        message="web search is disabled (TSM_AGT_SEARCH_MODE=off)",
+                        message="web search is disabled (web.search.mode=off)",
                     )
                 data = await asyncio.to_thread(
                     self._web_search, call.arguments,

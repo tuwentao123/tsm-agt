@@ -209,6 +209,9 @@ class ToolSpec:
     result_authority: ToolResultAuthority = ToolResultAuthority.UNSPECIFIED
     protocol: ToolProtocol = ToolProtocol.IMMEDIATE
     model_contract: ModelToolContract | None = None
+    # Provider-authored contextual data; kept separate from trusted instructions
+    # and regenerated from the same spec as the advertised parameter schema.
+    model_context: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -278,6 +281,8 @@ class ToolSpec:
         }
         if self.model_contract is not None:
             data["model_contract"] = self.model_contract.to_data()
+        if self.model_context is not None:
+            data["model_context"] = dict(self.model_context)
         return data
 
 

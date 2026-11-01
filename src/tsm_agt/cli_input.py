@@ -28,6 +28,13 @@ class TerminalLineInput:
 
     def __init__(self) -> None:
         self._session: PromptSession[str] | None = None
+        self._stream_text = ""
+
+    def set_stream_text(self, text: str, label: str = "agent") -> None:
+        """Redraw partial text without disturbing the editable control prompt."""
+        self._stream_text = f"{label}> {text[-1200:]}" if text else ""
+        if self._session is not None:
+            self._session.app.invalidate()
 
     @property
     def supports_live_input(self) -> bool:
@@ -66,6 +73,7 @@ class TerminalLineInput:
                 multiline=False,
                 enable_open_in_editor=False,
                 complete_while_typing=False,
+                bottom_toolbar=lambda: [("", self._stream_text)],
             )
         return self._session.prompt(prompt)
 
@@ -80,6 +88,7 @@ class TerminalLineInput:
                 multiline=False,
                 enable_open_in_editor=False,
                 complete_while_typing=False,
+                bottom_toolbar=lambda: [("", self._stream_text)],
             )
         return await self._session.prompt_async(prompt)
 

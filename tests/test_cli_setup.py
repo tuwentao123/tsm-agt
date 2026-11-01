@@ -6,155 +6,77 @@ import os
 import stat
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from tsm_agt.bootstrap.model_configuration import (
-    MODEL_ENV_NAMES, ModelConfigurationError, load_model_configuration,
+    ModelConfigurationError, load_model_configuration,
 )
 from tsm_agt.cli import main
-from tsm_agt.cli_setup import initialize_workspace, run_doctor
+from tsm_agt.cli_setup import initialize_configuration, run_doctor
 
 
-COMPLETE_ENV = {
-    "TSM_AGT_MODEL": "open",
-    "TSM_AGT_MODEL_BASE_URL": (
-        "https://user:password@models.example.test:8443/v1?token=hidden"
-    ),
-    "TSM_AGT_OPEN_MODEL": "test-model",
-    "TSM_AGT_MODEL_API_KEY": "sk-doctor-secret",
-}
+def _config(api_key: str = "sk-doctor-secret") -> str:
+    return f"""version: 1
+model:
+  default_profile: primary
+  providers:
+    primary:
+      protocol: openai_chat
+      base_url: https://user:password@models.example.test:8443/v1?token=hidden
+      auth:
+        api_key: {api_key}
+  profiles:
+    primary:
+      provider: primary
+      model: test-model
+"""
 
 
 class FirstRunSetupTest(unittest.TestCase):
-    def test_init_creates_private_template_without_runtime_directory(self) -> None:
+    def test_init_creates_private_yaml_without_runtime_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            target = root / "private" / "config.yaml"
             output = io.StringIO()
             with redirect_stdout(output):
-                result = initialize_workspace(root)
-            target = root / ".env"
+                result = initialize_configuration(target)
             self.assertEqual(result, 0)
             self.assertTrue(target.is_file())
             self.assertFalse((root / ".agent").exists())
-            self.assertEqual(
-                set(line.split("=", 1)[0] for line in target.read_text().splitlines()
-                    if line and not line.startswith("#")),
-                set(MODEL_ENV_NAMES),
-            )
+            self.assertIn("model:", target.read_text(encoding="utf-8"))
             if os.name != "nt":
                 self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
             self.assertIn("tsm-agt doctor", output.getvalue())
 
     def test_init_never_overwrites_existing_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / ".env"
+            target = Path(directory) / "config.yaml"
             target.write_text("original", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "refusing to overwrite"):
-                initialize_workspace(root)
+                initialize_configuration(target)
             self.assertEqual(target.read_text(encoding="utf-8"), "original")
 
-    def test_init_print_does_not_touch_workspace(self) -> None:
+    def test_init_print_does_not_touch_destination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            target = Path(directory) / "config.yaml"
             output = io.StringIO()
             with redirect_stdout(output):
-                self.assertEqual(initialize_workspace(root, print_only=True), 0)
-            self.assertIn("TSM_AGT_MODEL_BASE_URL", output.getvalue())
-            self.assertEqual(list(root.iterdir()), [])
+                self.assertEqual(initialize_configuration(target, print_only=True), 0)
+            self.assertIn("model:", output.getvalue())
+            self.assertFalse(target.exists())
 
     def test_configuration_error_is_actionable_and_never_prints_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / ".env"
+            path = Path(directory) / "config.yaml"
+            path.write_text(_config("your-api-key"), encoding="utf-8")
             with self.assertRaises(ModelConfigurationError) as caught:
-                load_model_configuration(
-                    path,
-                    {
-                        "TSM_AGT_MODEL": "open",
-                        "TSM_AGT_OPEN_MODEL": "private-model",
-                    },
-                )
+                load_model_configuration(path)
             message = str(caught.exception)
             self.assertIn("tsm-agt init", message)
-            self.assertIn("TSM_AGT_MODEL_API_KEY", message)
-            self.assertNotIn("private-model", message)
-
-    def test_generated_placeholders_are_not_accepted_as_configuration(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with redirect_stdout(io.StringIO()):
-                initialize_workspace(root)
-            with self.assertRaises(ModelConfigurationError) as caught:
-                load_model_configuration(root / ".env", {})
-            self.assertEqual(
-                caught.exception.missing,
-                ("TSM_AGT_OPEN_MODEL", "TSM_AGT_MODEL_API_KEY"),
-            )
-
-    def test_model_selector_selects_its_own_model(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_MODEL=open\n"
-                "TSM_AGT_MODEL_BASE_URL=https://gateway.example.test/v1\n"
-                "TSM_AGT_OPEN_MODEL=open-model\n"
-                "TSM_AGT_MODEL_API_KEY=secret\n"
-                "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=max_completion_tokens\n",
-                encoding="utf-8",
-            )
-            configuration = load_model_configuration(env_file, {})
-            assert configuration is not None
-            self.assertEqual(configuration.protocol, "open")
-            self.assertEqual(configuration.model, "open-model")
-            self.assertEqual(
-                configuration.effective_output_token_parameter,
-                "max_completion_tokens",
-            )
-            self.assertEqual(
-                configuration.sources["TSM_AGT_OPEN_MODEL"], "env_file"
-            )
-
-            env_file.write_text(
-                "TSM_AGT_MODEL=anthropic\n"
-                "TSM_AGT_MODEL_BASE_URL=https://gateway.example.test/v1\n"
-                "TSM_AGT_ANTHROPIC_MODEL=anthropic-model\n"
-                "TSM_AGT_MODEL_API_KEY=secret\n"
-                "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=max_completion_tokens\n",
-                encoding="utf-8",
-            )
-            configuration = load_model_configuration(env_file, {})
-            assert configuration is not None
-            self.assertEqual(configuration.protocol, "anthropic")
-            self.assertEqual(configuration.model, "anthropic-model")
-            self.assertEqual(configuration.effective_output_token_parameter, "max_tokens")
-            self.assertEqual(
-                configuration.sources["TSM_AGT_ANTHROPIC_MODEL"], "env_file"
-            )
-
-    def test_unknown_model_protocol_and_token_parameter_fail_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_MODEL=unknown_protocol\n"
-                "TSM_AGT_MODEL_BASE_URL=https://gateway.example.test/v1\n"
-                "TSM_AGT_OPEN_MODEL=test-model\n"
-                "TSM_AGT_MODEL_API_KEY=secret\n",
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(ValueError, "TSM_AGT_MODEL"):
-                load_model_configuration(env_file, {})
-            env_file.write_text(
-                "TSM_AGT_MODEL=open\n"
-                "TSM_AGT_MODEL_BASE_URL=https://gateway.example.test/v1\n"
-                "TSM_AGT_OPEN_MODEL=test-model\n"
-                "TSM_AGT_MODEL_API_KEY=secret\n"
-                "TSM_AGT_MODEL_OUTPUT_TOKEN_PARAMETER=token_budget\n",
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(ValueError, "MODEL_OUTPUT_TOKEN_PARAMETER"):
-                load_model_configuration(env_file, {})
+            self.assertIn("auth.api_key", message)
+            self.assertNotIn("test-model", message)
 
     def test_cli_version_uses_package_version(self) -> None:
         output = io.StringIO()
@@ -168,96 +90,52 @@ class FirstRunSetupTest(unittest.TestCase):
 class DoctorTest(unittest.IsolatedAsyncioTestCase):
     async def test_missing_configuration_is_structured_and_actionable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
             output = io.StringIO()
             with redirect_stdout(output):
                 result = await run_doctor(
-                    Path(directory), as_json=True, environment={}
+                    root, as_json=True, configuration_file=root / "missing.yaml",
                 )
             report = json.loads(output.getvalue())
-            self.assertEqual(result, 1)
-            self.assertFalse(report["healthy"])
-            configuration = next(
-                check for check in report["checks"]
-                if check["name"] == "model_configuration"
-            )
-            self.assertEqual(configuration["status"], "fail")
-            self.assertEqual(
-                configuration["details"]["missing"],
-                [
-                    "TSM_AGT_MODEL_BASE_URL",
-                    "TSM_AGT_MODEL",
-                    "TSM_AGT_MODEL_API_KEY",
-                ],
-            )
-            self.assertIn("tsm-agt init", configuration["remedy"])
+        self.assertEqual(result, 1)
+        configuration = next(item for item in report["checks"] if item["name"] == "model_configuration")
+        self.assertEqual(configuration["status"], "fail")
+        self.assertEqual(configuration["details"]["missing"], ["configuration file"])
+        self.assertIn("tsm-agt init", configuration["remedy"])
 
     async def test_json_report_redacts_endpoint_and_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "config.yaml"
+            path.write_text(_config(), encoding="utf-8")
             output = io.StringIO()
             with redirect_stdout(output):
-                result = await run_doctor(
-                    Path(directory), as_json=True, environment=COMPLETE_ENV
-                )
+                result = await run_doctor(root, as_json=True, configuration_file=path)
             encoded = output.getvalue()
             report = json.loads(encoded)
-            self.assertEqual(result, 0)
-            self.assertTrue(report["healthy"])
-            self.assertNotIn(COMPLETE_ENV["TSM_AGT_MODEL_API_KEY"], encoded)
-            self.assertNotIn("password", encoded)
-            self.assertNotIn("/v1", encoded)
-            configuration = next(
-                check for check in report["checks"]
-                if check["name"] == "model_configuration"
-            )
-            self.assertEqual(
-                configuration["details"]["endpoint_origin"],
-                "https://models.example.test:8443",
-            )
-            self.assertTrue(
-                configuration["details"]["credentials_configured"]
-            )
-
-    async def test_model_check_uses_injected_probe_and_reports_success(self) -> None:
-        seen = []
-
-        async def probe(configuration):
-            seen.append((configuration.endpoint_origin, configuration.model))
-
-        with tempfile.TemporaryDirectory() as directory:
-            output = io.StringIO()
-            with redirect_stdout(output):
-                result = await run_doctor(
-                    Path(directory), as_json=True, model_check=True,
-                    environment=COMPLETE_ENV, model_probe=probe,
-                )
-            report = json.loads(output.getvalue())
         self.assertEqual(result, 0)
-        self.assertEqual(seen, [("https://models.example.test:8443", "test-model")])
-        connectivity = next(
-            check for check in report["checks"]
-            if check["name"] == "model_connectivity"
-        )
-        self.assertEqual(connectivity["status"], "pass")
+        self.assertNotIn("sk-doctor-secret", encoded)
+        self.assertNotIn("password", encoded)
+        self.assertNotIn("/v1", encoded)
+        configuration = next(item for item in report["checks"] if item["name"] == "model_configuration")
+        self.assertEqual(configuration["details"]["endpoint_origin"], "https://models.example.test:8443")
 
     async def test_model_check_failure_redacts_secrets(self) -> None:
         async def failing_probe(configuration):
-            raise RuntimeError(
-                f"bad {configuration.api_key} at {configuration.base_url}"
-            )
+            raise RuntimeError(f"bad {configuration.api_key} at {configuration.base_url}")
 
         with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "config.yaml"
+            path.write_text(_config(), encoding="utf-8")
             output = io.StringIO()
             with redirect_stdout(output):
                 result = await run_doctor(
-                    Path(directory), as_json=True, model_check=True,
-                    environment=COMPLETE_ENV, model_probe=failing_probe,
+                    root, as_json=True, model_check=True,
+                    configuration_file=path, model_probe=failing_probe,
                 )
             encoded = output.getvalue()
         self.assertEqual(result, 1)
-        self.assertNotIn(COMPLETE_ENV["TSM_AGT_MODEL_API_KEY"], encoded)
-        self.assertNotIn(COMPLETE_ENV["TSM_AGT_MODEL_BASE_URL"], encoded)
+        self.assertNotIn("sk-doctor-secret", encoded)
+        self.assertNotIn("https://user:password", encoded)
         self.assertIn("<redacted>", encoded)
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -9,21 +9,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 
 from tsm_agt.core.context import ContextWindowManager
 from tsm_agt.core.session_context import SessionContextProjector
-
-
-CONTEXT_ENV_NAMES = (
-    "TSM_AGT_CONTEXT_COMPACTION_RATIO",
-    "TSM_AGT_CONTEXT_LATENCY_SOFT_TOKENS",
-    "TSM_AGT_SESSION_RECENT_MESSAGES",
-    "TSM_AGT_SESSION_TASK_SUMMARIES",
-    "TSM_AGT_CONTEXT_RECENT_MESSAGE_FLOOR",
-    "TSM_AGT_SESSION_HISTORY_FORMAT",
-    "TSM_AGT_CONTEXT_HISTORY_SOFT_TOKENS",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,28 +29,28 @@ class ContextConfiguration:
 
     def __post_init__(self) -> None:
         if self.conversation_history_format not in {"native", "json"}:
-            raise ValueError("TSM_AGT_SESSION_HISTORY_FORMAT must be native or json")
+            raise ValueError("session.history_format must be native or json")
         if not 0 < self.compaction_ratio < 1:
             raise ValueError(
-                "TSM_AGT_CONTEXT_COMPACTION_RATIO must be between 0 and 1"
+                "context.compaction_ratio must be between 0 and 1"
             )
         if self.latency_soft_tokens < 0:
             raise ValueError(
-                "TSM_AGT_CONTEXT_LATENCY_SOFT_TOKENS must be zero or positive"
+                "context.latency_soft_tokens must be zero or positive"
             )
         if self.history_soft_tokens < 0:
-            raise ValueError("TSM_AGT_CONTEXT_HISTORY_SOFT_TOKENS must be zero or positive")
+            raise ValueError("context.history_soft_tokens must be zero or positive")
         if self.session_recent_messages < 1:
             raise ValueError(
-                "TSM_AGT_SESSION_RECENT_MESSAGES must be positive"
+                "session.recent_messages must be positive"
             )
         if self.session_task_summaries < 1:
             raise ValueError(
-                "TSM_AGT_SESSION_TASK_SUMMARIES must be positive"
+                "session.task_summaries must be positive"
             )
         if self.recent_message_floor < 1:
             raise ValueError(
-                "TSM_AGT_CONTEXT_RECENT_MESSAGE_FLOOR must be positive"
+                "context.recent_message_floor must be positive"
             )
 
 
@@ -95,40 +83,21 @@ def session_context_projector(
     )
 
 
-def load_context_configuration(
-    path: Path, environment: Mapping[str, str],
-) -> ContextConfiguration:
-    values = _read_values(path.expanduser().resolve())
-    ratio_raw, ratio_source = _selected(
-        "TSM_AGT_CONTEXT_COMPACTION_RATIO", values, environment, "0.80"
-    )
-    soft_raw, soft_source = _selected(
-        "TSM_AGT_CONTEXT_LATENCY_SOFT_TOKENS", values, environment, "0"
-    )
-    messages_raw, messages_source = _selected(
-        "TSM_AGT_SESSION_RECENT_MESSAGES", values, environment, "8"
-    )
-    summaries_raw, summaries_source = _selected(
-        "TSM_AGT_SESSION_TASK_SUMMARIES", values, environment, "4"
-    )
-    floor_raw, floor_source = _selected(
-        "TSM_AGT_CONTEXT_RECENT_MESSAGE_FLOOR", values, environment, "8"
-    )
-    history_format, history_source = _selected(
-        "TSM_AGT_SESSION_HISTORY_FORMAT", values, environment, "native"
-    )
-    history_tokens_raw, history_tokens_source = _selected(
-        "TSM_AGT_CONTEXT_HISTORY_SOFT_TOKENS", values, environment, "16384"
-    )
-    try:
-        ratio = float(ratio_raw)
-        soft_tokens = int(soft_raw)
-        session_recent_messages = int(messages_raw)
-        session_task_summaries = int(summaries_raw)
-        recent_message_floor = int(floor_raw)
-        history_soft_tokens = int(history_tokens_raw)
-    except ValueError as error:
-        raise ValueError("context compaction settings must be numeric") from error
+def load_context_configuration(document: Mapping[str, object]) -> ContextConfiguration:
+    """Load context settings from the YAML document, without environment layers."""
+
+    values = _section(document, "context")
+    session = _section(document, "session")
+    defaults = ContextConfiguration()
+    ratio = _number(values.get("compaction_ratio"), "context.compaction_ratio", defaults.compaction_ratio)
+    soft_tokens = _nonnegative_int(values.get("latency_soft_tokens"), "context.latency_soft_tokens", defaults.latency_soft_tokens)
+    session_recent_messages = _positive_int(session.get("recent_messages"), "session.recent_messages", defaults.session_recent_messages)
+    session_task_summaries = _positive_int(session.get("task_summaries"), "session.task_summaries", defaults.session_task_summaries)
+    recent_message_floor = _positive_int(values.get("recent_message_floor"), "context.recent_message_floor", defaults.recent_message_floor)
+    history_format = session.get("history_format", defaults.conversation_history_format)
+    if not isinstance(history_format, str):
+        raise ValueError("session.history_format must be a string")
+    history_soft_tokens = _nonnegative_int(values.get("history_soft_tokens"), "context.history_soft_tokens", defaults.history_soft_tokens)
     return ContextConfiguration(
         compaction_ratio=ratio,
         latency_soft_tokens=soft_tokens,
@@ -138,41 +107,43 @@ def load_context_configuration(
         conversation_history_format=history_format,
         history_soft_tokens=history_soft_tokens,
         sources={
-            "context.compaction_ratio": ratio_source,
-            "context.latency_soft_tokens": soft_source,
-            "context.recent_message_floor": floor_source,
-            "session.recent_messages": messages_source,
-            "session.task_summaries": summaries_source,
-            "session.history_format": history_source,
-            "context.history_soft_tokens": history_tokens_source,
+            "context.compaction_ratio": "yaml" if "compaction_ratio" in values else "default",
+            "context.latency_soft_tokens": "yaml" if "latency_soft_tokens" in values else "default",
+            "context.recent_message_floor": "yaml" if "recent_message_floor" in values else "default",
+            "session.recent_messages": "yaml" if "recent_messages" in session else "default",
+            "session.task_summaries": "yaml" if "task_summaries" in session else "default",
+            "session.history_format": "yaml" if "history_format" in session else "default",
+            "context.history_soft_tokens": "yaml" if "history_soft_tokens" in values else "default",
         },
     )
 
 
-def _selected(name, file_values, environment, default):
-    exported = environment.get(name, "").strip()
-    from_file = file_values.get(name, "").strip()
-    if exported:
-        return exported, "environment"
-    if from_file:
-        return from_file, "env_file"
-    return default, "default"
+def _section(document: Mapping[str, object], name: str) -> Mapping[str, object]:
+    value = document.get(name, {})
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{name} must be a mapping")
+    return value
 
 
-def _read_values(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    values: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        if line.startswith("export "):
-            line = line[7:].strip()
-        name, value = (part.strip() for part in line.split("=", 1))
-        if name not in CONTEXT_ENV_NAMES:
-            continue
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        values[name] = value
-    return values
+def _number(value: object, name: str, default: float) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be numeric")
+    return float(value)
+
+
+def _positive_int(value: object, name: str, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _nonnegative_int(value: object, name: str, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value

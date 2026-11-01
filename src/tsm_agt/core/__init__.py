@@ -125,6 +125,10 @@ from .working_memory import (
     WorkingEvidenceReference, WorkingMemoryProjector, WorkingMemorySnapshot,
     WorkingPlanStep, WorkingPlanStepStatus,
 )
+from .diagnosis import (
+    DiagnosticFrame, DiagnosisHypothesis, DiagnosisMode, DiagnosisStatus,
+    HypothesisStatus, ReplayStatus,
+)
 from .steering import (
     SteeringInput, SteeringKind, SteeringProjection, SteeringProjector,
 )
@@ -358,6 +362,12 @@ __all__ = [
     "WorkingMemorySnapshot",
     "WorkingPlanStep",
     "WorkingPlanStepStatus",
+    "DiagnosticFrame",
+    "DiagnosisHypothesis",
+    "DiagnosisMode",
+    "DiagnosisStatus",
+    "HypothesisStatus",
+    "ReplayStatus",
     "SteeringInput",
     "SteeringKind",
     "SteeringProjection",

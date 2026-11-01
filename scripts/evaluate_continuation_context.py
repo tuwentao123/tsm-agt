@@ -196,7 +196,7 @@ def permitted(call, case):
 
 
 async def evaluate(args):
-    cfg = load_model_configuration(args.env_file, os.environ)
+    cfg = load_model_configuration(args.config)
     inject_conflict = getattr(args, "inject_v4a_conflict", False)
     conflict_kind = getattr(args, "v4a_conflict_kind", "import")
     model = ObservedModel(cfg, bool(args.baseline_segments), inject_conflict, conflict_kind)
@@ -367,7 +367,7 @@ async def evaluate(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--env-file", type=Path, default=Path(".env"))
+    parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--report-dir", type=Path, required=True)
     parser.add_argument("--case", choices=("implementation", "analysis", "restricted"), default="implementation")
     parser.add_argument("--baseline-segments", type=Path)

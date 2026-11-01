@@ -5,7 +5,7 @@ import unittest
 from tsm_agt.core import AgentTurnCheckpoint, TurnState
 from tsm_agt.core.conversation_loop.action_facts import (
     failed_processes_without_output_observation, latest_failed_delivery_action,
-    post_mutation_verification_fact, project_runtime_action_facts,
+    project_runtime_action_facts,
 )
 from tsm_agt.core.conversation_loop.prompt import latest_tool_result_instruction
 from tsm_agt.ports import (
@@ -44,47 +44,30 @@ class _Kernel:
 
 
 class RuntimeActionFactsTest(unittest.TestCase):
-    def test_verification_guidance_follows_observed_history(self) -> None:
+    def test_runtime_instruction_does_not_classify_verification_commands(self) -> None:
         patch = _spec("core.apply_patch", ToolEffect.MUTATE, ToolResultAuthority.MUTATION_FACT)
         process = _spec("core.run_command", ToolEffect.EXECUTE, ToolResultAuthority.PROCESS_FACT)
-        read = _spec("core.read_file", ToolEffect.OBSERVE, ToolResultAuthority.RUNTIME_FACT)
         edit = _exchange("edit", patch.name, {"path": "app.py"},
                          ToolResult("edit", True, data={"mutation_id": "m1"}))
-        readback = _exchange("read", read.name, {"path": "app.py"},
-                             ToolResult("read", True, data={"content": "changed"}))
-        def check(call_id, data):
-            return _exchange(call_id, process.name, {"argv": ["python", "-m", "pytest"]},
-                             ToolResult(call_id, True, data=data))
-        passing = check("pass", {"succeeded": True, "exit_code": 0})
-        failing = check("fail", {"succeeded": False, "exit_code": 1,
-                                 "failure_code": "PROCESS_EXIT_NON_ZERO"})
-        running = check("running", {"state": "RUNNING", "execution_state": "running"})
-        cases = (
-            (edit + readback, "missing", "Choose a sufficient check"),
-            (passing + edit, "missing", "after the latest mutation"),
-            (edit + failing, "failed", "repair relevant failures"),
-            (edit + running, "unknown", "Do not start a duplicate check"),
-            (edit + failing + passing, "passed", "do not repeat a still-valid passing check"),
+        check = _exchange(
+            "check", process.name, {"argv": ["python", "-m", "pytest"]},
+            ToolResult("check", True, data={"succeeded": True, "exit_code": 0}),
         )
-        for messages, status, guidance in cases:
-            with self.subTest(status=status, history=[m.message_id for m in messages]):
-                checkpoint = AgentTurnCheckpoint(
-                    "task", "turn", 1, (), (), (), 1, 0, 0, 0, 3, 3, 100, 1.0,
-                )
-                state = TurnState(
-                    task_id="task", turn_id="turn", checkpoint=checkpoint,
-                    messages=list(messages), pending_tool_calls=[], model_call_count=1,
-                    visible_tool_by_name={s.name: s for s in (patch, process, read)},
-                )
-                instruction = latest_tool_result_instruction(_Kernel(), state)
-                self.assertIn("check: " + status + ".", instruction)
-                self.assertIn(guidance, instruction)
-                self.assertIn("Respect scope, denials, and approval boundaries", instruction)
-                self.assertNotIn("Decide whether an available verification is needed", instruction)
-                self.assertNotIn('"call_id"', instruction)
-                if status == "missing":
-                    self.assertIn("other tool evidence may already cover it", instruction)
-                    self.assertIn("Prose needs no mandatory runtime test", instruction)
+        messages = edit + check
+        facts = project_runtime_action_facts(
+            messages, {spec.name: spec for spec in (patch, process)},
+        )
+        checkpoint = AgentTurnCheckpoint(
+            "task", "turn", 1, (), (), (), 1, 0, 0, 0, 3, 3, 100, 1.0,
+        )
+        state = TurnState(
+            task_id="task", turn_id="turn", checkpoint=checkpoint,
+            messages=list(messages), pending_tool_calls=[], model_call_count=1,
+            visible_tool_by_name={spec.name: spec for spec in (patch, process)},
+        )
+
+        self.assertFalse(hasattr(facts[-1], "is_recognized_verification"))
+        self.assertNotIn("recognized", latest_tool_result_instruction(_Kernel(), state).lower())
 
     def test_read_only_work_does_not_inject_post_mutation_guidance(self) -> None:
         read = _spec("core.read_file", ToolEffect.OBSERVE, ToolResultAuthority.RUNTIME_FACT)
@@ -153,10 +136,6 @@ class RuntimeActionFactsTest(unittest.TestCase):
             "requested_executable": "python",
             "failure_code": "EXECUTABLE_NOT_FOUND",
         })
-        self.assertEqual(
-            post_mutation_verification_fact((fact,)).status, "not_applicable"
-        )
-
         checkpoint = AgentTurnCheckpoint(
             "task", "turn", 1, (), (), (), 1, 0, 0, 0, 3, 3, 100, 1.0,
         )
@@ -171,41 +150,7 @@ class RuntimeActionFactsTest(unittest.TestCase):
         self.assertNotIn("python3", instruction)
         self.assertNotIn("install it", instruction)
 
-    def test_unstarted_check_after_a_mutation_is_unobserved_not_failed(self) -> None:
-        patch = _spec(
-            "core.apply_patch", ToolEffect.MUTATE,
-            ToolResultAuthority.MUTATION_FACT,
-        )
-        process = _spec(
-            "core.run_command", ToolEffect.EXECUTE,
-            ToolResultAuthority.PROCESS_FACT,
-        )
-        messages = (
-            *_exchange(
-                "patch", patch.name, {"path": "app.py"},
-                ToolResult("patch", True, data={"mutation_id": "m1"}),
-            ),
-            *_exchange(
-                "preflight", process.name, {"argv": ["python", "-m", "pytest"]},
-                ToolResult(
-                    "preflight", False, error_code="EXECUTABLE_NOT_FOUND",
-                    data={
-                        "execution_state": "not_started",
-                        "stage": "resolve_executable",
-                        "requested_executable": "python",
-                    },
-                ),
-            ),
-        )
-
-        facts = project_runtime_action_facts(
-            messages, {patch.name: patch, process.name: process},
-        )
-
-        self.assertFalse(facts[-1].is_recognized_verification)
-        self.assertEqual(post_mutation_verification_fact(facts).status, "missing")
-
-    def test_post_mutation_verification_tracks_only_the_later_attempt(self) -> None:
+    def test_command_projection_does_not_inspect_command_name(self) -> None:
         patch = _spec(
             "core.apply_patch", ToolEffect.MUTATE,
             ToolResultAuthority.MUTATION_FACT,
@@ -220,10 +165,10 @@ class RuntimeActionFactsTest(unittest.TestCase):
                 ToolResult("patch", True, data={"mutation_id": "mutation-1"}),
             ),
             *_exchange(
-                "test", "core.run_command", {"argv": ["python", "-m", "pytest"]},
+                "command", "core.run_command", {"argv": ["python", "-m", "pytest"]},
                 ToolResult(
-                    "test", True,
-                    data={"succeeded": False, "failure_code": "PROCESS_EXIT_NON_ZERO"},
+                    "command", True,
+                    data={"succeeded": True, "exit_code": 0},
                 ),
             ),
         )
@@ -231,11 +176,7 @@ class RuntimeActionFactsTest(unittest.TestCase):
         facts = project_runtime_action_facts(
             messages, {patch.name: patch, process.name: process},
         )
-        verification = post_mutation_verification_fact(facts)
-
-        self.assertEqual(verification.status, "failed")
-        self.assertEqual(verification.mutation.call_id, "patch")
-        self.assertEqual(verification.verification.call_id, "test")
+        self.assertNotIn("verification_attempt", facts[-1].prompt_data())
 
     def test_unknown_outcome_is_not_relabelled_as_an_ordinary_failure(self) -> None:
         process = _spec(

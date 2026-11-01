@@ -28,6 +28,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/tsm_agt"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"skills/verify_change" = "tsm_agt/bundled_skills/verify_change"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

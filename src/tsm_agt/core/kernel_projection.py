@@ -312,6 +312,7 @@ class ProjectionMixin:
             revision=revision,
             prompt_manifest=self._dependencies.prompt_template.manifest().to_data(),
             context=self._dependencies.context_manager.snapshot_data(),
+            max_parallel_tool_calls=self._dependencies.max_parallel_tool_calls,
         )
 
     @staticmethod

@@ -13,7 +13,7 @@ from tsm_agt.ports import Message, MessageRole, TextBlock, ToolSpec, ToolCallBlo
 from ..configuration import canonical_hash
 from ..execution import ToolExecutionRecord
 from ..context_messages import is_execution_context
-from .action_facts import project_runtime_action_facts, post_mutation_verification_fact
+from .action_facts import project_runtime_action_facts
 
 MAX_CONTEXT_BYTES = 3200  # <= 800 tokens under the shared UTF-8/4 estimate.
 MAX_PLAN_ID_CHARACTERS = 120  # WorkingPlanStep's validated identifier bound.
@@ -179,9 +179,6 @@ def _trim_context(data: dict[str, Any], protected_items: int) -> None:
                 else:
                     del item[key]
                 record["details_omitted"] = True
-            elif "recognized_post_mutation_check" in data:
-                del data["recognized_post_mutation_check"]
-                data["check_details_omitted"] = True
             elif any(record.get(key) is not None for key in ("active_item_id", "next_pending_item_id")):
                 # Avoid repeating pathological, heavily escaped IDs twice. The
                 # protected items still carry their full, actionable identifiers.
@@ -295,11 +292,6 @@ def project_execution_context(
     if facts:
         data["recent_actions"] = [fact.prompt_data() for fact in facts[-2:]]
         data["omitted_action_count"] = max(0, len(facts) - 2)
-        check = post_mutation_verification_fact(facts).prompt_data()
-        if check is not None:
-            data["recognized_post_mutation_check"] = {
-                **check, "classification_scope": "recognized_commands_only",
-            }
     if process_observations:
         data["recent_process_observations"] = process_observations
         data["omitted_process_observation_count"] = 0

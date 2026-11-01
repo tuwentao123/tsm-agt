@@ -2,7 +2,8 @@
 """Opt-in real-model multi-turn comparisons in fresh disposable workspaces.
 
 Nothing is submitted to an existing conversation. Credentials are loaded from
-the operator's env file, never copied into the disposable workspace or report.
+the operator's private YAML configuration, never copied into the disposable
+workspace or report.
 Reports distinguish observed calls, file assertions, independent tests and the
 final answer; they never equate a mutation with completed work.
 """
@@ -20,7 +21,7 @@ from uuid import uuid4
 
 from scripts.evaluate_execution_plan_behavior import _file_hash, _tool_names, MUTATION_TOOLS
 from tsm_agt.adapters.openai_compatible.request_diagnostics import TurnRequestDiagnostics
-from tsm_agt.bootstrap import compose_openai_compatible_engineering_application_from_env
+from tsm_agt.bootstrap import compose_openai_compatible_engineering_application_from_config
 from tsm_agt.sdk.runtime import EngineeringAgentClient
 from tsm_agt.ports import ModelCallPurpose, ModelStreamCompleted, ToolCallBlock
 
@@ -173,8 +174,8 @@ async def run_trial(args, fixture: dict, index: int) -> dict:
             path = workspace_path(root, relative)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
-        app = compose_openai_compatible_engineering_application_from_env(
-            args.env_file, root / ".agent" / "runtime.db", session_history_format=args.history_format,
+        app = compose_openai_compatible_engineering_application_from_config(
+            args.config, root / ".agent" / "runtime.db", session_history_format=args.history_format,
             history_soft_tokens=getattr(args, "history_soft_tokens", None),
         )
         client = EngineeringAgentClient(root, application_factory=lambda: app)
@@ -298,7 +299,7 @@ async def run_trial(args, fixture: dict, index: int) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", type=Path, required=True)
-    parser.add_argument("--env-file", type=Path, required=True)
+    parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--history-format", choices=("native", "json"), default="native")
     parser.add_argument("--history-soft-tokens", type=int, help="override shared history allocation; 0 disables only the soft cap")
     parser.add_argument("--report-path", type=Path, help="new output file (refuses to overwrite an existing report)")

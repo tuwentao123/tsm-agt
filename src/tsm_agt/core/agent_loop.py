@@ -45,6 +45,8 @@ class AgentLoopLimitExceeded(RuntimeError):
 
 
 class AgentProgressKind(StrEnum):
+    TEXT_DELTA = "text_delta"
+    TEXT_STATE = "text_state"
     REASONING_DELTA = "reasoning_delta"
     COMMENTARY = "commentary"
     MODEL_STARTED = "model_started"
@@ -110,6 +112,11 @@ class AgentProgress:
     diagnostic_detail: str = ""
     recovery_action: str = ""
     reasoning_text: str = ""
+    turn_id: str = ""
+    text_id: str = ""
+    text: str = ""
+    text_sequence: int = 0
+    text_status: str = ""
 
     def to_data(self) -> dict[str, Any]:
         """Return the live UI payload.
@@ -122,6 +129,11 @@ class AgentProgress:
         return {
             "kind": self.kind.value,
             "reasoning_text": self.reasoning_text,
+            "turn_id": self.turn_id,
+            "text_id": self.text_id,
+            "text": self.text,
+            "text_sequence": self.text_sequence,
+            "text_status": self.text_status,
             "model_call": self.model_call,
             "max_model_calls": self.max_model_calls,
             "tool_call": self.tool_call,

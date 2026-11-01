@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+
+import yaml
 from datetime import datetime
 from pathlib import Path
 
@@ -501,90 +503,78 @@ class ExplorationBudgetCompositionTest(unittest.TestCase):
         self.assertEqual(configuration.max_actions, 60)
         self.assertEqual(configuration.max_tool_seconds, 300)
 
-    def test_workspace_budget_is_configurable_and_environment_wins(self):
-        with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_EXPLORATION_PROFILE=legacy\n"
-                "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS=30\n"
-                "TSM_AGT_EXPLORATION_MAX_ACTIONS=28\n"
-                "TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS=3\n",
-                encoding="utf-8",
-            )
-            environment = {"TSM_AGT_EXPLORATION_MAX_TOOL_CALLS": "36"}
-            configuration = load_exploration_budget_configuration(
-                env_file, environment
-            )
-            self.assertEqual(configuration.max_tool_calls, 36)
-            self.assertEqual(configuration.max_actions, 28)
-            self.assertEqual(configuration.finalization_model_calls, 3)
-            self.assertEqual(configuration.profile, "legacy")
-            self.assertEqual(
-                configuration.sources["exploration_budget.profile"],
-                "env_file",
-            )
-            self.assertEqual(
-                configuration.sources["exploration_budget.max_tool_calls"],
-                "environment",
-            )
-            self.assertEqual(
-                configuration.sources["exploration_budget.max_actions"],
-                "env_file",
-            )
-            self.assertEqual(
-                configuration.sources[
-                    "exploration_budget.finalization_model_calls"
-                ],
-                "env_file",
-            )
-            self.assertEqual(configuration.agent_max_tool_calls, 120)
+    def test_yaml_budget_values_reach_the_policy(self):
+        configuration = load_exploration_budget_configuration({
+            "agent": {"finalization_model_calls": 3},
+            "exploration": {"profile": "legacy", "max_tool_calls": 36, "max_actions": 28},
+        })
+        self.assertEqual(configuration.max_tool_calls, 36)
+        self.assertEqual(configuration.max_actions, 28)
+        self.assertEqual(configuration.finalization_model_calls, 3)
+        self.assertEqual(configuration.profile, "legacy")
+        for key in ("profile", "max_tool_calls", "max_actions", "finalization_model_calls"):
+            self.assertEqual(configuration.sources[f"exploration_budget.{key}"], "yaml")
+        self.assertEqual(configuration.agent_max_tool_calls, 120)
 
     def test_invalid_budget_fails_at_startup(self):
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS=not-a-number\n",
+            configuration_file = Path(directory) / "config.yaml"
+            configuration_file.write_text(
+                '''
+exploration:
+  max_tool_calls: not-a-number
+''',
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(
-                ValueError, "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS"
+                ValueError, "exploration.max_tool_calls"
             ):
-                load_exploration_budget_configuration(env_file, {})
+                load_exploration_budget_configuration(yaml.safe_load(configuration_file.read_text()))
 
     def test_invalid_exploration_profile_fails_at_startup(self):
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_EXPLORATION_PROFILE=unknown\n", encoding="utf-8"
+            configuration_file = Path(directory) / "config.yaml"
+            configuration_file.write_text(
+                '''
+exploration:
+  profile: unknown
+''', encoding="utf-8"
             )
             with self.assertRaisesRegex(ValueError, "balanced.*legacy"):
-                load_exploration_budget_configuration(env_file, {})
+                load_exploration_budget_configuration(yaml.safe_load(configuration_file.read_text()))
 
     def test_soft_tool_limit_cannot_exceed_configured_hard_limit(self):
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_AGENT_MAX_TOOL_CALLS=20\n"
-                "TSM_AGT_EXPLORATION_MAX_TOOL_CALLS=21\n",
+            configuration_file = Path(directory) / "config.yaml"
+            configuration_file.write_text(
+                '''
+agent:
+  max_tool_calls: 20
+exploration:
+  max_tool_calls: 21
+''',
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(
-                ValueError, "TSM_AGT_AGENT_MAX_TOOL_CALLS"
+                ValueError, "agent.max_tool_calls"
             ):
-                load_exploration_budget_configuration(env_file, {})
+                load_exploration_budget_configuration(yaml.safe_load(configuration_file.read_text()))
 
     def test_finalization_reserve_must_be_below_model_hard_limit(self):
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory) / ".env"
-            env_file.write_text(
-                "TSM_AGT_AGENT_MAX_MODEL_CALLS=3\n"
-                "TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS=3\n",
+            configuration_file = Path(directory) / "config.yaml"
+            configuration_file.write_text(
+                '''
+agent:
+  max_model_calls: 3
+  finalization_model_calls: 3
+''',
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(
-                ValueError, "TSM_AGT_AGENT_FINALIZATION_MODEL_CALLS"
+                ValueError, "agent.finalization_model_calls"
             ):
-                load_exploration_budget_configuration(env_file, {})
+                load_exploration_budget_configuration(yaml.safe_load(configuration_file.read_text()))
 
 
 if __name__ == "__main__":

@@ -201,44 +201,29 @@ class EffectiveConfigurationKernelTest(unittest.IsolatedAsyncioTestCase):
             cli_data = json.loads(output.getvalue())
             self.assertEqual(cli_data["effective_config_hash"], expected.effective_config_hash)
 
-    async def test_env_sources_and_secrets_are_redacted(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"TSM_AGT_MODEL": "exported-model"}, clear=True
-        ):
+    async def test_yaml_sources_and_secrets_are_redacted(self) -> None:
+        from tests.test_model_profiles import _configuration
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TSM_AGT_MODEL": "exported-model"}, clear=True):
             root = Path(directory)
             secret = "sk-super-secret-value"
-            env_file = root / ".env"
-            env_file.write_text(
-                "TSM_AGT_MODEL_BASE_URL=https://user:pass@example.test:8443/v1/chat?token=x#f\n"
-                "TSM_AGT_MODEL=file-model\n"
-                f"TSM_AGT_MODEL_API_KEY={secret}\n", encoding="utf-8",
-            )
-            application = compose_openai_compatible_readonly_application_from_env(
-                env_file, root / "runtime.db"
-            )
+            path = root / "config.yaml"
+            path.write_text(_configuration().replace("local-secret", secret).replace("http://127.0.0.1:8000/v1", "https://user:pass@example.test:8443/v1/chat?token=x#f"), encoding="utf-8")
+            application = compose_openai_compatible_readonly_application_from_env(path, root / "runtime.db")
             await application.registry.start_all()
             try:
                 task = await application.kernel.create_task("goal", root)
                 await self._advance_to_execution(application, task.task_id)
-                snapshot = await application.kernel.get_effective_configuration(
-                    task.task_id
-                )
+                snapshot = await application.kernel.get_effective_configuration(task.task_id)
                 encoded = json.dumps(snapshot.to_data(), sort_keys=True)
                 self.assertNotIn(secret, encoded)
                 self.assertNotIn("user:pass", encoded)
                 self.assertNotIn("/v1/chat", encoded)
-                self.assertEqual(
-                    snapshot.model["endpoint_origin"], "https://example.test:8443"
-                )
-                self.assertEqual(snapshot.model["model"], "exported-model")
-                self.assertEqual(snapshot.sources["model.model"], "environment")
-                self.assertEqual(
-                    snapshot.sources["model.credentials_configured"], "env_file"
-                )
-                self.assertEqual(
-                    snapshot.model["output_token_parameter"], "max_tokens"
-                )
-                self.assertTrue(snapshot.model["strict_tool_schema"])
+                self.assertEqual(snapshot.model["endpoint_origin"], "https://example.test:8443")
+                self.assertEqual(snapshot.model["model"], "local-model")
+                self.assertEqual(snapshot.sources["model.model"], "yaml")
+                self.assertEqual(snapshot.sources["model.credentials_configured"], "yaml")
+                self.assertEqual(snapshot.model["output_token_parameter"], "max_tokens")
+                self.assertFalse(snapshot.model["strict_tool_schema"])
             finally:
                 await application.registry.stop_all()
 

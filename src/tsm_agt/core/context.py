@@ -324,6 +324,8 @@ class ContextWindowManager:
                 data["phase"] = message.phase.value
             if message.message_id.startswith("prompt-runtime-"):
                 bucket = "runtime_instruction"
+            elif message.message_id.startswith("tool-catalog-context-"):
+                bucket = "tool_catalog"
             elif message.message_id.startswith((
                 "task-spec-context-", "conversation-environment-context-",
             )):
@@ -341,12 +343,13 @@ class ContextWindowManager:
                 bucket = "working_memory"
             else:
                 bucket = "current_turn_and_tool_protocol"
-            buckets[bucket].append(data)
+            buckets.setdefault(bucket, []).append(data)
 
         allocations: list[ContextBudgetAllocation] = []
         protected = {
             "static_system", "runtime_instruction", "session_history",
             "working_memory", "current_turn_and_tool_protocol",
+            "tool_catalog",
         }
         for name, items in buckets.items():
             token_count = sum(

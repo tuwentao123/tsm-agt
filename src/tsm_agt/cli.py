@@ -17,12 +17,14 @@ from tsm_agt.bootstrap import (
     compose_fixture_application,
     compose_local_flow_query_application,
     compose_local_project_control_application,
-    compose_openai_compatible_engineering_application_from_env,
+    compose_openai_compatible_engineering_application_from_config,
     compose_readonly_application,
 )
 from tsm_agt.bootstrap.model_configuration import ModelConfigurationError
 from tsm_agt.cli_input import platform_line_input
-from tsm_agt.cli_setup import initialize_workspace, run_doctor
+from tsm_agt.cli_setup import (
+    initialize_configuration, run_doctor,
+)
 from tsm_agt import __version__
 from tsm_agt.local_api import LocalEventApiServer
 from tsm_agt.core import (
@@ -503,10 +505,11 @@ async def _files_demo(path: str, workspace: Path, recursive: bool) -> int:
 
 async def _agent(
     prompt: str, workspace: Path, *, verbose_progress: bool = False,
+    configuration_file: Path | None = None,
 ) -> int:
     root = workspace.expanduser().resolve()
-    application = compose_openai_compatible_engineering_application_from_env(
-        env_file=root / ".env",
+    application = compose_openai_compatible_engineering_application_from_config(
+        configuration_file=configuration_file,
         database_path=root / ".agent" / "runtime.db",
     )
     await application.start()
@@ -888,6 +891,7 @@ async def _chat(
     output_fn: Callable[[str], None] = print, application_factory=None,
     progress_renderer: Callable[[AgentProgress], tuple[str, ...]] | None = None,
     verbose_progress: bool = False,
+    configuration_file: Path | None = None,
 ) -> int:
     """Run a durable multi-turn terminal conversation over isolated Tasks."""
     render_progress = progress_renderer or _render_exploration_progress
@@ -914,8 +918,8 @@ async def _chat(
             previous_sigint = None
     root = workspace.expanduser().resolve()
     factory = application_factory or (lambda: (
-        compose_openai_compatible_engineering_application_from_env(
-            env_file=root / ".env",
+        compose_openai_compatible_engineering_application_from_config(
+            configuration_file=configuration_file,
             database_path=root / ".agent" / "runtime.db",
         )
     ))
@@ -1528,8 +1532,7 @@ async def _chat(
                 response_text_was_emitted = False
                 live_terminal = output_fn is print
                 prompt_safe_streaming = live_terminal and live_input_supported
-                pending_display = ""
-                displayed_agent_line = False
+                stream_phase = "pending"
                 activity_heartbeat: asyncio.Task[None] | None = None
 
                 def stop_heartbeat() -> None:
@@ -1558,24 +1561,13 @@ async def _chat(
                     activity_heartbeat = asyncio.create_task(report_wait())
 
                 def on_text_delta(text: str) -> None:
-                    nonlocal pending_display, displayed_agent_line
                     nonlocal response_text_was_emitted
                     stop_heartbeat()
                     if prompt_safe_streaming:
-                        # Prompt Toolkit can safely redraw complete lines above
-                        # an active ``control>`` prompt.  A raw token fragment,
-                        # however, is an incomplete terminal line and can be
-                        # split or overwritten by the next prompt redraw.  Keep
-                        # only that unfinished line buffered; complete lines
-                        # still appear progressively during long answers.
-                        pending_display += text
-                        while "\n" in pending_display:
-                            line, pending_display = pending_display.split(
-                                "\n", 1
-                            )
-                            prefix = "agent> " if not displayed_agent_line else ""
-                            print(prefix + line, flush=True)
-                            displayed_agent_line = True
+                        terminal_input.set_stream_text(
+                            "".join(streamed) + text,
+                            "处理说明" if stream_phase == "commentary" else "agent",
+                        )
                     elif live_terminal:
                         if not streamed:
                             print("agent> ", end="", flush=True)
@@ -1584,25 +1576,44 @@ async def _chat(
                     response_text_was_emitted = True
 
                 def finish_stream(result=None) -> None:
-                    nonlocal pending_display, displayed_agent_line
                     if streamed:
                         if prompt_safe_streaming:
-                            if pending_display or not displayed_agent_line:
-                                prefix = (
-                                    "agent> " if not displayed_agent_line else ""
-                                )
-                                print(prefix + pending_display, flush=True)
-                            pending_display = ""
-                            displayed_agent_line = False
+                            terminal_input.set_stream_text("")
+                            print(f"agent> {''.join(streamed)}", flush=True)
                         elif live_terminal:
                             print(flush=True)
                         else:
                             output_fn(f"agent> {''.join(streamed)}")
                         streamed.clear()
-                    elif result is not None:
+                    elif result is not None and not response_text_was_emitted:
                         output_fn(f"agent> {result.assistant_message.text}")
 
                 def on_progress(progress: AgentProgress) -> None:
+                    nonlocal stream_phase, response_text_was_emitted
+                    if progress.kind is AgentProgressKind.TEXT_DELTA:
+                        stream_phase = progress.phase
+                        return
+                    if progress.kind is AgentProgressKind.TEXT_STATE:
+                        stream_phase = progress.phase
+                        if progress.text_status in {"discarded", "interrupted"}:
+                            if live_terminal and not prompt_safe_streaming:
+                                finish_stream()
+                            else:
+                                streamed.clear()
+                            if prompt_safe_streaming:
+                                terminal_input.set_stream_text("")
+                            response_text_was_emitted = False
+                            if progress.text_status == "discarded":
+                                output_fn("[进度] 本段内容未作为最终回答提交。")
+                        elif progress.text_status == "committed":
+                            finish_stream()
+                        elif progress.text_status == "reviewing" and prompt_safe_streaming:
+                            terminal_input.set_stream_text("".join(streamed), "确认中")
+                        return
+                    if progress.kind is AgentProgressKind.COMMENTARY and progress.text_id:
+                        return  # This note was already displayed through its text stream.
+                    if progress.kind is AgentProgressKind.MODEL_STARTED:
+                        response_text_was_emitted = False
                     if progress.kind is AgentProgressKind.MODEL_COMPLETED:
                         stop_heartbeat()
                         return
@@ -2165,10 +2176,11 @@ def _print_chat_approval(
 
 async def _resolve_agent_approval(
     request_id: str, decision: ApprovalDecision, reason: str, workspace: Path,
+    *, configuration_file: Path | None = None,
 ) -> int:
     root = workspace.expanduser().resolve()
-    application = compose_openai_compatible_engineering_application_from_env(
-        env_file=root / ".env",
+    application = compose_openai_compatible_engineering_application_from_config(
+        configuration_file=configuration_file,
         database_path=root / ".agent" / "runtime.db"
     )
     await application.start()
@@ -2187,11 +2199,11 @@ async def _resolve_agent_approval(
 
 async def _resolve_agent_clarification(
     request_id: str, resume_token: str, answer: str | None, workspace: Path,
-    *, selected_choice: str | None = None,
+    *, selected_choice: str | None = None, configuration_file: Path | None = None,
 ) -> int:
     root = workspace.expanduser().resolve()
-    application = compose_openai_compatible_engineering_application_from_env(
-        env_file=root / ".env",
+    application = compose_openai_compatible_engineering_application_from_config(
+        configuration_file=configuration_file,
         database_path=root / ".agent" / "runtime.db"
     )
     await application.start()
@@ -2210,10 +2222,12 @@ async def _resolve_agent_clarification(
         await application.registry.stop_all()
 
 
-async def _resume_agent_task(task_id: str, workspace: Path) -> int:
+async def _resume_agent_task(
+    task_id: str, workspace: Path, *, configuration_file: Path | None = None,
+) -> int:
     root = workspace.expanduser().resolve()
-    application = compose_openai_compatible_engineering_application_from_env(
-        env_file=root / ".env",
+    application = compose_openai_compatible_engineering_application_from_config(
+        configuration_file=configuration_file,
         database_path=root / ".agent" / "runtime.db"
     )
     await application.start()
@@ -3218,8 +3232,17 @@ def _print_agent_result(
     )
 
 
-def _serve_local_api(workspace: Path, host: str, port: int) -> int:
-    server = LocalEventApiServer(workspace, host=host, port=port)
+def _serve_local_api(
+    workspace: Path, host: str, port: int, *, configuration_file: Path | None = None,
+) -> int:
+    root = workspace.expanduser().resolve()
+    server = LocalEventApiServer(
+        root, host=host, port=port,
+        application_factory=lambda: compose_openai_compatible_engineering_application_from_config(
+            configuration_file=configuration_file,
+            database_path=root / ".agent" / "runtime.db",
+        ),
+    )
     server.start()
     actual_host, actual_port = server.address
     print(f"local Event API: http://{actual_host}:{actual_port}")
@@ -3244,9 +3267,12 @@ def main() -> int:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     init = subparsers.add_parser(
-        "init", help="create a private first-run model configuration template"
+        "init", help="create the private YAML configuration template"
     )
-    init.add_argument("--workspace", type=Path, default=Path.cwd())
+    init.add_argument(
+        "--path", type=Path,
+        help="private YAML destination (default: ~/.tsm-agt/config.yaml)",
+    )
     init.add_argument(
         "--print", action="store_true", dest="print_only",
         help="print the template without writing a file",
@@ -3255,6 +3281,7 @@ def main() -> int:
         "doctor", help="diagnose installation, workspace, adapters, and model"
     )
     doctor.add_argument("--workspace", type=Path, default=Path.cwd())
+    doctor.add_argument("--config", type=Path, dest="configuration_file")
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument(
         "--model-check", action="store_true",
@@ -3268,6 +3295,7 @@ def main() -> int:
         "serve", help="bind an authenticated HTTP/SSE API to loopback only"
     )
     api_serve.add_argument("--workspace", type=Path, default=Path.cwd())
+    api_serve.add_argument("--config", type=Path, dest="configuration_file")
     api_serve.add_argument("--host", default="127.0.0.1")
     api_serve.add_argument("--port", type=int, default=8765)
     demo = subparsers.add_parser("task-demo", help="persist a legal task state trace")
@@ -3292,6 +3320,7 @@ def main() -> int:
     )
     real_agent.add_argument("prompt")
     real_agent.add_argument("--workspace", type=Path, default=Path.cwd())
+    real_agent.add_argument("--config", type=Path, dest="configuration_file")
     real_agent.add_argument(
         "--verbose-progress", action="store_true",
         help="show full tool arguments, policy projections, and budget counters",
@@ -3302,6 +3331,7 @@ def main() -> int:
     chat.add_argument("--session", dest="session_id")
     chat.add_argument("--title")
     chat.add_argument("--workspace", type=Path, default=Path.cwd())
+    chat.add_argument("--config", type=Path, dest="configuration_file")
     chat.add_argument(
         "--verbose-progress", action="store_true",
         help="show full tool arguments, policy projections, and budget counters",
@@ -3311,18 +3341,21 @@ def main() -> int:
     )
     resume.add_argument("task_id")
     resume.add_argument("--workspace", type=Path, default=Path.cwd())
+    resume.add_argument("--config", type=Path, dest="configuration_file")
     approve = subparsers.add_parser(
         "approve", help="approve a pending Agent action and resume its turn"
     )
     approve.add_argument("approval_id")
     approve.add_argument("--reason", required=True)
     approve.add_argument("--workspace", type=Path, default=Path.cwd())
+    approve.add_argument("--config", type=Path, dest="configuration_file")
     reject = subparsers.add_parser(
         "reject", help="reject a pending Agent action and resume its turn"
     )
     reject.add_argument("approval_id")
     reject.add_argument("--reason", required=True)
     reject.add_argument("--workspace", type=Path, default=Path.cwd())
+    reject.add_argument("--config", type=Path, dest="configuration_file")
     answer = subparsers.add_parser(
         "answer", help="answer a pending clarification and resume its turn"
     )
@@ -3332,6 +3365,7 @@ def main() -> int:
     answer_value.add_argument("--answer", dest="answer_text")
     answer_value.add_argument("--choice", dest="selected_choice")
     answer.add_argument("--workspace", type=Path, default=Path.cwd())
+    answer.add_argument("--config", type=Path, dest="configuration_file")
     trust = subparsers.add_parser(
         "trust", help="inspect or set trust for one canonical workspace"
     )
@@ -3563,17 +3597,21 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "init":
         try:
-            return initialize_workspace(args.workspace, print_only=args.print_only)
+            return initialize_configuration(args.path, print_only=args.print_only)
         except (OSError, ValueError) as error:
             print(f"error: {error}", file=sys.stderr)
             return 2
     if args.command == "doctor":
         return asyncio.run(run_doctor(
-            args.workspace, as_json=args.json, model_check=args.model_check
+            args.workspace, as_json=args.json, model_check=args.model_check,
+            configuration_file=args.configuration_file,
         ))
     if args.command == "api":
         try:
-            return _serve_local_api(args.workspace, args.host, args.port)
+            return _serve_local_api(
+                args.workspace, args.host, args.port,
+                configuration_file=args.configuration_file,
+            )
         except (OSError, RuntimeError, ValueError) as error:
             print(f"error: {error}", file=sys.stderr)
             return 2
@@ -3590,6 +3628,7 @@ def main() -> int:
             return asyncio.run(_agent(
                 args.prompt, args.workspace,
                 verbose_progress=args.verbose_progress,
+                configuration_file=args.configuration_file,
             ))
         except ModelConfigurationError as error:
             print(f"error: {error}", file=sys.stderr)
@@ -3604,6 +3643,7 @@ def main() -> int:
             return asyncio.run(_chat(
                 args.workspace, session_id=args.session_id, title=args.title,
                 verbose_progress=args.verbose_progress,
+                configuration_file=args.configuration_file,
             ))
         except KeyboardInterrupt:
             # A second Ctrl+C may arrive while asyncio is closing adapters. Keep the
@@ -3617,7 +3657,10 @@ def main() -> int:
             parser.error(str(error))
     if args.command == "resume":
         try:
-            return asyncio.run(_resume_agent_task(args.task_id, args.workspace))
+            return asyncio.run(_resume_agent_task(
+                args.task_id, args.workspace,
+                configuration_file=args.configuration_file,
+            ))
         except (LookupError, RuntimeError, ValueError) as error:
             parser.error(str(error))
     if args.command in {"approve", "reject"}:
@@ -3629,7 +3672,8 @@ def main() -> int:
         try:
             return asyncio.run(
                 _resolve_agent_approval(
-                    args.approval_id, decision, args.reason, args.workspace
+                    args.approval_id, decision, args.reason, args.workspace,
+                    configuration_file=args.configuration_file,
                 )
             )
         except (ValueError, LookupError) as error:
@@ -3639,6 +3683,7 @@ def main() -> int:
             return asyncio.run(_resolve_agent_clarification(
                 args.request_id, args.token, args.answer_text, args.workspace,
                 selected_choice=args.selected_choice,
+                configuration_file=args.configuration_file,
             ))
         except (ValueError, LookupError, PermissionError) as error:
             parser.error(str(error))

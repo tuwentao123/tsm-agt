@@ -116,10 +116,8 @@ class LocalWorkspaceSandboxTest(unittest.IsolatedAsyncioTestCase):
                 ApprovalDecision.APPROVE, "approve the exact environment entry",
             )
             self.assertTrue(started.ok, started.message)
-            waited = await kernel.invoke_tool(task.task_id, "turn-environment-entry", ToolCall(
-                "wait-environment-entry", "core.process_wait",
-                {"process_id": started.data["process_id"], "wait_seconds": 5},
-            ))
+            self.assertEqual(started.data["mode"], "foreground")
+            waited = started
             self.assertTrue(waited.ok, waited.message)
             self.assertTrue(waited.data["succeeded"], waited.data)
             output = json.loads(waited.data["stdout"]["text"])
@@ -183,10 +181,8 @@ class LocalWorkspaceSandboxTest(unittest.IsolatedAsyncioTestCase):
                         ApprovalDecision.APPROVE, "approve exact custom CLI invocation",
                     )
                     self.assertTrue(started.ok, started.message)
-                    waited = await kernel.invoke_tool(task.task_id, "turn-user-cli", ToolCall(
-                        "wait-user-cli", "core.process_wait",
-                        {"process_id": started.data["process_id"], "wait_seconds": 5},
-                    ))
+                    self.assertEqual(started.data["mode"], "foreground")
+                    waited = started
                     self.assertTrue(waited.ok, waited.message)
                     self.assertTrue(waited.data["succeeded"], waited.data)
                     self.assertEqual(json.loads(waited.data["stdout"]["text"]), {
@@ -235,7 +231,9 @@ class LocalWorkspaceSandboxTest(unittest.IsolatedAsyncioTestCase):
                 ApprovalDecision.APPROVE, "approved exact curl command",
             )
             self.assertTrue(result.ok, result.message)
-            self.assertTrue(result.data["started"])
+            self.assertEqual(result.data["mode"], "foreground")
+            self.assertTrue(result.data["succeeded"], result.data)
+            self.assertEqual(result.data["exit_code"], 0)
         finally:
             await application.registry.stop_all()
 

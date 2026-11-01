@@ -16,6 +16,7 @@ from typing import Any
 from tsm_agt.ports import RuntimeEvent
 
 from .configuration import canonical_hash
+from .diagnosis import DiagnosticFrame
 
 
 class WorkingPlanStepStatus(StrEnum):
@@ -94,6 +95,7 @@ class WorkingMemorySnapshot:
     completed_work: tuple[str, ...] = ()
     remaining_work: tuple[str, ...] = ()
     evidence: tuple[WorkingEvidenceReference, ...] = ()
+    diagnosis: DiagnosticFrame | None = None
     source_event_sequences: tuple[int, ...] = ()
     content_hash: str = ""
 
@@ -154,6 +156,7 @@ class WorkingMemorySnapshot:
             evidence=_object_tuple(
                 state, "evidence", WorkingEvidenceReference.from_data
             ),
+            diagnosis=_optional_object(state, "diagnosis", DiagnosticFrame.from_data),
             source_event_sequences=source_event_sequences,
         )
 
@@ -172,7 +175,7 @@ class WorkingMemorySnapshot:
         return snapshot
 
     def state_data(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "goal": self.goal, "constraints": list(self.constraints),
             "facts": list(self.facts), "decisions": list(self.decisions),
             "hypotheses": list(self.hypotheses),
@@ -182,6 +185,11 @@ class WorkingMemorySnapshot:
             "remaining_work": list(self.remaining_work),
             "evidence": [item.to_data() for item in self.evidence],
         }
+        # Omit an absent frame so snapshots written before diagnosis support
+        # retain their content hash during restart/replay.
+        if self.diagnosis is not None:
+            data["diagnosis"] = self.diagnosis.to_data()
+        return data
 
     def hash_source(self) -> dict[str, Any]:
         return {
@@ -379,6 +387,15 @@ def _object_tuple(data: Mapping[str, Any], key: str, factory):
     if any(not isinstance(item, Mapping) for item in raw):
         raise ValueError(f"working memory {key} entries must be objects")
     return tuple(factory(item) for item in raw)
+
+
+def _optional_object(data: Mapping[str, Any], key: str, factory):
+    raw = data.get(key)
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"working memory {key} must be an object or null")
+    return factory(raw)
 
 
 def _merge_bounded(

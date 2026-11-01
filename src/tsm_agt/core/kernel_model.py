@@ -161,6 +161,7 @@ class ModelMixin:
     async def _complete_agent_model_request(
         self, request: ModelRequest, on_text_delta: Callable[[str], None] | None,
         on_reasoning_delta: Callable[[str], None] | None = None,
+        on_text_event: Callable[[ModelTextDelta], None] | None = None,
     ) -> ModelResponse:
         model = self._dependencies.model
         if not isinstance(model, StreamingModelProviderPort):
@@ -178,6 +179,8 @@ class ModelMixin:
                 text_parts.append(event.text)
                 if on_text_delta is not None:
                     on_text_delta(event.text)
+                if on_text_event is not None:
+                    on_text_event(event)
             elif isinstance(event, ModelReasoningDelta):
                 if completed is not None or not event.text:
                     raise InvalidModelResponse("invalid reasoning summary delta")

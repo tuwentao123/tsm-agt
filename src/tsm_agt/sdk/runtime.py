@@ -11,10 +11,10 @@ from typing import Any
 from uuid import uuid4
 
 from tsm_agt.bootstrap import (
-    Application, compose_openai_compatible_engineering_application_from_env,
+    Application, compose_openai_compatible_engineering_application_from_config,
 )
 from tsm_agt.core import (
-    AgentClarificationSuspended, AgentProgress, AgentTurnIncomplete,
+    AgentClarificationSuspended, AgentProgress, AgentProgressKind, AgentTurnIncomplete,
     AgentTurnResult, AgentTurnSuspended,
     AgentContinuationSuspended,
     ApprovalDecision, ApprovalResolutionInput, CancelTaskInput,
@@ -255,8 +255,7 @@ class EngineeringAgentClient:
     ) -> None:
         self.workspace = workspace.expanduser().resolve()
         self._application_factory = application_factory or (lambda: (
-            compose_openai_compatible_engineering_application_from_env(
-                env_file=self.workspace / ".env",
+            compose_openai_compatible_engineering_application_from_config(
                 database_path=self.workspace / ".agent" / "runtime.db",
             )
         ))
@@ -276,6 +275,7 @@ class EngineeringAgentClient:
         ] = {}
         self._latest_results: dict[str, RuntimeTaskResult] = {}
         self._progress_history: dict[str, list[RuntimeProgressEnvelope]] = {}
+        self._text_streams: dict[str, dict[str, dict]] = {}
         self._progress_sequences: dict[str, int] = {}
         self._submit_lock = asyncio.Lock()
         # One foreground Task per Session: serialize inputs per Session id.
@@ -1551,6 +1551,28 @@ class EngineeringAgentClient:
             self._store().notify(task_id)
 
     def _record_progress(self, task_id: str, progress: AgentProgress) -> None:
+        if progress.kind in {AgentProgressKind.TEXT_DELTA, AgentProgressKind.TEXT_STATE}:
+            streams = self._text_streams.setdefault(task_id, {})
+            if progress.text_status in {"committed", "discarded", "interrupted"}:
+                streams.pop(progress.text_id, None)
+            else:
+                # Keep one aggregate for reconnects; the bounded event history
+                # stores fragments, not a complete answer for every token.
+                for identity in list(streams):
+                    if streams[identity]["turn_id"] != progress.turn_id:
+                        del streams[identity]
+                stream = streams.setdefault(progress.text_id, {
+                    "text_id": progress.text_id, "turn_id": progress.turn_id,
+                    "model_call": progress.model_call, "text": "",
+                    "text_sequence": 0,
+                })
+                if (
+                    progress.kind is AgentProgressKind.TEXT_DELTA
+                    and progress.text_sequence > stream["text_sequence"]
+                ):
+                    stream["text"] += progress.text
+                    stream["text_sequence"] = progress.text_sequence
+                stream.update(phase=progress.phase, text_status=progress.text_status)
         history = self._progress_history.setdefault(task_id, [])
         sequence = self._progress_sequences.get(task_id, 0) + 1
         self._progress_sequences[task_id] = sequence
@@ -1558,6 +1580,12 @@ class EngineeringAgentClient:
         self._store().notify(task_id)
         if len(history) > 2000:
             del history[:-2000]
+
+    def text_stream_snapshot(self, task_id: str) -> tuple[int, list[dict]]:
+        """Atomically capture live text and its separate, non-durable cursor."""
+        return self.latest_progress_sequence(task_id), [
+            dict(stream) for stream in self._text_streams.get(task_id, {}).values()
+        ]
 
     async def interrupt(
         self, task_id: str, *, command_id: str, reason: str,
@@ -1812,7 +1840,7 @@ class EngineeringAgentClient:
             # A stall-cap finalization reuses this suspension shape but ends the
             # Task as NEEDS_REVIEW, so the reported status must follow the Task,
             # not the suspension type.
-            finalized = current.state is TaskState.NEEDS_REVIEW
+            finalized = current.state.is_terminal
             task_result = replace(
                 base,
                 status=_status_for_state(current.state),

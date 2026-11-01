@@ -133,7 +133,7 @@ async def subscribe_task_ui(client, task_id: str, *, after: int = 0, heartbeat: 
         raise ValueError("after must be non-negative")
     store = client._store()
     cursor = after
-    live_cursor = client.latest_progress_sequence(task_id)
+    live_cursor, text_streams = client.text_stream_snapshot(task_id)
     with store.watch(task_id) as signal:
         changed = signal.changed
         snapshot = await ui_snapshot(client, task_id)
@@ -144,6 +144,9 @@ async def subscribe_task_ui(client, task_id: str, *, after: int = 0, heartbeat: 
             yield {"type": "stream.reset_required", "task_id": task_id, "sequence": 0}
             cursor = 0
         yield {"type": "stream.open", "task_id": task_id, "session_id": snapshot["session_id"], "active_turn_id": snapshot["active_turn_id"], "active_turn_sequence": snapshot["active_turn_sequence"]}
+        yield {"type": "text.snapshot", "task_id": task_id,
+               "turn_id": snapshot["active_turn_id"],
+               "streams": [item for item in text_streams if item["turn_id"] == snapshot["active_turn_id"]]}
         initial = True
         while True:
             visible = False
@@ -178,11 +181,23 @@ async def subscribe_task_ui(client, task_id: str, *, after: int = 0, heartbeat: 
                             continue
                     break
             # Only live-only content comes from the transient callback channel.
-            for live in client.read_progress(task_id, after=live_cursor, limit=1000):
-                live_cursor = live.sequence
-                if live.progress.kind.value in {"reasoning_delta", "focus", "exploration"}:
-                    yield {"type": "progress.transient", "task_id": task_id,
-                           "turn_id": snapshot["active_turn_id"], "progress": live.progress.to_data()}
+            while True:
+                updates = client.read_progress(task_id, after=live_cursor, limit=1000)
+                if updates and updates[0].sequence > live_cursor + 1:
+                    live_cursor, text_streams = client.text_stream_snapshot(task_id)
+                    yield {"type": "text.snapshot", "task_id": task_id,
+                           "turn_id": snapshot["active_turn_id"], "streams": text_streams}
+                    break
+                for live in updates:
+                    live_cursor = live.sequence
+                    if live.progress.kind.value in {
+                        "reasoning_delta", "focus", "exploration", "text_delta", "text_state",
+                    }:
+                        yield {"type": "progress.transient", "task_id": task_id,
+                               "turn_id": live.progress.turn_id or snapshot["active_turn_id"],
+                               "progress": live.progress.to_data()}
+                if len(updates) < 1000:
+                    break
             if visible or initial:
                 snapshot = candidate
                 snapshot["installations"] = installation_records(client, task_id, snapshot["session_id"])

@@ -303,6 +303,7 @@ from .working_memory import (
     EffectiveWorkingMemory, EffectiveWorkingMemoryProjector,
     WorkingMemoryProjector, WorkingMemorySnapshot, WorkingPlanStepStatus,
 )
+from .diagnosis import DiagnosticFrame
 from .steering import SteeringKind, SteeringProjection, SteeringProjector
 from .runtime_input import (
     ApprovalResolutionInput, CancelTaskInput, ClarificationReplyInput,
@@ -433,6 +434,7 @@ class KernelDependencies:
     #: only answer by continuing -- and each continuation re-read context.
     default_max_model_calls: int = 90
     default_max_tool_calls: int = 120
+    max_parallel_tool_calls: int = 8
     default_max_output_tokens: int = 1024
     finalization_model_calls: int = 2
     execution_reserve_model_calls: int = 1
@@ -750,6 +752,12 @@ def _goal_matches_command_argv(
 
 class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin, TaskMixin, MemoryMixin, ApprovalMixin, ProgressMixin, OnboardingMixin, ProjectionMixin, ProcessMixin, WorkspaceMixin, ToolMixin, SessionMixin):
     def __init__(self, dependencies: KernelDependencies) -> None:
+        if (
+            isinstance(dependencies.max_parallel_tool_calls, bool)
+            or not isinstance(dependencies.max_parallel_tool_calls, int)
+            or dependencies.max_parallel_tool_calls < 1
+        ):
+            raise ValueError("max_parallel_tool_calls must be a positive integer")
         self._dependencies = dependencies
         self._tool_policy = CoreToolPolicy()
         self._background_deadline_tasks: dict[str, asyncio.Task[None]] = {}
@@ -1168,22 +1176,49 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             if not isinstance(item, Mapping):
                 raise ValueError("working memory evidence entries must be objects")
             reference = str(item.get("reference") or "")
-            if reference.startswith("event:"):
-                try:
-                    exists = int(reference.removeprefix("event:")) in event_sequences
-                except ValueError:
-                    exists = False
-            elif reference.startswith("tool_call:"):
-                exists = reference.removeprefix("tool_call:") in tool_calls
-            elif reference.startswith("mutation:"):
-                exists = reference.removeprefix("mutation:") in mutations
-            else:
-                raise ValueError(
-                    "working memory evidence reference must use event:, tool_call:, "
-                    "or mutation:"
-                )
-            if not exists:
-                raise ValueError(f"working memory evidence does not exist: {reference}")
+            Kernel._validate_runtime_evidence_reference(
+                reference, event_sequences, tool_calls, mutations,
+                label="working memory evidence",
+            )
+
+    @staticmethod
+    def _validate_diagnosis_evidence(
+        task: TaskSnapshot, events: tuple[RuntimeEvent, ...],
+        diagnosis: DiagnosticFrame | None,
+    ) -> None:
+        if diagnosis is None:
+            return
+        event_sequences = {event.sequence for event in events}
+        tool_calls = {
+            execution.call.call_id for execution in task.tool_executions.values()
+        }
+        mutations = {item.mutation_id for item in task.mutation_journal}
+        for reference in diagnosis.evidence_references():
+            Kernel._validate_runtime_evidence_reference(
+                reference, event_sequences, tool_calls, mutations,
+                label="diagnosis evidence",
+            )
+
+    @staticmethod
+    def _validate_runtime_evidence_reference(
+        reference: str, event_sequences: set[int], tool_calls: set[str],
+        mutations: set[str], *, label: str,
+    ) -> None:
+        if reference.startswith("event:"):
+            try:
+                exists = int(reference.removeprefix("event:")) in event_sequences
+            except ValueError:
+                exists = False
+        elif reference.startswith("tool_call:"):
+            exists = reference.removeprefix("tool_call:") in tool_calls
+        elif reference.startswith("mutation:"):
+            exists = reference.removeprefix("mutation:") in mutations
+        else:
+            raise ValueError(
+                f"{label} reference must use event:, tool_call:, or mutation:"
+            )
+        if not exists:
+            raise ValueError(f"{label} does not exist: {reference}")
 
 
 

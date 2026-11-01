@@ -18,15 +18,8 @@ from ..prompt import PromptAssembly, PromptTemplate
 from ..context_messages import is_execution_context
 from .action_facts import (
     failed_processes_without_output_observation, latest_failed_delivery_action,
-    post_mutation_verification_fact, project_runtime_action_facts,
+    project_runtime_action_facts,
 )
-
-_POST_MUTATION_GUIDANCE = {
-    "missing": "No recognized check after the latest mutation. Choose a sufficient check for the change; other tool evidence may already cover it. Prose needs no mandatory runtime test.",
-    "failed": "Inspect and repair relevant failures, then rerun the affected check.",
-    "unknown": "Inspect or wait for the existing operation. Do not start a duplicate check.",
-    "passed": "This establishes only the observed check's coverage; do not repeat a still-valid passing check.",
-}
 
 
 def plan_maintenance_guidance(
@@ -83,7 +76,6 @@ def latest_tool_result_instruction(
     facts = project_runtime_action_facts(state.messages, tool_specs)
     failure = latest_failed_delivery_action(facts)
     unread_process_output = failed_processes_without_output_observation(facts)
-    check = post_mutation_verification_fact(facts)
     notes = []
     if any(fact.did_not_start_execution for fact in facts):
         notes.append(
@@ -108,11 +100,6 @@ def latest_tool_result_instruction(
         notes.append(
             "Runtime action facts in current_execution_state include a failure. "
             "Use the observed result to recover within scope; inspect unknown effects before retrying."
-        )
-    if check.status in _POST_MUTATION_GUIDANCE:
-        notes.append(
-            "Recognized post-mutation check: " + check.status + ". "
-            + _POST_MUTATION_GUIDANCE[check.status]
         )
     plan_note = plan_maintenance_guidance(
         state.messages, task_id=state.task_id, turn_id=state.turn_id,

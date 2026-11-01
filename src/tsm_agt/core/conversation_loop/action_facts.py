@@ -19,9 +19,6 @@ from tsm_agt.ports import (
 
 from ..execution import ToolCommitState
 from ..execution_facts import EffectStatus, classify_effect_status
-from ..verification_command import is_verification_request
-
-
 _DELIVERY_EFFECTS = frozenset({ToolEffect.MUTATE, ToolEffect.EXECUTE})
 
 
@@ -63,7 +60,6 @@ class RuntimeActionFact:
     process_id: str = ""
     exit_code: int | None = None
     output_observed: bool = False
-    is_recognized_verification: bool = False
 
     @property
     def is_delivery_action(self) -> bool:
@@ -137,35 +133,6 @@ class RuntimeActionFact:
             data["failure_code"] = self.failure_code
         if self.exit_code is not None:
             data["exit_code"] = self.exit_code
-        if self.is_recognized_verification:
-            data["verification_attempt"] = True
-        return data
-
-
-@dataclass(frozen=True, slots=True)
-class PostMutationVerificationFact:
-    """What the ledger observed after the latest successful workspace mutation.
-
-    ``missing`` does not claim that every mutation needs a test. It only says
-    that no recognized test/build observation has been recorded after it, which
-    lets the model decide whether to verify or to give an evidence-based reason
-    why a verifier is not applicable.
-    """
-
-    status: str
-    mutation: RuntimeActionFact | None = None
-    verification: RuntimeActionFact | None = None
-
-    def prompt_data(self) -> dict[str, object] | None:
-        if self.status == "not_applicable" or self.mutation is None:
-            return None
-        data: dict[str, object] = {
-            "status": self.status,
-            "mutation_call_id": self.mutation.call_id,
-            "mutation_tool": self.mutation.tool_name,
-        }
-        if self.verification is not None:
-            data["verification"] = self.verification.prompt_data()
         return data
 
 
@@ -246,15 +213,6 @@ def project_runtime_action_facts(
                     and not isinstance(raw_exit_code, bool) else None
                 ),
                 output_observed=data.get("output_observed") is True,
-                is_recognized_verification=(
-                    call.name == "core.run_command"
-                    and is_verification_request(call.arguments)
-                    # A command request is not a verification observation when
-                    # process preparation prevented any child from starting.
-                    # Keep this distinct from a check that ran and failed.
-                    and str(data.get("execution_state", "")).strip()
-                    != "not_started"
-                ),
             ))
     return tuple(facts)
 
@@ -299,31 +257,3 @@ def latest_failed_delivery_action(
         (fact for fact in reversed(facts) if fact.is_delivery_action), None
     )
     return latest if latest is not None and latest.can_request_recovery else None
-
-
-def post_mutation_verification_fact(
-    facts: tuple[RuntimeActionFact, ...],
-) -> PostMutationVerificationFact:
-    """Describe the latest recognized verification attempt after a mutation."""
-
-    mutation = next(
-        (
-            fact for fact in reversed(facts)
-            if fact.effect is ToolEffect.MUTATE and fact.succeeded
-        ),
-        None,
-    )
-    if mutation is None:
-        return PostMutationVerificationFact("not_applicable")
-    attempts = tuple(
-        fact for fact in facts
-        if fact.ordinal > mutation.ordinal and fact.is_recognized_verification
-    )
-    if not attempts:
-        return PostMutationVerificationFact("missing", mutation)
-    latest = attempts[-1]
-    if latest.succeeded:
-        return PostMutationVerificationFact("passed", mutation, latest)
-    if latest.failed:
-        return PostMutationVerificationFact("failed", mutation, latest)
-    return PostMutationVerificationFact("unknown", mutation, latest)

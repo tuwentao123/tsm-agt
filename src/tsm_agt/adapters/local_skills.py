@@ -127,6 +127,21 @@ class UserSkillsStore:
         finally:
             Path(temporary).unlink(missing_ok=True)
 
+    def save_disabled_builtin_skills(self, names: list[str]) -> None:
+        if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+            raise ValueError("disabled_builtin_skills 必须是名称列表")
+        data = self.settings()
+        data["disabled_builtin_skills"] = list(dict.fromkeys(names))
+        self.directory.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(dir=self.directory, prefix=".settings-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(data, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+            os.replace(temporary, self.settings_path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
     @staticmethod
     def parse(path: Path) -> Skill:
         if path.stat().st_size > 256_000:
@@ -174,6 +189,7 @@ class UserSkillsStore:
             args_schema={"type": "object", "properties": {}}, output_schema=None,
             handler=None, plan_path=str(path.resolve()), tags=tuple(tags),
             safety_level="read_only", approval_required=False,
+            source="user",
         )
 
     def discover(self) -> tuple[Skill, ...]:

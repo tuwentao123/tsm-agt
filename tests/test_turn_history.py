@@ -17,23 +17,19 @@ from tests import test_session_context as fixtures
 
 class HistoryConfigurationTest(unittest.TestCase):
     def test_default_native_and_explicit_json_override_without_policy_changes(self):
-        from pathlib import Path
         from tsm_agt.bootstrap.context_configuration import load_context_configuration, session_context_projector
-
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / ".env"
-            native = load_context_configuration(path, {})
-            baseline = load_context_configuration(path, {"TSM_AGT_SESSION_HISTORY_FORMAT": "json"})
-            self.assertEqual(session_context_projector(native).conversation_history_format, "native")
-            self.assertEqual(session_context_projector(baseline).conversation_history_format, "json")
-            self.assertEqual(native.compaction_ratio, baseline.compaction_ratio)
-            self.assertEqual(native.history_soft_tokens, 16384)
-            tuned = load_context_configuration(path, {"TSM_AGT_CONTEXT_HISTORY_SOFT_TOKENS": "2048"})
-            self.assertEqual(tuned.history_soft_tokens, 2048)
-            with self.assertRaisesRegex(ValueError, "HISTORY_SOFT_TOKENS"):
-                load_context_configuration(path, {"TSM_AGT_CONTEXT_HISTORY_SOFT_TOKENS": "-1"})
-            with self.assertRaisesRegex(ValueError, "SESSION_HISTORY_FORMAT"):
-                load_context_configuration(path, {"TSM_AGT_SESSION_HISTORY_FORMAT": "invalid"})
+        native = load_context_configuration({})
+        baseline = load_context_configuration({"session": {"history_format": "json"}})
+        self.assertEqual(session_context_projector(native).conversation_history_format, "native")
+        self.assertEqual(session_context_projector(baseline).conversation_history_format, "json")
+        self.assertEqual(native.compaction_ratio, baseline.compaction_ratio)
+        self.assertEqual(native.history_soft_tokens, 16384)
+        tuned = load_context_configuration({"context": {"history_soft_tokens": 2048}})
+        self.assertEqual(tuned.history_soft_tokens, 2048)
+        with self.assertRaisesRegex(ValueError, "history_soft_tokens"):
+            load_context_configuration({"context": {"history_soft_tokens": -1}})
+        with self.assertRaisesRegex(ValueError, "history_format"):
+            load_context_configuration({"session": {"history_format": "invalid"}})
 
 
 def result_event(sequence: int, turn: str, user: str, assistant: str) -> SessionEvent:

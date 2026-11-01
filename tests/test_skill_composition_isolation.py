@@ -1,4 +1,5 @@
 """Skill composition must respect model capabilities and isolate fixtures."""
+import asyncio
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -35,4 +36,6 @@ class SkillCompositionIsolationTest(unittest.IsolatedAsyncioTestCase):
     async def test_completed_runner_callback_is_safe_after_client_close(self):
         with TemporaryDirectory() as directory:
             client = EngineeringAgentClient(Path(directory))
-            client._runner_finished("already-closed-task")
+            finished = asyncio.get_running_loop().create_future()
+            finished.set_result(None)
+            client._runner_finished("already-closed-task", finished)
