@@ -3,14 +3,14 @@ from __future__ import annotations
 
 from dataclasses import replace
 from importlib.resources import files
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import hashlib
 import json
 
 import yaml
 
 from tsm_agt.core.skills import Skill, SkillKind, SkillRegistry
-from tsm_agt.ports.skill_files import SkillFilesPort
+from tsm_agt.ports.skill_files import SkillFilesPort, SkillResourceError, validate_skill_resource
 
 
 BUILTIN_SKILLS = {"verify-change": "verify_change"}
@@ -20,7 +20,7 @@ def _bundled_resource(folder: str, resource: str):
     root = files("tsm_agt").joinpath("bundled_skills", folder)
     if root.joinpath("SKILL.md").is_file():
         if isinstance(root, Path) and not root.joinpath(resource).resolve().is_relative_to(root.resolve()):
-            raise ValueError("Skill resource escapes its package directory")
+            raise SkillResourceError("SKILL_RESOURCE_FORBIDDEN", "Skill resource escapes its package directory", "Choose a file inside the Skill directory.")
         return root.joinpath(resource)
     # Editable/source checkouts retain the single authored source. Installed
     # wheels always take the package-resource branch, independent of cwd.
@@ -29,7 +29,7 @@ def _bundled_resource(folder: str, resource: str):
         root = checkout / "skills" / folder
         target = (root / resource).resolve()
         if not target.is_relative_to(root.resolve()):
-            raise ValueError("Skill resource escapes its source directory")
+            raise SkillResourceError("SKILL_RESOURCE_FORBIDDEN", "Skill resource escapes its source directory", "Choose a file inside the Skill directory.")
         return target
     raise FileNotFoundError("Bundled Skill resources are missing from the installation")
 
@@ -85,19 +85,18 @@ class SkillCatalog:
         return registry.list_all()
 
     def read(self, skill: Skill, resource: str = "SKILL.md") -> dict:
+        validate_skill_resource(resource)
         if skill.source != "builtin":
             data = self.user_store.read(skill, resource)
             return {**data, "source": skill.source, "overrides": list(skill.overrides)}
-        relative = PurePosixPath(resource)
-        if (not resource or relative.is_absolute() or ".." in relative.parts
-                or "\\" in resource or any(part.startswith(".") for part in relative.parts)):
-            raise ValueError("资源路径必须在 Skill 目录内，且不能包含隐藏路径")
         target = _bundled_resource(BUILTIN_SKILLS[skill.name], resource)
         if not target.is_file():
-            raise ValueError("Skill resource is not a file")
+            if target.is_dir():
+                raise SkillResourceError("SKILL_RESOURCE_NOT_FILE", "resource points to a directory, not a text file.", "Pass a complete relative file path, such as references/workflow.md.")
+            raise FileNotFoundError(f"Skill resource not found: {resource}")
         raw = target.read_bytes()
         if len(raw) > 256_000:
-            raise ValueError("Skill resource exceeds 256 KB")
+            raise SkillResourceError("SKILL_RESOURCE_TOO_LARGE", "Skill resource exceeds 256 KB", "Select a smaller reference file or split the resource before loading it.")
         return {"name": skill.name, "source": "builtin", "overrides": [],
                 "directory": f"builtin://{skill.name}",
                 "path": f"builtin://{skill.name}/{resource}",

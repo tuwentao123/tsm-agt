@@ -54,6 +54,14 @@ class MCPClient(Protocol):
     async def aclose(self) -> None: ...
 
 
+class MCPCallNotSentError(RuntimeError):
+    """The client can prove that this tools/call was not dispatched.
+
+    Other call exceptions provide no such guarantee: the server may already
+    have applied a side effect before its response was lost or rejected.
+    """
+
+
 MCPClientFactory = Callable[[MCPServerConfig], Awaitable[MCPClient]]
 
 
@@ -71,6 +79,7 @@ class MCPClientManager:
         self._clients: dict[str, MCPClient] = {}
         self._locks = {server_id: asyncio.Lock() for server_id in server_map}
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
 
     def server_ids(self) -> tuple[str, ...]:
         return tuple(self._servers)
@@ -106,10 +115,27 @@ class MCPClientManager:
             await self.get_client(server_id)
 
     async def aclose(self) -> None:
-        """Close every created transport exactly once, in reverse start order."""
-        if self._closed:
-            return
-        self._closed = True
+        """Join in-progress starts and close peers even if a caller cancels."""
+        if self._close_task is None:
+            self._closed = True
+            self._close_task = asyncio.create_task(self._close_clients())
+        cancelled = False
+        while not self._close_task.done():
+            try:
+                await asyncio.shield(self._close_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+        self._close_task.result()
+
+    async def _close_clients(self) -> None:
+        # A factory already inside get_client owns its new client until it
+        # returns. It observes _closed and disposes that client before releasing
+        # the lock. Do not report shutdown complete while that start is alive.
+        for lock in self._locks.values():
+            async with lock:
+                pass
         clients = tuple(self._clients.values())
         self._clients.clear()
         errors: list[Exception] = []
@@ -123,6 +149,7 @@ class MCPClientManager:
 
 
 __all__ = [
+    "MCPCallNotSentError",
     "MCPClient",
     "MCPClientFactory",
     "MCPClientManager",

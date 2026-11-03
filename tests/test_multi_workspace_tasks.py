@@ -176,14 +176,14 @@ class WebWorkspaceForwardingTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.web_app = importlib.import_module("tsm_agt.web.app")
         self.client = _RecordingClient()
-        self.workspace = "/tmp/AppHitchMainH5"
+        self.workspace = "/tmp/SampleWebProject"
         self._patches = [
             mock.patch.object(
                 self.web_app, "runtime_server", _RecordingServer(self.client)
             ),
             mock.patch.object(
                 self.web_app, "workspace_registry",
-                [{"id": "ws-1", "name": "AppHitchMainH5", "path": self.workspace}],
+                [{"id": "ws-1", "name": "SampleWebProject", "path": self.workspace}],
             ),
             mock.patch.object(self.web_app, "session_workspace_bindings", {}),
             mock.patch.object(self.web_app, "save_workspace_registry", lambda: None),

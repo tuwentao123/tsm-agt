@@ -1,0 +1,30 @@
+{
+  "case_id": "prompt-followup",
+  "files": {
+    "README.md": "# Prompt example\nplanning.md is consumed by prompt_loader.py at runtime.\nRun the existing prompt contract checks from the project root:\n{{PYTHON}} -m unittest test_flow\n",
+    "planning.md": "<!-- prompt: planning -->\n# Planning\nUse core.todo_list to coordinate work.\n\n<!-- prompt: response -->\nKeep responses concise.\n",
+    "prompt_loader.py": "from pathlib import Path\nimport re\n\n\ndef load_sections():\n    text = Path('planning.md').read_text()\n    markers = list(re.finditer(r'^<!-- prompt: ([a-z-]+) -->$', text, re.M))\n    sections = {}\n    for index, marker in enumerate(markers):\n        name = marker.group(1)\n        if name in sections:\n            raise ValueError('duplicate section')\n        end = markers[index + 1].start() if index + 1 < len(markers) else len(text)\n        sections[name] = text[marker.end():end].strip()\n    return sections\n",
+    "test_flow.py": "import unittest\nfrom prompt_loader import load_sections\n\n\nclass PromptContractTest(unittest.TestCase):\n    def test_planning_contract(self):\n        sections = load_sections()\n        self.assertEqual(set(sections), {'planning', 'response'})\n        planning = sections['planning'].lower()\n        self.assertIn('core.todo_list', planning)\n        self.assertIn('basic tool', planning)\n        self.assertIn('not a skill', planning)\n        self.assertEqual(sections['response'], 'Keep responses concise.')\n"
+  },
+  "editable_files": [
+    "planning.md"
+  ],
+  "preserve_files": [
+    "README.md",
+    "prompt_loader.py",
+    "test_flow.py"
+  ],
+  "history": [
+    {
+      "user": "想把 todo 的定位讲清楚，避免把它当成需要安装的 Skill。",
+      "assistant": "在 planning.md 的 Planning 段落明确：core.todo_list 是 Runtime 提供的基础工具，用英文 basic tool 和 not a Skill 表达；保留其他提示词段落以及加载方式。"
+    }
+  ],
+  "history_padding_rounds": 0,
+  "behavior_change": true,
+  "turns": [
+    {
+      "input": "直接一次性改完吧"
+    }
+  ]
+}

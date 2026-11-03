@@ -13,6 +13,39 @@ from typing import Protocol
 from .adapter import RuntimeAdapter
 
 
+PROCESS_OUTPUT_PAGE_BYTES = 16_000
+
+
+def process_output_page(output: Mapping[str, object], cursor: int = 0) -> dict[str, object]:
+    """A recoverable page of retained, decoded UTF-8 process text.
+
+    Capture limits and display pages are distinct. Cursors address the retained
+    text, so callers can read the remainder without rerunning the command.
+    """
+    text = output.get("text", "")
+    if not isinstance(text, str):
+        raise ValueError("process output text must be a string")
+    raw = text.encode("utf-8")
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or not 0 <= cursor <= len(raw):
+        raise ValueError("log cursor is outside the retained output")
+    if cursor < len(raw) and raw[cursor] & 0xC0 == 0x80:
+        raise ValueError("log cursor must be at a UTF-8 character boundary")
+    end = min(len(raw), cursor + PROCESS_OUTPUT_PAGE_BYTES)
+    while end < len(raw) and raw[end] & 0xC0 == 0x80:
+        end -= 1
+    has_more = end < len(raw)
+    capture_truncated = bool(output.get("truncated", False))
+    return {
+        "text": raw[cursor:end].decode("utf-8"),
+        "cursor": cursor, "next_cursor": end,
+        "cursor_unit": "retained_utf8_text_bytes",
+        "retained_bytes": len(raw),
+        "total_bytes": output.get("total_bytes", len(raw)),
+        "has_more": has_more, "retention_truncated": capture_truncated,
+        "truncated": has_more or capture_truncated,
+    }
+
+
 class ProcessExitStatus(StrEnum):
     EXITED = "exited"
     CANCELLED = "cancelled"

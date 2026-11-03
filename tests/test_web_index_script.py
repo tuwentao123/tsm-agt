@@ -112,3 +112,31 @@ def test_unfinished_turn_trace_is_a_sibling_of_its_input_bubble() -> None:
     assert "inputTrace = document.createElement('div');" in source
     assert "inputTrace.className = 'turn-trace';" in source
     assert "if (inputTrace) chatArea.appendChild(inputTrace);" in source
+
+
+def test_composer_suggest_menu_lists_available_skills() -> None:
+    """Typing "/skill" must offer discovered Skills from the settings API."""
+
+    source = _index_html_source()
+
+    assert "{ prefix: '/skill ', label: '/skill <名称>'" in source
+    assert "const SKILL_MENU_PREFIX = '/skill';" in source
+    assert "async function loadSkillMenuSkills() {" in source
+    assert "const response = await fetch('/settings/skills');" in source
+    assert "const matched = skillMenuSkills.filter(skill => !needle" in source
+    assert "skill.name.toLowerCase().includes(needle)" in source
+    # 选中 Skill 后插入的是让模型先读 SKILL.md 的引用句，而不是立即执行。
+    assert "function skillMentionText(name) {" in source
+    assert "使用 Skill「${name}」：先用 skill.load 读取 SKILL.md" in source
+    assert "applySkillMention(entry.skill, input);" in source
+
+
+def test_composer_suggest_menu_uses_the_rendered_entry_list() -> None:
+    """Arrow keys and Enter must follow the visible list, not the raw command array."""
+
+    source = _index_html_source()
+
+    assert "slashMenuItems = resolveSlashMenuItems(anchorInput.value);" in source
+    assert "const total = slashMenuItems.length;" in source
+    assert "const entry = slashMenuItems[slashMenuActiveIndex];" in source
+    assert "applySlashMenuItem(entry, anchorInput);" in source

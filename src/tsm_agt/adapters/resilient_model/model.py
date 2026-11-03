@@ -53,6 +53,26 @@ class ResilientModelProvider:
     async def start(self, context: AdapterContext) -> None:
         await self._provider.start(context)
 
+    def capabilities_for(self, profile_id=None):
+        lookup = getattr(self._provider, "capabilities_for", None)
+        return lookup(profile_id) if lookup else self.capabilities
+
+    def resolve_profile(self, profile_id=None):
+        lookup = getattr(self._provider, "resolve_profile", None)
+        if lookup:
+            return lookup(profile_id)
+        if profile_id is not None:
+            raise ValueError("this model provider has no selectable profiles")
+        return None
+
+    def profile_catalog(self):
+        lookup = getattr(self._provider, "profile_catalog", None)
+        return lookup() if lookup else {"default_profile": None, "profiles": []}
+
+    def profile_fingerprint(self, profile_id=None):
+        lookup = getattr(self._provider, "profile_fingerprint", None)
+        return lookup(profile_id) if lookup else None
+
     async def health(self) -> HealthStatus:
         return await self._provider.health()
 

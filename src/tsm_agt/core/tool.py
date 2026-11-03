@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import lru_cache
+import json
 from typing import Any
+
+from jsonschema import Draft202012Validator, SchemaError, ValidationError
+from jsonschema.validators import validator_for
+from referencing import Registry
+from referencing.exceptions import Unresolvable
 
 from tsm_agt.ports import ToolSpec
 
@@ -25,23 +32,30 @@ class InvalidToolResult(ValueError):
 
 
 def validate_tool_arguments(spec: ToolSpec, arguments: Mapping[str, Any]) -> None:
-    """Validate the dependency-free JSON Schema subset supported by the MVP."""
+    """Enforce the advertised schema locally, without fetching external $refs.
 
-    schema = spec.parameters
-    properties = schema.get("properties", {})
-    if not isinstance(properties, Mapping):
-        raise InvalidToolArguments(f"{spec.name} has an invalid properties schema")
-    required = schema.get("required", ())
-    if not isinstance(required, (list, tuple)) or not all(
-        isinstance(name, str) for name in required
-    ):
-        raise InvalidToolArguments(f"{spec.name} has an invalid required schema")
+    Provider strict mode is optional; nested constraints must hold regardless
+    of the model or transport. JSON Schema defaults remain annotations, never
+    implicit argument rewrites. Format is annotation-only unless a tool checks it.
+    """
 
-    missing = [name for name in required if name not in arguments]
-    if missing:
+    try:
+        validator = _argument_validator(json.dumps(dict(spec.parameters), sort_keys=True))
+        error = next(validator.iter_errors(dict(arguments)), None)
+    except (SchemaError, Unresolvable, TypeError, ValueError) as error:
         raise InvalidToolArguments(
-            f"{spec.name} is missing required arguments: {', '.join(missing)}"
+            f"{spec.name} has an invalid or unresolved parameter schema; "
+            "external schema references are not fetched"
+        ) from error
+    if error is not None:
+        path = "arguments" + "".join(
+            f"[{part}]" if isinstance(part, int) else f".{part}"
+            for part in error.absolute_path
         )
+        detail = _argument_error_detail(error)
+        description = error.schema.get("description", "") if isinstance(error.schema, Mapping) else ""
+        guidance = f" {description[:600]}" if isinstance(description, str) and description else ""
+        raise InvalidToolArguments(f"{spec.name} {path}: {detail}.{guidance}")
     if spec.name == "core.read_file":
         supplied = sum(
             isinstance(arguments.get(name), str)
@@ -53,30 +67,29 @@ def validate_tool_arguments(spec: ToolSpec, arguments: Mapping[str, Any]) -> Non
                 "core.read_file requires exactly one of path or resource_ref"
             )
 
-    if schema.get("additionalProperties") is False:
-        unknown = sorted(set(arguments) - set(properties))
-        if unknown:
-            raise InvalidToolArguments(
-                f"{spec.name} received unknown arguments: {', '.join(unknown)}"
-            )
 
-    type_checks = {
-        "string": lambda value: isinstance(value, str),
-        "integer": lambda value: isinstance(value, int) and not isinstance(value, bool),
-        "number": lambda value: isinstance(value, (int, float))
-        and not isinstance(value, bool),
-        "boolean": lambda value: isinstance(value, bool),
-        "object": lambda value: isinstance(value, Mapping),
-        "array": lambda value: isinstance(value, (list, tuple)),
-        "null": lambda value: value is None,
-    }
-    for name, value in arguments.items():
-        property_schema = properties.get(name)
-        if not isinstance(property_schema, Mapping):
-            continue
-        expected = property_schema.get("type")
-        check = type_checks.get(expected)
-        if check is not None and not check(value):
-            raise InvalidToolArguments(
-                f"{spec.name} argument {name!r} must be {expected}"
-            )
+@lru_cache(maxsize=256)
+def _argument_validator(serialized_schema: str):
+    schema = json.loads(serialized_schema)
+    validator_type = validator_for(schema, default=Draft202012Validator)
+    validator_type.check_schema(schema)
+    return validator_type(schema, registry=Registry())
+
+
+def _argument_error_detail(error: ValidationError) -> str:
+    """Describe the violated rule without echoing potentially sensitive values."""
+    rule, expected = error.validator, error.validator_value
+    if rule == "required":
+        missing = [name for name in expected if name not in error.instance]
+        return "missing required arguments: " + ", ".join(missing)
+    if rule == "type":
+        return f"must be {expected}"
+    if rule in {"enum", "const"}:
+        return f"must match {rule} {json.dumps(expected, ensure_ascii=False)}"
+    if rule in {"minLength", "maxLength"}:
+        return f"must contain {'at least' if rule == 'minLength' else 'at most'} {expected} characters"
+    if rule == "pattern":
+        return f"must match pattern {expected}"
+    if rule == "additionalProperties":
+        return "contains unknown arguments not allowed by additionalProperties"
+    return f"must satisfy {rule}={json.dumps(expected, ensure_ascii=False)}"

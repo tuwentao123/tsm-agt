@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator, Mapping
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
+from tsm_agt.ports.model import ReasoningBlock
 
 from tsm_agt.adapters.http_json import (
     HttpJsonTransport,
@@ -88,6 +89,8 @@ class AnthropicMessagesModelProvider:
         timeout_seconds: float = 60.0,
         streaming: bool = True,
         transport: HttpJsonTransport | None = None,
+        reasoning_effort: str | None = None,
+        request_parameters: Mapping[str, object] | None = None,
     ) -> None:
         normalized_url = base_url.strip().rstrip("/")
         if not normalized_url.startswith(("https://", "http://")):
@@ -106,6 +109,9 @@ class AnthropicMessagesModelProvider:
         self._anthropic_version = anthropic_version.strip()
         self._timeout_seconds = timeout_seconds
         self._streaming = streaming
+        import copy
+        self._reasoning_effort = reasoning_effort
+        self._request_parameters = copy.deepcopy(dict(request_parameters or {}))
         self._transport = transport or UrllibHttpJsonTransport()
         self._started = False
         capabilities = {"text", "tools", "vision"}
@@ -121,6 +127,7 @@ class AnthropicMessagesModelProvider:
         self.capabilities = ProviderCapabilities(
             tools=True,
             parallel_tools=True,
+            reasoning_blocks=True, prompt_cache=True,
             vision=True,
             stream_cancel=streaming,
             context_window=200_000,
@@ -215,6 +222,8 @@ class AnthropicMessagesModelProvider:
                 block_type = block.get("type")
                 if block_type == "text":
                     tool_parts[index] = {"type": "text"}
+                elif block_type in {"thinking", "redacted_thinking"}:
+                    tool_parts[index] = dict(block)
                 elif block_type == "tool_use":
                     tool_parts[index] = {
                         "type": "tool_use",
@@ -233,6 +242,14 @@ class AnthropicMessagesModelProvider:
                 if not isinstance(index, int) or not isinstance(delta, Mapping):
                     raise ModelProviderTransportError("invalid content_block_delta")
                 delta_type = delta.get("type")
+                if delta_type in {"thinking_delta", "signature_delta"}:
+                    aggregate = tool_parts.get(index)
+                    if not aggregate or aggregate.get("type") != "thinking":
+                        raise ModelProviderTransportError("thinking delta without thinking block")
+                    key = "thinking" if delta_type == "thinking_delta" else "signature"
+                    if not isinstance(delta.get(key), str):
+                        raise ModelProviderTransportError("invalid thinking delta")
+                    aggregate[key] = str(aggregate.get(key, "")) + delta[key]
                 if delta_type == "text_delta":
                     text = delta.get("text")
                     if not isinstance(text, str):
@@ -271,7 +288,10 @@ class AnthropicMessagesModelProvider:
                 retry_safety=ModelRetrySafety.SAFE_RESAMPLE,
                 reason_code="incomplete_anthropic_stream",
             )
-        content: list[dict[str, Any]] = [{"type": "text", "text": "".join(text_parts)}]
+        content: list[dict[str, Any]] = [dict(value) for _, value in sorted(tool_parts.items())
+                                        if value.get("type") in {"thinking", "redacted_thinking"}]
+        if text_parts:
+            content.append({"type": "text", "text": "".join(text_parts)})
         for _, value in sorted(tool_parts.items()):
             if value.get("type") != "tool_use":
                 continue
@@ -357,9 +377,19 @@ class AnthropicMessagesModelProvider:
 
         payload: dict[str, Any] = {
             "model": self._model,
-            "max_tokens": request.max_output_tokens,
+            "max_tokens": request.max_output_tokens or 8192,
             "messages": messages,
         }
+        import copy
+        payload.update(copy.deepcopy(self._request_parameters))
+        effort = request.reasoning_effort or self._reasoning_effort
+        if effort is not None:
+            if effort == "none":
+                payload["thinking"] = {"type": "disabled"}
+                payload.pop("output_config", None)
+            else:
+                payload.setdefault("thinking", {"type": "adaptive"})
+                payload["output_config"] = {"effort": effort}
         if system:
             # aibrain's Anthropic Messages gateway documents `system` as a
             # string. Keep internal multiple system messages ordered, then join
@@ -404,6 +434,11 @@ class AnthropicMessagesModelProvider:
         for block in message.content:
             if isinstance(block, TextBlock):
                 content.append({"type": "text", "text": block.text})
+            elif isinstance(block, ReasoningBlock) and block.provider == "anthropic_messages":
+                if block.kind == "thinking":
+                    content.append({"type": "thinking", "thinking": block.text, "signature": block.signature})
+                elif block.kind == "redacted_thinking":
+                    content.append({"type": "redacted_thinking", "data": block.data})
             elif isinstance(block, ImageBlock):
                 prefix, _, data = block.image_url.partition(";base64,")
                 content.append({
@@ -455,7 +490,15 @@ class AnthropicMessagesModelProvider:
             if not isinstance(block, Mapping):
                 raise ModelProviderTransportError("Anthropic content block must be an object")
             block_type = block.get("type")
-            if block_type == "text":
+            if block_type == "thinking":
+                if not isinstance(block.get("thinking"), str) or not isinstance(block.get("signature"), str):
+                    raise ModelProviderTransportError("invalid signed thinking block")
+                content.append(ReasoningBlock("anthropic_messages", "thinking", text=block["thinking"], signature=block["signature"]))
+            elif block_type == "redacted_thinking":
+                if not isinstance(block.get("data"), str):
+                    raise ModelProviderTransportError("invalid redacted thinking block")
+                content.append(ReasoningBlock("anthropic_messages", "redacted_thinking", data=block["data"]))
+            elif block_type == "text":
                 text = block.get("text")
                 if not isinstance(text, str):
                     raise ModelProviderTransportError("Anthropic text block must contain text")
@@ -500,9 +543,18 @@ class AnthropicMessagesModelProvider:
         output_tokens = usage.get("output_tokens", 0)
         if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
             raise ModelProviderTransportError("Anthropic usage tokens must be integers")
+        for key in ("cache_creation_input_tokens", "cache_read_input_tokens"):
+            cached = usage.get(key, 0)
+            if not isinstance(cached, int) or isinstance(cached, bool) or cached < 0:
+                raise ModelProviderTransportError("Anthropic cache usage tokens must be non-negative integers")
+            input_tokens += cached
         diagnostics: dict[str, object] = {}
         if isinstance(response.get("id"), str):
-            diagnostics["provider"] = {"response_id": response["id"], "model": response.get("model", "")}
+            diagnostics["provider"] = {"response_id": response["id"], "model": response.get("model", ""), "usage": {
+                key: value for key, value in usage.items()
+                if key in {"input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"}
+                and isinstance(value, int) and not isinstance(value, bool)
+            }}
         return ModelResponse(
             Message(str(response.get("id") or f"msg-{turn_id}-{uuid4().hex}"), MessageRole.ASSISTANT, tuple(content)),
             reason_map[raw_reason], ModelUsage(input_tokens, output_tokens), diagnostics,

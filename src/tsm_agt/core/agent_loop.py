@@ -306,6 +306,7 @@ class AgentTurnCheckpoint:
     #: bootstrap defaults.  The Session remains the long-lived source of
     #: truth and may be copied here when the checkpoint is bound.
     reasoning_effort: str | None = None
+    model_profile_id: str | None = None
     workspace_fingerprint: str = ""
     effective_config_hash: str = ""
     toolset_hash: str = ""
@@ -373,6 +374,7 @@ class AgentTurnCheckpoint:
                 str(data["reasoning_effort"])
                 if data.get("reasoning_effort") is not None else None
             ),
+            model_profile_id=data.get("model_profile_id"),
             checkpoint_schema_version=2,
             finalization_state=(
                 dict(data["finalization_state"])
@@ -462,6 +464,7 @@ class AgentTurnCheckpoint:
         ):
             legacy_content = checkpoint._content_data()
             evolved_fields = (
+                "model_profile_id",
                 "rejection_loop_state",
                 "model_budget_renewal_count", "model_budget_total_granted",
                 "task_spec_revision", "task_spec_hash",
@@ -498,6 +501,7 @@ class AgentTurnCheckpoint:
             "max_output_tokens": self.max_output_tokens,
             "tool_timeout_seconds": self.tool_timeout_seconds,
             "reasoning_effort": self.reasoning_effort,
+            "model_profile_id": self.model_profile_id,
             "finalization_state": dict(self.finalization_state or {}),
             "model_budget_renewal_count": self.model_budget_renewal_count,
             "model_budget_total_granted": self.model_budget_total_granted,

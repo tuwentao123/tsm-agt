@@ -19,7 +19,7 @@ from .context_messages import is_execution_context, is_generated_context
 _PROMPT_MARKER = re.compile(r"^<!-- prompt: ([a-z0-9-]+) -->$", re.MULTILINE)
 _PROMPT_FILES = (
     "base.md", "communication.md", "workspace.md", "external.md",
-    "coordination.md",
+    "tool_coordination.md", "coordination.md",
 )
 
 
@@ -174,7 +174,7 @@ class PromptTemplate:
         prompt_text = _load_prompt_text()
         template = cls(
             manifest_id="builtin.engineering-agent",
-            revision=55,
+            revision=58,
             static_segments=(
                 PromptTemplateSegment(
                     "system-safety", "core", "1.0",
@@ -184,7 +184,7 @@ class PromptTemplate:
                 # the only place that says how a request becomes an answer, so a
                 # capability-gated segment never has to carry routing rules.
                 PromptTemplateSegment(
-                    "request-pipeline-guidance", "harness", "5.6",
+                    "request-pipeline-guidance", "harness", "5.7",
                     prompt_text["request-pipeline-guidance"],
                 ),
                 # This is deliberately a stable, tool-capability-gated contract:
@@ -192,7 +192,7 @@ class PromptTemplate:
                 # work from its full conversational context.  Runtime does not
                 # classify user text or inject a per-turn implementation label.
                 PromptTemplateSegment(
-                    "delivery-mode-guidance", "harness", "5.3",
+                    "delivery-mode-guidance", "harness", "5.4",
                     prompt_text["delivery-mode-guidance"],
                     requires_any_tools=(
                         "core.apply_patch", "core.apply_patch_v4a",
@@ -200,7 +200,7 @@ class PromptTemplate:
                     ),
                 ),
                 PromptTemplateSegment(
-                    "skill-workflow-guidance", "harness", "1.0",
+                    "skill-workflow-guidance", "harness", "1.1",
                     prompt_text["skill-workflow-guidance"],
                     requires_any_tools=("skill.load",),
                 ),
@@ -233,7 +233,7 @@ class PromptTemplate:
                     requires_any_tools=("core.search_files",),
                 ),
                 PromptTemplateSegment(
-                    "workspace-read-guidance", "harness", "1.1",
+                    "workspace-read-guidance", "harness", "1.2",
                     prompt_text["workspace-read-guidance"],
                     requires_any_tools=("core.read_file", "core.search_files"),
                 ),
@@ -285,9 +285,13 @@ class PromptTemplate:
                     requires_any_tools=("core.working_memory_update",),
                 ),
                 PromptTemplateSegment(
-                    "task-plan-guidance", "harness", "4.2",
+                    "task-plan-guidance", "harness", "4.3",
                     prompt_text["task-plan-guidance"],
                     requires_any_tools=("core.todo_list",),
+                ),
+                PromptTemplateSegment(
+                    "reply-style-overview", "core", "1.0",
+                    prompt_text["reply-style-overview"],
                 ),
             ),
         )

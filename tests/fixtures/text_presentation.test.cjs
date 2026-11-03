@@ -5,6 +5,16 @@ const {test} = require('node:test');
 const page = fs.readFileSync(process.env.TSM_SKILL_TEST_SCRIPT, 'utf8');
 const helpers = page.slice(page.indexOf('const TERMINAL_STATES ='), page.indexOf('function renderTurnMarker('));
 
+test('context overflow from tool output does not blame image attachments', () => {
+  const context = vm.createContext({});
+  vm.runInContext(page.slice(page.indexOf('function describeFailure('), page.indexOf('function describeProgress(')), context);
+  const message = context.describeFailure('context cannot fit after safe compaction: estimated_input=219318, hard_input=119808; allocations: current_turn_and_tool_protocol=186570');
+  assert.match(message, /工具输出/);
+  assert.doesNotMatch(message, /缩小图片/);
+  assert.match(message, /未发送给模型/);
+  assert.equal(context.describeFailure('unrelated failure'), 'unrelated failure');
+});
+
 function setup() {
   const conversation = {messages: []}, frames = [], nodes = new Map();
   let rebuilds = 0, time = 0;

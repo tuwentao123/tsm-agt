@@ -112,10 +112,14 @@ class ReasoningBlock:
     text: str = ""
     signature: str = ""
     data: str = ""
+    model_profile_id: str | None = None
 
     def to_data(self) -> dict[str, str]:
-        return {"type": "reasoning", "provider": self.provider, "kind": self.kind,
-                "text": self.text, "signature": self.signature, "data": self.data}
+        result = {"type": "reasoning", "provider": self.provider, "kind": self.kind,
+                  "text": self.text, "signature": self.signature, "data": self.data}
+        if self.model_profile_id is not None:
+            result["model_profile_id"] = self.model_profile_id
+        return result
 
 
 IMAGE_DETAIL_LEVELS = ("auto", "low", "high")
@@ -308,6 +312,7 @@ class Message:
                     text=str(raw_block.get("text", "")),
                     signature=str(raw_block.get("signature", "")),
                     data=str(raw_block.get("data", "")),
+                    model_profile_id=raw_block.get("model_profile_id"),
                 ))
             elif block_type == "input_image":
                 blocks.append(ImageBlock(
@@ -418,6 +423,7 @@ class ModelRequest:
     # This is a process-local hint, not part of the durable checkpoint wire,
     # and may be ignored by adapters that do not support reasoning controls.
     reasoning_effort: str | None = None
+    model_profile_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

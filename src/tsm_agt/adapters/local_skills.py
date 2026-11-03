@@ -6,12 +6,14 @@ import json
 import os
 import re
 import tempfile
+import stat
 from pathlib import Path, PurePosixPath
 from collections.abc import Mapping
 
 import yaml
 
 from tsm_agt.core.skills import Skill, SkillKind, SkillRegistry
+from tsm_agt.ports.skill_files import SkillResourceError, validate_skill_resource
 from datetime import datetime, timezone
 from threading import RLock
 from uuid import uuid4
@@ -306,20 +308,19 @@ class UserSkillsStore:
         return self.install_upload(files)
 
     def read(self, skill: Skill, resource: str = "SKILL.md") -> dict:
+        validate_skill_resource(resource)
         if not skill.plan_path:
             raise ValueError("Skill has no instruction file")
         manifest = Path(skill.plan_path)
         root = manifest.parent.resolve()
-        relative = PurePosixPath(resource)
-        if relative.is_absolute() or ".." in relative.parts or "\\" in resource:
-            raise ValueError("资源路径必须在 Skill 目录内")
-        if any(part.startswith(".") for part in relative.parts):
-            raise ValueError("不能读取隐藏的 Skill 资源")
         target = (root / resource).resolve()
         if not target.is_relative_to(root):
-            raise ValueError("资源路径超出 Skill 目录")
-        if target.stat().st_size > 256_000:
-            raise ValueError("资源超过 256 KB，请拆分后读取")
+            raise SkillResourceError("SKILL_RESOURCE_FORBIDDEN", "resource resolves outside the Skill directory.", "Choose a file inside the Skill directory; escaped symlinks are not allowed.")
+        info = target.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise SkillResourceError("SKILL_RESOURCE_NOT_FILE", "resource must be a regular text file, not a directory or special file.", "Pass a complete relative file path within this Skill.")
+        if info.st_size > 256_000:
+            raise SkillResourceError("SKILL_RESOURCE_TOO_LARGE", "Skill resource exceeds 256 KB", "Select a smaller reference file or split the resource before loading it.")
         return {
             "name": skill.name, "directory": str(root), "path": str(target),
             "content": target.read_text(encoding="utf-8"),

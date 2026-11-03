@@ -102,6 +102,7 @@ class SessionSnapshot:
     #: source of truth; the Kernel may cache a per-session view in the
     #: SkillRegistry.
     enabled_skills: tuple[str, ...] = ()
+    model_profile_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.session_id.strip() or not self.subject.strip() or not self.title.strip():
@@ -245,6 +246,7 @@ class SessionSnapshot:
             # Session-level reasoning effort is optional and may be absent in
             # older snapshots; persistence always writes the explicit key.
             "reasoning_effort": self.reasoning_effort,
+            "model_profile_id": self.model_profile_id,
             # Session-wide skill configuration. Older snapshots may not carry
             # this key; persistence always writes an explicit list.
             "enabled_skills": list(self.enabled_skills),
@@ -295,6 +297,7 @@ class SessionSnapshot:
             enabled_skills=tuple(
                 str(skill_id) for skill_id in data.get("enabled_skills", [])
             ),
+            model_profile_id=data.get("model_profile_id"),
         )
         if data.get("context_hash") and str(data["context_hash"]) != snapshot.context_hash:
             raise ValueError("session context hash does not match")

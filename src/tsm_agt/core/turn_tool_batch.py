@@ -885,6 +885,9 @@ async def _run_tool_call(
             toolset_hash=state.checkpoint.toolset_hash,
             prompt_manifest_hash=state.checkpoint.prompt_manifest_hash,
             session_id=state.checkpoint.session_id,
+            model_profile_id=state.checkpoint.model_profile_id,
+            reasoning_effort=state.checkpoint.reasoning_effort,
+            enabled_skills=state.checkpoint.enabled_skills,
             session_context_hash=state.checkpoint.session_context_hash,
             working_memory_hash=state.checkpoint.working_memory_hash,
             last_steering_inbound_sequence=(

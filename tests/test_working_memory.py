@@ -51,8 +51,8 @@ def working_state(goal: str = "Ship the feature") -> dict[str, object]:
 
 class WorkingMemoryModel(EchoModelProvider):
     # This fixture checks scratchpad continuity, not a minimum context window.
-    # Allow the protected prompt, tool schemas, tool result and projected notes.
-    capabilities = ProviderCapabilities(tools=True, context_window=8192)
+    # Allow the registered reply-style prompt, schemas, results and notes.
+    capabilities = ProviderCapabilities(tools=True, context_window=16_384)
     descriptor = AdapterDescriptor(
         "fixture.working-memory-model", "1.0", "ModelProviderPort", "1.0"
     )

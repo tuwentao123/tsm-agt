@@ -11,6 +11,7 @@ from tsm_agt.ports import (
     AdapterDescriptor,
     HealthState,
     HealthStatus,
+    MCPCallNotSentError,
     MCPClientManager,
     ModelToolContract,
     ToolCall,
@@ -58,8 +59,11 @@ class MCPToolProvider(ToolProviderPort):
             await self._manager.ensure_all_started()
             self._tools = await self._discover_tools()
             self._started = True
-        except BaseException:
-            await self._manager.aclose()
+        except BaseException as error:
+            try:
+                await self._manager.aclose()
+            except Exception as cleanup_error:
+                error.add_note(f"MCP startup cleanup also failed: {type(cleanup_error).__name__}")
             raise
 
     async def health(self) -> HealthStatus:
@@ -109,7 +113,6 @@ class MCPToolProvider(ToolProviderPort):
             )
         try:
             client = await self._manager.get_client(server_id)
-            raw_result = await client.call_tool(tool_name, call.arguments)
         except KeyError:
             return _error(
                 call, "MCP_SERVER_NOT_CONFIGURED",
@@ -119,14 +122,42 @@ class MCPToolProvider(ToolProviderPort):
             )
         except Exception as error:
             return _error(
-                call, "MCP_TRANSPORT_ERROR",
-                f"MCP server '{server_id}' could not run '{tool_name}': {type(error).__name__}: {error}",
+                call, "MCP_CONNECTION_ERROR",
+                f"MCP server '{server_id}' connection is unavailable; '{tool_name}' was not dispatched ({type(error).__name__})",
                 retryable=True,
                 recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
             )
 
-        result_data = _json_data(raw_result)
-        is_error = _mcp_result_is_error(raw_result, result_data)
+        try:
+            raw_result = await client.call_tool(tool_name, call.arguments)
+            result_data = _json_data(raw_result)
+            is_error = _mcp_result_is_error(raw_result, result_data)
+        except MCPCallNotSentError:
+            return _error(
+                call, "MCP_CALL_NOT_SENT",
+                f"MCP server '{server_id}' connection is unavailable; '{tool_name}' was not dispatched",
+                retryable=True,
+                recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+            )
+        except Exception as error:
+            # SDK exceptions include read timeouts, lost responses and output
+            # validation failures *after* a server may have executed the call.
+            # All currently advertised MCP tools are non-idempotent. Only an
+            # explicit not-sent guarantee can avoid uncertainty here.
+            return ToolResult(
+                call_id=call.call_id,
+                ok=False,
+                error_code="UNKNOWN_OUTCOME",
+                message=(
+                    f"MCP tool '{call.name}' may have executed, but no trustworthy "
+                    "final result was received. Do not repeat the operation "
+                    "before checking the target system."
+                ),
+                hint="Inspect the target system before deciding whether to retry.",
+                retryable=False,
+                recovery_kind=ToolRecoveryKind.UNKNOWN_OUTCOME,
+                meta={"untrusted_data": True, "error_type": type(error).__name__},
+            )
         fact = ToolFactDescriptor(
             authority=ToolResultAuthority.EXTERNAL_SERVICE,
             scope=(f"mcp_server:{server_id}", f"mcp_tool:{tool_name}"),

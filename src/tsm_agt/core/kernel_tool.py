@@ -67,6 +67,7 @@ from tsm_agt.ports import (
     ToolSpec, ToolTaskSpecControl,
     ToolWorkingMemoryControl, ToolWorkspaceControl,
 )
+from tsm_agt.ports.process import process_output_page
 
 
 # ``core.process_wait`` has its own bounded observation window.  The outer
@@ -272,26 +273,37 @@ class _TaskProcessControl(ToolProcessControl):
     async def logs(
         self, process_id: str, stdout_cursor: int, stderr_cursor: int
     ) -> Mapping[str, Any]:
-        logs = await self.kernel.read_background_process_logs(
-            await self._owner(process_id), process_id,
-            stdout_cursor=stdout_cursor, stderr_cursor=stderr_cursor,
-        )
-        return {
-            "process_id": process_id,
-            "output_observed": True,
-            "stdout": {
-                "text": logs.stdout.text, "cursor": logs.stdout.cursor,
-                "next_cursor": logs.stdout.next_cursor,
-                "total_bytes": logs.stdout.total_bytes,
-                "truncated": logs.stdout.truncated,
-            },
-            "stderr": {
-                "text": logs.stderr.text, "cursor": logs.stderr.cursor,
-                "next_cursor": logs.stderr.next_cursor,
-                "total_bytes": logs.stderr.total_bytes,
-                "truncated": logs.stderr.truncated,
-            },
-        }
+        for task in await self._accessible_tasks():
+            record = task.background_processes.get(process_id)
+            if record is not None:
+                try:
+                    # Tool cursors address decoded UTF-8 text, independently of
+                    # an executor's raw-byte buffers or retention policy.
+                    logs = await self.kernel.read_background_process_logs(task.task_id, process_id)
+                    return {
+                        "process_id": process_id, "output_observed": True,
+                        "stdout": process_output_page({"text": logs.stdout.text, "total_bytes": logs.stdout.total_bytes,
+                                                       "truncated": logs.stdout.truncated}, stdout_cursor),
+                        "stderr": process_output_page({"text": logs.stderr.text, "total_bytes": logs.stderr.total_bytes,
+                                                       "truncated": logs.stderr.truncated}, stderr_cursor),
+                    }
+                except LookupError:
+                    if not record.state.is_terminal:
+                        raise
+            # Foreground output, and completed background output after a
+            # restart, is already retained in the owning Task's event ledger.
+            events = await self.kernel._dependencies.store.read_events(
+                task.task_id, event_types=("process.exited", "process.cancelled"),
+            )
+            terminal = next((event for event in reversed(events)
+                             if event.payload.get("process_id") == process_id), None)
+            if terminal is not None:
+                return {
+                    "process_id": process_id, "output_observed": True,
+                    "stdout": process_output_page(terminal.payload.get("stdout", {}), stdout_cursor),
+                    "stderr": process_output_page(terminal.payload.get("stderr", {}), stderr_cursor),
+                }
+        raise LookupError("process output not found in this session")
 
     async def stop(
         self, process_id: str, grace_seconds: float
@@ -1876,7 +1888,15 @@ class ToolMixin:
         if after_tool is None:
             raise TaskNotFound(f"task disappeared during tool invocation: {task_id}")
         current_task = TaskSnapshot.from_data(after_tool.data)
-        if (
+        if not result.ok and result.effective_recovery_kind is ToolRecoveryKind.UNKNOWN_OUTCOME:
+            # Providers can detect uncertain dispatch independently of the
+            # outer deadline (e.g. an MCP response lost after a write).
+            commit_state = ToolCommitState.UNKNOWN_OUTCOME
+            result = replace(
+                result, error_code="UNKNOWN_OUTCOME", retryable=False,
+                recovery_kind=ToolRecoveryKind.UNKNOWN_OUTCOME,
+            )
+        elif (
             not result.ok
             and result.error_code == "TIMEOUT"
             and selected_spec.idempotency is ToolIdempotency.NON_IDEMPOTENT

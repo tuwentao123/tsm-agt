@@ -43,7 +43,7 @@ ALL_SEGMENTS = [
     "runtime-fact-routing",
     # Layer 4: call mechanics, working memory, plan bookkeeping.
     "parallel-tool-call-guidance", "working-memory-guidance",
-    "task-plan-guidance",
+    "task-plan-guidance", "reply-style-overview",
 ]
 
 
@@ -118,7 +118,7 @@ class PromptManifestTest(unittest.TestCase):
         # Pin content, ordering, section versions and capability gates together.
         self.assertEqual(
             self.template.manifest().manifest_hash,
-            "c17b9c9732896f7e1109f6e60a43a4fa82913a8925fd8ffd0294067c31fe09e2",
+            "c97e7dd2751d3a6f2afc0eefb8d38955dd8414820065252570f945dfdce33565",
         )
 
     def test_packaged_prompt_rejects_duplicate_sections(self) -> None:
@@ -136,6 +136,16 @@ class PromptManifestTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "duplicate packaged prompt section"):
                 prompt._load_prompt_text()
 
+    def test_reply_style_is_registered_without_losing_tool_coordination(self) -> None:
+        style = self.segment("reply-style-overview")
+        self.assertIn('"operation handbook" style', style.content)
+        self.assertIn("操作步骤（Steps）", style.content)
+        self.assertEqual(style.version, "1.0")
+        self.assertEqual(style.requires_any_tools, ())
+        rendered = "\n".join(message.text for message in self.template.assemble((self.user,), ()).messages)
+        self.assertIn(style.content, rendered)
+        self.assertIn("issue them together", self.segment("parallel-tool-call-guidance").content)
+
     def test_assembly_preserves_trust_roles_and_ignores_message_id(self) -> None:
         first = self.template.assemble((self.user,), ())
         same_content = Message(
@@ -148,7 +158,7 @@ class PromptManifestTest(unittest.TestCase):
             [
                 MessageRole.SYSTEM, MessageRole.SYSTEM, MessageRole.SYSTEM,
                 MessageRole.SYSTEM, MessageRole.SYSTEM, MessageRole.SYSTEM,
-                MessageRole.SYSTEM,
+                MessageRole.SYSTEM, MessageRole.SYSTEM,
                 MessageRole.USER,
             ],
         )
@@ -178,7 +188,7 @@ class PromptManifestTest(unittest.TestCase):
         runtime_id = f"prompt-runtime-r{self.template.revision}"
         self.assertLess(ids.index("project-instructions-context-project"), ids.index(runtime_id))
         self.assertLess(ids.index("task-spec-context-task"), ids.index(runtime_id))
-        self.assertEqual(assembled.receipt.static_segment_count, 7)
+        self.assertEqual(assembled.receipt.static_segment_count, 8)
 
     def test_cache_fingerprints_distinguish_order_from_dynamic_messages(self) -> None:
         tools = (tool("fixture.first"), tool("fixture.second"))
@@ -244,7 +254,7 @@ class PromptManifestTest(unittest.TestCase):
             data["prompt_role_order"],
             [
                 "system", "system", "system", "system", "system", "system",
-                "system", "user",
+                "system", "system", "user",
             ],
         )
         self.assertNotIn("inspect the project", str(data))
@@ -296,7 +306,7 @@ class PromptManifestTest(unittest.TestCase):
     def test_request_pipeline_orders_understanding_before_tools(self) -> None:
         segment = self.segment("request-pipeline-guidance")
         content = segment.content
-        self.assertEqual(segment.version, "5.6")
+        self.assertEqual(segment.version, "5.7")
         headings = ["# Working with the user", "# Evidence and action", "# Persistence and completion", "# Progress communication"]
         positions = [content.index(h) for h in headings]
         self.assertEqual(positions, sorted(positions))
@@ -341,12 +351,12 @@ class PromptManifestTest(unittest.TestCase):
         self.assertEqual(segment.version, "1.0")
         for scenario in ("news", "headline", "article", "financial", "新闻"):
             self.assertNotIn(scenario, content)
-        self.assertEqual(self.template.revision, 55)
+        self.assertEqual(self.template.revision, 58)
 
     def test_workspace_guidance_is_capability_bound(self) -> None:
         search = self.segment("workspace-search-guidance").content
         read = self.segment("workspace-read-guidance").content
-        self.assertEqual(self.segment("workspace-read-guidance").version, "1.1")
+        self.assertEqual(self.segment("workspace-read-guidance").version, "1.2")
         self.assertIn("reused_from_call_id", read)
         self.assertIn("reference itself is not file text", read)
         self.assertIn("body is unavailable, read the needed range again", read)
@@ -379,8 +389,8 @@ class PromptManifestTest(unittest.TestCase):
 
     def test_delivery_guidance_is_static_and_requires_a_write_tool(self) -> None:
         segment = self.segment("delivery-mode-guidance")
-        self.assertEqual(segment.version, "5.3")
-        for boundary in ("carry out the edits now", "interface wiring", "receipt is not proof", "smallest sufficient verification", "after the last relevant edit", "not mandatory runtime tests", "do not repeat passing checks", "independent compilation", "never present unperformed or unverified work as done"):
+        self.assertEqual(segment.version, "5.4")
+        for boundary in ("carry out the edits now", "interface wiring", "receipt is not proof", "smallest sufficient verification", "After the last relevant edit", "not mandatory runtime tests", "do not repeat passing checks", "independent compilation", "never present unperformed or unverified work as done"):
             self.assertIn(boundary, segment.content)
         self.assertEqual(segment.requires_any_tools, ("core.apply_patch", "core.apply_patch_v4a", "core.apply_patches", "core.delete_file"))
 
@@ -390,6 +400,21 @@ class PromptManifestTest(unittest.TestCase):
         prefix = "prompt-delivery-mode-guidance-"
         self.assertFalse(any(m.message_id.startswith(prefix) for m in without.messages))
         self.assertTrue(any(m.message_id.startswith(prefix) for m in with_write.messages))
+
+    def test_behavior_verification_covers_runtime_markdown_and_short_authorizations(self) -> None:
+        request = self.segment("request-pipeline-guidance").content
+        delivery = self.segment("delivery-mode-guidance").content
+        workflow = self.segment("skill-workflow-guidance").content
+        self.assertIn("follow-up authorizing an earlier implementation plan", request)
+        self.assertIn("need not separately request tests", request)
+        self.assertIn("Before editing", delivery)
+        self.assertIn("After the last relevant edit", delivery)
+        self.assertIn("Markdown file loaded as runtime instructions", delivery)
+        self.assertIn("prompts, Skills, runtime templates, tests and automation", delivery)
+        self.assertIn("representative model trajectories", delivery)
+        self.assertIn("Respect an explicit user restriction on execution", delivery)
+        self.assertIn("load verify-change before editing when it is listed", workflow)
+        self.assertIn("If no matching workflow is available", workflow)
 
     def test_tool_feedback_guidance_is_stable_base_and_capability_free(self) -> None:
         segment = self.segment("tool-feedback-guidance")
@@ -469,10 +494,10 @@ class PromptManifestTest(unittest.TestCase):
 
     def test_task_plan_guidance_is_capability_bound(self) -> None:
         segment = self.segment("task-plan-guidance")
-        self.assertEqual(segment.version, "4.2")
+        self.assertEqual(segment.version, "4.3")
         self.assertEqual(segment.requires_any_tools, ("core.todo_list",))
         for boundary in ("skip creating a new plan for straightforward tasks", "Maintain an existing relevant plan", "latest revision", "at most one item in_progress", "verification does not complete", "Never mark unfinished work completed", "not an independent instruction", "Read only when state is missing", "do not postpone progress updates", "Example — progress", "Example — resume", "Example — scope"):
-            self.assertIn(boundary, segment.content)
+            self.assertIn(boundary.casefold(), segment.content.replace("`", "").casefold())
         # Execution persistence belongs to the generic request rules, not Todo.
         self.assertNotIn("until the list is complete", segment.content)
 

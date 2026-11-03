@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from .request_diagnostics import RequestDiagnosticCapture
 from .reasoning_config import DEFAULT_REASONING_EFFORT_REGISTRY, ReasoningEffortRegistry
+from tsm_agt.ports.model import ReasoningBlock
 
 from tsm_agt.ports import (
     AssistantMessagePhase,
@@ -110,6 +111,8 @@ class OpenAICompatibleModelProvider:
         native_structured_conclusion: bool = True,
         transport: HttpJsonTransport | None = None,
         request_diagnostics: RequestDiagnosticCapture | None = None,
+        request_parameters: Mapping[str, object] | None = None,
+        send_output_token_limit: bool = True,
     ) -> None:
         normalized_url = base_url.strip().rstrip("/")
         if not normalized_url.startswith(("https://", "http://")):
@@ -138,12 +141,15 @@ class OpenAICompatibleModelProvider:
         self._max_retries = max_retries
         self._retry_backoff_seconds = retry_backoff_seconds
         self._output_token_parameter = output_token_parameter
+        self._send_output_token_limit = send_output_token_limit
         self._reasoning_effort = reasoning_effort
         self._reasoning_registry = reasoning_registry or DEFAULT_REASONING_EFFORT_REGISTRY
         self._strict_tool_schema = strict_tool_schema
         self._streaming = streaming
         self._native_structured_conclusion = native_structured_conclusion
         self._request_diagnostics = request_diagnostics
+        import copy
+        self._request_parameters = copy.deepcopy(dict(request_parameters or {}))
         # `structured-conclusion` advertises a Kernel-reachable protocol, not
         # only an optional provider-native message field.  Every compatible
         # provider can receive the controlled text-block instruction below;
@@ -162,6 +168,7 @@ class OpenAICompatibleModelProvider:
         )
         self.capabilities = ProviderCapabilities(
             tools=True, parallel_tools=False,
+            reasoning_blocks=True, prompt_cache=True,
             strict_json_schema=strict_tool_schema,
             # The controlled block is an explicit, adapter-enforced fallback
             # whenever the Chat Completions provider cannot carry `conclusion`.
@@ -232,6 +239,7 @@ class OpenAICompatibleModelProvider:
         payload["stream_options"] = {"include_usage": True}
         self._capture_request(request, payload)
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         pending_text_parts: list[str] = []
         conclusion_tail = ""
         conclusion_captured = False
@@ -315,6 +323,8 @@ class OpenAICompatibleModelProvider:
                     "provider stream delta must be an object"
                 )
             content = delta.get("content")
+            if isinstance(delta.get("reasoning_content"), str):
+                reasoning_parts.append(delta["reasoning_content"])
             raw_stream_conclusion = delta.get("conclusion")
             if raw_stream_conclusion is not None:
                 if streamed_conclusion is not None or not isinstance(
@@ -453,6 +463,7 @@ class OpenAICompatibleModelProvider:
                     "message": {
                         "role": "assistant",
                         "content": "".join(text_parts) or None,
+                        "reasoning_content": "".join(reasoning_parts),
                         "conclusion": streamed_conclusion,
                         "tool_calls": raw_calls,
                     },
@@ -542,6 +553,7 @@ class OpenAICompatibleModelProvider:
                 diagnostics["routing"] = bounded_routing
         for key in (
             "completion_tokens_details", "prompt_tokens_details", "total_tokens",
+            "prompt_cache_hit_tokens", "prompt_cache_miss_tokens",
         ):
             value = usage.get(key)
             if isinstance(value, Mapping):
@@ -741,7 +753,7 @@ class OpenAICompatibleModelProvider:
             "model": self._model,
             "messages": provider_messages,
         }
-        if request.max_output_tokens is not None:
+        if self._send_output_token_limit and request.max_output_tokens is not None:
             payload[self._output_token_parameter] = request.max_output_tokens
         # Per-turn override takes precedence over the provider's default
         # reasoning_effort; when absent, fall back to the bootstrap value.
@@ -751,6 +763,12 @@ class OpenAICompatibleModelProvider:
         )
         if mapped_effort is not None:
             payload["reasoning_effort"] = mapped_effort
+        import copy
+        payload.update(copy.deepcopy(self._request_parameters))
+        if "thinking" in payload and request.reasoning_effort is not None:
+            payload["thinking"]["type"] = "disabled" if request.reasoning_effort == "none" else "enabled"
+        if "thinking" in payload:
+            payload.pop("reasoning_effort", None)
         if request.tools:
             encoded_tools: list[dict[str, Any]] = []
             for tool in request.tools:
@@ -817,6 +835,10 @@ class OpenAICompatibleModelProvider:
             }
 
         data: dict[str, Any] = {"role": message.role.value}
+        reasoning = [block.text for block in message.content if isinstance(block, ReasoningBlock)
+                     and block.provider == "openai_chat" and block.kind == "reasoning_content"]
+        if reasoning:
+            data["reasoning_content"] = "".join(reasoning)
         provider_content: list[dict[str, Any]] = []
         for block in message.content:
             if isinstance(block, TextBlock):
@@ -1030,6 +1052,8 @@ class OpenAICompatibleModelProvider:
         usage = response.get("usage", {})
         if not isinstance(usage, Mapping):
             raise OpenAICompatibleProviderError("provider usage must be an object")
+        if isinstance(provider_message.get("reasoning_content"), str) and provider_message["reasoning_content"]:
+            content.insert(0, ReasoningBlock("openai_chat", "reasoning_content", text=provider_message["reasoning_content"]))
         input_tokens = usage.get("prompt_tokens", 0)
         output_tokens = usage.get("completion_tokens", 0)
         if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):

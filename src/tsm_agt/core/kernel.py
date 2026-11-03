@@ -1918,7 +1918,9 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             raise ApprovalNotPending(
                 f"task {task_id} has no resumable Agent approval"
             )
-        checkpoint = AgentTurnCheckpoint.from_data(approval.agent_checkpoint)
+        checkpoint = self._restore_checkpoint_model_profile(
+            task, AgentTurnCheckpoint.from_data(approval.agent_checkpoint),
+        )
         if checkpoint.task_id != task_id or checkpoint.turn_id != approval.turn_id:
             raise ApprovalPayloadMismatch(
                 "approval checkpoint does not belong to the pending task and turn"
@@ -2005,6 +2007,9 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             toolset_hash=checkpoint.toolset_hash,
             prompt_manifest_hash=checkpoint.prompt_manifest_hash,
             session_id=checkpoint.session_id,
+            model_profile_id=checkpoint.model_profile_id,
+            reasoning_effort=checkpoint.reasoning_effort,
+            enabled_skills=checkpoint.enabled_skills,
             session_context_hash=checkpoint.session_context_hash,
             working_memory_hash=(await self.get_working_memory(task_id)).content_hash,
             last_steering_inbound_sequence=(

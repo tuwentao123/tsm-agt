@@ -1,0 +1,67 @@
+# Example only. Adapt into ~/.tsm-agt/config.yaml outside the repository.
+# All addresses and credentials below are placeholders.
+version: 1
+model:
+  default_profile: default-model
+  providers:
+    chat-gateway:
+      protocol: openai_chat
+      base_url: http://127.0.0.1:8000/v1
+      auth: {api_key: your-api-key}
+    messages-gateway:
+      protocol: anthropic_messages
+      base_url: http://127.0.0.1:8000/v1
+      auth: {api_key: your-api-key}
+    responses-gateway:
+      protocol: openai_responses
+      base_url: http://127.0.0.1:8000/v1
+      auth: {api_key: your-api-key}
+  profiles:
+    # One entry per model; each entry binds to one fixed provider/protocol.
+    # Protocol comparison belongs in the probe script's --protocol option.
+    default-model:
+      label: Chat model
+      status: unverified
+      provider: chat-gateway
+      model: your-model-name
+      reasoning_efforts: [none, low, medium, high]
+      options:
+        streaming: true
+        strict_tool_schema: false
+        output_token_parameter: max_completion_tokens
+        reasoning_effort: low
+        # Optional, only when accepted by this gateway:
+        # request_parameters:
+        #   prompt_cache_key: stable-agent-prefix-v1
+    messages-model:
+      label: Messages model
+      provider: messages-gateway
+      model: your-messages-model-name
+      enabled: false
+      disabled_reason: Confirm the Messages route before enabling
+      reasoning_efforts: [none, low, medium, high]
+      options:
+        reasoning_effort: high
+        request_parameters:
+          thinking: {type: adaptive}
+          cache_control: {type: ephemeral}
+    responses-model:
+      label: Responses model
+      provider: responses-gateway
+      model: your-responses-model-name
+      enabled: false
+      disabled_reason: Confirm the Responses route before enabling
+      options:
+        reasoning_effort: medium
+        # Only for gateways known to mishandle optional output limits:
+        # send_output_token_limit: false
+      # If text works but this route does not support function tools:
+      # capabilities: {tools: false, parallel_tools: false}
+      # status: limited
+      # status_detail: Text verified; tool route needs repair
+    image-model:
+      label: Image generation model
+      provider: chat-gateway
+      model: your-image-model-name
+      kind: image
+      enabled: false

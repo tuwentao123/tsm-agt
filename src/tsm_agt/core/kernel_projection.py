@@ -274,6 +274,7 @@ class ProjectionMixin:
 
     async def _build_effective_configuration(
         self, task: TaskSnapshot, revision: int,
+        *, model_profile_id: str | None = None,
     ) -> EffectiveConfigurationSnapshot:
         adapter_snapshots = []
         for adapter in self._dependencies.runtime_adapters:
@@ -290,6 +291,18 @@ class ProjectionMixin:
         raw_model = metadata.get("model", {})
         raw_sources = metadata.get("sources", {})
         model = dict(raw_model) if isinstance(raw_model, Mapping) else {}
+        session = await self.get_session(task.session_id)
+        profile_id = model_profile_id or session.model_profile_id
+        catalog = getattr(self._dependencies.model, "profile_catalog", None)
+        if catalog:
+            data = catalog()
+            profile_id = profile_id or data["default_profile"]
+            selected = next((row for row in data["profiles"] if row["id"] == profile_id), None)
+            if selected:
+                model.update({"profile": profile_id, "model": selected["model"], "wire_protocol": selected["protocol"]})
+                fingerprint = getattr(self._dependencies.model, "profile_fingerprint", None)
+                if fingerprint:
+                    model["profile_configuration_hash"] = fingerprint(profile_id)
         sources = dict(raw_sources) if isinstance(raw_sources, Mapping) else {}
         policy = self._tool_policy.snapshot_data()
         raw_exploration_budget = metadata.get("exploration_budget")
@@ -299,7 +312,7 @@ class ProjectionMixin:
         return EffectiveConfigurationSnapshot.build(
             captured_at=datetime.now(timezone.utc),
             model=model,
-            capabilities=self._dependencies.model.capabilities,
+            capabilities=self._model_capabilities_for(profile_id),
             tools=await self.list_tools(),
             adapters=adapters,
             policy=policy,

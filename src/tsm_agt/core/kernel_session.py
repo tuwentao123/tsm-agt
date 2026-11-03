@@ -119,6 +119,47 @@ class SessionMixin:
             )
         return snapshot
 
+    async def update_session_model_profile(self, session_id: str, profile_id: str | None):
+        """Choose the next Turn's model without rebinding an active checkpoint."""
+        for attempt in range(4):
+            try:
+                return await self._update_session_model_profile(session_id, profile_id)
+            except ValueError as error:
+                if "version conflict" not in str(error) or attempt == 3:
+                    raise
+
+    async def _update_session_model_profile(self, session_id: str, profile_id: str | None):
+        stored = await self._dependencies.store.load_session(session_id)
+        if stored is None:
+            raise LookupError(f"session not found: {session_id}")
+        snapshot = SessionSnapshot.from_data(stored.data)
+        if snapshot.subject != self._dependencies.local_identity.current_subject():
+            raise PermissionError("session belongs to another local subject")
+        resolver = getattr(self._dependencies.model, "resolve_profile", None)
+        if not resolver and profile_id is not None:
+            raise ValueError("this model provider has no selectable profiles")
+        selected = resolver(profile_id or snapshot.model_profile_id) if resolver else None
+        if snapshot.model_profile_id == selected:
+            return snapshot
+        effort = snapshot.reasoning_effort
+        catalog = getattr(self._dependencies.model, "profile_catalog", None)
+        if catalog:
+            row = next((row for row in catalog()["profiles"] if row["id"] == selected), None)
+            if row and effort not in row.get("reasoning_efforts", []):
+                effort = None
+        updated = replace(snapshot, model_profile_id=selected, reasoning_effort=effort, updated_at=utc_now())
+        event = SessionEvent(
+            f"sevt-{uuid4().hex}", session_id, stored.last_event_sequence + 1,
+            "session.model_profile_updated", {
+                "model_profile_id": selected, "reasoning_effort": effort,
+                "applies_to": "next_turn",
+            },
+        )
+        await self._dependencies.store.commit_session(SessionUnitOfWork(
+            session_id, stored.version, updated.to_data(), (event,),
+        ))
+        return updated
+
     async def update_session_reasoning_effort(
         self, session_id: str, reasoning_effort: str | None,
     ) -> SessionSnapshot:
@@ -134,6 +175,14 @@ class SessionMixin:
         # Enforce subject isolation exactly like ``get_session``.
         if snapshot.subject != self._dependencies.local_identity.current_subject():
             raise PermissionError("session belongs to another local subject")
+        catalog = getattr(self._dependencies.model, "profile_catalog", None)
+        if catalog and reasoning_effort is not None:
+            data = catalog()
+            selected = snapshot.model_profile_id or data["default_profile"]
+            row = next((row for row in data["profiles"] if row["id"] == selected), None)
+            allowed = row.get("reasoning_efforts", []) if row else []
+            if allowed and reasoning_effort not in allowed:
+                raise ValueError(f"reasoning effort {reasoning_effort!r} is not supported by profile {selected}; allowed: {', '.join(allowed)}")
         updated = replace(
             snapshot,
             reasoning_effort=reasoning_effort,

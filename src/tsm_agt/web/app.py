@@ -92,7 +92,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .workspace-resizer{position:absolute;top:0;bottom:0;width:14px;cursor:col-resize;z-index:10;touch-action:none;outline:none}.workspace-resizer[hidden]{display:none}.workspace-stage.resizing{user-select:none;cursor:col-resize}
 .workspace-resizer-handle{position:absolute;top:0;bottom:0;width:2px;background-color:rgba(148,163,184,.9);left:6px}
 .workspace-resizer:hover .workspace-resizer-handle,.workspace-resizer:focus-visible .workspace-resizer-handle{background-color:rgba(59,130,246,1)}
-.pane-shell{position:relative;min-height:0;height:100%;display:flex;flex-direction:column;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.72);border-radius:24px;overflow:hidden;backdrop-filter:blur(10px);box-shadow:none}
+.pane-shell{position:relative;min-height:0;height:100%;display:flex;flex-direction:column;background:transparent;border:none;border-radius:0;overflow:hidden;backdrop-filter:none;box-shadow:none}
 .pane-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:14px 18px 10px;border-bottom:1px solid rgba(237,242,247,.75);background:rgba(255,255,255,.78)}
 .pane-title{font-size:15px;font-weight:700;color:#111827}
 .pane-subtitle{margin-top:4px;font-size:12px;color:#64748b}
@@ -103,7 +103,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .approval-dock.visible{display:block}
 .approval-dock .message.approval{width:100%;max-width:none;min-height:0;max-height:min(48vh,420px);overflow:auto;pointer-events:auto;padding:9px 11px;gap:6px;box-shadow:0 12px 28px rgba(15,23,42,.16)}
 .approval-dock .approval-title{font-size:14px}.approval-dock .approval-subtitle{display:none}.approval-dock .approval-risk{padding:3px 8px;font-size:10px}.approval-dock .approval-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.approval-dock .approval-item{padding:5px 7px}.approval-dock .approval-label{margin-bottom:2px;font-size:9px}.approval-dock .approval-value{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.approval-dock .approval-actions{gap:7px}.approval-dock .approval-btn{min-height:32px;padding:7px 13px;border-radius:10px;font-size:12px}.approval-details{border-top:1px solid #e5edf5;padding-top:5px}.approval-details>summary{cursor:pointer;font-size:11px;color:#64748b;user-select:none}.approval-details[open]>summary{margin-bottom:6px}.approval-details .approval-preview{max-height:140px}
-.trace-pane{gap:10px;padding:12px;background:linear-gradient(180deg,rgba(248,250,252,.96),rgba(241,245,249,.96));border-radius:18px;box-shadow:0 10px 20px rgba(15,23,42,.06)}
+.trace-pane{gap:10px;padding:12px 0;background:transparent;border-radius:0;box-shadow:none}
 .trace-live-board{display:flex;flex-direction:column;gap:8px}
 .trace-future-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
 .trace-future-card{border:1px solid #e2e8f0;border-radius:12px;padding:8px 10px;background:rgba(255,255,255,.96)}
@@ -127,13 +127,14 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .message{display:flex;flex-direction:column;position:relative;max-width:min(920px,100%);word-break:break-word;gap:8px}
 .message.assistant{align-self:flex-start;width:100%;padding:18px 8px 22px;background:linear-gradient(180deg,rgba(255,255,255,.72),rgba(248,250,252,.58));border:none;border-radius:0;box-shadow:none}
 .message.user{display:inline-flex;align-self:flex-end !important;margin-left:auto !important;margin-right:0 !important;width:fit-content;max-width:min(720px,calc(100% - 24px));background:#f3f4f6;color:#334155;border:none !important;outline:none !important;box-shadow:none !important;border-radius:16px;padding:12px 14px;text-align:left}
-.message-body{width:min(88ch,100%);margin:0 auto;white-space:normal;font-size:15px;line-height:1.68;letter-spacing:-.003em;color:var(--text);font-family:Inter,"SF Pro Display","Segoe UI",sans-serif}
+.message-body{width:100%;margin:0;white-space:normal;font-size:15px;line-height:1.68;letter-spacing:-.003em;color:var(--text);font-family:Inter,"SF Pro Display","Segoe UI",sans-serif}
 .message-body > *:first-child{margin-top:0}
 .message-body > *:last-child{margin-bottom:0}
-.stream-text-label{width:min(88ch,100%);margin:0 auto 6px;color:var(--muted);font-size:12px}
+.stream-text-label{width:100%;margin:4px 0 4px;color:#2563eb;font-size:12px;font-weight:600}
 .message-body.streaming-text{white-space:pre-wrap;overflow-wrap:anywhere}
-.message.stream-commentary{background:transparent;padding-top:8px;padding-bottom:8px}
-.message.stream-commentary .message-body{font-size:14px}
+.message.stream-commentary{margin-top:6px;padding:0;border-radius:0;border:none;background:transparent}
+.message.stream-commentary .message-body{font-size:13px;color:#374151}
+.turn-trace{margin:6px 0 10px;padding:4px 10px;border-radius:0;border-left:3px solid #cbd5f5;background:transparent}
 .message-body p{margin:.42em 0;color:var(--text-soft);max-width:88ch}
 .message-body h1,.message-body h2,.message-body h3{line-height:1.24;font-weight:650;letter-spacing:-.022em;color:var(--text)}
 .message-body h1{margin:1.1em 0 .42em;font-size:28px}
@@ -172,7 +173,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .message-images img{width:56px;height:56px;object-fit:cover;border-radius:10px;display:block;cursor:zoom-in;border:1px solid #dbe5f0}
 .message.user,.message.assistant{position:relative;display:flex;flex-direction:column;gap:8px;padding:12px 14px;border-radius:14px;box-shadow:none;backdrop-filter:none}
 .message.user{justify-content:flex-end;align-self:flex-end !important;margin-left:auto !important;margin-right:0 !important;background:#f3f4f6;border:none !important;outline:none !important;box-shadow:none !important;border-bottom-right-radius:8px;color:#334155;text-align:left}
-.message.assistant{align-self:flex-start;background:#ffffff;border:1px solid var(--border);border-bottom-left-radius:8px;color:#1f2937;width:100%}
+.message.assistant{align-self:flex-start;background:transparent;border:none;border-bottom-left-radius:0;color:#1f2937;width:100%}
 .message-role{display:flex;align-items:center;gap:8px;font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#64748b}
 .message-role::before{content:'';width:8px;height:8px;border-radius:999px;background:currentColor;opacity:.85}
 .message.assistant .message-role{color:#4b5563}
@@ -234,16 +235,16 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .task-progress-line.markdown-progress{padding:0;border:none;background:transparent;white-space:normal;color:#475569;font-size:14px;line-height:1.68}
 .task-progress-line.markdown-progress .message-section{gap:0}
 .task-progress-line.markdown-progress .tool-call-markdown{max-width:100%}
-.turn-calls{width:min(88ch,100%);margin:0 auto;border:1px solid #e6edf5;border-radius:12px;background:#fbfdff;overflow:hidden}
-.turn-calls.has-calls{border-color:#d7e3f1;background:#f8fbff}
+.turn-calls{width:100%;margin:0;padding:0;border:none;border-radius:0;background:transparent;overflow:visible}
+.turn-calls.has-calls{border:none;background:transparent}
 .turn-trace{align-self:stretch;width:100%;max-width:none;padding:0;margin:0;background:transparent;border:none;box-shadow:none}
-.turn-calls > summary{display:flex;align-items:center;gap:8px;padding:7px 11px;font-size:11px;color:#64748b;cursor:pointer;list-style:none}
+.turn-calls > summary{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:11px;color:#64748b;cursor:pointer;list-style:none}
 .turn-calls > summary::-webkit-details-marker{display:none}
 .turn-calls > summary::before{content:'▸';font-size:10px;color:#94a3b8;transition:transform .15s ease;flex:none}
 .turn-calls[open] > summary::before{transform:rotate(90deg)}
 .turn-calls-label{font-weight:600;color:#475569;flex:none}
 .turn-calls-names{color:#7b8794;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
-.turn-call-list{display:flex;flex-direction:column;gap:4px;padding:7px 11px 10px;border-top:1px solid #edf2f7}
+.turn-call-list{display:flex;flex-direction:column;gap:4px;padding:4px 0 6px;border-top:1px solid #edf2f7}
 .turn-call-row{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;font-size:11px;line-height:1.5}
 .turn-call-name{font-family:"SFMono-Regular","JetBrains Mono","Fira Code",monospace;font-size:11px;color:#1e293b;background:#eef4fb;border:1px solid #d7e3f1;border-radius:6px;padding:1px 6px;flex:none}
 .turn-call-status{font-size:10px;border-radius:999px;padding:1px 7px;flex:none}
@@ -488,6 +489,11 @@ textarea::placeholder{color:#94a3b8}
       <div class=\"composer-meta\" style=\"margin-bottom:6px;display:flex;align-items:center;gap:12px;justify-content:space-between;\">
         <div class=\"composer-title\">会话输入</div>
         <div style=\"display:flex;align-items:center;gap:8px;\">
+          <label for=\"model-profile\" style=\"font-size:11px;color:#64748b;\">模型
+            <select id=\"model-profile\" aria-label=\"会话模型\" title=\"新建会话时选择模型；已有会话保持原模型\" style=\"max-width:250px;\">
+              <option value=\"\">跟随服务配置</option>
+            </select>
+          </label>
           <label for=\"reasoning-effort\" style=\"font-size:11px;color:#64748b;display:flex;align-items:center;gap:6px;\">
             推理强度
             <select id=\"reasoning-effort\" style=\"font-size:11px;padding:2px 6px;border-radius:6px;border:1px solid #cbd5e1;background:#ffffff;color:#334155;\">
@@ -977,6 +983,109 @@ function getActiveConversation() {
   return getConversationById(activeConversationId);
 }
 
+let modelProfiles = [];
+let defaultModelProfile = null;
+
+async function loadModelProfiles() {
+  try {
+    const response = await fetch('/model-profiles');
+    if (!response.ok) return;
+    const data = await response.json();
+    modelProfiles = data.profiles || [];
+    defaultModelProfile = data.default_profile || null;
+    renderModelSelector();
+  } catch (error) { console.error(error); }
+}
+
+function renderModelSelector() {
+  const select = document.getElementById('model-profile');
+  if (!select) return;
+  const conversation = getActiveConversation();
+  const selected = conversation?.modelProfileId || defaultModelProfile || '';
+  if (conversation && !conversation.modelSelectionPending) conversation.confirmedModelProfileId = selected;
+  select.replaceChildren();
+  if (!modelProfiles.length) {
+    const option = document.createElement('option');
+    option.value = ''; option.textContent = '跟随服务配置'; select.appendChild(option);
+  }
+  modelProfiles.forEach(profile => {
+    const option = document.createElement('option');
+    option.value = profile.id;
+    const statusLabels = {limited: '部分能力受限', unverified: '待验证', blocked: '服务受限', unsupported: '协议未接入'};
+    const status = profile.kind === 'image' ? '图像模型' : statusLabels[profile.status] || '';
+    const suffix = status || (profile.enabled ? '' : '未启用');
+    option.textContent = `${profile.label}${suffix ? ' · ' + suffix : ''}`;
+    option.disabled = !profile.enabled;
+    option.title = [profile.status_detail, profile.disabled_reason].filter(Boolean).join('；');
+    select.appendChild(option);
+  });
+  if (selected && !modelProfiles.some(profile => profile.id === selected)) {
+    const option = document.createElement('option');
+    option.value = selected; option.textContent = `${selected} · 配置已移除`; option.disabled = true;
+    select.appendChild(option);
+  }
+  select.value = selected;
+  select.disabled = !modelProfiles.some(profile => profile.enabled);
+  select.title = '切换后从下一轮生效，正在生成的回复保持原模型';
+  select.onchange = () => {
+    if (!conversation || select.disabled) return;
+    const previous = conversation.modelProfileId || defaultModelProfile;
+    conversation.modelProfileId = select.value || null;
+    updateReasoningOptions();
+    conversation.reasoningEffort = document.getElementById('reasoning-effort')?.value || null;
+    const selectedProfile = conversation.modelProfileId;
+    const generation = (conversation.modelSelectionGeneration || 0) + 1;
+    conversation.modelSelectionGeneration = generation;
+    conversation.modelSelectionPending = true;
+    // Serialize rapid changes so the last choice also wins on the server.
+    const pending = conversation.modelSelectionSave || Promise.resolve();
+    conversation.modelSelectionSave = pending.catch(() => {}).then(() =>
+      persistConversationModel(conversation, selectedProfile, previous, generation));
+    return conversation.modelSelectionSave;
+  };
+  const effort = document.getElementById('reasoning-effort');
+  if (effort) {
+    effort.value = conversation?.reasoningEffort || '';
+    effort.onchange = () => {
+      if (conversation) conversation.reasoningEffort = effort.value || null;
+    };
+  }
+  updateReasoningOptions();
+}
+
+async function persistConversationModel(conversation, selected, previous, generation) {
+  try {
+    const response = await fetch(`/sessions/${encodeURIComponent(conversation.id)}/model-profile`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model_profile_id: selected}),
+    });
+    // Empty new conversations become durable on their first submitted message.
+    if (response.status === 404) return;
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || '模型选择保存失败');
+    conversation.confirmedModelProfileId = data.model_profile_id;
+  } catch (error) {
+    if (conversation.modelSelectionGeneration !== generation) return;
+    conversation.modelProfileId = conversation.confirmedModelProfileId || previous;
+    if (getActiveConversation()?.id === conversation.id) renderModelSelector();
+    showError(error.message || '模型选择保存失败');
+  } finally {
+    if (conversation.modelSelectionGeneration === generation) conversation.modelSelectionPending = false;
+  }
+}
+
+function updateReasoningOptions() {
+  const selected = document.getElementById('model-profile')?.value;
+  const profile = modelProfiles.find(item => item.id === selected);
+  const effort = document.getElementById('reasoning-effort');
+  if (!effort) return;
+  const allowed = profile?.reasoning_efforts || [];
+  Array.from(effort.options).forEach(option => {
+    option.disabled = Boolean(option.value && !allowed.includes(option.value));
+  });
+  if (effort.selectedOptions[0]?.disabled) effort.value = '';
+}
+
 function renderConversations() {
   // Sessions render inside their workspace group, so refreshing the workspace
   // list is what keeps both in sync.
@@ -984,6 +1093,7 @@ function renderConversations() {
   const active = getActiveConversation();
   document.getElementById('conversation-name').textContent = active?.title || '新建会话';
   renderSessionId(active);
+  renderModelSelector();
 }
 
 // The Session id is what a Task, a Turn and any log line refer back to, so it
@@ -1785,6 +1895,38 @@ function buildTraceSteps(task) {
       pendingModel = null;
       return;
     }
+    if (kind === 'commentary') {
+      // 将阶段性说明附加到最近的运行中步骤（优先工具，其次模型），而不是单独渲染成一个泛化“运行事件”。
+      const attachIndex = (() => {
+        const runningToolIndex = pendingTools.findLastIndex((candidate) => {
+          const step = steps[candidate];
+          return step && step.state === 'running';
+        });
+        if (runningToolIndex >= 0) {
+          return pendingTools[runningToolIndex];
+        }
+        if (pendingModel !== null && steps[pendingModel]?.state === 'running') {
+          return pendingModel;
+        }
+        // 如果没有明确的运行中步骤，就附加到最后一个步骤，避免丢失说明文案。
+        return steps.length ? steps.length - 1 : null;
+      })();
+      if (attachIndex !== null && steps[attachIndex]) {
+        const step = steps[attachIndex];
+        step.body = `${step.body}\\n${text}`;
+        step.meta = step.meta || `#${step.startSequence || sequence}`;
+      } else {
+        // 回退：仍然保留为通用运行事件，避免进度信息完全缺失。
+        steps.push({
+          title: '运行事件',
+          body: text,
+          state: traceStateForProgress(progress),
+          meta: `#${sequence || steps.length + 1}`,
+          startSequence: sequence,
+        });
+      }
+      return;
+    }
     if (kind === 'waiting') {
       // The authoritative current waiting payload below has richer structure
       // (approval versus text input). Do not preserve an old generic progress
@@ -2207,6 +2349,9 @@ function applySkillSettings(data) {
   renderSkillDirectories();
   renderSkillCatalog(data);
   document.getElementById('skill-settings-status').textContent = (data.issues || []).join(String.fromCodePoint(10));
+  // 目录或启用状态变了，输入框的 Skill 联想缓存随之失效，下次触发时重新读取。
+  skillMenuSkills = null;
+  skillMenuError = '';
 }
 
 async function readSkillResponse(response, action) {
@@ -3306,8 +3451,11 @@ async function handlePaste(event) {
 }
 
 function describeFailure(reason) {
+  if (/context cannot fit/.test(reason) && /current_turn_and_tool_protocol=/.test(reason)) {
+    return '本轮对话或工具输出超出模型上下文上限，当前请求未发送给模型。请减少一次读取的内容，或分段处理后继续。';
+  }
   if (/context cannot fit/.test(reason)) {
-    return '输入内容超出模型上下文上限，请缩小图片尺寸或减少附件后重试。';
+    return '本轮内容超出模型上下文上限，当前请求未发送给模型。请减少输入、附件或一次读取的工具内容后重试。';
   }
   return reason;
 }
@@ -3522,6 +3670,7 @@ async function runTask() {
   document.getElementById('diagnostic-toggle').textContent = '诊断下一轮';
   try {
     const activeConversation = getConversationById(conversationId);
+    if (activeConversation?.modelSelectionSave) await activeConversation.modelSelectionSave;
     const activeTaskId = activeConversation?.activeTaskId || null;
     let intent = null;
     let routedText = prompt;
@@ -3542,6 +3691,7 @@ async function runTask() {
         target_task_id: activeTaskId,
         intent,
         reasoning_effort: reasoningEffort,
+        model_profile_id: activeConversation?.modelProfileId || document.getElementById('model-profile')?.value || null,
         diagnose_request: diagnosticRequested,
         images,
       })
@@ -4425,6 +4575,8 @@ async function loadSessions() {
         draft: '',
         loaded: false,
         latestTaskId: item.latest_task_id,
+        modelProfileId: item.model_profile_id || defaultModelProfile,
+        reasoningEffort: item.reasoning_effort || null,
       });
     });
   } catch (error) {
@@ -4438,6 +4590,8 @@ async function ensureConversationLoaded(conversationId) {
   conversation.loaded = true;
   const loadGeneration = (conversation.historyLoadGeneration || 0) + 1;
   conversation.historyLoadGeneration = loadGeneration;
+  const selectionGeneration = conversation.modelSelectionGeneration || 0;
+  const restoreSelection = !conversation.modelSelectionPending;
   try {
     const response = await fetch(`/sessions/${conversationId}`);
     if (!response.ok) {
@@ -4448,6 +4602,11 @@ async function ensureConversationLoaded(conversationId) {
     // A history request started before a Turn finished may return afterwards.
     // Only the newest refresh can replace the transcript or reopen a follower.
     if (conversation.historyLoadGeneration !== loadGeneration) return false;
+    if (restoreSelection && !conversation.modelSelectionPending
+        && selectionGeneration === (conversation.modelSelectionGeneration || 0)) {
+      conversation.modelProfileId = data.model_profile_id || defaultModelProfile;
+      conversation.reasoningEffort = data.reasoning_effort || null;
+    }
     const tasksById = new Map(
       (data.tasks || []).map((task) => [task.task_id, task]),
     );
@@ -4633,6 +4792,7 @@ async function refreshConversationHistory(conversationId) {
 
 async function loadWorkspaces() {
   try {
+    await loadModelProfiles();
     const response = await fetch('/workspaces');
     if (!response.ok) {
       throw new Error('加载工作区列表失败');
@@ -4673,10 +4833,84 @@ const slashCommands = [
   { prefix: '/queue ', label: '/queue <后续任务>', description: '在当前 Task 完成后排队一个新的任务' },
   { prefix: '/redirect ', label: '/redirect <新目标>', description: '替换当前 Task 目标，保留已提交修改与工具结果' },
   { prefix: '/followup ', label: '/followup steer|queue|auto', description: '固定或恢复运行中输入的默认模式' },
+  { prefix: '/skill ', label: '/skill <名称>', description: '列出已发现的 Skill，选中后引用它', skillMenu: true },
 ];
 
 let slashMenuElement = null;
 let slashMenuActiveIndex = -1;
+// 当前菜单实际展示的条目（命令或 Skill）；方向键与 Enter 以它为准，避免过滤后索引错位。
+let slashMenuItems = [];
+
+// Skill 联想的触发前缀：输入 "/skill" 或 "/skill 关键词" 时列出已发现的 Skill。
+// 数据来自 /settings/skills；选中后插入一段提示模型先用 skill.load 读 SKILL.md 的文本。
+const SKILL_MENU_PREFIX = '/skill';
+let skillMenuSkills = null;
+let skillMenuLoading = false;
+let skillMenuError = '';
+
+function isSkillMenuMode(value) {
+  return value === SKILL_MENU_PREFIX || value.startsWith(`${SKILL_MENU_PREFIX} `);
+}
+
+function skillSourceLabel(source) {
+  if (source === 'builtin') return '内置';
+  if (source === 'user') return '用户目录';
+  return '代码注册';
+}
+
+async function loadSkillMenuSkills() {
+  if (skillMenuLoading || skillMenuSkills !== null) return;
+  skillMenuLoading = true;
+  try {
+    const response = await fetch('/settings/skills');
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    skillMenuSkills = (data.skills || []).map(skill => ({
+      name: skill.name,
+      description: skill.description || '',
+      source: skill.source || '',
+    }));
+    skillMenuError = '';
+  } catch (error) {
+    skillMenuError = String((error && error.message) || error);
+  } finally {
+    skillMenuLoading = false;
+  }
+  // 加载完成时如果用户还停在 /skill 前缀，就地刷新菜单。
+  if (promptComposer && isSkillMenuMode(promptComposer.value)) {
+    renderSlashMenu(promptComposer);
+  }
+}
+
+function resolveSkillMenuItems(query) {
+  if (skillMenuSkills === null) {
+    if (!skillMenuLoading) loadSkillMenuSkills();
+    return [{ kind: 'info', label: '正在读取可用 Skill…', description: '首次打开会加载一次，之后使用缓存', badge: '' }];
+  }
+  if (skillMenuError) {
+    return [{ kind: 'info', label: '读取 Skill 列表失败', description: skillMenuError, badge: '' }];
+  }
+  const needle = query.toLowerCase();
+  const matched = skillMenuSkills.filter(skill => !needle
+    || skill.name.toLowerCase().includes(needle)
+    || skill.description.toLowerCase().includes(needle));
+  if (matched.length === 0) {
+    return [{ kind: 'info', label: '没有匹配的 Skill', description: '换个关键词，或先在设置里安装 / 启用 Skill', badge: '' }];
+  }
+  return matched.map(skill => ({
+    kind: 'skill', label: skill.name, description: skill.description, badge: skillSourceLabel(skill.source), skill,
+  }));
+}
+
+function resolveSlashMenuItems(value) {
+  if (isSkillMenuMode(value)) {
+    return resolveSkillMenuItems(value.slice(SKILL_MENU_PREFIX.length).trim());
+  }
+  const query = value.slice(1).trim().toLowerCase();
+  return slashCommands
+    .filter(command => !query || command.prefix.slice(1).trim().toLowerCase().startsWith(query))
+    .map(command => ({ kind: 'command', label: command.label, description: command.description, badge: '', command }));
+}
 
 function ensureSlashMenu() {
   if (slashMenuElement) return slashMenuElement;
@@ -4711,7 +4945,14 @@ function renderSlashMenu(anchorInput) {
   menu.innerHTML = '';
   slashMenuActiveIndex = -1;
 
-  slashCommands.forEach((command, index) => {
+  slashMenuItems = resolveSlashMenuItems(anchorInput.value);
+  if (slashMenuItems.length === 0) {
+    // 没有匹配项时收起菜单，避免留下空白浮层。
+    menu.style.display = 'none';
+    return;
+  }
+
+  slashMenuItems.forEach((entry, index) => {
     const item = document.createElement('div');
     item.style.padding = '6px 10px';
     item.style.cursor = 'pointer';
@@ -4721,13 +4962,22 @@ function renderSlashMenu(anchorInput) {
     item.dataset.index = String(index);
 
     const title = document.createElement('div');
-    title.textContent = command.label;
+    title.textContent = entry.label;
     title.style.fontFamily = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
     title.style.fontSize = '12px';
     title.style.color = '#0f172a';
 
+    if (entry.badge) {
+      const badge = document.createElement('span');
+      badge.textContent = entry.badge;
+      badge.style.marginLeft = '6px';
+      badge.style.fontSize = '11px';
+      badge.style.color = '#94a3b8';
+      title.appendChild(badge);
+    }
+
     const desc = document.createElement('div');
-    desc.textContent = command.description;
+    desc.textContent = entry.description;
     desc.style.color = '#64748b';
 
     item.appendChild(title);
@@ -4743,7 +4993,7 @@ function renderSlashMenu(anchorInput) {
     });
 
     item.addEventListener('click', () => {
-      applySlashCommand(command, anchorInput);
+      applySlashMenuItem(entry, anchorInput);
     });
 
     menu.appendChild(item);
@@ -4785,7 +5035,7 @@ function highlightSlashMenuItem(index) {
 
 function moveSlashMenuSelection(delta) {
   if (!slashMenuElement || slashMenuElement.style.display === 'none') return;
-  const total = slashCommands.length;
+  const total = slashMenuItems.length;
   if (total === 0) return;
   let next = slashMenuActiveIndex;
   if (next < 0) {
@@ -4821,6 +5071,49 @@ function applySlashCommand(command, input) {
   persistActiveDraft();
   hideSlashMenu();
 }
+
+function skillMentionText(name) {
+  return `使用 Skill「${name}」：先用 skill.load 读取 SKILL.md，再按其中的步骤执行。`;
+}
+
+// 选中 Skill 后把 "/skill 关键词" 这段触发文本替换成引用句，光标停在句尾方便继续描述任务。
+function applySkillMention(skill, input) {
+  const mention = skillMentionText(skill.name);
+  const value = input.value;
+  const selectionStart = input.selectionStart ?? 0;
+  const selectionEnd = input.selectionEnd ?? selectionStart;
+  let nextValue;
+  let cursorPos;
+  if (isSkillMenuMode(value)) {
+    nextValue = mention;
+    cursorPos = mention.length;
+  } else {
+    nextValue = value.slice(0, selectionStart) + mention + value.slice(selectionEnd);
+    cursorPos = selectionStart + mention.length;
+  }
+
+  input.value = nextValue;
+  input.selectionStart = cursorPos;
+  input.selectionEnd = cursorPos;
+  persistActiveDraft();
+  hideSlashMenu();
+  if (typeof input.focus === 'function') input.focus();
+}
+
+function applySlashMenuItem(entry, input) {
+  if (!entry) return;
+  if (entry.kind === 'command') {
+    applySlashCommand(entry.command, input);
+    // "/skill" 命令执行后直接进入 Skill 列表模式，不必再等一次键盘输入。
+    if (entry.command.skillMenu && isSkillMenuMode(input.value)) renderSlashMenu(input);
+    return;
+  }
+  if (entry.kind === 'skill') {
+    applySkillMention(entry.skill, input);
+    return;
+  }
+  hideSlashMenu();
+}
  
 // 等页面 DOM 就绪后再绑定到真正的输入框，避免脚本在 textarea 挂载前执行导致 promptComposer 为空。
 window.addEventListener('DOMContentLoaded', () => {
@@ -4830,7 +5123,7 @@ window.addEventListener('DOMContentLoaded', () => {
     promptComposer.addEventListener('input', () => {
       persistActiveDraft();
 
-      // 文本层级触发斜杠菜单：只要当前内容以 "/" 开头，就弹出联想列表。
+      // 文本层级触发斜杠菜单：以 "/" 开头时弹出命令列表，输入 "/skill 关键词" 时改为列出可用 Skill。
       const value = promptComposer.value;
 
       if (value.startsWith('/')) {
@@ -4901,8 +5194,8 @@ window.addEventListener('DOMContentLoaded', () => {
         }
         if (event.key === 'Enter' && slashMenuActiveIndex >= 0) {
           event.preventDefault();
-          const command = slashCommands[slashMenuActiveIndex];
-          if (command) applySlashCommand(command, promptComposer);
+          const entry = slashMenuItems[slashMenuActiveIndex];
+          if (entry) applySlashMenuItem(entry, promptComposer);
           return;
         }
         if (event.key === 'Escape') {
@@ -5431,6 +5724,36 @@ async def read_turn_diagnostics(payload: dict, request: Request) -> Response:
     return JSONResponse(content=data, headers={'Cache-Control': 'no-store'})
 
 
+@app.get("/model-profiles")
+async def list_model_profiles() -> dict:
+    if runtime_server is None:
+        return {"default_profile": None, "profiles": []}
+    model = runtime_server._client.application.kernel.dependencies.model
+    catalog = getattr(model, "profile_catalog", None)
+    return catalog() if catalog else {"default_profile": None, "profiles": []}
+
+
+@app.post("/sessions/{session_id}/model-profile")
+async def update_session_model_profile(session_id: str, payload: dict) -> dict:
+    """Save the next Turn's model; active/resumable Turns keep their snapshot."""
+    if runtime_server is None:
+        raise HTTPException(status_code=503, detail=runtime_error or "runtime unavailable")
+    profile_id = payload.get("model_profile_id")
+    if not isinstance(profile_id, str) or not profile_id.strip():
+        raise HTTPException(status_code=400, detail="model_profile_id must be a non-empty string")
+    kernel = runtime_server._client.application.kernel
+    try:
+        snapshot = runtime_server._call(kernel.update_session_model_profile(session_id, profile_id.strip()))
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail="session not found") from error
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail="session access denied") from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {"session_id": snapshot.session_id, "model_profile_id": snapshot.model_profile_id,
+            "reasoning_effort": snapshot.reasoning_effort, "applies_to": "next_turn"}
+
+
 @app.post("/session-input")
 async def submit_session_input(payload: dict, request: Request = None) -> dict:
     """Web's high-level normal-message ingress; `/tasks` stays low-level."""
@@ -5450,6 +5773,9 @@ async def submit_session_input(payload: dict, request: Request = None) -> dict:
         else None
     )
     reasoning_effort_raw = payload.get("reasoning_effort")
+    model_profile_id = payload.get("model_profile_id")
+    if model_profile_id is not None and (not isinstance(model_profile_id, str) or not model_profile_id.strip()):
+        raise HTTPException(status_code=400, detail="model_profile_id must be a non-empty string")
     reasoning_effort = (
         str(reasoning_effort_raw).strip().lower()
         if reasoning_effort_raw is not None
@@ -5475,21 +5801,28 @@ async def submit_session_input(payload: dict, request: Request = None) -> dict:
             await kernel.get_session(session_id)
         except LookupError:
             await kernel.create_session(text[:120], session_id=session_id)
+        if hasattr(kernel, "update_session_model_profile"):
+            await kernel.update_session_model_profile(session_id, model_profile_id)
         # Session-level reasoning-effort is a durable preference: when the
         # caller supplies a value, keep the Session as the single source of
         # truth and update its snapshot. Failure must not block the input.
-        if reasoning_effort is not None:
+        if "reasoning_effort" in payload:
             try:
                 await kernel.update_session_reasoning_effort(
                     session_id, reasoning_effort,
                 )
+            except ValueError:
+                raise
             except Exception:
                 logger.exception(
                     "failed to update session reasoning_effort session_id=%s",
                     session_id,
                 )
 
-    runtime_server._call(ensure_session())
+    try:
+        runtime_server._call(ensure_session())
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     # Attachments stay structured. Inlining base64 into the text would blow
     # past the Task SPEC goal limit and fail task creation outright.
     image_blocks = _normalize_image_blocks(payload.get("images"))
@@ -6233,6 +6566,8 @@ async def list_sessions(limit: int = 40) -> dict:
             "workspace_path": workspace_path,
             "task_count": len(snapshot.task_ids),
             "latest_task_id": latest_task_id,
+            "model_profile_id": getattr(snapshot, "model_profile_id", None),
+            "reasoning_effort": getattr(snapshot, "reasoning_effort", None),
             "updated_at": snapshot.updated_at.isoformat(),
         })
     return {"sessions": items}
@@ -6342,6 +6677,8 @@ async def get_session(session_id: str) -> dict:
     return {
         "session_id": snapshot.session_id,
         "title": snapshot.title,
+        "model_profile_id": getattr(snapshot, "model_profile_id", None),
+        "reasoning_effort": getattr(snapshot, "reasoning_effort", None),
         "active_task_id": snapshot.active_task_id,
         "latest_task_id": latest["task_id"] if latest else None,
         "latest_task_state": latest["phase1_state"] if latest else None,

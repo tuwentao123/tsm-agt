@@ -104,7 +104,9 @@ def _identity(call: ToolCall, result: ToolResult, task_id: str) -> tuple[Any, ..
             return None
     elif cursor is not None or offset is not None:
         return None
-    return (task_id, root, path, sha, requested, fields, result.truncated,
+    # Identity follows the actual observed window. A larger requested limit
+    # can return exactly the same small file or byte-bounded page.
+    return (task_id, root, path, sha, fields, result.truncated,
             _json(cursor), offset)
 
 

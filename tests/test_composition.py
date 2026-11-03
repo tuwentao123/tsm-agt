@@ -538,8 +538,8 @@ model:
             with patch.dict(os.environ, {}, clear=True):
                 application = compose_openai_compatible_engineering_application_from_config(configuration_file)
             provider = application.registry.require(ModelProviderPort)
-            self.assertIsInstance(provider._provider, AnthropicMessagesModelProvider)
-            self.assertEqual(provider._provider._anthropic_version, "2023-06-01")
+            self.assertIsInstance(provider._provider.default_provider, AnthropicMessagesModelProvider)
+            self.assertEqual(provider._provider.default_provider._anthropic_version, "2023-06-01")
             metadata = application.kernel.dependencies.configuration_metadata
             self.assertEqual(metadata["model"]["provider"], "anthropic-messages")
             self.assertEqual(metadata["model"]["protocol"], "anthropic")

@@ -1,6 +1,7 @@
 """The only composition root allowed to instantiate concrete adapters."""
 
 from __future__ import annotations
+from tsm_agt.core.configuration import canonical_hash
 
 from tsm_agt.adapters.evented_runtime_store import evented_store
 
@@ -218,6 +219,7 @@ from .model_configuration import (
     endpoint_origin,
     load_configuration_document,
     load_model_configuration,
+    model_profile_catalog,
     model_configuration_sources,
 )
 from .tool_execution_configuration import load_max_parallel_tool_calls
@@ -292,8 +294,39 @@ def _physical_model_provider(
     open_api_mode: str = "chat",
     reasoning_effort: str | None = None,
     capability_overrides: Mapping[str, bool | int] | None = None,
+    request_parameters: Mapping[str, object] | None = None,
+    send_output_token_limit: bool = True,
+    profile_configurations=None,
+    profile_catalog=(),
+    default_profile_id=None,
 ):
     """Select the wire adapter while preserving one Kernel model contract."""
+    if profile_configurations is not None:
+        from tsm_agt.adapters.model_profiles import ModelProfileProvider
+        providers = {
+            name: _physical_model_provider(
+                base_url=c.base_url, model=c.model, api_key=c.api_key,
+                protocol=c.protocol, anthropic_version=c.anthropic_version,
+                timeout_seconds=c.timeout_seconds,
+                output_token_parameter=c.effective_output_token_parameter,
+                strict_tool_schema=c.strict_tool_schema, streaming=c.streaming,
+                open_api_mode=c.open_api_mode, reasoning_effort=c.reasoning_effort,
+                capability_overrides=c.capability_overrides,
+                request_parameters=c.request_parameters,
+                send_output_token_limit=c.send_output_token_limit,
+            ) for name, c in profile_configurations.items()
+        }
+        hashes = {name: canonical_hash({
+            "model": c.model, "protocol": c.wire_protocol,
+            "endpoint_hash": canonical_hash(c.base_url),
+            "reasoning_effort": c.reasoning_effort, "streaming": c.streaming,
+            "request_parameters": dict(c.request_parameters),
+            "capabilities": dict(c.capability_overrides),
+            "output_token_parameter": c.output_token_parameter,
+            "send_output_token_limit": c.send_output_token_limit,
+            "strict_tool_schema": c.strict_tool_schema,
+        }) for name, c in profile_configurations.items()}
+        return ModelProfileProvider(providers, default_profile_id, profile_catalog, hashes)
     if protocol == MODEL_PROTOCOL_ANTHROPIC_MESSAGES:
         provider = AnthropicMessagesModelProvider(
             base_url,
@@ -302,6 +335,8 @@ def _physical_model_provider(
             anthropic_version=anthropic_version,
             timeout_seconds=timeout_seconds,
             streaming=streaming,
+            reasoning_effort=reasoning_effort,
+            request_parameters=request_parameters,
         )
     else:
         provider_class = (
@@ -320,6 +355,8 @@ def _physical_model_provider(
             strict_tool_schema=strict_tool_schema,
             streaming=streaming,
             reasoning_effort=reasoning_effort,
+            request_parameters=request_parameters,
+            send_output_token_limit=send_output_token_limit,
         )
     return _apply_capability_overrides(provider, capability_overrides or {})
 
@@ -1017,6 +1054,9 @@ def compose_openai_compatible_readonly_application(
     model_reasoning_effort: str | None = None,
     model_capability_overrides: Mapping[str, bool | int] | None = None,
     model_profile_id: str | None = None,
+    model_request_parameters=None,
+    model_configurations=None,
+    model_catalog=(),
     context_configuration: ContextConfiguration | None = None,
     web_egress_configuration: WebEgressConfiguration | None = None,
     search_configuration: SearchConfiguration | None = None,
@@ -1050,6 +1090,10 @@ def compose_openai_compatible_readonly_application(
         open_api_mode=model_open_api_mode,
         reasoning_effort=model_reasoning_effort,
         capability_overrides=model_capability_overrides,
+        request_parameters=model_request_parameters,
+        profile_configurations=model_configurations,
+        profile_catalog=model_catalog,
+        default_profile_id=model_profile_id,
     )
     recovery_policy = RuleBasedModelRecoveryPolicy(
         model_retry_backoff_seconds
@@ -1223,6 +1267,9 @@ def compose_openai_compatible_engineering_application(
     model_reasoning_effort: str | None = None,
     model_capability_overrides: Mapping[str, bool | int] | None = None,
     model_profile_id: str | None = None,
+    model_request_parameters=None,
+    model_configurations=None,
+    model_catalog=(),
     context_configuration: ContextConfiguration | None = None,
     web_egress_configuration: WebEgressConfiguration | None = None,
     search_configuration: SearchConfiguration | None = None,
@@ -1259,6 +1306,10 @@ def compose_openai_compatible_engineering_application(
         open_api_mode=model_open_api_mode,
         reasoning_effort=model_reasoning_effort,
         capability_overrides=model_capability_overrides,
+        request_parameters=model_request_parameters,
+        profile_configurations=model_configurations,
+        profile_catalog=model_catalog,
+        default_profile_id=model_profile_id,
     )
     recovery_policy = RuleBasedModelRecoveryPolicy(
         model_retry_backoff_seconds
@@ -1460,6 +1511,11 @@ def compose_openai_compatible_readonly_application_from_config(
         model_reasoning_effort=configuration.reasoning_effort,
         model_capability_overrides=configuration.capability_overrides,
         model_profile_id=configuration.profile_id,
+        model_request_parameters=configuration.request_parameters,
+        model_catalog=model_profile_catalog(document),
+        model_configurations={row["id"]: load_model_configuration(
+            selected_configuration_file, document, profile_id=row["id"],
+        ) for row in model_profile_catalog(document) if row["enabled"]},
         max_parallel_tool_calls=load_max_parallel_tool_calls(document),
         context_configuration=context,
         web_egress_configuration=egress,
@@ -1515,6 +1571,11 @@ def compose_openai_compatible_engineering_application_from_config(
         model_reasoning_effort=configuration.reasoning_effort,
         model_capability_overrides=configuration.capability_overrides,
         model_profile_id=configuration.profile_id,
+        model_request_parameters=configuration.request_parameters,
+        model_catalog=model_profile_catalog(document),
+        model_configurations={row["id"]: load_model_configuration(
+            selected_configuration_file, document, profile_id=row["id"],
+        ) for row in model_profile_catalog(document) if row["enabled"]},
         max_parallel_tool_calls=load_max_parallel_tool_calls(document),
         context_configuration=context,
         web_egress_configuration=egress,
@@ -1569,6 +1630,15 @@ def configure_request_diagnostics(application: Application):
 
     model = application.kernel.dependencies.model
     physical = getattr(model, "_provider", model)
+    profiles = getattr(physical, "_providers", None)
+    if profiles is not None:
+        capture = TurnRequestDiagnostics()
+        supported = False
+        for provider in profiles.values():
+            if isinstance(provider, OpenAICompatibleModelProvider):
+                provider._request_diagnostics = capture
+                supported = True
+        return capture if supported else None
     if isinstance(physical, OpenAICompatibleModelProvider):
         capture = TurnRequestDiagnostics()
         physical._request_diagnostics = capture

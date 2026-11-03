@@ -115,7 +115,7 @@ class UserSkillsStoreTest(unittest.TestCase):
         skill = self.store.install_path(source / "SKILL.md")
         content = self.store.read(skill)["content"]
         self.assertEqual(skill.name, "verify-change")
-        self.assertIn("Choose the smallest verification", content)
+        self.assertEqual(content, (source / "SKILL.md").read_text(encoding="utf-8"))
 
     def test_multiple_sources_deduplicate_paths_and_keep_external_files_unchanged(self):
         kiro = self.root / ".kiro/skills"

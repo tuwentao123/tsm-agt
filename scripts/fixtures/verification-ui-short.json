@@ -1,0 +1,30 @@
+{
+  "case_id": "ui-short",
+  "files": {
+    "README.md": "# Timeline example\nFrontend JavaScript lives in PAGE_SCRIPT in page.py.\nRun the existing behavior checks from the project root:\n{{PYTHON}} -m unittest test_flow\nThe wrapper reads the Node executable from toolchain.json.\n",
+    "page.py": "PAGE_SCRIPT = \"\"\"\nfunction buildTimeline(events) {\n  const tools = events.filter(item => item.kind === 'tool');\n  const comments = events.filter(item => item.kind === 'commentary');\n  const answers = events.filter(item => item.kind === 'final_answer');\n  return [...tools, ...comments, ...answers];\n}\n\"\"\"\n",
+    "toolchain.json": "{{TOOLCHAIN}}",
+    "test_flow.py": "import json\nfrom pathlib import Path\nimport subprocess\nimport unittest\nfrom page import PAGE_SCRIPT\n\n\nclass TimelineTest(unittest.TestCase):\n    def test_preserves_interleaved_events(self):\n        node = json.loads(Path('toolchain.json').read_text())['node']\n        script = PAGE_SCRIPT + \"\"\"\nconst assert = require('node:assert/strict');\nconst events = [\n  {kind:'tool', text:'read'}, {kind:'commentary', text:'read complete'},\n  {kind:'tool', text:'edit'}, {kind:'commentary', text:'edit complete'},\n  {kind:'final_answer', text:'done'}\n];\nassert.deepEqual(buildTimeline(events), events);\nassert.deepEqual(buildTimeline([]), []);\nassert.deepEqual(buildTimeline([{kind:'commentary',text:'starting'}]),\n                 [{kind:'commentary',text:'starting'}]);\n\"\"\"\n        result = subprocess.run([node, '-e', script], capture_output=True, text=True)\n        self.assertEqual(result.returncode, 0, result.stderr)\n"
+  },
+  "editable_files": [
+    "page.py"
+  ],
+  "preserve_files": [
+    "README.md",
+    "toolchain.json",
+    "test_flow.py"
+  ],
+  "history": [
+    {
+      "user": "现在工具调用和阶段说明被分成两组，看不出执行顺序，希望改为工具、阶段说明交替的时间线，最后显示最终回答。",
+      "assistant": "可以修改 page.py 里的 buildTimeline，按输入事件顺序组织条目。这是展示逻辑调整，保持事件结构和调用方接口。"
+    }
+  ],
+  "history_padding_rounds": 0,
+  "behavior_change": true,
+  "turns": [
+    {
+      "input": "直接按照你说的改吧"
+    }
+  ]
+}

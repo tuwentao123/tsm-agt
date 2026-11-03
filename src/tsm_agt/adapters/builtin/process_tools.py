@@ -29,6 +29,7 @@ from tsm_agt.ports import (
     ToolRisk,
     ToolSpec,
 )
+from tsm_agt.ports.process import process_output_page
 
 
 class _BoundedNumberError(ValueError):
@@ -73,7 +74,11 @@ class CoreProcessToolProvider:
                 "stdout, stderr, and duration. Set mode='background' only for a service "
                 "or other intentionally long-lived process; that mode returns a process "
                 "id and RUNNING is not a successful command outcome. Use core.process_wait "
-                "or core.process_logs only for an explicit background process. "
+                "for an explicit background process. Output returns at most 16000 "
+                "UTF-8 text bytes per stream per observation. If has_more is true, "
+                "use core.process_logs with the process id and returned next cursors "
+                "to read retained output, including foreground commands; do not rerun "
+                "a command just to recover its remaining output. "
                 "Prefer web.search and web.fetch_markdown for public web pages. "
                 "Reading another project's source is a normal use of this tool. "
                 "With the gh CLI, gh api -H 'Accept: application/vnd.github.raw' "
@@ -206,7 +211,10 @@ class CoreProcessToolProvider:
             description=(
                 "Read retained stdout and stderr from one session-owned managed "
                 "process. Pass the returned next cursors on the next call to receive "
-                "only new output. Output is bounded and may report truncation."
+                "the next page. Also reads retained foreground output. Each stream "
+                "returns up to 16000 UTF-8 text bytes; has_more indicates another "
+                "retained page, while retention_truncated indicates capture loss. "
+                "Cursors are byte offsets in retained decoded UTF-8 text."
             ),
             parameters={
                 "type": "object",
@@ -352,10 +360,13 @@ class CoreProcessToolProvider:
                 data = await control.stop(process_id, grace_seconds)
             else:
                 return self._error(call, "NOT_FOUND", f"unknown process tool: {call.name}")
+            data = self._page_output(data)
+            truncated, hint = self._output_notice(data)
             return ToolResult(
                 call.call_id,
                 True,
                 data=dict(data),
+                truncated=truncated, hint=hint,
                 fact_descriptor=self._fact_descriptor(call, context, data),
             )
         except ProcessStartError as error:
@@ -435,6 +446,31 @@ class CoreProcessToolProvider:
         )
 
     @staticmethod
+    def _page_output(data: Mapping[str, Any]) -> dict[str, Any]:
+        bounded = dict(data)
+        for name in ("stdout", "stderr"):
+            stream = data.get(name)
+            if isinstance(stream, Mapping) and "text" in stream and "cursor_unit" not in stream:
+                bounded[name] = process_output_page(stream)
+        return bounded
+
+    @staticmethod
+    def _output_notice(data: Mapping[str, Any]) -> tuple[bool, str | None]:
+        streams = [data.get(name, {}) for name in ("stdout", "stderr")]
+        truncated = any(isinstance(stream, Mapping) and stream.get("truncated") for stream in streams)
+        if any(isinstance(stream, Mapping) and stream.get("has_more") for stream in streams):
+            return True, (
+                "Output is paginated; the command outcome above is unchanged. "
+                f"Read retained output with core.process_logs process_id={data.get('process_id')} "
+                f"stdout_cursor={data.get('stdout', {}).get('next_cursor', 0)} "
+                f"stderr_cursor={data.get('stderr', {}).get('next_cursor', 0)}. "
+                "Do not rerun the command to recover output."
+            )
+        if truncated:
+            return True, "The capture limit was reached; no more retained output remains after these cursors."
+        return False, None
+
+    @staticmethod
     def _command_result(
         call: ToolCall,
         context: ToolInvocationContext,
@@ -449,17 +485,21 @@ class CoreProcessToolProvider:
         Background starts remain successful receipts until a later observation
         reaches a terminal state.
         """
+        data = CoreProcessToolProvider._page_output(data)
+        truncated, hint = CoreProcessToolProvider._output_notice(data)
         if data.get("succeeded") is False:
             failure_code = str(data.get("failure_code") or "PROCESS_EXIT_NON_ZERO")
             return ToolResult(
                 call.call_id, False, data=dict(data), error_code=failure_code,
                 message="command reached a terminal non-success outcome",
+                truncated=truncated, hint=hint,
                 fact_descriptor=CoreProcessToolProvider._fact_descriptor(
                     call, context, data,
                 ),
             )
         return ToolResult(
             call.call_id, True, data=dict(data),
+            truncated=truncated, hint=hint,
             fact_descriptor=CoreProcessToolProvider._fact_descriptor(
                 call, context, data,
             ),

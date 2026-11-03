@@ -17,6 +17,8 @@ status='unchanged' and reused_from_call_id refers to the same-version text windo
 earlier result; the reference itself is not file text or proof that other ranges were read. If the
 body is unavailable, read the needed range again. Different observed file versions are historical
 snapshots; use the latest observed version for current edits and retain expected_hash checks.
+Do not reread the same visible window just for reassurance. Continue with the task or read a
+missing range; reread when a change is observed, an edit conflicts, or the exact body is no longer visible.
 
 <!-- prompt: code-edit-guidance -->
 Use core.apply_patch for short, unique text replacements, including localized multi-line blocks.

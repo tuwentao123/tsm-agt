@@ -37,6 +37,8 @@ from tsm_agt.ports import (
     is_sensitive_read_path,
 )
 
+from .file_read_cache import FileReadCache, file_version
+
 _MAX_LIST_LIMIT = 1000
 _MAX_READ_LINES = 1000
 _MAX_READ_CHARS = 8000
@@ -225,7 +227,8 @@ class CoreReadOnlyToolProvider:
             name="core.read_file",
             description=(
                 "Read a UTF-8 text file by path or by a resource_ref returned from a "
-                "prior list/find/search result in this Task. Use it after "
+                "prior list/find/search result in this Task. Reuse unchanged text already "
+                "visible in context; do not repeat the same read just for reassurance. Use it after "
                 "locating a specific source or config file; do not use it for binary or "
                 "secret files. An absolute outside path pauses for explicit Task-scoped "
                 "directory read approval. Escaped symlinks, .git, environment files, "
@@ -354,8 +357,10 @@ class CoreReadOnlyToolProvider:
 
     def __init__(self) -> None:
         self._started = False
+        self._file_reads = FileReadCache()
 
     async def start(self, context: AdapterContext) -> None:
+        self._file_reads.clear()
         self._started = True
 
     async def health(self) -> HealthStatus:
@@ -365,6 +370,7 @@ class CoreReadOnlyToolProvider:
 
     async def stop(self, deadline: datetime) -> None:
         self._started = False
+        self._file_reads.clear()
 
     async def list_tools(self) -> tuple[ToolSpec, ...]:
         return self._tools
@@ -664,53 +670,39 @@ class CoreReadOnlyToolProvider:
             return self._error(call, "NOT_FOUND", f"file does not exist: {raw_path}")
         if not path.is_file():
             return self._error(call, "INVALID_PARAM", f"path is not a file: {raw_path}")
-        raw = path.read_bytes()
-        if b"\x00" in raw:
-            return self._error(call, "INVALID_PARAM", f"file is binary: {raw_path}")
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            return self._error(call, "INVALID_PARAM", f"file is not UTF-8 text: {raw_path}")
-        lines = text.splitlines(keepends=True)
-        if start_column > 1 and (
-            start_line > len(lines) or start_column > len(lines[start_line - 1])
-        ):
-            return self._error(call, "INVALID_PARAM", "start_column is beyond the requested line")
-
-        parts: list[str] = []
-        remaining = _MAX_READ_CHARS
-        index = start_line - 1
-        actual_end = start_line - 1
-        next_column = 1
-        while index < len(lines) and index < start_line - 1 + max_lines:
-            column = start_column if index == start_line - 1 else 1
-            line = lines[index][column - 1 :]
-            if len(line) > remaining:
-                # Prefer whole lines; split only when a single line exceeds the
-                # page size so the line/column cursor always makes progress.
-                if not parts:
-                    parts.append(line[:remaining])
-                    actual_end = index + 1
-                    next_column = column + remaining
-                break
-            parts.append(line)
-            remaining -= len(line)
-            actual_end = index + 1
-            index += 1
-            if remaining == 0:
-                break
-        content = "".join(parts)
-        truncated = index < len(lines)
-        next_cursor = (
-            {"start_line": index + 1, "start_column": next_column}
-            if truncated else None
-        )
+        file_key = (context.task_id, str(resolved.workspace), str(path))
+        page_key = (file_key, start_line, start_column, max_lines)
+        with self._file_reads.reading(file_key):
+            # Even a hit opens the current target: cached text must not bypass
+            # newly denied read access. No body read/hash occurs on a stable hit.
+            with path.open("rb") as stream:
+                info = os.fstat(stream.fileno())
+                version = file_version(info)
+                page = self._file_reads.get(page_key, version)
+                current_info = os.fstat(stream.fileno())
+                current = file_version(current_info)
+                if current != version:
+                    page = None
+                    info = current_info
+                    version = current
+                cache_hit = page is not None
+                if page is None:
+                    raw = stream.read()
+                    page = self._read_file_page(raw, raw_path, start_line, start_column, max_lines)
+                    # A racing write or atomic replacement must not bind its
+                    # new metadata to the old bytes. Unstable reads aren't cached.
+                    if (version is not None and len(raw) == info.st_size
+                            and version == file_version(os.fstat(stream.fileno()))
+                            and version == file_version(path.stat())):
+                        self._file_reads.put(page_key, version, page)
+        next_cursor = page["next_cursor"]
+        truncated = next_cursor is not None
         target_hint = (
             f"resource_ref={call.arguments['resource_ref']}"
             if call.arguments.get("resource_ref") else f"path={raw_path}"
         )
         hint = (
-            f"Read through line {actual_end} of {len(lines)} (a line may be partial): continue with "
+            f"Read through line {page['end_line']} of {page['total_lines']} (a line may be partial): continue with "
             f"core.read_file {target_hint} start_line={next_cursor['start_line']} "
             f"start_column={next_cursor['start_column']} before "
             "concluding from this file."
@@ -722,28 +714,61 @@ class CoreReadOnlyToolProvider:
             data={
                 "path": self._display_path(resolved.workspace, path),
                 **self._resolved_path_data(context, raw_path, resolved),
-                "sha256": hashlib.sha256(raw).hexdigest(),
-                "start_line": start_line,
-                "start_column": start_column,
-                "end_line": actual_end,
-                "total_lines": len(lines),
-                # Keep the legacy line offset; next_cursor also handles a line
-                # longer than the character limit.
-                "next_offset": next_cursor["start_line"] if next_cursor else None,
-                "next_cursor": next_cursor,
-                "content": content,
+                **page,
             },
             truncated=truncated,
             hint=hint,
-            meta={"untrusted_data": True},
+            meta={"untrusted_data": True, "read_cache_hit": cache_hit},
             fact_descriptor=self._workspace_fact(
                 context,
                 resolved,
                 ToolResultMaterialization.CONTENT,
                 (ToolFactCapability.DESCRIBE_CONTENT,),
-                content_hash="sha256:" + hashlib.sha256(raw).hexdigest(),
+                content_hash="sha256:" + page["sha256"],
             ),
         )
+
+    @staticmethod
+    def _read_file_page(raw: bytes, raw_path: str, start_line: int,
+                        start_column: int, max_lines: int) -> dict[str, Any]:
+        if b"\x00" in raw:
+            raise ValueError(f"file is binary: {raw_path}")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"file is not UTF-8 text: {raw_path}") from error
+        lines = text.splitlines(keepends=True)
+        if start_column > 1 and (
+            start_line > len(lines) or start_column > len(lines[start_line - 1])
+        ):
+            raise ValueError("start_column is beyond the requested line")
+        parts: list[str] = []
+        remaining = _MAX_READ_CHARS
+        index = start_line - 1
+        actual_end = start_line - 1
+        next_column = 1
+        while index < len(lines) and index < start_line - 1 + max_lines:
+            column = start_column if index == start_line - 1 else 1
+            line = lines[index][column - 1:]
+            if len(line) > remaining:
+                # Split only a line too large for one page, preserving its cursor.
+                if not parts:
+                    parts.append(line[:remaining])
+                    actual_end = index + 1
+                    next_column = column + remaining
+                break
+            parts.append(line)
+            remaining -= len(line)
+            actual_end = index + 1
+            index += 1
+            if remaining == 0:
+                break
+        next_cursor = ({"start_line": index + 1, "start_column": next_column}
+                       if index < len(lines) else None)
+        return {"sha256": hashlib.sha256(raw).hexdigest(), "start_line": start_line,
+                "start_column": start_column, "end_line": actual_end, "total_lines": len(lines),
+                "next_offset": next_cursor["start_line"] if next_cursor else None,
+                "next_cursor": next_cursor, "content": "".join(parts)}
 
     def _search_text(
         self, call: ToolCall, context: ToolInvocationContext

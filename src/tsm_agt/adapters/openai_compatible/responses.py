@@ -83,9 +83,12 @@ class OpenAIResponsesModelProvider(OpenAICompatibleModelProvider):
                 function = call["function"]
                 items.append({"type": "function_call", "call_id": call["id"], "name": function["name"], "arguments": function["arguments"]})
         payload = {"model": self._model, "input": items,
-                   "reasoning": {"effort": self._reasoning_effort, "summary": "auto"},
+                   "reasoning": {"effort": request.reasoning_effort or self._reasoning_effort, "summary": "auto"},
                    "include": ["reasoning.encrypted_content"], "store": False}
-        if request.max_output_tokens is not None:
+        for key in ("prompt_cache_key", "prompt_cache_retention", "parallel_tool_calls"):
+            if key in chat:
+                payload[key] = chat[key]
+        if self._send_output_token_limit and request.max_output_tokens is not None:
             payload["max_output_tokens"] = request.max_output_tokens
         if chat.get("tools"):
             payload["tools"] = [{"type": "function", **tool["function"]} for tool in chat["tools"]]
@@ -146,7 +149,9 @@ class OpenAIResponsesModelProvider(OpenAICompatibleModelProvider):
         chat_response = {"id": response.get("id"), "model": response.get("model"),
                          "choices": [{"message": assistant_message,
                                       "finish_reason": "tool_calls" if calls else ("length" if response.get("status") == "incomplete" else "stop")}],
-                         "usage": {"prompt_tokens": usage.get("input_tokens", 0), "completion_tokens": usage.get("output_tokens", 0)}}
+                         "usage": {"prompt_tokens": usage.get("input_tokens", 0), "completion_tokens": usage.get("output_tokens", 0),
+                                   "prompt_tokens_details": usage.get("input_tokens_details", {}),
+                                   "completion_tokens_details": usage.get("output_tokens_details", {})}}
         result = self._normalize_response(request.turn_id, chat_response, names,
                     allow_text_tool_fallback=request.allow_tool_calls,
                     allowed_outcome_refs=frozenset(request.outcome_refs),

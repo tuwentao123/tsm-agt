@@ -11,6 +11,8 @@ build/
 .env.*
 !.env.example
 .agent/
+# Uploaded skills are local runtime content, not application source.
+/uploaded_skills/
 # Local CLI identity/state and SQLite shell marker; never source artifacts.
 .local/
 /.headers on

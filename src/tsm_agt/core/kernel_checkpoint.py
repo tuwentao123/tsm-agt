@@ -57,8 +57,21 @@ from .trust import workspace_fingerprint
 
 
 class CheckpointMixin:
+    @staticmethod
+    def _restore_checkpoint_model_profile(task, checkpoint):
+        """Recover older checkpoints from their immutable configuration."""
+        if checkpoint.model_profile_id is not None:
+            return checkpoint
+        configuration = next((item for item in reversed(task.effective_configurations)
+                              if item.effective_config_hash == checkpoint.effective_config_hash), None)
+        if configuration is None:
+            return checkpoint
+        profile_id = configuration.model.get("profile") or configuration.model.get("profile_id")
+        return replace(checkpoint, model_profile_id=profile_id) if isinstance(profile_id, str) else checkpoint
+
     async def _refresh_conversation_configuration(
         self, task_id: str, turn_id: str,
+        *, model_profile_id: str | None = None,
     ) -> TaskSnapshot:
         """Bind a NEW Turn to live configuration, never refresh a resume.
 
@@ -73,6 +86,7 @@ class CheckpointMixin:
                 raise AgentCheckpointConflict("new Turn configuration requires an executing Task without a pending approval")
             configuration = await self._build_effective_configuration(
                 current, len(current.effective_configurations) + 1,
+                model_profile_id=model_profile_id,
             )
             previous = current.effective_configurations[-1] if current.effective_configurations else None
             if previous is not None:
@@ -181,7 +195,10 @@ class CheckpointMixin:
         visible_tools: tuple[ToolSpec, ...],
     ) -> AgentTurnCheckpoint:
         if task.task_kind is TaskKind.CONVERSATION:
-            task = await self._refresh_conversation_configuration(task.task_id, checkpoint.turn_id)
+            task = await self._refresh_conversation_configuration(
+                task.task_id, checkpoint.turn_id,
+                model_profile_id=checkpoint.model_profile_id,
+            )
         if not task.effective_configurations:
             raise RuntimeError("Agent checkpoint requires Effective Configuration")
         configuration = task.effective_configurations[-1]
@@ -208,11 +225,12 @@ class CheckpointMixin:
             toolset_hash=effective_toolset_hash(visible_tools),
             prompt_manifest_hash=(configuration.prompt_manifest_hash or ""),
             session_id=session.session_id,
+            model_profile_id=checkpoint.model_profile_id or session.model_profile_id,
             session_context_hash=session.context_hash,
             working_memory_hash=working_memory.content_hash,
             reasoning_effort=(
                 checkpoint.reasoning_effort
-                if getattr(checkpoint, "reasoning_effort", None) is not None
+                if checkpoint.model_profile_id is not None or checkpoint.reasoning_effort is not None
                 else session.reasoning_effort
             ),
             enabled_skills=(
@@ -468,7 +486,8 @@ class CheckpointMixin:
             stored = await self._require_stored_task(task.task_id)
             current = TaskSnapshot.from_data(stored.data)
             configuration = await self._build_effective_configuration(
-                current, len(current.effective_configurations) + 1
+                current, len(current.effective_configurations) + 1,
+                model_profile_id=checkpoint.model_profile_id,
             )
             current = current.with_effective_configuration(configuration)
             await self._dependencies.store.commit(RuntimeUnitOfWork(
@@ -606,7 +625,8 @@ class CheckpointMixin:
             ):
                 conflicts.append("prompt_manifest_hash")
             live = await self._build_effective_configuration(
-                task, configuration.revision
+                task, configuration.revision,
+                model_profile_id=checkpoint.model_profile_id,
             )
             if dict(live.model) != dict(configuration.model):
                 conflicts.append("model_configuration")
@@ -687,7 +707,8 @@ class CheckpointMixin:
         stored = await self._require_stored_task(task.task_id)
         current = TaskSnapshot.from_data(stored.data)
         configuration = await self._build_effective_configuration(
-            current, len(current.effective_configurations) + 1
+            current, len(current.effective_configurations) + 1,
+            model_profile_id=checkpoint.model_profile_id,
         )
         updated = current.with_effective_configuration(configuration)
         event = RuntimeEvent(

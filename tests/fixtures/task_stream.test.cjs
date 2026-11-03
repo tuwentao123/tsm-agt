@@ -15,7 +15,7 @@ function setup({realFinal = false, realAnswers = false} = {}) {
     return cards.get(id);
   };
   const context = vm.createContext({
-    console, activeConversationId: 'chat',
+    console, activeConversationId: 'chat', defaultModelProfile: null,
     EventSource: class {
       constructor(url) { this.url = url; streams.push(this); }
       close() { this.closed = true; }
@@ -171,7 +171,7 @@ test('durable turn panels receive tool and transport progress while the volatile
 test('an older history response cannot erase the newest completed turn or reopen its stream', async () => {
   const pending = [];
   const conversation = {loaded: false, messages: []};
-  const ctx = vm.createContext({console, activeConversationId: 'chat',
+  const ctx = vm.createContext({console, activeConversationId: 'chat', defaultModelProfile: null,
     getConversationById: () => conversation,
     fetch: () => new Promise(resolve => pending.push(resolve)),
     renderConversations() {}, renderMessages() {}, setLoading() {},
@@ -196,7 +196,7 @@ test('authoritative history keeps the visible prefix of the same answer while re
   const original = {role: 'assistant', taskId: 'task', turnId: 'turn',
     content: '回答还在逐字展开', textPresentation: presentation};
   const conversation = {loaded: false, messages: [original]};
-  const ctx = vm.createContext({console, getConversationById: () => conversation,
+  const ctx = vm.createContext({console, defaultModelProfile: null, getConversationById: () => conversation,
     fetch: async () => ({ok: true, json: async () => ({messages: [{role: 'assistant',
       content: original.content, task_id: 'task', turn_id: 'turn', source_event_sequence: 20}]})}),
     renderConversations() {}, renderMessages() {},
@@ -210,7 +210,7 @@ test('authoritative history keeps the visible prefix of the same answer while re
 
 test('an interrupted task keeps its unanswered Turn trace anchored under the user input', async () => {
   const conversation = {loaded: false, messages: []};
-  const ctx = vm.createContext({console, getConversationById: () => conversation,
+  const ctx = vm.createContext({console, defaultModelProfile: null, getConversationById: () => conversation,
     TERMINAL_STATES: ['INTERRUPTED', 'DONE'],
     fetch: async () => ({ok: true, json: async () => ({active_task_id: 'task',
       tasks: [{task_id: 'task', phase1_state: 'INTERRUPTED'}],

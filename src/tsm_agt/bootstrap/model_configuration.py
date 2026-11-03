@@ -135,6 +135,9 @@ class ModelConfiguration:
     reasoning_effort: str | None = None
     profile_id: str | None = None
     capability_overrides: Mapping[str, bool | int] = field(default_factory=dict)
+    request_parameters: Mapping[str, object] = field(default_factory=dict)
+    send_output_token_limit: bool = True
+    reasoning_efforts: tuple[str, ...] = ()
 
     @property
     def effective_output_token_parameter(self) -> str:
@@ -195,6 +198,7 @@ def load_model_configuration(
     document: Mapping[str, object] | None = None,
     *,
     require_complete: bool = True,
+    profile_id: str | None = None,
 ) -> ModelConfiguration | None:
     """Load the selected YAML model profile.
 
@@ -209,8 +213,12 @@ def load_model_configuration(
     model_data = _mapping(document.get("model"), "model")
     providers = _mapping(model_data.get("providers"), "model.providers")
     profiles = _mapping(model_data.get("profiles"), "model.profiles")
-    profile_id = _string(model_data.get("default_profile"), "model.default_profile")
+    profile_id = profile_id or _string(model_data.get("default_profile"), "model.default_profile")
     profile = _mapping(profiles.get(profile_id), f"model.profiles.{profile_id}")
+    if not _bool(profile.get("enabled", True), f"model.profiles.{profile_id}.enabled"):
+        raise ValueError(f"model profile is disabled: {profile_id}")
+    if profile.get("kind", "text") != "text":
+        raise ValueError(f"model profile is not a text agent: {profile_id}")
     provider_id = _string(profile.get("provider"), f"model.profiles.{profile_id}.provider")
     provider = _mapping(providers.get(provider_id), f"model.providers.{provider_id}")
     wire_protocol = _choice(provider.get("protocol"), f"model.providers.{provider_id}.protocol", WIRE_PROTOCOLS)
@@ -234,6 +242,9 @@ def load_model_configuration(
     _validate_option_names(options, profile_id)
     capability_overrides = _capability_overrides(profile.get("capabilities"), profile_id)
     protocol = MODEL_PROTOCOL_ANTHROPIC if wire_protocol == WIRE_PROTOCOL_ANTHROPIC_MESSAGES else MODEL_PROTOCOL_OPEN
+    send_output_token_limit = _bool(options.get("send_output_token_limit", True), "model options.send_output_token_limit")
+    if protocol == MODEL_PROTOCOL_ANTHROPIC and not send_output_token_limit:
+        raise ValueError("Anthropic Messages requires an output token limit")
     sources = {name: "yaml" for name in (
         "model.provider", "model.endpoint_origin", "model.model",
         "model.credentials_configured", "model.protocol", "model.profile",
@@ -257,7 +268,83 @@ def load_model_configuration(
         reasoning_effort=_optional_choice(options.get("reasoning_effort"), "model options.reasoning_effort", {"none", "minimal", "low", "medium", "high", "xhigh", "max"}),
         profile_id=profile_id,
         capability_overrides=capability_overrides,
+        request_parameters=_request_parameters(options.get("request_parameters"), wire_protocol),
+        send_output_token_limit=send_output_token_limit,
+        reasoning_efforts=_reasoning_efforts(profile, profile_id),
     )
+
+
+def model_profile_catalog(document: Mapping[str, object]) -> tuple[dict[str, object], ...]:
+    """Public profile metadata only: never return endpoints, options or credentials."""
+    model = _mapping(document.get("model"), "model")
+    providers = _mapping(model.get("providers"), "model.providers")
+    profiles = _mapping(model.get("profiles"), "model.profiles")
+    rows = []
+    for profile_id, raw in profiles.items():
+        profile = _mapping(raw, f"model.profiles.{profile_id}")
+        provider_id = _string(profile.get("provider"), "model profile provider")
+        provider = _mapping(providers.get(provider_id), "model provider")
+        kind = _choice(profile.get("kind", "text"), "model profile kind", {"text", "image"})
+        enabled = _bool(profile.get("enabled", True), "model profile enabled")
+        efforts = _reasoning_efforts(profile, profile_id)
+        rows.append({
+            "id": profile_id, "label": _string(profile.get("label", profile.get("model")), "model profile label"),
+            "model": _string(profile.get("model"), "model profile model"),
+            "protocol": _choice(provider.get("protocol"), "model provider protocol", WIRE_PROTOCOLS),
+            "enabled": enabled and kind == "text", "kind": kind,
+            "disabled_reason": str(profile.get("disabled_reason", "图像模型不能用于代码会话" if kind == "image" else "")),
+            "reasoning_efforts": list(efforts),
+            "status": _choice(profile.get("status", "unverified"), "model profile status",
+                              {"ready", "limited", "unverified", "blocked", "unsupported"}),
+            "status_detail": str(profile.get("status_detail", "")),
+        })
+    return tuple(rows)
+
+
+def _reasoning_efforts(profile: Mapping[str, object], profile_id: str) -> tuple[str, ...]:
+    efforts = profile.get("reasoning_efforts", [])
+    allowed = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+    if not isinstance(efforts, list) or any(not isinstance(value, str) or value not in allowed for value in efforts):
+        raise ValueError(f"invalid reasoning_efforts for {profile_id}")
+    return tuple(efforts)
+
+
+def _request_parameters(value: object, protocol: str) -> Mapping[str, object]:
+    import copy
+    parameters = _optional_mapping(value, "model options.request_parameters")
+    common = {"thinking", "output_config", "cache_control"}
+    allowed = common if protocol == WIRE_PROTOCOL_ANTHROPIC_MESSAGES else {
+        "thinking", "prompt_cache_key", "prompt_cache_retention", "parallel_tool_calls",
+    }
+    if protocol == WIRE_PROTOCOL_OPENAI_RESPONSES:
+        allowed = allowed - {"thinking"}
+    if set(parameters) - allowed:
+        raise ValueError("unsupported request_parameters: " + ", ".join(sorted(set(parameters) - allowed)))
+    for key in ("thinking", "output_config", "cache_control"):
+        if key in parameters:
+            _mapping(parameters[key], "request_parameters." + key)
+    if "thinking" in parameters:
+        thinking = parameters["thinking"]
+        if set(thinking) - {"type", "budget_tokens"}:
+            raise ValueError("unsupported thinking parameters")
+        _choice(thinking.get("type"), "thinking.type", {"enabled", "disabled", "adaptive"})
+        if "budget_tokens" in thinking:
+            _int_range(thinking["budget_tokens"], "thinking.budget_tokens", 1024, 1_000_000)
+    if "output_config" in parameters:
+        output = parameters["output_config"]
+        if set(output) != {"effort"}:
+            raise ValueError("output_config only accepts effort")
+        _choice(output["effort"], "output_config.effort", {"low", "medium", "high", "max"})
+    if "cache_control" in parameters and parameters["cache_control"] not in (
+        {"type": "ephemeral"}, {"type": "ephemeral", "ttl": "5m"}, {"type": "ephemeral", "ttl": "1h"},
+    ):
+        raise ValueError("invalid cache_control")
+    for key in ("prompt_cache_key", "prompt_cache_retention"):
+        if key in parameters:
+            _string(parameters[key], "request_parameters." + key)
+    if "parallel_tool_calls" in parameters:
+        _bool(parameters["parallel_tool_calls"], "parallel_tool_calls")
+    return copy.deepcopy(dict(parameters))
 
 
 def inspect_model_configuration(path: Path | None = None) -> tuple[ModelConfiguration | None, tuple[str, ...]]:
@@ -337,7 +424,7 @@ def _validate_option_names(options: Mapping[str, object], profile_id: str) -> No
     supported = {
         "timeout_seconds", "max_retries", "retry_backoff_seconds",
         "output_token_parameter", "anthropic_version", "strict_tool_schema",
-        "streaming", "reasoning_effort",
+        "streaming", "reasoning_effort", "request_parameters", "send_output_token_limit",
     }
     unknown = sorted(set(options) - supported)
     if unknown:

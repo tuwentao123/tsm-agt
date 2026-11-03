@@ -76,7 +76,9 @@ from .process import (
     ProcessStartError,
     process_result_succeeded,
 )
-from .mcp import MCPClient, MCPClientFactory, MCPClientManager, MCPServerConfig
+from .mcp import (
+    MCPCallNotSentError, MCPClient, MCPClientFactory, MCPClientManager, MCPServerConfig,
+)
 from .sandbox import SandboxDecision, SandboxPort, SandboxRequest
 from .cross_process_lock import CrossProcessLockPort
 from .workspace_filesystem import WorkspaceFilesystemPort
@@ -273,6 +275,7 @@ __all__ = [
     "ProcessCommandResult",
     "ProcessStartError",
     "MCPClient",
+    "MCPCallNotSentError",
     "MCPClientFactory",
     "MCPClientManager",
     "MCPServerConfig",

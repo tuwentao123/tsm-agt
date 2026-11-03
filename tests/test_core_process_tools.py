@@ -30,6 +30,7 @@ from tsm_agt.ports import (
     ToolCall,
     ToolFactCapability,
     ToolIdempotency,
+    ToolInvocationContext,
     ToolRecoveryKind,
     ToolResultMaterialization,
     ToolRisk,
@@ -199,7 +200,7 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_command_rejects_an_omitted_working_directory_before_approval(self) -> None:
         with self.assertRaisesRegex(
-            ValueError, "core.run_command is missing required arguments: cwd",
+            InvalidToolArguments, r"core\.run_command arguments: missing required arguments: cwd",
         ):
             await self.application.kernel.invoke_tool(
                 self.task.task_id, "turn-missing-cwd",
@@ -467,12 +468,33 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
             self.task.task_id, result.data["process_id"], grace_seconds=0.01,
         )
 
-    async def test_wait_range_error_is_recoverable_with_correction_facts(self) -> None:
-        result = await self.application.kernel.invoke_tool(
-            self.task.task_id, "turn-invalid-wait",
+    async def test_wait_range_error_is_rejected_before_dispatch(self) -> None:
+        with self.assertRaisesRegex(InvalidToolArguments, r"arguments\.wait_seconds.*maximum=30"):
+            await self.application.kernel.invoke_tool(
+                self.task.task_id, "turn-invalid-wait",
+                ToolCall("call-invalid-wait", "core.process_wait", {
+                    "process_id": "process-not-reached", "wait_seconds": 600,
+                }),
+            )
+        events = await self.application.kernel.dependencies.store.read_events(self.task.task_id)
+        self.assertFalse(any(event.event_type == "tool.started" and
+                             event.payload.get("call", {}).get("call_id") == "call-invalid-wait"
+                             for event in events))
+
+    async def test_provider_wait_range_error_is_recoverable_with_correction_facts(self) -> None:
+        class UnusedControl:
+            async def wait(self, *args):
+                raise AssertionError("invalid wait must not reach process control")
+
+        provider = CoreProcessToolProvider()
+        await provider.start(AdapterContext({}, lambda *_: None))
+        result = await provider.invoke(
             ToolCall("call-invalid-wait", "core.process_wait", {
                 "process_id": "process-not-reached", "wait_seconds": 600,
             }),
+            ToolInvocationContext("inv-invalid-wait", self.task.task_id, "turn-invalid-wait",
+                                  Path(self.temporary.name), datetime.now(timezone.utc) + timedelta(seconds=30),
+                                  process_control=UnusedControl()),
         )
 
         self.assertFalse(result.ok)

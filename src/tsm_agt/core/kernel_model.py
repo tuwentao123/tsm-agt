@@ -75,6 +75,11 @@ _GENERIC_PROTOCOL_CORRECTION = (
 
 
 class ModelMixin:
+    def _model_capabilities_for(self, profile_id=None):
+        model = self._dependencies.model
+        lookup = getattr(model, "capabilities_for", None)
+        return lookup(profile_id) if lookup else model.capabilities
+
     async def _commit_model_response_checkpoint(
         self, checkpoint: AgentTurnCheckpoint, response: Any,
         prompt_receipt: PromptAssemblyReceipt, context_budget: Any, *,

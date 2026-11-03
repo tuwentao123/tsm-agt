@@ -1,0 +1,26 @@
+{
+  "case_id": "prose-only",
+  "files": {
+    "README.md": "# Example\n这是一个本地工具。\n\n## Usage\nRead the documentation before running commands.\n",
+    "utility.py": "def identity(value):\n    return value\n"
+  },
+  "editable_files": [
+    "README.md"
+  ],
+  "preserve_files": [
+    "utility.py"
+  ],
+  "history": [
+    {
+      "user": "README 的介绍想换成：这是一个本地开发工具。其他内容保持原样。",
+      "assistant": "可以，只调整介绍这一句话。"
+    }
+  ],
+  "history_padding_rounds": 0,
+  "behavior_change": false,
+  "turns": [
+    {
+      "input": "按这个改一下介绍文字。"
+    }
+  ]
+}

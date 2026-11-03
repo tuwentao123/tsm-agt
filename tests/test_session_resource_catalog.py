@@ -20,7 +20,9 @@ from tsm_agt.ports import (
 
 
 class CatalogFollowUpModel(EchoModelProvider):
-    capabilities = ProviderCapabilities(tools=True, context_window=8192)
+    # Exercise authority separation with the full registered prompt; context
+    # overflow and compaction boundaries have their own dedicated tests.
+    capabilities = ProviderCapabilities(tools=True, context_window=16_384)
 
     def __init__(self) -> None:
         super().__init__()

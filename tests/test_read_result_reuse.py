@@ -108,7 +108,7 @@ def test_file_changes_are_actually_observed(reader, tmp_path, change):
     assert project_read_results(canonical, "task").messages == canonical
 
 
-@pytest.mark.parametrize("difference", ["path", "root", "task", "range", "request_limit"])
+@pytest.mark.parametrize("difference", ["path", "root", "task", "range"])
 def test_identical_text_is_not_enough_to_reuse(reader, tmp_path, difference):
     first = reader("a", max_lines=30)
     if difference == "path":
@@ -123,11 +123,18 @@ def test_identical_text_is_not_enough_to_reuse(reader, tmp_path, difference):
         second = reader("b", task="other-task", max_lines=30)
     elif difference == "range":
         second = reader("b", start_line=2, max_lines=30)
-    else:
-        first = reader("a", max_lines=200)
-        second = reader("b", max_lines=300)  # same actual body, different request
     canonical = (*exchange(*first), *exchange(*second))
     assert project_read_results(canonical, "task").messages == canonical
+
+
+def test_different_limits_reuse_only_identical_observed_windows(reader):
+    first = reader("a", max_lines=200)
+    second = reader("b", max_lines=300)  # Both returned the complete same file.
+    projected = project_read_results((*exchange(*first), *exchange(*second)), "task")
+    assert results(projected.messages)[1].data["reused_from_call_id"] == "a"
+    smaller = reader("c", max_lines=20)
+    distinct = project_read_results((*exchange(*first), *exchange(*smaller)), "task")
+    assert "content" in results(distinct.messages)[1].data
 
 
 @pytest.mark.parametrize("invalid", ["no_fact", "authority", "hash", "range", "cursor", "redacted", "failed", "visible_text"])
@@ -283,11 +290,16 @@ class ReadReuseLoopTest(unittest.IsolatedAsyncioTestCase):
 
         class CountingReads(CoreReadOnlyToolProvider):
             count = 0
+            body_reads = 0
 
             async def invoke(self, call, context):
                 if call.name == "core.read_file":
                     self.count += 1
                 return await super().invoke(call, context)
+
+            def _read_file_page(self, *args):
+                self.body_reads += 1
+                return super()._read_file_page(*args)
 
         provider = CountingReads()
         model = CapturingModel([
@@ -315,6 +327,9 @@ class ReadReuseLoopTest(unittest.IsolatedAsyncioTestCase):
                 task = await _executing(application, root)
                 await application.kernel.run_agent_turn(task.task_id, "Inspect source.py twice")
                 assert provider.count == (3 if compact else 2)
+                from tsm_agt.adapters.builtin.file_read_cache import file_version
+                assert provider.body_reads == (1 if file_version((root / "source.py").stat())
+                                               else provider.count)
                 visible = results(model.requests[-1].messages)
                 assert visible, str([(m.message_id, m.role.value) for m in model.requests[-1].messages
                                      if not m.message_id.startswith("prompt-")])

@@ -1,6 +1,6 @@
 ---
 name: verify-change
-description: Use when implementing or repairing code, configuration, integration, or UI behavior; select and execute relevant checks before reporting completion. Includes short follow-ups continuing that work. Excludes analysis-only requests and ordinary prose edits.
+description: Use for behavior changes to code, UI, configuration, prompts, Skills, runtime templates, tests, or automation; discover and execute relevant checks after the last edit. Includes short follow-ups authorizing implementation. Excludes analysis-only requests and ordinary prose not consumed as runtime instructions.
 kind: plan
 tags:
   - verify
@@ -15,27 +15,34 @@ approval_required: false
 
 # Verify a change
 
-Use this Skill when a requested implementation, configuration, build, test, or UI behavior change needs evidence before reporting completion. Do not use it merely to answer, analyze, or edit prose without a behavior claim.
+Short approvals of an implementation plan include verification. Code, UI, configuration, tests,
+automation and program-consumed Markdown prompts/Skills are behavior inputs. Ordinary prose and
+analysis-only requests do not require runtime tests. Respect explicit user execution restrictions.
 
 ## Decide from the actual change
 
-0. Load `references/workflow.md` with `skill.load(resource="references/workflow.md")` before selecting or running a check. Establish the executable entry and working directory from observed project instructions, runner configuration, wrappers, or environment facts. A test framework imported by a file does not establish that a similarly named executable exists.
-1. Read the current user request, the final relevant change, trusted project instructions (in this runtime, `.agent/projectInstructions.md` when present), and existing project entry points. Inspect available tools before assuming a browser, test runner, service, or MCP capability exists.
-2. Choose the smallest verification that can support the behavior being claimed. Reuse project commands and existing tests when they fit. Do not choose a command because its executable name looks like a test.
-3. For UI behavior, use an available browser, DevTools, Playwright, MCP, or existing end-to-end path when it can exercise the requested flow. Start a local service only when the project and available tools support it. A source read or successful build alone does not prove an interactive UI flow.
-4. Inspect actual output from a failed, partial, or running operation before diagnosing it. Repair and rerun only the checks made stale or relevant by the repair.
-5. In the final response, separate what was changed, what was actually checked, the coverage that check provides, and any remaining limitation. Never convert a write receipt, an unrelated zero exit code, or an unexecuted plan into a verification claim.
+1. **Discover before editing.** Read the project's README, trusted instructions (such as
+   `.agent/projectInstructions.md` when present), manifests or runner wrappers and relevant tests
+   with available read tools. Identify the observable outcome, exact executable/arguments and cwd.
+   Do not choose a runner from a filename or an imported framework. No project-instructions file
+   is required. Use available environment observations when the invocation is not documented.
+2. **Implement, then execute.** After the last relevant edit, invoke the smallest sufficient check
+   with ordinary execution tools and read its terminal output. A write receipt, source inspection,
+   loading this Skill, a pre-edit pass or an unrelated zero exit is not verification.
+3. **Recover, then observe.** If the command did not start, verification has not run. Return to the
+   README/wrappers and environment facts, correct the invocation and execute the available check.
+   One missing executable does not show that the project cannot be checked. Do not stop at that
+   first lookup failure or hand an available check to the user. Diagnose actual output, repair
+   relevant failures and rerun only affected checks. Establish remaining blockers with evidence.
+4. **Report evidence.** Describe the change, executed check, observed result and coverage gaps.
+   Do not claim an interactive flow works from compilation alone. For UI, exercise the affected
+   events/interactions; for prompts/Skills, check their actual loader/contracts. Claims about agent
+   behavior additionally need representative model trajectories. Inspect snapshot changes before
+   updating pins; a new hash alone is not behavior evidence.
 
-Once the
-last relevant edit succeeds, carry out that check with the available execution tools and inspect
-its actual result. A promise to run it or instructions for the user do not complete this workflow.
-Choose according to the behavior changed, not just a file extension: a Python file can contain
-JavaScript, generated templates, or configuration that needs a different test path.
-
-If an attempted command did not start, the check remains unexecuted. Continue discovering the
-project's actual invocation through available reads or environment observations; do not guess a
-replacement executable, treat one missing executable as proof that all verification is impossible,
-or finish by asking the user to run an available check. Establish any remaining blocker with evidence.
+This complete execution workflow does not require a second Skill load. For further check-selection
+guidance, load `references/workflow.md` with
+`skill.load(name="verify-change", resource="references/workflow.md")`.
 
 ## When this follows a diagnosis
 

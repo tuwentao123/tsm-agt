@@ -5,12 +5,12 @@ from __future__ import annotations
 import inspect
 from datetime import datetime
 
-from tsm_agt.ports.skill_files import SkillCatalogPort, SkillFilesPort
+from tsm_agt.ports.skill_files import SkillCatalogPort, SkillFilesPort, SkillResourceError
 from tsm_agt.core.skills import SkillKind, SkillRegistry
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ToolCall,
     ToolEffect, ToolIdempotency, ToolInvocationContext, ToolResult,
-    ToolResultAuthority, ToolRisk, ToolSpec,
+    ToolResultAuthority, ToolRisk, ToolSpec, ToolRecoveryKind,
 )
 
 
@@ -57,12 +57,18 @@ class CoreSkillToolProvider:
                     "Load reusable Skill instructions and then follow them using normal tools. "
                     "Load a named or clearly relevant Skill, including verification workflows for implementation tasks. "
                     "Choose from the Available Skills catalog in the request context. "
-                    "The optional resource reads a text file relative to the Skill directory."
+                    "Omit resource to read SKILL.md. If supplied, resource must be a non-empty "
+                    "relative path to a text file within the Skill directory."
                 ),
                 parameters={
                     "type": "object", "properties": {
                         "name": {"type": "string", "enum": [skill.name for skill in plans]},
-                        "resource": {"type": "string"},
+                        "resource": {
+                            "type": "string", "minLength": 1, "pattern": r"\S",
+                            "description": 'Omit resource to read the main instructions, or pass "SKILL.md". '
+                            'For a linked file, pass its relative path, e.g. "references/workflow.md". '
+                            'Empty or whitespace-only strings are invalid.',
+                        },
                         "catalog_revision": {"type": "string"},
                     }, "required": ["name"], "additionalProperties": False,
                 },
@@ -105,17 +111,20 @@ class CoreSkillToolProvider:
             current = self.catalog.model_data(skills)
             if expected_revision != current["revision"]:
                 return ToolResult(call.call_id, False, error_code="SKILL_CATALOG_CHANGED",
-                                  message="Skill catalog changed; use the refreshed catalog before loading.", data=current)
+                                  message="Skill catalog changed; use the refreshed catalog before loading.", data=current,
+                                  hint="Choose the Skill and catalog_revision from the returned catalog, then submit a new call.",
+                                  recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE)
         name = call.arguments.get("name") if call.name == "skill.load" else call.name
         skill = next((item for item in self.registry.list_all() if item.name == name), None)
         if skill is None:
-            return ToolResult(call.call_id, False, error_code="SKILL_NOT_FOUND", message=f"Skill unavailable: {name}")
+            return ToolResult(call.call_id, False, error_code="SKILL_NOT_FOUND", message=f"Skill unavailable: {name}",
+                              hint="Choose an exact name from the current Available Skills catalog.",
+                              recovery_kind=ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS,
+                              data=self.catalog.model_data(skills))
         meta = {"runtime_kind": "skill", "skill_id": skill.id, "skill_kind": skill.kind.value}
         try:
             if call.name == "skill.load" and skill.kind is SkillKind.PLAN:
                 resource = call.arguments.get("resource", "SKILL.md")
-                if not isinstance(resource, str):
-                    raise ValueError("resource must be a string")
                 data = self.catalog.read(skill, resource)
             elif skill.kind is SkillKind.CODE and skill.handler is not None:
                 data = skill.handler(call.arguments)
@@ -124,8 +133,46 @@ class CoreSkillToolProvider:
             else:
                 raise ValueError("Use skill.load to load instruction Skills")
             return ToolResult(call.call_id, True, data=data, meta=meta)
-        except (OSError, ValueError, UnicodeError) as error:
-            return ToolResult(call.call_id, False, error_code="SKILL_LOAD_FAILED", message=str(error), meta=meta)
+        except SkillResourceError as error:
+            recovery = (ToolRecoveryKind.TERMINAL if error.code == "SKILL_RESOURCE_FORBIDDEN"
+                        else ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS)
+            return self._load_error(call, meta, error.code, str(error), error.hint, recovery)
+        except FileNotFoundError as error:
+            return self._load_error(call, meta, "SKILL_RESOURCE_NOT_FOUND", str(error),
+                                    'Check the relative file path; omit resource or pass "SKILL.md" for the main instructions.',
+                                    ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS)
+        except IsADirectoryError as error:
+            return self._load_error(call, meta, "SKILL_RESOURCE_NOT_FILE", str(error),
+                                    "Pass a file path instead of a directory.",
+                                    ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS)
+        except PermissionError as error:
+            return self._load_error(call, meta, "SKILL_RESOURCE_PERMISSION_DENIED", str(error),
+                                    "The resource is not readable. Ask its owner to fix file permissions; do not retry unchanged or bypass access controls.",
+                                    ToolRecoveryKind.USER_ACTION_REQUIRED)
+        except UnicodeError:
+            return self._load_error(call, meta, "SKILL_RESOURCE_ENCODING_ERROR",
+                                    "Skill resource is not valid UTF-8 text.",
+                                    "Use a UTF-8 text resource or ask its owner to convert the file before retrying.",
+                                    ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE)
+        except OSError as error:
+            return self._load_error(call, meta, "SKILL_RESOURCE_READ_FAILED", str(error),
+                                    "Inspect the file or installation error before retrying; repeating the same call may not help.",
+                                    ToolRecoveryKind.TERMINAL)
+        except ValueError as error:
+            # Preserve a conservative fallback for code Skills and third-party
+            # catalogs without guessing recovery semantics from error prose.
+            return self._load_error(call, meta, "SKILL_LOAD_FAILED", str(error),
+                                    "Inspect the reported Skill error before choosing another action.",
+                                    ToolRecoveryKind.TERMINAL)
+
+    @staticmethod
+    def _load_error(call, meta, code, message, hint, recovery) -> ToolResult:
+        return ToolResult(
+            call.call_id, False, error_code=code, message=message, hint=hint, meta=meta,
+            recovery_kind=recovery,
+            recovery_action={"field": "resource", "skill": call.arguments.get("name"),
+                             "resource": call.arguments.get("resource", "SKILL.md")},
+        )
 
     async def _finish_installation(self, call: ToolCall, context: ToolInvocationContext) -> ToolResult:
         try:

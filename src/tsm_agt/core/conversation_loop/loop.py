@@ -72,6 +72,7 @@ from ..clarification import ClarificationNotPending
 from ..context import ContextWindowExceeded
 from ..context_messages import GENERATED_CONTEXT_PREFIXES
 from ..task import TaskKind, TaskSnapshot, TaskState
+from ..tool import InvalidToolArguments, validate_tool_arguments
 from ..turn import InvalidModelResponse, InvalidTurnState, ModelInvocationFailed
 from .finalizer import ITERATION_BUDGET_EXHAUSTED, ConversationFinalizer
 from .finalization import ConversationFinalizationPipeline
@@ -167,12 +168,18 @@ class ConversationAgentLoop:
         initial_exposure_profile = model_tool_exposure_profile(
             visible_tools, user_text=user_text, model_call=1,
         )
-        capabilities = kernel._dependencies.model.capabilities
-        if visible_tools and not capabilities.tools:
+        session = await kernel.get_session(task.session_id)
+        resolver = getattr(kernel._dependencies.model, "resolve_profile", None)
+        profile_id = resolver(session.model_profile_id) if resolver else session.model_profile_id
+        capabilities = kernel._model_capabilities_for(profile_id)
+        if visible_tools and not capabilities.tools and task.task_kind is not TaskKind.CONVERSATION:
             raise ProviderCapabilityMismatch(
                 "selected model provider does not support tools, but the Agent turn "
                 f"exposes {len(visible_tools)} tool(s)"
             )
+        if not capabilities.tools:
+            initial_model_tools = ()
+            initial_exposure_profile = "text_only"
         turn_id = f"turn-{uuid4().hex}"
         user_message = Message(
             message_id=f"msg-{uuid4().hex}",
@@ -193,6 +200,7 @@ class ConversationAgentLoop:
             ],
             "tool_exposure_profile": initial_exposure_profile,
             "provider_capabilities": capabilities.to_data(),
+            "model_profile_id": profile_id,
         }),))
         await kernel._append_events(task_id, (("conversation.turn_started", {
             "turn_id": turn_id,
@@ -224,6 +232,8 @@ class ConversationAgentLoop:
             max_output_tokens=max_output_tokens,
             tool_timeout_seconds=tool_timeout_seconds,
             enabled_skills=enabled_skill_ids,
+            model_profile_id=profile_id,
+            reasoning_effort=session.reasoning_effort,
         )
         checkpoint = await kernel._bind_agent_checkpoint(
             task, checkpoint, visible_tools
@@ -262,7 +272,9 @@ class ConversationAgentLoop:
             )
         if task.active_agent_checkpoint is None:
             raise LookupError(f"task has no active Agent checkpoint: {task_id}")
-        checkpoint = AgentTurnCheckpoint.from_data(task.active_agent_checkpoint)
+        checkpoint = kernel._restore_checkpoint_model_profile(
+            task, AgentTurnCheckpoint.from_data(task.active_agent_checkpoint),
+        )
         visible_tools = await kernel.list_tools()
         decision = await kernel._evaluate_checkpoint_compatibility(
             task, checkpoint, visible_tools
@@ -437,6 +449,8 @@ class ConversationAgentLoop:
                         response.message,
                         response.finish_reason,
                     )
+                    if parsed_calls and not state.request.allow_tool_calls:
+                        raise ModelInvocationFailed(state.turn_id, "text-only model returned an unexpected tool call")
                     duplicate = [
                         call.call_id for call in parsed_calls
                         if call.call_id in state.seen_call_ids
@@ -816,12 +830,19 @@ class ConversationAgentLoop:
         if response is not None and parsed_calls:
             state.messages.append(response.message)
             for call in parsed_calls:
+                error_code = "INVALID_ARGUMENT"
+                spec = state.visible_tool_by_name.get(call.name)
+                if spec is not None:
+                    try:
+                        validate_tool_arguments(spec, call.arguments)
+                    except InvalidToolArguments:
+                        error_code = "INVALID_PARAM"
                 state.messages.append(Message(
                     message_id=f"msg-tool-{uuid4().hex}",
                     role=MessageRole.TOOL,
                     content=(ToolResultBlock(ToolResult(
                         call.call_id, False,
-                        error_code="INVALID_ARGUMENT",
+                        error_code=error_code,
                         message=(
                             error.detail
                             or "the runtime rejected this tool call before execution"
@@ -919,12 +940,20 @@ class ConversationAgentLoop:
         runtime_instruction = latest_tool_result_instruction(
             kernel, state, model_tools,
         )
+        if not kernel._model_capabilities_for(state.checkpoint.model_profile_id).tools:
+            model_tools = ()
+            runtime_instruction += (
+                "\n\nThe selected model is configured for text-only conversation. "
+                "No tools are available for this request. Do not claim to read files, "
+                "run commands or make changes. If the user needs those actions, "
+                "explain this limitation and ask them to choose a model with tools."
+            )
         try:
             prepared = kernel._dependencies.context_manager.prepare(
                 conversation=tuple(state.messages),
                 tools=model_tools,
                 prompt_template=kernel._dependencies.prompt_template,
-                context_window=kernel._dependencies.model.capabilities.context_window,
+                context_window=kernel._model_capabilities_for(state.checkpoint.model_profile_id).context_window,
                 max_output_tokens=state.checkpoint.max_output_tokens,
                 runtime_instruction=runtime_instruction,
                 read_reuse_task_id=state.task_id,
@@ -965,11 +994,11 @@ class ConversationAgentLoop:
             messages=prompt.messages,
             max_output_tokens=state.checkpoint.max_output_tokens,
             tools=model_tools,
-            allow_tool_calls=True,
+            allow_tool_calls=kernel._model_capabilities_for(state.checkpoint.model_profile_id).tools,
             on_transport_progress=record_transport,
             conclusion_protocol_mode=(
                 ConclusionProtocolMode.REQUIRE_STRUCTURED
-                if kernel._dependencies.model.capabilities.structured_conclusion
+                if kernel._model_capabilities_for(state.checkpoint.model_profile_id).structured_conclusion
                 else ConclusionProtocolMode.OBSERVE
             ),
             cancellation_scope=kernel._cancellation_scope(state.task_id),
@@ -977,6 +1006,7 @@ class ConversationAgentLoop:
             # loop; routing, planning and review calls keep their bootstrap
             # defaults.
             reasoning_effort=getattr(state.checkpoint, "reasoning_effort", None),
+            model_profile_id=state.checkpoint.model_profile_id,
         )
         state.prepared = prepared
         state.prompt = prompt

@@ -43,13 +43,14 @@ through to the SDK.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Sequence
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
-from pathlib import Path
+import math
 from typing import Any, Mapping
 import sys
 
-from tsm_agt.ports import MCPServerConfig
+from tsm_agt.ports import MCPCallNotSentError, MCPServerConfig
 
 
 try:  # pragma: no cover - import is environment dependent
@@ -76,42 +77,115 @@ except Exception as exc:  # pragma: no cover - exercised only when SDK missing
     _SDK_IMPORT_ERROR = exc
 
 
-@dataclass(slots=True)
+_MAX_TOOL_LIST_PAGES = 1000
+_MAX_DISCOVERED_TOOLS = 10000
+
+
 class _WrappedMCPClient:
-    """Small adapter around the official MCP Client/Session.
+    """Proxy whose SDK contexts live entirely in one long-lived owner Task."""
 
-    This wrapper normalises the Python SDK API into the minimal
-    ``list_tools`` / ``call_tool`` protocol expected by :class:`MCPToolProvider`.
-    It is intentionally conservative: it exposes only what tsm-agt needs
-    today and leaves advanced features (resources, prompts, streaming) to
-    future extensions.
-    """
+    def __init__(self, kind: str, server_id: str) -> None:
+        self.kind = kind
+        self._server_id = server_id
+        self._session: Any = None
+        self._ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._stop = asyncio.Event()
+        self._closing = False
+        self._tearing_down = False
+        self._failure: BaseException | None = None
+        self._owner: asyncio.Task[None] | None = None
 
-    kind: str
-    session: Any
-    _exit_stack: AsyncExitStack
+    async def _run(self, transport: Any) -> None:
+        try:
+            async with AsyncExitStack() as exits:
+                try:
+                    streams = await exits.enter_async_context(transport)
+                    session = await exits.enter_async_context(
+                        _ClientSession(streams[0], streams[1])
+                    )
+                    await session.initialize()
+                    self._session = session
+                    self._ready.set_result(None)
+                    await self._stop.wait()
+                finally:
+                    self._tearing_down = True
+                    self._session = None
+        except asyncio.CancelledError as error:
+            # The factory preserves its caller's cancellation after joining us.
+            # Store owner cancellation rather than leaving an unobserved task
+            # exception; the SDK scopes have already unwound in this Task.
+            self._failure = error
+        except Exception as error:
+            self._failure = error
+        finally:
+            self._session = None
+            if not self._ready.done():
+                self._ready.set_result(None)
+
+    def _require_session(self) -> Any:
+        if self._closing or self._session is None or self._owner is None or self._owner.done():
+            raise MCPCallNotSentError(
+                f"MCP server '{self._server_id}' connection is not available"
+            ) from self._failure
+        return self._session
 
     async def list_tools(self) -> Any:
         """Return tool descriptors from the underlying MCP client.
 
-        The return value is passed straight through to ``MCPToolProvider``,
-        which only relies on each element exposing ``name``, ``description``
-        and an ``inputSchema`` (or compatible) attribute.
+        Complete every page before exposing descriptors to ``MCPToolProvider``.
+        Repeated cursors and bounded discovery limits reject the whole catalog.
         """
 
-        tool_list = await self.session.list_tools()
-        # The python-sdk returns a wrapper object with a ``tools`` attribute;
-        # retain compatibility with clients that directly return a sequence.
-        return getattr(tool_list, "tools", tool_list)
+        tools: list[Any] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        for _ in range(_MAX_TOOL_LIST_PAGES):
+            session = self._require_session()
+            page = (
+                await session.list_tools() if cursor is None
+                else await session.list_tools(cursor=cursor)
+            )
+            items = getattr(page, "tools", page)
+            if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+                raise RuntimeError("MCP tools/list returned an invalid tools sequence")
+            tools.extend(items)
+            if len(tools) > _MAX_DISCOVERED_TOOLS:
+                raise RuntimeError("MCP tools/list exceeded the tool discovery limit")
+            cursor = getattr(page, "nextCursor", None)
+            if cursor is None:
+                return tools
+            if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+                raise RuntimeError("MCP tools/list returned an invalid or repeated cursor")
+            seen_cursors.add(cursor)
+        raise RuntimeError("MCP tools/list exceeded the page discovery limit")
 
     async def call_tool(self, name: str, arguments: Mapping[str, Any]) -> Any:
         """Call a single MCP tool and return the SDK's result object."""
 
-        return await self.session.call_tool(name, dict(arguments))
+        session = self._require_session()
+        return await session.call_tool(name, dict(arguments))
 
     async def aclose(self) -> None:
-        """Close the session before its transport subprocess/HTTP stream."""
-        await self._exit_stack.aclose()
+        """Ask the owner to close; join it before propagating caller cancellation."""
+        self._closing = True
+        self._stop.set()
+        await self._wait_owner()
+        if self._failure is not None and not isinstance(self._failure, asyncio.CancelledError):
+            raise RuntimeError(
+                f"MCP server '{self._server_id}' session failed"
+            ) from self._failure
+
+    async def _wait_owner(self) -> None:
+        assert self._owner is not None
+        cancelled = False
+        while not self._owner.done():
+            try:
+                await asyncio.shield(self._owner)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+        self._owner.result()
 
 
 async def create_mcp_sdk_client(config: MCPServerConfig) -> _WrappedMCPClient:
@@ -158,21 +232,13 @@ async def create_mcp_sdk_client(config: MCPServerConfig) -> _WrappedMCPClient:
                 "non-empty command tuple"
             )
 
-        # The python-sdk uses a stdio transport plus a ClientSession.  The
-        # exact helper names are stable across the v2 API surface; we keep the
-        # integration intentionally simple and focused on the core
-        # list_tools/call_tool flow.
+        # Preserve argv. Bare Python names deliberately use the Agent's Python
+        # for compatibility; explicit interpreter paths are kept unchanged.
         command = list(config.command)
         program = command[0]
         args = command[1:]
 
-        # Some agents pass a single script path as the program; normalise that
-        # into a ``Path`` so the SDK can infer the correct interpreter.
-        if len(command) == 1:
-            server_path = Path(program)
-            program = sys.executable
-            args = [str(server_path)]
-        elif program in {"python", "python3"}:
+        if program in {"python", "python3"}:
             # Respect the current Python interpreter rather than relying on a
             # bare "python" shim being available on PATH.
             program = sys.executable
@@ -201,23 +267,28 @@ async def create_mcp_sdk_client(config: MCPServerConfig) -> _WrappedMCPClient:
 
 
 async def _session_client(*, kind: str, transport: Any, server_id: str) -> _WrappedMCPClient:
-    """Enter transport and session scopes before issuing MCP initialize.
-
-    ``ClientSession`` owns request/response task groups. Calling ``initialize``
-    outside its async context leaves those groups inactive and can wait forever
-    for a response. One exit stack makes the session lifetime match the MCP
-    provider lifecycle.
-    """
-    exits = AsyncExitStack()
+    """Keep AnyIO context entry/exit in the same Task, independent of callers."""
+    client = _WrappedMCPClient(kind, server_id)
+    client._owner = asyncio.create_task(
+        client._run(transport), name=f"mcp-session:{server_id}",
+    )
     try:
-        streams = await exits.enter_async_context(transport)
-        read, write = streams[0], streams[1]
-        session = await exits.enter_async_context(_ClientSession(read, write))
-        await session.initialize()
-        return _WrappedMCPClient(kind=kind, session=session, _exit_stack=exits)
-    except BaseException:
-        await exits.aclose()
-        raise RuntimeError(f"MCP server '{server_id}' failed during initialization") from None
+        await asyncio.shield(client._ready)
+    except asyncio.CancelledError:
+        if not client._tearing_down:
+            client._owner.cancel()
+        try:
+            await client._wait_owner()
+        except asyncio.CancelledError:
+            pass  # Repeated caller cancellation must not abandon SDK cleanup.
+        raise
+    if client._session is None or client._owner.done():
+        if isinstance(client._failure, asyncio.CancelledError):
+            raise asyncio.CancelledError
+        raise RuntimeError(
+            f"MCP server '{server_id}' failed during initialization"
+        ) from client._failure
+    return client
 
 
 def _string_mapping(value: object, field: str) -> dict[str, str]:
@@ -241,7 +312,7 @@ def _optional_string(value: object, field: str) -> str | None:
 
 def _positive_number(value: object, field: str) -> float:
     if (not isinstance(value, (int, float)) or isinstance(value, bool)
-            or float(value) <= 0):
+            or not math.isfinite(float(value)) or float(value) <= 0):
         raise ValueError(f"MCP server option '{field}' must be positive")
     return float(value)
 
