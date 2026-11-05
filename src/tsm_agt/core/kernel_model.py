@@ -75,6 +75,10 @@ _GENERIC_PROTOCOL_CORRECTION = (
 
 
 class ModelMixin:
+    def _model_output_token_limit_for(self, profile_id=None):
+        lookup = getattr(self._dependencies.model, "output_token_limit_for", None)
+        return lookup(profile_id) if lookup else None
+
     def _model_capabilities_for(self, profile_id=None):
         model = self._dependencies.model
         lookup = getattr(model, "capabilities_for", None)
@@ -410,6 +414,7 @@ class ModelMixin:
                 "visible_output_emitted": update.visible_output_emitted,
                 "response_committed": update.response_committed,
                 "transport_mode": update.transport_mode,
+                "diagnostics": dict(update.diagnostics),
             }))
         if not event_data:
             return

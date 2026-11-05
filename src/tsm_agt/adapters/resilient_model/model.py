@@ -57,6 +57,10 @@ class ResilientModelProvider:
         lookup = getattr(self._provider, "capabilities_for", None)
         return lookup(profile_id) if lookup else self.capabilities
 
+    def output_token_limit_for(self, profile_id=None):
+        lookup = getattr(self._provider, "output_token_limit_for", None)
+        return lookup(profile_id) if lookup else None
+
     def resolve_profile(self, profile_id=None):
         lookup = getattr(self._provider, "resolve_profile", None)
         if lookup:
@@ -223,6 +227,7 @@ class ResilientModelProvider:
             diagnostic_detail=self._safe_diagnostic_detail(failure.message),
             visible_output_emitted=failure.visible_output_emitted,
             response_committed=failure.response_committed,
+            diagnostics=failure.diagnostics,
         )
         await self._notify(request, ModelTransportProgress(
             "attempt_failed", attempt, max_attempts,

@@ -545,11 +545,9 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
     async def test_truncated_tool_arguments_are_reported_as_truncation(
         self,
     ) -> None:
-        """A length-stopped tool call is a budget problem, not a model mistake.
+        """A length-stopped partial call must retain its truncation diagnosis.
 
-        ``task-ef2f8587`` interrupted after its Planner SPEC outgrew the output
-        cap: the arguments were cut mid-JSON, the ledger said "invalid JSON
-        arguments", and recovery resampled at the same cap until it exhausted.
+        finish_reason alone does not prove which output/context ceiling applied.
         """
 
         provider, _ = await self._streaming_provider([
@@ -569,7 +567,7 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             caught.exception.reason_code, "truncated_tool_arguments",
         )
-        self.assertIn("truncated by the output token limit", str(caught.exception))
+        self.assertIn("truncated by the provider limit", str(caught.exception))
         self.assertNotIn("invalid JSON arguments", str(caught.exception))
 
     async def test_malformed_arguments_without_truncation_still_name_invalid_json(

@@ -376,6 +376,7 @@ class ModelTransportProgress:
     visible_output_emitted: bool = False
     response_committed: bool = False
     transport_mode: str = ""
+    diagnostics: Mapping[str, object] = field(default_factory=dict)
 
     def to_data(self) -> dict[str, object]:
         return {
@@ -389,6 +390,7 @@ class ModelTransportProgress:
             "visible_output_emitted": self.visible_output_emitted,
             "response_committed": self.response_committed,
             "transport_mode": self.transport_mode,
+            "diagnostics": dict(self.diagnostics),
         }
 
 
@@ -397,9 +399,9 @@ class ModelRequest:
     turn_id: str
     messages: tuple[Message, ...]
     #: Wire-level output ceiling (``max_tokens`` / ``max_completion_tokens``).
-    #: ``None`` sends nothing, leaving the ceiling to the provider -- what Codex
-    #: does always and the reference harness does when unset. This is NOT the
-    #: context budget's output reservation: see
+    #: ``None`` uses the configured provider default; OpenAI adapters omit the
+    #: ceiling when no default is configured. Messages requires a ceiling.
+    #: This is NOT the context budget's output reservation: see
     #: ``ContextBudget.reserved_output_tokens``.
     max_output_tokens: int | None = None
     tools: tuple[ToolSpec, ...] = ()

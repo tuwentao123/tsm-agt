@@ -296,6 +296,7 @@ def _physical_model_provider(
     capability_overrides: Mapping[str, bool | int] | None = None,
     request_parameters: Mapping[str, object] | None = None,
     send_output_token_limit: bool = True,
+    max_output_tokens: int | None = None,
     profile_configurations=None,
     profile_catalog=(),
     default_profile_id=None,
@@ -314,6 +315,7 @@ def _physical_model_provider(
                 capability_overrides=c.capability_overrides,
                 request_parameters=c.request_parameters,
                 send_output_token_limit=c.send_output_token_limit,
+                max_output_tokens=c.max_output_tokens,
             ) for name, c in profile_configurations.items()
         }
         hashes = {name: canonical_hash({
@@ -325,6 +327,7 @@ def _physical_model_provider(
             "output_token_parameter": c.output_token_parameter,
             "send_output_token_limit": c.send_output_token_limit,
             "strict_tool_schema": c.strict_tool_schema,
+            **({"max_output_tokens": c.max_output_tokens} if c.max_output_tokens is not None else {}),
         }) for name, c in profile_configurations.items()}
         return ModelProfileProvider(providers, default_profile_id, profile_catalog, hashes)
     if protocol == MODEL_PROTOCOL_ANTHROPIC_MESSAGES:
@@ -337,6 +340,7 @@ def _physical_model_provider(
             streaming=streaming,
             reasoning_effort=reasoning_effort,
             request_parameters=request_parameters,
+            max_output_tokens=max_output_tokens,
         )
     else:
         provider_class = (
@@ -357,6 +361,7 @@ def _physical_model_provider(
             reasoning_effort=reasoning_effort,
             request_parameters=request_parameters,
             send_output_token_limit=send_output_token_limit,
+            max_output_tokens=max_output_tokens,
         )
     return _apply_capability_overrides(provider, capability_overrides or {})
 

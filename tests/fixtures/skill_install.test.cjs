@@ -15,13 +15,26 @@ const feedbackScript = pageScript.slice(
 );
 
 class Element {
-  constructor() {
+  constructor(tag = 'div') {
+    this.tag = tag;
     this.children = [];
     this.style = {};
+    this.dataset = {};
+    this.attributes = {};
     this.disabled = false;
     this.value = '';
     const classes = new Set();
-    this.classList = {add: name => classes.add(name), remove: name => classes.delete(name), contains: name => classes.has(name)};
+    this.classList = {
+      add: name => classes.add(name),
+      remove: name => classes.delete(name),
+      contains: name => classes.has(name),
+      toggle: (name, force) => {
+        const on = force === undefined ? !classes.has(name) : Boolean(force);
+        if (on) classes.add(name); else classes.delete(name);
+      },
+    };
+    this.setAttribute = (name, value) => { this.attributes[name] = String(value); };
+    this.getAttribute = name => (name in this.attributes ? this.attributes[name] : null);
   }
   set textContent(text) { this.text = text; }
   get textContent() { return (this.text || '') + this.children.map(child => child.textContent || '').join(''); }
@@ -60,7 +73,7 @@ function setup(responses, {modalOpen = true, sidebar = true} = {}) {
     document: {
       getElementById: id => nodes.get(id) || null,
       querySelectorAll: () => buttons,
-      createElement: () => new Element(),
+      createElement: tag => new Element(tag),
       createTextNode: text => ({textContent: text}),
     },
     FormData: class { append() {} },
@@ -81,6 +94,16 @@ const response = (data, status = 200) => ({ok: status < 400, status, json: async
 const installed = name => response({installed: true, skill: {name, plan_path: `/home/.tsm-agent/skills/${name}/SKILL.md`}});
 const catalog = (...names) => response({skills: names.map(name => ({name, description: 'Demo'})), issues: []});
 
+// Settings cards nest controls inside header/footer, so tests locate them by tag.
+const findElement = (node, tag) => {
+  for (const child of node.children || []) {
+    if (child.tag === tag) return child;
+    const found = findElement(child, tag);
+    if (found) return found;
+  }
+  return null;
+};
+
 test('built-in workflow controls preserve source labels and persist disablement with directory settings', async () => {
   const data = {install_directory: '/home/skills', discovery_directories: ['/home/skills'],
     builtin_skills: [{name: 'verify-change'}], disabled_builtin_skills: [],
@@ -90,13 +113,13 @@ test('built-in workflow controls preserve source labels and persist disablement 
   s.nodes.set('skill-directory-path', new Element());
   s.context.applySkillSettings(data);
   assert.match(s.nodes.get('skill-discovered-catalog').children[1].textContent, /内置/);
-  const checkbox = s.nodes.get('skill-builtin-catalog').children[0].children[0];
+  const checkbox = findElement(s.nodes.get('skill-builtin-catalog'), 'input');
   assert.equal(checkbox.checked, true);
   checkbox.checked = false; checkbox.onchange();
   await s.context.saveSkillSettings();
   const payload = JSON.parse(s.requests[0].options.body);
   assert.deepEqual(payload.disabled_builtin_skills, ['verify-change']);
-  assert.equal(s.nodes.get('skill-builtin-catalog').children[0].children[0].checked, false);
+  assert.equal(findElement(s.nodes.get('skill-builtin-catalog'), 'input').checked, false);
 });
 
 test('saved files start preparation and open the new recent-workspace conversation when ready', async () => {

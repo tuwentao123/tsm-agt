@@ -305,7 +305,7 @@ class UserSkillsWebTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(HTTPException) as caught:
                     await web.upload_skill_directory(files=[UploadFile(filename="demo/SKILL.md", file=io.BytesIO(manifest(description="changed")))])
                 self.assertEqual(caught.exception.status_code, 409)
-                self.assertIn("可发现 Skills 目录", web.INDEX_HTML)
+                self.assertIn("可发现 Skill 的目录", web.INDEX_HTML)
                 self.assertIn("pickSkillDirectories()", web.INDEX_HTML)
 
     async def test_picker_supports_multiple_paths_and_cancel(self):

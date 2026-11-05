@@ -31,6 +31,8 @@ from tsm_agt.bootstrap.composition import (
     configure_request_diagnostics, user_skills_store_for_application,
     skill_installation_prompt, skill_catalog_for_application, builtin_skill_names,
 )
+from tsm_agt.bootstrap.model_configuration import load_configuration_document
+from tsm_agt.bootstrap.mcp_status import describe_mcp_servers, mcp_configuration_summary
 from tsm_agt.ports import ImageBlock, MessageRole
 
 app = FastAPI(title="tsm-agt-web")
@@ -65,6 +67,13 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .list{display:flex;flex-direction:column;gap:2px}
 .workspace-group{display:flex;flex-direction:column;margin-bottom:6px}
 .workspace-row{display:flex;align-items:center;gap:2px}
+.workspace-remove{color:var(--muted);opacity:.5;padding:2px 6px;font-size:14px}
+.workspace-remove:hover{color:#b42318;opacity:1}
+.session-row{display:flex;align-items:center;gap:2px}
+.session-row .session-item{flex:1;min-width:0}
+.session-remove{color:var(--muted);opacity:0;padding:0 6px;font-size:14px}
+.session-row:hover .session-remove{opacity:.6}
+.session-remove:hover{color:#b42318;opacity:1}
 .workspace-entry{flex:1;min-width:0}
 .workspace-trust{font-size:10px;color:#64748b;margin-left:6px}.workspace-trust.trusted{color:#15803d}.workspace-trust.untrusted{color:#b45309}
 .session-list{display:flex;flex-direction:column;gap:1px;margin:2px 0 0 10px;padding-left:8px;border-left:1px solid var(--border)}
@@ -106,22 +115,22 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .trace-pane{gap:10px;padding:12px 0;background:transparent;border-radius:0;box-shadow:none}
 .trace-live-board{display:flex;flex-direction:column;gap:8px}
 .trace-future-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
-.trace-future-card{border:1px solid #e2e8f0;border-radius:12px;padding:8px 10px;background:rgba(255,255,255,.96)}
+.trace-future-card{border-radius:12px;padding:8px 10px;background:rgba(255,255,255,.96)}
 .trace-future-title{font-size:12px;font-weight:600;color:#1f2937;margin-bottom:4px}
 .trace-future-copy{font-size:11px;color:#6b7280;line-height:1.6}
 .trace-board{display:grid;grid-template-columns:minmax(0,1fr) 220px;gap:10px;align-items:start}
 .trace-main{display:flex;flex-direction:column;gap:8px}
 .trace-sidebar{position:sticky;top:8px;display:flex;flex-direction:column;gap:8px;opacity:.98}
-.trace-overview-panel{background:linear-gradient(180deg,rgba(255,255,255,.94),rgba(248,250,252,.98));border:1px solid rgba(226,232,240,.9);border-radius:14px;padding:10px;display:flex;flex-direction:column;gap:8px}
+.trace-overview-panel{background:linear-gradient(180deg,rgba(255,255,255,.94),rgba(248,250,252,.98));border-radius:14px;padding:10px;display:flex;flex-direction:column;gap:8px}
 .trace-panel-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px}
 .trace-panel-title{font-size:12px;font-weight:600;color:#0f172a}
 .trace-panel-caption{font-size:11px;color:#64748b}
 .trace-summary-strip{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
-.trace-metric{background:rgba(255,255,255,.98);border:1px solid #e2e8f0;border-radius:10px;padding:7px 8px;min-height:46px}
+.trace-metric{background:rgba(255,255,255,.98);border-radius:10px;padding:7px 8px;min-height:46px}
 .trace-metric-label{font-size:9px;color:#6b7280;text-transform:uppercase;letter-spacing:.04em}
 .trace-metric-value{font-size:14px;font-weight:700;margin-top:2px;color:#111827}
 .trace-legend-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px}
-.trace-legend-item{display:flex;align-items:center;gap:5px;color:var(--text-soft);font-size:10px;padding:4px 6px;border-radius:8px;background:rgba(251,253,255,.96);border:1px solid #e7edf5}
+.trace-legend-item{display:flex;align-items:center;gap:5px;color:var(--text-soft);font-size:10px;padding:4px 6px;border-radius:8px;background:rgba(251,253,255,.96)}
 .trace-dot{width:10px;height:10px;border-radius:50%;box-shadow:0 0 0 4px rgba(255,255,255,.1)}
 .trace-dot.running{background:#1677ff}.trace-dot.waiting{background:#faad14}.trace-dot.done{background:#52c41a}.trace-dot.failed{background:#ff4d4f}
 .message{display:flex;flex-direction:column;position:relative;max-width:min(920px,100%);word-break:break-word;gap:8px}
@@ -183,20 +192,20 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .message-body p:last-child{margin-bottom:0}
 .message.system{align-self:flex-start;max-width:100%;color:var(--muted);font-size:12px;padding:0 2px}
 .message.task{align-self:stretch;max-width:100%;padding:0}
-.task-card{border:1px solid #d9e1ec;border-radius:18px;background:linear-gradient(180deg,#ffffff,#f8fafc);padding:14px 16px;display:flex;flex-direction:column;gap:10px;box-shadow:0 2px 6px rgba(15,23,42,.04)}
+.task-card{border-radius:18px;background:linear-gradient(180deg,#ffffff,#f8fafc);padding:14px 16px;display:flex;flex-direction:column;gap:10px;box-shadow:0 2px 6px rgba(15,23,42,.04)}
 .task-card-header{display:flex;justify-content:space-between;gap:10px;align-items:center}
 .task-card-meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .task-phase-badge{padding:3px 8px;border-radius:999px;font-size:10px;background:#dbeafe;color:#2563eb;border:1px solid #93c5fd;font-weight:600}
 .task-card-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;align-items:stretch}
-.task-summary-item{background:#f8fafc;border:1px solid #d9e1ec;border-radius:10px;padding:8px 10px;min-height:0}
+.task-summary-item{background:#f8fafc;border-radius:10px;padding:8px 10px;min-height:0}
 .task-summary-label{font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:.06em}
 .task-summary-value{margin-top:3px;font-size:13px;font-weight:700;color:#111827;line-height:1.2}
-.todo-panel{display:flex;flex-direction:column;gap:9px;padding:11px 12px;border:1px solid #d9e1ec;border-radius:12px;background:#fff}
+.todo-panel{display:flex;flex-direction:column;gap:9px;padding:11px 12px;border-radius:12px;background:#f8fafc}
 .todo-panel-header{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .todo-panel-title{font-size:12px;font-weight:700;color:#111827}
 .todo-panel-summary{font-size:11px;color:#64748b}
 .todo-list{display:flex;flex-direction:column;gap:7px}
-.todo-item{display:grid;grid-template-columns:18px minmax(0,1fr);gap:8px;align-items:start;padding:7px 8px;border-radius:9px;background:#f8fafc;border:1px solid #e2e8f0}
+.todo-item{display:grid;grid-template-columns:18px minmax(0,1fr);gap:8px;align-items:start;padding:7px 8px;border-radius:9px;background:#f1f5f9}
 .todo-marker{width:16px;height:16px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:1px solid #94a3b8;color:#64748b;font-size:10px;font-weight:700;margin-top:1px}
 .todo-item.in_progress{border-color:#93c5fd;background:#eff6ff}.todo-item.in_progress .todo-marker{border-color:#3b82f6;background:#3b82f6;color:#fff}
 .todo-item.completed .todo-marker{border-color:#22c55e;background:#22c55e;color:#fff}.todo-item.completed .todo-content{text-decoration:line-through;color:#94a3b8}
@@ -211,12 +220,12 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .task-collapsible.collapsed{max-height:220px}
 .task-collapsible.collapsed::after{content:'';position:absolute;left:0;right:0;bottom:0;height:64px;background:linear-gradient(180deg,rgba(248,250,252,0),rgba(248,250,252,.96))}
 .task-progress{display:flex;flex-direction:column;gap:6px}
-.task-progress-line{font-size:12px;color:#334155;white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid #d9e1ec;border-left:2px solid #91caff;border-radius:10px;padding:8px 10px}
+.task-progress-line{font-size:12px;color:#334155;white-space:pre-wrap;word-break:break-word;background:#f8fafc;border-left:2px solid #91caff;border-radius:10px;padding:8px 10px}
 .task-progress-empty{font-size:12px;color:#94a3b8}
 .trace-timeline-scroll{min-height:0;max-height:min(72vh,1400px);overflow-y:auto;overscroll-behavior:contain;padding-right:4px}
 .trace-timeline{position:relative;display:flex;flex-direction:column;gap:8px;padding-left:18px;padding-bottom:6px}
 .trace-timeline::before{content:'';position:absolute;left:6px;top:6px;bottom:6px;width:2px;background:linear-gradient(180deg,#cbd5e1,#dbe5f0)}
-.trace-step{position:relative;padding:7px 10px;border-radius:10px;background:#ffffff;border:1px solid #d9e1ec;box-shadow:0 1px 1px rgba(15,23,42,.03)}
+.trace-step{position:relative;padding:7px 10px;border-radius:10px;background:#ffffff;box-shadow:0 1px 1px rgba(15,23,42,.03)}
 .trace-step::before{content:'';position:absolute;left:-12px;top:10px;width:8px;height:8px;border-radius:50%;background:#8b95a7;border:2px solid #f8fafc;box-shadow:none}
 .trace-step.done::before{background:#52c41a}.trace-step.waiting::before{background:#faad14}.trace-step.failed::before{background:#ff4d4f}
 .trace-step-header{display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:nowrap}
@@ -229,7 +238,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .task-card-state{font-size:12px;color:var(--muted);flex:none}
 .task-card-state.running{color:#8ab4f8}.task-card-state.waiting{color:#f0c674}.task-card-state.incomplete{color:#c68a00}.task-card-state.failed{color:#f4837a}.task-card-state.done{color:#81c995}
 .incomplete-boundary{border:1px solid #f1d18a;background:#fffaf0;border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px}.incomplete-title{font-weight:700;color:#7c5200}.incomplete-copy,.incomplete-gap{font-size:12px;color:#6b5a36}.incomplete-actions{display:flex;flex-wrap:wrap;gap:8px}.incomplete-actions button{border:1px solid #d9b95c;padding:6px 10px;background:#fff;color:#6b4b00}.incomplete-actions button.primary{background:#9a6700;color:#fff;border-color:#9a6700}
-.completion-panel{display:flex;flex-direction:column;gap:6px;padding:10px 12px;border:1px solid #d9e1ec;border-radius:12px;background:#f8fafc}.completion-title{font-size:12px;font-weight:700;color:#1e293b}.completion-summary,.completion-item{font-size:11px;line-height:1.45;color:#475569;word-break:break-word}.completion-item{display:grid;grid-template-columns:108px minmax(0,1fr);gap:8px}.completion-label{font-weight:600;color:#334155}.completion-value{color:#64748b}
+.completion-panel{display:flex;flex-direction:column;gap:6px;padding:10px 12px;border-radius:12px;background:#f1f5f9}.completion-title{font-size:12px;font-weight:700;color:#1e293b}.completion-summary,.completion-item{font-size:11px;line-height:1.45;color:#475569;word-break:break-word}.completion-item{display:grid;grid-template-columns:108px minmax(0,1fr);gap:8px}.completion-label{font-weight:600;color:#334155}.completion-value{color:#64748b}
 .task-progress{display:flex;flex-direction:column;gap:3px;border-top:1px solid var(--border);padding-top:7px}
 .task-progress-line{font-size:12px;color:var(--muted);white-space:pre-wrap;word-break:break-word}
 .task-progress-line.markdown-progress{padding:0;border:none;background:transparent;white-space:normal;color:#475569;font-size:14px;line-height:1.68}
@@ -251,9 +260,9 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .turn-call-status.ok{color:#0f766e;background:#e8f7f3;border:1px solid #bfe6dd}
 .turn-call-status.failed{color:#b42318;background:#fdeceb;border:1px solid #f6cdc9}
 .turn-call-target{color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
-.turn-source-evaluation{margin:0 11px 8px;padding:8px 9px;border:1px solid #cfe2ff;border-radius:9px;background:#f5f9ff}.turn-source-evaluation-heading{font-size:11px;font-weight:700;color:#1d4ed8}.turn-source-evaluation-heading span{font-weight:500;color:#64748b}.turn-source-evaluation-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-top:6px}.turn-source-evaluation-grid div{display:flex;flex-direction:column;gap:1px}.turn-source-evaluation-grid small{font-size:9px;color:#64748b}.turn-source-evaluation-grid strong{font-size:10px;color:#334155;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.turn-source-evaluation-grid strong.good{color:#047857}.turn-source-evaluation-grid strong.warn{color:#b45309}.turn-source-evaluation-note{margin-top:6px;font-size:10px;line-height:1.4;color:#475569}
+.turn-source-evaluation{margin:0 11px 8px;padding:8px 9px;border-radius:9px;background:#f5f9ff}.turn-source-evaluation-heading{font-size:11px;font-weight:700;color:#1d4ed8}.turn-source-evaluation-heading span{font-weight:500;color:#64748b}.turn-source-evaluation-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-top:6px}.turn-source-evaluation-grid div{display:flex;flex-direction:column;gap:1px}.turn-source-evaluation-grid small{font-size:9px;color:#64748b}.turn-source-evaluation-grid strong{font-size:10px;color:#334155;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.turn-source-evaluation-grid strong.good{color:#047857}.turn-source-evaluation-grid strong.warn{color:#b45309}.turn-source-evaluation-note{margin-top:6px;font-size:10px;line-height:1.4;color:#475569}
 .live-turn{opacity:.98}
-.live-turn-panel{width:min(88ch,100%);margin:0 auto;border:1px solid #cfe2ff;border-radius:12px;background:linear-gradient(180deg,#f7fbff,#f2f8ff);padding:9px 12px;display:flex;flex-direction:column;gap:5px}
+.live-turn-panel{width:min(88ch,100%);margin:0 auto;border-radius:12px;background:linear-gradient(180deg,#f7fbff,#f2f8ff);padding:9px 12px;display:flex;flex-direction:column;gap:5px}
 .live-turn-head{display:flex;align-items:center;gap:7px;font-size:11px;font-weight:600;color:#2563eb}
 .live-turn-dot{width:7px;height:7px;border-radius:50%;background:#1677ff;box-shadow:0 0 0 4px rgba(22,119,255,.14);animation:live-turn-pulse 1.4s ease-in-out infinite;flex:none}
 @keyframes live-turn-pulse{0%,100%{opacity:1}50%{opacity:.35}}
@@ -410,6 +419,98 @@ textarea::placeholder{color:#94a3b8}
 @media(max-width:1280px){.workspace-stage{grid-template-columns:1fr}.trace-board{grid-template-columns:1fr}.trace-sidebar{position:static;order:-1;opacity:.72}.task-card-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.trace-future-grid{grid-template-columns:1fr}}
 @media(max-width:1024px){.layout{grid-template-columns:1fr;height:auto}.sidebar{display:none}.topbar{padding-inline:16px}.chat-shell{padding:16px 16px 14px}.chat-area,.trace-pane{padding:14px}.message.user{max-width:100%}.composer{padding:8px 14px 10px}.composer-box{padding:9px 10px}.textarea{min-height:44px}}
 @media(max-width:720px){.trace-board{gap:8px}.task-card-summary{grid-template-columns:1fr}.chat-area,.trace-pane{padding:10px 12px 18px}.task-card{padding:9px 10px}.trace-step{padding-block:6px}.composer{padding:8px 10px}.composer-meta{align-items:flex-start;flex-direction:column;gap:3px}.composer-input-row{align-items:stretch;flex-wrap:wrap}.composer-actions{width:100%;justify-content:space-between}.send-btn{padding:8px 14px}.composer-hint{white-space:normal}}
+/* 设置面板：左侧分类导航 + 右侧卡片区（对齐插件广场的信息层级） */
+.settings-dialog { width: min(1320px, 96vw); height: min(864px, 92vh); padding: 0; border: none; border-radius: 20px; background: var(--panel, #fff); color: inherit; box-shadow: 0 32px 80px rgba(15, 23, 42, .32); overflow: hidden; }
+.settings-dialog[open] { display: flex; flex-direction: column; }
+.settings-dialog::backdrop { background: rgba(15, 23, 42, .48); }
+.settings-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 22px 30px 18px; border-bottom: 1px solid var(--border, #e2e8f0); }
+.settings-title { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: .01em; }
+.settings-subtitle { margin: 3px 0 0; font-size: 12px; line-height: 1.6; color: var(--muted, #64748b); }
+.settings-close { border: none; background: transparent; font-size: 20px; line-height: 1; width: 30px; height: 30px; border-radius: 8px; color: var(--muted, #64748b); cursor: pointer; }
+.settings-close:hover { background: var(--panel-muted, #f1f5f9); color: inherit; }
+.settings-shell { flex: 1; display: grid; grid-template-columns: 244px minmax(0, 1fr); min-height: 0; }
+.settings-nav { display: flex; flex-direction: column; gap: 2px; padding: 12px 10px; border-right: 1px solid var(--border, #e2e8f0); background: var(--panel-muted, #f8fafc); overflow-y: auto; }
+.settings-nav-group { padding: 10px 10px 6px; font-size: 11px; letter-spacing: .06em; color: var(--muted, #94a3b8); }
+.settings-nav-item { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border: 1px solid transparent; border-radius: 10px; background: transparent; color: var(--muted, #475569); font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; }
+.settings-nav-item:hover { background: rgba(148, 163, 184, .18); color: inherit; }
+.settings-nav-item.active { background: var(--panel, #fff); border-color: var(--border, #e2e8f0); color: inherit; font-weight: 600; box-shadow: 0 1px 2px rgba(15, 23, 42, .06); }
+.settings-nav-glyph { display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; border-radius: 8px; background: rgba(148, 163, 184, .22); font-size: 12px; flex: none; }
+.settings-nav-item.active .settings-nav-glyph { background: linear-gradient(135deg, #dbeafe, #ede9fe); color: #1d4ed8; }
+.settings-nav-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-tab-count { min-width: 20px; padding: 0 6px; border-radius: 999px; background: rgba(148, 163, 184, .22); font-size: 11px; line-height: 18px; text-align: center; flex: none; }
+.settings-content { min-width: 0; overflow-y: auto; padding: 22px 30px 30px; }
+.settings-panel { display: none; flex-direction: column; gap: 14px; }
+.settings-panel.active { display: flex; }
+.settings-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.settings-toolbar-title { font-size: 15px; font-weight: 650; }
+.settings-toolbar-caption { margin-top: 4px; font-size: 12px; line-height: 1.6; color: var(--muted, #64748b); overflow-wrap: anywhere; }
+.settings-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.settings-btn { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border-strong, #cbd5e1); background: var(--panel, #fff); color: inherit; padding: 7px 13px; border-radius: 9px; font-size: 12px; font-family: inherit; cursor: pointer; }
+.settings-btn:hover { background: var(--panel-muted, #f1f5f9); }
+.settings-btn.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+.settings-btn.primary:hover { background: #1d4ed8; }
+.settings-btn.ghost { border-color: transparent; background: transparent; color: var(--muted, #64748b); padding-inline: 8px; }
+.settings-btn.ghost:hover { background: #fef2f2; color: #b91c1c; }
+.settings-input { flex: 1; min-width: 0; padding: 8px 11px; border: 1px solid var(--border-strong, #cbd5e1); border-radius: 9px; font-size: 13px; font-family: inherit; background: var(--panel, #fff); color: inherit; }
+.settings-inline { display: flex; gap: 8px; }
+.settings-search { display: flex; align-items: center; gap: 8px; padding: 0 12px; border: 1px solid var(--border, #e2e8f0); border-radius: 10px; background: var(--panel-muted, #f8fafc); }
+.settings-search:focus-within { border-color: #93c5fd; background: var(--panel, #fff); box-shadow: 0 0 0 3px rgba(37, 99, 235, .12); }
+.settings-search-glyph { font-size: 13px; color: var(--muted, #94a3b8); }
+.settings-search input { flex: 1; min-width: 0; padding: 9px 0; border: none; outline: none; background: transparent; color: inherit; font-family: inherit; font-size: 13px; }
+.settings-summary { display: flex; gap: 10px; flex-wrap: wrap; }
+.settings-stat { min-width: 108px; padding: 10px 14px; border: 1px solid var(--border, #e2e8f0); border-radius: 12px; background: var(--panel-muted, #f8fafc); }
+.settings-stat-value { font-size: 18px; font-weight: 650; }
+.settings-stat-label { margin-top: 2px; font-size: 11px; color: var(--muted, #64748b); }
+.settings-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(288px, 1fr)); gap: 14px; }
+.settings-card { display: flex; flex-direction: column; gap: 10px; padding: 14px 15px; border: 1px solid var(--border, #e2e8f0); border-radius: 14px; background: var(--panel, #fff); transition: border-color .15s, box-shadow .15s, transform .15s; }
+.settings-card:hover { border-color: #bfdbfe; box-shadow: 0 10px 24px rgba(37, 99, 235, .1); transform: translateY(-1px); }
+.settings-card-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.settings-avatar { display: flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 10px; background: linear-gradient(135deg, #dbeafe, #ede9fe); color: #1d4ed8; font-size: 14px; font-weight: 650; flex: none; }
+.settings-card-headtext { flex: 1; min-width: 0; }
+.settings-card-title { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.settings-card-sub { margin-top: 2px; font-size: 11px; color: var(--muted, #94a3b8); overflow-wrap: anywhere; }
+.settings-card-desc { margin: 0; font-size: 12px; line-height: 1.6; color: var(--muted, #64748b); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.settings-card-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: auto; padding-top: 9px; border-top: 1px dashed var(--border, #e2e8f0); }
+.settings-card-meta { font-size: 11px; color: var(--muted, #94a3b8); overflow-wrap: anywhere; text-align: right; }
+.settings-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+.settings-tag { display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 999px; font-size: 11px; line-height: 18px; background: rgba(148, 163, 184, .18); color: var(--muted, #475569); }
+.settings-tag.ok { background: #ecfdf5; color: #047857; }
+.settings-tag.warn { background: #fffbeb; color: #b45309; }
+.settings-tag.bad { background: #fef2f2; color: #b91c1c; }
+.settings-tag.accent { background: #eff6ff; color: #1d4ed8; }
+.settings-switch { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted, #64748b); cursor: pointer; }
+.settings-list { display: flex; flex-direction: column; gap: 8px; }
+.settings-list-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--border, #e2e8f0); border-radius: 10px; background: var(--panel, #fff); font-size: 12px; }
+.settings-row-desc { flex: 1; min-width: 0; font-size: 12px; color: var(--muted, #64748b); overflow-wrap: anywhere; }
+.settings-path { flex: 1; min-width: 0; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+.settings-install { display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border: 1px solid var(--border, #e2e8f0); border-radius: 12px; background: var(--panel-muted, #f8fafc); }
+@media (max-width: 980px) {
+  .settings-dialog { width: 96vw; height: 92vh; }
+  .settings-shell { grid-template-columns: 184px minmax(0, 1fr); }
+  .settings-head { padding: 18px 20px 14px; }
+  .settings-content { padding: 16px 18px 22px; }
+}
+@media (max-width: 640px) {
+  .settings-shell { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .settings-nav { flex-direction: row; gap: 6px; overflow-x: auto; overflow-y: hidden; border-right: none; border-bottom: 1px solid var(--border, #e2e8f0); }
+  .settings-nav-group { display: none; }
+  .settings-nav-item { flex: none; }
+}
+.settings-install-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12.5px; font-weight: 600; }
+.settings-install-line { margin: 0; font-size: 12px; line-height: 1.6; color: var(--muted, #64748b); overflow-wrap: anywhere; }
+.settings-install > .settings-btn { align-self: flex-start; }
+.settings-caption { grid-column: 1 / -1; font-size: 12px; line-height: 1.6; color: var(--muted, #64748b); }
+.settings-empty { padding: 24px; border: 1px dashed var(--border-strong, #cbd5e1); border-radius: 12px; text-align: center; font-size: 12px; color: var(--muted, #94a3b8); }
+.settings-status { margin: 14px 0 0; font-size: 12px; white-space: pre-wrap; color: var(--muted, #64748b); }
+.settings-status:empty { display: none; }
+@media (max-width: 860px) {
+  .settings-dialog { width: 96vw; height: 92vh; }
+  .settings-shell { grid-template-columns: 1fr; }
+  .settings-nav { flex-flow: row wrap; overflow-x: auto; border-right: none; border-bottom: 1px solid var(--border, #e2e8f0); }
+  .settings-nav-group { display: none; }
+  .settings-content { padding: 14px; }
+  .settings-grid { grid-template-columns: 1fr; }
+}
 </style>
 </head>
 <body>
@@ -441,24 +542,117 @@ textarea::placeholder{color:#94a3b8}
       </div>
     </div>
 
-    <dialog id="skill-settings-dialog" style="width:min(720px,92vw);max-height:85vh;overflow:auto;border:1px solid #e2e8f0;border-radius:18px;padding:24px;color:#1f2937;">
-      <div style="display:flex;justify-content:space-between;align-items:center;"><h2 style="margin:0;">设置</h2><button onclick="document.getElementById('skill-settings-dialog').close()" aria-label="关闭设置">×</button></div>
-      <h3>Skill 安装目录</h3>
-      <div id="skill-install-directory" style="overflow-wrap:anywhere;"></div>
-      <p style="color:#64748b;">新安装的 Skill 保存在用户目录，对所有项目和会话可用。</p>
-      <button class="new-session-btn" data-skill-install onclick="const input = document.getElementById('settings-skill-upload'); input.value = ''; input.click()">从本地目录安装 Skill</button>
-      <input type="file" id="settings-skill-upload" webkitdirectory hidden onchange="uploadSkillDirectoryAndInstall(this.files, this)" />
-      <p style="color:#64748b;">保存后自动在最近使用的工作区新建安装会话，由模型按 Skill 文档检查、按需准备并验证环境。</p>
-      <div id="skill-installations" role="status" style="overflow-wrap:anywhere;"></div>
-      <h3>内置工作流</h3>
-      <div id="skill-builtin-catalog"></div>
-      <h3>可发现 Skills 目录</h3>
-      <p style="color:#64748b;">默认包含安装目录。可添加多个目录，例如 ~/.kiro/skills；外部目录仅用于发现和读取。</p>
-      <ul id="skill-discovery-list" style="padding-left:20px;"></ul>
-      <div style="display:flex;gap:8px;"><input id="skill-directory-path" placeholder="输入目录路径，如 ~/.kiro/skills" style="flex:1;min-width:0;padding:8px;" /><button onclick="addSkillDirectoryPath()">添加</button></div>
-      <div style="display:flex;gap:16px;margin-top:14px;"><button onclick="pickSkillDirectories()">选择多个目录…</button><button id="save-skill-settings" onclick="saveSkillSettings()">保存并刷新</button></div>
-      <p id="skill-settings-status" role="status" style="white-space:pre-wrap;"></p>
-      <div id="skill-discovered-catalog" style="overflow-wrap:anywhere;"></div>
+    <dialog id="skill-settings-dialog" class="settings-dialog" aria-label="设置">
+      <header class="settings-head">
+        <div>
+          <h2 class="settings-title">设置</h2>
+          <p class="settings-subtitle">Skill 与 MCP 扩展 · 用户级配置，所有项目和会话共享</p>
+        </div>
+        <button class="settings-close" type="button" onclick="document.getElementById('skill-settings-dialog').close()" aria-label="关闭设置">×</button>
+      </header>
+      <div class="settings-shell">
+        <nav class="settings-nav" role="tablist" aria-label="设置分类">
+          <div class="settings-nav-group">Skill 扩展</div>
+          <button class="settings-nav-item active" id="settings-nav-skills" type="button" role="tab" aria-controls="settings-panel-skills" aria-selected="true" onclick="showSettingsTab('skills')">
+            <span class="settings-nav-glyph" aria-hidden="true">技</span>
+            <span class="settings-nav-label">已安装 Skills</span>
+            <span class="settings-tab-count" id="settings-tab-count-skills">0</span>
+          </button>
+          <button class="settings-nav-item" id="settings-nav-builtin" type="button" role="tab" aria-controls="settings-panel-builtin" aria-selected="false" onclick="showSettingsTab('builtin')">
+            <span class="settings-nav-glyph" aria-hidden="true">流</span>
+            <span class="settings-nav-label">内置工作流</span>
+            <span class="settings-tab-count" id="settings-tab-count-builtin">0</span>
+          </button>
+          <button class="settings-nav-item" id="settings-nav-directories" type="button" role="tab" aria-controls="settings-panel-directories" aria-selected="false" onclick="showSettingsTab('directories')">
+            <span class="settings-nav-glyph" aria-hidden="true">路</span>
+            <span class="settings-nav-label">目录与发现</span>
+            <span class="settings-tab-count" id="settings-tab-count-directories">0</span>
+          </button>
+          <div class="settings-nav-group">连接</div>
+          <button class="settings-nav-item" id="settings-nav-mcp" type="button" role="tab" aria-controls="settings-panel-mcp" aria-selected="false" onclick="showSettingsTab('mcp')">
+            <span class="settings-nav-glyph" aria-hidden="true">链</span>
+            <span class="settings-nav-label">MCP 服务器</span>
+            <span class="settings-tab-count" id="settings-tab-count-mcp">0</span>
+          </button>
+        </nav>
+        <div class="settings-content" id="settings-content">
+          <section class="settings-panel active" id="settings-panel-skills" role="tabpanel" data-settings-panel="skills">
+            <div class="settings-toolbar">
+              <div>
+                <div class="settings-toolbar-title">已安装与可用的 Skill</div>
+                <div class="settings-toolbar-caption">安装目录：<span id="skill-install-directory"></span></div>
+                <div class="settings-toolbar-caption">安装后自动在最近使用的工作区新建安装会话，由模型按 Skill 文档检查、按需准备并验证环境。</div>
+              </div>
+              <div class="settings-actions">
+                <button class="settings-btn primary" type="button" data-skill-install onclick="const input = document.getElementById('settings-skill-upload'); input.value = ''; input.click()">从本地目录安装</button>
+              </div>
+            </div>
+            <label class="settings-search">
+              <span class="settings-search-glyph" aria-hidden="true">⌕</span>
+              <input id="settings-search-skills" type="search" placeholder="按名称、描述或来源搜索 Skill" oninput="filterSettingsCards('skills', this.value)" />
+            </label>
+            <input type="file" id="settings-skill-upload" webkitdirectory hidden onchange="uploadSkillDirectoryAndInstall(this.files, this)" />
+            <div id="skill-installations" role="status" class="settings-list"></div>
+            <div id="installed-skills-list" class="settings-grid"></div>
+            <div id="settings-empty-skills" class="settings-empty" style="display:none">没有匹配的 Skill。</div>
+          </section>
+
+          <section class="settings-panel" id="settings-panel-builtin" role="tabpanel" data-settings-panel="builtin">
+            <div class="settings-toolbar">
+              <div>
+                <div class="settings-toolbar-title">内置工作流</div>
+                <div class="settings-toolbar-caption">随程序提供。取消勾选后点击「保存并刷新」才会生效。</div>
+              </div>
+              <div class="settings-actions">
+                <button class="settings-btn primary" type="button" id="save-builtin-skill-settings" onclick="saveSkillSettings('save-builtin-skill-settings')">保存并刷新</button>
+              </div>
+            </div>
+            <div id="skill-builtin-catalog" class="settings-grid"></div>
+            <div id="settings-empty-builtin" class="settings-empty" style="display:none">没有匹配的内置工作流。</div>
+          </section>
+
+          <section class="settings-panel" id="settings-panel-directories" role="tabpanel" data-settings-panel="directories">
+            <div class="settings-toolbar">
+              <div>
+                <div class="settings-toolbar-title">可发现 Skill 的目录</div>
+                <div class="settings-toolbar-caption">默认包含安装目录。可添加多个目录，例如 ~/.kiro/skills；外部目录仅用于发现和读取。</div>
+              </div>
+              <div class="settings-actions">
+                <button class="settings-btn" type="button" onclick="pickSkillDirectories()">选择多个目录…</button>
+                <button class="settings-btn primary" type="button" id="save-skill-settings" onclick="saveSkillSettings()">保存并刷新</button>
+              </div>
+            </div>
+            <div id="skill-discovery-list" class="settings-list"></div>
+            <div class="settings-inline">
+              <input id="skill-directory-path" class="settings-input" placeholder="输入目录路径，如 ~/.kiro/skills" />
+              <button class="settings-btn" type="button" onclick="addSkillDirectoryPath()">添加</button>
+            </div>
+            <div id="skill-discovered-catalog" class="settings-grid"></div>
+          </section>
+
+          <section class="settings-panel" id="settings-panel-mcp" role="tabpanel" data-settings-panel="mcp">
+            <div class="settings-toolbar">
+              <div>
+                <div class="settings-toolbar-title">已注册的 MCP 服务器</div>
+                <div class="settings-toolbar-caption">数据来自私有 YAML 配置的 <code>mcp.enabled</code> 与 <code>mcp.servers</code>；重新检测会真实初始化每个服务器。</div>
+              </div>
+              <div class="settings-actions">
+                <button class="settings-btn primary" type="button" onclick="loadMcpSettings(true)">重新检测</button>
+                <button class="settings-btn" type="button" onclick="loadMcpSettings(false)">只看配置</button>
+              </div>
+            </div>
+            <label class="settings-search">
+              <span class="settings-search-glyph" aria-hidden="true">⌕</span>
+              <input id="settings-search-mcp" type="search" placeholder="按名称、类型或命令搜索服务器" oninput="filterSettingsCards('mcp', this.value)" />
+            </label>
+            <p id="mcp-settings-status" role="status" class="settings-status"></p>
+            <div id="mcp-server-list" class="settings-grid"></div>
+            <div id="settings-empty-mcp" class="settings-empty" style="display:none">没有匹配的 MCP 服务器。</div>
+          </section>
+
+          <p id="skill-settings-status" role="status" class="settings-status"></p>
+        </div>
+      </div>
     </dialog>
     <div id=\"error-banner\" class=\"error-banner\"></div>
     <div id=\"config-banner\" class=\"config-banner\"></div>
@@ -775,6 +969,25 @@ function updateComposerButtonState() {
     });
   }
 
+  // 已停止/中断的 Turn 不会写入 Session 的结果记录，它在 turnCalls 里的
+  // settled 会一直是 false；只按 turnCalls 判断会让取消按钮在一轮结束后长期
+  // 滞留。这里再叠加 Task 自身的终态：任务已进入终态、且该终态属于当前这个
+  // 未结算 Turn 时，这一轮已经无法取消。
+  // settledTurnId 记录“上一次终态快照属于哪个 Turn”，这样在同一任务上开启
+  // 新一轮、而快照还停留在上一轮终态时，取消按钮不会被误隐藏。
+  if (runningTurn && activeTaskId) {
+    const card = taskMessage(active.id, activeTaskId);
+    const task = card ? card.task : null;
+    const phase = String(task?.phase1State || '').toUpperCase();
+    const status = String(task?.status || '').toLowerCase();
+    const settledTurnId = String(task?.settledTurnId || '');
+    const sameTurn = !settledTurnId
+      || settledTurnId === String(runningTurn.turn_id || '');
+    const taskFinished = TERMINAL_STATES.includes(phase)
+      || ['stopped', 'interrupted', 'cancelled'].includes(status);
+    if (taskFinished && sameTurn) runningTurn = null;
+  }
+
   if (runningTurn && activeTaskId) {
     cancelButton.classList.remove('hidden');
     cancelButton.dataset.taskId = activeTaskId;
@@ -844,6 +1057,16 @@ function renderWorkspaceList() {
     header.append(entry, add);
     group.appendChild(header);
 
+    const removeWorkspaceBtn = document.createElement('button');
+    removeWorkspaceBtn.className = 'icon-btn workspace-remove';
+    removeWorkspaceBtn.textContent = '−';
+    removeWorkspaceBtn.title = '移除当前工作区';
+    removeWorkspaceBtn.onclick = (event) => {
+      event.stopPropagation();
+      removeWorkspace(workspace.id);
+    };
+    header.appendChild(removeWorkspaceBtn);
+
     // Sessions belong to a workspace, so they are nested under their owner
     // instead of living in a separate flat list.
     const sessions = conversations.filter(
@@ -880,7 +1103,18 @@ function renderWorkspaceList() {
           <div class='item-title'>${conversation.title}</div>
           <div class='item-meta' style='direction:ltr'>${conversation.messages.length} 条消息 · ${conversation.createdAt}</div>
         `;
-        nested.appendChild(item);
+        const row = document.createElement('div');
+        row.className = 'session-row';
+        const removeSessionBtn = document.createElement('button');
+        removeSessionBtn.className = 'icon-btn session-remove';
+        removeSessionBtn.textContent = '×';
+        removeSessionBtn.title = '移除当前会话';
+        removeSessionBtn.onclick = (event) => {
+          event.stopPropagation();
+          removeConversation(conversation.id);
+        };
+        row.append(item, removeSessionBtn);
+        nested.appendChild(row);
       });
     }
     group.appendChild(nested);
@@ -981,6 +1215,70 @@ function createConversation() {
 
 function getActiveConversation() {
   return getConversationById(activeConversationId);
+}
+
+function removeConversation(conversationId) {
+  const conversation = getConversationById(conversationId);
+  if (!conversation) return;
+  const label = conversation.title || '该会话';
+  if (!window.confirm(`从列表移除「${label}」？磁盘文件与运行记录不受影响。`)) return;
+  const wasActive = conversation.id === activeConversationId;
+  const index = conversations.findIndex((item) => item.id === conversation.id);
+  if (index >= 0) conversations.splice(index, 1);
+  // A draft created in this tab was never registered server-side, so a 404 is
+  // the expected answer; the local entry is already gone either way.
+  fetch(`/sessions/${encodeURIComponent(conversation.id)}`, {method: 'DELETE'})
+    .catch((error) => console.error('移除会话失败', error));
+  if (wasActive) {
+    const next = conversations.find(
+      (item) => item.workspaceId === conversation.workspaceId,
+    );
+    activeConversationId = next ? next.id : null;
+    if (next) ensureConversationLoaded(next.id);
+  }
+  renderConversations();
+  renderMessages();
+  restoreConversationDraft();
+}
+
+async function removeWorkspace(workspaceId) {
+  const workspace = workspaces.find((item) => item.id === workspaceId);
+  if (!workspace) return;
+  const owned = conversations.filter((item) => item.workspaceId === workspaceId);
+  const scope = owned.length
+    ? `\\n该工作区下的 ${owned.length} 个会话将一并从侧栏移除。`
+    : '';
+  if (!window.confirm(`移除工作区「${workspace.name}」？${scope}`)) return;
+  try {
+    const response = await fetch(
+      `/workspaces/${encodeURIComponent(workspaceId)}`, {method: 'DELETE'},
+    );
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      throw new Error(detail.detail || '移除工作区失败');
+    }
+  } catch (error) {
+    showError(error.message || '移除工作区失败。');
+    return;
+  }
+  const index = workspaces.findIndex((item) => item.id === workspaceId);
+  if (index >= 0) workspaces.splice(index, 1);
+  for (let cursor = conversations.length - 1; cursor >= 0; cursor -= 1) {
+    if (conversations[cursor].workspaceId === workspaceId) {
+      conversations.splice(cursor, 1);
+    }
+  }
+  if (activeWorkspaceId === workspaceId) {
+    activeWorkspaceId = workspaces[0]?.id || null;
+    activeConversationId = conversations.find(
+      (item) => item.workspaceId === activeWorkspaceId,
+    )?.id || null;
+  }
+  updateWorkspaceState();
+  renderConversations();
+  renderMessages();
+  restoreConversationDraft();
+  if (activeConversationId) ensureConversationLoaded(activeConversationId);
 }
 
 let modelProfiles = [];
@@ -2286,59 +2584,209 @@ async function openSkillInstallationConversation(job) {
   await ensureConversationLoaded(job.session_id);
 }
 
+const SETTINGS_TAB_IDS = ['skills', 'builtin', 'directories', 'mcp'];
+
+function showSettingsTab(name) {
+  const tab = SETTINGS_TAB_IDS.includes(name) ? name : 'skills';
+  for (const key of SETTINGS_TAB_IDS) {
+    const active = key === tab;
+    const navItem = document.getElementById(`settings-nav-${key}`);
+    if (navItem) {
+      navItem.classList.toggle('active', active);
+      navItem.setAttribute('aria-selected', active ? 'true' : 'false');
+    }
+    const panel = document.getElementById(`settings-panel-${key}`);
+    if (panel) panel.classList.toggle('active', active);
+  }
+  const content = document.getElementById('settings-content');
+  if (content) content.scrollTop = 0;
+}
+
+function refreshSettingsCounts(panelName) {
+  const panel = document.getElementById(`settings-panel-${panelName}`);
+  const badge = document.getElementById(`settings-tab-count-${panelName}`);
+  if (!panel || !badge) return;
+  const items = Array.from(panel.querySelectorAll('[data-settings-card]'));
+  const shown = items.filter(item => item.style.display !== 'none').length;
+  badge.textContent = shown === items.length ? String(items.length) : `${shown}/${items.length}`;
+}
+
+function refreshAllSettingsCounts() {
+  for (const key of SETTINGS_TAB_IDS) refreshSettingsCounts(key);
+}
+
+function filterSettingsCards(panelName, query) {
+  const panel = document.getElementById(`settings-panel-${panelName}`);
+  if (!panel) return;
+  const needle = String(query || '').trim().toLowerCase();
+  let shown = 0;
+  for (const item of panel.querySelectorAll('[data-settings-card]')) {
+    const haystack = (item.dataset.searchText || item.textContent || '').toLowerCase();
+    const matched = !needle || haystack.includes(needle);
+    item.style.display = matched ? '' : 'none';
+    if (matched) shown += 1;
+  }
+  const empty = document.getElementById(`settings-empty-${panelName}`);
+  if (empty) empty.style.display = shown ? 'none' : '';
+  refreshSettingsCounts(panelName);
+}
+
+function settingsTag(text, tone) {
+  const tag = document.createElement('span');
+  tag.className = tone ? `settings-tag ${tone}` : 'settings-tag';
+  tag.textContent = text;
+  return tag;
+}
+
+function settingsCard({glyph, title, sub, description, tags = [], meta, actions = [], searchText}) {
+  const card = document.createElement('article');
+  card.className = 'settings-card';
+  card.dataset.settingsCard = '';
+  card.dataset.searchText = searchText || [title, sub, description, meta].filter(Boolean).join(' ');
+  const head = document.createElement('div');
+  head.className = 'settings-card-head';
+  const avatar = document.createElement('span');
+  avatar.className = 'settings-avatar';
+  avatar.textContent = glyph || String(title || '?').slice(0, 1);
+  const headText = document.createElement('div');
+  headText.className = 'settings-card-headtext';
+  const titleEl = document.createElement('div');
+  titleEl.className = 'settings-card-title';
+  titleEl.textContent = title || '未命名';
+  headText.append(titleEl);
+  if (sub) {
+    const subEl = document.createElement('div');
+    subEl.className = 'settings-card-sub';
+    subEl.textContent = sub;
+    headText.append(subEl);
+  }
+  head.append(avatar, headText);
+  card.append(head);
+  if (description) {
+    const desc = document.createElement('p');
+    desc.className = 'settings-card-desc';
+    desc.textContent = description;
+    card.append(desc);
+  }
+  if (tags.length) {
+    const tagWrap = document.createElement('div');
+    tagWrap.className = 'settings-tags';
+    for (const tag of tags) tagWrap.append(settingsTag(tag.text, tag.tone));
+    card.append(tagWrap);
+  }
+  if (meta || actions.length) {
+    const foot = document.createElement('div');
+    foot.className = 'settings-card-foot';
+    const metaEl = document.createElement('span');
+    metaEl.className = 'settings-card-meta';
+    metaEl.textContent = meta || '';
+    foot.append(metaEl);
+    if (actions.length) {
+      const actionWrap = document.createElement('div');
+      actionWrap.className = 'settings-actions';
+      for (const action of actions) actionWrap.append(action);
+      foot.append(actionWrap);
+    }
+    card.append(foot);
+  }
+  return card;
+}
+
 function renderSkillDirectories() {
   const list = document.getElementById('skill-discovery-list');
+  if (!list) return;
   list.replaceChildren();
   for (const directory of skillSettingsDirectories) {
-    const item = document.createElement('li');
-    item.style.overflowWrap = 'anywhere';
-    item.append(document.createTextNode(directory));
+    const row = document.createElement('div');
+    row.className = 'settings-list-row';
+    row.dataset.settingsCard = '';
+    row.dataset.searchText = directory;
+    const path = document.createElement('span');
+    path.className = 'settings-path';
+    path.textContent = directory;
+    row.append(path);
     if (directory === skillDefaultDirectory) {
-      item.append(document.createTextNode('（默认安装目录）'));
+      row.append(settingsTag('默认安装目录', 'accent'));
     } else {
       const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'settings-btn ghost';
       remove.textContent = '移除';
       remove.onclick = () => {
-        skillSettingsDirectories = skillSettingsDirectories.filter(path => path !== directory);
+        skillSettingsDirectories = skillSettingsDirectories.filter(item => item !== directory);
         renderSkillDirectories();
       };
-      item.append(remove);
+      row.append(remove);
     }
-    list.append(item);
+    list.append(row);
   }
+  if (!skillSettingsDirectories.length) {
+    const empty = document.createElement('div');
+    empty.className = 'settings-empty';
+    empty.textContent = '还没有可发现 Skill 的目录。';
+    list.append(empty);
+  }
+  refreshSettingsCounts('directories');
 }
 
 function renderSkillCatalog(data) {
   const catalog = document.getElementById('skill-discovered-catalog');
-  catalog.replaceChildren();
-  const heading = document.createElement('p');
-  heading.textContent = `已发现 ${(data.skills || []).length} 个 Skill`;
-  catalog.append(heading);
-  for (const skill of data.skills || []) {
-    const row = document.createElement('p');
-    const source = skill.source === 'builtin' ? '内置' : skill.source === 'user' ? '用户目录' : '代码注册';
-    const override = skill.overrides?.includes('builtin') ? '，覆盖内置版本' : '';
-    row.textContent = `${skill.name} — ${skill.description} [${source}${override}] (${skill.plan_path || '代码注册'})`;
-    catalog.append(row);
+  if (catalog) {
+    catalog.replaceChildren();
+    const skills = data.skills || [];
+    const caption = document.createElement('div');
+    caption.className = 'settings-caption';
+    caption.textContent = `已发现 ${skills.length} 个 Skill`;
+    catalog.append(caption);
+    for (const skill of skills) {
+      const source = skill.source === 'builtin' ? '内置'
+        : skill.source === 'user' ? '用户目录'
+        : '代码注册';
+      const tags = [{text: source, tone: skill.source === 'builtin' ? 'accent' : ''}];
+      if (skill.overrides?.includes('builtin')) tags.push({text: '覆盖内置版本', tone: 'warn'});
+      if (skill.safety_level) tags.push({text: `安全级别：${skill.safety_level}`, tone: ''});
+      catalog.append(settingsCard({
+        glyph: String(skill.name || '?').slice(0, 1),
+        title: skill.name,
+        sub: skill.plan_path || '代码注册',
+        description: skill.description || '',
+        tags,
+        meta: source,
+        searchText: [skill.name, skill.description, source, skill.plan_path].filter(Boolean).join(' '),
+      }));
+    }
   }
   const builtins = document.getElementById('skill-builtin-catalog');
   if (builtins) {
     builtins.replaceChildren();
     for (const skill of data.builtin_skills || []) {
-      const label = document.createElement('label');
-      label.style.display = 'block';
       const checkbox = document.createElement('input');
       checkbox.type = 'checkbox';
       checkbox.checked = !disabledBuiltinSkills.includes(skill.name);
+      const state = document.createElement('span');
+      state.textContent = checkbox.checked ? '已启用' : '已停用';
       checkbox.onchange = () => {
         disabledBuiltinSkills = disabledBuiltinSkills.filter(name => name !== skill.name);
         if (!checkbox.checked) disabledBuiltinSkills.push(skill.name);
+        state.textContent = checkbox.checked ? '已启用' : '已停用';
       };
-      label.append(checkbox, document.createTextNode(` ${skill.name}（随程序提供；保存后生效）`));
-      builtins.append(label);
+      const toggle = document.createElement('label');
+      toggle.className = 'settings-switch';
+      toggle.append(checkbox, state);
+      builtins.append(settingsCard({
+        glyph: String(skill.name || '?').slice(0, 1),
+        title: skill.name,
+        sub: '随程序提供',
+        description: skill.description || '',
+        tags: [{text: '内置工作流', tone: 'accent'}],
+        meta: '保存后生效',
+        actions: [toggle],
+        searchText: [skill.name, skill.description, '内置'].filter(Boolean).join(' '),
+      }));
     }
   }
   renderSkillInstallations(data.installations || []);
+  refreshAllSettingsCounts();
 }
 
 function applySkillSettings(data) {
@@ -2348,10 +2796,120 @@ function applySkillSettings(data) {
   document.getElementById('skill-install-directory').textContent = data.install_directory;
   renderSkillDirectories();
   renderSkillCatalog(data);
+  const installed = document.getElementById('installed-skills-list');
+  if (installed) {
+    installed.replaceChildren();
+    for (const skill of data.skills || []) {
+      const source = skill.source === 'builtin' ? '内置'
+        : skill.source === 'user' ? '用户目录'
+        : (skill.source || '其他');
+      const tags = [{text: source, tone: skill.source === 'builtin' ? 'accent' : ''}];
+      if (skill.safety_level) tags.push({text: `安全级别：${skill.safety_level}`, tone: ''});
+      installed.append(settingsCard({
+        glyph: String(skill.name || '?').slice(0, 1),
+        title: skill.name,
+        sub: skill.plan_path || '代码注册',
+        description: skill.description || '',
+        tags,
+        meta: source,
+        searchText: [skill.name, skill.description, source, skill.plan_path].filter(Boolean).join(' '),
+      }));
+    }
+  }
   document.getElementById('skill-settings-status').textContent = (data.issues || []).join(String.fromCodePoint(10));
+  refreshAllSettingsCounts();
   // 目录或启用状态变了，输入框的 Skill 联想缓存随之失效，下次触发时重新读取。
   skillMenuSkills = null;
   skillMenuError = '';
+}
+
+let mcpSettingsLoading = false;
+
+function mcpAvailabilityBadge(server, enabled) {
+  const badge = document.createElement('span');
+  badge.style.cssText = 'display:inline-block;padding:0 8px;border-radius:999px;font-size:12px;margin-right:6px;';
+  if (!enabled) {
+    badge.textContent = '未启用';
+    badge.style.background = 'var(--panel-muted)';
+    badge.style.color = 'var(--muted)';
+  } else if (server.available === true) {
+    badge.textContent = '可用';
+    badge.style.background = '#ecfdf5';
+    badge.style.color = '#047857';
+  } else if (server.available === false) {
+    badge.textContent = '不可用';
+    badge.style.background = '#fef2f2';
+    badge.style.color = '#b91c1c';
+  } else {
+    badge.textContent = '未检测';
+    badge.style.background = 'var(--panel-muted)';
+    badge.style.color = 'var(--muted)';
+  }
+  return badge;
+}
+
+function renderMcpSettings(data) {
+  const list = document.getElementById('mcp-server-list');
+  if (!list) return;
+  const status = document.getElementById('mcp-settings-status');
+  list.replaceChildren();
+  const enabled = data?.enabled === true;
+  const servers = Array.isArray(data?.servers) ? data.servers : [];
+  const issues = Array.isArray(data?.issues) ? data.issues : [];
+  if (status) {
+    const parts = [enabled ? 'mcp.enabled = true' : 'mcp.enabled = false', `共 ${servers.length} 个服务器`];
+    if (data?.probed) {
+      const usable = servers.filter((server) => server.available === true).length;
+      parts.push(`可用 ${usable} / ${servers.length}`);
+    } else {
+      parts.push('未检测连通性');
+    }
+    if (!enabled) parts.push('配置不会注册到工具列表');
+    status.textContent = [parts.join(' · '), ...issues.map(issue => `配置问题：${issue}`)].join(String.fromCodePoint(10));
+  }
+  for (const server of servers) {
+    const spec = [`类型：${server.kind || '未指定'}`];
+    if (server.command && server.command.length) spec.push(`命令：${server.command.join(' ')}`);
+    else if (server.url) spec.push(`URL：${server.url}`);
+    else if (server.module) spec.push(`模块：${server.module}`);
+    if (server.option_keys && server.option_keys.length) spec.push(`options：${server.option_keys.join(', ')}`);
+    const tools = Array.isArray(server.tools) ? server.tools : [];
+    const availability = !enabled ? {text: '未启用', tone: ''}
+      : server.available === true ? {text: '可用', tone: 'ok'}
+      : server.available === false ? {text: '不可用', tone: 'bad'}
+      : {text: '未检测', tone: 'warn'};
+    const tags = [availability, {text: server.kind || '未指定类型', tone: 'accent'}];
+    if (tools.length) tags.push({text: `${tools.length} 个工具`, tone: ''});
+    list.append(settingsCard({
+      glyph: String(server.id || '?').slice(0, 1),
+      title: server.id,
+      sub: spec.slice(1).join(' · ') || '未配置启动方式',
+      description: [server.detail, tools.join(', ')].filter(Boolean).join('：'),
+      tags,
+      meta: spec[0],
+      searchText: [server.id, server.kind, (server.command || []).join(' '), server.url, server.module, server.detail, tools.join(' ')]
+        .filter(Boolean).join(' '),
+    }));
+  }
+  const empty = document.getElementById('settings-empty-mcp');
+  if (empty) empty.style.display = servers.length ? 'none' : '';
+  refreshAllSettingsCounts();
+}
+
+async function loadMcpSettings(probe) {
+  if (mcpSettingsLoading) return;
+  const status = document.getElementById('mcp-settings-status');
+  mcpSettingsLoading = true;
+  if (status) status.textContent = probe ? '正在检测 MCP 服务器连通性…' : '正在读取 MCP 配置…';
+  try {
+    const response = await fetch(`/settings/mcp?probe=${probe ? 'true' : 'false'}`);
+    const data = await readSkillResponse(response, '读取 MCP 设置失败');
+    renderMcpSettings(data);
+  } catch (error) {
+    if (status) status.textContent = error.message;
+  } finally {
+    mcpSettingsLoading = false;
+  }
 }
 
 async function readSkillResponse(response, action) {
@@ -2386,6 +2944,8 @@ async function openSkillSettings() {
   } catch (error) {
     document.getElementById('skill-settings-status').textContent = error.message;
   }
+  // MCP 设置是只读展示，单独读取失败不影响 Skill 设置的使用；probe=true 会做真实连通性探测。
+  await loadMcpSettings(true);
 }
 
 function addSkillDirectoryPath() {
@@ -4346,6 +4906,10 @@ async function renderFinalResult(taskId, state, conversationId) {
     applyTaskProjection(card.task, state.projection);
     applyTaskProtocol(card.task, state);
     card.task.phase1State = state.phase1_state || card.task.phase1State;
+    if (state.turn_id
+      && TERMINAL_STATES.includes(String(card.task.phase1State || '').toUpperCase())) {
+      card.task.settledTurnId = state.turn_id;
+    }
     card.task.status = state.status || card.task.status;
     card.task.waiting = null;
   }
@@ -4407,6 +4971,10 @@ function followTask(taskId, conversationId) {
       current.task.todoList = state.todo_list || null;
       current.task.cursor = Math.max(Number(current.task.cursor || 0), Number(state.cursor || 0));
       current.task.phase1State = state.phase1_state;
+      if (state.turn_id
+        && TERMINAL_STATES.includes(String(state.phase1_state || '').toUpperCase())) {
+        current.task.settledTurnId = state.turn_id;
+      }
       current.task.status = state.status;
       current.task.waiting = state.waiting || (state.approval
         ? {kind: 'APPROVAL', approval: state.approval}
@@ -5261,6 +5829,11 @@ runtime_error: str | None = None
 configuration_issues: list[str] = []
 workspace_registry: list[dict[str, str]] = []
 session_workspace_bindings: dict[str, str] = {}
+# Removal is an explicit deny-list rather than "absent from the index": the
+# Runtime keeps owning the Session and Task records, and the startup recovery
+# below rebuilds the index from them, so absence alone would resurrect entries.
+removed_workspace_paths: set[str] = set()
+removed_session_ids: set[str] = set()
 turn_request_diagnostics: Any | None = None
 
 # These runs are deliberately Web-local: the evaluated Agent Tasks themselves
@@ -5376,6 +5949,47 @@ def load_session_workspace_bindings() -> None:
             session_workspace_bindings[session_id] = workspace_id
 
 
+def web_removals_path() -> Path:
+    return Path.cwd() / ".agent" / "web-removals.json"
+
+
+def load_web_removals() -> None:
+    removed_workspace_paths.clear()
+    removed_session_ids.clear()
+    try:
+        raw = json.loads(web_removals_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(raw, dict):
+        return
+    for path in raw.get("workspaces") or []:
+        if isinstance(path, str):
+            removed_workspace_paths.add(path)
+    for session_id in raw.get("sessions") or []:
+        if isinstance(session_id, str):
+            removed_session_ids.add(session_id)
+
+
+def save_web_removals() -> None:
+    target = web_removals_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(
+                {
+                    "workspaces": sorted(removed_workspace_paths),
+                    "sessions": sorted(removed_session_ids),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        # A read-only workspace still runs; it just cannot remember removals.
+        return
+
+
 def save_session_workspace_bindings() -> None:
     target = session_workspace_bindings_path()
     try:
@@ -5425,6 +6039,8 @@ def recover_workspace_registry_from_runtime() -> None:
             except (LookupError, PermissionError):
                 continue
             path = str(task.workspace)
+            if path in removed_workspace_paths:
+                continue
             if path in known:
                 existing = next(item for item in workspace_registry if item["path"] == path)
                 if "last_used_at" not in existing:
@@ -5451,6 +6067,7 @@ async def startup() -> None:
     global runtime_server, runtime_error, configuration_issues, turn_request_diagnostics
     load_workspace_registry()
     load_session_workspace_bindings()
+    load_web_removals()
     runtime_server = LocalEventApiServer(Path.cwd())
     try:
         runtime_server.start()
@@ -5548,6 +6165,13 @@ def register_workspace(raw_path: str) -> dict[str, str]:
         raise HTTPException(status_code=400, detail="所选路径不是目录")
 
     workspace_path = str(resolved)
+    # Selecting a directory is an explicit revival, so the deny-list entry has
+    # to go before the early return below: after a removal the registry holds no
+    # entry for this path, and keeping the path listed would hide the workspace
+    # the user just picked on the very next reload.
+    if workspace_path in removed_workspace_paths:
+        removed_workspace_paths.discard(workspace_path)
+        save_web_removals()
     existing = next(
         (item for item in workspace_registry if item["path"] == workspace_path),
         None,
@@ -5579,6 +6203,27 @@ async def activate_workspace(workspace_id: str) -> dict:
         raise HTTPException(status_code=404, detail="工作区不存在")
     touch_workspace(workspace)
     return workspace
+
+
+@app.delete("/workspaces/{workspace_id}")
+async def remove_workspace(workspace_id: str) -> dict:
+    """Remove one workspace from this Web UI's sidebar index.
+
+    The directory and its Runtime Session history are left untouched; only the
+    sidebar entry disappears. Because the startup recovery rebuilds the index
+    from durable Task ownership, the path is also written to the deny-list or
+    it would come back on the next reload.
+    """
+    workspace = next((item for item in workspace_registry if item["id"] == workspace_id), None)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="工作区不存在")
+    workspace_registry[:] = [
+        item for item in workspace_registry if item["id"] != workspace_id
+    ]
+    removed_workspace_paths.add(str(workspace["path"]))
+    save_workspace_registry()
+    save_web_removals()
+    return {"removed_workspace_id": workspace_id, "path": workspace["path"]}
 
 
 MAX_IMAGE_DATA_URL_CHARS = 400_000
@@ -6117,6 +6762,35 @@ async def get_skill_settings() -> dict:
     }
 
 
+@app.get("/settings/mcp")
+async def get_mcp_settings(probe: bool = True) -> dict:
+    """Report configured MCP servers plus whether each one is actually usable.
+
+    Read-only on purpose: the panel shows configuration and a real
+    connectivity result, but never edits the private YAML ``mcp`` section.
+    ``probe=false`` skips the connection attempt for a fast render.
+    """
+    try:
+        configuration_file, document = load_configuration_document()
+    except (OSError, ValueError) as error:
+        return {
+            "configuration_path": None,
+            "enabled": False,
+            "servers": [],
+            "issues": [f"读取私有配置失败：{error}"],
+            "probed": False,
+        }
+    enabled, servers, issues = mcp_configuration_summary(document)
+    rows = await describe_mcp_servers(enabled, servers, probe=probe)
+    return {
+        "configuration_path": str(configuration_file),
+        "enabled": enabled,
+        "servers": rows,
+        "issues": list(issues),
+        "probed": bool(probe and enabled and servers),
+    }
+
+
 @app.put("/settings/skills")
 async def save_skill_settings(payload: dict) -> dict:
     try:
@@ -6532,6 +7206,30 @@ async def create_task(payload: dict) -> dict:
     return result.to_data()
 
 
+@app.delete("/sessions/{session_id}")
+async def remove_session(session_id: str) -> dict:
+    """Hide one Session from the chat list.
+
+    Session and Task records are durable Runtime data and the Kernel exposes no
+    delete, so this is a UI-level removal: the id goes into a deny-list that
+    both ``/sessions`` and the startup path honour. Removing a Session never
+    removes its workspace.
+    """
+    if runtime_server is None:
+        raise HTTPException(
+            status_code=503, detail=runtime_error or "runtime unavailable",
+        )
+    kernel = runtime_server._client.application.kernel
+    sessions = runtime_server._call(kernel.list_sessions())
+    if not any(snapshot.session_id == session_id for snapshot in sessions):
+        raise HTTPException(status_code=404, detail="会话不存在")
+    removed_session_ids.add(session_id)
+    save_web_removals()
+    if session_workspace_bindings.pop(session_id, None) is not None:
+        save_session_workspace_bindings()
+    return {"removed_session_id": session_id}
+
+
 @app.get("/sessions")
 async def list_sessions(limit: int = 40) -> dict:
     """List durable Sessions so a reload or restart can rebuild the chat list.
@@ -6549,7 +7247,11 @@ async def list_sessions(limit: int = 40) -> dict:
     items: list[dict] = []
     for snapshot in sorted(
         sessions, key=lambda item: item.updated_at, reverse=True
-    )[:max(1, min(limit, 200))]:
+    ):
+        if snapshot.session_id in removed_session_ids:
+            continue
+        if len(items) >= max(1, min(limit, 200)):
+            break
         workspace_path = ""
         latest_task_id = snapshot.active_task_id or (
             snapshot.task_ids[-1] if snapshot.task_ids else None

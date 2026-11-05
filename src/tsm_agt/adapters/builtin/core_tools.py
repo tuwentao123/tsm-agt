@@ -29,6 +29,7 @@ from tsm_agt.ports import (
     ToolFactDescriptor,
     ToolIdempotency,
     ToolInvocationContext,
+    ToolRecoveryKind,
     ToolResult,
     ToolResultAuthority,
     ToolResultMaterialization,
@@ -248,12 +249,17 @@ class CoreReadOnlyToolProvider:
                 "properties": {
                     "path": {
                         "type": "string",
+                        "minLength": 1,
                         "description": (
                             "Workspace-relative or absolute local file path; provide exactly "
-                            "one of path/resource_ref. Outside paths may require directory read approval."
+                            "one of path/resource_ref. Omit resource_ref entirely when using path; "
+                            "do not fill it with an empty string. Outside paths may require directory read approval."
                         ),
                     },
-                    "resource_ref": {"type": "string", "description": "A task-scoped reference returned by a discovery tool; provide exactly one of path/resource_ref."},
+                    "resource_ref": {
+                        "type": "string", "minLength": 1,
+                        "description": "A task-scoped reference returned by a discovery tool; provide exactly one of path/resource_ref. Omit path entirely when using a reference; do not use empty placeholders.",
+                    },
                     "start_line": {"type": "integer", "minimum": 1, "description": "First 1-based line to return; defaults to 1."},
                     "start_column": {"type": "integer", "minimum": 1, "description": "First 1-based Unicode character in start_line; defaults to 1. Use next_cursor to continue a split long line."},
                     "max_lines": {
@@ -263,6 +269,7 @@ class CoreReadOnlyToolProvider:
                     },
                 },
                 "additionalProperties": False,
+                "oneOf": [{"required": ["path"]}, {"required": ["resource_ref"]}],
             },
             risk=ToolRisk.R0,
             is_read_only=True,
@@ -1506,6 +1513,14 @@ class CoreReadOnlyToolProvider:
             error_code=code,
             message=message,
             hint=hint,
-            retryable=retryable,
+            retryable=retryable or code == "INVALID_PARAM",
+            recovery_kind=(
+                ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS
+                if code == "INVALID_PARAM" else None
+            ),
+            recovery_action=(
+                {"tool": call.name, "reason": "invalid_arguments"}
+                if code == "INVALID_PARAM" else {}
+            ),
             meta={"untrusted_data": True},
         )

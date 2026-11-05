@@ -54,4 +54,6 @@ model:
 - `default_profile`：默认模型的配置名，此处为 `main`。网页切换模型从下一轮生效。
 - `options`：按接口支持填写；Chat 输出上限参数使用 `max_tokens` 或 `max_completion_tokens`。
 
+主对话的上下文预算仍预留输出空间（默认 8,192 tokens），这份预留不会自动成为请求的输出上限。OpenAI Chat / Responses 默认省略输出上限，由服务端决定；需要限制时设置模型的 `options.max_output_tokens`（正整数）。本地预算会至少预留该上限。Anthropic Messages 必须发送 `max_tokens`，未配置时使用 8,192。`send_output_token_limit: false` 仍可用于 OpenAI 接口，但不能与显式 `max_output_tokens` 同时配置。
+
 修改 YAML 后重启服务。更多选项见[配置示例](examples/model-profiles.yaml)和[模型配置说明](src/tsm_agt/docs/model_profiles.md)。

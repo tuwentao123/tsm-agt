@@ -113,6 +113,7 @@ class OpenAICompatibleModelProvider:
         request_diagnostics: RequestDiagnosticCapture | None = None,
         request_parameters: Mapping[str, object] | None = None,
         send_output_token_limit: bool = True,
+        max_output_tokens: int | None = None,
     ) -> None:
         normalized_url = base_url.strip().rstrip("/")
         if not normalized_url.startswith(("https://", "http://")):
@@ -142,6 +143,11 @@ class OpenAICompatibleModelProvider:
         self._retry_backoff_seconds = retry_backoff_seconds
         self._output_token_parameter = output_token_parameter
         self._send_output_token_limit = send_output_token_limit
+        if max_output_tokens is not None and (type(max_output_tokens) is not int or max_output_tokens <= 0):
+            raise ValueError("max_output_tokens must be a positive integer")
+        if max_output_tokens is not None and not send_output_token_limit:
+            raise ValueError("max_output_tokens requires send_output_token_limit=true")
+        self._max_output_tokens = max_output_tokens
         self._reasoning_effort = reasoning_effort
         self._reasoning_registry = reasoning_registry or DEFAULT_REASONING_EFFORT_REGISTRY
         self._strict_tool_schema = strict_tool_schema
@@ -183,6 +189,10 @@ class OpenAICompatibleModelProvider:
     async def start(self, context: AdapterContext) -> None:
         self._started = True
 
+    def output_token_limit_for(self, profile_id=None) -> int | None:
+        """Configured default wire ceiling; None leaves it to the gateway."""
+        return self._max_output_tokens if self._send_output_token_limit else None
+
     async def health(self) -> HealthStatus:
         state = HealthState.HEALTHY if self._started else HealthState.UNHEALTHY
         message = (
@@ -207,6 +217,8 @@ class OpenAICompatibleModelProvider:
         )
         normalized = self._normalize_response(
             request.turn_id, response, provider_to_internal,
+            requested_output_limit=payload.get(self._output_token_parameter),
+            output_limit_parameter=self._output_token_parameter,
             allow_text_tool_fallback=request.allow_tool_calls,
             allowed_outcome_refs=frozenset(request.outcome_refs),
             conclusion_protocol_mode=request.conclusion_protocol_mode,
@@ -472,6 +484,8 @@ class OpenAICompatibleModelProvider:
                 "usage": usage,
             },
             provider_to_internal,
+            requested_output_limit=payload.get(self._output_token_parameter),
+            output_limit_parameter=self._output_token_parameter,
             allow_text_tool_fallback=request.allow_tool_calls,
             allowed_outcome_refs=frozenset(request.outcome_refs),
             conclusion_protocol_mode=request.conclusion_protocol_mode,
@@ -753,8 +767,9 @@ class OpenAICompatibleModelProvider:
             "model": self._model,
             "messages": provider_messages,
         }
-        if self._send_output_token_limit and request.max_output_tokens is not None:
-            payload[self._output_token_parameter] = request.max_output_tokens
+        output_limit = request.max_output_tokens if request.max_output_tokens is not None else self.output_token_limit_for()
+        if self._send_output_token_limit and output_limit is not None:
+            payload[self._output_token_parameter] = output_limit
         # Per-turn override takes precedence over the provider's default
         # reasoning_effort; when absent, fall back to the bootstrap value.
         effective_effort = request.reasoning_effort or self._reasoning_effort
@@ -893,6 +908,52 @@ class OpenAICompatibleModelProvider:
         return encoded
 
     @classmethod
+    def _truncation_diagnostics(
+        cls, response, raw_calls, names, requested_output_limit, output_limit_parameter,
+    ) -> dict[str, object]:
+        """Bounded facts only: never persist argument, reasoning or text bodies."""
+        usage = response.get("usage")
+        safe_usage: dict[str, object] = {}
+        if isinstance(usage, Mapping):
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                if type(usage.get(key)) is int and usage[key] >= 0:
+                    safe_usage[key] = usage[key]
+            for key, counters in (
+                ("prompt_tokens_details", ("cached_tokens",)),
+                ("completion_tokens_details", ("reasoning_tokens", "accepted_prediction_tokens", "rejected_prediction_tokens")),
+            ):
+                details = usage.get(key)
+                if isinstance(details, Mapping):
+                    safe_usage[key] = {name: details[name] for name in counters
+                                       if type(details.get(name)) is int and details[name] >= 0}
+        tools = []
+        for call in raw_calls[:16]:
+            function = call.get("function") if isinstance(call, Mapping) else None
+            if not isinstance(function, Mapping):
+                continue
+            name, arguments = function.get("name"), function.get("arguments")
+            valid = False
+            if isinstance(arguments, str):
+                try:
+                    json.loads(arguments)
+                    valid = True
+                except (ValueError, RecursionError):
+                    pass
+            tools.append({
+                "name": names.get(name, "<unadvertised>") if isinstance(name, str) else "<missing>",
+                "argument_chars": len(arguments) if isinstance(arguments, str) else None,
+                "json_valid": valid,
+            })
+        return {
+            "finish_reason": "length",
+            "requested_output_limit": requested_output_limit,
+            "output_limit_parameter": output_limit_parameter if requested_output_limit is not None else None,
+            "usage": safe_usage,
+            "tool_call_count": len(raw_calls),
+            "tool_calls": tools,
+        }
+
+    @classmethod
     def _normalize_response(
         cls,
         turn_id: str,
@@ -902,6 +963,8 @@ class OpenAICompatibleModelProvider:
         allow_text_tool_fallback: bool = True,
         allowed_outcome_refs: frozenset[str] = frozenset(),
         conclusion_protocol_mode: ConclusionProtocolMode = ConclusionProtocolMode.OBSERVE,
+        requested_output_limit: int | None = None,
+        output_limit_parameter: str | None = None,
     ) -> ModelResponse:
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices:
@@ -985,20 +1048,19 @@ class OpenAICompatibleModelProvider:
                 arguments = json.loads(raw_arguments)
             except json.JSONDecodeError as error:
                 if raw_reason == "length":
-                    # The provider stopped at max_output_tokens, so these
-                    # arguments are a prefix of the JSON the model was writing.
-                    # Reporting that as a malformed tool call blamed the model
-                    # for the Runtime's own budget: a Task SPEC that outgrew its
-                    # cap was retried at the same cap until recovery exhausted
-                    # and the Task interrupted (task-ef2f8587). Same failure
-                    # class and retry safety as before -- only the diagnosis is
-                    # now true, so the ledger names the real cause.
+                    # length alone cannot identify a client cap versus an
+                    # upstream output/context limit. Keep the evidence before
+                    # normalization fails, without retaining partial arguments.
                     raise OpenAICompatibleProviderError(
                         f"tool call {call_id} arguments were truncated by the "
-                        "output token limit (finish_reason=length)",
+                        "provider limit (finish_reason=length)",
                         reason_code="truncated_tool_arguments",
                         category=ModelFailureCategory.INVALID_RESPONSE,
                         retry_safety=ModelRetrySafety.SAFE_RESAMPLE,
+                        diagnostics=cls._truncation_diagnostics(
+                            response, raw_calls, provider_to_internal,
+                            requested_output_limit, output_limit_parameter,
+                        ),
                     ) from error
                 raise OpenAICompatibleProviderError(
                     f"tool call {call_id} contains invalid JSON arguments"
@@ -1034,6 +1096,10 @@ class OpenAICompatibleModelProvider:
                 reason_code="empty_message",
                 category=ModelFailureCategory.INVALID_RESPONSE,
                 retry_safety=ModelRetrySafety.SAFE_RESAMPLE,
+                diagnostics=(cls._truncation_diagnostics(
+                    response, raw_calls, provider_to_internal,
+                    requested_output_limit, output_limit_parameter,
+                ) if raw_reason == "length" else {}),
             )
 
         reason_map = {

@@ -38,6 +38,11 @@ class ModelProfileProvider:
     def capabilities_for(self, profile_id=None):
         return self._providers[self.resolve_profile(profile_id)].capabilities
 
+    def output_token_limit_for(self, profile_id=None):
+        provider = self._providers[self.resolve_profile(profile_id)]
+        lookup = getattr(provider, "output_token_limit_for", None)
+        return lookup() if lookup else None
+
     async def start(self, context):
         started = []
         try:

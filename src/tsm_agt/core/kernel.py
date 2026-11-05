@@ -1852,6 +1852,11 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         on_text_delta: Callable[[str], None] | None = None,
         on_progress: Callable[[AgentProgress], None] | None = None,
     ) -> AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended:
+        """Run a turn; max_output_tokens reserves local context space.
+
+        The wire ceiling is configured independently by the model profile's
+        options.max_output_tokens, or the adapter's protocol requirement.
+        """
         normalized_text = user_text.strip()
         max_model_calls = (
             self._dependencies.default_max_model_calls

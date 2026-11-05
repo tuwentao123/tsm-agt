@@ -948,13 +948,14 @@ class ConversationAgentLoop:
                 "run commands or make changes. If the user needs those actions, "
                 "explain this limitation and ask them to choose a model with tools."
             )
+        wire_output_limit = kernel._model_output_token_limit_for(state.checkpoint.model_profile_id)
         try:
             prepared = kernel._dependencies.context_manager.prepare(
                 conversation=tuple(state.messages),
                 tools=model_tools,
                 prompt_template=kernel._dependencies.prompt_template,
                 context_window=kernel._model_capabilities_for(state.checkpoint.model_profile_id).context_window,
-                max_output_tokens=state.checkpoint.max_output_tokens,
+                max_output_tokens=max(state.checkpoint.max_output_tokens, wire_output_limit or 0),
                 runtime_instruction=runtime_instruction,
                 read_reuse_task_id=state.task_id,
             )
@@ -992,7 +993,9 @@ class ConversationAgentLoop:
         state.request = ModelRequest(
             turn_id=state.turn_id,
             messages=prompt.messages,
-            max_output_tokens=state.checkpoint.max_output_tokens,
+            # Local reservation is not a wire ceiling. Explicit profile caps
+            # (and Messages' required default) are resolved separately.
+            max_output_tokens=wire_output_limit,
             tools=model_tools,
             allow_tool_calls=kernel._model_capabilities_for(state.checkpoint.model_profile_id).tools,
             on_transport_progress=record_transport,

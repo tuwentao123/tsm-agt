@@ -9,10 +9,11 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from tsm_agt.ports import (
-    Message, MessageRole, TextBlock, ToolCallBlock, ToolResultBlock, ToolSpec,
+    ImageBlock, Message, MessageRole, TextBlock, ToolCallBlock, ToolResultBlock, ToolSpec,
 )
 
 from .configuration import canonical_hash
+from .image_budget import estimate_image_tokens
 from .prompt import PromptTemplate
 from .context_messages import is_execution_context
 from .read_result_reuse import ReadReuseStats, project_read_results
@@ -43,7 +44,7 @@ class ContextBudget:
     trigger_tokens: int
     hard_input_tokens: int
     estimated_input_tokens: int
-    estimation_method: str = "utf8-bytes-div-4-conservative-v1"
+    estimation_method: str = "utf8-bytes-div-4-with-image-reserve-v2"
     allocations: tuple[ContextBudgetAllocation, ...] = ()
     history_soft_tokens: int = 0
 
@@ -168,7 +169,7 @@ class ContextWindowManager:
             "latency_soft_input_tokens": self.latency_soft_input_tokens,
             "pinned_message_ceiling": self.pinned_message_ceiling,
             "history_soft_tokens": self.history_soft_tokens,
-            "estimation_method": "utf8-bytes-div-4-conservative-v1",
+            "estimation_method": "utf8-bytes-div-4-with-image-reserve-v2",
             "preserve_first_user_goal": True,
             "preserve_session_and_working_memory": True,
             "preserve_all_session_task_indexes": True,
@@ -315,10 +316,22 @@ class ContextWindowManager:
             "project_context": [], "session_history": [],
             "working_memory": [], "current_turn_and_tool_protocol": [],
         }
+        image_tokens = 0
         for message in assembly.messages:
+            # Only typed images get visual accounting. Base64 inside ordinary
+            # text, tool arguments/results, or opaque reasoning is still text.
+            # Build an estimate-only projection; retain the original attachment
+            # in canonical history and in the actual provider request.
+            content = []
+            for block in message.content:
+                if isinstance(block, ImageBlock):
+                    image_tokens += estimate_image_tokens(block)
+                    content.append({"type": "input_image", "detail": block.detail})
+                else:
+                    content.append(block.to_data())
             data = {
                 "role": message.role.value,
-                "content": message.to_data()["content"],
+                "content": content,
             }
             if message.phase is not None:
                 data["phase"] = message.phase.value
@@ -359,6 +372,8 @@ class ContextWindowManager:
             allocations.append(ContextBudgetAllocation(
                 name, token_count, name in protected
             ))
+        if image_tokens:
+            allocations.append(ContextBudgetAllocation("image_inputs", image_tokens, True))
         tool_data = [{
             "name": tool.name, "description": tool.description,
             "parameters": dict(tool.parameters),

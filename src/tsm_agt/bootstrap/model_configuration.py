@@ -138,6 +138,8 @@ class ModelConfiguration:
     request_parameters: Mapping[str, object] = field(default_factory=dict)
     send_output_token_limit: bool = True
     reasoning_efforts: tuple[str, ...] = ()
+    # Optional wire ceiling, independent of the runtime's context reservation.
+    max_output_tokens: int | None = None
 
     @property
     def effective_output_token_parameter(self) -> str:
@@ -245,6 +247,11 @@ def load_model_configuration(
     send_output_token_limit = _bool(options.get("send_output_token_limit", True), "model options.send_output_token_limit")
     if protocol == MODEL_PROTOCOL_ANTHROPIC and not send_output_token_limit:
         raise ValueError("Anthropic Messages requires an output token limit")
+    max_output_tokens = options.get("max_output_tokens")
+    if max_output_tokens is not None:
+        max_output_tokens = _int_range(max_output_tokens, "model options.max_output_tokens", 1, 1_000_000)
+        if not send_output_token_limit:
+            raise ValueError("max_output_tokens requires send_output_token_limit=true")
     sources = {name: "yaml" for name in (
         "model.provider", "model.endpoint_origin", "model.model",
         "model.credentials_configured", "model.protocol", "model.profile",
@@ -271,6 +278,7 @@ def load_model_configuration(
         request_parameters=_request_parameters(options.get("request_parameters"), wire_protocol),
         send_output_token_limit=send_output_token_limit,
         reasoning_efforts=_reasoning_efforts(profile, profile_id),
+        max_output_tokens=max_output_tokens,
     )
 
 
@@ -425,6 +433,7 @@ def _validate_option_names(options: Mapping[str, object], profile_id: str) -> No
         "timeout_seconds", "max_retries", "retry_backoff_seconds",
         "output_token_parameter", "anthropic_version", "strict_tool_schema",
         "streaming", "reasoning_effort", "request_parameters", "send_output_token_limit",
+        "max_output_tokens",
     }
     unknown = sorted(set(options) - supported)
     if unknown:

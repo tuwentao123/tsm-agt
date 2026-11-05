@@ -91,6 +91,7 @@ class AnthropicMessagesModelProvider:
         transport: HttpJsonTransport | None = None,
         reasoning_effort: str | None = None,
         request_parameters: Mapping[str, object] | None = None,
+        max_output_tokens: int | None = None,
     ) -> None:
         normalized_url = base_url.strip().rstrip("/")
         if not normalized_url.startswith(("https://", "http://")):
@@ -109,6 +110,10 @@ class AnthropicMessagesModelProvider:
         self._anthropic_version = anthropic_version.strip()
         self._timeout_seconds = timeout_seconds
         self._streaming = streaming
+        if max_output_tokens is not None and (type(max_output_tokens) is not int or max_output_tokens <= 0):
+            raise ValueError("max_output_tokens must be a positive integer")
+        # Messages requires max_tokens, even without a configured ceiling.
+        self._max_output_tokens = max_output_tokens if max_output_tokens is not None else 8192
         import copy
         self._reasoning_effort = reasoning_effort
         self._request_parameters = copy.deepcopy(dict(request_parameters or {}))
@@ -133,6 +138,9 @@ class AnthropicMessagesModelProvider:
             context_window=200_000,
             structured_conclusion=False,
         )
+
+    def output_token_limit_for(self, profile_id=None) -> int:
+        return self._max_output_tokens
 
     async def start(self, context: AdapterContext) -> None:
         self._started = True
@@ -377,7 +385,7 @@ class AnthropicMessagesModelProvider:
 
         payload: dict[str, Any] = {
             "model": self._model,
-            "max_tokens": request.max_output_tokens or 8192,
+            "max_tokens": request.max_output_tokens if request.max_output_tokens is not None else self._max_output_tokens,
             "messages": messages,
         }
         import copy

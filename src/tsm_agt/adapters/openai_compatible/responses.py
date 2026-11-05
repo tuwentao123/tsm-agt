@@ -88,10 +88,15 @@ class OpenAIResponsesModelProvider(OpenAICompatibleModelProvider):
         for key in ("prompt_cache_key", "prompt_cache_retention", "parallel_tool_calls"):
             if key in chat:
                 payload[key] = chat[key]
-        if self._send_output_token_limit and request.max_output_tokens is not None:
-            payload["max_output_tokens"] = request.max_output_tokens
+        if self._output_token_parameter in chat:
+            payload["max_output_tokens"] = chat[self._output_token_parameter]
         if chat.get("tools"):
-            payload["tools"] = [{"type": "function", **tool["function"]} for tool in chat["tools"]]
+            # Responses may normalize an omitted strict flag into strict mode,
+            # making optional fields required. Preserve an explicit opt-out.
+            payload["tools"] = [
+                {"type": "function", **tool["function"], "strict": self._strict_tool_schema}
+                for tool in chat["tools"]
+            ]
             payload["tool_choice"] = chat["tool_choice"]
         return payload, names
 
@@ -142,17 +147,23 @@ class OpenAIResponsesModelProvider(OpenAICompatibleModelProvider):
             )
         response_phase = next(iter(message_phases), None)
         usage = response.get("usage") or {}
+        incomplete_reason = (response.get("incomplete_details") or {}).get("reason")
+        finish_reason = (
+            "content_filter" if incomplete_reason == "content_filter" else "length"
+        ) if response.get("status") == "incomplete" else ("tool_calls" if calls else "stop")
         assistant_message = {"role": "assistant", "content": "".join(text) or None,
                              "tool_calls": calls}
         if response_phase is not None:
             assistant_message["phase"] = response_phase.value
         chat_response = {"id": response.get("id"), "model": response.get("model"),
                          "choices": [{"message": assistant_message,
-                                      "finish_reason": "tool_calls" if calls else ("length" if response.get("status") == "incomplete" else "stop")}],
-                         "usage": {"prompt_tokens": usage.get("input_tokens", 0), "completion_tokens": usage.get("output_tokens", 0),
+                                      "finish_reason": finish_reason}],
+                         "usage": {"prompt_tokens": usage.get("input_tokens", 0), "completion_tokens": usage.get("output_tokens", 0), "total_tokens": usage.get("total_tokens"),
                                    "prompt_tokens_details": usage.get("input_tokens_details", {}),
                                    "completion_tokens_details": usage.get("output_tokens_details", {})}}
         result = self._normalize_response(request.turn_id, chat_response, names,
+                    requested_output_limit=(request.max_output_tokens if request.max_output_tokens is not None else self.output_token_limit_for()) if self._send_output_token_limit else None,
+                    output_limit_parameter="max_output_tokens",
                     allow_text_tool_fallback=request.allow_tool_calls,
                     allowed_outcome_refs=frozenset(request.outcome_refs),
                     conclusion_protocol_mode=request.conclusion_protocol_mode)

@@ -39,6 +39,7 @@ class ModelProviderTransportError(ModelAttemptFailed):
         self, message: str, *, retryable: bool = False, reason_code: str = "",
         category: ModelFailureCategory | None = None,
         retry_safety: ModelRetrySafety | None = None,
+        diagnostics: Mapping[str, object] | None = None,
     ) -> None:
         self.reason_code = reason_code or "provider_error"
         self.category = category or (
@@ -55,7 +56,8 @@ class ModelProviderTransportError(ModelAttemptFailed):
             ModelRetrySafety.SAFE_FALLBACK_TRANSPORT,
         }
         super().__init__(ModelAttemptFailure(
-            self.category, self.retry_safety, self.reason_code, message
+            self.category, self.retry_safety, self.reason_code, message,
+            diagnostics=dict(diagnostics or {}),
         ))
 
 

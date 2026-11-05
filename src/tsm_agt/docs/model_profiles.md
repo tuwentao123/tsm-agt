@@ -29,10 +29,12 @@ Web 输入区从本地 `/model-profiles` 读取安全目录。此路由不调用
 - Chat 支持 reasoning_effort；原生 thinking 兼容服务可配置 options.request_parameters.thinking，这时不重复发送 reasoning_effort。UI 的 none/high 分别切换 disabled/enabled，不承诺原生 thinking 有多个强度档。
 - Messages 支持 thinking、output_config.effort、cache_control。none 关闭 thinking，其他强度默认采用 adaptive，也可配置 legacy enabled/budget_tokens。供应商的 token 预算限制仍适用；拒绝参数时不会静默删除并假称成功。
 - Responses 使用 reasoning.effort，支持每轮覆盖，保留缓存与思考 token 统计及不透明 reasoning 历史。
+- Responses 在 `options.strict_tool_schema: false` 时显式发送工具的 `strict: false`；省略该字段可能使服务端把可选字段归一化为必填。工具参数的本地 Schema 校验和权限检查仍然生效。
 - Chat reasoning_content、Messages thinking/signature/redacted_thinking 作为 provider-owned block 重放，不作为用户回答或思考摘要展示。
 - request_parameters 使用协议白名单，不能覆盖 model、messages、input、认证头等身份或历史数据。
 - 缓存接受参数与实际命中分开报告。观察 cached_tokens 或 cache_read_input_tokens 等计数，不能用响应速度证明缓存命中。
-- 可选的 `options.send_output_token_limit: false` 让 Chat/Responses 不发送输出 token 上限，适用于已确认存在参数转换问题的兼容网关。框架上下文预算不变，上游输出长度使用服务默认设置；默认仍发送上限。Messages 必须提供上限，不接受此选项为 false。此选项按 Profile 明确配置，不根据报错静默重试。
+- 主对话的本地输出预留（默认 8,192 tokens）与请求上限分开计算。Chat/Responses 默认不发送输出上限，使用服务端默认值；可选的 `options.max_output_tokens` 设置显式请求上限，本地至少预留同样的空间。Chat 使用 `output_token_parameter` 指定的字段，Responses 使用 `max_output_tokens`。Messages 必须提供 `max_tokens`，未配置时使用 8,192，本地也预留该值。
+- `options.send_output_token_limit: false` 可强制 Chat/Responses 省略上限，包含辅助调用显式指定的上限；不能与 `options.max_output_tokens` 同时配置。Messages 不接受 false。辅助调用仍可使用自己的逐请求上限；不根据报错静默修改参数或自动增加额度。
 
 ## 可重复的真实 API 探测
 

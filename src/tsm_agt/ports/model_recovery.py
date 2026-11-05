@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Protocol
 
@@ -55,6 +56,7 @@ class ModelAttemptFailure:
     response_committed: bool = False
     provider_request_id: str | None = None
     retry_after_seconds: float | None = None
+    diagnostics: Mapping[str, object] = field(default_factory=dict)
 
     def with_visibility(self, visible: bool) -> "ModelAttemptFailure":
         if not visible or self.visible_output_emitted:
@@ -64,6 +66,7 @@ class ModelAttemptFailure:
             self.diagnostic_code, self.message, True, True,
             self.response_committed, self.provider_request_id,
             self.retry_after_seconds,
+            self.diagnostics,
         )
 
     def to_data(self) -> dict[str, object]:
@@ -77,6 +80,7 @@ class ModelAttemptFailure:
             "response_committed": self.response_committed,
             "provider_request_id": self.provider_request_id,
             "retry_after_seconds": self.retry_after_seconds,
+            "diagnostics": dict(self.diagnostics),
         }
 
 
