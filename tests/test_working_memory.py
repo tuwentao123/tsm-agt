@@ -302,10 +302,13 @@ class WorkingMemoryTest(unittest.IsolatedAsyncioTestCase):
                 await application.kernel.update_working_memory(
                     task.task_id, 1, working_state(), "valid", "test"
                 )
-                with self.assertRaisesRegex(ValueError, "revision conflict"):
+                from tsm_agt.ports import WorkingMemoryRevisionConflict
+                with self.assertRaisesRegex(WorkingMemoryRevisionConflict, "revision conflict") as conflict:
                     await application.kernel.update_working_memory(
                         task.task_id, 1, working_state("stale"), "stale", "test"
                     )
+                self.assertEqual((conflict.exception.expected_revision, conflict.exception.current_revision), (1, 2))
+                self.assertEqual((await application.kernel.get_working_memory(task.task_id)).revision, 2)
             finally:
                 await application.registry.stop_all()
 

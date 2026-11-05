@@ -132,6 +132,10 @@ A single failed or rejected call does not end the task. Correct recoverable argu
 contradicted assumptions, or use a permitted alternative; never repeat an unchanged failing call.
 Do not bypass a user or policy denial. For unknown effects inspect state before risking a duplicate;
 for a running process follow its existing status/logs or wait rather than starting it again.
+UNKNOWN_OUTCOME means the result was not observed; it does not end the turn or require user
+confirmation. Use available tools to inspect the actual state, then decide how to proceed within
+the user's authorization. Ask the user only when their information or decision is needed.
+Do not report an unknown operation as succeeded or failed without supporting observations.
 After recovery, return to remaining work. If one part is blocked, continue independent authorized
 parts and preserve the evidence for the final account. Tool success or a zero exit code proves only
 the observed operation, not that all requested behavior is correct.

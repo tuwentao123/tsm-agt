@@ -262,7 +262,6 @@ async def _run_tool_call(
             Path(task_before_action.workspace), call, semantic_action
         )
         exploration_decision = None
-        effective_tool_timeout_seconds = state.checkpoint.tool_timeout_seconds
         scope_decision = ProgressiveScopeDecision(
             ProgressiveScopeAction.ALLOW, "evidence_guided",
             "evidence_guided", current_depth=scope_probe.depth,
@@ -294,11 +293,6 @@ async def _run_tool_call(
                 )
                 scope_probe = kernel._progressive_scope_probe(
                     Path(task_before_action.workspace), call, semantic_action
-                )
-            if exploration_decision.probe_timeout_seconds is not None:
-                effective_tool_timeout_seconds = min(
-                    effective_tool_timeout_seconds,
-                    exploration_decision.probe_timeout_seconds,
                 )
             if exploration_decision.action in {
                 ExplorationCoordinatorAction.RETURN_FEEDBACK,
@@ -931,7 +925,7 @@ async def _run_tool_call(
         ))
         try:
             result = await kernel._invoke_agent_tool(
-                state.task_id, state.turn_id, call, effective_tool_timeout_seconds,
+                state.task_id, state.turn_id, call, state.checkpoint.tool_timeout_seconds,
                 agent_checkpoint=suspension.to_data(),
                 recover_interrupted=state.recover_interrupted,
                 allow_closed_outcome_ref=True,
@@ -1166,7 +1160,3 @@ async def _run_tool_call(
         )
         await kernel._save_agent_checkpoint(after_tool, "tool-result-recorded")
         state.checkpoint = after_tool
-        if result.error_code == "UNKNOWN_OUTCOME":
-            return await kernel._suspend_unknown_tool_outcome(
-                after_tool, call, result
-            )

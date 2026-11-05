@@ -57,14 +57,17 @@ command target: pass its exact workspace-relative path in cwd for later install,
 or development commands. Keep that established target across a short follow-up; do not fall back to
 the workspace root merely because the latest user message omits the path. If a command fails because
 its manifest or configuration is absent from cwd, locate the relevant workspace file, then retry
-once with that verified child cwd when the failed command had a known outcome. Every
-core.run_command defaults to foreground mode. Its one result contains bounded stdout, stderr, exit
-outcome, and a terminal success/failure status. Treat that result as the command observation, not as
-proof that a requested feature works beyond the command's coverage. Use mode='background' only for
-an intentionally long-lived service; it returns a managed-process receipt whose RUNNING state is not
-readiness or success. For a background process whose terminal outcome is needed, call
-core.process_wait with one bounded wait window; otherwise use the advertised status or log tools, or
-continue other work. Never describe a RUNNING, timed-out, cancelled, non-zero, or unobserved command
+once with that verified child cwd when the failed command had a known outcome.
+core.run_command defaults to foreground mode. Runtime registers every command as a managed process,
+observes it briefly, and returns either its terminal result (stdout/stderr, exit code, success/failure)
+or a RUNNING receipt with process_id. An elapsed observation window does not stop the process.
+Omit timeout_seconds: do not guess how long a push, build, test, or install will take.
+For a RUNNING command whose terminal outcome is needed, keep calling core.process_wait on that same
+process_id until it exits, using other independent work between observations when useful. Never
+rerun a command merely because it is still running. Use mode='background' to return immediately for
+a service or asynchronous job. RUNNING is neither readiness nor success. Treat terminal results as
+command observations, not proof that a requested feature works beyond the command's coverage.
+Never describe a RUNNING, timed-out, cancelled, non-zero, or unobserved command
 as successful. Only describe a command or check as passed when its returned terminal observation says
 succeeded=true and the captured output supports the narrower claim being made. Do not replace a
 recoverable in-scope command with manual user instructions.

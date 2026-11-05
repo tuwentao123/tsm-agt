@@ -17,11 +17,30 @@ from tsm_agt.ports import (
     ToolCall,
     ToolFactCapability,
     ToolInvocationContext,
+    ToolRecoveryKind,
     ToolResultMaterialization,
 )
 
 
 class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_and_denied_reads_have_serializable_recovery(self) -> None:
+        for call, code in (
+            (ToolCall("missing", "core.list_files", {"path": "missing"}), "NOT_FOUND"),
+            (ToolCall("denied", "core.read_file", {"path": ".env"}), "PERMISSION_DENIED"),
+        ):
+            with self.subTest(code=code):
+                result = await self.provider.invoke(call, self.context)
+                self.assertEqual(result.error_code, code)
+                self.assertEqual(result.to_data()["recovery_kind"], ToolRecoveryKind.TERMINAL.value)
+
+    async def test_os_error_retains_retry_semantics_when_serialized(self) -> None:
+        from unittest.mock import patch
+
+        with patch.object(self.provider, "_list_files", side_effect=OSError("fixture I/O error")):
+            result = await self.provider.invoke(ToolCall("io", "core.list_files", {}), self.context)
+        self.assertEqual(result.error_code, "TOOL_FAILED")
+        self.assertEqual(result.to_data()["recovery_kind"], ToolRecoveryKind.RETRY_SAME.value)
+
     def _point_ripgrep_at(self, binary: Path) -> None:
         """Make the search tools use a stub ripgrep for this test."""
 

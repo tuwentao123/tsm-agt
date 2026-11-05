@@ -34,7 +34,8 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from tsm_agt.ports import (
-    Message, MessageRole, RuntimeEvent, RuntimeUnitOfWork, TextBlock
+    Message, MessageRole, RuntimeEvent, RuntimeUnitOfWork, TextBlock,
+    WorkingMemoryRevisionConflict,
 )
 from typing import Any
 from uuid import uuid4
@@ -102,10 +103,7 @@ class MemoryMixin:
             task_id, task.goal, events
         )
         if current.revision != expected_revision:
-            raise ValueError(
-                "working memory revision conflict: expected "
-                f"{expected_revision}, got {current.revision}"
-            )
+            raise WorkingMemoryRevisionConflict(expected_revision, current.revision)
         sequence = stored.last_event_sequence + 1
         candidate_state = {"goal": current.goal, **state}
         # A progress update that does not mention diagnosis cannot erase the

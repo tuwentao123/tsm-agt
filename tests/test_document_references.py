@@ -14,6 +14,12 @@ from tsm_agt.ports import ToolCall
 
 
 class ExplicitDocumentReferenceTest(unittest.IsolatedAsyncioTestCase):
+    def test_invalid_candidates_do_not_abort_other_document_references(self):
+        references = extract_document_references(
+            "https://[broken https://bad.example：8080/path https://valid.example/doc"
+        )
+        self.assertEqual([item["url"] for item in references], ["https://valid.example/doc"])
+
     async def _executing_task(self, app, root: Path, goal: str, task_id: str, session_id: str | None = None):
         task = await app.kernel.create_task(goal, root, task_id, session_id=session_id)
         for state in (

@@ -8,6 +8,7 @@ same server identity and lifecycle without depending on one another.
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -27,6 +28,8 @@ class MCPServerConfig:
     url: str | None = None
     module: str | None = None
     options: Mapping[str, Any] = field(default_factory=dict)
+    required: bool = False
+    startup_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         if not _SERVER_ID.fullmatch(self.id):
@@ -42,6 +45,13 @@ class MCPServerConfig:
             raise ValueError("MCP server command must contain non-empty strings")
         if not isinstance(self.options, Mapping):
             raise TypeError("MCP server options must be a mapping")
+        if not isinstance(self.required, bool):
+            raise ValueError("MCP server required must be true or false")
+        if (isinstance(self.startup_timeout_seconds, bool)
+                or not isinstance(self.startup_timeout_seconds, (int, float))
+                or not math.isfinite(self.startup_timeout_seconds)
+                or self.startup_timeout_seconds <= 0):
+            raise ValueError("MCP startup_timeout_seconds must be a finite positive number")
 
 
 class MCPClient(Protocol):
@@ -60,6 +70,15 @@ class MCPCallNotSentError(RuntimeError):
     Other call exceptions provide no such guarantee: the server may already
     have applied a side effect before its response was lost or rejected.
     """
+
+
+class MCPServerStartupError(RuntimeError):
+    """Safe startup diagnostic retaining the server identity and failure stage."""
+
+    def __init__(self, server_id: str, stage: str, detail: str) -> None:
+        self.server_id = server_id
+        self.stage = stage
+        super().__init__(f"MCP server '{server_id}' failed during {stage}: {detail}")
 
 
 MCPClientFactory = Callable[[MCPServerConfig], Awaitable[MCPClient]]
@@ -114,6 +133,14 @@ class MCPClientManager:
         for server_id in self.server_ids():
             await self.get_client(server_id)
 
+    async def close_server(self, server_id: str) -> None:
+        """Close an isolated failed start without closing healthy peers."""
+        async with self._locks[server_id]:
+            client = self._clients.get(server_id)
+            if client is not None:
+                await client.aclose()
+                self._clients.pop(server_id, None)
+
     async def aclose(self) -> None:
         """Join in-progress starts and close peers even if a caller cancels."""
         if self._close_task is None:
@@ -150,6 +177,7 @@ class MCPClientManager:
 
 __all__ = [
     "MCPCallNotSentError",
+    "MCPServerStartupError",
     "MCPClient",
     "MCPClientFactory",
     "MCPClientManager",

@@ -21,3 +21,8 @@ build/
 
 # Local investigation notes may contain workspace paths and internal project names.
 实测记录与优化问题本.md
+# Local design notes and helper scripts that embed this machine's absolute paths
+# (/Users/<user>/...). Keep them out of the published repository.
+src/tsm_agt/docs/context_lifecycle.md
+src/tsm_agt/docs/context_latency_turn_2ffeda.md
+scripts/sync_kiro_mcp_config.py

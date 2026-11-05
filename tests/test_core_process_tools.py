@@ -310,25 +310,57 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
             ToolResultMaterialization.RUNTIME_OBSERVATION,
         )
 
-    async def test_foreground_timeout_returns_terminal_failed_observation(self) -> None:
+    async def test_observation_expiry_returns_process_and_command_finishes_once(self) -> None:
+        marker = Path(self.temporary.name) / "completion"
         result = await self._approve_call(ToolCall(
             "call-command-timeout-terminal", "core.run_command", {
                 "argv": [
                     sys.executable, "-c",
-                    "import time; print('started', flush=True); time.sleep(30)",
+                    "import time; from pathlib import Path; "
+                    "print('started', flush=True); time.sleep(.2); "
+                    "Path('completion').write_text('once'); print('finished', flush=True)",
                 ],
                 "cwd": ".",
                 "timeout_seconds": 0.05,
             },
         ), "turn-terminal-timeout")
 
-        self.assertFalse(result.ok)
-        self.assertEqual(result.error_code, "PROCESS_TIMED_OUT")
-        self.assertEqual(result.data["mode"], "foreground")
-        self.assertTrue(result.data["output_observed"])
-        self.assertEqual(result.data["execution_state"], "failed_known")
-        self.assertEqual(result.data["status"], "timed_out")
-        self.assertIn("started", result.data["stdout"]["text"])
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["state"], "RUNNING")
+        self.assertIsNone(result.data["succeeded"])
+        self.assertIn("core.process_wait", result.hint)
+        final = await self.application.kernel.invoke_tool(self.task.task_id, "wait", ToolCall(
+            "wait-result", "core.process_wait", {
+                "process_id": result.data["process_id"], "wait_seconds": 2,
+            },
+        ))
+        self.assertTrue(final.data["succeeded"])
+        self.assertEqual(final.data["exit_code"], 0)
+        self.assertIn("started", final.data["stdout"]["text"])
+        self.assertIn("finished", final.data["stdout"]["text"])
+        self.assertEqual(marker.read_text(), "once")
+        events = await self.application.kernel.dependencies.store.read_events(self.task.task_id)
+        self.assertEqual(sum(e.event_type == "process.started" for e in events), 1)
+        self.assertFalse(any(e.event_type == "process.cancelled" for e in events))
+
+    async def test_cancelling_command_observer_returns_managed_identity_without_killing(self):
+        control = _TaskProcessControl(self.application.kernel, self.task.task_id, "turn-yield", "observer")
+        observer = asyncio.create_task(control.run(
+            (sys.executable, "-c", "import time; time.sleep(.3); print('survived')"),
+            cwd=".", environment={}, max_output_bytes=1024,
+            max_lifetime_seconds=60, stop_on_task_end=True,
+            mode="foreground", timeout_seconds=10,
+        ))
+        async with asyncio.timeout(2):
+            while not (await self.application.kernel.get_task(self.task.task_id)).background_processes:
+                await asyncio.sleep(.005)
+        observer.cancel()
+        receipt = await observer
+        final = await self.application.kernel.wait_background_process(
+            self.task.task_id, receipt.process_id, wait_seconds=2,
+        )
+        self.assertTrue(final.result.succeeded)
+        self.assertIn("survived", final.stdout.text)
 
     async def test_missing_executable_is_a_not_started_result_without_approval(self) -> None:
         result = await self.application.kernel.invoke_tool(

@@ -43,6 +43,7 @@ class MCPCallOutcomeTest(unittest.IsolatedAsyncioTestCase):
         )
         self.provider = MCPToolProvider(self.manager)
         await self.provider.start(AdapterContext({}, lambda *_: None))
+        await self.provider.wait_ready()
         self.call = ToolCall("call", "mcp.fixture.write", {})
         self.context = ToolInvocationContext(
             "inv", "task", "turn", Path.cwd(), datetime.now(timezone.utc),

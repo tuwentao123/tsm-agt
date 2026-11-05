@@ -72,16 +72,13 @@ class CheckpointCompatibilityPolicyTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(decision.action, CheckpointCompatibilityAction.BLOCKED)
 
-    async def test_unknown_or_non_idempotent_execution_is_blocked(self) -> None:
-        for changes in (
-            {"unknown_outcome_count": 1},
-            {"running_non_idempotent_count": 1},
-        ):
-            with self.subTest(changes=changes):
-                decision = await self._evaluate(**changes)
-                self.assertEqual(
-                    decision.action, CheckpointCompatibilityAction.BLOCKED
-                )
+    async def test_unknown_result_does_not_block_resuming_model_observation(self) -> None:
+        decision = await self._evaluate(unknown_outcome_count=1)
+        self.assertEqual(decision.action, CheckpointCompatibilityAction.EXACT_RESUME)
+
+    async def test_live_non_idempotent_execution_cannot_be_dispatched_again(self) -> None:
+        decision = await self._evaluate(running_non_idempotent_count=1)
+        self.assertEqual(decision.action, CheckpointCompatibilityAction.BLOCKED)
 
     async def test_runtime_upgrade_with_execution_state_requires_validation(self) -> None:
         cases = (

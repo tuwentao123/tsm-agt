@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from tsm_agt.adapters.mcp_python_sdk_client import create_mcp_sdk_client
 from tsm_agt.adapters.mcp_tool_provider import MCPToolProvider
+from tsm_agt.adapters.builtin import CoreReadOnlyToolProvider
 from tsm_agt.bootstrap import (
     compose_fixture_application,
     compose_openai_compatible_engineering_application_from_env,
@@ -29,7 +30,7 @@ from tests.test_conversation_loop import ScriptedModel, _executing, text_respons
 
 def _demo_server() -> MCPServerConfig:
     return MCPServerConfig(
-        id="demo",
+        id="demo", required=True,
         kind="executable",
         command=("python", "-m", "tsm_agt.adapters.mcp_demo_server_stdio"),
     )
@@ -37,7 +38,7 @@ def _demo_server() -> MCPServerConfig:
 
 def _p0_server(*args: str) -> MCPServerConfig:
     return MCPServerConfig(
-        id="p0", kind="executable",
+        id="p0", required=True, kind="executable",
         command=(sys.executable, str(Path(__file__).parent / "fixtures" / "mcp_p0_server.py"), *args),
     )
 
@@ -88,9 +89,11 @@ class MCPSDKIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 ))
                 model = ScriptedModel([
                     tool_response("writes", "apply-once", f"mcp.p0.{tool}", {}),
-                    text_response("unexpected", "must not reach the model after uncertainty"),
+                    tool_response("inspect", "observe-state", "core.read_file", {"path": "receipt"}),
+                    text_response("observed", "The receipt records the write."),
                 ])
-                application = compose_fixture_application(model_adapter=model, tool_adapters=(provider,))
+                application = compose_fixture_application(model_adapter=model,
+                    tool_adapters=(provider, CoreReadOnlyToolProvider()))
                 async with asyncio.timeout(12):
                     await application.start()
                     try:
@@ -100,8 +103,13 @@ class MCPSDKIntegrationTest(unittest.IsolatedAsyncioTestCase):
                         outcome = await application.kernel.resolve_agent_approval(
                             approval.approval_request_id, ApprovalDecision.APPROVE, "approve local write once",
                         )
-                        self.assertIsInstance(outcome, AgentClarificationSuspended)
-                        self.assertEqual(len(model.requests), 1)
+                        self.assertIsInstance(outcome, AgentTurnResult)
+                        self.assertEqual(len(model.requests), 3)
+                        self.assertTrue(any(isinstance(block, ToolResultBlock)
+                            and block.result.error_code == "UNKNOWN_OUTCOME"
+                            for message in model.requests[1].messages for block in message.content))
+                        live = await application.kernel.get_task(task.task_id)
+                        self.assertIsNone(live.pending_clarification)
                         execution = next(iter((await application.kernel.get_task(task.task_id)).tool_executions.values()))
                         self.assertEqual(execution.state, ToolCommitState.UNKNOWN_OUTCOME)
                         self.assertEqual(execution.result.error_code, "UNKNOWN_OUTCOME")
@@ -117,6 +125,7 @@ class MCPSDKIntegrationTest(unittest.IsolatedAsyncioTestCase):
                         events = await application.registry.require(RuntimeStorePort).read_events(task.task_id)
                         failure = next(event for event in events if event.event_type == "tool.failed")
                         self.assertEqual(failure.payload["commit_state"], "UNKNOWN_OUTCOME")
+                        self.assertFalse(any(event.event_type == "clarification.requested" for event in events))
                     finally:
                         await application.registry.stop_all()
 
@@ -208,7 +217,7 @@ model:
                 encoding="utf-8",
             )
             with configuration_file.open("a", encoding="utf-8") as stream:
-                stream.write("\nmcp:\n  servers:\n    demo:\n      kind: executable\n      command: [python, -m, tsm_agt.adapters.mcp_demo_server_stdio]\n")
+                stream.write("\nmcp:\n  servers:\n    demo:\n      required: true\n      kind: executable\n      command: [python, -m, tsm_agt.adapters.mcp_demo_server_stdio]\n")
             with patch.dict(os.environ, {}, clear=True):
                 application = compose_openai_compatible_engineering_application_from_env(
                     configuration_file, database_path=workspace / ".agent" / "runtime.db",

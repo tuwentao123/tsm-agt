@@ -44,7 +44,8 @@ function setup({realFinal = false, realAnswers = false} = {}) {
   });
   const finalRenderer = page.slice(page.indexOf('async function renderFinalResult('), page.indexOf('// Each follower owns exactly one Task card.'));
   const answerRenderer = page.slice(page.indexOf('function appendTaskAssistantText('), page.indexOf('function renderTurnMarker('));
-  vm.runInContext(constants + (realAnswers ? answerRenderer : '') + (realFinal ? finalRenderer : '') + follower, context);
+  const clarificationSync = page.slice(page.indexOf('function syncClarificationMessage('), page.indexOf('function renderClarificationCard('));
+  vm.runInContext(constants + clarificationSync + (realAnswers ? answerRenderer : '') + (realFinal ? finalRenderer : '') + follower, context);
   async function emit(source, payload) {
     const current = vm.runInContext("followers.get('task')", context);
     source.emit(payload);
@@ -276,6 +277,21 @@ test('approval snapshot stops cleanly and retains the actionable request', async
   assert.equal(stream.closed, true);
   assert.equal(s.card('task').task.approval.request_id, 'approve-1');
   assert.equal(s.requests.length, 0);
+});
+
+test('unknown outcome snapshot retains recovery choices even when history refresh fails', async () => {
+  const s = setup();
+  s.context.refreshConversationHistory = async () => {throw new Error('history unavailable');};
+  s.context.followTask('task', 'chat');
+  const stream = s.streams[0];
+  const clarification = {kind: 'OUTCOME_RECONCILIATION', request_id: 'pending',
+    question: 'Check actual state', choices: [{value: 'KEEP_BLOCKED', label: 'Wait'}]};
+  await s.emit(stream, {type: 'task.snapshot', status: 'awaiting_user', phase1_state: 'WAITING',
+    clarification, waiting: clarification});
+  assert.equal(stream.closed, true);
+  const card = s.conversation.messages.find(item => item.role === 'clarification');
+  assert.equal(card.clarification.request_id, 'pending');
+  assert.equal(card.clarification.choices[0].value, 'KEEP_BLOCKED');
 });
 
 test('only exhausted reconnects perform one recovery status read', async () => {

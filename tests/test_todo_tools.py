@@ -10,7 +10,8 @@ from pathlib import Path
 from tsm_agt.adapters.builtin.todo_tools import CoreTodoToolProvider
 from tsm_agt.ports import (
     AdapterContext, ToolCall, ToolEffect,
-    ToolInvocationContext, ToolResultAuthority,
+    ToolInvocationContext, ToolResultAuthority, WorkingMemoryRevisionConflict,
+    ToolRecoveryKind,
 )
 
 
@@ -54,7 +55,7 @@ class _WorkingMemoryControl:
         self, expected_revision: int, state: dict, operation_id: str,
     ) -> dict:
         if expected_revision != self.state["revision"]:
-            raise ValueError("working memory revision conflict")
+            raise WorkingMemoryRevisionConflict(expected_revision, self.state["revision"])
         self.operations.append(operation_id)
         self.state = {
             **self.state,
@@ -118,6 +119,41 @@ class TodoToolProviderTest(unittest.IsolatedAsyncioTestCase):
                 },
             },
         )
+
+    async def test_new_plan_at_revision_11_reports_conflict_without_writing_then_can_retry(self):
+        self.control.state["revision"] = 11
+        original = deepcopy(self.control.state)
+        arguments = {"todos": [_item("new", "in_progress")], "merge": False,
+                     "expected_revision": 0, "operation_id": "new-plan"}
+        conflict = await self._call(arguments)
+        self.assertEqual(conflict.error_code, "REVISION_CONFLICT")
+        self.assertTrue(conflict.retryable)
+        self.assertEqual(conflict.effective_recovery_kind, ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS)
+        self.assertEqual(conflict.data, {"expected_revision": 0, "current_revision": 11})
+        self.assertEqual(conflict.recovery_action["read_tool"], "core.todo_list")
+        self.assertEqual(self.control.state, original)
+        self.assertEqual(self.control.operations, [])
+        current = await self._call({})
+        succeeded = await self._call({**arguments, "expected_revision": current.data["revision"]})
+        self.assertTrue(succeeded.ok)
+        self.assertEqual(succeeded.data["revision"], 12)
+        self.assertEqual(succeeded.data["summary"]["completed"], 0)
+        self.assertEqual(self.control.operations, ["new-plan"])
+
+    async def test_working_memory_tool_also_reports_a_recoverable_revision_conflict(self):
+        from tsm_agt.adapters.builtin.working_memory_tools import CoreWorkingMemoryToolProvider
+        provider = CoreWorkingMemoryToolProvider()
+        await provider.start(AdapterContext(config={}, emit_event=lambda *args: None))
+        self.control.state["revision"] = 11
+        original = deepcopy(self.control.state)
+        result = await provider.invoke(ToolCall("stale-memory", "core.working_memory_update", {
+            "state": original, "expected_revision": 0, "operation_id": "stale-memory",
+        }), self._context(self.control))
+        self.assertEqual(result.error_code, "REVISION_CONFLICT")
+        self.assertTrue(result.retryable)
+        self.assertEqual(result.data["current_revision"], 11)
+        self.assertEqual(result.recovery_action["read_tool"], "core.working_memory_read")
+        self.assertEqual(self.control.state, original)
 
     async def test_write_updates_working_memory_plan(self) -> None:
         result = await self._call({

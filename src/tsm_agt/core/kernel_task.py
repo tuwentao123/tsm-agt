@@ -54,6 +54,7 @@ from typing import Any
 from uuid import uuid4
 from .agent_loop import AgentTurnCheckpoint
 from .configuration import canonical_hash
+from .clarification import ClarificationKind
 from .document_references import extract_document_references
 from .runtime_input import SessionTaskRelation
 from .session import SessionSnapshot, standalone_session_id
@@ -1219,6 +1220,38 @@ class TaskMixin:
         if stored is None:
             return False
         task = TaskSnapshot.from_data(stored.data)
+        if (task.state is TaskState.AWAITING_USER and task.pending_clarification
+                and task.pending_clarification.kind is ClarificationKind.OUTCOME_RECONCILIATION):
+            # Upgrade old Runtime-authored gates into an ordinary interruption.
+            # No answer is fabricated, no tool result changes, and no call is
+            # replayed. The next user message can start a normal conversation
+            # turn with the original execution facts still available.
+            request_id = task.pending_clarification.request_id
+            checkpoint_data = task.active_agent_checkpoint
+            turn_id = checkpoint_data.get("turn_id") if checkpoint_data else None
+            updated = task.clear_pending_interactions()
+            if checkpoint_data:
+                updated = updated.with_agent_checkpoint(replace(
+                    AgentTurnCheckpoint.from_data(checkpoint_data), pending_user_action={},
+                ).to_data())
+            updated = updated.transition(TaskState.INTERRUPTING).transition(TaskState.INTERRUPTED)
+            entries = (
+                ("clarification.retired", {"request_id": request_id, "turn_id": turn_id,
+                    "reason": "runtime_outcome_gate_removed", "outcome_unchanged": True}),
+                ("task.state_changed", {"previous_state": task.state.value,
+                    "next_state": TaskState.INTERRUPTING.value, "reason": "runtime_outcome_gate_removed"}),
+                ("turn.interrupted", {"turn_id": turn_id, "reason": "runtime_outcome_gate_removed",
+                    "checkpoint_preserved": checkpoint_data is not None}),
+                ("task.state_changed", {"previous_state": TaskState.INTERRUPTING.value,
+                    "next_state": updated.state.value, "reason": "runtime_outcome_gate_removed"}),
+            )
+            events = tuple(RuntimeEvent(f"evt-{uuid4().hex}", task_id,
+                stored.last_event_sequence + i + 1, kind, payload)
+                for i, (kind, payload) in enumerate(entries))
+            await self._dependencies.store.commit(RuntimeUnitOfWork(
+                task_id, stored.version, updated.to_data(), events,
+            ))
+            return True
         target = self._ORPHANED_SETTLEMENTS.get(task.state)
         if target is None:
             return False

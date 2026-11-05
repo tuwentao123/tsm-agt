@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import math
 import secrets
 import socket
 import sys
@@ -27,11 +28,14 @@ class LocalEventApiServer:
     def __init__(
         self, workspace: Path, *, host: str = "127.0.0.1", port: int = 8765,
         token: str | None = None, application_factory=None,
+        startup_timeout_seconds: float = 40,
     ) -> None:
         if host not in {"127.0.0.1", "::1", "localhost"}:
             raise ValueError("local Event API may bind only to a loopback host")
         if not 0 <= port <= 65535:
             raise ValueError("port must be between 0 and 65535")
+        if (not math.isfinite(startup_timeout_seconds) or startup_timeout_seconds <= 0):
+            raise ValueError("startup_timeout_seconds must be finite and positive")
         selected_token = token or secrets.token_urlsafe(32)
         if len(selected_token) < 24:
             raise ValueError("local Event API token must contain at least 24 characters")
@@ -39,6 +43,7 @@ class LocalEventApiServer:
         self.host = host
         self.port = port
         self.token = selected_token
+        self.startup_timeout_seconds = startup_timeout_seconds
         self._client = EngineeringAgentClient(
             self.workspace, application_factory=application_factory
         )
@@ -58,17 +63,25 @@ class LocalEventApiServer:
             return
         ready = threading.Event()
         loop_error: list[BaseException] = []
+        startup_tasks: list[asyncio.Task] = []
 
         def run_loop() -> None:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             self._loop = loop
             try:
-                loop.run_until_complete(self._client.start())
+                startup_task = loop.create_task(self._client.start())
+                startup_tasks.append(startup_task)
+                loop.run_until_complete(startup_task)
             except BaseException as error:
                 loop_error.append(error)
-                ready.set()
-                loop.close()
+                try:
+                    loop.run_until_complete(self._client.close())
+                except BaseException as cleanup_error:
+                    error.add_note(f"Runtime cleanup failed: {type(cleanup_error).__name__}")
+                finally:
+                    loop.close()
+                    ready.set()
                 return
             ready.set()
             loop.run_forever()
@@ -79,8 +92,23 @@ class LocalEventApiServer:
             target=run_loop, name="tsm-agt-local-api-runtime", daemon=True
         )
         self._loop_thread.start()
-        ready.wait(timeout=10)
+        if not ready.wait(timeout=self.startup_timeout_seconds):
+            # Publishing a loop reference is not proof that Runtime.start has
+            # completed. Cancel on its own loop and let it drain MCP owners.
+            def cancel_startup() -> None:
+                for task in startup_tasks:
+                    task.cancel()
+            if self._loop is not None and not self._loop.is_closed():
+                self._loop.call_soon_threadsafe(cancel_startup)
+            self._loop_thread.join(timeout=10)
+            if not self._loop_thread.is_alive():
+                self._loop_thread = None
+                self._loop = None
+            raise RuntimeError("local Event API Runtime startup timed out")
         if loop_error:
+            self._loop_thread.join(timeout=10)
+            self._loop_thread = None
+            self._loop = None
             raise RuntimeError("failed to start local Event API Runtime") from loop_error[0]
         if self._loop is None:
             raise RuntimeError("local Event API Runtime did not start")
@@ -105,6 +133,7 @@ class LocalEventApiServer:
                 continue
 
         if self._http is None:
+            self.stop()
             raise RuntimeError(
                 f"failed to bind local Event API on {self.host}:{self.port}"
             ) from bind_error
@@ -175,6 +204,8 @@ class LocalEventApiServer:
         future = asyncio.run_coroutine_threadsafe(awaitable, self._loop)
 
         def report(completed: Future[Any]) -> None:
+            if completed.cancelled():
+                return
             error = completed.exception()
             if error is None:
                 return

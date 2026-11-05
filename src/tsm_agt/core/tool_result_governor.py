@@ -8,7 +8,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode
 
 from tsm_agt.ports.tool import ToolCall, ToolResult, ToolResultAuthority, ToolSpec
 
@@ -229,14 +229,22 @@ def _sanitize_text(value: str) -> tuple[str, bool]:
 def _redact_url_queries(value: str) -> str:
     def redact(match: re.Match[str]) -> str:
         url = match.group(0)
-        parsed = urlsplit(url)
-        if not parsed.query:
+        # This is arbitrary tool text, not a validated network address. A URL
+        # candidate may include Markdown punctuation or an invalid authority;
+        # urlsplit would raise on some Unicode characters and abort the turn.
+        # Query redaction needs only lexical delimiters, never host validation.
+        before_fragment, fragment_separator, fragment = url.partition("#")
+        prefix, query_separator, raw_query = before_fragment.partition("?")
+        if not query_separator:
+            return url
+        pairs = parse_qsl(raw_query, keep_blank_values=True)
+        if not any(_is_sensitive_key(key) for key, _ in pairs):
             return url
         query = [
             (key, _REDACTED if _is_sensitive_key(key) else item)
-            for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+            for key, item in pairs
         ]
-        return urlunsplit(parsed._replace(query=urlencode(query)))
+        return prefix + "?" + urlencode(query) + fragment_separator + fragment
 
     return _URL_PATTERN.sub(redact, value)
 

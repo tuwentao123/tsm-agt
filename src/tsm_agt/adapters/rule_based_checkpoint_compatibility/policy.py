@@ -70,12 +70,8 @@ class RuleBasedCheckpointCompatibilityPolicy:
             if item not in self._HARD_IDENTITY_DIFFERENCES
             and item not in self._SAFE_REBASE_DIFFERENCES
         )
-        if probe.unknown_outcome_count or probe.running_non_idempotent_count:
-            reasons = differences + ((
-                "unknown_tool_execution_outcome"
-                if probe.unknown_outcome_count else
-                "running_non_idempotent_tool"
-            ),)
+        if probe.running_non_idempotent_count:
+            reasons = differences + ("running_non_idempotent_tool",)
             return CheckpointCompatibilityDecision(
                 CheckpointCompatibilityAction.BLOCKED,
                 "unsafe_tool_execution_state", tuple(dict.fromkeys(reasons)),

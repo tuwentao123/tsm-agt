@@ -1662,12 +1662,6 @@ class SessionMixin:
             task = TaskSnapshot.from_data(task_stored.data)
             if not task.state.is_terminal:
                 blockers.append(f"{task_id}:{task.state.value}")
-            if any(
-                execution.state is ToolCommitState.UNKNOWN_OUTCOME
-                and execution.reconciled_outcome is None
-                for execution in task.tool_executions.values()
-            ):
-                blockers.append(f"{task_id}:UNKNOWN_OUTCOME")
         if blockers:
             raise RuntimeError(
                 "session cannot close while Tasks are unresolved: " + ", ".join(blockers)

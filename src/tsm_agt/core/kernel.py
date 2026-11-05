@@ -985,7 +985,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             execution for execution in task.tool_executions.values()
             if execution.invocation_id != writer and execution.state in {
                 ToolCommitState.PREPARED, ToolCommitState.RUNNING,
-                ToolCommitState.UNKNOWN_OUTCOME,
             }
         )
         if active:
@@ -2048,13 +2047,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             role=MessageRole.TOOL,
             content=(ToolResultBlock(result),),
         )
-        if result.error_code == "UNKNOWN_OUTCOME":
-            blocked_checkpoint = replace(
-                resumed, messages=resumed.messages + (tool_message,),
-            )
-            return await self._suspend_unknown_tool_outcome(
-                blocked_checkpoint, approved_call, result
-            )
         from .conversation_loop.loop import ConversationAgentLoop
 
         return await ConversationAgentLoop(self).continue_after_approval(
@@ -2226,6 +2218,42 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             on_text_delta=on_text_delta, on_progress=on_progress,
         )
 
+    async def reissue_agent_clarification_token(
+        self, task_id: str, request_id: str,
+    ) -> str:
+        """Renew a pending request credential for a trusted interactive client.
+
+        This does not answer the question or replay the uncertain action. Only
+        a token hash is durable, so a restarted local UI needs a new credential.
+        Optimistic task versioning prevents two clients rotating the same row.
+        """
+        stored = await self._require_stored_task(task_id)
+        task = TaskSnapshot.from_data(stored.data)
+        request = task.pending_clarification
+        if (task.state is not TaskState.AWAITING_USER or request is None
+                or request.request_id != request_id):
+            raise ClarificationNotPending("this clarification is no longer pending")
+        if task.active_agent_checkpoint is None:
+            raise ClarificationNotPending("pending clarification lost its checkpoint")
+        checkpoint = AgentTurnCheckpoint.from_data(task.active_agent_checkpoint)
+        if checkpoint.task_id != task_id or checkpoint.turn_id != request.turn_id:
+            raise ClarificationNotPending("clarification checkpoint does not match")
+        token = secrets.token_urlsafe(32)
+        renewed = replace(request,
+            resume_token_hash=ClarificationRequest.hash_resume_token(token),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        )
+        updated = replace(task, pending_clarification=renewed)
+        await self._dependencies.store.commit(RuntimeUnitOfWork(
+            task_id, stored.version, updated.to_data(), (RuntimeEvent(
+                f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
+                "clarification.credential_renewed", {
+                    "request_id": request_id, "turn_id": request.turn_id,
+                },
+            ),),
+        ))
+        return token
+
     async def resolve_agent_clarification(
         self, request_id: str, resume_token: str, answer: str | None = None, *,
         selected_choice: str | None = None,
@@ -2264,18 +2292,8 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             raise ClarificationNotPending("pending clarification lost its checkpoint")
         checkpoint = AgentTurnCheckpoint.from_data(task.active_agent_checkpoint)
         if request.kind is ClarificationKind.OUTCOME_RECONCILIATION:
-            pending = checkpoint.pending_user_action
-            if (
-                pending.get("kind") != request.kind.value
-                or pending.get("request_id") != request.request_id
-                or pending.get("execution_id") != request.execution_id
-            ):
-                raise ClarificationTokenMismatch(
-                    "outcome reconciliation does not match the active checkpoint"
-                )
-            return await self._resolve_outcome_reconciliation(
-                task, request, checkpoint, normalized_answer,
-                normalized_choice, resume_token, on_text_delta, on_progress,
+            raise ClarificationNotPending(
+                "Runtime outcome gates are retired; continue through ordinary conversation input"
             )
         if (
             checkpoint.task_id != task.task_id
@@ -2412,173 +2430,6 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         await self._dependencies.store.commit(RuntimeUnitOfWork(
             task.task_id, stored.version, resumed.to_data(), events
         ))
-        from .conversation_loop.loop import ConversationAgentLoop
-
-        return await ConversationAgentLoop(self)._drive(
-            resumed_checkpoint, visible_tools,
-            on_text_delta=on_text_delta, on_progress=on_progress,
-        )
-
-    async def _resolve_outcome_reconciliation(
-        self, task: TaskSnapshot, request: ClarificationRequest,
-        checkpoint: AgentTurnCheckpoint, normalized_answer: str,
-        normalized_choice: str, resume_token: str,
-        on_text_delta: Callable[[str], None] | None,
-        on_progress: Callable[[AgentProgress], None] | None,
-    ) -> AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended:
-        """Apply an explicit observation without rewriting tool history."""
-        allowed = {choice.value for choice in request.choices}
-        selected = normalized_choice or (
-            normalized_answer if normalized_answer in allowed else ""
-        )
-        if selected not in allowed:
-            raise ValueError(
-                "outcome reconciliation requires a displayed selected_choice"
-            )
-        if selected == "KEEP_BLOCKED":
-            return AgentClarificationSuspended(
-                task.task_id, request.turn_id, checkpoint.revision,
-                request.request_id, request.question,
-                tuple((item.value, item.label) for item in request.choices),
-                request.reason, request.required, resume_token, request.kind.value,
-            )
-        execution_id = request.execution_id or ""
-        execution = task.tool_executions.get(execution_id)
-        if execution is None or execution.state is not ToolCommitState.UNKNOWN_OUTCOME:
-            raise ClarificationNotPending(
-                "outcome reconciliation lost its UNKNOWN_OUTCOME execution"
-            )
-        reconciled_value = (
-            "SUCCEEDED" if selected == "CONFIRM_SUCCEEDED" else "NOT_APPLIED"
-        )
-        reference = f"user:{request.request_id}:outcome-reconciliation"
-        reconciled_execution = execution.reconcile(reconciled_value, reference)
-        result = ToolResult(
-            call_id=execution.call.call_id,
-            ok=reconciled_value == "SUCCEEDED",
-            data={
-                "reconciled_outcome": reconciled_value,
-                "execution_id": execution_id,
-            },
-            error_code=(
-                None if reconciled_value == "SUCCEEDED" else "NOT_APPLIED"
-            ),
-            message=(
-                "User confirmed the external action succeeded."
-                if reconciled_value == "SUCCEEDED" else
-                "User confirmed the external action did not take effect."
-            ),
-            retryable=reconciled_value == "NOT_APPLIED",
-            meta={
-                "request_id": request.request_id,
-                "reconciled_by_user": True,
-                "original_commit_state": ToolCommitState.UNKNOWN_OUTCOME.value,
-            },
-        )
-        tool_message = Message(
-            f"msg-tool-reconciled-{uuid4().hex}", MessageRole.TOOL,
-            (ToolResultBlock(result),),
-        )
-        reconciled_messages = tuple(
-            message for message in checkpoint.messages
-            if not (
-                message.role is MessageRole.TOOL
-                and any(
-                    isinstance(block, ToolResultBlock)
-                    and block.result.call_id == execution.call.call_id
-                    for block in message.content
-                )
-            )
-        )
-        resumed_checkpoint = replace(
-            checkpoint, revision=checkpoint.revision + 1,
-            messages=reconciled_messages + (tool_message,),
-            pending_tool_calls=(), pending_user_action={},
-            tool_batch=(
-                checkpoint.tool_batch.with_pending(
-                    (), status=ToolBatchStatus.CLOSED
-                ) if checkpoint.tool_batch is not None else None
-            ),
-        )
-        stored = await self._require_stored_task(task.task_id)
-        live = TaskSnapshot.from_data(stored.data)
-        resumed = live.with_tool_execution(
-            reconciled_execution
-        ).resolve_clarification().with_agent_checkpoint(
-            resumed_checkpoint.to_data()
-        )
-        answer_hash = canonical_hash({
-            "selected_choice": selected, "execution_id": execution_id,
-        })
-        events: tuple[RuntimeEvent, ...] = (
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", task.task_id,
-                stored.last_event_sequence + 1, "tool.outcome_reconciled", {
-                    "request_id": request.request_id,
-                    "execution_id": execution_id,
-                    "reconciled_outcome": reconciled_value,
-                    "answer_hash": answer_hash,
-                    "outcome_ref": execution.call.outcome_ref,
-                },
-            ),
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", task.task_id,
-                stored.last_event_sequence + 2, "clarification.resolved", {
-                    "request_id": request.request_id,
-                    "turn_id": request.turn_id,
-                    "selected_choice": selected,
-                    "input_mode": request.input_mode,
-                    "kind": request.kind.value,
-                    "answer_hash": answer_hash,
-                },
-            ),
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", task.task_id,
-                stored.last_event_sequence + 3, "task.state_changed", {
-                    "previous_state": live.state.value,
-                    "next_state": resumed.state.value,
-                    "reason": "unknown tool outcome reconciled",
-                },
-            ),
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", task.task_id,
-                stored.last_event_sequence + 4, "checkpoint.saved", {
-                    "turn_id": request.turn_id,
-                    "revision": resumed_checkpoint.revision,
-                    "checkpoint_hash": resumed_checkpoint.checkpoint_hash,
-                    "reason": "unknown-outcome-reconciled",
-                },
-            ),
-        )
-        if (
-            execution.call.outcome_ref is not None
-            and execution.call.outcome_binding_mode
-            is OutcomeBindingMode.FULFILLMENT
-        ):
-            events += (RuntimeEvent(
-                f"evt-{uuid4().hex}", task.task_id,
-                stored.last_event_sequence + len(events) + 1,
-                "task_outcome.state_changed", {
-                    "outcome_id": execution.call.outcome_ref,
-                    "status": (
-                        TaskOutcomeStatus.ALREADY_SATISFIED.value
-                        if reconciled_value == "SUCCEEDED" else
-                        TaskOutcomeStatus.PENDING.value
-                    ),
-                    "fulfillment_ref": (
-                        reference if reconciled_value == "SUCCEEDED" else ""
-                    ),
-                    "reason": "unknown_tool_outcome_reconciled",
-                    "tool_call_id": execution.call.call_id,
-                },
-            ),)
-        await self._dependencies.store.commit(RuntimeUnitOfWork(
-            task.task_id, stored.version, resumed.to_data(), events
-        ))
-        visible_tools = await self.list_tools()
-        await self._validate_agent_checkpoint(
-            await self.get_task(task.task_id), resumed_checkpoint, visible_tools
-        )
         from .conversation_loop.loop import ConversationAgentLoop
 
         return await ConversationAgentLoop(self)._drive(

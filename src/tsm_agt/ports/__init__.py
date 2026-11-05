@@ -78,6 +78,7 @@ from .process import (
 )
 from .mcp import (
     MCPCallNotSentError, MCPClient, MCPClientFactory, MCPClientManager, MCPServerConfig,
+    MCPServerStartupError,
 )
 from .sandbox import SandboxDecision, SandboxPort, SandboxRequest
 from .cross_process_lock import CrossProcessLockPort
@@ -189,6 +190,7 @@ from .tool import (
     ToolInvocationContext,
     ToolMemoryControl,
     ToolWorkingMemoryControl,
+    WorkingMemoryRevisionConflict,
     ToolTaskSpecControl,
     ToolProviderPort,
     ToolProcessControl,
@@ -276,6 +278,7 @@ __all__ = [
     "ProcessStartError",
     "MCPClient",
     "MCPCallNotSentError",
+    "MCPServerStartupError",
     "MCPClientFactory",
     "MCPClientManager",
     "MCPServerConfig",
@@ -399,6 +402,7 @@ __all__ = [
     "ToolInvocationContext",
     "ToolMemoryControl",
     "ToolWorkingMemoryControl",
+    "WorkingMemoryRevisionConflict",
     "ToolTaskSpecControl",
     "ToolProviderPort",
     "ToolProcessControl",

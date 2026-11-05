@@ -8,7 +8,8 @@ from datetime import datetime
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ToolCall,
     ToolEffect, ToolIdempotency, ToolInvocationContext, ToolResult,
-    ToolResultAuthority, ToolRisk, ToolSpec,
+    ToolResultAuthority, ToolRisk, ToolSpec, ToolRecoveryKind,
+    WorkingMemoryRevisionConflict,
 )
 
 
@@ -165,6 +166,14 @@ class CoreWorkingMemoryToolProvider:
             return ToolResult(
                 call.call_id, True, data=data,
                 meta={"runtime_internal_state": True, "plan_changed": plan_changed},
+            )
+        except WorkingMemoryRevisionConflict as error:
+            return ToolResult(
+                call.call_id, False, error_code="REVISION_CONFLICT", message=str(error),
+                data={"expected_revision": error.expected_revision, "current_revision": error.current_revision},
+                hint="Read core.working_memory_read, reconcile the intended update with the current state, and retry using its revision.",
+                retryable=True, recovery_kind=ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS,
+                recovery_action={"reason": "revision_conflict", "read_tool": "core.working_memory_read"},
             )
         except (KeyError, TypeError, ValueError) as error:
             return ToolResult(

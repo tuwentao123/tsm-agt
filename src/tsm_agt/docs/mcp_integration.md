@@ -55,14 +55,18 @@ CLI 的 `--config /absolute/path/to/config.yaml` 可以选择另一份完整私�
 
 1. `compose_openai_compatible_engineering_application_from_env` 读取私有 YAML。
 2. 有已启用的 server 时，composition 注册 `MCPToolProvider` 和 `MCPClientManager`。
-3. `Application.start()` 经 registry 启动 provider。manager 按配置顺序建立 transport、
+3. `Application.start()` 经 registry 启动 provider。每个 MCP 在独立后台 Task 中建立 transport、
    由每连接一个长期存活的 owner Task 进入 `ClientSession` 并执行 `initialize`；provider
    随后发现工具。连接的创建和退出始终由该 owner 完成，其他 Task 可以调用或请求关闭。
-   任何一个 server
-   初始化或工具 schema 出错，当前都会使整个 MCP provider 启动失败。
+   默认 `required: false`，核心 Runtime 不等待 MCP。每服务器默认
+   `startup_timeout_seconds: 30`，覆盖连接、initialize 和完整工具发现；初始化、发现或
+   schema 失败仅将该服务器标为 failed，并清理其连接，其他服务器和聊天继续运行。
+   只有显式配置 `required: true` 才等待其就绪，并在失败时阻止 Runtime 启动。
 4. SDK 的 `inputSchema` 被转换为 Runtime `ToolSpec`。发现会遍历 `tools/list` 的全部
    分页；重复/无效游标、超过 1000 页或 10000 个工具会明确失败，不发布半份目录。
-   这两个界限用于阻止无界发现，不是 MCP 标准规定。目录在本次 provider 生命周期内不刷新。
+   这两个界限用于阻止无界发现，不是 MCP 标准规定。每服务器首次发现成功后整体发布，
+   下一次 Turn 取工具快照时可见；不会修改已经开始的 Turn 的工具快照。
+   暂不处理运行中的 `tools/list_changed`。
 5. 模型收到例如 `mcp.demo.add` 的参数 schema，自行决定是否调用。
 6. Kernel 按普通外部工具执行参数校验、风险与审批策略、执行账本和超时控制。MCP 工具
    当前统一为 R2、非只读、不可并发、非幂等；服务器声明不会自动降低权限。
@@ -76,7 +80,9 @@ CLI 的 `--config /absolute/path/to/config.yaml` 可以选择另一份完整私�
    `CancelledError`；关闭中被取消也先等待清理再传递取消。manager 还会等待已在进行的初始化。
 
 现有 Kernel 调用有工具 deadline；HTTP transport 的 `timeout_seconds` 不等于独立的
-MCP 启动预算或每个 MCP 工具的执行预算。目前没有可选服务器故障隔离、自动重连、
+MCP 启动预算或每个 MCP 工具的执行预算。`/diagnostics` 只查询当前实例的 MCP 状态，
+失败提示保留服务器 ID、阶段和 HTTP 状态码，避免展示 AnyIO 的内部 `WouldBlock`。
+目前没有自动重连、
 MCP OAuth 登录、resources/prompts 的模型入口，也没有专门的多媒体结果投影或输出上限。
 
 Runtime 只负责连接、权限、调用及回传事实；选择哪一个 MCP 工具、怎样根据结果继续、

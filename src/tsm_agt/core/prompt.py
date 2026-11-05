@@ -209,7 +209,7 @@ class PromptTemplate:
                 # not duplicate the command-specific facts kept in
                 # workspace-command-guidance.
                 PromptTemplateSegment(
-                    "tool-feedback-guidance", "harness", "2.0",
+                    "tool-feedback-guidance", "harness", "2.1",
                     prompt_text["tool-feedback-guidance"],
                 ),
                 PromptTemplateSegment(
@@ -243,7 +243,7 @@ class PromptTemplate:
                     requires_any_tools=("core.apply_patch", "core.apply_patch_v4a"),
                 ),
                 PromptTemplateSegment(
-                    "workspace-command-guidance", "harness", "1.8",
+                    "workspace-command-guidance", "harness", "1.9",
                     prompt_text["workspace-command-guidance"],
                     requires_any_tools=("core.run_command", "core.process_wait"),
                 ),
@@ -285,7 +285,7 @@ class PromptTemplate:
                     requires_any_tools=("core.working_memory_update",),
                 ),
                 PromptTemplateSegment(
-                    "task-plan-guidance", "harness", "4.3",
+                    "task-plan-guidance", "harness", "4.5",
                     prompt_text["task-plan-guidance"],
                     requires_any_tools=("core.todo_list",),
                 ),

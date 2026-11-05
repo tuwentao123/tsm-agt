@@ -168,7 +168,7 @@ class ConversationConfigurationResumeTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await second.registry.stop_all()
 
-    async def test_old_settled_work_is_not_a_current_effect_but_uncertainty_still_blocks(self):
+    async def test_old_settled_work_and_unknown_results_do_not_prevent_model_continuation(self):
         app = compose_fixture_application(model_adapter=ScriptedModel([text_response("unused", "unused")]),
                                           tool_adapters=())
         await app.registry.start_all()
@@ -186,18 +186,18 @@ class ConversationConfigurationResumeTest(unittest.IsolatedAsyncioTestCase):
                     settled_task, checkpoint, await app.kernel.list_tools(),
                 )
             self.assertEqual(decision.action, CheckpointCompatibilityAction.REBASE_REQUIRED)
-            for state, reason in (
-                (ToolCommitState.UNKNOWN_OUTCOME, "unknown_tool_execution_outcome"),
-                (ToolCommitState.RUNNING, "running_non_idempotent_tool"),
-            ):
+            for state in (ToolCommitState.UNKNOWN_OUTCOME, ToolCommitState.RUNNING):
                 with self.subTest(state=state):
                     unresolved = replace(old, state=state, result=None, idempotency=ToolIdempotency.NON_IDEMPOTENT)
                     task_with_uncertainty = replace(task, tool_executions={old.execution_id: unresolved})
                     decision = await app.kernel._evaluate_checkpoint_compatibility(
                         task_with_uncertainty, checkpoint, await app.kernel.list_tools(),
                     )
-                    self.assertEqual(decision.action, CheckpointCompatibilityAction.BLOCKED)
-                    self.assertIn(reason, decision.conflict_reasons)
+                    self.assertEqual(decision.action,
+                        CheckpointCompatibilityAction.EXACT_RESUME if state is ToolCommitState.UNKNOWN_OUTCOME
+                        else CheckpointCompatibilityAction.BLOCKED)
+                    if state is ToolCommitState.RUNNING:
+                        self.assertIn("running_non_idempotent_tool", decision.conflict_reasons)
 
 
 class CheckpointTurnScopeTest(unittest.TestCase):

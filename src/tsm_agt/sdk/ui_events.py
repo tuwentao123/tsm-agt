@@ -169,7 +169,7 @@ async def subscribe_task_ui(client, task_id: str, *, after: int = 0, heartbeat: 
                         yield {"schema_version": 1, "type": event.event_type, "task_id": task_id,
                                "session_id": event.session_id or snapshot["session_id"], "turn_id": event.turn_id or progress.get("turn_id"),
                                "sequence": event.sequence, "progress": progress}
-                    if event.event_type in {"task.state_changed", "working_memory.updated", "steering.queued", "turn.failed", "turn.incomplete_boundary"}:
+                    if event.event_type in {"task.state_changed", "working_memory.updated", "steering.queued", "turn.failed", "turn.incomplete_boundary", "clarification.resolved"}:
                         visible = True
                 if len(events) < 500:
                     if visible or initial:
@@ -244,6 +244,7 @@ _TURN_PROGRESS_EVENT_TYPES = (
     "approval.requested",
     "approval.resolved",
     "approval.invalidated",
+    "clarification.requested",
     "checkpoint.conflict",
 )
 
@@ -355,6 +356,18 @@ def _turn_progress_item(event, *, fallback_turn_id: str | None = None) -> dict |
             "tool_call_id": str(result.get("call_id") or ""),
             "ok": bool(result.get("ok")),
             "error_code": result.get("error_code"),
+            "detail": _bounded_text(result.get("message")) if not result.get("ok") else None,
+        }
+    if kind == "clarification.requested":
+        reconciling = payload.get("kind") == "OUTCOME_RECONCILIATION"
+        return {
+            **base, "kind": "waiting",
+            "waiting_kind": "outcome_reconciliation" if reconciling else "input",
+            "request_id": str(payload.get("request_id") or ""),
+            "action": (
+                "操作结果尚未确认，已暂停后续操作；请先核对目标系统中的实际状态。"
+                if reconciling else "任务已暂停，等待补充信息。"
+            ),
         }
     if kind == "turn.completed":
         return {

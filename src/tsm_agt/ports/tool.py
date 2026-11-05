@@ -508,6 +508,8 @@ class ToolResult:
     def __post_init__(self) -> None:
         if not self.call_id.strip():
             raise ValueError("tool result call_id must not be empty")
+        if not isinstance(self.recovery_kind, ToolRecoveryKind):
+            raise ValueError("tool result recovery_kind must be ToolRecoveryKind")
         if self.ok and self.error_code is not None:
             raise ValueError("successful tool result cannot have an error_code")
         if not self.ok and not self.error_code:
@@ -697,6 +699,17 @@ class ToolMemoryControl(Protocol):
     async def forget(
         self, memory_id: str, operation_id: str,
     ) -> Mapping[str, Any]: ...
+
+
+class WorkingMemoryRevisionConflict(ValueError):
+    """An update observed a different scratchpad version; no write occurred."""
+
+    def __init__(self, expected_revision: int, current_revision: int) -> None:
+        self.expected_revision = expected_revision
+        self.current_revision = current_revision
+        super().__init__(
+            f"working memory revision conflict: expected {expected_revision}, got {current_revision}"
+        )
 
 
 class ToolWorkingMemoryControl(Protocol):

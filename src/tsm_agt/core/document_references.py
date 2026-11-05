@@ -15,7 +15,12 @@ def extract_document_references(text: str) -> tuple[dict[str, str], ...]:
     seen: set[str] = set()
     for match in _URL_PATTERN.finditer(text):
         raw_url = match.group(0).rstrip(_TRAILING_PUNCTUATION)
-        parsed = urlsplit(raw_url)
+        try:
+            parsed = urlsplit(raw_url)
+        except ValueError:
+            # An invalid link candidate in prose is not a valid document
+            # reference, and must not prevent processing the rest of the input.
+            continue
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
             continue
         url = urlunsplit((

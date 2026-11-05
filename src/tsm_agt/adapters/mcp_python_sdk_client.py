@@ -50,7 +50,8 @@ import math
 from typing import Any, Mapping
 import sys
 
-from tsm_agt.ports import MCPCallNotSentError, MCPServerConfig
+from tsm_agt.ports import MCPCallNotSentError, MCPServerConfig, MCPServerStartupError
+from .mcp_errors import mcp_failure_detail
 
 
 try:  # pragma: no cover - import is environment dependent
@@ -285,8 +286,8 @@ async def _session_client(*, kind: str, transport: Any, server_id: str) -> _Wrap
     if client._session is None or client._owner.done():
         if isinstance(client._failure, asyncio.CancelledError):
             raise asyncio.CancelledError
-        raise RuntimeError(
-            f"MCP server '{server_id}' failed during initialization"
+        raise MCPServerStartupError(
+            server_id, "initialization", mcp_failure_detail(client._failure)
         ) from client._failure
     return client
 

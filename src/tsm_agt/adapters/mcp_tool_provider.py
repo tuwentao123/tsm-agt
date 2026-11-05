@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
@@ -13,6 +14,7 @@ from tsm_agt.ports import (
     HealthStatus,
     MCPCallNotSentError,
     MCPClientManager,
+    MCPServerStartupError,
     ModelToolContract,
     ToolCall,
     ToolEffect,
@@ -28,6 +30,7 @@ from tsm_agt.ports import (
     ToolRisk,
     ToolSpec,
 )
+from .mcp_errors import mcp_failure_detail
 
 
 class MCPToolProvider(ToolProviderPort):
@@ -50,35 +53,127 @@ class MCPToolProvider(ToolProviderPort):
         self._manager = manager
         self._started = False
         self._tools: tuple[ToolSpec, ...] = ()
+        self._startup_tasks: dict[str, asyncio.Task[None]] = {}
+        self._server_tools: dict[str, tuple[ToolSpec, ...]] = {}
+        self._server_status: dict[str, dict[str, Any]] = {}
+        self._stop_task: asyncio.Task[None] | None = None
 
     async def start(self, context: AdapterContext) -> None:
         del context
-        # Fail during application startup, before a model is shown a tool that
-        # cannot actually be reached. This also executes MCP initialize once.
+        if self._started:
+            return
+        self._started = True
+        # Optional integrations must not gate the core Runtime. Only publish a
+        # server's tools after its complete initialization/discovery succeeds.
+        for server_id in self._manager.server_ids():
+            config = self._manager.server_config(server_id)
+            self._server_status[server_id] = {
+                "id": server_id, "required": config.required,
+                "state": "connecting", "tool_count": 0, "detail": "MCP 正在后台连接",
+            }
+            self._startup_tasks[server_id] = asyncio.create_task(
+                self._start_server(server_id), name=f"mcp-startup:{server_id}",
+            )
         try:
-            await self._manager.ensure_all_started()
-            self._tools = await self._discover_tools()
-            self._started = True
+            await asyncio.gather(*(
+                task for server_id, task in self._startup_tasks.items()
+                if self._manager.server_config(server_id).required
+            ))
         except BaseException as error:
             try:
-                await self._manager.aclose()
+                await self.stop(datetime.now())
             except Exception as cleanup_error:
                 error.add_note(f"MCP startup cleanup also failed: {type(cleanup_error).__name__}")
             raise
 
+    async def _start_server(self, server_id: str) -> None:
+        config = self._manager.server_config(server_id)
+        stage = "initialization"
+        try:
+            async with asyncio.timeout(config.startup_timeout_seconds):
+                await self._manager.get_client(server_id)
+                stage = "tool discovery"
+                tools = await self._discover_tools((server_id,))
+            if not self._started:
+                return
+            self._server_tools[server_id] = tools
+            self._tools = tuple(
+                spec for name in self._manager.server_ids()
+                for spec in self._server_tools.get(name, ())
+            )
+            self._server_status[server_id].update(
+                state="ready", tool_count=len(tools), detail=f"已连通，发现 {len(tools)} 个工具",
+            )
+        except asyncio.CancelledError:
+            self._server_status[server_id].update(state="stopped", detail="MCP 连接已停止")
+            raise
+        except Exception as error:
+            detail = (
+                str(error) if isinstance(error, MCPServerStartupError)
+                else f"MCP server '{server_id}' failed during {stage}: " + (
+                    f"timeout ({config.startup_timeout_seconds:g}s)"
+                    if isinstance(error, TimeoutError) else mcp_failure_detail(error)
+                )
+            )
+            self._server_status[server_id].update(state="failed", detail=detail)
+            try:
+                await self._manager.close_server(server_id)
+            except Exception as cleanup_error:
+                self._server_status[server_id]["cleanup_error"] = type(cleanup_error).__name__
+            if config.required:
+                if isinstance(error, MCPServerStartupError):
+                    raise
+                raise MCPServerStartupError(
+                    server_id, stage,
+                    f"timeout ({config.startup_timeout_seconds:g}s)"
+                    if isinstance(error, TimeoutError) else mcp_failure_detail(error),
+                ) from error
+
+    def startup_status(self) -> tuple[dict[str, Any], ...]:
+        """Read startup state without creating new transports or disclosing config."""
+        return tuple(dict(row) for row in self._server_status.values())
+
+    async def wait_ready(self) -> None:
+        """Explicitly wait for the configured discovery attempts (e.g. in tests)."""
+        await asyncio.gather(*self._startup_tasks.values())
+
     async def health(self) -> HealthStatus:
+        if not self._started:
+            return HealthStatus(HealthState.UNHEALTHY, "MCP tools not started")
+        degraded = any(row["state"] != "ready" for row in self._server_status.values())
         return HealthStatus(
-            HealthState.HEALTHY if self._started else HealthState.UNHEALTHY,
-            "MCP tools ready" if self._started else "MCP tools not started",
+            HealthState.DEGRADED if degraded else HealthState.HEALTHY,
+            "Some MCP servers are connecting or unavailable" if degraded else "MCP tools ready",
         )
 
     async def stop(self, deadline: datetime) -> None:
         del deadline
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(self._stop())
+        cancelled = False
+        while not self._stop_task.done():
+            try:
+                await asyncio.shield(self._stop_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        self._stop_task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _stop(self) -> None:
+        self._started = False
         try:
+            for task in self._startup_tasks.values():
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*self._startup_tasks.values(), return_exceptions=True)
             await self._manager.aclose()
         finally:
-            self._started = False
             self._tools = ()
+            self._server_tools.clear()
+            for row in self._server_status.values():
+                if row["state"] != "failed":
+                    row.update(state="stopped", tool_count=0, detail="MCP 连接已停止")
 
     async def list_tools(self) -> tuple[ToolSpec, ...]:
         if not self._started:
@@ -186,10 +281,10 @@ class MCPToolProvider(ToolProviderPort):
             meta={"untrusted_data": True},
         )
 
-    async def _discover_tools(self) -> tuple[ToolSpec, ...]:
+    async def _discover_tools(self, server_ids: tuple[str, ...]) -> tuple[ToolSpec, ...]:
         specs: list[ToolSpec] = []
         names: set[str] = set()
-        for server_id in self._manager.server_ids():
+        for server_id in server_ids:
             client = await self._manager.get_client(server_id)
             raw_tools: Sequence[Any] = await client.list_tools()
             for raw_tool in raw_tools:

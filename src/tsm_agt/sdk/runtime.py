@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -405,7 +405,8 @@ class EngineeringAgentClient:
         """
 
         async with self._submit_lock:
-            if task_id not in self._run_tasks:
+            existing = self._run_tasks.get(task_id)
+            if existing is None or existing.done():
                 runner = asyncio.create_task(
                     # The same wrapper a first turn uses: it records a failed
                     # turn on the Task and returns its result. Scheduling
@@ -1399,13 +1400,23 @@ class EngineeringAgentClient:
             # restart and claiming there is still a running model exchange.
             status = "incomplete"
             assistant_text = None
+        clarification = _clarification_data(task)
+        cached_clarification = cached.clarification if cached else None
+        if task.pending_clarification and cached_clarification:
+            token = cached_clarification.get("resume_token")
+            if (cached_clarification.get("request_id") == task.pending_clarification.request_id
+                    and isinstance(token, str) and task.pending_clarification.accepts_token(token)):
+                clarification = {**dict(clarification or {}), "resume_token": token}
+        elif (cached_clarification and status == "awaiting_user"
+                and cached_clarification.get("kind") == "CONTINUATION"):
+            clarification = cached_clarification
         return RuntimeTaskResult(
             task_id, task.state.value,
             "INTERRUPTED" if partial is not None else task.state.phase1_state.value,
             status, stored.last_event_sequence,
             assistant_text=assistant_text,
             approval=_approval_data(task),
-            clarification=(cached.clarification if cached else _clarification_data(task)),
+            clarification=clarification,
             pending_steering=pending_steering,
             verification=cached.verification if cached else None,
             evidence_level=cached.evidence_level if cached else None,
@@ -1538,6 +1549,38 @@ class EngineeringAgentClient:
             lambda done, tid=task_id: self._runner_finished(tid, done)
         )
 
+    async def _run_owned_continuation(
+        self, task_id: str, execute: Callable[[], Awaitable[RuntimeTaskResult]],
+    ) -> RuntimeTaskResult:
+        """Publish resumed work in the same registry as submitted Turns.
+
+        Approval and clarification HTTP handlers run in their own background
+        tasks. Without a registered runner, ordinary input mistakes the live
+        continuation for an orphan and starts a second Turn over its checkpoint.
+        """
+        while True:
+            async with self._submit_lock:
+                predecessor = self._run_tasks.get(task_id)
+                if predecessor is None or predecessor.done():
+                    runner = asyncio.create_task(
+                        execute(), name=f"tsm-agt-sdk-resume-{task_id}",
+                    )
+                    self._register_runner(task_id, runner)
+                    break
+            # A duplicate reply must not replace the actual running Turn with
+            # a worker merely waiting for it: interrupt must find that Turn.
+            if predecessor is asyncio.current_task():
+                raise RuntimeError("cannot resume a Turn from its own runner")
+            try:
+                await asyncio.shield(predecessor)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+            except Exception:
+                pass  # execute revalidates its pending action after the wait.
+        return await runner
+
     def _runner_finished(
         self, task_id: str, finished: asyncio.Task[RuntimeTaskResult],
     ) -> None:
@@ -1617,7 +1660,9 @@ class EngineeringAgentClient:
         return await self._command(
             command_id, "resume_continuation",
             {"task_id": task_id, "text_hash": canonical_hash(text)},
-            lambda: self.run_task(task_id, text),
+            lambda: self._run_owned_continuation(
+                task_id, lambda: self.run_task(task_id, text),
+            ),
             lambda result: result.to_data(),
         )
 
@@ -1770,12 +1815,52 @@ class EngineeringAgentClient:
                 ),
             )
             return await self._finish_agent_result(result)
+
+        async def resume():
+            stored = await self._store().find_task_by_pending_approval(request_id)
+            if stored is None:
+                return await execute()  # Preserve the existing stale-request error.
+            return await self._run_owned_continuation(stored.task_id, execute)
+
         return await self._command(
             command_id, "approval", {
                 "request_id": request_id, "decision": decision.value,
                 "reason": reason,
-            }, execute, lambda result: result.to_data(),
+            }, resume, lambda result: result.to_data(),
         )
+
+    async def answer_pending_clarification(
+        self, task_id: str, request_id: str, answer: str | None = None, *,
+        selected_choice: str | None = None, command_id: str,
+    ) -> RuntimeCommandResult:
+        """Trusted local UI reply, including after losing an in-memory token.
+
+        Task/request binding and the explicit answer remain mandatory. Token
+        renewal is inside the idempotent command, never part of its fingerprint.
+        """
+        async def execute():
+            task = await self.application.kernel.get_task(task_id)
+            pending = task.pending_clarification
+            if pending is None or pending.request_id != request_id:
+                raise ValueError("this clarification is no longer pending")
+            if pending.choices:
+                if answer or selected_choice not in {c.value for c in pending.choices}:
+                    raise ValueError("select one displayed clarification choice")
+            elif selected_choice or not (answer or "").strip():
+                raise ValueError("a clarification answer is required")
+            token = await self.application.kernel.reissue_agent_clarification_token(
+                task_id, request_id,
+            )
+            result = await self.application.kernel.dispatch_input_event(
+                ClarificationReplyInput(request_id, token, answer, selected_choice),
+                on_progress=lambda item: self._record_progress(task_id, item),
+            )
+            return await self._finish_agent_result(result)
+        return await self._command(command_id, "pending_clarification", {
+            "task_id": task_id, "request_id": request_id,
+            "answer_hash": canonical_hash(answer) if answer is not None else None,
+            "selected_choice": selected_choice,
+        }, lambda: self._run_owned_continuation(task_id, execute), lambda result: result.to_data())
 
     async def answer_clarification(
         self, request_id: str, resume_token: str, answer: str | None = None, *,
@@ -1800,6 +1885,13 @@ class EngineeringAgentClient:
                 ),
             )
             return await self._finish_agent_result(result)
+
+        async def resume():
+            stored = await self._store().find_task_by_pending_clarification(request_id)
+            if stored is None:
+                return await execute()
+            return await self._run_owned_continuation(stored.task_id, execute)
+
         return await self._command(
             command_id, "clarification", {
                 "request_id": request_id, "resume_token_hash": canonical_hash(
@@ -1809,7 +1901,7 @@ class EngineeringAgentClient:
                     canonical_hash(answer) if answer is not None else None
                 ),
                 "selected_choice": selected_choice,
-            }, execute, lambda result: result.to_data(),
+            }, resume, lambda result: result.to_data(),
         )
 
     async def _finish_agent_result(self, result: object) -> RuntimeTaskResult:
@@ -1910,6 +2002,14 @@ class EngineeringAgentClient:
             if asyncio.iscoroutine(value):
                 value = await value
             encoded = dict(serialize(value))
+        except asyncio.CancelledError:
+            await self._store().fail_runtime_command(
+                normalized_id, request_hash, {
+                    "error_code": "RUNTIME_COMMAND_CANCELLED",
+                    "error_type": "CancelledError",
+                },
+            )
+            raise
         except Exception as error:
             # A background command must never retain an in_progress receipt
             # forever after its coroutine has already failed.  Persist only a

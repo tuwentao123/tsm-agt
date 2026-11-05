@@ -106,6 +106,7 @@ const taskMessage = () => card;
 const appendTaskAssistantText = (_task, text) => answers.push(text);
 const applyTaskProjection = () => {}; const applyTaskProtocol = () => {};
 const clearApprovalMessage = () => {};
+const syncClarificationMessage = () => {};
 const TERMINAL_STATES = ['INTERRUPTED'];
 const finish = async () => { finished = true; };
 """ + reconcile + """

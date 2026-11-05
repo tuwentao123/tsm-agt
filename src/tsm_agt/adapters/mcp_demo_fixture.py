@@ -138,7 +138,7 @@ def compose_demo_mcp_application() -> tuple[Any, tuple[str, ...]]:
     # A single logical MCP server identified as "demo".  The transport-specific
     # fields are left at defaults because this demo is fully in-process.
     servers: tuple[MCPServerConfig, ...] = (
-        MCPServerConfig(id="demo", kind="inprocess"),
+        MCPServerConfig(id="demo", kind="inprocess", required=True),
     )
 
     application: Application = compose_mcp_fixture_application(

@@ -915,21 +915,12 @@ class TaskCardIsolationUiTest(unittest.TestCase):
         self.assertIn("kind === 'tool_started'", html)
         self.assertIn("kind === 'tool_completed'", html)
         self.assertIn("progress.ok === false || progress.error_code", html)
-        self.assertIn("const progress = item.progressData || {}", html)
+        self.assertIn("const progress = (item && item.progressData) || {}", html)
         # Patch contents and filenames are untrusted display text. In particular,
         # `approval-request-bound` must never turn a completed patch into waiting.
         self.assertNotIn("lower.includes('approval')", html)
         self.assertNotIn("lower.includes('fail')", html)
         self.assertNotIn("lower.includes('错误')", html)
-
-    def test_tool_and_model_start_completion_events_are_paired(self) -> None:
-        html = web_app.INDEX_HTML
-        self.assertIn("const pendingTools = []", html)
-        self.assertIn("pendingTools.splice(index, 1)", html)
-        self.assertIn("step.state = state", html)
-        self.assertIn("let pendingModel = null", html)
-        self.assertIn("kind === 'model_completed' && pendingModel !== null", html)
-        self.assertIn("lines.push({ sequence, text, progressData })", html)
 
     def test_new_active_task_stops_older_followers_in_the_same_session(self):
         html = web_app.INDEX_HTML

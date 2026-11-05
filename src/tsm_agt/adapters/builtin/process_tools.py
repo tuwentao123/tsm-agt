@@ -70,11 +70,14 @@ class CoreProcessToolProvider:
             description=(
                 "Run a command as a structured argv array inside the task workspace. "
                 "No shell parses the arguments. Commands run in foreground mode by "
-                "default and return one bounded terminal observation: status, exit code, "
-                "stdout, stderr, and duration. Set mode='background' only for a service "
-                "or other intentionally long-lived process; that mode returns a process "
-                "id and RUNNING is not a successful command outcome. Use core.process_wait "
-                "for an explicit background process. Output returns at most 16000 "
+                "default. Runtime waits briefly for completion and automatically "
+                "returns a managed process id if the command is still running. "
+                "An elapsed observation window NEVER terminates the command. "
+                "Do not estimate or set a command timeout. For RUNNING results, "
+                "continue with core.process_wait until a terminal result; do not "
+                "rerun the command or claim success. This also applies to git push, "
+                "builds, tests, and installs. Set mode='background' to return immediately "
+                "for a service or other asynchronous command. Output returns at most 16000 "
                 "UTF-8 text bytes per stream per observation. If has_more is true, "
                 "use core.process_logs with the process id and returned next cursors "
                 "to read retained output, including foreground commands; do not rerun "
@@ -92,10 +95,11 @@ class CoreProcessToolProvider:
                 "policy denial is the result of this call, not evidence that this "
                 "execution route is unavailable before calling it. "
                 "The environment starts minimal and rejects credential-like variable names. "
-                "For a foreground command, a non-zero exit or timeout is returned as a "
+                "For a completed command, a non-zero exit is returned as a "
                 "failed command result with its captured output; do not mistake tool "
                 "dispatch for success. Runtime assigns a background process resource "
-                "lease and reports deadline_at only in background mode. "
+                "lease independent of the observation window and reports deadline_at "
+                "when returning a running process. "
                 "Bringing a public repository in with git clone, git fetch, or "
                 "git ls-remote is allowed without extra approval under a trusted "
                 "project; other commands require approval."
@@ -107,8 +111,8 @@ class CoreProcessToolProvider:
                     "cwd": {"type": "string", "description": "Required workspace-relative working directory."},
                     "environment": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Optional non-secret environment overrides."},
                     "max_output_bytes": {"type": "integer", "minimum": 1, "maximum": 5000000, "description": "Retained stdout/stderr byte limit; defaults to 1000000."},
-                    "mode": {"type": "string", "enum": ["foreground", "background"], "description": "foreground (default) waits for a bounded terminal result; background is only for intentionally long-lived processes."},
-                    "timeout_seconds": {"type": "number", "minimum": 0.01, "maximum": 60, "description": "Foreground execution limit in seconds; defaults to 20. Not valid for background mode."},
+                    "mode": {"type": "string", "enum": ["foreground", "background"], "description": "foreground (default) observes briefly, then returns a process id without stopping a running command; background returns immediately."},
+                    "timeout_seconds": {"type": "number", "minimum": 0.01, "maximum": 60, "description": "Legacy observation hint for compatibility. Omit this field. It never terminates a process and Runtime caps the wait at 10 seconds."},
                 },
                 # Directory is part of the command identity: it must be visible
                 # to the model, approval flow, execution record, and process
@@ -128,8 +132,8 @@ class CoreProcessToolProvider:
             effect=ToolEffect.EXECUTE,
             result_authority=ToolResultAuthority.PROCESS_FACT,
             model_contract=ModelToolContract(
-                purpose="Run one structured command and return its terminal observation, or explicitly start a background service.",
-                use_when=("a local command is needed to inspect, build, test, or operate the current task",),
+                purpose="Run one structured command; return its result or a managed process id if still running. Waiting never kills the command.",
+                use_when=("a local command is needed to inspect, build, test, or operate the current task", "omit timeout_seconds; Runtime yields automatically", "on RUNNING, use core.process_wait until terminal completion instead of rerunning or claiming success"),
                 avoid_when=("you only need public web content; use web tools", "you need shell parsing; it is not available"),
                 returns=(
                     "foreground: bounded stdout, stderr, exit outcome, and success/failure status",
@@ -433,7 +437,7 @@ class CoreProcessToolProvider:
         timeout_seconds: float | None = None
         if mode == "foreground":
             timeout_seconds = self._bounded_number(
-                arguments, "timeout_seconds", 20.0, 0.01, 60.0,
+                arguments, "timeout_seconds", 10.0, 0.01, 60.0,
             )
         elif "timeout_seconds" in arguments:
             raise TypeError("timeout_seconds is only valid when mode is 'foreground'")
@@ -487,6 +491,13 @@ class CoreProcessToolProvider:
         """
         data = CoreProcessToolProvider._page_output(data)
         truncated, hint = CoreProcessToolProvider._output_notice(data)
+        if data.get("execution_state") == "running":
+            running_hint = (
+                "The command is still running under Runtime supervision. "
+                f"Continue with core.process_wait process_id={data.get('process_id')} "
+                "until it exits; do not rerun it or report completion."
+            )
+            hint = f"{hint} {running_hint}" if hint else running_hint
         if data.get("succeeded") is False:
             failure_code = str(data.get("failure_code") or "PROCESS_EXIT_NON_ZERO")
             return ToolResult(

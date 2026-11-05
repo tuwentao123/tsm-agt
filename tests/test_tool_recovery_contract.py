@@ -8,6 +8,11 @@ from tsm_agt.ports import ToolRecoveryKind, ToolResult
 class ToolRecoveryContractTest(unittest.TestCase):
     """Recovery metadata remains explicit and old stored results still load."""
 
+    def test_invalid_recovery_kind_is_rejected_before_result_persistence(self) -> None:
+        for value in (None, "retry_same", 0):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "recovery_kind"):
+                ToolResult("invalid", False, error_code="NOT_FOUND", recovery_kind=value)
+
     def test_legacy_retryable_failure_maps_to_retry_same(self) -> None:
         result = ToolResult.from_data({
             "call_id": "legacy", "ok": False, "data": None,

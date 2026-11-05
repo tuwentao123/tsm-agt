@@ -1516,7 +1516,7 @@ class CoreReadOnlyToolProvider:
             retryable=retryable or code == "INVALID_PARAM",
             recovery_kind=(
                 ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS
-                if code == "INVALID_PARAM" else None
+                if code == "INVALID_PARAM" else ToolRecoveryKind.NONE
             ),
             recovery_action=(
                 {"tool": call.name, "reason": "invalid_arguments"}

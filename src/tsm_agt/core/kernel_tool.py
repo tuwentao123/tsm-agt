@@ -26,7 +26,6 @@ Moved from ``core/kernel.py``:
 * ``_record_tool_result_reused``
 * ``_recover_interrupted_tool``
 * ``_resume_safe_tool``
-* ``_suspend_unknown_tool_outcome``
 * ``_synchronize_tool_batch``
 * ``_tool_effect_supports_outcome``
 * ``_validate_tool_batch_proposal``
@@ -49,9 +48,9 @@ to reach them, so their home is here now:
 from __future__ import annotations
 
 
+import asyncio
 import json
 import re
-import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -77,14 +76,11 @@ from tsm_agt.ports.process import process_output_page
 _PROCESS_WAIT_RETURN_GRACE_SECONDS = 2.0
 from uuid import uuid4
 from .agent_loop import (
-    AgentClarificationSuspended, AgentTurnCheckpoint, ToolBatchSnapshot,
+    AgentTurnCheckpoint, ToolBatchSnapshot,
     ToolBatchStatus
 )
 from .approval import (
     ApprovalKind, ApprovalRequest, ApprovalRequired, utc_now
-)
-from .clarification import (
-    ClarificationChoice, ClarificationKind, ClarificationRequest
 )
 from .configuration import canonical_hash
 from .execution import (
@@ -204,14 +200,6 @@ class _TaskProcessControl(ToolProcessControl):
         mode: str, timeout_seconds: float | None,
     ) -> BackgroundProcessStartResult | ProcessCommandResult:
         try:
-            if mode == "foreground":
-                assert timeout_seconds is not None
-                return await self.kernel.run_foreground_process(
-                    self.task_id, self.turn_id, argv, cwd=cwd,
-                    environment=environment, timeout_seconds=timeout_seconds,
-                    max_output_bytes=max_output_bytes,
-                    invocation_id=self.invocation_id,
-                )
             record = await self.kernel.start_background_process(
                 self.task_id, self.turn_id, argv, cwd=cwd,
                 environment=environment,
@@ -224,6 +212,21 @@ class _TaskProcessControl(ToolProcessControl):
             raise ProcessStartError(
                 error.code, str(error), data=error.to_data(), hint=error.hint,
             ) from error
+        if mode == "foreground":
+            # The tool owns an observation window, not the OS process lifetime.
+            # Every command is registered before waiting, so a slow push/build
+            # survives both this window and cancellation of the tool observer.
+            try:
+                observation = await self.kernel.wait_background_process(
+                    self.task_id, record.process_id,
+                    wait_seconds=min(timeout_seconds or 10.0, 10.0),
+                )
+                if observation.result is not None:
+                    return ProcessCommandResult(record.handle, observation.result)
+            except asyncio.CancelledError:
+                # The outer tool deadline must not stop a registered process
+                # or erase its durable identity with UNKNOWN_OUTCOME.
+                pass
         # A non-blocking poll captures fast command completion without making
         # process start depend on an eventual exit.
         record = await self.kernel.get_background_process_status(
@@ -598,180 +601,6 @@ class ToolMixin:
         return tuple(
             result for result in reversed(results)
             if not result.ok and result.effective_recovery_kind in recoverable
-        )
-
-    async def _suspend_unknown_tool_outcome(
-        self, checkpoint: AgentTurnCheckpoint, call: ToolCall,
-        result: ToolResult,
-    ) -> AgentClarificationSuspended:
-        """Stop immediately when a started side effect has no known result.
-
-        This is a Runtime safety boundary, not a model decision.  Remaining
-        calls in the accepted batch are cancelled before another tool or model
-        request can run.  The original execution ledger remains immutable; a
-        later answer records a separate reconciliation observation.
-        """
-        stored = await self._require_stored_task(checkpoint.task_id)
-        task = TaskSnapshot.from_data(stored.data)
-        execution_id = ToolExecutionRecord.identity(
-            checkpoint.turn_id, call.call_id
-        )
-        execution = task.tool_executions.get(execution_id)
-        if (
-            execution is None
-            or execution.state is not ToolCommitState.UNKNOWN_OUTCOME
-        ):
-            raise RuntimeError(
-                "UNKNOWN_OUTCOME result is missing its execution ledger entry"
-            )
-        token = secrets.token_urlsafe(32)
-        created = datetime.now(timezone.utc)
-        choices = (
-            ClarificationChoice(
-                "CONFIRM_SUCCEEDED",
-                "已核对现场：操作确实成功",
-            ),
-            ClarificationChoice(
-                "CONFIRM_NOT_APPLIED",
-                "已核对现场：操作没有生效",
-            ),
-            ClarificationChoice(
-                "KEEP_BLOCKED",
-                "暂时无法确认，保持阻塞",
-            ),
-        )
-        request = ClarificationRequest(
-            request_id=f"clarification-{uuid4().hex}",
-            task_id=task.task_id, turn_id=checkpoint.turn_id, call=call,
-            question=(
-                "该操作已经开始，但 Runtime 没有收到可信的最终结果。"
-                "请先核对目标系统中的实际状态。"
-            ),
-            choices=choices,
-            reason=(
-                f"{call.name} returned UNKNOWN_OUTCOME; automatic retry and "
-                "dependent actions are unsafe"
-            ),
-            required=True,
-            resume_token_hash=ClarificationRequest.hash_resume_token(token),
-            created_at=created, expires_at=created + timedelta(hours=24),
-            kind=ClarificationKind.OUTCOME_RECONCILIATION,
-            execution_id=execution_id,
-        )
-        pending_user_action = {
-            "kind": ClarificationKind.OUTCOME_RECONCILIATION.value,
-            "request_id": request.request_id,
-            "execution_id": execution_id,
-            "tool_name": call.name,
-            "outcome_ref": call.outcome_ref,
-            "discarded_pending_call_count": len(
-                checkpoint.pending_tool_calls
-            ),
-        }
-        cancellation_messages = tuple(
-            Message(
-                f"msg-tool-cancelled-{uuid4().hex}", MessageRole.TOOL,
-                (ToolResultBlock(ToolResult(
-                    pending.call_id, False,
-                    error_code="CANCELLED_AFTER_UNKNOWN_OUTCOME",
-                    message=(
-                        "The call was not started because an earlier call in "
-                        "the same batch has an unknown external outcome."
-                    ),
-                    recovery_kind=ToolRecoveryKind.TERMINAL,
-                    meta={"batch_cancelled": True},
-                )),),
-            )
-            for pending in checkpoint.pending_tool_calls
-        )
-        suspended_checkpoint = replace(
-            checkpoint, revision=checkpoint.revision + 1,
-            messages=checkpoint.messages + cancellation_messages,
-            pending_tool_calls=(), pending_user_action=pending_user_action,
-            tool_batch=(
-                checkpoint.tool_batch.with_pending(
-                    (), status=ToolBatchStatus.RECONCILING
-                ) if checkpoint.tool_batch is not None else None
-            ),
-        )
-        awaiting = task.await_clarification(request).with_agent_checkpoint(
-            suspended_checkpoint.to_data()
-        )
-        events: tuple[RuntimeEvent, ...] = (
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", task.task_id,
-                stored.last_event_sequence + 1,
-                "outcome_reconciliation.requested", {
-                    "request_id": request.request_id,
-                    "turn_id": checkpoint.turn_id,
-                    "execution_id": execution_id,
-                    "tool_name": call.name,
-                    "outcome_ref": call.outcome_ref,
-                    "choice_count": len(choices),
-                    "discarded_pending_call_count": len(
-                        checkpoint.pending_tool_calls
-                    ),
-                    "error_code": result.error_code,
-                },
-            ),
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", task.task_id,
-                stored.last_event_sequence + 2, "clarification.requested", {
-                    "request_id": request.request_id,
-                    "turn_id": checkpoint.turn_id,
-                    "outcome_ref": call.outcome_ref,
-                    "question_hash": canonical_hash({
-                        "question": request.question
-                    }),
-                    "choice_count": len(choices),
-                    "input_mode": request.input_mode,
-                    "required": True,
-                    "kind": request.kind.value,
-                    "expires_at": request.expires_at.isoformat(),
-                },
-            ),
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", task.task_id,
-                stored.last_event_sequence + 3, "checkpoint.saved", {
-                    "turn_id": checkpoint.turn_id,
-                    "revision": suspended_checkpoint.revision,
-                    "checkpoint_hash": suspended_checkpoint.checkpoint_hash,
-                    "reason": "unknown-tool-outcome-safety-stop",
-                    "pending_user_action": pending_user_action,
-                },
-            ),
-            RuntimeEvent(
-                f"evt-{uuid4().hex}", task.task_id,
-                stored.last_event_sequence + 4, "task.state_changed", {
-                    "previous_state": task.state.value,
-                    "next_state": awaiting.state.value,
-                    "reason": "unknown tool outcome requires reconciliation",
-                },
-            ),
-        )
-        if (
-            call.outcome_ref is not None
-            and call.outcome_binding_mode is OutcomeBindingMode.FULFILLMENT
-        ):
-            events += (RuntimeEvent(
-                f"evt-{uuid4().hex}", task.task_id,
-                stored.last_event_sequence + len(events) + 1,
-                "task_outcome.state_changed", {
-                    "outcome_id": call.outcome_ref,
-                    "status": TaskOutcomeStatus.BLOCKED.value,
-                    "fulfillment_ref": "",
-                    "reason": "unknown_tool_execution_outcome",
-                    "tool_call_id": call.call_id,
-                },
-            ),)
-        await self._dependencies.store.commit(RuntimeUnitOfWork(
-            task.task_id, stored.version, awaiting.to_data(), events
-        ))
-        return AgentClarificationSuspended(
-            task.task_id, checkpoint.turn_id, suspended_checkpoint.revision,
-            request.request_id, request.question,
-            tuple((choice.value, choice.label) for choice in choices),
-            request.reason, True, token, request.kind.value,
         )
 
     @staticmethod
@@ -1683,20 +1512,10 @@ class ToolMixin:
     ) -> ToolResult:
         effective_timeout_seconds = timeout_seconds
         if call.name == "core.run_command":
-            declared = call.arguments.get("timeout_seconds")
-            grace = call.arguments.get("termination_grace_seconds", 2.0)
-            if (
-                isinstance(declared, (int, float))
-                and not isinstance(declared, bool)
-                and isinstance(grace, (int, float))
-                and not isinstance(grace, bool)
-            ):
-                # The process supervisor owns timeout termination and can return
-                # a definitive TIMED_OUT result. Give it enough time to finish
-                # TERM/KILL and output draining before the outer Tool deadline.
-                effective_timeout_seconds = max(
-                    timeout_seconds, float(declared) + float(grace) + 2.0
-                )
+            # Command lifetime is a Runtime resource lease, independent of the
+            # model's observation. Legacy timeout_seconds no longer schedules
+            # process termination or inflates this tool's deadline.
+            effective_timeout_seconds = max(timeout_seconds, 15.0)
         elif call.name == "core.process_wait":
             requested_wait = call.arguments.get("wait_seconds")
             if (

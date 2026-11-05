@@ -42,6 +42,33 @@ class GitReadOnlyToolProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("two", show.data["content"])
         self.assertEqual((self.workspace / "example.txt").read_text(encoding="utf-8"), "one\nchanged\n")
 
+    async def test_branches_preserve_head_upstream_and_remote_fields(self) -> None:
+        def git(*args):
+            return subprocess.run(["git", *args], cwd=self.workspace, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        current = git("symbolic-ref", "--short", "HEAD")
+        commit = git("rev-parse", "--short", "HEAD")
+        git("branch", "topic")
+        git("remote", "add", "origin", "https://example.invalid/repo.git")
+        git("update-ref", "refs/remotes/origin/main", "HEAD")
+        git("branch", "--set-upstream-to=origin/main", current)
+        before = git("status", "--porcelain=v1", "--branch")
+
+        result = await self.provider.invoke(ToolCall("branches", "git.branches", {"include_remote": True}), self.context)
+        self.assertTrue(result.ok, result.message)
+        branches = {row["name"]: row for row in result.data["branches"]}
+        self.assertEqual(set(branches), {current, "topic", "origin/main"})
+        self.assertEqual(branches[current], {"head": "*", "name": current,
+                                            "upstream": "origin/main", "commit": commit})
+        self.assertEqual(branches["topic"]["head"], " ")
+        self.assertEqual(branches["topic"]["upstream"], "")
+        self.assertEqual(branches["origin/main"]["upstream"], "")
+        self.assertEqual(branches["origin/main"]["commit"], commit)
+        local = await self.provider.invoke(ToolCall("local", "git.branches", {"include_remote": False}), self.context)
+        self.assertTrue(local.ok, local.message)
+        self.assertEqual({row["name"] for row in local.data["branches"]}, {current, "topic"})
+        self.assertEqual(git("status", "--porcelain=v1", "--branch"), before)
+
     async def test_path_escape_and_non_repository_are_rejected(self) -> None:
         escaped = await self.provider.invoke(ToolCall("diff", "git.diff", {"path": "../secret"}), self.context)
         self.assertFalse(escaped.ok)

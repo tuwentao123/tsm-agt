@@ -27,6 +27,33 @@ def _spec(
 
 
 class ToolResultGovernorTest(unittest.TestCase):
+    def test_arbitrary_url_text_cannot_abort_redaction_or_change_plain_content(self) -> None:
+        samples = (
+            "打开 [Web 页面](http://127.0.0.1:8080)，选择工作区和模型后开始对话。也可使用命令行：",
+            "broken https://[invalid/authority and https://example.test：8080/path",
+            "[search](https://example.test/?q=a%20b&safe=value#heading)",
+            "https://example.test/path#fragment?token=not-a-query",
+        )
+        for text in samples:
+            with self.subTest(text=text):
+                result = ToolResult("url-text", True, data={"content": text}, message=text, hint=text)
+                governed = DefaultToolResultGovernor().govern(
+                    _spec(), ToolCall("url-text", "fixture.governed"), result)
+                self.assertEqual(governed.data["content"], text)
+                self.assertEqual(governed.message, text)
+                self.assertEqual(governed.hint, text)
+                self.assertFalse(governed.meta["result_governance"]["redacted"])
+
+    def test_sensitive_query_is_redacted_even_if_url_authority_is_invalid(self) -> None:
+        for url in ("https://example.test：8080/path?token=synthetic-secret&safe=value#heading",
+                    "https://example.test／invalid/path?%74oken=synthetic-secret&safe=value#heading"):
+            with self.subTest(url=url):
+                governed = DefaultToolResultGovernor().govern(
+                    _spec(), ToolCall("url", "fixture.governed"), ToolResult("url", True, data={"url": url}))
+                self.assertNotIn("synthetic-secret", governed.data["url"])
+                self.assertIn("token=%5BREDACTED%5D", governed.data["url"])
+                self.assertTrue(governed.data["url"].endswith("&safe=value#heading"))
+
     def test_recursively_redacts_sensitive_values_and_marks_external_content(self) -> None:
         result = ToolResult(
             call_id="call-1",

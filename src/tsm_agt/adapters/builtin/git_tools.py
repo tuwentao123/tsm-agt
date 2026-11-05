@@ -124,7 +124,8 @@ class GitReadOnlyToolProvider:
         return self._command(call, workspace, ["blame", "--porcelain", f"-L{start},{end}", "--", path], lambda text: {"path": path, "start_line": start, "end_line": end, "porcelain": text})
 
     def _branches(self, call: ToolCall, workspace: Path) -> ToolResult:
-        args = ["branch", "--format=%(HEAD)%x1f%(refname:short)%x1f%(upstream:short)%x1f%(objectname:short)"]
+        # branch uses the ref-filter format (%xx), unlike log's %xXX.
+        args = ["branch", "--format=%(HEAD)%1f%(refname:short)%1f%(upstream:short)%1f%(objectname:short)"]
         if call.arguments.get("include_remote", True):
             args.append("--all")
         def parse(text: str) -> dict[str, Any]:

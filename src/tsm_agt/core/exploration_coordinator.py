@@ -39,7 +39,6 @@ class ExplorationCoordinatorDecision:
     rejection_state: RejectionLoopState
     relation_count: int = 0
     rejection_occurrence: int = 0
-    probe_timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,8 +117,6 @@ class ExplorationCoordinator:
         return ExplorationCoordinatorDecision(
             mapped, recovery.reason, assessment, effective_call, relation_state,
             recovery.state, len(relations), recovery.occurrence,
-            10.0 if recovery.action is RejectionRecoveryAction.ALLOW_BOUNDED_PROBE
-            else None,
         )
 
     async def after_result(

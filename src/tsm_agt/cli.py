@@ -1988,15 +1988,6 @@ async def _chat(
                             ),
                             on_text_delta=on_text_delta, on_progress=on_progress,
                         )
-                        if (
-                            selected_choice == "KEEP_BLOCKED"
-                            and isinstance(result, AgentClarificationSuspended)
-                        ):
-                            output_fn(
-                                "[安全停点] 结果仍未确认；Task 保持阻塞，"
-                                "后续不会自动重试或执行依赖操作。"
-                            )
-                            return 0
                         stop_heartbeat()
                         finish_stream(
                             result if isinstance(result, AgentTurnResult) else None

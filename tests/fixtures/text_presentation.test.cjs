@@ -5,6 +5,29 @@ const {test} = require('node:test');
 const page = fs.readFileSync(process.env.TSM_SKILL_TEST_SCRIPT, 'utf8');
 const helpers = page.slice(page.indexOf('const TERMINAL_STATES ='), page.indexOf('function renderTurnMarker('));
 
+test('unknown tool outcomes show timeout and observation guidance without claiming a pause', () => {
+  const context = vm.createContext({});
+  const descriptions = page.slice(page.indexOf('function describeFailure('), page.indexOf('async function handleCancelAction('));
+  const replay = page.slice(page.indexOf('function turnProgressLines('), page.indexOf('function renderTurnCallPanel('));
+  vm.runInContext(descriptions + replay, context);
+  const failure = {kind: 'tool_completed', tool_name: 'core.run_command', tool_call_id: 'push',
+    ok: false, error_code: 'UNKNOWN_OUTCOME', detail: 'tool exceeded 62 second deadline'};
+  const live = context.describeProgress(failure);
+  assert.match(live, /62 秒/);
+  assert.match(live, /结果未确认/);
+  assert.match(live, /继续查询/);
+  assert.doesNotMatch(live, /已暂停|请先核对/);
+  const waiting = {kind: 'waiting', waiting_kind: 'outcome_reconciliation',
+    action: '操作结果尚未确认，已暂停后续操作；请先核对目标系统中的实际状态。'};
+  assert.match(context.describeProgress(waiting), /核对/);
+  const lines = context.turnProgressLines([
+    {kind: 'tool_started', tool_name: 'core.run_command', tool_call_id: 'push'}, failure, waiting,
+  ]);
+  assert.match(lines[1].text, /62 秒/);
+  assert.match(lines[1].text, /结果未确认/);
+  assert.match(lines[2].text, /核对/);
+});
+
 test('context overflow from tool output does not blame image attachments', () => {
   const context = vm.createContext({});
   vm.runInContext(page.slice(page.indexOf('function describeFailure('), page.indexOf('function describeProgress(')), context);
@@ -39,6 +62,7 @@ function setup() {
   const context = vm.createContext({Intl,
     activeConversationId: 'chat', shouldAutoFollowChat: false,
     lastConversationScrollTop: 0, isNearChatBottom: () => false,
+    updateChatJumpButton() {},
     getConversationById: () => conversation,
     document: {getElementById: () => chat},
     requestAnimationFrame: callback => { frames.push(callback); return frames.length; },

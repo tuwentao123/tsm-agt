@@ -256,6 +256,7 @@ class ProcessMixin:
         record = BackgroundProcessRecord(
             process_id, turn_id, handle, BackgroundProcessState.RUNNING,
             max_lifetime_seconds, deadline, stop_on_task_end,
+            invocation_id=invocation_id,
         )
         await self._commit_background_process(
             task_id, record, "process.started", {
@@ -413,7 +414,9 @@ class ProcessMixin:
         completed = record.finish(result)
         event_type = "process.exited" if result.status is ProcessExitStatus.EXITED else "process.cancelled"
         await self._commit_background_process(task_id, completed, event_type, {
+            **result.to_data(),
             "turn_id": record.turn_id, "process_id": record.process_id,
+            "invocation_id": record.invocation_id,
             "status": result.status.value, "exit_code": result.exit_code,
             "succeeded": result.succeeded,
             "failure_code": result.failure_code,

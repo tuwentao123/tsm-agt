@@ -6,8 +6,10 @@ import unittest
 from pathlib import Path
 
 from tsm_agt.adapters.fixture import EchoToolProvider
+from tsm_agt.adapters.builtin import CoreReadOnlyToolProvider
 from tsm_agt.bootstrap import compose_fixture_application
-from tsm_agt.core import TaskState, ToolCommitState
+from tsm_agt.core import TaskState, ToolCommitState, AgentTurnResult
+from tests.test_conversation_loop import ScriptedModel, _executing, text_response, tool_response
 from tsm_agt.ports import (
     AdapterDescriptor,
     RuntimeStorePort,
@@ -76,6 +78,32 @@ class NonIdempotentFailingProvider(SensitiveToolProvider):
 
 
 class ToolResultGovernorKernelTest(unittest.IsolatedAsyncioTestCase):
+    async def test_readme_url_followed_by_chinese_prose_reaches_model_and_finishes_turn(self):
+        content = "打开 [Web 页面](http://127.0.0.1:8080)，选择工作区和模型后开始对话。也可使用命令行：\n"
+        model = ScriptedModel([
+            tool_response("read", "read-readme", "core.read_file", {"path": "README.md"}),
+            text_response("answer", "README read successfully."),
+        ])
+        app = compose_fixture_application(model_adapter=model, tool_adapters=(CoreReadOnlyToolProvider(),))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(content, encoding="utf-8")
+            await app.start()
+            try:
+                task = await _executing(app, root)
+                result = await app.kernel.run_agent_turn(task.task_id, "Read the local README")
+                self.assertIsInstance(result, AgentTurnResult)
+                self.assertEqual(len(model.requests), 2)
+                live = await app.kernel.get_task(task.task_id)
+                execution = live.tool_executions[f"{result.turn_id}:read-readme"]
+                self.assertEqual(execution.state, ToolCommitState.COMMITTED)
+                self.assertIn(content.strip(), json.dumps(execution.result.data, ensure_ascii=False))
+                self.assertEqual(result.assistant_message.text, "README read successfully.")
+                events = await app.kernel.dependencies.store.read_events(task.task_id)
+                self.assertFalse(any(e.event_type in {"llm.failed", "turn.failed"} for e in events))
+            finally:
+                await app.registry.stop_all()
+
     async def _create_executing_task(self, provider: EchoToolProvider):
         application = compose_fixture_application(tool_adapters=(provider,))
         await application.registry.start_all()

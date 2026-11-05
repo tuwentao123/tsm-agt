@@ -132,6 +132,7 @@ class BackgroundProcessRecord:
     exit_code: int | None = None
     termination_signal: str | None = None
     finished_at: datetime | None = None
+    invocation_id: str | None = None
 
     def finish(self, result: ProcessResult) -> BackgroundProcessRecord:
         states = {
@@ -143,6 +144,7 @@ class BackgroundProcessRecord:
             self.process_id, self.turn_id, self.handle, states[result.status.value],
             self.max_lifetime_seconds, self.deadline_at, self.stop_on_task_end,
             result.exit_code, result.termination_signal, result.finished_at,
+            self.invocation_id,
         )
 
     def orphan(self, when: datetime) -> BackgroundProcessRecord:
@@ -150,11 +152,13 @@ class BackgroundProcessRecord:
             self.process_id, self.turn_id, self.handle,
             BackgroundProcessState.ORPHANED, self.max_lifetime_seconds,
             self.deadline_at, self.stop_on_task_end, finished_at=when,
+            invocation_id=self.invocation_id,
         )
 
     def to_data(self) -> dict[str, Any]:
         return {
             "process_id": self.process_id, "turn_id": self.turn_id,
+            "invocation_id": self.invocation_id,
             "state": self.state.value,
             "max_lifetime_seconds": self.max_lifetime_seconds,
             "deadline_at": self.deadline_at.isoformat(),
@@ -188,6 +192,7 @@ class BackgroundProcessRecord:
             max_lifetime_seconds=float(data["max_lifetime_seconds"]),
             deadline_at=datetime.fromisoformat(str(data["deadline_at"])),
             stop_on_task_end=bool(data.get("stop_on_task_end", True)),
+            invocation_id=data.get("invocation_id"),
             exit_code=int(data["exit_code"]) if data.get("exit_code") is not None else None,
             termination_signal=(str(data["termination_signal"]) if data.get("termination_signal") else None),
             finished_at=datetime.fromisoformat(str(finished)) if finished else None,

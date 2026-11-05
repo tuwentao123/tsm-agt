@@ -174,6 +174,11 @@ def project_runtime_action_facts(
                 error_code=result.error_code or "",
             )
             status, code = classified if classified is not None else (None, "")
+            if _invocation_state_for(result) is ToolCommitState.UNKNOWN_OUTCOME:
+                # Delivery uncertainty is a fact even when an adapter has not
+                # classified its tool's domain effect. Never flatten it into
+                # an ordinary failed operation or "not applicable".
+                status, code = EffectStatus.UNKNOWN, "UNKNOWN_OUTCOME"
             # A successful managed-process start is an invocation receipt,
             # not a passing check. Keep this model-facing projection honest
             # without changing the shared execution/acceptance policy.

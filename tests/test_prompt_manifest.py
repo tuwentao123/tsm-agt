@@ -118,7 +118,7 @@ class PromptManifestTest(unittest.TestCase):
         # Pin content, ordering, section versions and capability gates together.
         self.assertEqual(
             self.template.manifest().manifest_hash,
-            "c97e7dd2751d3a6f2afc0eefb8d38955dd8414820065252570f945dfdce33565",
+            "1e3c45cd6639303b247d84e57dcb8ba8145dbf2864e1dd9e881aa0ea5c4fe044",
         )
 
     def test_packaged_prompt_rejects_duplicate_sections(self) -> None:
@@ -418,7 +418,7 @@ class PromptManifestTest(unittest.TestCase):
 
     def test_tool_feedback_guidance_is_stable_base_and_capability_free(self) -> None:
         segment = self.segment("tool-feedback-guidance")
-        self.assertEqual(segment.version, "2.0")
+        self.assertEqual(segment.version, "2.1")
         self.assertFalse(segment.requires_any_tools)
         for boundary in ("partial or truncated", "never repeat an unchanged failing call", "Do not bypass a user or policy denial", "unknown effects inspect state", "running process", "independent authorized", "zero exit code proves only"):
             self.assertIn(boundary, segment.content)
@@ -448,7 +448,7 @@ class PromptManifestTest(unittest.TestCase):
     def test_workspace_command_guidance_keeps_cwd_in_workspace(self) -> None:
         segment = self.segment("workspace-command-guidance")
 
-        self.assertEqual(segment.version, "1.8")
+        self.assertEqual(segment.version, "1.9")
         self.assertEqual(
             segment.requires_any_tools, ("core.run_command", "core.process_wait"),
         )
@@ -494,7 +494,7 @@ class PromptManifestTest(unittest.TestCase):
 
     def test_task_plan_guidance_is_capability_bound(self) -> None:
         segment = self.segment("task-plan-guidance")
-        self.assertEqual(segment.version, "4.3")
+        self.assertEqual(segment.version, "4.5")
         self.assertEqual(segment.requires_any_tools, ("core.todo_list",))
         for boundary in ("skip creating a new plan for straightforward tasks", "Maintain an existing relevant plan", "latest revision", "at most one item in_progress", "verification does not complete", "Never mark unfinished work completed", "not an independent instruction", "Read only when state is missing", "do not postpone progress updates", "Example — progress", "Example — resume", "Example — scope"):
             self.assertIn(boundary.casefold(), segment.content.replace("`", "").casefold())

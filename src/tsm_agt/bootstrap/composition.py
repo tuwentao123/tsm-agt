@@ -248,6 +248,16 @@ from tsm_agt.adapters.github_source.configuration import (
 )
 
 
+async def mcp_runtime_status(application: Application) -> list[dict[str, object]]:
+    """Observe active MCP integrations on the Runtime loop without probing."""
+    return [
+        row
+        for provider in application.registry.all(ToolProviderPort)
+        if isinstance(provider, MCPToolProvider)
+        for row in provider.startup_status()
+    ]
+
+
 @dataclass(frozen=True, slots=True)
 class Application:
     kernel: Kernel

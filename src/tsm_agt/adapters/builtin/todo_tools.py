@@ -9,7 +9,8 @@ from typing import Any
 from tsm_agt.ports import (
     AdapterContext, AdapterDescriptor, HealthState, HealthStatus, ToolCall,
     ToolEffect, ToolIdempotency, ToolInvocationContext, ToolProtocol, ToolResult,
-    ToolResultAuthority, ToolRisk, ToolSpec,
+    ToolResultAuthority, ToolRisk, ToolSpec, ToolRecoveryKind,
+    WorkingMemoryRevisionConflict,
 )
 
 MAX_TODO_ITEMS = 30
@@ -93,7 +94,12 @@ _TODO_DESCRIPTION = (
     "work spans multiple files or subsystems, or progress must survive interruption "
     "or restart. Skip creating a new plan for explanations, simple searches, "
     "single-command tasks, or one small localized change. Maintain an existing "
-    "relevant plan even when this turn's change is small. When resuming work, "
+    "relevant unfinished plan even when this turn's change is small. After all "
+    "items are completed, a later request needing a plan starts a fresh list "
+    "with merge=false; do not append new work to that finished list. A new turn "
+    "or merge=false does not reset the Working Memory revision: expected_revision "
+    "must still use the latest observed revision, never a guessed zero. A turn "
+    "continuing unfinished work keeps its existing plan. When resuming work, "
     "reconcile the latest plan with current evidence and the user's scope; "
     "inspection alone need not write an unchanged list. Mark an item in_progress when starting "
     "it, and completed as soon as its completion criteria and appropriate checks "
@@ -369,6 +375,14 @@ class CoreTodoToolProvider:
             return ToolResult(
                 call.call_id, True, data=data,
                 meta={"runtime_internal_state": True, "plan_changed": plan_changed},
+            )
+        except WorkingMemoryRevisionConflict as error:
+            return ToolResult(
+                call.call_id, False, error_code="REVISION_CONFLICT", message=str(error),
+                data={"expected_revision": error.expected_revision, "current_revision": error.current_revision},
+                hint="Read core.todo_list with no arguments, reconcile the intended update with that list, and retry using its revision. A new plan does not reset the revision.",
+                retryable=True, recovery_kind=ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS,
+                recovery_action={"reason": "revision_conflict", "read_tool": "core.todo_list"},
             )
         except (KeyError, TypeError, ValueError) as error:
             return ToolResult(
