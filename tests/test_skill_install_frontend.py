@@ -19,7 +19,7 @@ class SkillInstallFrontendTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "page.js"
             source.write_text("\n".join(scripts), encoding="utf-8")
-            fixtures = [Path(__file__).parent / "fixtures" / name for name in ("composer_cancel_button.test.cjs", "skill_install.test.cjs", "task_stream.test.cjs", "text_presentation.test.cjs", "workspace_resizer.test.cjs", "todo_dock.test.cjs", "model_selection.test.cjs", "clarification_recovery.test.cjs", "chat_navigation.test.cjs", "trace_timeline.test.cjs")]
+            fixtures = [Path(__file__).parent / "fixtures" / name for name in ("composer_cancel_button.test.cjs", "skill_install.test.cjs", "task_stream.test.cjs", "text_presentation.test.cjs", "workspace_resizer.test.cjs", "todo_dock.test.cjs", "model_selection.test.cjs", "clarification_recovery.test.cjs", "chat_navigation.test.cjs", "trace_timeline.test.cjs", "approval_redirect.test.cjs")]
             completed = subprocess.run(
                 [shutil.which("node"), "--test", *(str(fixture) for fixture in fixtures)],
                 env={**os.environ, "TSM_SKILL_TEST_SCRIPT": str(source)},

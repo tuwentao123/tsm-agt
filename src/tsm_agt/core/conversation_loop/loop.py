@@ -79,6 +79,7 @@ from .finalization import ConversationFinalizationPipeline
 from .prompt import assemble_stable_prompt, latest_tool_result_instruction
 from .state import build_turn_state
 from .execution_context import project_execution_context
+from .tool_catalog import refresh_observed_tool_catalog
 
 
 #: Message-id prefixes the Runtime re-projects on every model call. They are
@@ -904,6 +905,7 @@ class ConversationAgentLoop:
 
     async def _prepare_model_call(self, state: TurnState) -> None:
         kernel = self._kernel
+        await refresh_observed_tool_catalog(kernel, state)
         latest_tool_message = next(
             (message for message in reversed(state.messages) if message.role is MessageRole.TOOL), None,
         )

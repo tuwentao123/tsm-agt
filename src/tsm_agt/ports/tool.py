@@ -212,6 +212,10 @@ class ToolSpec:
     # Provider-authored contextual data; kept separate from trusted instructions
     # and regenerated from the same spec as the advertised parameter schema.
     model_context: Mapping[str, Any] | None = None
+    # A successful observation may expose tools registered since this turn's
+    # initial snapshot. The loop re-reads trusted providers, never definitions
+    # supplied in an external tool result.
+    refreshes_tool_catalog: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -248,6 +252,8 @@ class ToolSpec:
             self.model_contract, ModelToolContract
         ):
             raise ValueError("tool model_contract must be ModelToolContract")
+        if not isinstance(self.refreshes_tool_catalog, bool):
+            raise ValueError("refreshes_tool_catalog must be true or false")
 
     def model_description(self) -> str:
         """Return the concise protocol sent to model providers.
@@ -283,6 +289,8 @@ class ToolSpec:
             data["model_contract"] = self.model_contract.to_data()
         if self.model_context is not None:
             data["model_context"] = dict(self.model_context)
+        if self.refreshes_tool_catalog:
+            data["refreshes_tool_catalog"] = True
         return data
 
 

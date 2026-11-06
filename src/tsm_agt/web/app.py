@@ -2963,6 +2963,29 @@ function setSkillInstallFeedback(message, failed = false) {
   if (failed) showError(message);
 }
 
+// 设置面板是原生 <dialog>：面板外的遮罩区域属于 dialog 自身，所以点到面板外时
+// event.target 就是 dialog。只在这种情况下关闭，点击面板内任何内容都保持打开；
+// 若在面板内按下、拖到遮罩才抬起（框选文本），也不能误关。
+let skillSettingsBackdropPressed = false;
+
+function trackSkillSettingsBackdropPress(event) {
+  skillSettingsBackdropPressed = event.target === event.currentTarget;
+}
+
+function handleSkillSettingsBackdropClose(event) {
+  const dialog = event.currentTarget;
+  const pressedOnBackdrop = event.target === dialog && skillSettingsBackdropPressed;
+  skillSettingsBackdropPressed = false;
+  if (pressedOnBackdrop && typeof dialog.close === 'function') dialog.close();
+}
+
+(() => {
+  const dialog = document.getElementById('skill-settings-dialog');
+  if (!dialog || typeof dialog.addEventListener !== 'function') return;
+  dialog.addEventListener('pointerdown', trackSkillSettingsBackdropPress);
+  dialog.addEventListener('click', handleSkillSettingsBackdropClose);
+})();
+
 async function openSkillSettings() {
   const dialog = document.getElementById('skill-settings-dialog');
   if (!dialog.open) dialog.showModal();
@@ -3406,6 +3429,12 @@ function bindLatestInputToTask(conversationId, taskId, turnId = null) {
 function upsertApprovalMessage(taskId, approval, conversationId = activeConversationId) {
   const conversation = getConversationById(conversationId);
   if (!conversation || !approval?.request_id) return null;
+  // A Task has only one current approval. Resolved/invalidated requests live
+  // in the durable Turn trace, not as stale actionable docks beside a new one.
+  conversation.messages = conversation.messages.filter((item) => !(
+    item.role === 'approval' && item.taskId === taskId
+    && item.approval?.request_id !== approval.request_id
+  ));
   let message = conversation.messages.find((item) => (
     item.role === 'approval'
     && item.taskId === taskId
@@ -3796,8 +3825,11 @@ async function cancelTask(taskId, conversationId) {
 }
 
 async function decideApproval(message, decision) {
+  if (message.submitting) return;
   const approval = message.approval || {};
   clearError();
+  message.submitting = true;
+  renderMessages();
   try {
     const response = await fetch('/approvals', {
       method: 'POST',
@@ -3814,6 +3846,8 @@ async function decideApproval(message, decision) {
       throw new Error(detail.detail || `授权失败，状态码 ${response.status}`);
     }
   } catch (error) {
+    message.submitting = false;
+    renderMessages();
     console.error(error);
     showError(error.message || '提交授权决定失败。');
     return;
@@ -3841,10 +3875,10 @@ async function decideApproval(message, decision) {
     };
   }
   renderMessages();
-  if (decision === 'APPROVE') {
-    setLoading(true);
-    followTask(message.taskId, message.conversationId || activeConversationId);
-  }
+  // Both decisions resume the Agent loop. A denial can produce an answer or a
+  // different approval, so it needs the same durable-state follower.
+  setLoading(true);
+  followTask(message.taskId, message.conversationId || activeConversationId);
 }
 
 function appendApproval(taskId, approval, conversationId = activeConversationId) {
@@ -4381,7 +4415,8 @@ async function runTask() {
     // it now so an immediately suspended approval still owns its Turn trace.
     // Approval carries the authoritative turn_id for this boundary.
     bindLatestInputToTask(
-      conversationId, task.task_id, task.approval?.turn_id || null,
+      conversationId, task.task_id,
+      task.approval?.turn_id === data.superseded_turn_id ? null : task.approval?.turn_id || null,
     );
     const card = upsertTaskCard(conversationId, {
       task_id: task.task_id,
@@ -4393,9 +4428,12 @@ async function runTask() {
       )
         ? taskMessage(conversationId, task.task_id).task.goal
         : prompt,
-      phase1_state: task.phase1_state || 'PREPARING',
-      status: task.status || 'running',
-      progress_cursor: 0,
+      phase1_state: data.superseded_turn_id && task.status === 'interrupted'
+        ? 'PREPARING' : task.phase1_state || 'PREPARING',
+      status: data.superseded_turn_id && task.status === 'interrupted'
+        ? 'running' : task.status || 'running',
+      progress_cursor: data.superseded_turn_id && task.status === 'interrupted'
+        ? Number(task.cursor || 0) : 0,
       projection: task.projection || null,
       waiting: task.approval
         ? { kind: 'APPROVAL', approval: task.approval }
@@ -4403,11 +4441,7 @@ async function runTask() {
           ? { kind: task.clarification?.kind || 'INPUT', ...task.clarification }
           : null,
     });
-    if (TERMINAL_STATES.includes(task.phase1_state)) {
-      renderFinalResult(task.task_id, task, conversationId);
-      setLoading(false);
-      updateComposerButtonState();
-    } else if (data.kind === 'continuation') {
+    if (data.kind === 'continuation') {
       // A later turn on this conversation was accepted and runs in the
       // background exactly like a first turn. Its task still reads as idle
       // (AWAITING_INPUT -> WAITING) until that turn starts, so following it is
@@ -4415,7 +4449,18 @@ async function runTask() {
       // This Turn starts with an empty buffer: lines kept from the previous
       // Turn must never read as progress of the question just asked.
       if (card) card.task.progress = [];
+      if (data.superseded_turn_id) {
+        clearApprovalMessage(task.task_id, conversationId);
+        if (card) {
+          card.task.waiting = null;
+          card.task.approvalResolution = null;
+        }
+      }
       followTask(task.task_id, conversationId);
+      updateComposerButtonState();
+    } else if (TERMINAL_STATES.includes(task.phase1_state)) {
+      renderFinalResult(task.task_id, task, conversationId);
+      setLoading(false);
       updateComposerButtonState();
     } else {
       // Even an immediately suspended Task must attach its SSE follower. It

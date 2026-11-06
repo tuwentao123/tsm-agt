@@ -11,11 +11,13 @@ from tsm_agt.adapters.builtin import CoreReadOnlyToolProvider
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import ApprovalDecision, TaskState
+from tsm_agt.core.approval import ApprovalNotPending
 from tsm_agt.ports import (
     FinishReason, Message, MessageRole, ModelResponse, ModelUsage,
     RuntimeStorePort, TextBlock, ToolCall, ToolCallBlock, ToolResultBlock,
 )
 from tsm_agt.sdk import EngineeringAgentClient
+from tsm_agt.sdk.ui_events import ui_snapshot
 from tests.test_sdk_runtime import ApprovalModel, ApprovalTool
 
 
@@ -58,6 +60,119 @@ class ResumedModel(ApprovalModel):
 
 
 class ResumedTurnOwnershipTest(unittest.IsolatedAsyncioTestCase):
+    async def test_new_message_supersedes_pending_approval_without_executing_it(self):
+        class CountingTool(ApprovalTool):
+            calls = 0
+
+            async def invoke(self, call, context):
+                self.calls += 1
+                return await super().invoke(call, context)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, tool = ResumedModel(), CountingTool()
+            app = compose_fixture_application(model_adapter=model, tool_adapters=(tool,),
+                store_adapter=SQLiteRuntimeStore(root / "runtime.db"))
+            async with EngineeringAgentClient(root, application_factory=lambda: app) as client:
+                accepted = await client.submit_user_input("conv", "first", input_id="first")
+                task_id = accepted.result["task"]["task_id"]
+                waiting = await client.wait_task(task_id, timeout=3)
+                self.assertEqual(waiting.state, "AWAITING_APPROVAL")
+                request_id = waiting.approval["request_id"]
+                redirected = await client.submit_user_input("conv", "new context", input_id="next")
+                self.assertEqual(redirected.result["kind"], "continuation")
+                self.assertEqual(redirected.result["routed_task_id"], task_id)
+                result = await client.wait_task(task_id, timeout=3)
+                self.assertEqual(result.assistant_text, "new turn completed")
+                self.assertEqual(result.state, "AWAITING_INPUT")
+                self.assertEqual(tool.calls, 0)
+                current = await app.kernel.get_task(task_id)
+                self.assertIsNone(current.pending_approval)
+                with self.assertRaises(ApprovalNotPending):
+                    await client.resolve_approval(request_id, ApprovalDecision.APPROVE,
+                        "late click on old request", command_id="late")
+                self.assertEqual(tool.calls, 0)
+                events = await app.registry.require(RuntimeStorePort).read_events(task_id)
+                invalidated = [event for event in events if event.event_type == "approval.invalidated"]
+                self.assertEqual([event.payload["request_id"] for event in invalidated], [request_id])
+                self.assertFalse(any(event.event_type == "approval.resolved" for event in events))
+                self.assertEqual(len([event for event in events if event.event_type == "turn.started"]), 2)
+
+    async def test_redirect_while_approval_runner_is_settling_drains_it_before_latest_turn(self):
+        class SettlingClient(EngineeringAgentClient):
+            async def run_task(self, task_id, user_text, **kwargs):
+                result = await super().run_task(task_id, user_text, **kwargs)
+                if user_text == "first":
+                    suspended.set()
+                    try:
+                        await asyncio.Future()
+                    except asyncio.CancelledError:
+                        cancelled.set()
+                        await cleanup_release.wait()
+                        raise
+                return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            suspended, cancelled, cleanup_release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+            model = ResumedModel()
+            app = compose_fixture_application(model_adapter=model, tool_adapters=(ApprovalTool(),),
+                store_adapter=SQLiteRuntimeStore(root / "runtime.db"))
+            async with SettlingClient(root, application_factory=lambda: app) as client:
+                accepted = await client.submit_user_input("conv", "first", input_id="first")
+                task_id = accepted.result["task"]["task_id"]
+                try:
+                    await asyncio.wait_for(suspended.wait(), 3)
+                    redirected = await client.submit_user_input("conv", "discarded context", input_id="second")
+                    await asyncio.wait_for(cancelled.wait(), 1)
+                    self.assertFalse(model.new_entered.is_set())
+                    snapshot = await ui_snapshot(client, task_id)
+                    self.assertTrue(snapshot["redirect_pending"])
+                    self.assertEqual(snapshot["phase1_state"], "PREPARING")
+                    self.assertFalse(snapshot["final"])
+                    stream = client.subscribe_task_ui(task_id, after=redirected.result["task"]["cursor"])
+                    async with asyncio.timeout(3):
+                        async for packet in stream:
+                            if packet["type"] == "task.snapshot":
+                                self.assertFalse(packet["final"])
+                                break
+                    await client.submit_user_input("conv", "new context", input_id="third")
+                    cleanup_release.set()
+                    async with asyncio.timeout(3):
+                        packets = [packet async for packet in stream]
+                    self.assertTrue(any(packet.get("progress", {}).get("kind") == "turn_started"
+                        for packet in packets))
+                    self.assertEqual(packets[-1]["status"], "awaiting_input")
+                    final = await client.wait_task(task_id, timeout=3)
+                    self.assertEqual(final.assistant_text, "new turn completed")
+                    self.assertEqual(len(model.requests), 2)
+                    events = await app.registry.require(RuntimeStorePort).read_events(task_id)
+                    starts = [event for event in events if event.event_type == "turn.started"]
+                    self.assertEqual(len(starts), 2)
+                    self.assertFalse(any(event.event_type == "checkpoint.saved"
+                        and event.payload.get("turn_id") == starts[0].payload["turn_id"]
+                        for event in events if event.sequence > starts[1].sequence))
+                finally:
+                    cleanup_release.set()
+
+    async def test_pending_approval_after_restart_accepts_a_new_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def application():
+                return compose_fixture_application(model_adapter=ResumedModel(),
+                    tool_adapters=(ApprovalTool(),), store_adapter=SQLiteRuntimeStore(root / "runtime.db"))
+
+            async with EngineeringAgentClient(root, application_factory=application) as client:
+                accepted = await client.submit_user_input("conv", "first", input_id="first")
+                task_id = accepted.result["task"]["task_id"]
+                self.assertEqual((await client.wait_task(task_id, timeout=3)).state, "AWAITING_APPROVAL")
+            async with EngineeringAgentClient(root, application_factory=application) as client:
+                result = await client.submit_user_input("conv", "new context", input_id="after-restart")
+                self.assertEqual(result.result["routed_task_id"], task_id)
+                final = await client.wait_task(task_id, timeout=3)
+                self.assertEqual(final.assistant_text, "new turn completed")
+
     async def test_completed_runner_waiting_for_cleanup_does_not_drop_next_input(self):
         from tests.test_conversation_loop import ScriptedModel, text_response
 

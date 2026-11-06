@@ -63,7 +63,7 @@ class MCPSDKIntegrationTest(unittest.IsolatedAsyncioTestCase):
             await application.start()
             try:
                 names = {tool.name for tool in await provider.list_tools()}
-                self.assertEqual(names, {f"mcp.p0.{name}" for name in ("echo", "write", "fail", "bad_output")})
+                self.assertEqual(names, {"core.mcp_discover", *(f"mcp.p0.{name}" for name in ("echo", "write", "fail", "bad_output"))})
                 with tempfile.TemporaryDirectory() as directory:
                     task = await _executing(application, Path(directory))
                     call = ToolCall("fail", "mcp.p0.fail", {})

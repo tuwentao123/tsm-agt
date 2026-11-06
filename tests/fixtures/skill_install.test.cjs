@@ -265,3 +265,22 @@ test('parallel clicks submit only one upload and release the busy state', async 
   await first;
   assert.ok(state.buttons.every(button => !button.disabled));
 });
+
+test('clicking outside the settings panel closes it while panel clicks keep it open', () => {
+  const state = setup([]);
+  const dialog = state.nodes.get('skill-settings-dialog');
+  const innerCard = new Element();
+
+  state.context.trackSkillSettingsBackdropPress({target: innerCard, currentTarget: dialog});
+  state.context.handleSkillSettingsBackdropClose({target: innerCard, currentTarget: dialog});
+  assert.equal(dialog.open, true, 'panel content clicks must keep the panel open');
+
+  // Press inside and release on the backdrop (text selection drag) must not close.
+  state.context.trackSkillSettingsBackdropPress({target: innerCard, currentTarget: dialog});
+  state.context.handleSkillSettingsBackdropClose({target: dialog, currentTarget: dialog});
+  assert.equal(dialog.open, true, 'dragging out of the panel must not close it');
+
+  state.context.trackSkillSettingsBackdropPress({target: dialog, currentTarget: dialog});
+  state.context.handleSkillSettingsBackdropClose({target: dialog, currentTarget: dialog});
+  assert.equal(dialog.open, false, 'a backdrop press must close the panel');
+});

@@ -72,12 +72,14 @@ class CheckpointMixin:
     async def _refresh_conversation_configuration(
         self, task_id: str, turn_id: str,
         *, model_profile_id: str | None = None,
+        reason: str = "new_conversation_turn",
     ) -> TaskSnapshot:
-        """Bind a NEW Turn to live configuration, never refresh a resume.
+        """Capture live configuration at a new turn or explicit catalog read.
 
         A conversation reuses its Task across deployments. Archived revisions
         remain immutable; only changed configuration gets a new revision before
-        the first model/tool action. Pending approvals cannot enter this path.
+        the first model/tool action or after a catalog-refreshing tool. Pending
+        approvals cannot enter this path; a resume never refreshes implicitly.
         """
         for attempt in range(4):
             stored = await self._require_stored_task(task_id)
@@ -99,7 +101,7 @@ class CheckpointMixin:
             event = RuntimeEvent(
                 f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
                 "config.snapshot", {
-                    "turn_id": turn_id, "reason": "new_conversation_turn",
+                    "turn_id": turn_id, "reason": reason,
                     "revision": configuration.revision,
                     "effective_config_hash": configuration.effective_config_hash,
                     "toolset_hash": configuration.toolset_hash,
@@ -193,11 +195,13 @@ class CheckpointMixin:
     async def _bind_agent_checkpoint(
         self, task: TaskSnapshot, checkpoint: AgentTurnCheckpoint,
         visible_tools: tuple[ToolSpec, ...],
+        *, configuration_reason: str = "new_conversation_turn",
     ) -> AgentTurnCheckpoint:
         if task.task_kind is TaskKind.CONVERSATION:
             task = await self._refresh_conversation_configuration(
                 task.task_id, checkpoint.turn_id,
                 model_profile_id=checkpoint.model_profile_id,
+                reason=configuration_reason,
             )
         if not task.effective_configurations:
             raise RuntimeError("Agent checkpoint requires Effective Configuration")

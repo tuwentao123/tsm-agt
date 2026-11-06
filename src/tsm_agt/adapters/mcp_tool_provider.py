@@ -31,6 +31,7 @@ from tsm_agt.ports import (
     ToolSpec,
 )
 from .mcp_errors import mcp_failure_detail
+from .mcp_discovery import DISCOVERY_TOOL, discover, discovery_spec
 
 
 class MCPToolProvider(ToolProviderPort):
@@ -178,7 +179,9 @@ class MCPToolProvider(ToolProviderPort):
     async def list_tools(self) -> tuple[ToolSpec, ...]:
         if not self._started:
             raise RuntimeError("MCP tool provider is not started")
-        return self._tools
+        if not self._manager.server_ids():
+            return self._tools
+        return (discovery_spec(self._manager, self._server_status), *self._tools)
 
     async def invoke(
         self, call: ToolCall, context: ToolInvocationContext,
@@ -189,6 +192,11 @@ class MCPToolProvider(ToolProviderPort):
                 call, "MCP_NOT_STARTED", "MCP tool provider is not started",
                 retryable=True,
                 recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE,
+            )
+        if call.name == DISCOVERY_TOOL:
+            return await discover(
+                call, self._manager, self._server_status,
+                self._startup_tasks, lambda: self._tools,
             )
         parsed = _parse_tool_name(call.name)
         if parsed is None:
@@ -316,8 +324,8 @@ class MCPToolProvider(ToolProviderPort):
                     result_authority=ToolResultAuthority.EXTERNAL_SERVICE,
                     model_contract=ModelToolContract(
                         purpose=(
-                            f"Call MCP server '{server_id}' tool '{tool_name}' using its "
-                            "advertised input schema."
+                            str(description) if isinstance(description, str) and description.strip()
+                            else f"Call MCP server '{server_id}' tool '{tool_name}' using its advertised input schema."
                         ),
                         returns=(
                             "untrusted content returned by the configured MCP server",

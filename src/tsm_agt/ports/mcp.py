@@ -30,6 +30,7 @@ class MCPServerConfig:
     options: Mapping[str, Any] = field(default_factory=dict)
     required: bool = False
     startup_timeout_seconds: float = 30.0
+    description: str = ""
 
     def __post_init__(self) -> None:
         if not _SERVER_ID.fullmatch(self.id):
@@ -47,6 +48,8 @@ class MCPServerConfig:
             raise TypeError("MCP server options must be a mapping")
         if not isinstance(self.required, bool):
             raise ValueError("MCP server required must be true or false")
+        if not isinstance(self.description, str) or len(self.description) > 1024:
+            raise ValueError("MCP server description must be a string of at most 1024 characters")
         if (isinstance(self.startup_timeout_seconds, bool)
                 or not isinstance(self.startup_timeout_seconds, (int, float))
                 or not math.isfinite(self.startup_timeout_seconds)

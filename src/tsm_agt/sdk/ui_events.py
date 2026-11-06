@@ -73,7 +73,11 @@ async def ui_snapshot(client, task_id: str):
         task = await client.application.kernel.get_task(task_id)
         before = await store.load_task(task_id)
         session = await store.load_session(task.session_id) if task.session_id else None
-        key = (before.version, session.version if session else 0)
+        redirect_pending = (
+            task.state.value == "INTERRUPTED"
+            and getattr(client, "_has_pending_redirect", lambda _: False)(task_id)
+        )
+        key = (before.version, session.version if session else 0, redirect_pending)
         if task_id in cache and cache[task_id][0] == key:
             return dict(cache[task_id][1])
         result = await client.get_task_result(task_id)
@@ -118,6 +122,12 @@ async def ui_snapshot(client, task_id: str):
                     turn_id=turn_id, active_turn_id=turn_id, active_turn_sequence=latest.sequence if latest else 0, sequence=result.cursor,
                     waiting=waiting, failure_reason=failure,
                     final=result.phase1_state in {"INTERRUPTED", "DONE", "FAILED", "CANCELLED", "NEEDS_REVIEW"})
+        if redirect_pending:
+            # The durable interruption belongs to the previous Turn. A live
+            # successor owns this conversation and is draining its predecessor;
+            # do not settle its stream or redisplay the superseded approval.
+            data.update(redirect_pending=True, phase1_state="PREPARING", status="running",
+                        waiting=None, approval=None, assistant_text=None, final=False)
         cache[task_id] = (key, data)
         return dict(data)
     raise RuntimeError("Task changed while reading its UI snapshot; reconnect to retry")

@@ -160,6 +160,7 @@ class EffectiveConfigurationSnapshot:
             "max_result_tokens": tool.max_result_tokens,
             "requires_network": tool.requires_network,
             "data_transmission": tool.data_transmission,
+            **({"refreshes_tool_catalog": True} if tool.refreshes_tool_catalog else {}),
         }
 
     @staticmethod

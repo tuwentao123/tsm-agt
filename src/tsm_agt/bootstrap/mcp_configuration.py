@@ -104,6 +104,7 @@ def _parse_server_entry(server_id: str, raw: dict) -> MCPServerConfig:
         options=options,
         required=raw.get("required", False),
         startup_timeout_seconds=raw.get("startup_timeout_seconds", 30.0),
+        description=raw.get("description", ""),
     )
 
 

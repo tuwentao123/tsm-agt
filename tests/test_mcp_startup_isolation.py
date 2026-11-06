@@ -82,7 +82,7 @@ class MCPStartupIsolationTest(unittest.IsolatedAsyncioTestCase):
         await provider.start(CONTEXT)
         try:
             await provider.wait_ready()
-            self.assertEqual([spec.name for spec in await provider.list_tools()], ["mcp.good.echo"])
+            self.assertEqual([spec.name for spec in await provider.list_tools()], ["core.mcp_discover", "mcp.good.echo"])
             states = {row["id"]: row["state"] for row in provider.startup_status()}
             self.assertEqual(states, {"good": "ready", "bad": "failed"})
             self.assertEqual((await provider.health()).state, HealthState.DEGRADED)

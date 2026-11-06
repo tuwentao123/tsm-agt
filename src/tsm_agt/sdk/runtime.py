@@ -869,6 +869,20 @@ class EngineeringAgentClient:
                 reason="default_redirect_replaces_pending_turn",
             )
 
+        # An approval suspends one operation, not the conversation composer.
+        # Ordinary text starts a fresh Turn; it never grants the pending action.
+        # The redirect barrier drains the old runner before the fresh-turn
+        # commit invalidates the exact approval and drops its checkpoint.
+        if (
+            active is not None
+            and active.task_kind is TaskKind.CONVERSATION
+            and active.state is TaskState.AWAITING_APPROVAL
+        ):
+            return await self._interrupt_and_redirect(
+                text, input_id, active, image_blocks,
+                reason="default_interrupt_and_redirect",
+            )
+
         # (3) Attachments take the same fresh-Turn path as ordinary text when a
         #     conversation is running. They remain structured blocks on that
         #     Turn rather than forcing an unrelated work item.
@@ -1018,7 +1032,7 @@ class EngineeringAgentClient:
         wait_target = (
             predecessor
             if (
-                active.state in self._RUNNING_TASK_STATES
+                active.state in self._INTERRUPTIBLE_TASK_STATES
                 or (
                     predecessor is self._redirect_runners.get(active.task_id)
                     and (prior_barrier is None or prior_barrier.done())
@@ -1026,7 +1040,7 @@ class EngineeringAgentClient:
             )
             else prior_barrier or predecessor
         )
-        if active.state in self._RUNNING_TASK_STATES:
+        if active.state in self._INTERRUPTIBLE_TASK_STATES:
             try:
                 await self.interrupt(
                     active.task_id,
@@ -1053,6 +1067,10 @@ class EngineeringAgentClient:
             "reason_code": reason,
             "applied": True,
             "routed_task_id": active.task_id,
+            "superseded_turn_id": (
+                active.active_agent_checkpoint.get("turn_id")
+                if active.active_agent_checkpoint else None
+            ),
             "task": task.to_data(),
         })
 
