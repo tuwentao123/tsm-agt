@@ -33,12 +33,31 @@ class RuleBasedArtifactReadPolicyTest(unittest.IsolatedAsyncioTestCase):
         )
         return update.state
 
-    async def test_same_tool_and_range_requires_reuse(self):
+    async def test_same_tool_and_range_prefers_projection_reuse(self):
         state = await self._record()
         decision = await self.policy.before_call(
             read_call("read-2"), ArtifactReadProbe("path-hash", "content-v1", 1, 2), state,
         )
-        self.assertEqual(decision.action, ArtifactReadAction.REQUIRE_REUSE)
+        self.assertEqual(decision.action, ArtifactReadAction.PREFER_REUSE)
+
+    async def test_larger_limit_for_same_complete_file_is_not_a_new_question(self):
+        call = read_call("first", max_lines=100)
+        state = (await self.policy.after_result(call, ToolResult(call.call_id, True, {
+            "sha256": "content-v1", "start_line": 1, "end_line": 32, "total_lines": 32,
+        }), ArtifactReadProbe("path-hash", "", 1, 100), ArtifactReadState())).state
+        decision = await self.policy.before_call(
+            read_call("second", max_lines=80),
+            ArtifactReadProbe("path-hash", "content-v1", 1, 80), state,
+        )
+        self.assertEqual(decision.action, ArtifactReadAction.PREFER_REUSE)
+
+    async def test_larger_unobserved_range_is_allowed(self):
+        decision = await self.policy.before_call(
+            read_call("more", max_lines=4), ArtifactReadProbe("path-hash", "content-v1", 1, 4),
+            await self._record(),
+        )
+        self.assertEqual(decision.action, ArtifactReadAction.ALLOW)
+        self.assertEqual(decision.reason, "new_range")
 
     async def test_changed_range_has_distinct_fingerprint_and_is_allowed(self):
         state = await self._record()

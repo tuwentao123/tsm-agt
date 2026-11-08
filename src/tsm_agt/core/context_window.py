@@ -46,7 +46,7 @@ def restore_messages(data: Mapping[str, Any]) -> tuple[Message, ...]:
         replace(message, message_id="window-history-" + message.message_id)
         if message.role is not MessageRole.SYSTEM
         and not message.message_id.startswith(("window-", "session-", "project-", "task-spec-",
-                                                "conversation-environment-", "document-", "working-", "execution-", "tool-catalog-", "context-summary-"))
+                                                "conversation-environment-", "document-", "working-", "execution-", "workflow-handoff-", "tool-catalog-", "context-summary-"))
         else message
         for message in (Message.from_data(row) for row in data.get("messages", []))
     )

@@ -84,6 +84,7 @@ from .tool_catalog import refresh_observed_tool_catalog
 from ..context_window import establish_window, context_updates, restore_messages, window_identity, window_history
 from ..skills import SkillCatalogBudget, render_skill_catalog
 from .compaction import complete_window_compaction
+from .workflow_handoff import workflow_handoff
 
 
 #: Message-id prefixes the Runtime re-projects on every model call. They are
@@ -980,6 +981,13 @@ class ConversationAgentLoop:
         projections = await kernel._project_context_messages(
             state.task_id, updates_only=bool(state.checkpoint.context_window_state),
         )
+        handoff = None
+        if state.model_call_count == 0:
+            # Reusing a Session window must still hand off this request's
+            # current progress, without rebuilding the entire Session history.
+            memory = await kernel.get_working_memory(state.task_id)
+            handoff = workflow_handoff(task, source_user, projections,
+                history=tuple(state.messages), memory_state=memory.to_data())
         identity = window_identity(
             task_id=state.task_id, profile_id=state.checkpoint.model_profile_id, workspace=task.workspace,
             manifest_hash=kernel._dependencies.prompt_template.manifest().manifest_hash,
@@ -996,6 +1004,8 @@ class ConversationAgentLoop:
             baseline, window = establish_window(
                 kernel._dependencies.prompt_template, snapshots, model_tools, identity,
             )
+            if handoff is not None:
+                baseline = (*baseline, handoff)
             state.messages = list(baseline) + [message for message in state.messages
                 if not message.message_id.startswith(_GENERATED_CONTEXT_PREFIXES)]
         else:
@@ -1024,6 +1034,10 @@ class ConversationAgentLoop:
                 }),))
             else:
                 state.messages.extend(updates)
+                if handoff is not None and not any(message.message_id == handoff.message_id for message in state.messages):
+                    at = next((index for index, message in enumerate(state.messages)
+                               if source_user is not None and message.message_id == source_user.message_id), len(state.messages))
+                    state.messages.insert(at, handoff)
         if runtime_instruction and window.get("runtime_instruction") != runtime_instruction:
             note = Message(
                 "window-context-runtime-" + uuid4().hex, MessageRole.USER,
@@ -1041,8 +1055,19 @@ class ConversationAgentLoop:
         # Dynamic guidance is now part of durable history, never a rewritten
         # instruction ahead of it. Empty guidance needs no new message.
         runtime_instruction = ""
-        state.checkpoint = replace(state.checkpoint, messages=tuple(state.messages), context_window_state=window)
         wire_output_limit = kernel._model_output_token_limit_for(state.checkpoint.model_profile_id)
+        if handoff is not None:
+            capacity = kernel._model_capabilities_for(state.checkpoint.model_profile_id).context_window
+            reserve = max(state.checkpoint.max_output_tokens, wire_output_limit or 0)
+            if capacity and kernel._dependencies.context_manager.estimate_input_tokens(
+                tuple(state.messages), model_tools, kernel._dependencies.prompt_template,
+                read_reuse_task_id=state.task_id,
+            ) + reserve > capacity:
+                # The optional first-request note cannot make an otherwise
+                # fitting request overflow. A compaction will rebuild a smaller
+                # handoff from the durable sources if history needs reduction.
+                state.messages = [message for message in state.messages if message.message_id != handoff.message_id]
+        state.checkpoint = replace(state.checkpoint, messages=tuple(state.messages), context_window_state=window)
         try:
             prepared = kernel._dependencies.context_manager.prepare(
                 conversation=tuple(state.messages),

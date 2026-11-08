@@ -5,6 +5,7 @@ GENERATED_CONTEXT_PREFIXES = (
     "conversation-environment-context-", "project-onboarding-context-",
     "project-memory-context-", "session-context-", "document-references-context-",
     "working-memory-context-", "execution-context-",
+    "workflow-handoff-context-",
 )
 
 

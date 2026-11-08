@@ -48,6 +48,7 @@ class ContextBudget:
     estimation_method: str = "utf8-bytes-div-4-with-image-reserve-v2"
     allocations: tuple[ContextBudgetAllocation, ...] = ()
     history_soft_tokens: int = 0
+    trigger_reasons: tuple[str, ...] = ()
 
     @property
     def should_compact(self) -> bool:
@@ -73,6 +74,7 @@ class ContextBudget:
             "history_budget_algorithm": "turn-token-v2",
             "history_estimated_tokens": history_tokens,
             "history_soft_limit_exceeded": bool(self.history_soft_tokens and history_tokens > self.history_soft_tokens),
+            "trigger_reasons": list(self.trigger_reasons),
         }
 
 
@@ -95,6 +97,7 @@ class ContextCompactionReceipt:
     forgotten_message_ids: tuple[str, ...] = ()
     forgotten_event_sequences: tuple[int, ...] = ()
     pinned_message_ids: tuple[str, ...] = ()
+    trigger_reasons: tuple[str, ...] = ()
 
     def event_data(self) -> dict[str, Any]:
         return {
@@ -116,6 +119,7 @@ class ContextCompactionReceipt:
             "forgotten_event_sequences": list(self.forgotten_event_sequences),
             "pinned_message_ids": list(self.pinned_message_ids),
             "summary_body_persisted": False,
+            "trigger_reasons": list(self.trigger_reasons),
         }
 
 
@@ -247,6 +251,14 @@ class ContextWindowManager:
         )
         if not budget.should_compact and not history_pressure:
             return self._prepared(conversation, budget, None, read_reuse_task_id)
+        reasons = []
+        if before + max_output_tokens >= math.floor(context_window * self.trigger_ratio):
+            reasons.append("context_capacity")
+        if self.latency_soft_input_tokens and before + max_output_tokens >= self.latency_soft_input_tokens:
+            reasons.append("latency_target")
+        if history_pressure:
+            reasons.append("history_pressure")
+        budget = replace(budget, trigger_reasons=tuple(reasons))
         if history_pressure:
             history_tokens = sum(item.estimated_tokens for item in before_allocations if item.name == "session_history")
             budget = replace(budget, trigger_tokens=min(budget.trigger_tokens,
@@ -278,12 +290,8 @@ class ContextWindowManager:
                 f"visible Tool schemas are too large; allocations: {allocation_summary}"
             )
         return self._prepared(
-            compacted, ContextBudget(
-                context_window, max_output_tokens, budget.trigger_tokens,
-                budget.hard_input_tokens, after, budget.estimation_method,
-                after_allocations,
-                self.history_soft_tokens,
-            ), receipt, read_reuse_task_id,
+            compacted, replace(budget, estimated_input_tokens=after, allocations=after_allocations),
+            receipt, read_reuse_task_id,
         )
 
     @staticmethod
@@ -363,7 +371,7 @@ class ContextWindowManager:
                 bucket = "project_context"
             elif message.message_id.startswith(("session-context-", "session-history-", "session-facts-", "window-history-")):
                 bucket = "session_history"
-            elif message.message_id.startswith("working-memory-context-") or is_execution_context(message.message_id):
+            elif message.message_id.startswith(("working-memory-context-", "workflow-handoff-context-")) or is_execution_context(message.message_id):
                 bucket = "working_memory"
             else:
                 bucket = "current_turn_and_tool_protocol"
@@ -740,6 +748,7 @@ class ContextWindowManager:
             forgotten_message_ids=forgotten,
             forgotten_event_sequences=tuple(sorted(forgotten_sequences)),
             pinned_message_ids=pinned_message_ids,
+            trigger_reasons=budget.trigger_reasons,
         )
 
     @staticmethod

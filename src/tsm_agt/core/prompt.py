@@ -409,7 +409,7 @@ class PromptTemplate:
         )
         working_memory_messages = tuple(
             message for message in conversation
-            if message.message_id.startswith("working-memory-context-")
+            if message.message_id.startswith(("working-memory-context-", "workflow-handoff-context-"))
         )
         execution_messages = tuple(message for message in conversation
                                    if is_execution_context(message.message_id))

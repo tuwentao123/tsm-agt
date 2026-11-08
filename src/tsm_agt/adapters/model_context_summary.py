@@ -16,7 +16,8 @@ observed verification results and failures; unfinished work and next steps; key
 paths, artifact references, tool/Skill names. Distinguish assistant claims from
 observed tool results and success from unknown outcomes. Do not infer completion
 or authorization. Do not copy large outputs, credentials, or complete schemas.
-Definitions and Skill bodies omitted from history must be read again before use.
+Omitted definitions and Skill bodies may need reloading; exact instruction
+exchanges explicitly retained in the next window do not need a second load.
 Update the previous handoff with this next chronological fragment. Return only
 the concise handoff, in the user's language, within about 700 tokens."""
 

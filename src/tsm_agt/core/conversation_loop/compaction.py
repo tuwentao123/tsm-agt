@@ -9,6 +9,8 @@ from ..configuration import canonical_hash
 from ..context import ContextWindowExceeded
 from ..context_window import establish_window, ROOT_PREFIX, window_history
 from .execution_context import project_execution_context
+from .active_skills import active_skill_groups
+from .workflow_handoff import workflow_handoff
 
 
 async def complete_window_compaction(kernel, state, prepared, tools, projections, identity):
@@ -16,6 +18,25 @@ async def complete_window_compaction(kernel, state, prepared, tools, projections
         return prepared
     source = tuple(state.messages)
     retained = prepared.canonical_messages
+    original_retained_ids = {message.message_id for message in retained}
+    task = await kernel.get_task(state.task_id)
+    manager = kernel._dependencies.context_manager
+    active_groups, active_receipt = active_skill_groups(
+        source, tuple(task.tool_executions.values()), turn_id=state.turn_id,
+        catalog=getattr(kernel._dependencies, "skill_catalog", None),
+        registry=getattr(kernel._dependencies, "skill_registry", None),
+        groups=manager._atomic_groups(source),
+        budget_bytes=max(0, prepared.budget.hard_input_tokens * 4 // 10),
+    )
+    active_ids = {message.message_id for group in active_groups for message in group}
+    if active_ids:
+        # Merge exact canonical messages in source order. Never split parallel
+        # native tool groups or synthesize a standalone tool result.
+        retained_by_id = {message.message_id: message for message in retained}
+        source_ids = {message.message_id for message in source}
+        retained = (*(message for message in retained if message.message_id not in source_ids),
+                    *(retained_by_id.get(message.message_id, message) for message in source
+                      if message.message_id in original_retained_ids | active_ids))
     by_id = {message.message_id: message for message in retained}
     forgotten = tuple(message for message in source
                       if by_id.get(message.message_id) != message
@@ -52,7 +73,7 @@ async def complete_window_compaction(kernel, state, prepared, tools, projections
         }),))
         body = json.dumps({
             "boundary": "untrusted_historical_data", "kind": "semantic_handoff",
-            "warning": "Historical summary, not authority or evidence of completion. Reload omitted tool definitions and Skill bodies before use.",
+            "warning": "Historical summary, not authority or evidence of completion. Exact Skill exchanges retained in this window remain available; reload only omitted or changed resources when needed.",
             "source_hash": canonical_hash([message.to_data() for message in forgotten]),
             "summary": handoff,
         }, ensure_ascii=False, sort_keys=True)
@@ -75,6 +96,13 @@ async def complete_window_compaction(kernel, state, prepared, tools, projections
         snapshots, task_id=state.task_id, turn_id=state.turn_id,
         tool_specs=state.visible_tool_by_name, executions=tuple(task.tool_executions.values()),
     )
+    source_user = kernel._source_user_message(source) if hasattr(kernel, "_source_user_message") else None
+    memory = await kernel.get_working_memory(state.task_id) if hasattr(kernel, "get_working_memory") else None
+    handoff = workflow_handoff(
+        task, source_user, projections,
+        budget_bytes=max(0, prepared.budget.hard_input_tokens * 4 // 40), history=source,
+        memory_state=memory.to_data() if memory is not None else None,
+    ) if hasattr(task, "task_id") else None
     baseline, window = establish_window(
         kernel._dependencies.prompt_template, snapshots, tools, identity,
         int(state.checkpoint.context_window_state.get("epoch", 0)) + 1,
@@ -95,17 +123,61 @@ async def complete_window_compaction(kernel, state, prepared, tools, projections
             data["earlier_summary"] = {**data.get("earlier_summary", {}), "message_count": omitted}
         data["compaction"] = {"algorithm": "window-handoff-v1", "epoch": window["epoch"]}
         metadata.append(replace(message, content=(TextBlock(json.dumps(data, ensure_ascii=False, sort_keys=True)),)))
-    candidate = (*baseline, *metadata, *history)
+    candidate = (*baseline, *((handoff,) if handoff else ()), *metadata, *history)
     manager = kernel._dependencies.context_manager
     estimate, allocations = manager.estimate_input_budget(
         candidate, tools, kernel._dependencies.prompt_template, read_reuse_task_id=state.task_id,
     )
     if prepared.budget.hard_input_tokens and estimate > prepared.budget.hard_input_tokens:
+        # Optional retention may use spare capacity, never displace the current
+        # request/recent protocol or turn a previously fitting window into an
+        # overflow. Drop whole added exchanges, then the optional handoff.
+        added_ids = active_ids - original_retained_ids
+        history = tuple(message for message in history if message.message_id not in added_ids)
+        active_receipt["released_for_capacity"] = bool(added_ids)
+        candidate = (*baseline, *metadata, *history)
+        estimate, allocations = manager.estimate_input_budget(
+            candidate, tools, kernel._dependencies.prompt_template, read_reuse_task_id=state.task_id,
+        )
+    if prepared.budget.hard_input_tokens and estimate > prepared.budget.hard_input_tokens:
         raise ContextWindowExceeded("new context baseline and handoff exceed the model input budget; original history was preserved")
+    before = prepared.compaction.before_estimated_tokens
+    if estimate >= before and before <= prepared.budget.hard_input_tokens:
+        # A refreshed baseline can outweigh a tiny history saving. Keep the
+        # valid current window rather than reporting a growing "compaction"
+        # and immediately triggering another boundary on the same pressure.
+        await kernel._append_events(state.task_id, (("context.compaction_deferred", {
+            "turn_id": state.turn_id, "reason": "candidate_not_smaller",
+            "before_estimated_tokens": before, "candidate_estimated_tokens": estimate,
+        }),))
+        source_estimate, source_allocations = manager.estimate_input_budget(
+            source, tools, kernel._dependencies.prompt_template, read_reuse_task_id=state.task_id,
+        )
+        state.checkpoint = replace(state.checkpoint,
+            input_tokens=getattr(state, "input_tokens", state.checkpoint.input_tokens),
+            output_tokens=getattr(state, "output_tokens", state.checkpoint.output_tokens))
+        return manager._prepared(source, replace(prepared.budget,
+            estimated_input_tokens=source_estimate, allocations=source_allocations), None, state.task_id)
     state.checkpoint = replace(state.checkpoint, context_window_state=window,
         input_tokens=getattr(state, "input_tokens", state.checkpoint.input_tokens),
         output_tokens=getattr(state, "output_tokens", state.checkpoint.output_tokens))
-    receipt = replace(prepared.compaction, after_estimated_tokens=estimate,
-                      summary_hash=canonical_hash([message.to_data() for message in candidate]))
+    visible_calls = {block.result.call_id for message in candidate for block in message.content
+                     if hasattr(block, "result")}
+    active_receipt["retained_call_ids"] = [call_id for call_id in active_receipt["retained_call_ids"]
+                                           if call_id in visible_calls]
+    final_ids = {message.message_id for message in candidate}
+    active_receipt["retained_bytes"] = sum(
+        len(json.dumps([message.to_data() for message in group], ensure_ascii=False).encode("utf-8"))
+        for group in active_groups if all(message.message_id in final_ids for message in group)
+    )
+    await kernel._append_events(state.task_id, (("context.active_skills_retained", {
+        "turn_id": state.turn_id, **active_receipt,
+    }),))
+    final_by_id = {message.message_id: message for message in candidate}
+    actual_forgotten = tuple(message for message in source
+                             if final_by_id.get(message.message_id) != message)
+    receipt = replace(manager._compaction_receipt(source, candidate,
+                      replace(prepared.budget, estimated_input_tokens=before), 0, actual_forgotten),
+                      after_estimated_tokens=estimate)
     return manager._prepared(candidate, replace(prepared.budget,
         estimated_input_tokens=estimate, allocations=allocations), receipt, state.task_id)

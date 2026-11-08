@@ -609,12 +609,14 @@ def _kernel_dependencies(
         raise ValueError("completion review max_continuations must not be negative")
     skill_registry = SkillRegistry()
     skill_selector = SkillSelector(skill_registry)
+    skill_catalog = None
     if enable_skills and registry.require(ModelProviderPort).capabilities.tools:
         skill_store = UserSkillsStore()
+        skill_catalog = SkillCatalog(skill_store)
         registry.register(
             ToolProviderPort, CoreSkillToolProvider(
                 skill_registry, skill_store, registry.require(RuntimeStorePort),
-                catalog=SkillCatalog(skill_store),
+                catalog=skill_catalog,
             ),
         )
     return KernelDependencies(
@@ -727,6 +729,7 @@ def _kernel_dependencies(
         ),
         context_manager=context_manager or ContextWindowManager(),
         skill_registry=skill_registry,
+        skill_catalog=skill_catalog,
         skill_selector=skill_selector,
     )
 

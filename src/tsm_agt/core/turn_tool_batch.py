@@ -51,7 +51,7 @@ from .trust import (
     workspace_fingerprint,
 )
 from tsm_agt.ports import (
-    ArtifactReadAction, ExplorationBudgetAction, ExplorationBudgetObservation, ExplorationBudgetProbe, ExplorationBudgetState, ExplorationOutcomeAction, Message, MessageRole, ProgressiveScopeAction, ProgressiveScopeDecision, ReadHitsAction, StopOrPivotAction, StopOrPivotSignals, TextBlock, ToolCall, ToolRecoveryKind, ToolResult, ToolResultBlock,
+    ExplorationBudgetAction, ExplorationBudgetObservation, ExplorationBudgetProbe, ExplorationBudgetState, ExplorationOutcomeAction, Message, MessageRole, ProgressiveScopeAction, ProgressiveScopeDecision, ReadHitsAction, StopOrPivotAction, StopOrPivotSignals, TextBlock, ToolCall, ToolRecoveryKind, ToolResult, ToolResultBlock,
 )
 from .tool_concurrency import ToolExecutionGate, supports_parallel_execution
 from .tool import InvalidToolArguments, validate_tool_arguments
@@ -665,44 +665,14 @@ async def _run_tool_call(
             Path(task_before_action.workspace), call,
             state.checkpoint.artifact_read_state,
         )
-        artifact_decision = await kernel._evaluate_artifact_read_before(
+        await kernel._evaluate_artifact_read_before(
             state.task_id, state.turn_id, call, artifact_probe,
             state.checkpoint.artifact_read_state,
         )
-        if artifact_decision.action is ArtifactReadAction.REQUIRE_REUSE:
-            result = ToolResult(
-                call.call_id, False, error_code="ARTIFACT_ALREADY_READ",
-                message=(
-                    "The same unchanged file range was already read for this "
-                    "same call fingerprint."
-                ),
-                hint=(
-                    "Reuse the existing Tool Result or Evidence. Read a different "
-                    "line range, use different effective arguments, or "
-                    "read again after the file content changes."
-                ),
-                meta={
-                    "runtime_guard": "ARTIFACT_READ_CACHE",
-                    "matching_record_count": (
-                        artifact_decision.matching_record_count
-                    ),
-                },
-            )
-            state.messages.append(Message(
-                message_id=f"msg-tool-{uuid4().hex}",
-                role=MessageRole.TOOL,
-                content=(ToolResultBlock(_govern_runtime_result(kernel, state, call, result)),),
-            ))
-            _complete_pending_call(state, call.call_id)
-            state.checkpoint = replace(
-                state.checkpoint, messages=tuple(state.messages),
-                pending_tool_calls=tuple(state.pending_tool_calls),
-                seen_call_ids=tuple(sorted(state.seen_call_ids)),
-            )
-            await kernel._save_agent_checkpoint(
-                state.checkpoint, "artifact-read-reuse-required"
-            )
-            continue
+        # Task history is advisory, not a visibility or access guarantee. The
+        # normal provider rechecks permission/version (and its bounded cache),
+        # keeps a full canonical result, then final request projection folds
+        # identical bodies only while their source is still in that request.
         decision = state.plan_guard.evaluate(
             call, memory_before_action,
             workspace_fingerprint(

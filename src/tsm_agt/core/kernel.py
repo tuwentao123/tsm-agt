@@ -214,6 +214,7 @@ from .configuration import (
 )
 from .context import ContextWindowExceeded, ContextWindowManager
 from tsm_agt.ports.context_summary import ContextSummaryPort
+from tsm_agt.ports.skill_files import SkillCatalogPort
 from .conclusion_reference_validator import ConclusionReferenceValidator
 from .document_references import extract_document_references
 from .prompt import PromptAssemblyReceipt, PromptTemplate
@@ -456,6 +457,7 @@ class KernelDependencies:
         default_factory=EffectiveWorkingMemoryProjector
     )
     skill_registry: SkillRegistry = field(default_factory=SkillRegistry)
+    skill_catalog: SkillCatalogPort | None = None
     skill_selector: SkillSelector | None = None
 
 

@@ -199,14 +199,15 @@ class PolicyMixin:
                 "question_hash": decision.question_hash,
             },
         ),))
-        if decision.action is ArtifactReadAction.REQUIRE_REUSE:
+        if decision.action in {ArtifactReadAction.REQUIRE_REUSE, ArtifactReadAction.PREFER_REUSE}:
             await self._append_events(task_id, ((
-                "artifact_read.reuse_required", {
+                "artifact_read.reuse_candidate", {
                     "turn_id": turn_id, "tool_call_id": call.call_id,
                     "tool_name": call.name,
                     "matching_record_count": decision.matching_record_count,
                     "path_hash": decision.path_hash,
                     "question_hash": decision.question_hash,
+                    "handling": "governed_read_then_request_projection",
                 },
             ),))
         return decision

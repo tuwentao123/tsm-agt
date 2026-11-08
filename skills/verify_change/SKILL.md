@@ -26,6 +26,9 @@ analysis-only requests do not require runtime tests. Respect explicit user execu
    with available read tools. Identify the observable outcome, exact executable/arguments and cwd.
    Do not choose a runner from a filename or an imported framework. No project-instructions file
    is required. Use available environment observations when the invocation is not documented.
+   If the current task already has a valid check entry, reuse its exact arguments and cwd;
+   investigate only a specific missing or changed fact. Keep the entry and coverage target
+   in existing Working Memory evidence/remaining work when continuing across context windows.
 2. **Implement, then execute.** After the last relevant edit, invoke the smallest sufficient check
    with ordinary execution tools and read its terminal output. A write receipt, source inspection,
    loading this Skill, a pre-edit pass or an unrelated zero exit is not verification.
@@ -40,8 +43,10 @@ analysis-only requests do not require runtime tests. Respect explicit user execu
    behavior additionally need representative model trajectories. Inspect snapshot changes before
    updating pins; a new hash alone is not behavior evidence.
 
-This complete execution workflow does not require a second Skill load. For further check-selection
-guidance, load `references/workflow.md` with
+This complete execution workflow does not require a second Skill load. Reuse the complete
+Skill text retained in the current window; compaction alone
+does not require a reload. Historical handoff notes are not proof that a check ran or passed.
+For further check-selection guidance, load `references/workflow.md` with
 `skill.load(name="verify-change", resource="references/workflow.md")`.
 
 ## When this follows a diagnosis

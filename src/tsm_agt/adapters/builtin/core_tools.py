@@ -237,8 +237,9 @@ class CoreReadOnlyToolProvider:
                 "start_line defaults to 1 and max_lines defaults to 200 (maximum 1000). "
                 "Success returns the authoritative resolved path/root, whole-file sha256, "
                 "content, actual line range, total lines, and truncation. A page is "
-                "limited to 8000 characters. When truncated, continue with the "
-                "returned next_cursor (start_line and start_column). "
+                "limited to 8000 characters. next_cursor (start_line and start_column) "
+                "indicates more content is available; continue only if the current "
+                "question needs it. Prefer search or symbol location before paging. "
                 "In model context, unchanged with reused_from_call_id refers to "
                 "the same-version text window retained in another result; it is "
                 "not file text. Other ranges or versions return their own content. "
@@ -709,10 +710,9 @@ class CoreReadOnlyToolProvider:
             if call.arguments.get("resource_ref") else f"path={raw_path}"
         )
         hint = (
-            f"Read through line {page['end_line']} of {page['total_lines']} (a line may be partial): continue with "
+            f"Read through line {page['end_line']} of {page['total_lines']} (a line may be partial). If more text is needed for the current question, continue with "
             f"core.read_file {target_hint} start_line={next_cursor['start_line']} "
-            f"start_column={next_cursor['start_column']} before "
-            "concluding from this file."
+            f"start_column={next_cursor['start_column']}. Otherwise use the relevant text already returned."
             if truncated else None
         )
         return ToolResult(

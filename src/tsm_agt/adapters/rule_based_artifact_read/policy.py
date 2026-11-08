@@ -83,7 +83,7 @@ class RuleBasedArtifactReadPolicy:
             )
             if exact_empty_repeat or covered:
                 return ArtifactReadDecision(
-                    ArtifactReadAction.REQUIRE_REUSE, "range_already_read",
+                    ArtifactReadAction.PREFER_REUSE, "range_previously_observed",
                     len(same_question), probe.path_hash, question_hash,
                 )
         return ArtifactReadDecision(
@@ -124,7 +124,9 @@ class RuleBasedArtifactReadPolicy:
     def _question_hash(cls, call: ToolCall) -> str:
         return cls._hash({
             "tool_name": call.name,
-            "arguments": cls._canonical_arguments(call.arguments),
+            "arguments": cls._canonical_arguments({
+                key: value for key, value in call.arguments.items() if key != "max_lines"
+            }),
         })
 
     @staticmethod

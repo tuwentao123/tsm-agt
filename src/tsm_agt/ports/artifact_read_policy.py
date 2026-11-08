@@ -13,6 +13,9 @@ from .tool import ToolCall, ToolResult
 
 class ArtifactReadAction(StrEnum):
     ALLOW = "ALLOW"
+    PREFER_REUSE = "PREFER_REUSE"
+    # Legacy policy signal. Historical observations alone cannot prove that
+    # text remains visible, so it must never bypass a governed current read.
     REQUIRE_REUSE = "REQUIRE_REUSE"
 
 

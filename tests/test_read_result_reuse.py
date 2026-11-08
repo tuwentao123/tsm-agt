@@ -11,6 +11,7 @@ import unittest
 import pytest
 
 from tsm_agt.adapters.builtin import CoreReadOnlyToolProvider
+from tsm_agt.adapters.rule_based_artifact_read import RuleBasedArtifactReadPolicy
 from tsm_agt.adapters.posix_path import PosixWorkspacePath
 from tsm_agt.adapters.windows_path import WindowsWorkspacePath
 from tsm_agt.bootstrap import compose_fixture_application
@@ -314,6 +315,7 @@ class ReadReuseLoopTest(unittest.IsolatedAsyncioTestCase):
         database = Path(temporary.name) / "runtime.db"
         application = compose_fixture_application(
             model_adapter=model, tool_adapters=(provider,),
+            artifact_read_policy_adapter=RuleBasedArtifactReadPolicy(),
             store_adapter=SQLiteRuntimeStore(database),
             context_manager=(ContextWindowManager(latency_soft_input_tokens=1, recent_message_floor=4)
                              if compact else ContextWindowManager()),
