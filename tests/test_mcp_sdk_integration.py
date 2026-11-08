@@ -63,7 +63,7 @@ class MCPSDKIntegrationTest(unittest.IsolatedAsyncioTestCase):
             await application.start()
             try:
                 names = {tool.name for tool in await provider.list_tools()}
-                self.assertEqual(names, {"core.mcp_discover", *(f"mcp.p0.{name}" for name in ("echo", "write", "fail", "bad_output"))})
+                self.assertEqual(names, {"core.mcp_discover", "core.mcp_call", *(f"mcp.p0.{name}" for name in ("echo", "write", "fail", "bad_output"))})
                 with tempfile.TemporaryDirectory() as directory:
                     task = await _executing(application, Path(directory))
                     call = ToolCall("fail", "mcp.p0.fail", {})
@@ -88,7 +88,7 @@ class MCPSDKIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     (_p0_server("--receipt", str(receipt)),), create_mcp_sdk_client,
                 ))
                 model = ScriptedModel([
-                    tool_response("writes", "apply-once", f"mcp.p0.{tool}", {}),
+                    tool_response("writes", "apply-once", "core.mcp_call", {"tool_name": f"mcp.p0.{tool}", "arguments_json": "{}"}),
                     tool_response("inspect", "observe-state", "core.read_file", {"path": "receipt"}),
                     text_response("observed", "The receipt records the write."),
                 ])
@@ -152,7 +152,7 @@ class MCPSDKIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_stdio_mcp_is_advertised_to_model_and_invoked_after_approval(self):
         model = ScriptedModel([
-            tool_response("mcp-call", "call-add", "mcp.demo.add", {"a": 2, "b": 5}),
+            tool_response("mcp-call", "call-add", "core.mcp_call", {"tool_name": "mcp.demo.add", "arguments_json": '{"a": 2, "b": 5}'}),
             text_response("mcp-finished", "MCP returned 7."),
         ])
         provider = MCPToolProvider(MCPClientManager(
@@ -171,7 +171,7 @@ class MCPSDKIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(outcome, AgentTurnSuspended)
                 assert isinstance(outcome, AgentTurnSuspended)
                 self.assertIn(
-                    "mcp.demo.add", [tool.name for tool in model.requests[0].tools],
+                    "core.mcp_call", [tool.name for tool in model.requests[0].tools],
                 )
 
                 outcome = await application.kernel.resolve_agent_approval(

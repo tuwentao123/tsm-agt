@@ -15,6 +15,7 @@ from tsm_agt.ports import (
 from .configuration import canonical_hash
 from .image_budget import estimate_image_tokens
 from .prompt import PromptTemplate
+from .skills import SkillCatalogBudget
 from .context_messages import is_execution_context
 from .read_result_reuse import ReadReuseStats, project_read_results
 from .session_history import MANAGED_HISTORY_BUDGETS, compact_history_body, history_turn_groups
@@ -143,6 +144,8 @@ class ContextWindowManager:
     # One allocation for all authored history, runtime facts and read payloads.
     # Zero disables this soft cap, not the Provider hard-window protection.
     history_soft_tokens: int = 16384
+    semantic_compaction: bool = False
+    skill_catalog_budget: SkillCatalogBudget = SkillCatalogBudget()
 
     def __post_init__(self) -> None:
         if not 0 < self.trigger_ratio < 1:
@@ -164,6 +167,9 @@ class ContextWindowManager:
         return {
             "algorithm": "provider-budget-managed-session",
             "version": 2,
+            "semantic_compaction": self.semantic_compaction,
+            "skill_catalog_ratio": self.skill_catalog_budget.ratio,
+            "skill_catalog_fallback_tokens": self.skill_catalog_budget.fallback_tokens,
             "trigger_ratio": self.trigger_ratio,
             "recent_message_floor": self.recent_message_floor,
             "latency_soft_input_tokens": self.latency_soft_input_tokens,
@@ -184,6 +190,7 @@ class ContextWindowManager:
         max_output_tokens: int,
         runtime_instruction: str | None = None,
         read_reuse_task_id: str | None = None,
+        defer_hard_limit_for_summary: bool = False,
     ) -> PreparedContext:
         if max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
@@ -233,13 +240,17 @@ class ContextWindowManager:
             (body := self._session_body(message)) is not None
             and body.get("history_budget") in MANAGED_HISTORY_BUDGETS
             for message in conversation
-        )
+        ) or any(message.message_id.startswith("window-history-") for message in conversation)
         history_pressure = self.history_soft_tokens and managed_history and any(
             item.name == "session_history" and item.estimated_tokens > self.history_soft_tokens
             for item in before_allocations
         )
         if not budget.should_compact and not history_pressure:
             return self._prepared(conversation, budget, None, read_reuse_task_id)
+        if history_pressure:
+            history_tokens = sum(item.estimated_tokens for item in before_allocations if item.name == "session_history")
+            budget = replace(budget, trigger_tokens=min(budget.trigger_tokens,
+                before - history_tokens + self.history_soft_tokens + max_output_tokens))
 
         compacted, receipt = self._compact(
             conversation, tools, prompt_template, budget, runtime_instruction,
@@ -251,7 +262,7 @@ class ContextWindowManager:
         )
         if receipt is not None:
             receipt = replace(receipt, after_estimated_tokens=after)
-        if after > budget.hard_input_tokens:
+        if after > budget.hard_input_tokens and not (defer_hard_limit_for_summary and receipt is not None):
             allocation_summary = ", ".join(
                 f"{item.name}={item.estimated_tokens}"
                 for item in sorted(
@@ -350,7 +361,7 @@ class ContextWindowManager:
                 "task-spec-context-", "conversation-environment-context-",
             )):
                 bucket = "project_context"
-            elif message.message_id.startswith(("session-context-", "session-history-", "session-facts-")):
+            elif message.message_id.startswith(("session-context-", "session-history-", "session-facts-", "window-history-")):
                 bucket = "session_history"
             elif message.message_id.startswith("working-memory-context-") or is_execution_context(message.message_id):
                 bucket = "working_memory"
@@ -779,6 +790,7 @@ class ContextWindowManager:
                     and not message.message_id.startswith((
                         "context-summary-", "project-onboarding-context-",
                         "project-memory-context-", "document-references-context-",
+                        "window-context-", "window-history-", "session-history-", "session-facts-",
                     )))
                    or message.message_id.startswith((
             "session-context-", "working-memory-context-", "execution-context-",
@@ -818,7 +830,24 @@ class ContextWindowManager:
                 continue
             groups.append((message,))
             index += 1
-        return tuple(groups)
+        # Previous user turns restored from a window are indivisible history:
+        # preserve their user input, tool protocol and final reply together.
+        merged: list[tuple[Message, ...]] = []
+        historical_turn: list[Message] = []
+        for group in groups:
+            first = group[0]
+            historical = first.message_id.startswith(("window-history-", "session-history-", "session-facts-"))
+            starts_turn = historical and first.role is MessageRole.USER and not first.message_id.startswith("session-facts-")
+            if historical_turn and (starts_turn or not historical):
+                merged.append(tuple(historical_turn))
+                historical_turn = []
+            if starts_turn or historical_turn:
+                historical_turn.extend(group)
+            else:
+                merged.append(group)
+        if historical_turn:
+            merged.append(tuple(historical_turn))
+        return tuple(merged)
 
     @classmethod
     def _summary_message(cls, messages: tuple[Message, ...]) -> Message:

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from tsm_agt.core.context import ContextWindowManager
 from tsm_agt.core.session_context import SessionContextProjector
+from tsm_agt.core.skills import SkillCatalogBudget
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,8 +27,12 @@ class ContextConfiguration:
     sources: Mapping[str, str] | None = None
     conversation_history_format: str = "native"
     history_soft_tokens: int = 16384
+    semantic_compaction: bool = True
+    skill_catalog_ratio: float = 0.02
+    skill_catalog_fallback_tokens: int = 2048
 
     def __post_init__(self) -> None:
+        SkillCatalogBudget(self.skill_catalog_ratio, self.skill_catalog_fallback_tokens)
         if self.conversation_history_format not in {"native", "json"}:
             raise ValueError("session.history_format must be native or json")
         if not 0 < self.compaction_ratio < 1:
@@ -68,6 +73,8 @@ def context_window_manager(
         latency_soft_input_tokens=configuration.latency_soft_tokens,
         recent_message_floor=configuration.recent_message_floor,
         history_soft_tokens=configuration.history_soft_tokens,
+        semantic_compaction=configuration.semantic_compaction,
+        skill_catalog_budget=SkillCatalogBudget(configuration.skill_catalog_ratio, configuration.skill_catalog_fallback_tokens),
     )
 
 
@@ -98,6 +105,9 @@ def load_context_configuration(document: Mapping[str, object]) -> ContextConfigu
     if not isinstance(history_format, str):
         raise ValueError("session.history_format must be a string")
     history_soft_tokens = _nonnegative_int(values.get("history_soft_tokens"), "context.history_soft_tokens", defaults.history_soft_tokens)
+    semantic_compaction = values.get("semantic_compaction", defaults.semantic_compaction)
+    if not isinstance(semantic_compaction, bool):
+        raise ValueError("context.semantic_compaction must be true or false")
     return ContextConfiguration(
         compaction_ratio=ratio,
         latency_soft_tokens=soft_tokens,
@@ -106,6 +116,9 @@ def load_context_configuration(document: Mapping[str, object]) -> ContextConfigu
         recent_message_floor=recent_message_floor,
         conversation_history_format=history_format,
         history_soft_tokens=history_soft_tokens,
+        semantic_compaction=semantic_compaction,
+        skill_catalog_ratio=_number(values.get("skill_catalog_ratio"), "context.skill_catalog_ratio", defaults.skill_catalog_ratio),
+        skill_catalog_fallback_tokens=_positive_int(values.get("skill_catalog_fallback_tokens"), "context.skill_catalog_fallback_tokens", defaults.skill_catalog_fallback_tokens),
         sources={
             "context.compaction_ratio": "yaml" if "compaction_ratio" in values else "default",
             "context.latency_soft_tokens": "yaml" if "latency_soft_tokens" in values else "default",
@@ -114,6 +127,9 @@ def load_context_configuration(document: Mapping[str, object]) -> ContextConfigu
             "session.task_summaries": "yaml" if "task_summaries" in session else "default",
             "session.history_format": "yaml" if "history_format" in session else "default",
             "context.history_soft_tokens": "yaml" if "history_soft_tokens" in values else "default",
+            "context.semantic_compaction": "yaml" if "semantic_compaction" in values else "default",
+            "context.skill_catalog_ratio": "yaml" if "skill_catalog_ratio" in values else "default",
+            "context.skill_catalog_fallback_tokens": "yaml" if "skill_catalog_fallback_tokens" in values else "default",
         },
     )
 

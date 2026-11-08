@@ -13,6 +13,7 @@ from tsm_agt.ports import (
 )
 
 DISCOVERY_TOOL = "core.mcp_discover"
+from tsm_agt.core.mcp_call import MCP_CALL_TOOL, schema_hash
 _OVERVIEW_LIMIT = 20
 _DESCRIPTION_LIMIT = 256
 
@@ -36,15 +37,17 @@ def _server_entries(
 def discovery_spec(
     manager: MCPClientManager, statuses: Mapping[str, Mapping[str, Any]],
 ) -> ToolSpec:
-    entries = _server_entries(manager, statuses)
+    entries = [{"kind": "server", "id": name,
+                "description": manager.server_config(name).description[:_DESCRIPTION_LIMIT]}
+               for name in sorted(manager.server_ids())]
     return ToolSpec(
         name=DISCOVERY_TOOL,
         description=(
             "Discover configured MCP integrations, their connection state, and tool names. "
             "Use this entry point when an integration may provide the capability you need, "
             "including tools missing from the current tool list. Do not search private "
-            "configuration files for connection details. Successful discovery refreshes "
-            "the callable tool definitions for the next model request. "
+            "configuration files for connection details. Returns input schemas for "
+            "matching tools; invoke them through core.mcp_call. "
             "Optionally wait up to 5 seconds for existing background initialization; "
             "waiting does not restart or cancel a connection. Use next_offset for more entries. "
             "This only observes the catalog; it does not invoke a remote business tool."
@@ -99,6 +102,8 @@ async def discover(
         "kind": "tool", "name": spec.name,
         "server_id": spec.name.split(".", 2)[1],
         "description": spec.description[:_DESCRIPTION_LIMIT],
+        "parameters": dict(spec.parameters), "schema_hash": schema_hash(spec),
+        "call_tool": MCP_CALL_TOOL,
     } for spec in tools())
     if server_id is not None:
         entries = [entry for entry in entries if entry.get("server_id", entry.get("id")) == server_id]

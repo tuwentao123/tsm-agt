@@ -46,7 +46,7 @@ def test_legacy_outcome_wait_retires_on_restart_and_normal_input_continues():
                 return instance
 
             first = await client(ScriptedModel([
-                tool_response("write", "once", "mcp.p0.write", {}),
+                tool_response("write", "once", "core.mcp_call", {"tool_name": "mcp.p0.write", "arguments_json": "{}"}),
                 text_response("unknown", "The response was lost."),
             ]))
             try:

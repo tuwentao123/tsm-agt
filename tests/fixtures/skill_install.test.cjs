@@ -91,7 +91,7 @@ function setup(responses, {modalOpen = true, sidebar = true} = {}) {
 
 const file = {name: 'SKILL.md', webkitRelativePath: 'demo/SKILL.md'};
 const response = (data, status = 200) => ({ok: status < 400, status, json: async () => data});
-const installed = name => response({installed: true, skill: {name, plan_path: `/home/.tsm-agent/skills/${name}/SKILL.md`}});
+const installed = name => response({installed: true, loadable: true, skill: {name, plan_path: `/home/.tsm-agent/skills/${name}/SKILL.md`}});
 const catalog = (...names) => response({skills: names.map(name => ({name, description: 'Demo'})), issues: []});
 
 // Settings cards nest controls inside header/footer, so tests locate them by tag.
@@ -122,42 +122,35 @@ test('built-in workflow controls preserve source labels and persist disablement 
   assert.equal(findElement(s.nodes.get('skill-builtin-catalog'), 'input').checked, false);
 });
 
-test('saved files start preparation and open the new recent-workspace conversation when ready', async () => {
-  const job = {id: 'install-one', skill_name: 'demo', status: 'starting', summary: '正在检查',
-    session_id: 'install-chat', workspace_id: 'recent', workspace_path: '/recent', created_at: '2026-10-22T08:00:00Z'};
+test('file import stays in settings without preparation, SSE or opening a conversation', async () => {
+  const job = {id: 'install-one', skill_name: 'demo', status: 'installed', summary: '未执行指令或准备环境'};
   const state = setup([
-    response({installed: true, skill: {name: 'demo', plan_path: '/skills/demo/SKILL.md'}, installation: job}),
+    response({installed: true, loadable: true, skill: {name: 'demo', plan_path: '/skills/demo/SKILL.md'}, installation: job}),
     catalog('demo'),
   ]);
   await state.context.uploadSkillDirectoryAndInstall([file]);
-  assert.match(state.nodes.get('skill-settings-status').textContent, /文件已保存 demo/);
-  assert.doesNotMatch(state.nodes.get('skill-settings-status').textContent, /已安装 demo/);
-  assert.match(state.nodes.get('skill-installations').textContent, /正在创建安装会话/);
+  assert.match(state.nodes.get('skill-settings-status').textContent, /已安装 · 可加载 demo/);
+  assert.match(state.nodes.get('skill-settings-status').textContent, /未执行指令或准备环境/);
+  assert.match(state.nodes.get('skill-installations').textContent, /文件导入完成/);
   assert.equal(state.opened.length, 0);
-  assert.equal(state.streams.length, 1);
-  assert.match(state.streams[0].url, /install-one\/events$/);
-  state.streams[0].emit({...job, status: 'ready', task_id: 'install-task', summary: '无需安装环境', checks: ['SKILL.md 已读取，无前置依赖']}, false);
-  assert.match(state.nodes.get('skill-installations').textContent, /安装成功，验证通过/);
-  assert.match(state.nodes.get('skill-installations').textContent, /无前置依赖/);
-  assert.deepEqual(state.opened, ['install-chat']);
-  assert.equal(state.conversations[0].workspaceId, 'recent');
-  assert.equal(vm.runInContext('activeConversationId', state.context), 'install-chat');
-  assert.equal(state.nodes.get('skill-settings-dialog').open, false);
+  assert.equal(state.streams.length, 0);
+  assert.deepEqual(state.conversations, []);
+  assert.equal(state.nodes.get('skill-settings-dialog').open, true);
   assert.equal(state.timers.length, 0);
-  assert.equal(state.streams[0].closed, true);
 });
 
-test('offline preparation remains pending and the retry action starts a new preparation', async () => {
+test('historical pending receipt can confirm file import without starting preparation', async () => {
   const job = {id: 'pending-one', skill_name: 'demo', status: 'pending', summary: '运行时不可用'};
-  const state = setup([response({...job, status: 'starting', summary: '正在创建'})]);
+  const state = setup([response({...job, status: 'installed', summary: '未执行指令或准备环境'})]);
   state.context.renderSkillInstallations([job]);
   assert.match(state.nodes.get('skill-installations').textContent, /准备待启动/);
   assert.equal(state.timers.length, 0);
-  const retry = state.nodes.get('skill-installations').children[0].children.find(row => row.textContent === '重试准备');
+  const retry = state.nodes.get('skill-installations').children[0].children.find(row => row.textContent === '确认文件安装');
   await retry.onclick();
   assert.match(state.requests[0].url, /pending-one\/retry$/);
-  assert.match(state.nodes.get('skill-installations').textContent, /正在创建安装会话/);
-  assert.equal(state.streams.length, 1);
+  assert.match(state.nodes.get('skill-installations').textContent, /文件导入完成/);
+  assert.equal(state.streams.length, 0);
+  assert.deepEqual(state.opened, []);
 });
 
 test('lost progress connection retries without turning saved files into a failed upload', async () => {
@@ -179,11 +172,11 @@ test('install two Skills in settings, update catalog and preserve unsaved direct
   vm.runInContext("skillSettingsDirectories = ['/unsaved/skills']", state.context);
   const input = {value: 'selected'};
   await state.context.uploadSkillDirectoryAndInstall([file], input);
-  assert.match(state.nodes.get('skill-settings-status').textContent, /已安装 one/);
+  assert.match(state.nodes.get('skill-settings-status').textContent, /已安装 · 可加载 one/);
   assert.equal(input.value, '');
   input.value = 'selected-again';
   await state.context.uploadSkillDirectoryAndInstall([file], input);
-  assert.match(state.nodes.get('skill-settings-status').textContent, /已安装 two/);
+  assert.match(state.nodes.get('skill-settings-status').textContent, /已安装 · 可加载 two/);
   assert.match(state.nodes.get('skill-discovered-catalog').textContent, /已发现 2 个 Skill/);
   assert.equal(vm.runInContext('skillSettingsDirectories[0]', state.context), '/unsaved/skills');
   assert.equal(state.nodes.get('error-banner').classList.contains('visible'), false);
@@ -194,7 +187,7 @@ test('install two Skills in settings, update catalog and preserve unsaved direct
 test('sidebar install works without a settings refresh', async () => {
   const state = setup([installed('demo')], {modalOpen: false});
   await state.context.uploadSkillDirectoryAndInstall([file]);
-  assert.match(state.nodes.get('skill-install-status').textContent, /已安装 demo/);
+  assert.match(state.nodes.get('skill-install-status').textContent, /已安装 · 可加载 demo/);
   assert.equal(state.requests.length, 1);
   assert.equal(state.nodes.get('error-banner').classList.contains('visible'), false);
 });
@@ -203,17 +196,17 @@ test('catalog refresh failure preserves success and displays a refresh warning',
   const state = setup([installed('demo'), new Error('offline')]);
   await state.context.uploadSkillDirectoryAndInstall([file]);
   const message = state.nodes.get('skill-settings-status').textContent;
-  assert.match(message, /已安装 demo/);
+  assert.match(message, /已安装 · 可加载 demo/);
   assert.match(message, /目录列表刷新失败/);
   assert.ok(message.includes('\n'), 'warnings must use real newlines');
   assert.equal(state.nodes.get('error-banner').classList.contains('visible'), false);
 });
 
 test('server refresh warning remains visible on a successful installation', async () => {
-  const result = response({installed: true, skill: {name: 'demo', plan_path: '/skills/demo/SKILL.md'}, warnings: ['runtime catalog unavailable']});
+  const result = response({installed: true, loadable: true, skill: {name: 'demo', plan_path: '/skills/demo/SKILL.md'}, warnings: ['runtime catalog unavailable']});
   const state = setup([result, catalog('demo')]);
   await state.context.uploadSkillDirectoryAndInstall([file]);
-  assert.match(state.nodes.get('skill-settings-status').textContent, /已安装 demo/);
+  assert.match(state.nodes.get('skill-settings-status').textContent, /已安装 · 可加载 demo/);
   assert.match(state.nodes.get('skill-settings-status').textContent, /runtime catalog unavailable/);
 });
 
@@ -226,7 +219,7 @@ test('changed duplicate is reported; retry clears the stale error and can succee
   assert.equal(state.nodes.get('error-banner').classList.contains('visible'), true);
   await state.context.uploadSkillDirectoryAndInstall([file], input);
   assert.equal(state.nodes.get('error-banner').classList.contains('visible'), false);
-  assert.match(state.nodes.get('skill-settings-status').textContent, /已安装 demo/);
+  assert.match(state.nodes.get('skill-settings-status').textContent, /已安装 · 可加载 demo/);
 });
 
 test('non-JSON, malformed success and interrupted upload each recover the controls', async () => {
@@ -283,4 +276,170 @@ test('clicking outside the settings panel closes it while panel clicks keep it o
   state.context.trackSkillSettingsBackdropPress({target: dialog, currentTarget: dialog});
   state.context.handleSkillSettingsBackdropClose({target: dialog, currentTarget: dialog});
   assert.equal(dialog.open, false, 'a backdrop press must close the panel');
+});
+
+const discovered = name => ({name, source: 'user', plan_path: `/external/skills/${name}/SKILL.md`, description: 'Demo'});
+const preparation = (name, status = 'installed') => ({id: `install-${name}`, skill_name: name, status, loadable: status === 'installed', plan_path: `/home/skills/${name}/SKILL.md`, source_plan_path: `/external/skills/${name}/SKILL.md`, summary: `${name} file import`});
+const discoveryData = (skills, installations = []) => ({skills, installations, issues: []});
+const discoveryControls = state => Array.from(vm.runInContext('discoverySkillControls.values()', state.context));
+const discoveryToolbar = state => state.nodes.get('skill-discovered-catalog').children[0];
+const selectAllDiscovery = state => {
+  const checkbox = findElement(discoveryToolbar(state), 'input');
+  checkbox.checked = true;
+  checkbox.onchange();
+};
+const discoveryReceipt = (skill, job = preparation(skill.name)) => response({
+  installed: true, loadable: job.loadable === true, skill: {...skill, plan_path: `/home/skills/${skill.name}/SKILL.md`}, installation: job,
+});
+
+test('discovery cards have selection and install actions; builtins and ready Skills are excluded', () => {
+  const state = setup([]);
+  state.context.renderSkillCatalog(discoveryData([
+    discovered('one'), discovered('two'), {name: 'builtin', source: 'builtin'}, discovered('ready'),
+  ], [preparation('ready', 'ready')]));
+  const controls = discoveryControls(state);
+  assert.equal(controls.length, 4);
+  assert.ok(controls.every(row => row.checkbox.tag === 'input' && row.button.tag === 'button'));
+  assert.equal(controls[0].checkbox.getAttribute('aria-label'), '选择 one');
+  assert.equal(controls[0].button.textContent, '安装');
+  assert.equal(controls[2].button.textContent, '无需安装');
+  assert.equal(controls[3].button.textContent, '已安装');
+  assert.equal(controls[2].checkbox.disabled, true);
+  assert.equal(controls[3].checkbox.disabled, true);
+  assert.equal(findElement(discoveryToolbar(state), 'button').disabled, true);
+  controls[0].checkbox.checked = true;
+  controls[0].checkbox.onchange();
+  const all = findElement(discoveryToolbar(state), 'input');
+  assert.equal(all.indeterminate, true);
+  assert.equal(all.checked, false);
+  selectAllDiscovery(state);
+  assert.deepEqual(controls.map(row => row.checkbox.checked), [true, true, false, false]);
+  assert.equal(all.indeterminate, false);
+  assert.equal(all.checked, true);
+  assert.equal(findElement(discoveryToolbar(state), 'button').textContent, '全部安装');
+  all.checked = false;
+  all.onchange();
+  assert.ok(controls.every(row => !row.checkbox.checked));
+  assert.equal(findElement(discoveryToolbar(state), 'button').disabled, true);
+});
+
+test('single discovery install submits its manifest and immediately records import without model dispatch', async () => {
+  const skill = discovered('one');
+  const job = preparation('one');
+  const state = setup([discoveryReceipt(skill, job), response(discoveryData([skill], [job]))]);
+  state.context.renderSkillCatalog(discoveryData([skill]));
+  await discoveryControls(state)[0].button.onclick();
+  assert.equal(state.requests[0].url, '/skills/install');
+  assert.equal(state.requests[0].options.method, 'POST');
+  assert.deepEqual(JSON.parse(state.requests[0].options.body), {plan_path: skill.plan_path});
+  assert.equal(state.requests[1].url, '/settings/skills');
+  assert.equal(discoveryControls(state)[0].button.disabled, true);
+  assert.doesNotMatch(state.nodes.get('skill-settings-status').textContent, /验证通过/);
+  assert.equal(state.streams.length, 0);
+  assert.equal(discoveryControls(state)[0].button.textContent, '已安装 · 可加载');
+  assert.match(state.nodes.get('skill-settings-status').textContent, /未执行指令或准备环境/);
+  assert.equal(state.nodes.get('skill-settings-dialog').open, true);
+  assert.deepEqual(state.opened, []);
+  assert.equal(discoveryControls(state)[0].checkbox.disabled, true);
+});
+
+test('select all installs sequentially, prevents duplicate clicks and keeps each preparation in settings', async () => {
+  const one = discovered('one'), two = discovered('two');
+  const jobs = [preparation('one'), preparation('two')];
+  let finish;
+  const state = setup([
+    () => new Promise(resolve => {finish = resolve;}), discoveryReceipt(two, jobs[1]),
+    response(discoveryData([one, two], jobs)),
+  ]);
+  vm.runInContext("skillSettingsDirectories = ['/unsaved/skills']", state.context);
+  state.context.renderSkillCatalog(discoveryData([one, two, {name: 'builtin', source: 'builtin'}]));
+  selectAllDiscovery(state);
+  const batch = findElement(discoveryToolbar(state), 'button');
+  const first = batch.onclick();
+  assert.equal(state.requests.length, 1);
+  assert.ok(discoveryControls(state).every(row => row.checkbox.disabled && row.button.disabled));
+  assert.equal(batch.disabled, true);
+  await batch.onclick();
+  await state.context.uploadSkillDirectoryAndInstall([file]);
+  assert.equal(state.requests.length, 1, 'shared busy state must prevent another install or upload');
+  finish(discoveryReceipt(one, jobs[0]));
+  await first;
+  assert.deepEqual(state.requests.filter(row => row.options?.method === 'POST').map(row => JSON.parse(row.options.body).plan_path), [one.plan_path, two.plan_path]);
+  assert.match(state.nodes.get('skill-settings-status').textContent, /可加载 2\/2/);
+  assert.equal(state.streams.length, 0);
+  assert.equal(vm.runInContext('selectedDiscoverySkills.size', state.context), 0);
+  assert.equal(vm.runInContext('skillSettingsDirectories[0]', state.context), '/unsaved/skills');
+  assert.equal(vm.runInContext('skillInstallInFlight', state.context), false);
+  assert.equal(state.nodes.get('skill-settings-dialog').open, true);
+  assert.deepEqual(state.opened, []);
+});
+
+test('partial failure continues the batch, preserves failed selection and allows a clean retry', async () => {
+  const one = discovered('one'), two = discovered('two');
+  const state = setup([
+    response({detail: '同名 Skill 内容不同'}, 409), discoveryReceipt(two),
+    response(discoveryData([one, two], [preparation('two')])),
+    discoveryReceipt(one), response(discoveryData([one, two], [preparation('one'), preparation('two')])),
+  ]);
+  state.context.renderSkillCatalog(discoveryData([one, two]));
+  selectAllDiscovery(state);
+  await findElement(discoveryToolbar(state), 'button').onclick();
+  assert.match(state.nodes.get('skill-settings-status').textContent, /可加载 1\/2/);
+  assert.match(discoveryControls(state)[0].status.textContent, /同名 Skill 内容不同/);
+  assert.equal(discoveryControls(state)[0].checkbox.checked, true);
+  assert.equal(discoveryControls(state)[1].checkbox.checked, false);
+  assert.equal(discoveryControls(state)[0].button.disabled, false);
+  await discoveryControls(state)[0].button.onclick();
+  assert.doesNotMatch(discoveryControls(state)[0].status.textContent, /内容不同/);
+  assert.equal(vm.runInContext('selectedDiscoverySkills.size', state.context), 0);
+});
+
+test('historical pending discovery imports the source through the common install endpoint', async () => {
+  const skill = discovered('pending');
+  const state = setup([discoveryReceipt(skill), response(discoveryData([skill], [preparation('pending')]))]);
+  state.context.renderSkillCatalog(discoveryData([skill], [preparation('pending', 'pending')]));
+  assert.equal(discoveryControls(state)[0].button.textContent, '安装');
+  await discoveryControls(state)[0].button.onclick();
+  assert.equal(state.requests[0].url, '/skills/install');
+  assert.deepEqual(JSON.parse(state.requests[0].options.body), {plan_path: skill.plan_path});
+  assert.equal(state.streams.length, 0);
+  assert.equal(discoveryControls(state)[0].button.disabled, true);
+  assert.deepEqual(state.opened, []);
+});
+
+test('interrupted discovery request reports unknown outcome and releases all controls', async () => {
+  const skill = discovered('one');
+  const state = setup([new Error('network interrupted')]);
+  state.context.renderSkillCatalog(discoveryData([skill]));
+  await discoveryControls(state)[0].button.onclick();
+  assert.match(state.nodes.get('skill-settings-status').textContent, /结果尚未确认/);
+  assert.equal(state.requests.length, 1, 'must not automatically duplicate an unknown-outcome install');
+  assert.equal(discoveryControls(state)[0].button.disabled, false);
+  assert.equal(vm.runInContext('skillInstallInFlight', state.context), false);
+});
+
+test('refresh preserves current selection and removes vanished skills; an empty list cannot install', () => {
+  const state = setup([]);
+  state.context.renderSkillCatalog(discoveryData([discovered('one'), discovered('two')]));
+  selectAllDiscovery(state);
+  state.context.renderSkillCatalog(discoveryData([discovered('two')]));
+  assert.equal(vm.runInContext('selectedDiscoverySkills.size', state.context), 1);
+  assert.equal(discoveryControls(state)[0].checkbox.checked, true);
+  state.context.renderSkillCatalog(discoveryData([]));
+  assert.equal(vm.runInContext('selectedDiscoverySkills.size', state.context), 0);
+  assert.equal(findElement(discoveryToolbar(state), 'input').disabled, true);
+  assert.equal(findElement(discoveryToolbar(state), 'button').disabled, true);
+});
+
+
+test('failed load validation preserves imported files and permits retry without claiming loadability', async () => {
+  const skill = discovered('broken');
+  const job = {...preparation('broken'), loadable: false};
+  const state = setup([discoveryReceipt(skill, job), response(discoveryData([skill], [job]))]);
+  state.context.renderSkillCatalog(discoveryData([skill]));
+  await discoveryControls(state)[0].button.onclick();
+  assert.equal(discoveryControls(state)[0].button.disabled, false);
+  assert.equal(discoveryControls(state)[0].button.textContent, '已导入 · 重试加载');
+  assert.match(state.nodes.get('skill-settings-status').textContent, /可加载 0\/1/);
+  assert.equal(state.streams.length, 0);
 });

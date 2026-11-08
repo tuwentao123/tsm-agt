@@ -43,6 +43,49 @@ class Client:
 
 
 class MCPDiscoveryTest(unittest.IsolatedAsyncioTestCase):
+    async def test_gateway_rejects_bad_payloads_and_authorizes_actual_target(self):
+        class ValidatingClient(Client):
+            calls = 0
+            async def list_tools(self):
+                return [SimpleNamespace(name="query", description="Query one integer", inputSchema={
+                    "type": "object", "properties": {"value": {"type": "integer"}},
+                    "required": ["value"], "additionalProperties": False,
+                })]
+            async def call_tool(self, name, arguments):
+                self.calls += 1
+                raise AssertionError("invalid or denied calls must not reach the server")
+        client = ValidatingClient()
+        provider = await self.make_provider(client)
+        await provider.wait_ready()
+        target = "mcp.reports.query"
+        model = ScriptedModel([
+            tool_response("bad-json", "bad-json", "core.mcp_call", {"tool_name": target, "arguments_json": "[]"}),
+            tool_response("bad-args", "bad-args", "core.mcp_call", {"tool_name": target, "arguments_json": '{"value":"wrong"}'}),
+            tool_response("changed", "changed", "core.mcp_call", {"tool_name": target, "arguments_json": '{"value":1}', "schema_hash": "old"}),
+            tool_response("wrong-target", "wrong-target", "core.mcp_call", {"tool_name": "core.run_command", "arguments_json": "{}"}),
+            tool_response("valid", "valid", "core.mcp_call", {"tool_name": target, "arguments_json": '{"value":1}'}),
+            text_response("done", "The operation was denied."),
+        ])
+        app = compose_fixture_application(model_adapter=model, tool_adapters=(provider,))
+        await app.start()
+        self.addAsyncCleanup(app.registry.stop_all)
+        with tempfile.TemporaryDirectory() as directory:
+            task = await _executing(app, Path(directory))
+            outcome = await app.kernel.run_agent_turn(task.task_id, "Query the configured service")
+            self.assertIsInstance(outcome, AgentTurnSuspended)
+            pending = await app.kernel.get_task(task.task_id)
+            self.assertEqual(pending.pending_approval.call.name, target)
+            self.assertEqual(pending.pending_approval.call.arguments, {"value": 1})
+            errors = {block.result.call_id: block.result.error_code
+                      for message in model.requests[-1].messages for block in message.content
+                      if isinstance(block, ToolResultBlock)}
+            self.assertEqual(errors["bad-json"], "INVALID_PARAM")
+            self.assertEqual(errors["bad-args"], "INVALID_PARAM")
+            self.assertEqual(errors["changed"], "MCP_SCHEMA_CHANGED")
+            self.assertIn(errors["wrong-target"], {"INVALID_PARAM", "INVALID_ARGUMENT"})
+            await app.kernel.resolve_agent_approval(outcome.approval_request_id, ApprovalDecision.DENY, "deny fixture")
+            self.assertEqual(client.calls, 0)
+
     async def make_provider(self, client, *, gate=None, config=None):
         async def factory(_config):
             if gate is not None:
@@ -74,7 +117,7 @@ class MCPDiscoveryTest(unittest.IsolatedAsyncioTestCase):
         request = model.requests[0]
         self.assertIn(DISCOVERY_TOOL, {tool.name for tool in request.tools})
         context = next(message.text for message in request.messages if "Available MCP Servers" in message.text)
-        self.assertIn('"state": "connecting"', context)
+        self.assertNotIn('"state"', context)
         self.assertIn("Query data dashboards", context)
         serialized = context + json.dumps([spec.to_data() for spec in request.tools])
         for private in ("example.invalid", "ACCESS_KEY", "private-test-key", "private-header"):
@@ -157,7 +200,14 @@ class MCPDiscoveryTest(unittest.IsolatedAsyncioTestCase):
             task = await _executing(app, Path(directory))
             await app.kernel.run_agent_turn(task.task_id, "Inspect available tools and files")
         self.assertNotIn("mcp.reports.report_0", {spec.name for spec in model.requests[0].tools})
-        self.assertIn("mcp.reports.report_0", {spec.name for spec in model.requests[1].tools})
+        self.assertNotIn("mcp.reports.report_0", {spec.name for spec in model.requests[1].tools})
+        self.assertIn("core.mcp_call", {spec.name for spec in model.requests[1].tools})
+        discovered = [block.result for message in model.requests[1].messages
+                      for block in message.content if isinstance(block, ToolResultBlock)
+                      and block.result.call_id == "discover"]
+        entry = next(row for row in discovered[0].data["entries"] if row["kind"] == "tool")
+        self.assertEqual(entry["name"], "mcp.reports.report_0")
+        self.assertEqual(entry["parameters"], {"type": "object"})
         results = [block.result.call_id for message in model.requests[1].messages
                    for block in message.content if isinstance(block, ToolResultBlock)]
         self.assertEqual(results[-2:], ["discover", "files"])
@@ -184,7 +234,9 @@ class MCPDiscoveryTest(unittest.IsolatedAsyncioTestCase):
 
         model = LateModel([
             tool_response("discover", "discover", DISCOVERY_TOOL, {"server_id": "demo"}),
-            tool_response("add", "add", "mcp.demo.add", {"a": 2, "b": 5}),
+            tool_response("add", "add", "core.mcp_call", {
+                "tool_name": "mcp.demo.add", "arguments_json": '{"a": 2, "b": 5}',
+            }),
         ])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -199,7 +251,10 @@ class MCPDiscoveryTest(unittest.IsolatedAsyncioTestCase):
                     outcome = await app.kernel.run_agent_turn(task.task_id, "Add 2 and 5 using configured tools")
                     self.assertIsInstance(outcome, AgentTurnSuspended)
                     self.assertNotIn("mcp.demo.add", {spec.name for spec in model.requests[0].tools})
-                    self.assertIn("mcp.demo.add", {spec.name for spec in model.requests[1].tools})
+                    self.assertNotIn("mcp.demo.add", {spec.name for spec in model.requests[1].tools})
+                    self.assertIn("core.mcp_call", {spec.name for spec in model.requests[1].tools})
+                    checkpoint = (await app.kernel.get_task(task.task_id)).active_agent_checkpoint
+                    self.assertEqual(checkpoint["tool_batch"]["calls"][0]["name"], "core.mcp_call")
                     events = await app.kernel.dependencies.store.read_events(task.task_id)
                     refresh = next(event for event in events if event.event_type == "tools.catalog_refreshed")
                     self.assertIn("mcp.demo.add", refresh.payload["added_tools"])

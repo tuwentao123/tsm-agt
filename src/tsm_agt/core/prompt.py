@@ -338,6 +338,7 @@ class PromptTemplate:
             and not message.message_id.startswith((
                 "project-instructions-context-", "task-spec-context-",
                 "conversation-environment-context-",
+                "window-system-",
             ))
             for message in conversation
         ):
@@ -457,6 +458,11 @@ class PromptTemplate:
             + document_reference_messages + working_memory_messages
             + ordinary_conversation + execution_messages
         )
+        if any(message.message_id.startswith("window-context-root-") for message in conversation):
+            # The loop has already rendered and persisted its baseline. Keep
+            # chronological updates in place; do not regenerate catalogs or
+            # move a later project instruction ahead of older history.
+            messages = system_messages + conversation + runtime_messages
         manifest = self.manifest()
         tool_data = tuple(sorted((
             {

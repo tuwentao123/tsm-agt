@@ -1,6 +1,7 @@
 """Settings-panel contracts for the read-only MCP status report."""
 from __future__ import annotations
 
+import inspect
 import sys
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from tsm_agt.bootstrap.mcp_status import (
+    DEFAULT_PROBE_TIMEOUT_SECONDS,
     describe_mcp_servers,
     mcp_configuration_summary,
 )
@@ -69,6 +71,17 @@ class McpStatusTests(unittest.IsolatedAsyncioTestCase):
 
 
 class McpSettingsRouteTests(unittest.TestCase):
+    def test_probe_budget_defaults_to_fifteen_seconds(self) -> None:
+        # The route calls describe_mcp_servers without timeout_seconds, so the
+        # module default is the budget the settings panel really uses.
+        default = (
+            inspect.signature(describe_mcp_servers)
+            .parameters["timeout_seconds"]
+            .default
+        )
+        self.assertEqual(DEFAULT_PROBE_TIMEOUT_SECONDS, 15.0)
+        self.assertEqual(default, DEFAULT_PROBE_TIMEOUT_SECONDS)
+
     def test_route_reports_configuration_without_probing(self) -> None:
         document = _document()
         with patch.object(

@@ -312,7 +312,7 @@ model:
                     "code.symbol_overview", "code.definition",
                     "code.references", "code.implementations",
                     "code.workspace_symbols", "code.diagnostics",
-                    "code.rename_preview", "core.request_input", "skill.load",
+                    "code.rename_preview", "core.request_input", "skill.load", "skill.discover",
                 ],
             )
             self.assertIsNotNone(
@@ -565,6 +565,8 @@ model:
 context:
   compaction_ratio: 0.75
   latency_soft_tokens: 60000
+  skill_catalog_ratio: 0.03
+  skill_catalog_fallback_tokens: 3000
 ''',
                 encoding="utf-8",
             )
@@ -577,6 +579,9 @@ context:
             manager = application.kernel.dependencies.context_manager
             self.assertEqual(manager.trigger_ratio, 0.75)
             self.assertEqual(manager.latency_soft_input_tokens, 60_000)
+            self.assertEqual(manager.skill_catalog_budget.ratio, 0.03)
+            self.assertEqual(manager.skill_catalog_budget.fallback_tokens, 3000)
+            self.assertEqual(manager.snapshot_data()["skill_catalog_ratio"], 0.03)
             self.assertEqual(
                 application.kernel.dependencies.configuration_metadata["sources"][
                     "context.compaction_ratio"

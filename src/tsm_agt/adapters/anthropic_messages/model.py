@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from tsm_agt.adapters.request_prefix import observe_request_prefix
 from collections.abc import AsyncIterator, Mapping
 from datetime import datetime
 from typing import Any
@@ -159,6 +160,7 @@ class AnthropicMessagesModelProvider:
         if not self._started:
             raise RuntimeError("adapter is not started")
         payload, provider_to_internal = self._build_payload(request)
+        await observe_request_prefix(self, request, payload)
         response = await self._transport.post_json(
             self._messages_url(), self._headers(), payload,
             request.timeout_seconds or self._timeout_seconds,
@@ -182,6 +184,7 @@ class AnthropicMessagesModelProvider:
             return
         payload, provider_to_internal = self._build_payload(request)
         payload["stream"] = True
+        await observe_request_prefix(self, request, payload)
         text_parts: list[str] = []
         tool_parts: dict[int, dict[str, Any]] = {}
         message_id: str | None = None

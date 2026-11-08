@@ -15,6 +15,7 @@ from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import PromptTemplate
 from tsm_agt.core.context import ContextWindowManager
 from tsm_agt.core.skills import SkillRegistry
+from tsm_agt.core.conversation_loop.loop import select_model_tools
 from tsm_agt.ports import Message, MessageRole, TextBlock, ToolCall, ToolResultBlock
 from tests.test_conversation_loop import ScriptedModel, _executing, text_response, tool_response
 
@@ -30,7 +31,8 @@ class BundledSkillsTest(unittest.IsolatedAsyncioTestCase):
     async def test_fresh_home_loads_shipped_skill_and_reference_without_installation(self):
         await self.provider.start(None)
         spec = next(t for t in await self.provider.list_tools() if t.name == "skill.load")
-        self.assertEqual(spec.parameters["properties"]["name"]["enum"], ["verify-change"])
+        self.assertNotIn("enum", spec.parameters["properties"]["name"])
+        self.assertEqual([row["name"] for row in spec.model_context["skills"]], ["verify-change"])
         revision = spec.model_context["revision"]
         result = await self.provider.invoke(ToolCall("load", "skill.load", {
             "name": "verify-change", "catalog_revision": revision,
@@ -101,7 +103,7 @@ class BundledSkillsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(model.requests), 1, "the runtime must not force a continuation or verification call")
 
     async def test_compaction_regenerates_catalog_from_the_same_advertised_spec(self):
-        spec = (await self.provider.list_tools())[0]
+        spec = select_model_tools(await self.provider.list_tools(), user_text="", model_call=1, context_window=22000)[0]
         template = PromptTemplate.default()
         history = [Message("user", MessageRole.USER, (TextBlock("修复错误"),))]
         for i in range(16):
@@ -182,5 +184,10 @@ class BundledSkillsTest(unittest.IsolatedAsyncioTestCase):
         old = next(t for t in model.requests[0].tools if t.name == "skill.load").model_context
         new = next(t for t in model.requests[1].tools if t.name == "skill.load").model_context
         self.assertNotEqual(new["revision"], old["revision"])
-        self.assertEqual(new["skills"][0]["source"], "user")
-        self.assertIn(new["revision"], next(m.text for m in model.requests[1].messages if m.message_id == "tool-catalog-context-skill.load"))
+        self.assertEqual(new["skills"][0]["description"], "New user workflow")
+        changed = next(block.result for message in model.requests[1].messages for block in message.content
+                       if isinstance(block, ToolResultBlock) and block.result.error_code == "SKILL_CATALOG_CHANGED")
+        self.assertEqual(changed.data["revision"], new["revision"])
+        # The original directory is retained; current revisions arrive through
+        # discovery/load results instead of replacing earlier prompt messages.
+        self.assertIn(old["revision"], next(m.text for m in model.requests[1].messages if m.message_id == "tool-catalog-context-skill.load"))

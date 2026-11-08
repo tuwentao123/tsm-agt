@@ -84,6 +84,23 @@ class SkillCatalog:
         registry.replace_discovered(self.discover())
         return registry.list_all()
 
+    def load_registered(self, registry: SkillRegistry, name: str, resource: str = "SKILL.md",
+                        *, expected_path: str | None = None) -> dict:
+        """Select and read instructions through the same path used by skill.load."""
+        skill = next((item for item in registry.list_all() if item.name == name), None)
+        if skill is None:
+            raise SkillResourceError("SKILL_NOT_FOUND", f"Skill unavailable: {name}", "Refresh the Skill catalog.")
+        if skill.kind is not SkillKind.PLAN:
+            raise SkillResourceError("SKILL_NOT_INSTRUCTION", "Selected Skill is not an instruction Skill", "Use an instruction Skill.")
+        if expected_path is not None and (not skill.plan_path or skill.plan_path.startswith("builtin://")
+                                         or Path(skill.plan_path).resolve() != Path(expected_path).resolve()):
+            raise SkillResourceError("SKILL_PATH_MISMATCH", "The registered name selects a different Skill path", "Resolve the duplicate name or registry conflict.")
+        data = self.read(skill, resource)
+        if expected_path is not None and (not data.get("path") or data["path"].startswith("builtin://")
+                                         or Path(data["path"]).resolve() != Path(expected_path).resolve()):
+            raise SkillResourceError("SKILL_PATH_MISMATCH", "The loader read a different Skill path", "Resolve the catalog path conflict.")
+        return data
+
     def read(self, skill: Skill, resource: str = "SKILL.md") -> dict:
         validate_skill_resource(resource)
         if skill.source != "builtin":

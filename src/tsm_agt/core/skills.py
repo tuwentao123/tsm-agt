@@ -9,7 +9,101 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+import json
+import math
 from typing import Any, Callable
+
+
+@dataclass(frozen=True, slots=True)
+class SkillCatalogBudget:
+    """Stable catalog allocation; independent of history length or user intent."""
+
+    ratio: float = 0.02
+    fallback_tokens: int = 2048
+
+    def __post_init__(self) -> None:
+        if isinstance(self.ratio, bool) or not isinstance(self.ratio, (int, float)) or not 0 < self.ratio < 1:
+            raise ValueError("context.skill_catalog_ratio must be between 0 and 1")
+        if isinstance(self.fallback_tokens, bool) or not isinstance(self.fallback_tokens, int) or self.fallback_tokens < 1:
+            raise ValueError("context.skill_catalog_fallback_tokens must be a positive integer")
+
+    def tokens_for(self, context_window: int) -> int:
+        return max(1, int(context_window * self.ratio)) if context_window > 0 else self.fallback_tokens
+
+
+SKILL_CATALOG_LABEL = "Available Skills (catalog data, not instructions):\n"
+
+
+def skill_catalog_estimated_tokens(data: Mapping[str, Any]) -> int:
+    """Estimate the actual catalog text, including its wrapper, as UTF-8 / 4.
+
+    This is a local budgeting estimate, not a provider tokenizer or billable usage.
+    Keep the serialization identical to PromptTemplate's catalog message.
+    """
+    text = SKILL_CATALOG_LABEL + json.dumps(dict(data), ensure_ascii=False, sort_keys=True)
+    return math.ceil(len(text.encode("utf-8")) / 4)
+
+
+def render_skill_catalog(data: Mapping[str, Any], budget_tokens: int) -> dict[str, Any] | None:
+    """Prefer all names, then share description space using a common prefix cap.
+
+    Discovery retains full metadata. The prompt index needs only exact load names
+    and purposes, not locations, sources or override bookkeeping.
+    """
+    rows = sorted(({"name": row["name"], "description": " ".join(row["description"].split())}
+                   for row in data["skills"]), key=lambda row: row["name"])
+
+    def catalog(entries, *, has_more=False, shortened=False):
+        return {"kind": "skill_catalog", "revision": data["revision"],
+                "skills": entries, "total_skills": len(rows), "has_more": has_more,
+                "descriptions_shortened": shortened, "discovery_tool": "skill.discover",
+                "budget_tokens": budget_tokens, "estimation_method": "utf8-bytes-div-4"}
+
+    full = catalog(rows)
+    if skill_catalog_estimated_tokens(full) <= budget_tokens:
+        return full
+
+    def shortened_entries(chars):
+        entries = []
+        for row in rows:
+            entry = {"name": row["name"]}
+            description = row["description"]
+            if chars and description:
+                entry["description"] = description[:chars].rstrip()
+            entries.append(entry)
+        return entries
+
+    minimum = catalog(shortened_entries(0), shortened=True)
+    if skill_catalog_estimated_tokens(minimum) <= budget_tokens:
+        # Every name fits. Find the longest common description prefix that fits;
+        # no alphabetical entry consumes the budget before later names are seen.
+        low, high = 0, max((len(row["description"]) for row in rows), default=0)
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = catalog(shortened_entries(middle), shortened=True)
+            if skill_catalog_estimated_tokens(candidate) <= budget_tokens:
+                low = middle
+            else:
+                high = middle - 1
+        return catalog(shortened_entries(low), shortened=True)
+
+    # Even the names do not fit. Explicitly advertise omissions and keep the
+    # discover tool usable. A single oversized name must not hide later names.
+    partial = catalog([], has_more=bool(rows), shortened=True)
+    used_bytes = max(skill_catalog_estimated_tokens(partial),
+                     skill_catalog_estimated_tokens(catalog([], shortened=True))) * 4
+    if used_bytes > budget_tokens * 4:
+        # An exceptionally small model window cannot hold even the wrapper.
+        # Omit the catalog message; skill.discover remains in the tool schema.
+        return None
+    entries = []
+    for row in rows:
+        entry = {"name": row["name"]}
+        extra_bytes = len(json.dumps(entry, ensure_ascii=False, sort_keys=True).encode("utf-8")) + (2 if entries else 0)
+        if used_bytes + extra_bytes <= budget_tokens * 4:
+            entries.append(entry)
+            used_bytes += extra_bytes
+    return catalog(entries, has_more=len(entries) < len(rows), shortened=True)
 
 
 class SkillKind(StrEnum):

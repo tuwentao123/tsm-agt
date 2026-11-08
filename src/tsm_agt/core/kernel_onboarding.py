@@ -316,7 +316,18 @@ class OnboardingMixin:
             MessageRole.USER, (TextBlock(body),),
         )
 
-    async def _project_context_messages(self, task_id: str) -> tuple[Message, ...]:
+    async def _project_context_messages(
+        self, task_id: str, *, updates_only: bool = False,
+    ) -> tuple[Message, ...]:
+        if updates_only:
+            # Window snapshots are already durable. Avoid rebuilding Session
+            # history, memory and progress on every model/tool iteration.
+            projected = await asyncio.gather(
+                self._project_instructions_context_message(task_id),
+                self._task_spec_context_message(task_id),
+                self._document_reference_context_message(task_id),
+            )
+            return tuple(message for message in projected if message is not None)
         instructions, task_spec, onboarding, memory, session, document_references, working_memory = (
             await asyncio.gather(
             self._project_instructions_context_message(task_id),

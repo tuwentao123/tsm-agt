@@ -213,6 +213,7 @@ from .configuration import (
     EffectiveConfigurationSnapshot, canonical_hash, effective_toolset_hash,
 )
 from .context import ContextWindowExceeded, ContextWindowManager
+from tsm_agt.ports.context_summary import ContextSummaryPort
 from .conclusion_reference_validator import ConclusionReferenceValidator
 from .document_references import extract_document_references
 from .prompt import PromptAssemblyReceipt, PromptTemplate
@@ -387,6 +388,7 @@ class KernelDependencies:
     local_identity: LocalIdentityPort
     project_memory: ProjectMemoryPort
     completion_reviewer: CompletionReviewerPort | None = None
+    context_summarizer: ContextSummaryPort | None = None
     turn_stop_policies: tuple[TurnStopPolicyPort, ...] = ()
     completion_review_mode: CompletionReviewMode = CompletionReviewMode.OFF
     completion_review_max_continuations: int = 1
@@ -1528,7 +1530,10 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
     @staticmethod
     def _source_user_message(messages: Sequence[Message]) -> Message | None:
         from .context_messages import GENERATED_CONTEXT_PREFIXES
-        generated_prefixes = GENERATED_CONTEXT_PREFIXES + ("completion-readiness-",)
+        generated_prefixes = GENERATED_CONTEXT_PREFIXES + (
+            "completion-readiness-", "window-context-", "window-history-", "context-summary-",
+            "session-history-", "session-facts-", "tool-catalog-context-",
+        )
         return next((
             message for message in messages
             if message.role is MessageRole.USER
@@ -1541,6 +1546,7 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         assistant_replay_eligible: bool = False,
         additional_events: tuple[tuple[str, Mapping[str, Any]], ...] = (),
         clear_agent_checkpoint: bool = True,
+        model_context_window: Mapping[str, Any] | None = None,
     ) -> ConclusionReferenceValidation | None:
         """Atomically record the final Task answer and its Session handoff.
 
@@ -1647,6 +1653,7 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                     "model_calls": llm_payload.get("model_call") or 0,
                     "tool_calls": completed_tool_calls,
                 },
+                model_context_window=model_context_window,
             )
             command_id = "final-agent-result:" + canonical_hash({
                 "task_id": task_id,
@@ -1981,6 +1988,7 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             checkpoint.action_progress
         )
         resumed = AgentTurnCheckpoint(
+            context_window_state=checkpoint.context_window_state,
             task_id=checkpoint.task_id,
             turn_id=checkpoint.turn_id,
             revision=checkpoint.revision + 1,

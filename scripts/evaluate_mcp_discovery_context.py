@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Offline incremental-cost measurement; no private config or model requests.
+"""Offline model-surface comparison; no private config or model requests.
 
 Hold business tool definitions, question and prompt fixed. Compare them with
-the same surface plus the implemented MCP discovery tool/catalog. This is not
+the native surface against the fixed discovery/call entrypoints. This is not
 a reconstruction of every historical code change or a provider token count.
 """
 from __future__ import annotations
@@ -19,6 +19,8 @@ from tsm_agt.adapters.mcp_discovery import DISCOVERY_TOOL
 from tsm_agt.adapters.mcp_tool_provider import MCPToolProvider
 from tsm_agt.adapters.openai_compatible.model import OpenAICompatibleModelProvider
 from tsm_agt.core import ContextWindowManager, PromptTemplate
+from tsm_agt.core.conversation_loop.loop import select_model_tools
+from tsm_agt.core.mcp_call import MCP_CALL_TOOL
 from tsm_agt.ports import AdapterContext, MCPClientManager, MCPServerConfig, Message, MessageRole, ModelRequest, TextBlock
 
 
@@ -89,15 +91,15 @@ async def evaluate():
             await provider.start(context)
             try:
                 current = (*await core.list_tools(), *await provider.list_tools())
-                baseline = tuple(tool for tool in current if tool.name != DISCOVERY_TOOL)
+                baseline = tuple(tool for tool in current if tool.name != MCP_CALL_TOOL)
+                selected = select_model_tools(current, user_text="", model_call=1)
                 before = measure(conversation, baseline, template, serializer)
-                after = measure(conversation, current, template, serializer)
-                assert before["business_mcp_tools"] == after["business_mcp_tools"]
-                assert after["all_tools"] == before["all_tools"] + 1
+                after = measure(conversation, selected, template, serializer)
+                assert after["business_mcp_tools"] == 0
                 delta = after["estimated_input_tokens"] - before["estimated_input_tokens"]
                 rows.append({
                     "servers": servers, "tools_per_server": tools_per_server,
-                    "baseline_without_discovery": before, "implemented_with_discovery": after,
+                    "full_native_definitions": before, "fixed_mcp_entrypoints": after,
                     "estimated_input_token_delta": delta,
                     "estimated_input_reduction_percent": round(-100 * delta / before["estimated_input_tokens"], 2),
                     "canonical_input_byte_delta": after["canonical_input_json_utf8_bytes"] - before["canonical_input_json_utf8_bytes"],
@@ -112,7 +114,7 @@ async def evaluate():
         "estimate_method": "production ContextWindowManager; UTF-8 JSON bytes / 4 plus per-item overhead",
         "provider_tokenizer_used": False, "live_model_requests": 0,
         "billing_or_cache_measurement": False,
-        "comparison": "incremental discovery/catalog cost, not full historical revision comparison",
+        "comparison": "initial full native definitions versus fixed MCP entrypoints; same current catalog and core tools, not an exact historical revision or post-discovery history comparison",
         "rows": rows,
     }
 

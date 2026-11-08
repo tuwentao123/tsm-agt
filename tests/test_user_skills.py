@@ -84,6 +84,46 @@ class UserSkillsStoreTest(unittest.TestCase):
         self.assertEqual(registry.get("local.demo.plan"), skill)
         self.assertEqual(self.store.read(skill)["content"], legacy.decode())
 
+    def test_foreign_extensions_convert_without_rewriting_instructions_or_resources(self):
+        body = "\r\n# Workflow\r\nUse vendor CLI and read references/check.md.\r\n"
+        raw = (
+            "---\r\nname: vendor-demo\r\ndescription: >\r\n  Vendor workflow\r\n"
+            "kind: workflow\r\ntags: vendor\r\nallowed-tools: Bash\r\n"
+            "metadata:\r\n  platform: custom\r\n---\r\n" + body
+        ).encode()
+        files = {"vendor/SKILL.md": raw, "vendor/references/check.md": b"vendor reference",
+                 "vendor/scripts/run.sh": b"do-not-execute", "vendor/assets/template.bin": b"\x00\xff"}
+        skill = self.store.install_upload(files)
+        metadata, installed_body, _ = self.store.manifest_data(Path(skill.plan_path))
+        self.assertEqual(metadata["kind"], "plan")
+        self.assertEqual(metadata["source_kind"], "workflow")
+        self.assertEqual(metadata["allowed-tools"], "Bash")
+        self.assertEqual(metadata["metadata"], {"platform": "custom"})
+        self.assertEqual(skill.description, "Vendor workflow")
+        self.assertEqual(skill.tags, ("vendor",))
+        self.assertIsNone(skill.handler)
+        self.assertEqual(installed_body, body)
+        self.assertEqual((Path(skill.plan_path).parent / "assets/template.bin").read_bytes(), b"\x00\xff")
+        before = Path(skill.plan_path).stat().st_mtime_ns
+        self.assertEqual(self.store.install_upload(files), skill)
+        self.assertEqual(Path(skill.plan_path).stat().st_mtime_ns, before)
+        registry = SkillRegistry()
+        self.store.refresh(registry)
+        self.assertEqual(self.store.read(registry.get(skill.name), "references/check.md")["content"], "vendor reference")
+
+    def test_standard_extensions_remain_byte_identical_and_invalid_inputs_leave_no_skill(self):
+        raw = manifest() + b"\nVendor-specific instructions remain unchanged.\n"
+        skill = self.store.install_upload({"standard/SKILL.md": raw})
+        self.assertEqual(Path(skill.plan_path).read_bytes(), raw)
+        for files in (
+            {"SKILL.md": b"---\nname: bad\n---\ntext"},
+            {"SKILL.md": b"\xff"},
+            {"one/SKILL.md": manifest("one"), "two/SKILL.md": manifest("two")},
+        ):
+            with self.subTest(files=list(files)), self.assertRaises(ValueError):
+                self.store.install_upload(files)
+        self.assertEqual([path.name for path in self.store.install_directory.iterdir()], [skill.name])
+
     def test_unclosed_markdown_frontmatter_reports_uploaded_filename_and_fix(self):
         broken = b"---\nname: demo-plan\ndescription: Demo\n\n# Instructions\nWrite a demo document.\n"
         with self.assertRaisesRegex(ValueError, r"demo/SKILL.md: .*---"):
@@ -101,6 +141,10 @@ class UserSkillsStoreTest(unittest.TestCase):
                 ).encode("utf-8"))
                 skill = self.store.parse(path)
                 self.assertEqual(skill.description, "Demo with folded description")
+                store = UserSkillsStore(self.root / f"home-{terminator}")
+                installed = store.install_upload({"demo/SKILL.md": path.read_bytes()})
+                self.assertEqual(Path(installed.plan_path).read_bytes(), path.read_bytes())
+                self.assertEqual(store.discover(), (installed,))
 
     def test_repository_demo_installs_as_a_standard_instruction_skill(self):
         source = Path(__file__).resolve().parents[1] / "skills/demo_plan"
@@ -248,7 +292,7 @@ class UserSkillsWebTest(unittest.IsolatedAsyncioTestCase):
                         return result.value
                     raise AssertionError("unexpected suspension")
 
-            with patch.object(web, "runtime_server", Server()):
+            with patch.object(web, "runtime_server", Server()), patch.object(web, "user_skills_store", return_value=store):
                 result = await web.upload_skill_directory(files=[UploadFile(filename="demo/SKILL.md", file=io.BytesIO(manifest()))])
                 self.assertTrue(result["installed"])
                 self.assertIsNotNone(application.kernel._dependencies.skill_registry.get("demo-plan"))
@@ -307,6 +351,47 @@ class UserSkillsWebTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(caught.exception.status_code, 409)
                 self.assertIn("可发现 Skill 的目录", web.INDEX_HTML)
                 self.assertIn("pickSkillDirectories()", web.INDEX_HTML)
+
+    async def test_discovered_local_skills_install_with_resources_and_reuse_pending_receipt(self):
+        web = importlib.import_module("tsm_agt.web.app")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = UserSkillsStore(root / "home")
+            external = root / "external/skills"
+            for name in ("one", "two"):
+                source = external / name
+                (source / "references").mkdir(parents=True)
+                (source / "SKILL.md").write_bytes(manifest(name=name))
+                (source / "references/example.md").write_text(f"{name} example")
+            with patch.object(web, "runtime_server", None), patch.object(web, "user_skills_store", return_value=store):
+                settings = await web.save_skill_settings({"discovery_directories": [str(external)]})
+                skills = {skill["name"]: skill for skill in settings["skills"]}
+                receipts = []
+                for name in ("one", "two"):
+                    self.assertEqual(Path(skills[name]["plan_path"]), (external / name / "SKILL.md").resolve())
+                    receipt = await web.install_skill_endpoint({"plan_path": skills[name]["plan_path"]})
+                    receipts.append(receipt)
+                    self.assertTrue(receipt["installed"])
+                    self.assertEqual(receipt["installation"]["status"], "installed")
+                    self.assertFalse(receipt["preparation_required"])
+                    self.assertNotIn("session_id", receipt["installation"])
+                    target = Path(receipt["skill"]["plan_path"])
+                    self.assertTrue(target.is_relative_to(store.install_directory.resolve()))
+                    self.assertEqual((target.parent / "references/example.md").read_text(), f"{name} example")
+                    self.assertEqual((external / name / "SKILL.md").read_bytes(), manifest(name=name))
+                    repeated = await web.install_skill_endpoint({"plan_path": str(target)})
+                    self.assertEqual(repeated["installation"]["id"], receipt["installation"]["id"])
+                self.assertNotEqual(receipts[0]["installation"]["id"], receipts[1]["installation"]["id"])
+                refreshed = await web.get_skill_settings()
+                self.assertTrue({"one", "two"}.issubset({skill["name"] for skill in refreshed["skills"]}))
+                (external / "one/SKILL.md").write_bytes(manifest(name="one", description="changed"))
+                with self.assertRaises(HTTPException) as conflict:
+                    await web.install_skill_endpoint({"plan_path": str(external / "one/SKILL.md")})
+                self.assertEqual(conflict.exception.status_code, 409)
+                for invalid in ({}, {"plan_path": str(external)}, {"plan_path": str(external / "missing/SKILL.md")}):
+                    with self.assertRaises(HTTPException) as invalid_path:
+                        await web.install_skill_endpoint(invalid)
+                    self.assertEqual(invalid_path.exception.status_code, 400)
 
     async def test_picker_supports_multiple_paths_and_cancel(self):
         web = importlib.import_module("tsm_agt.web.app")

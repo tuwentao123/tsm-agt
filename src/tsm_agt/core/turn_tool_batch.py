@@ -848,6 +848,7 @@ async def _run_tool_call(
             ),),
         )
         suspension = AgentTurnCheckpoint(
+            context_window_state=state.checkpoint.context_window_state,
             task_id=state.task_id,
             turn_id=state.turn_id,
             revision=state.checkpoint.revision,

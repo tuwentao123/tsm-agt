@@ -104,6 +104,7 @@ from tsm_agt.adapters.skill_catalog import BUILTIN_SKILLS, SkillCatalog
 from tsm_agt.adapters.builtin.skill_tools import CoreSkillToolProvider
 from tsm_agt.adapters.mcp_client_manager import MCPClientManager, MCPServerConfig
 from tsm_agt.adapters.mcp_tool_provider import MCPToolProvider
+from tsm_agt.adapters.model_context_summary import ModelContextSummarizer
 from tsm_agt.adapters.mcp_python_sdk_client import create_mcp_sdk_client
 from tsm_agt.bootstrap.mcp_configuration import (
     load_mcp_servers_from_configuration,
@@ -617,6 +618,10 @@ def _kernel_dependencies(
             ),
         )
     return KernelDependencies(
+        context_summarizer=(
+            ModelContextSummarizer(registry.require(ModelProviderPort))
+            if context_manager is not None and context_manager.semantic_compaction else None
+        ),
         max_parallel_tool_calls=max_parallel_tool_calls,
         model=registry.require(ModelProviderPort),
         store=registry.require(RuntimeStorePort),

@@ -469,6 +469,9 @@ textarea::placeholder{color:#94a3b8}
 .settings-stat-value { font-size: 18px; font-weight: 650; }
 .settings-stat-label { margin-top: 2px; font-size: 11px; color: var(--muted, #64748b); }
 .settings-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(288px, 1fr)); gap: 14px; }
+.settings-discovery-toolbar { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.settings-discovery-toolbar .settings-caption { margin-right: auto; }
+.settings-btn:disabled { opacity: .55; cursor: not-allowed; }
 .settings-card { display: flex; flex-direction: column; gap: 10px; padding: 14px 15px; border: 1px solid var(--border, #e2e8f0); border-radius: 14px; background: var(--panel, #fff); transition: border-color .15s, box-shadow .15s, transform .15s; }
 .settings-card:hover { border-color: #bfdbfe; box-shadow: 0 10px 24px rgba(37, 99, 235, .1); transform: translateY(-1px); }
 .settings-card-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
@@ -588,7 +591,7 @@ textarea::placeholder{color:#94a3b8}
               <div>
                 <div class="settings-toolbar-title">已安装与可用的 Skill</div>
                 <div class="settings-toolbar-caption">安装目录：<span id="skill-install-directory"></span></div>
-                <div class="settings-toolbar-caption">安装后自动在最近使用的工作区新建安装会话，由模型按 Skill 文档检查、按需准备并验证环境。</div>
+                <div class="settings-toolbar-caption">安装仅校验格式、按需转换并保存文件。不调用模型、不准备环境；后续执行仍遵循正常审批。</div>
               </div>
               <div class="settings-actions">
                 <button class="settings-btn primary" type="button" data-skill-install onclick="const input = document.getElementById('settings-skill-upload'); input.value = ''; input.click()">从本地目录安装</button>
@@ -2472,9 +2475,9 @@ function renderSkillInstallButton() {
   panel.id = 'skill-install-runner';
   panel.innerHTML = `
     <div class='trace-panel-heading'><div><div class='trace-panel-title'>Skill 安装</div><div class='trace-panel-caption'>用户级别 · 所有项目和会话可用</div></div></div>
-    <button class='new-session-btn' id='install-plan-skill' data-skill-install ${skillInstallInFlight ? 'disabled' : ''}>从本地目录安装 PLAN Skill</button>
+    <button class='new-session-btn' id='install-plan-skill' data-skill-install ${skillInstallInFlight ? 'disabled' : ''}>从本地目录安装 Skill</button>
     <input type='file' id='skill-dir-input' webkitdirectory style='display:none' />
-    <div class='trace-panel-caption' id='skill-install-status' role='status'>保存到 ~/.tsm-agent/skills，自动在最近工作区新建安装会话并验证准备情况。</div>`;
+    <div class='trace-panel-caption' id='skill-install-status' role='status'>校验格式、按需转换并保存到 ~/.tsm-agent/skills；不执行指令或准备环境。</div>`;
 
   const button = panel.querySelector('#install-plan-skill');
   const input = panel.querySelector('#skill-dir-input');
@@ -2503,13 +2506,128 @@ let disabledBuiltinSkills = [];
 const skillInstallations = new Map();
 const skillInstallationStreams = new Map();
 const skillInstallationAutoOpen = new Set();
+const selectedDiscoverySkills = new Set();
+const discoverySkillControls = new Map();
+const discoveryInstallMessages = new Map();
+let discoverySelectAll = null;
+let discoveryInstallSelected = null;
+let discoverySelectionCount = null;
+
+function latestDiscoveryInstallation(skill) {
+  return [...skillInstallations.values()].reverse().find(job => job.skill_name === skill.name
+    && [job.plan_path, job.source_plan_path].includes(skill.plan_path));
+}
+
+function discoverySkillState(skill) {
+  if (skill.source !== 'user' || !skill.plan_path) return {available: false, label: '无需安装'};
+  const job = latestDiscoveryInstallation(skill);
+  if (!job) return {available: true, label: '安装'};
+  if (job.status === 'installed') return job.loadable === true
+    ? {available: false, label: '已安装 · 可加载', job}
+    : {available: true, label: '已导入 · 重试加载', job};
+  if (job.status === 'ready') return {available: false, label: '已安装', job};
+  const active = {starting: '正在准备', running: '正在验证', awaiting_approval: '等待审批', awaiting_user: '等待补充信息'};
+  if (active[job.status]) return {available: false, label: active[job.status], job};
+  return {available: true, label: '安装', job};
+}
+
+function refreshDiscoverySkillControls() {
+  let availableCount = 0;
+  for (const [path, controls] of discoverySkillControls) {
+    const state = discoverySkillState(controls.skill);
+    if (!state.available) selectedDiscoverySkills.delete(path);
+    else availableCount += 1;
+    controls.checkbox.checked = selectedDiscoverySkills.has(path);
+    controls.checkbox.disabled = skillInstallInFlight || !state.available;
+    controls.button.disabled = skillInstallInFlight || !state.available;
+    controls.button.textContent = state.label;
+    controls.status.textContent = discoveryInstallMessages.get(path) || state.job?.summary || '';
+  }
+  const selectedCount = selectedDiscoverySkills.size;
+  if (discoverySelectAll) {
+    discoverySelectAll.checked = availableCount > 0 && selectedCount === availableCount;
+    discoverySelectAll.indeterminate = selectedCount > 0 && selectedCount < availableCount;
+    discoverySelectAll.disabled = skillInstallInFlight || availableCount === 0;
+  }
+  if (discoveryInstallSelected) {
+    discoveryInstallSelected.disabled = skillInstallInFlight || selectedCount === 0;
+    discoveryInstallSelected.textContent = selectedCount > 0 && selectedCount === availableCount ? '全部安装' : '安装所选';
+  }
+  if (discoverySelectionCount) discoverySelectionCount.textContent = `已选 ${selectedCount} / 可安装 ${availableCount}`;
+}
+
+function refreshSkillInstallControls() {
+  document.querySelectorAll('[data-skill-install]').forEach(button => { button.disabled = skillInstallInFlight; });
+  refreshDiscoverySkillControls();
+}
+
+async function installDiscoveredSkills(skills) {
+  if (skillInstallInFlight) return;
+  const queue = skills.filter(skill => discoverySkillState(skill).available);
+  if (!queue.length) return;
+  skillInstallInFlight = true;
+  refreshSkillInstallControls();
+  clearError();
+  let saved = 0;
+  let loadable = 0;
+  const errors = [];
+  try {
+    for (const [index, skill] of queue.entries()) {
+      setSkillInstallFeedback(`正在提交安装 ${index + 1}/${queue.length}：${skill.name}…`);
+      discoveryInstallMessages.delete(skill.plan_path);
+      try {
+        let response;
+        try {
+          response = await fetch('/skills/install', {method: 'POST', headers: {'content-type': 'application/json'},
+            body: JSON.stringify({plan_path: skill.plan_path})});
+        } catch (error) {
+          throw new Error('请求中断，结果尚未确认；刷新安装状态后再重试。');
+        }
+        const data = await readSkillResponse(response, '安装失败');
+        if (data?.installed !== true || data.skill?.name !== skill.name || !data.skill?.plan_path) {
+          throw new Error('安装响应缺少结果信息，请刷新安装状态后重试。');
+        }
+        if (data.installation) renderSkillInstallations([data.installation]);
+        errors.push(...(data.warnings || []));
+        // File import stays in settings and never dispatches uploaded instructions.
+        saved += 1;
+        if (data.loadable === true) {
+          loadable += 1;
+          selectedDiscoverySkills.delete(skill.plan_path);
+        } else {
+          discoveryInstallMessages.set(skill.plan_path, `${skill.name}：已导入 · 加载验证失败：${data.load_validation?.message || '尚未验证可加载'}`);
+        }
+      } catch (error) {
+        const message = `${skill.name}：${error.message || '安装失败'}`;
+        errors.push(message);
+        discoveryInstallMessages.set(skill.plan_path, message);
+      }
+    }
+    if (saved) {
+      try {
+        const data = await readSkillResponse(await fetch('/settings/skills'), '刷新目录失败');
+        renderSkillCatalog(data);
+        skillMenuSkills = null;
+        errors.push(...(data.issues || []));
+      } catch (error) {
+        errors.push(`文件已保存，但列表刷新失败：${error.message}`);
+      }
+    }
+    setSkillInstallFeedback([`已导入 ${saved}/${queue.length} 项 Skill；已安装 · 可加载 ${loadable}/${queue.length}；未执行指令或准备环境。`, ...errors].join(String.fromCodePoint(10)));
+  } finally {
+    skillInstallInFlight = false;
+    refreshSkillInstallControls();
+  }
+}
 
 function renderSkillInstallations(jobs = []) {
   for (const job of jobs) skillInstallations.set(job.id, job);
+  refreshDiscoverySkillControls();
   const panel = document.getElementById('skill-installations');
   if (!panel) return;
   panel.replaceChildren();
   const labels = {
+    installed: '已导入（文件导入完成）',
     pending: '文件已保存，准备待启动', starting: '正在创建安装会话', running: '正在准备和验证',
     ready: '安装成功，验证通过', blocked: '准备受阻', failed: '准备失败',
     awaiting_approval: '等待审批', awaiting_user: '等待补充信息',
@@ -2519,7 +2637,8 @@ function renderSkillInstallations(jobs = []) {
     const row = document.createElement('div');
     row.style.cssText = 'border:1px solid #e2e8f0;border-radius:10px;padding:10px;margin-top:10px;';
     const text = document.createElement('p');
-    text.textContent = `${job.skill_name} · ${labels[job.status] || job.status}：${job.summary}`;
+    const label = job.status === 'installed' && job.loadable === true ? '已安装 · 可加载' : (labels[job.status] || job.status);
+    text.textContent = `${job.skill_name} · ${label}：${job.summary}`;
     row.append(text);
     if (job.workspace_path) {
       const workspace = document.createElement('p');
@@ -2539,12 +2658,11 @@ function renderSkillInstallations(jobs = []) {
     }
     if (['pending', 'failed', 'interrupted', 'unverified', 'needs_review'].includes(job.status)) {
       const retry = document.createElement('button');
-      retry.textContent = '重试准备';
+      retry.textContent = '确认文件安装';
       retry.onclick = async () => {
         retry.disabled = true;
         try {
-          const next = await readSkillResponse(await fetch(`/skills/installations/${encodeURIComponent(job.id)}/retry`, {method: 'POST'}), '启动准备失败');
-          skillInstallationAutoOpen.add(next.id);
+          const next = await readSkillResponse(await fetch(`/skills/installations/${encodeURIComponent(job.id)}/retry`, {method: 'POST'}), '确认安装失败');
           renderSkillInstallations([next]);
         } catch (error) { setSkillInstallFeedback(error.message, true); }
         finally { retry.disabled = false; }
@@ -2552,10 +2670,6 @@ function renderSkillInstallations(jobs = []) {
       row.append(retry);
     }
     panel.append(row);
-    if (skillInstallationAutoOpen.has(job.id) && job.task_id) {
-      skillInstallationAutoOpen.delete(job.id);
-      openSkillInstallationConversation(job).catch(error => setSkillInstallFeedback(`文件已保存；打开安装会话失败：${error.message}`));
-    }
     if (['starting', 'running', 'awaiting_approval', 'awaiting_user'].includes(job.status)) {
       watchSkillInstallation(job.id);
     } else if (skillInstallationStreams.has(job.id)) {
@@ -2762,11 +2876,43 @@ function renderSkillCatalog(data) {
   const catalog = document.getElementById('skill-discovered-catalog');
   if (catalog) {
     catalog.replaceChildren();
+    discoverySkillControls.clear();
     const skills = data.skills || [];
+    const paths = new Set(skills.map(skill => skill.plan_path));
+    for (const path of selectedDiscoverySkills) if (!paths.has(path)) selectedDiscoverySkills.delete(path);
+    const toolbar = document.createElement('div');
+    toolbar.className = 'settings-discovery-toolbar';
     const caption = document.createElement('div');
     caption.className = 'settings-caption';
     caption.textContent = `已发现 ${skills.length} 个 Skill`;
-    catalog.append(caption);
+    discoverySelectAll = document.createElement('input');
+    discoverySelectAll.type = 'checkbox';
+    discoverySelectAll.id = 'skill-discovery-select-all';
+    const selectAllLabel = document.createElement('label');
+    selectAllLabel.className = 'settings-switch';
+    const selectAllText = document.createElement('span');
+    selectAllText.textContent = '全部勾选';
+    selectAllLabel.append(discoverySelectAll, selectAllText);
+    discoverySelectAll.onchange = () => {
+      for (const [path, controls] of discoverySkillControls) {
+        if (discoverySelectAll.checked && discoverySkillState(controls.skill).available) selectedDiscoverySkills.add(path);
+        else selectedDiscoverySkills.delete(path);
+      }
+      refreshDiscoverySkillControls();
+    };
+    discoverySelectionCount = document.createElement('span');
+    discoverySelectionCount.className = 'settings-caption';
+    discoverySelectionCount.setAttribute('aria-live', 'polite');
+    discoveryInstallSelected = document.createElement('button');
+    discoveryInstallSelected.type = 'button';
+    discoveryInstallSelected.id = 'skill-discovery-install-selected';
+    discoveryInstallSelected.className = 'settings-btn primary';
+    discoveryInstallSelected.dataset.skillInstall = '';
+    discoveryInstallSelected.textContent = '安装所选';
+    discoveryInstallSelected.onclick = () => installDiscoveredSkills([...discoverySkillControls.values()]
+      .filter(controls => selectedDiscoverySkills.has(controls.skill.plan_path)).map(controls => controls.skill));
+    toolbar.append(caption, selectAllLabel, discoverySelectionCount, discoveryInstallSelected);
+    catalog.append(toolbar);
     for (const skill of skills) {
       const source = skill.source === 'builtin' ? '内置'
         : skill.source === 'user' ? '用户目录'
@@ -2774,15 +2920,36 @@ function renderSkillCatalog(data) {
       const tags = [{text: source, tone: skill.source === 'builtin' ? 'accent' : ''}];
       if (skill.overrides?.includes('builtin')) tags.push({text: '覆盖内置版本', tone: 'warn'});
       if (skill.safety_level) tags.push({text: `安全级别：${skill.safety_level}`, tone: ''});
-      catalog.append(settingsCard({
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.setAttribute('aria-label', `选择 ${skill.name}`);
+      checkbox.onchange = () => {
+        if (checkbox.checked) selectedDiscoverySkills.add(skill.plan_path);
+        else selectedDiscoverySkills.delete(skill.plan_path);
+        refreshDiscoverySkillControls();
+      };
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'settings-btn';
+      button.dataset.skillInstall = '';
+      button.setAttribute('aria-label', `安装 ${skill.name}`);
+      button.onclick = () => installDiscoveredSkills([skill]);
+      const status = document.createElement('div');
+      status.className = 'settings-card-sub';
+      status.setAttribute('role', 'status');
+      discoverySkillControls.set(skill.plan_path || skill.name, {skill, checkbox, button, status});
+      const card = settingsCard({
         glyph: String(skill.name || '?').slice(0, 1),
         title: skill.name,
         sub: skill.plan_path || '代码注册',
         description: skill.description || '',
         tags,
         meta: source,
+        actions: [checkbox, button],
         searchText: [skill.name, skill.description, source, skill.plan_path].filter(Boolean).join(' '),
-      }));
+      });
+      card.append(status);
+      catalog.append(card);
     }
   }
   const builtins = document.getElementById('skill-builtin-catalog');
@@ -3047,7 +3214,7 @@ async function uploadSkillDirectoryAndInstall(fileList, input = null) {
   ));
   if (!files.length || skillInstallInFlight) return;
   skillInstallInFlight = true;
-  document.querySelectorAll('[data-skill-install]').forEach(button => { button.disabled = true; });
+  refreshSkillInstallControls();
   clearError();
   setSkillInstallFeedback('正在安装到用户 Skill 目录…');
   try {
@@ -3064,11 +3231,7 @@ async function uploadSkillDirectoryAndInstall(fileList, input = null) {
     if (data?.installed !== true || !data.skill?.name || !data.skill?.plan_path) {
       throw new Error('安装响应缺少结果信息，请在设置中检查安装状态后重试。');
     }
-    const message = data.installation
-      ? `文件已保存 ${data.skill.name}：${data.skill.plan_path}。${data.installation.summary}`
-      : data.preparation_required
-        ? `文件已保存 ${data.skill.name}：${data.skill.plan_path}。安装准备未启动。`
-        : `已安装 ${data.skill.name}：${data.skill.plan_path}`;
+    const message = `${data.loadable === true ? '已安装 · 可加载' : '已导入 · 加载验证失败'} ${data.skill.name}：${data.skill.plan_path}。未执行指令或准备环境。`;
     const warnings = Array.isArray(data.warnings) ? [...data.warnings] : [];
     // The upload has committed. A later catalog refresh failure must not be
     // presented as a failed installation or lose the successful receipt.
@@ -3083,14 +3246,13 @@ async function uploadSkillDirectoryAndInstall(fileList, input = null) {
     }
     setSkillInstallFeedback([message, ...new Set(warnings)].join(String.fromCodePoint(10)));
     if (data.installation) {
-      skillInstallationAutoOpen.add(data.installation.id);
       renderSkillInstallations([data.installation]);
     }
   } catch (error) {
     setSkillInstallFeedback(error.message || '安装 Skill 失败', true);
   } finally {
     skillInstallInFlight = false;
-    document.querySelectorAll('[data-skill-install]').forEach(button => { button.disabled = false; });
+    refreshSkillInstallControls();
     if (input) input.value = '';
   }
 }
@@ -6735,28 +6897,57 @@ def skill_data(skill) -> dict:
     }
 
 
-def skill_install_receipt(skill, store) -> dict:
-    """Disk commit is successful even if a subsequent catalog refresh fails."""
-    warnings = []
+def validate_skill_load(store, name, plan_path, *, refresh=True) -> dict:
+    """Use the Agent's registry and actual instruction loader, without dispatch."""
+    from tsm_agt.ports.skill_files import SkillResourceError
+    if runtime_server is None:
+        return {"ok": False, "error_code": "SKILL_RUNTIME_UNAVAILABLE", "message": "运行时未连接，尚未验证可加载。"}
+    server = runtime_server
+
+    async def check():
+        application = server._client.application
+        registry = application.kernel._dependencies.skill_registry
+        catalog = skill_catalog_for_application(application, store)
+        if refresh:
+            catalog.refresh(registry)
+            store.issues = list(catalog.issues)
+        data = catalog.load_registered(registry, name, expected_path=plan_path)
+        return {"ok": True, "path": data["path"], "content_sha256": sha256(data["content"].encode("utf-8")).hexdigest()}
+
     try:
-        refresh_skill_catalog(store)
-    except Exception:
-        logger.exception("Skill installed but runtime catalog refresh failed: %s", skill.name)
-        warnings.append("文件已安装，但运行时目录刷新失败；请稍后刷新设置或重启服务。")
+        return server._call(check())
+    except Exception as error:
+        code = error.code if isinstance(error, SkillResourceError) else "SKILL_LOAD_FAILED"
+        return {"ok": False, "error_code": code, "message": str(error)}
+
+
+def skill_install_receipt(skill, store, *, source_plan_path=None) -> dict:
+    """Keep file import separate from actual runtime loadability and readiness."""
+    validation = validate_skill_load(store, skill.name, skill.plan_path)
+    warnings = [] if validation["ok"] else ["文件已导入，但加载验证失败：" + validation["message"]]
     installation = None
     try:
-        installation = start_skill_preparation(store, store.installations.create(skill))
+        installation = store.installations.record_import(skill)
+        if source_plan_path is not None and source_plan_path != skill.plan_path:
+            installation = store.installations.update(installation["id"], source_plan_path=source_plan_path)
+        installation = store.installations.update(
+            installation["id"], imported=True, installed=True, loadable=validation["ok"],
+            load_validation=validation, ready=False,
+            summary=("已安装 · 可加载" if validation["ok"] else "已导入 · 加载验证失败：" + validation["message"])
+                    + "；未执行指令或准备运行环境。",
+        )
     except Exception:
-        logger.exception("Skill files saved but preparation could not start: %s", skill.name)
-        warnings.append("文件已保存，但安装准备未启动；请在设置中重试准备。")
+        logger.exception("Skill files saved but import receipt could not be saved: %s", skill.name)
+        warnings.append("文件已导入，但安装记录保存失败；请稍后刷新设置。")
     return {
-        "installed": True, "scope": "user", "skill": skill_data(skill),
+        "imported": True, "installed": True, "loadable": validation["ok"],
+        "load_validation": validation, "scope": "user", "skill": skill_data(skill),
         "plan_path": skill.plan_path, "skill_id": skill.id,
         "skill_name": skill.name, "description": skill.description,
         "warnings": warnings,
         "installation": installation,
-        "preparation_required": True,
-        "ready": bool(installation and installation["status"] == "ready"),
+        "preparation_required": False,
+        "ready": False,
     }
 
 
@@ -6820,8 +7011,17 @@ def start_skill_preparation(store, job: dict) -> dict:
     return store.installations.get(job["id"])
 
 
+def revalidate_skill_import(store, job: dict) -> dict:
+    if job["status"] != "installed":
+        return job
+    validation = validate_skill_load(store, job["skill_name"], job["plan_path"])
+    return {**job, "loadable": validation["ok"], "load_validation": validation,
+            "summary": ("已安装 · 可加载" if validation["ok"] else "已导入 · 加载验证失败：" + validation["message"])
+                       + "；未执行指令或准备运行环境。"}
+
+
 def refresh_skill_installation(store, job: dict) -> dict:
-    if runtime_server is None or job["status"] in {"pending", "ready", "blocked", "failed"}:
+    if runtime_server is None or job["status"] in {"installed", "pending", "ready", "blocked", "failed"}:
         return job
 
     async def status():
@@ -6895,16 +7095,16 @@ async def stream_skill_installation(installation_id: str):
 
 @app.post("/skills/installations/{installation_id}/retry")
 async def retry_skill_preparation(installation_id: str) -> dict:
+    """Legacy retry now confirms file import, never starts a model conversation."""
     store = user_skills_store()
     try:
-        job = refresh_skill_installation(store, store.installations.get(installation_id))
+        job = store.installations.get(installation_id)
+        skill = store.parse(Path(job["plan_path"]))
     except StopIteration:
         raise HTTPException(status_code=404, detail="安装记录不存在") from None
-    if job["status"] in {"starting", "running", "awaiting_approval", "awaiting_user"}:
-        return job
-    if job["status"] != "pending":
-        job = store.installations.create(store.parse(Path(job["plan_path"])), retry=True)
-    return start_skill_preparation(store, job)
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return skill_install_receipt(skill, store)["installation"]
 
 
 @app.get("/settings/skills")
@@ -6922,7 +7122,8 @@ async def get_skill_settings() -> dict:
         "builtin_skills": [{"name": name} for name in builtin_skill_names()],
         "disabled_builtin_skills": store.settings().get("disabled_builtin_skills", []),
         "issues": list(store.issues),
-        "installations": [refresh_skill_installation(store, row) for row in store.installations.list()[-30:]],
+        "installations": [revalidate_skill_import(store, refresh_skill_installation(store, row))
+                          for row in store.installations.list()[-30:]],
     }
 
 
@@ -7050,7 +7251,7 @@ async def install_skill_endpoint(payload: dict) -> dict:
             skill = store.parse(manifest)
         else:
             skill = store.install_path(manifest)
-        return skill_install_receipt(skill, store)
+        return skill_install_receipt(skill, store, source_plan_path=str(manifest))
     except FileExistsError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     except (OSError, ValueError) as error:

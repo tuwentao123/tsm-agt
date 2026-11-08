@@ -11,6 +11,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from .request_diagnostics import RequestDiagnosticCapture
+from tsm_agt.adapters.request_prefix import observe_request_prefix
 from .reasoning_config import DEFAULT_REASONING_EFFORT_REGISTRY, ReasoningEffortRegistry
 from tsm_agt.ports.model import ReasoningBlock
 
@@ -210,6 +211,7 @@ class OpenAICompatibleModelProvider:
             raise RuntimeError("adapter is not started")
         payload, provider_to_internal = self._build_payload(request)
         self._capture_request(request, payload)
+        await observe_request_prefix(self, request, payload)
         response = await self._transport.post_json(
             f"{self._base_url}/chat/completions",
             {"Authorization": f"Bearer {self._api_key}"},
@@ -250,6 +252,7 @@ class OpenAICompatibleModelProvider:
         payload["stream"] = True
         payload["stream_options"] = {"include_usage": True}
         self._capture_request(request, payload)
+        await observe_request_prefix(self, request, payload)
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         pending_text_parts: list[str] = []

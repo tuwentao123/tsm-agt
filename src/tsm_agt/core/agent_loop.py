@@ -341,6 +341,7 @@ class AgentTurnCheckpoint:
     checkpoint_schema_version: int = 2
     finalization_state: Mapping[str, Any] = field(default_factory=dict)
     enabled_skills: tuple[str, ...] = ()
+    context_window_state: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> AgentTurnCheckpoint:
@@ -376,6 +377,7 @@ class AgentTurnCheckpoint:
             ),
             model_profile_id=data.get("model_profile_id"),
             checkpoint_schema_version=2,
+            context_window_state=dict(data.get("context_window_state", {})),
             finalization_state=(
                 dict(data["finalization_state"])
                 if isinstance(data.get("finalization_state"), Mapping) else {}
@@ -464,6 +466,7 @@ class AgentTurnCheckpoint:
         ):
             legacy_content = checkpoint._content_data()
             evolved_fields = (
+                "context_window_state",
                 "model_profile_id",
                 "rejection_loop_state",
                 "model_budget_renewal_count", "model_budget_total_granted",
@@ -502,6 +505,7 @@ class AgentTurnCheckpoint:
             "tool_timeout_seconds": self.tool_timeout_seconds,
             "reasoning_effort": self.reasoning_effort,
             "model_profile_id": self.model_profile_id,
+            "context_window_state": dict(self.context_window_state),
             "finalization_state": dict(self.finalization_state or {}),
             "model_budget_renewal_count": self.model_budget_renewal_count,
             "model_budget_total_granted": self.model_budget_total_granted,

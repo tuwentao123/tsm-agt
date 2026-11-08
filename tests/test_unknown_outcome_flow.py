@@ -40,11 +40,9 @@ def test_unknown_batch_result_does_not_cancel_other_calls_or_suspend_model():
                            for block in message.content if isinstance(block, ToolResultBlock)}
                 assert results["unknown"].error_code == "UNKNOWN_OUTCOME"
                 assert results["other"].ok
-                context = next(json.loads(message.text) for message in model.requests[1].messages
-                               if message.message_id.startswith("execution-context-"))
-                fact = next(item for item in context["recent_actions"] if item["call_id"] == "unknown")
-                assert fact["operation_outcome"] == "unknown"
-                assert fact["failure_code"] == "UNKNOWN_OUTCOME"
+                # The tool result itself carries the uncertainty; the Runtime
+                # does not regenerate a progress snapshot ahead of history.
+                assert results["unknown"].effective_recovery_kind is ToolRecoveryKind.UNKNOWN_OUTCOME
                 live = await app.kernel.get_task(task.task_id)
                 assert live.pending_clarification is None
                 assert live.tool_executions[f"{result.turn_id}:unknown"].state is ToolCommitState.UNKNOWN_OUTCOME

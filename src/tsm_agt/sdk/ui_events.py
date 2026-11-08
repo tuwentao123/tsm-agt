@@ -448,6 +448,14 @@ def _bounded_text(value: Any) -> str:
 
 def _incomplete_reason(payload) -> str:
     reason = str(payload.get("reason") or "unknown")
+    if reason == "tool_call_budget_exhausted":
+        used, maximum = payload.get("tool_calls"), payload.get("max_tool_calls")
+        requested, remaining = payload.get("requested_tool_calls"), payload.get("remaining_tool_calls")
+        return (
+            f"本轮工具调用预算不足：已使用 {used}/{maximum} 次，"
+            f"下一批请求 {requested} 次，剩余 {remaining} 次。"
+            "本轮已停止，执行进度已保留，超额批次未执行。"
+        )
     if reason == "completion_reviewer_unavailable":
         return "完成复核失败，最终答复尚未发布；本轮保留为未完成，可继续重试复核。"
     return f"本轮未完成（{_bounded_text(reason)}），执行进度已保留。"

@@ -56,13 +56,14 @@ class CoreSkillToolProvider:
                 description=(
                     "Load reusable Skill instructions and then follow them using normal tools. "
                     "Load a named or clearly relevant Skill, including verification workflows for implementation tasks. "
-                    "Choose from the Available Skills catalog in the request context. "
+                    "Use an exact name from Available Skills or one explicitly named by the user. "
+                    "If purposes are shortened or the desired Skill is absent, search with skill.discover. "
                     "Omit resource to read SKILL.md. If supplied, resource must be a non-empty "
                     "relative path to a text file within the Skill directory."
                 ),
                 parameters={
                     "type": "object", "properties": {
-                        "name": {"type": "string", "enum": [skill.name for skill in plans]},
+                        "name": {"type": "string", "minLength": 1},
                         "resource": {
                             "type": "string", "minLength": 1, "pattern": r"\S",
                             "description": 'Omit resource to read the main instructions, or pass "SKILL.md". '
@@ -75,7 +76,21 @@ class CoreSkillToolProvider:
                 risk=ToolRisk.R0, is_read_only=True, is_concurrency_safe=True,
                 idempotency=ToolIdempotency.IDEMPOTENT, max_result_tokens=100_000,
                 effect=ToolEffect.OBSERVE, result_authority=ToolResultAuthority.NONE,
+                # Preserve the full registry snapshot. The conversation request
+                # projects it using the selected model's context-window budget.
                 model_context=model_data,
+            ))
+            tools.append(ToolSpec(
+                name="skill.discover",
+                description="Search the available Skill catalog by name or purpose. Read a selected Skill with skill.load. Use next_offset to see more entries.",
+                parameters={"type": "object", "properties": {
+                    "query": {"type": "string", "maxLength": 256},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                }, "additionalProperties": False},
+                risk=ToolRisk.R0, is_read_only=True, is_concurrency_safe=True,
+                idempotency=ToolIdempotency.IDEMPOTENT, max_result_tokens=6000,
+                effect=ToolEffect.OBSERVE, result_authority=ToolResultAuthority.NONE,
             ))
         for skill in skills:
             if skill.kind is SkillKind.CODE:
@@ -106,13 +121,24 @@ class CoreSkillToolProvider:
         if call.name == "skill.installation_finish":
             return await self._finish_installation(call, context)
         skills = self.refresh_catalog()
+        if call.name == "skill.discover":
+            data = self.catalog.model_data(skills)
+            query = call.arguments.get("query", "").strip().casefold()
+            entries = [entry for entry in sorted(data["skills"], key=lambda row: row["name"])
+                       if query in (entry["name"] + " " + entry["description"]).casefold()]
+            offset, limit = call.arguments.get("offset", 0), call.arguments.get("limit", 20)
+            return ToolResult(call.call_id, True, data={
+                "skills": entries[offset:offset + limit], "total": len(entries),
+                "catalog_revision": data["revision"],
+                "next_offset": offset + limit if offset + limit < len(entries) else None,
+            })
         expected_revision = call.arguments.get("catalog_revision")
         if expected_revision is not None:
             current = self.catalog.model_data(skills)
             if expected_revision != current["revision"]:
                 return ToolResult(call.call_id, False, error_code="SKILL_CATALOG_CHANGED",
-                                  message="Skill catalog changed; use the refreshed catalog before loading.", data=current,
-                                  hint="Choose the Skill and catalog_revision from the returned catalog, then submit a new call.",
+                                  message="Skill catalog changed; refresh the selection before loading.", data=self._catalog_notice(current),
+                                  hint="Use skill.discover to inspect current metadata and catalog_revision, then submit a new call.",
                                   recovery_kind=ToolRecoveryKind.RETRY_AFTER_STATE_CHANGE)
         name = call.arguments.get("name") if call.name == "skill.load" else call.name
         skill = next((item for item in self.registry.list_all() if item.name == name), None)
@@ -120,12 +146,12 @@ class CoreSkillToolProvider:
             return ToolResult(call.call_id, False, error_code="SKILL_NOT_FOUND", message=f"Skill unavailable: {name}",
                               hint="Choose an exact name from the current Available Skills catalog.",
                               recovery_kind=ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS,
-                              data=self.catalog.model_data(skills))
+                              data=self._catalog_notice(self.catalog.model_data(skills)))
         meta = {"runtime_kind": "skill", "skill_id": skill.id, "skill_kind": skill.kind.value}
         try:
-            if call.name == "skill.load" and skill.kind is SkillKind.PLAN:
+            if call.name == "skill.load":
                 resource = call.arguments.get("resource", "SKILL.md")
-                data = self.catalog.read(skill, resource)
+                data = self.catalog.load_registered(self.registry, name, resource)
             elif skill.kind is SkillKind.CODE and skill.handler is not None:
                 data = skill.handler(call.arguments)
                 if inspect.isawaitable(data):
@@ -164,6 +190,12 @@ class CoreSkillToolProvider:
             return self._load_error(call, meta, "SKILL_LOAD_FAILED", str(error),
                                     "Inspect the reported Skill error before choosing another action.",
                                     ToolRecoveryKind.TERMINAL)
+
+    @staticmethod
+    def _catalog_notice(data: dict) -> dict:
+        # Do not undo prompt slimming by dumping every entry on an error.
+        return {"revision": data["revision"], "total_skills": len(data["skills"]),
+                "discovery_tool": "skill.discover"}
 
     @staticmethod
     def _load_error(call, meta, code, message, hint, recovery) -> ToolResult:

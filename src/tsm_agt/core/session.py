@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
@@ -103,6 +103,7 @@ class SessionSnapshot:
     #: SkillRegistry.
     enabled_skills: tuple[str, ...] = ()
     model_profile_id: str | None = None
+    model_context_window: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.session_id.strip() or not self.subject.strip() or not self.title.strip():
@@ -247,6 +248,7 @@ class SessionSnapshot:
             # older snapshots; persistence always writes the explicit key.
             "reasoning_effort": self.reasoning_effort,
             "model_profile_id": self.model_profile_id,
+            "model_context_window": dict(self.model_context_window),
             # Session-wide skill configuration. Older snapshots may not carry
             # this key; persistence always writes an explicit list.
             "enabled_skills": list(self.enabled_skills),
@@ -298,6 +300,7 @@ class SessionSnapshot:
                 str(skill_id) for skill_id in data.get("enabled_skills", [])
             ),
             model_profile_id=data.get("model_profile_id"),
+            model_context_window=dict(data.get("model_context_window", {})),
         )
         if data.get("context_hash") and str(data["context_hash"]) != snapshot.context_hash:
             raise ValueError("session context hash does not match")

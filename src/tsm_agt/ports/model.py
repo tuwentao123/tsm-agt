@@ -426,6 +426,8 @@ class ModelRequest:
     # and may be ignored by adapters that do not support reasoning controls.
     reasoning_effort: str | None = None
     model_profile_id: str | None = None
+    # Local diagnostic correlation; never included in a provider payload.
+    context_window_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,6 +14,7 @@ FORBIDDEN_FROM_CORE = ("tsm_agt.adapters", "tsm_agt.extensions")
 #: plumbing); a shared transport is not a provider adapter.
 SHARED_ADAPTER_MODULES = frozenset({
     "tsm_agt.adapters.http_json",
+    "tsm_agt.adapters.request_prefix",
 })
 
 

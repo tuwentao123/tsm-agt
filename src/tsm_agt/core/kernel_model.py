@@ -391,6 +391,7 @@ class ModelMixin:
             return
         event_data: list[tuple[str, Mapping[str, Any]]] = []
         names = {
+            "request_prefix_observed": "model.request_prefix_observed",
             "attempt_started": "model.attempt_started",
             "attempt_completed": "model.attempt_completed",
             "attempt_failed": "model.attempt_failed",

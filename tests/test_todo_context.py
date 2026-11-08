@@ -21,6 +21,12 @@ def snapshots(request):
             if message.message_id.startswith("execution-context-")]
 
 
+def todo_results(request):
+    return [block.result for message in request.messages for block in message.content
+            if isinstance(block, ToolResultBlock) and isinstance(block.result.data, dict)
+            and ("todos" in block.result.data or block.result.error_code == "REVISION_CONFLICT")]
+
+
 class TodoContextTest(unittest.IsolatedAsyncioTestCase):
     async def test_completed_plan_allows_remaining_four_file_read_batch(self):
         from dataclasses import replace
@@ -135,17 +141,18 @@ class TodoContextTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(memory.plan[0].step_id, identifier)
         self.assertEqual(memory.plan[0].status.value, "IN_PROGRESS")
         for request in model.requests[1:]:
-            data = json.loads(snapshots(request)[0].text)["plan_record"]
-            self.assertEqual(data["items"][0]["step_id"], identifier)
-            runtime = [m.text for m in request.messages if m.message_id.startswith("prompt-runtime-")]
-            self.assertEqual(len(runtime), 1)
-            self.assertEqual(runtime[0].count("The current execution state includes a plan."), 1)
-        failed_note = next(m.text for m in model.requests[2].messages if m.message_id.startswith("prompt-runtime-"))
-        recovered_note = next(m.text for m in model.requests[3].messages if m.message_id.startswith("prompt-runtime-"))
-        self.assertIn("Inspect the latest plan write outcome", failed_note)
-        self.assertNotIn("Inspect the latest plan write outcome", recovered_note)
+            successful = [result for result in todo_results(request) if result.ok]
+            self.assertEqual(successful[-1].data["todos"][0]["id"], identifier)
+            self.assertEqual(snapshots(request), snapshots(model.requests[0]))
+        failed = todo_results(model.requests[2])[-1]
+        recovered = todo_results(model.requests[3])[-1]
+        self.assertEqual(failed.error_code, "REVISION_CONFLICT")
+        self.assertEqual(failed.data["current_revision"], 2)
+        self.assertIn("Read core.todo_list", failed.hint)
+        self.assertTrue(recovered.ok)
+        self.assertEqual(recovered.data["revision"], 3)
 
-    async def test_updated_plan_replaces_snapshot_and_survives_compaction(self):
+    async def test_updated_plan_uses_tool_results_and_baseline_survives_compaction(self):
         model = ScriptedModel([
             tool_response("create", "create", "core.todo_list", {
                 "expected_revision": 1, "operation_id": "create",
@@ -174,27 +181,25 @@ class TodoContextTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(model.requests), 3)  # No new completion gate.
         before = snapshots(model.requests[1])
         after = snapshots(model.requests[2])
-        self.assertEqual(len(before), 1)
-        self.assertEqual(len(after), 1)
-        self.assertEqual(json.loads(before[0].text)["plan_record"]["revision"], 2)
-        data = json.loads(after[0].text)["plan_record"]
+        self.assertEqual(before, after)  # Earlier snapshots are never rewritten.
+        self.assertEqual(todo_results(model.requests[1])[-1].data["revision"], 2)
+        data = todo_results(model.requests[2])[-1].data
         self.assertEqual(data["revision"], 3)
-        self.assertEqual(data["open_count"], 1)
-        self.assertEqual(data["active_item_id"], "b")
-        self.assertEqual(data["maintenance_this_turn"]["successful_write_count"], 2)
-        self.assertTrue(data["maintenance_this_turn"]["updated_this_turn"])
-        self.assertEqual([step["status"] for step in data["items"]], ["IN_PROGRESS", "COMPLETED"])
-        self.assertEqual(model.requests[2].messages[-1], after[0])
-        self.assertIs(after[0].role, MessageRole.USER)
-        head = next(m for m in model.requests[2].messages if m.message_id.startswith("working-memory-context-"))
-        self.assertNotIn("plan", json.loads(head.text))
+        self.assertEqual(data["summary"]["in_progress"], 1)
+        self.assertEqual(data["plan_state"]["active_item_id"], "b")
+        self.assertEqual([step["status"] for step in data["todos"]], ["completed", "in_progress"])
+        self.assertEqual(
+            [m for m in model.requests[2].messages if m.message_id.startswith("working-memory-context-")],
+            [m for m in model.requests[0].messages if m.message_id.startswith("working-memory-context-")],
+        )
 
         template = PromptTemplate.default()
         static_tokens = ContextWindowManager.estimate_input_tokens((), (), template)
         current = Message("current", MessageRole.USER, (TextBlock("Continue implementation"),))
         prepared = ContextWindowManager(trigger_ratio=0.50, recent_message_floor=1).prepare(
             conversation=(
-                current, after[0], *tool_pair("old", "old observation " * 200),
+                current, Message("execution-context-fixture", MessageRole.USER, (TextBlock("window-start observation"),)),
+                *tool_pair("old", "old observation " * 200),
                 Message("bridge", MessageRole.ASSISTANT, (TextBlock("Continue checking"),)),
                 *tool_pair("recent", "recent observation"),
             ),
@@ -202,7 +207,7 @@ class TodoContextTest(unittest.IsolatedAsyncioTestCase):
             max_output_tokens=128,
         )
         self.assertIsNotNone(prepared.compaction)
-        self.assertIn(after[0], prepared.messages)
+        self.assertTrue(any(message.message_id == "execution-context-fixture" for message in prepared.messages))
 
     async def test_new_application_restores_latest_plan_into_next_turn(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -240,20 +245,16 @@ class TodoContextTest(unittest.IsolatedAsyncioTestCase):
             try:
                 await second.kernel.run_agent_turn(task.task_id, "Continue the implementation")
                 latest = snapshots(model.requests[0])
-                self.assertEqual(len(latest), 1)
-                data = json.loads(latest[0].text)["plan_record"]
+                self.assertEqual(latest, snapshots(model.requests[1]))
+                # Same window survives restart; the latest plan is its durable
+                # tool result rather than a replacement of the initial snapshot.
+                data = todo_results(model.requests[0])[-1].data
                 self.assertEqual(data["revision"], 2)
-                self.assertEqual(data["open_count"], 1)
-                self.assertEqual(data["maintenance_this_turn"]["write_attempt_count"], 0)
-                self.assertFalse(data["maintenance_this_turn"]["updated_this_turn"])
-                self.assertEqual(data["items"][0]["description"], "Implement integration")
-                reminder = [m.text for m in model.requests[0].messages
-                            if m.message_id.startswith("prompt-runtime-")]
-                self.assertEqual(len(reminder), 1)
-                self.assertIn("synchronize observed completion", reminder[0])
-                after = json.loads(snapshots(model.requests[1])[0].text)["plan_record"]
+                self.assertEqual(data["summary"]["pending"], 1)
+                self.assertEqual(data["todos"][0]["content"], "Implement integration")
+                after = todo_results(model.requests[1])[-1].data
                 self.assertEqual(after["revision"], 3)
-                self.assertEqual(after["maintenance_this_turn"]["last_write"]["status"], "succeeded")
-                self.assertEqual(after["items"][0]["status"], "IN_PROGRESS")
+                self.assertTrue(todo_results(model.requests[1])[-1].ok)
+                self.assertEqual(after["todos"][0]["status"], "in_progress")
             finally:
                 await second.registry.stop_all()

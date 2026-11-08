@@ -61,9 +61,23 @@ class SkillInstallations:
             row = next(row for row in rows if row["id"] == identity)
             if expected_status is not None and row["status"] != expected_status:
                 return dict(row)
+            if all(row.get(key) == value for key, value in changes.items()):
+                return dict(row)
             row.update(changes, updated_at=datetime.now(timezone.utc).isoformat())
             self._save(rows)
             return dict(row)
+
+    def record_import(self, skill) -> dict:
+        """Record file availability, not environment readiness or model checks."""
+        with _lock:
+            row = self.create(skill)
+            if row["status"] == "installed":
+                return row
+            return self.update(
+                row["id"], status="installed",
+                summary="已导入用户 Skill 目录；未执行指令或准备运行环境。",
+                checks=["SKILL.md 格式可读取", "Skill 文件及附带资源已保存"],
+            )
 
     def _save(self, rows: list[dict]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -145,11 +159,14 @@ class UserSkillsStore:
             Path(temporary).unlink(missing_ok=True)
 
     @staticmethod
-    def parse(path: Path) -> Skill:
+    def manifest_data(path: Path) -> tuple[dict, str | None, str]:
+        """Read common Skill metadata and preserve Markdown verbatim."""
         if path.stat().st_size > 256_000:
             raise ValueError("SKILL.md exceeds 256 KB")
-        text = path.read_text(encoding="utf-8-sig")
-        lines = text.splitlines()
+        with path.open(encoding="utf-8-sig", newline="") as stream:
+            text = stream.read()
+        lines = text.splitlines(keepends=True)
+        body = None
         yaml_document = False
         if lines and lines[0].strip() == "---":
             end = next((i for i in range(1, len(lines)) if lines[i].strip() in {"---", "..."}), None)
@@ -161,7 +178,8 @@ class UserSkillsStore:
                 yaml_document = True
                 yaml_text = text
             else:
-                yaml_text = "\n".join(lines[1:end])
+                yaml_text = "".join(lines[1:end])
+                body = "".join(lines[end + 1:])
         else:
             # Compatibility with the original YAML-only demo SKILL.md.
             yaml_text = text
@@ -176,16 +194,24 @@ class UserSkillsStore:
             raise ValueError(f"Invalid SKILL.md YAML: {error}") from error
         if not isinstance(metadata, dict):
             raise ValueError("SKILL.md requires YAML name and description")
+        return metadata, body, text
+
+    @staticmethod
+    def parse(path: Path) -> Skill:
+        metadata, _, _ = UserSkillsStore.manifest_data(path)
         name, description = metadata.get("name"), metadata.get("description")
         if not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}", name):
             raise ValueError("Invalid Skill name")
         if not isinstance(description, str) or not description.strip():
             raise ValueError("SKILL.md requires a description")
-        if metadata.get("kind", "plan") != "plan":
-            raise ValueError("Only instruction Skills can be discovered from files")
         tags = metadata.get("tags", [])
-        if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
-            raise ValueError("Skill tags must be a list of strings")
+        # Vendor extension fields are not execution policy. All file Skills
+        # load as instructions; scripts remain resources, never Python handlers.
+        if isinstance(tags, str):
+            tags = [tags]
+        if not isinstance(tags, list):
+            tags = []
+        tags = [tag for tag in tags if isinstance(tag, str)]
         return Skill(
             id=name, name=name, description=description.strip(), kind=SkillKind.PLAN,
             args_schema={"type": "object", "properties": {}}, output_schema=None,
@@ -193,6 +219,26 @@ class UserSkillsStore:
             safety_level="read_only", approval_required=False,
             source="user",
         )
+
+    @staticmethod
+    def normalize_manifest(path: Path) -> Skill:
+        """Convert incompatible extensions only; compatible files stay intact."""
+        skill = UserSkillsStore.parse(path)
+        metadata, body, text = UserSkillsStore.manifest_data(path)
+        changed = False
+        if metadata.get("kind", "plan") != "plan":
+            metadata.setdefault("source_kind", metadata["kind"])
+            metadata["kind"] = "plan"
+            changed = True
+        if "tags" in metadata and metadata["tags"] != list(skill.tags):
+            metadata["tags"] = list(skill.tags)
+            changed = True
+        if changed:
+            header = yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False)
+            # YAML-only legacy files have no Markdown body to move.
+            text = "---\n" + header + ("---\n" + body if body is not None else "")
+            path.write_text(text, encoding="utf-8")
+        return skill
 
     def discover(self) -> tuple[Skill, ...]:
         self.issues = []
@@ -277,7 +323,7 @@ class UserSkillsStore:
             if len(manifests) != 1:
                 raise ValueError("请选择只包含一个 SKILL.md 的 Skill 目录")
             try:
-                skill = self.parse(manifests[0])
+                skill = self.normalize_manifest(manifests[0])
             except ValueError as error:
                 relative_manifest = manifests[0].relative_to(stage).as_posix()
                 raise ValueError(f"{relative_manifest}: {error}") from error

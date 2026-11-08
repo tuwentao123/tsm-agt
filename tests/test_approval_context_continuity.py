@@ -85,10 +85,10 @@ class ApprovalContextContinuityTest(unittest.IsolatedAsyncioTestCase):
                                   for result in results], [("change-a", True, "A")])
                 self.assertIn("fixture.change", [tool.name for tool in request.tools])
                 tail = [m for m in request.messages if m.message_id.startswith("execution-context-")]
-                self.assertEqual(len(tail), 1)
-                self.assertEqual(request.messages[-1], tail[0])
-                self.assertIs(tail[0].role, MessageRole.USER)
-                self.assertEqual(json.loads(tail[0].text)["recent_actions"][-1]["call_id"], "change-a")
+                # The mutation result is the new fact. The baseline remains
+                # unchanged across both immediate and approval-resumed paths.
+                self.assertEqual(tail, [m for m in model.requests[1].messages
+                                        if m.message_id.startswith("execution-context-")])
                 return approvals
         finally:
             await app.registry.stop_all()

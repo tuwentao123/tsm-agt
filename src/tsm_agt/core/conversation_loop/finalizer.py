@@ -25,6 +25,7 @@ from ..agent_loop import AgentTurnIncomplete, AgentTurnResult, TurnState
 
 #: Reasons recorded on a partial boundary. They are durable event payloads.
 ITERATION_BUDGET_EXHAUSTED = "iteration_budget_exhausted"
+TOOL_CALL_BUDGET_EXHAUSTED = "tool_call_budget_exhausted"
 
 
 class ConversationFinalizer:
@@ -49,6 +50,11 @@ class ConversationFinalizer:
             user_message=user_message,
             assistant_message=response.message,
             assistant_replay_eligible=assistant_replay_eligible,
+            model_context_window={
+                **dict(state.checkpoint.context_window_state),
+                "task_id": state.task_id,
+                "messages": [message.to_data() for message in state.messages],
+            },
             llm_payload={
                 "turn_id": state.turn_id,
                 "orchestration_mode": "CONVERSATION_LOOP",
@@ -95,7 +101,7 @@ class ConversationFinalizer:
         )
 
     async def persist_partial_boundary(
-        self, state: TurnState, reason: str,
+        self, state: TurnState, reason: str, *, budget: dict[str, int] | None = None,
     ) -> AgentTurnIncomplete:
         """Record a resumable, explicitly-partial boundary for this turn."""
 
@@ -131,6 +137,7 @@ class ConversationFinalizer:
                     "model_calls": state.model_call_count,
                     "tool_calls": state.tool_call_count,
                     "pending_tool_calls": len(state.pending_tool_calls),
+                    **(budget or {}),
                 },
             ),
             (
@@ -141,6 +148,7 @@ class ConversationFinalizer:
                     "reason": reason,
                     "model_calls": state.model_call_count,
                     "tool_calls": state.tool_call_count,
+                    **(budget or {}),
                 },
             ),
         ))

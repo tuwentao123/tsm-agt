@@ -83,6 +83,7 @@ from .approval import (
     ApprovalKind, ApprovalRequest, ApprovalRequired, utc_now
 )
 from .configuration import canonical_hash
+from .mcp_call import MCP_CALL_TOOL, resolve_mcp_call, schema_hash
 from .execution import (
     IdempotencyConflict, ToolCommitState, ToolExecutionInProgress,
     ToolExecutionRecord
@@ -1094,6 +1095,23 @@ class ToolMixin:
             raise ValueError("turn_id must not be empty")
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+
+        if call.name == MCP_CALL_TOOL:
+            _, envelope_spec = await self._find_tool(MCP_CALL_TOOL)
+            validate_tool_arguments(envelope_spec, call.arguments)
+            target = resolve_mcp_call(call)
+            _, target_spec = await self._find_tool(target.name)
+            if (call.arguments.get("schema_hash") is not None
+                    and call.arguments["schema_hash"] != schema_hash(target_spec)):
+                return ToolResult(
+                    call.call_id, False, error_code="MCP_SCHEMA_CHANGED",
+                    message="The target input schema changed; discover the tool again.",
+                    retryable=True,
+                    recovery_kind=ToolRecoveryKind.RETRY_WITH_CORRECTED_ARGUMENTS,
+                )
+            # History and the frozen batch retain the model envelope. Policy,
+            # execution and idempotency use the target with the same call_id.
+            call = target
 
         stored = await self._dependencies.store.load_task(task_id)
         if stored is None:

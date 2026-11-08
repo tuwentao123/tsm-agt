@@ -1961,6 +1961,7 @@ class SessionMixin:
         conclusion_validation: ConclusionReferenceValidation | None = None,
         answer_event_ref: str | None = None,
         turn_counters: Mapping[str, int] | None = None,
+        model_context_window: Mapping[str, Any] | None = None,
     ) -> SessionUnitOfWork:
         message_data = assistant_message.to_data()
         effective_memory = await self.get_effective_working_memory(task.task_id)
@@ -1984,6 +1985,8 @@ class SessionMixin:
         current = SessionSnapshot.from_data(stored.data)
         self._authorize_session(current)
         updated = current.bump_context()
+        if model_context_window is not None:
+            updated = replace(updated, model_context_window=dict(model_context_window))
         payload: dict[str, Any] = {
             "task_id": task.task_id, "turn_id": turn_id,
             "task_state": task.state.value,

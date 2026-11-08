@@ -315,7 +315,7 @@ class ReadReuseLoopTest(unittest.IsolatedAsyncioTestCase):
         application = compose_fixture_application(
             model_adapter=model, tool_adapters=(provider,),
             store_adapter=SQLiteRuntimeStore(database),
-            context_manager=(ContextWindowManager(latency_soft_input_tokens=1, recent_message_floor=8)
+            context_manager=(ContextWindowManager(latency_soft_input_tokens=1, recent_message_floor=4)
                              if compact else ContextWindowManager()),
         )
         model.application = application

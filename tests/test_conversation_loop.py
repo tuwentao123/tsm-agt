@@ -715,8 +715,8 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
                 history = session_history_view(model.requests[1])["recent_messages"]
                 self.assertIn(
                     "I found two missing dashboard views; I can implement them.",
-                    [item["text"] for item in history
-                     if item["role"] == "assistant"],
+                    [message.text for message in model.requests[1].messages
+                     if message.role is MessageRole.ASSISTANT],
                 )
         finally:
             await application.registry.stop_all()
@@ -920,7 +920,7 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
                 second = model.requests[1].messages
                 rendered = "\n".join(
                     message.text for message in second
-                    if message.role is MessageRole.SYSTEM
+                    if message.role is MessageRole.SYSTEM or message.message_id.startswith("window-context-runtime-")
                 )
                 self.assertIn("current_execution_state include a failure", rendered)
                 self.assertNotIn("recovery_kind", rendered)

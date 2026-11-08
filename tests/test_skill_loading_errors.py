@@ -92,10 +92,12 @@ class SkillLoadingErrorsTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.error_code, code)
             self.assertEqual(result.effective_recovery_kind, recovery)
 
-    async def test_unknown_skill_and_changed_catalog_offer_current_catalog(self):
+    async def test_unknown_skill_and_changed_catalog_offer_discovery_without_dumping_catalog(self):
         result = await self.load("missing")
         self.assertEqual(result.error_code, "SKILL_NOT_FOUND")
-        self.assertTrue(result.data["skills"])
+        self.assertNotIn("skills", result.data)
+        self.assertEqual(result.data["discovery_tool"], "skill.discover")
+        self.assertGreater(result.data["total_skills"], 0)
         result = await self.load(catalog_revision="stale")
         self.assertEqual(result.error_code, "SKILL_CATALOG_CHANGED")
         self.assertTrue(result.data["revision"])

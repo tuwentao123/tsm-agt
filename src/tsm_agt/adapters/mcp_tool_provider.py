@@ -32,6 +32,7 @@ from tsm_agt.ports import (
 )
 from .mcp_errors import mcp_failure_detail
 from .mcp_discovery import DISCOVERY_TOOL, discover, discovery_spec
+from tsm_agt.core.mcp_call import mcp_call_spec
 
 
 class MCPToolProvider(ToolProviderPort):
@@ -181,7 +182,7 @@ class MCPToolProvider(ToolProviderPort):
             raise RuntimeError("MCP tool provider is not started")
         if not self._manager.server_ids():
             return self._tools
-        return (discovery_spec(self._manager, self._server_status), *self._tools)
+        return (discovery_spec(self._manager, self._server_status), mcp_call_spec(), *self._tools)
 
     async def invoke(
         self, call: ToolCall, context: ToolInvocationContext,

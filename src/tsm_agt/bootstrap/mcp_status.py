@@ -23,7 +23,11 @@ from tsm_agt.ports import MCPServerConfig
 from .mcp_configuration import load_mcp_servers_from_configuration
 
 
-DEFAULT_PROBE_TIMEOUT_SECONDS = 8.0
+# Per-step budget for the settings probe. A cold ``npx`` start plus
+# ``initialize`` + ``tools/list`` regularly needs more than 8s on a machine
+# that has to resolve a package first, so a tight budget reported healthy
+# servers as "connect timeout".
+DEFAULT_PROBE_TIMEOUT_SECONDS = 15.0
 
 
 def mcp_configuration_summary(

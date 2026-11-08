@@ -56,7 +56,6 @@ from tsm_agt.ports import (
 from ..agent_loop import (
     AgentCheckpointConflict,
     AgentClarificationSuspended,
-    AgentLoopLimitExceeded,
     AgentProgress,
     AgentProgressKind,
     AgentTurnCheckpoint,
@@ -74,12 +73,17 @@ from ..context_messages import GENERATED_CONTEXT_PREFIXES
 from ..task import TaskKind, TaskSnapshot, TaskState
 from ..tool import InvalidToolArguments, validate_tool_arguments
 from ..turn import InvalidModelResponse, InvalidTurnState, ModelInvocationFailed
-from .finalizer import ITERATION_BUDGET_EXHAUSTED, ConversationFinalizer
+from .finalizer import (
+    ITERATION_BUDGET_EXHAUSTED, TOOL_CALL_BUDGET_EXHAUSTED, ConversationFinalizer,
+)
 from .finalization import ConversationFinalizationPipeline
 from .prompt import assemble_stable_prompt, latest_tool_result_instruction
 from .state import build_turn_state
 from .execution_context import project_execution_context
 from .tool_catalog import refresh_observed_tool_catalog
+from ..context_window import establish_window, context_updates, restore_messages, window_identity, window_history
+from ..skills import SkillCatalogBudget, render_skill_catalog
+from .compaction import complete_window_compaction
 
 
 #: Message-id prefixes the Runtime re-projects on every model call. They are
@@ -99,7 +103,8 @@ def model_visible_tools(visible_tools: tuple[ToolSpec, ...]) -> tuple[ToolSpec, 
 
 def select_model_tools(
     visible_tools: tuple[ToolSpec, ...], *, user_text: str, model_call: int,
-    task_kind: TaskKind | None = None,
+    task_kind: TaskKind | None = None, context_window: int = 0,
+    skill_catalog_budget: SkillCatalogBudget = SkillCatalogBudget(),
 ) -> tuple[ToolSpec, ...]:
     """Return the tools applicable to this execution kind on every sample.
 
@@ -112,13 +117,20 @@ def select_model_tools(
     """
     del user_text, model_call
     tools = model_visible_tools(visible_tools)
+    if any(tool.name == "core.mcp_call" for tool in tools):
+        tools = tuple(tool for tool in tools if not tool.name.startswith("mcp."))
     if task_kind is TaskKind.CONVERSATION:
         # These describe a fixed work-item contract, not a persistent chat.
         # Keep the runtime registry/checkpoint toolset intact for recovery.
         tools = tuple(tool for tool in tools if tool.name not in {
             "core.task_spec_read", "core.task_spec_update",
         })
-    return tools
+    budget_tokens = skill_catalog_budget.tokens_for(context_window)
+    return tuple(
+        replace(tool, model_context=render_skill_catalog(tool.model_context, budget_tokens))
+        if tool.model_context and tool.model_context.get("kind") == "skill_catalog" else tool
+        for tool in tools
+    )
 
 
 def model_tool_exposure_profile(
@@ -162,10 +174,6 @@ class ConversationAgentLoop:
         enabled_skill_ids = tuple(
             skill.id for skill in kernel._dependencies.skill_registry.list_all()
         )
-        initial_model_tools = select_model_tools(
-            visible_tools, user_text=user_text, model_call=1,
-            task_kind=task.task_kind,
-        )
         initial_exposure_profile = model_tool_exposure_profile(
             visible_tools, user_text=user_text, model_call=1,
         )
@@ -173,6 +181,11 @@ class ConversationAgentLoop:
         resolver = getattr(kernel._dependencies.model, "resolve_profile", None)
         profile_id = resolver(session.model_profile_id) if resolver else session.model_profile_id
         capabilities = kernel._model_capabilities_for(profile_id)
+        initial_model_tools = select_model_tools(
+            visible_tools, user_text=user_text, model_call=1,
+            task_kind=task.task_kind, context_window=capabilities.context_window,
+            skill_catalog_budget=kernel._dependencies.context_manager.skill_catalog_budget,
+        )
         if visible_tools and not capabilities.tools and task.task_kind is not TaskKind.CONVERSATION:
             raise ProviderCapabilityMismatch(
                 "selected model provider does not support tools, but the Agent turn "
@@ -236,6 +249,20 @@ class ConversationAgentLoop:
             model_profile_id=profile_id,
             reasoning_effort=session.reasoning_effort,
         )
+        identity = window_identity(
+            task_id=task_id, profile_id=profile_id, workspace=task.workspace,
+            manifest_hash=kernel._dependencies.prompt_template.manifest().manifest_hash,
+            tools=initial_model_tools, reasoning_effort=session.reasoning_effort,
+            model_fingerprint=(kernel._dependencies.model.profile_fingerprint(profile_id)
+                               if hasattr(kernel._dependencies.model, "profile_fingerprint") else ""),
+        )
+        saved_window = session.model_context_window
+        if (task.task_kind is TaskKind.CONVERSATION
+                and saved_window.get("identity") == identity):
+            checkpoint = replace(checkpoint,
+                messages=(*restore_messages(saved_window), user_message),
+                context_window_state={key: value for key, value in saved_window.items() if key != "messages"},
+            )
         checkpoint = await kernel._bind_agent_checkpoint(
             task, checkpoint, visible_tools
         )
@@ -471,7 +498,7 @@ class ConversationAgentLoop:
                         for call in parsed_calls
                     )
                     kernel._validate_tool_batch_proposal(
-                        parsed_calls, state.visible_tool_by_name, state.seen_call_ids
+                        parsed_calls, {tool.name: tool for tool in state.request.tools}, state.seen_call_ids
                     )
                 except RecoverableToolProtocolError as error:
                     await self._record_recoverable_protocol_error(
@@ -487,13 +514,22 @@ class ConversationAgentLoop:
                     await self._record_model_failure(state, error)
                     raise
                 if state.tool_call_count + len(parsed_calls) > checkpoint.max_tool_calls:
-                    raise AgentLoopLimitExceeded(
-                        state.turn_id, "max_tool_calls", checkpoint.max_tool_calls,
-                        model_calls=state.model_call_count,
-                        tool_calls=state.tool_call_count,
-                        max_model_calls=checkpoint.max_model_calls,
-                        max_tool_calls=checkpoint.max_tool_calls,
-                        last_tool_error=state.last_tool_error,
+                    # The model request finished, but none of this proposed
+                    # batch was accepted or dispatched. Preserve a complete
+                    # protocol checkpoint and expose the same partial boundary
+                    # as model-budget exhaustion, including approval resumes.
+                    state.model_call_count += 1
+                    state.input_tokens += response.usage.input_tokens
+                    state.output_tokens += response.usage.output_tokens
+                    return await self._finalizer.persist_partial_boundary(
+                        state, TOOL_CALL_BUDGET_EXHAUSTED,
+                        budget={
+                            "max_tool_calls": checkpoint.max_tool_calls,
+                            "requested_tool_calls": len(parsed_calls),
+                            "remaining_tool_calls": max(
+                                0, checkpoint.max_tool_calls - state.tool_call_count,
+                            ),
+                        },
                     )
                 text_stream.resolve(response, has_tools=bool(parsed_calls))
                 state.seen_call_ids.update(call.call_id for call in parsed_calls)
@@ -920,24 +956,15 @@ class ConversationAgentLoop:
             tuple(state.messages)
         ))
         model_call = state.model_call_count + 1
-        state.messages = [
-            message for message in state.messages
-            if not message.message_id.startswith(_GENERATED_CONTEXT_PREFIXES)
-        ]
-        state.messages.extend(await kernel._project_context_messages(state.task_id))
         task = await kernel.get_task(state.task_id)
-        state.messages = list(project_execution_context(
-            state.messages, task_id=state.task_id, turn_id=state.turn_id,
-            tool_specs=state.visible_tool_by_name,
-            executions=tuple(task.tool_executions.values()),
-        ))
-        state.checkpoint = replace(state.checkpoint, messages=tuple(state.messages))
         source_user = kernel._source_user_message(state.checkpoint.messages)
         model_tools = select_model_tools(
             state.visible_tools,
             user_text=source_user.text if source_user is not None else "",
             model_call=model_call,
             task_kind=task.task_kind,
+            context_window=kernel._model_capabilities_for(state.checkpoint.model_profile_id).context_window,
+            skill_catalog_budget=kernel._dependencies.context_manager.skill_catalog_budget,
         )
         runtime_instruction = latest_tool_result_instruction(
             kernel, state, model_tools,
@@ -950,6 +977,71 @@ class ConversationAgentLoop:
                 "run commands or make changes. If the user needs those actions, "
                 "explain this limitation and ask them to choose a model with tools."
             )
+        projections = await kernel._project_context_messages(
+            state.task_id, updates_only=bool(state.checkpoint.context_window_state),
+        )
+        identity = window_identity(
+            task_id=state.task_id, profile_id=state.checkpoint.model_profile_id, workspace=task.workspace,
+            manifest_hash=kernel._dependencies.prompt_template.manifest().manifest_hash,
+            tools=model_tools, reasoning_effort=state.checkpoint.reasoning_effort,
+            model_fingerprint=(kernel._dependencies.model.profile_fingerprint(state.checkpoint.model_profile_id)
+                               if hasattr(kernel._dependencies.model, "profile_fingerprint") else ""),
+        )
+        window = dict(state.checkpoint.context_window_state)
+        if not window:
+            snapshots = project_execution_context(
+                projections, task_id=state.task_id, turn_id=state.turn_id,
+                tool_specs=state.visible_tool_by_name, executions=tuple(task.tool_executions.values()),
+            )
+            baseline, window = establish_window(
+                kernel._dependencies.prompt_template, snapshots, model_tools, identity,
+            )
+            state.messages = list(baseline) + [message for message in state.messages
+                if not message.message_id.startswith(_GENERATED_CONTEXT_PREFIXES)]
+        else:
+            updates, window = context_updates(window, projections, model_tools)
+            if window.get("identity") != identity or any(message.role is MessageRole.SYSTEM for message in updates):
+                # Messages-style providers collect system roles into one wire
+                # prefix. A trusted-instruction/config change therefore starts
+                # an explicit window rather than pretending a tail system
+                # message can preserve that prefix across both protocols.
+                projections = await kernel._project_context_messages(state.task_id)
+                snapshots = project_execution_context(
+                    tuple(message for message in projections if not message.message_id.startswith("session-context-")),
+                    task_id=state.task_id, turn_id=state.turn_id,
+                    tool_specs=state.visible_tool_by_name, executions=tuple(task.tool_executions.values()),
+                )
+                metadata = tuple(message for message in state.messages if message.message_id.startswith("session-context-"))
+                baseline, window = establish_window(
+                    kernel._dependencies.prompt_template,
+                    snapshots,
+                    model_tools, identity, int(window.get("epoch", 1)) + 1,
+                )
+                state.messages = [*baseline, *metadata, *window_history(tuple(state.messages))]
+                await kernel._append_events(state.task_id, (("context.window_reset", {
+                    "turn_id": state.turn_id, "reason": "configuration_or_trusted_instructions_changed",
+                    "epoch": window["epoch"],
+                }),))
+            else:
+                state.messages.extend(updates)
+        if runtime_instruction and window.get("runtime_instruction") != runtime_instruction:
+            note = Message(
+                "window-context-runtime-" + uuid4().hex, MessageRole.USER,
+                (TextBlock(runtime_instruction),),
+            )
+            # Put initial runtime context before the current authored input.
+            # Later observations append without changing earlier messages.
+            if state.model_call_count == 0 and source_user is not None:
+                at = next((i for i, message in enumerate(state.messages)
+                           if message.message_id == source_user.message_id), len(state.messages))
+                state.messages.insert(at, note)
+            else:
+                state.messages.append(note)
+        window["runtime_instruction"] = runtime_instruction
+        # Dynamic guidance is now part of durable history, never a rewritten
+        # instruction ahead of it. Empty guidance needs no new message.
+        runtime_instruction = ""
+        state.checkpoint = replace(state.checkpoint, messages=tuple(state.messages), context_window_state=window)
         wire_output_limit = kernel._model_output_token_limit_for(state.checkpoint.model_profile_id)
         try:
             prepared = kernel._dependencies.context_manager.prepare(
@@ -960,6 +1052,10 @@ class ConversationAgentLoop:
                 max_output_tokens=max(state.checkpoint.max_output_tokens, wire_output_limit or 0),
                 runtime_instruction=runtime_instruction,
                 read_reuse_task_id=state.task_id,
+                defer_hard_limit_for_summary=kernel._dependencies.context_summarizer is not None,
+            )
+            prepared = await complete_window_compaction(
+                kernel, state, prepared, model_tools, projections, identity,
             )
         except ContextWindowExceeded as error:
             await kernel._record_turn_failure(state.task_id, state.turn_id, error)
@@ -1012,8 +1108,12 @@ class ConversationAgentLoop:
             # defaults.
             reasoning_effort=getattr(state.checkpoint, "reasoning_effort", None),
             model_profile_id=state.checkpoint.model_profile_id,
+            context_window_id=identity + ":" + str(state.checkpoint.context_window_state.get("epoch", 1)),
         )
         state.prepared = prepared
         state.prompt = prompt
         state.model_call_number = model_call
         state.model_started_at = time.monotonic()
+        # Persist the exact baseline before the API call so crash recovery
+        # cannot rebuild it from a newer filesystem or MCP connection state.
+        await kernel._save_agent_checkpoint(state.checkpoint, "conversation-loop-context-window")

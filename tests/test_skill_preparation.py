@@ -89,7 +89,40 @@ class SkillPreparationTest(unittest.IsolatedAsyncioTestCase):
             await server._client.wait_task(updated["task_id"], timeout=5)
         return self.store.installations.get(job["id"])
 
-    async def test_directory_install_creates_independent_chat_in_recent_workspace_and_reports_ready(self):
+    async def legacy_preparation(self):
+        # Retain historical receipt/approval compatibility checks, but public
+        # file-import endpoints must never call this preparation helper.
+        skill = self.store.install_upload({"demo/SKILL.md": manifest()})
+        web.refresh_skill_catalog(self.store)
+        return web.start_skill_preparation(self.store, self.store.installations.create(skill))
+
+    async def test_public_import_and_legacy_retry_never_call_model_or_create_session(self):
+        model = ScriptedModel([])
+        client = await self.client(model)
+        server = SameLoopServer(client)
+        with patch.object(web, "runtime_server", server), patch.object(web, "start_skill_preparation", side_effect=AssertionError("must not prepare")):
+            result = await self.upload()
+            job = result["installation"]
+            self.assertEqual(job["status"], "installed")
+            self.assertFalse(result["preparation_required"])
+            self.assertFalse(result["ready"])
+            self.assertNotIn("session_id", job)
+            self.assertNotIn("task_id", job)
+            self.assertIsNotNone(client.application.kernel._dependencies.skill_registry.get("demo-plan"))
+            before = Path(job["plan_path"]).stat().st_mtime_ns
+            repeated = await self.upload()
+            self.assertEqual(repeated["installation"], job)
+            self.store.installations.update(job["id"], status="pending")
+            retried = await web.retry_skill_preparation(job["id"])
+            self.assertEqual(retried["status"], "installed")
+            self.assertEqual(Path(job["plan_path"]).stat().st_mtime_ns, before)
+            self.assertEqual((await web.get_skill_installation(job["id"]))["status"], "installed")
+            self.assertEqual(model.requests, [])
+            self.assertEqual(server.launches, [])
+            self.assertEqual(web.session_workspace_bindings, {})
+        self.assertEqual(UserSkillsStore(self.root / "home").installations.get(job["id"])["status"], "installed")
+
+    async def test_legacy_preparation_receipt_still_reports_real_ready_checks(self):
         class Model(ScriptedModel):
             async def complete(inner, request):
                 if len(inner.requests) == 1:
@@ -107,8 +140,7 @@ class SkillPreparationTest(unittest.IsolatedAsyncioTestCase):
         client = await self.client(model)
         server = SameLoopServer(client)
         with patch.object(web, "runtime_server", server):
-            receipt = await self.upload()
-            job = await self.complete_launch(server, receipt["installation"])
+            job = await self.complete_launch(server, await self.legacy_preparation())
             result = await client.get_task_result(job["task_id"])
             events = await client.application.kernel._dependencies.store.read_events(job["task_id"])
             self.assertEqual(job["status"], "ready", (job, result, [e.payload for e in events if e.event_type in {"tool.failed", "turn.failed"}]))
@@ -121,9 +153,10 @@ class SkillPreparationTest(unittest.IsolatedAsyncioTestCase):
             repeated = await self.upload()
             self.assertEqual(repeated["installation"]["id"], job["id"])
             self.assertEqual(len(server.launches), 1)
-            self.assertEqual((await web.get_skill_installation(job["id"]))["status"], "ready")
+            self.assertEqual((await web.get_skill_installation(job["id"]))["status"], "installed")
         restored = UserSkillsStore(self.root / "home").installations.get(job["id"])
-        self.assertEqual(restored["checks"], job["checks"])
+        self.assertEqual(restored["status"], "installed")
+        self.assertIn("未执行指令", restored["summary"])
         self.assertIn("不要假定每个 Skill 都需要安装环境", installation_prompt(job))
         self.assertTrue(all(tool.name != "core.process_start" for request in model.requests for tool in request.tools))
 
@@ -131,7 +164,7 @@ class SkillPreparationTest(unittest.IsolatedAsyncioTestCase):
         client = await self.client(ScriptedModel([text_response("done", "安装好了")]))
         server = SameLoopServer(client)
         with patch.object(web, "runtime_server", server):
-            job = (await self.upload())["installation"]
+            job = await self.legacy_preparation()
             job = await self.complete_launch(server, job)
             status = await web.get_skill_installation(job["id"])
             self.assertEqual(status["status"], "unverified")
@@ -144,7 +177,7 @@ class SkillPreparationTest(unittest.IsolatedAsyncioTestCase):
         ]), tools=(CoreProcessToolProvider(),))
         server = SameLoopServer(client)
         with patch.object(web, "runtime_server", server):
-            job = await self.complete_launch(server, (await self.upload())["installation"])
+            job = await self.complete_launch(server, await self.legacy_preparation())
             result = await web.get_skill_installation(job["id"])
             events = await client.application.kernel._dependencies.store.read_events(job["task_id"])
             self.assertEqual(result["status"], "awaiting_approval", [e.payload for e in events if e.event_type in {"tool.failed", "turn.failed"}])
@@ -153,22 +186,22 @@ class SkillPreparationTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(task.approval)
             self.assertNotEqual(self.store.installations.get(job["id"])["status"], "ready")
 
-    async def test_offline_or_missing_workspace_keeps_pending_receipt_and_retry_starts(self):
+    async def test_import_succeeds_offline_and_without_workspace(self):
         with patch.object(web, "runtime_server", None):
             job = (await self.upload())["installation"]
-            self.assertEqual(job["status"], "pending")
+            self.assertEqual(job["status"], "installed")
             self.assertNotIn("session_id", job)
         client = await self.client(ScriptedModel([text_response("done", "请继续验证")]))
         server = SameLoopServer(client)
         with patch.object(web, "runtime_server", server), patch.object(web, "workspace_registry", []):
             pending = await web.retry_skill_preparation(job["id"])
-            self.assertEqual(pending["status"], "pending")
+            self.assertEqual(pending["status"], "installed")
             self.assertEqual(len(server.launches), 0)
         with patch.object(web, "runtime_server", server):
             started = await web.retry_skill_preparation(job["id"])
-            self.assertEqual(started["status"], "starting")
-            done = await self.complete_launch(server, started)
-            self.assertTrue(done["task_id"])
+            self.assertEqual(started["status"], "installed")
+            self.assertEqual(len(server.launches), 0)
+            self.assertNotIn("task_id", started)
 
     async def test_activation_recency_survives_registry_reload(self):
         await web.activate_workspace("first")
