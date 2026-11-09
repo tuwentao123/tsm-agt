@@ -418,10 +418,9 @@ textarea::placeholder{color:#94a3b8}
 .image-preview-content{position:relative;display:flex;align-items:center;justify-content:center;padding:14px;border-radius:18px;background:rgba(255,255,255,.96);box-shadow:0 18px 50px rgba(15,23,42,.28)}
 .image-preview-content img{max-width:min(88vw,1600px);max-height:82vh;border-radius:12px;display:block;object-fit:contain}
 .image-preview-close{position:absolute;top:-10px;right:-10px;width:30px;height:30px;border-radius:50%;border:none;background:#0f172a;color:#fff;font-size:18px;cursor:pointer;box-shadow:0 4px 14px rgba(15,23,42,.24)}
-.loading,.error-banner,.config-banner{display:none;font-size:13px;color:var(--muted);padding:0 20px}
-.loading.visible,.error-banner.visible,.config-banner.visible{display:block}
-.error-banner{color:#f4837a}
-.config-banner{color:#d98b2b;white-space:pre-line}
+.loading{display:none;font-size:13px;color:var(--muted);padding:0 20px}
+.error-banner{display:none;color:#b91c1c;font-size:12px;padding:0 12px 4px;overflow-wrap:anywhere}
+.loading.visible,.error-banner.visible{display:block}
 @media(max-width:1500px){.workspace-stage{grid-template-columns:minmax(0,1fr) 380px}}
 @media(max-width:1280px){.workspace-stage{grid-template-columns:1fr}.task-card-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:1024px){.layout{grid-template-columns:1fr;height:auto}.sidebar{display:none}.topbar{padding-inline:16px}.chat-shell{padding:16px 16px 14px}.chat-area,.trace-pane{padding:14px}.message.user{max-width:100%}.composer{padding:8px 14px 10px}.composer-box{padding:9px 10px}.textarea{min-height:44px}}
@@ -494,6 +493,20 @@ textarea::placeholder{color:#94a3b8}
 .settings-row-desc { flex: 1; min-width: 0; font-size: 12px; color: var(--muted, #64748b); overflow-wrap: anywhere; }
 .settings-path { flex: 1; min-width: 0; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
 .settings-install { display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border: 1px solid var(--border, #e2e8f0); border-radius: 12px; background: var(--panel-muted, #f8fafc); }
+.settings-install-history { display: flex; flex-direction: column; gap: 8px; }
+.settings-install-history[hidden] { display: none; }
+.settings-install-history-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.settings-install-history-title { font-size: 13px; font-weight: 600; }
+.settings-install-history-caption { font-size: 11.5px; color: var(--muted, #94a3b8); }
+.settings-install-row-card { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; border: 1px solid var(--border, #e2e8f0); border-radius: 12px; background: var(--panel-muted, #f8fafc); }
+.settings-install-row-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.settings-install-row-name { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.settings-install-row-time { margin-left: auto; font-size: 11px; color: var(--muted, #94a3b8); }
+.settings-install-row-workspace { margin-right: auto; font-size: 11px; color: var(--muted, #94a3b8); overflow-wrap: anywhere; }
+.settings-install-row-checks { font-size: 11.5px; color: var(--muted, #64748b); }
+.settings-install-row-checks summary { cursor: pointer; }
+.settings-install-row-checks ul { margin: 6px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
+.settings-install-row-checks li { line-height: 1.6; overflow-wrap: anywhere; }
 @media (max-width: 980px) {
   .settings-dialog { width: 96vw; height: 92vh; }
   .settings-shell { grid-template-columns: 184px minmax(0, 1fr); }
@@ -602,9 +615,15 @@ textarea::placeholder{color:#94a3b8}
               <input id="settings-search-skills" type="search" placeholder="按名称、描述或来源搜索 Skill" oninput="filterSettingsCards('skills', this.value)" />
             </label>
             <input type="file" id="settings-skill-upload" webkitdirectory hidden onchange="uploadSkillDirectoryAndInstall(this.files, this)" />
-            <div id="skill-installations" role="status" class="settings-list"></div>
             <div id="installed-skills-list" class="settings-grid"></div>
             <div id="settings-empty-skills" class="settings-empty" style="display:none">没有匹配的 Skill。</div>
+            <section class="settings-install-history" id="skill-install-history" hidden>
+              <div class="settings-install-history-head">
+                <span class="settings-install-history-title">安装记录</span>
+                <span class="settings-install-history-caption">每个 Skill 只显示最近一次结果，校验明细可展开。</span>
+              </div>
+              <div id="skill-installations" role="status" class="settings-list"></div>
+            </section>
           </section>
 
           <section class="settings-panel" id="settings-panel-builtin" role="tabpanel" data-settings-panel="builtin">
@@ -655,17 +674,17 @@ textarea::placeholder{color:#94a3b8}
               <span class="settings-search-glyph" aria-hidden="true">⌕</span>
               <input id="settings-search-mcp" type="search" placeholder="按名称、类型或命令搜索服务器" oninput="filterSettingsCards('mcp', this.value)" />
             </label>
+            <p id="mcp-runtime-status" role="status" class="settings-status"></p>
             <p id="mcp-settings-status" role="status" class="settings-status"></p>
             <div id="mcp-server-list" class="settings-grid"></div>
             <div id="settings-empty-mcp" class="settings-empty" style="display:none">没有匹配的 MCP 服务器。</div>
           </section>
 
           <p id="skill-settings-status" role="status" class="settings-status"></p>
+          <p id="runtime-settings-status" role="status" class="settings-status"></p>
         </div>
       </div>
     </dialog>
-    <div id=\"error-banner\" class=\"error-banner\"></div>
-    <div id=\"config-banner\" class=\"config-banner\"></div>
     <div id=\"loading\" class=\"loading\">正在等待运行结果…</div>
     <div class=\"chat-shell\">
       <div class=\"workspace-stage\">
@@ -694,6 +713,10 @@ textarea::placeholder{color:#94a3b8}
       <div class=\"composer-meta\" style=\"margin-bottom:6px;display:flex;align-items:center;gap:12px;justify-content:space-between;\">
         <div class=\"composer-title\">会话输入</div>
         <div style=\"display:flex;align-items:center;gap:8px;\">
+          <label for=\"auto-approve\" title=\"开启后本会话收到的授权请求会自动审批通过（含信任工作区）；仅影响当前会话，可随时关闭\" style=\"font-size:11px;color:#64748b;display:flex;align-items:center;gap:6px;\">
+            <input id=\"auto-approve\" type=\"checkbox\" aria-label=\"帮我自动授权\" style=\"width:13px;height:13px;margin:0;accent-color:#2563eb;\" />
+            帮我自动授权
+          </label>
           <label for=\"model-profile\" style=\"font-size:11px;color:#64748b;\">模型
             <select id=\"model-profile\" aria-label=\"会话模型\" title=\"新建会话时选择模型；已有会话保持原模型\" style=\"max-width:250px;\">
               <option value=\"\">跟随服务配置</option>
@@ -736,6 +759,7 @@ textarea::placeholder{color:#94a3b8}
           </div>
         </div>
       </div>
+      <div id=\"error-banner\" class=\"error-banner\" role=\"alert\"></div>
     </div>
   </main>
 </div>
@@ -1216,6 +1240,8 @@ function createConversation() {
     createdAt: new Date().toLocaleTimeString(),
     messages: [],
     draft: '',
+    isLocalDraft: true,
+    autoApprove: false,
   };
   conversations.unshift(conversation);
   activeConversationId = conversation.id;
@@ -1383,6 +1409,62 @@ async function persistConversationModel(conversation, selected, previous, genera
   }
 }
 
+// Auto approve is a per-conversation switch, so what it resolves is whatever
+// that conversation currently shows as a live dock. Each request is submitted
+// at most once: a Runtime rejection hands the decision back to the user
+// instead of spinning into a submit loop.
+function autoApprovePendingApprovals(conversationId = activeConversationId) {
+  const conversation = getConversationById(conversationId);
+  if (!conversation?.autoApprove) return 0;
+  const pending = (conversation.messages || []).filter((message) => (
+    message.role === 'approval'
+    && message.approval?.request_id
+    && !message.resolved
+    && !message.submitting
+    && !message.autoApproved
+  ));
+  pending.forEach((message) => {
+    message.autoApproved = true;
+    decideApproval(message, 'APPROVE', {automatic: true});
+  });
+  return pending.length;
+}
+
+async function persistConversationAutoApprove(conversation, enabled, previous) {
+  try {
+    const response = await fetch(`/sessions/${encodeURIComponent(conversation.id)}/auto-approve`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({auto_approve: enabled}),
+    });
+    // A drafted conversation becomes durable on its first submitted message,
+    // so a missing Session is not a reason to revert the switch.
+    if (response.status === 404) return;
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || '自动授权设置保存失败');
+    conversation.autoApprove = Boolean(data.auto_approve);
+  } catch (error) {
+    conversation.autoApprove = previous;
+    if (getActiveConversation()?.id === conversation.id) renderAutoApproveToggle();
+    showError(error.message || '自动授权设置保存失败');
+  }
+}
+
+function renderAutoApproveToggle() {
+  const checkbox = document.getElementById('auto-approve');
+  if (!checkbox) return;
+  const conversation = getActiveConversation();
+  checkbox.checked = Boolean(conversation?.autoApprove);
+  checkbox.disabled = !conversation;
+  checkbox.onchange = () => {
+    if (!conversation) return;
+    const previous = Boolean(conversation.autoApprove);
+    conversation.autoApprove = checkbox.checked;
+    // Switching it on applies to the approvals already on screen.
+    if (checkbox.checked) autoApprovePendingApprovals(conversation.id);
+    persistConversationAutoApprove(conversation, checkbox.checked, previous);
+  };
+}
+
 function updateReasoningOptions() {
   const selected = document.getElementById('model-profile')?.value;
   const profile = modelProfiles.find(item => item.id === selected);
@@ -1403,6 +1485,7 @@ function renderConversations() {
   document.getElementById('conversation-name').textContent = active?.title || '新建会话';
   renderSessionId(active);
   renderModelSelector();
+  renderAutoApproveToggle();
 }
 
 // The Session id is what a Task, a Turn and any log line refer back to, so it
@@ -1844,6 +1927,8 @@ document.addEventListener('click', (event) => {
 
 function renderMessages(forceScrollToBottom = false) {
   const active = getActiveConversation();
+  const errorConversationId = document.getElementById('error-banner')?.dataset?.conversationId;
+  if (errorConversationId && errorConversationId !== active?.id) clearError();
   renderConversationTodo(activeWorkspaceId ? active : null);
   const chatArea = document.getElementById('chat-area');
   const approvalDock = document.getElementById('approval-dock');
@@ -2518,16 +2603,30 @@ function latestDiscoveryInstallation(skill) {
     && [job.plan_path, job.source_plan_path].includes(skill.plan_path));
 }
 
+// 「已安装」与「目录与发现」共用同一条判定：指令文件是否已经落在安装目录内。
+// 发现目录里的 Skill 属于“可用但未安装”，两个面板都必须这样展示，否则会同一
+// 个 Skill 一边显示已安装、一边又给「安装」按钮。
+function skillLivesInInstallDirectory(skill) {
+  const normalize = value => String(value || '').replace(/\\/g, '/').replace(/\/+$/, '');
+  const planPath = normalize(skill?.plan_path);
+  const installDirectory = normalize(skillDefaultDirectory);
+  if (!planPath || !installDirectory || planPath.startsWith('builtin://')) return false;
+  return planPath.startsWith(`${installDirectory}/`);
+}
+
 function discoverySkillState(skill) {
   if (skill.source !== 'user' || !skill.plan_path) return {available: false, label: '无需安装'};
   const job = latestDiscoveryInstallation(skill);
+  const active = {starting: '正在准备', running: '正在验证', awaiting_approval: '等待审批', awaiting_user: '等待补充信息'};
+  if (job && active[job.status]) return {available: false, label: active[job.status], job};
+  // 已在安装目录内：再次导入只会同名冲突，而且「已安装」面板会照实列出它。
+  if (skillLivesInInstallDirectory(skill)) return {available: false,
+    label: job?.loadable === false ? '已安装 · 加载待确认' : '已安装', job};
   if (!job) return {available: true, label: '安装'};
   if (job.status === 'installed') return job.loadable === true
     ? {available: false, label: '已安装 · 可加载', job}
     : {available: true, label: '已导入 · 重试加载', job};
   if (job.status === 'ready') return {available: false, label: '已安装', job};
-  const active = {starting: '正在准备', running: '正在验证', awaiting_approval: '等待审批', awaiting_user: '等待补充信息'};
-  if (active[job.status]) return {available: false, label: active[job.status], job};
   return {available: true, label: '安装', job};
 }
 
@@ -2620,44 +2719,126 @@ async function installDiscoveredSkills(skills) {
   }
 }
 
+const SKILL_INSTALL_LABELS = {
+  installed: '已导入（文件导入完成）',
+  pending: '文件已保存，准备待启动', starting: '正在创建安装会话', running: '正在准备和验证',
+  ready: '安装成功，验证通过', blocked: '准备受阻', failed: '准备失败',
+  awaiting_approval: '等待审批', awaiting_user: '等待补充信息',
+  unverified: '尚未完成验证', interrupted: '准备已中断', needs_review: '需要复核',
+};
+const SKILL_INSTALL_TONES = {
+  installed: 'ok', ready: 'ok', failed: 'bad', blocked: 'bad', interrupted: 'bad',
+  pending: 'warn', unverified: 'warn', needs_review: 'warn',
+  awaiting_approval: 'warn', awaiting_user: 'warn',
+};
+const SKILL_INSTALL_STATUS_PREFIXES = ['已安装 · 可加载', '已导入（文件导入完成）', '安装成功，验证通过'];
+
+function skillInstallationStatus(job) {
+  if (job.status === 'installed' && job.loadable === true) return {label: '已安装 · 可加载', tone: 'ok'};
+  return {label: SKILL_INSTALL_LABELS[job.status] || job.status, tone: SKILL_INSTALL_TONES[job.status] || ''};
+}
+
+// 回执摘要常以状态短语开头，卡片已单独展示状态标签，这里去掉重复前缀。
+function skillInstallationDetail(job, label) {
+  const summary = String(job.summary || '').trim();
+  if (!summary) return '';
+  for (const prefix of [label, ...SKILL_INSTALL_STATUS_PREFIXES].filter(Boolean)) {
+    if (!summary.startsWith(prefix)) continue;
+    const rest = summary.slice(prefix.length).replace(/^[\s·，,。：:；;]+/, '').trim();
+    if (rest) return rest;
+  }
+  return summary;
+}
+
+function skillInstallationStamp(job) {
+  const raw = job.updated_at || job.created_at;
+  const date = raw ? new Date(raw) : null;
+  if (!date || Number.isNaN(date.getTime())) return '';
+  const pad = value => String(value).padStart(2, '0');
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+// 同一 Skill 的多次安装只保留最近一次，避免历史回执堆在面板里。
+function latestSkillInstallations() {
+  const newest = new Map();
+  const stampOf = job => String(job.updated_at || job.created_at || '');
+  for (const job of skillInstallations.values()) {
+    const key = job.skill_name || job.id;
+    const seen = newest.get(key);
+    if (!seen || stampOf(job) >= stampOf(seen)) newest.set(key, job);
+  }
+  return [...newest.values()].sort((a, b) => stampOf(a).localeCompare(stampOf(b))).slice(-30).reverse();
+}
+
 function renderSkillInstallations(jobs = []) {
   for (const job of jobs) skillInstallations.set(job.id, job);
   refreshDiscoverySkillControls();
   const panel = document.getElementById('skill-installations');
   if (!panel) return;
   panel.replaceChildren();
-  const labels = {
-    installed: '已导入（文件导入完成）',
-    pending: '文件已保存，准备待启动', starting: '正在创建安装会话', running: '正在准备和验证',
-    ready: '安装成功，验证通过', blocked: '准备受阻', failed: '准备失败',
-    awaiting_approval: '等待审批', awaiting_user: '等待补充信息',
-    unverified: '尚未完成验证', interrupted: '准备已中断', needs_review: '需要复核',
-  };
-  for (const job of [...skillInstallations.values()].slice(-30).reverse()) {
+  const rows = latestSkillInstallations();
+  const history = document.getElementById('skill-install-history');
+  if (history) history.hidden = rows.length === 0;
+  for (const job of rows) {
+    const status = skillInstallationStatus(job);
     const row = document.createElement('div');
-    row.style.cssText = 'border:1px solid #e2e8f0;border-radius:10px;padding:10px;margin-top:10px;';
-    const text = document.createElement('p');
-    const label = job.status === 'installed' && job.loadable === true ? '已安装 · 可加载' : (labels[job.status] || job.status);
-    text.textContent = `${job.skill_name} · ${label}：${job.summary}`;
-    row.append(text);
-    if (job.workspace_path) {
-      const workspace = document.createElement('p');
-      workspace.textContent = `安装会话工作区：${job.workspace_path}`;
-      row.append(workspace);
+    row.className = 'settings-install-row-card';
+    const head = document.createElement('div');
+    head.className = 'settings-install-row-head';
+    const name = document.createElement('span');
+    name.className = 'settings-install-row-name';
+    name.textContent = job.skill_name;
+    head.append(name, settingsTag(status.label, status.tone));
+    const stamp = skillInstallationStamp(job);
+    if (stamp) {
+      const meta = document.createElement('span');
+      meta.className = 'settings-install-row-time';
+      meta.textContent = stamp;
+      head.append(meta);
     }
-    for (const check of job.checks || []) {
-      const item = document.createElement('p');
-      item.textContent = check;
-      row.append(item);
+    row.append(head);
+    const detail = skillInstallationDetail(job, status.label);
+    if (detail) {
+      const description = document.createElement('p');
+      description.className = 'settings-card-desc';
+      description.textContent = detail;
+      if (detail.length > 110) description.title = detail;
+      row.append(description);
+    }
+    const checks = (job.checks || []).filter(Boolean);
+    if (checks.length) {
+      const details = document.createElement('details');
+      details.className = 'settings-install-row-checks';
+      const summary = document.createElement('summary');
+      summary.textContent = `校验明细 · ${checks.length} 项`;
+      details.append(summary);
+      const list = document.createElement('ul');
+      for (const check of checks) {
+        const item = document.createElement('li');
+        item.textContent = check;
+        list.append(item);
+      }
+      details.append(list);
+      row.append(details);
+    }
+    const actions = document.createElement('div');
+    actions.className = 'settings-actions';
+    if (job.workspace_path) {
+      const workspace = document.createElement('span');
+      workspace.className = 'settings-install-row-workspace';
+      workspace.textContent = `工作区：${job.workspace_path}`;
+      actions.append(workspace);
     }
     if (job.session_id && job.task_id) {
       const open = document.createElement('button');
+      open.className = 'settings-btn';
       open.textContent = '打开安装会话';
       open.onclick = () => openSkillInstallationConversation(job);
-      row.append(open);
+      actions.append(open);
     }
     if (['pending', 'failed', 'interrupted', 'unverified', 'needs_review'].includes(job.status)) {
       const retry = document.createElement('button');
+      retry.className = 'settings-btn';
       retry.textContent = '确认文件安装';
       retry.onclick = async () => {
         retry.disabled = true;
@@ -2667,8 +2848,9 @@ function renderSkillInstallations(jobs = []) {
         } catch (error) { setSkillInstallFeedback(error.message, true); }
         finally { retry.disabled = false; }
       };
-      row.append(retry);
+      actions.append(retry);
     }
+    if (actions.children.length) row.append(actions);
     panel.append(row);
     if (['starting', 'running', 'awaiting_approval', 'awaiting_user'].includes(job.status)) {
       watchSkillInstallation(job.id);
@@ -2884,7 +3066,10 @@ function renderSkillCatalog(data) {
     toolbar.className = 'settings-discovery-toolbar';
     const caption = document.createElement('div');
     caption.className = 'settings-caption';
-    caption.textContent = `已发现 ${skills.length} 个 Skill`;
+    const installedCount = skills.filter(skill => skillLivesInInstallDirectory(skill)).length;
+    const installableCount = skills.filter(skill => skill.source === 'user' && skill.plan_path
+      && !skillLivesInInstallDirectory(skill)).length;
+    caption.textContent = `已发现 ${skills.length} 个 Skill · 已安装 ${installedCount} 个 · 可安装 ${installableCount} 个`;
     discoverySelectAll = document.createElement('input');
     discoverySelectAll.type = 'checkbox';
     discoverySelectAll.id = 'skill-discovery-select-all';
@@ -2995,11 +3180,19 @@ function applySkillSettings(data) {
   const installed = document.getElementById('installed-skills-list');
   if (installed) {
     installed.replaceChildren();
-    for (const skill of data.skills || []) {
-      const source = skill.source === 'builtin' ? '内置'
+    const skills = data.skills || [];
+    // 只有指令文件落在安装目录内（或随程序提供）的 Skill 才算已安装；发现目录
+    // 里的 Skill 保持“可安装”，与「目录与发现」的按钮状态保持一致。
+    const installedSkills = skills.filter(skill => skill.source === 'builtin' || skillLivesInInstallDirectory(skill));
+    const pendingCount = skills.length - installedSkills.length;
+    for (const skill of installedSkills) {
+      const builtin = skill.source === 'builtin';
+      const source = builtin ? '内置'
         : skill.source === 'user' ? '用户目录'
         : (skill.source || '其他');
-      const tags = [{text: source, tone: skill.source === 'builtin' ? 'accent' : ''}];
+      const tags = [{text: source, tone: builtin ? 'accent' : ''},
+        {text: builtin ? '随程序提供' : '安装目录内', tone: 'ok'}];
+      if (skill.overrides?.includes('builtin')) tags.push({text: '覆盖内置版本', tone: 'warn'});
       if (skill.safety_level) tags.push({text: `安全级别：${skill.safety_level}`, tone: ''});
       installed.append(settingsCard({
         glyph: String(skill.name || '?').slice(0, 1),
@@ -3010,6 +3203,13 @@ function applySkillSettings(data) {
         meta: source,
         searchText: [skill.name, skill.description, source, skill.plan_path].filter(Boolean).join(' '),
       }));
+    }
+    if (pendingCount > 0) {
+      const hint = document.createElement('div');
+      hint.className = 'settings-caption';
+      hint.id = 'installed-skills-pending';
+      hint.textContent = `另有 ${pendingCount} 个 Skill 位于发现目录，尚未安装到本地；在「目录与发现」中安装后会出现在这里。`;
+      installed.append(hint);
     }
   }
   document.getElementById('skill-settings-status').textContent = (data.issues || []).join(String.fromCodePoint(10));
@@ -3156,6 +3356,7 @@ function handleSkillSettingsBackdropClose(event) {
 async function openSkillSettings() {
   const dialog = document.getElementById('skill-settings-dialog');
   if (!dialog.open) dialog.showModal();
+  loadDiagnostics();
   try {
     const response = await fetch('/settings/skills');
     const data = await readSkillResponse(response, '读取 Skills 设置失败');
@@ -3925,9 +4126,15 @@ function renderApprovalCard(element, message) {
   } else if (message.submitting) {
     const pending = document.createElement('div');
     pending.className = 'approval-row';
-    pending.textContent = '正在提交授权…';
+    pending.textContent = message.autoApproved ? '已按会话设置自动授权…' : '正在提交授权…';
     actions.appendChild(pending);
   } else {
+    if (message.autoApproveFailed) {
+      const failed = document.createElement('div');
+      failed.className = 'approval-row';
+      failed.textContent = '自动授权失败，请手动确认';
+      actions.appendChild(failed);
+    }
     const approve = document.createElement('button');
     approve.className = 'approval-btn approve';
     approve.textContent = isProjectTrust ? '信任并继续' : '允许';
@@ -3986,10 +4193,15 @@ async function cancelTask(taskId, conversationId) {
   followTask(taskId, conversationId || activeConversationId);
 }
 
-async function decideApproval(message, decision) {
+async function decideApproval(message, decision, options = {}) {
   if (message.submitting) return;
   const approval = message.approval || {};
-  clearError();
+  // Only a human click dismisses whatever banner is on screen and retires the
+  // failed-automatic notice; an automatic attempt must not clear either.
+  if (!options.automatic) {
+    clearError();
+    message.autoApproveFailed = false;
+  }
   message.submitting = true;
   renderMessages();
   try {
@@ -4009,9 +4221,12 @@ async function decideApproval(message, decision) {
     }
   } catch (error) {
     message.submitting = false;
+    // A failed automatic attempt hands the decision back: the dock keeps its
+    // buttons and says why, instead of a toast detached from the switch.
+    message.autoApproveFailed = Boolean(options.automatic);
     renderMessages();
     console.error(error);
-    showError(error.message || '提交授权决定失败。');
+    if (!options.automatic) showError(error.message || '提交授权决定失败。');
     return;
   }
   const card = taskMessage(message.conversationId || activeConversationId, message.taskId);
@@ -4058,6 +4273,7 @@ function appendApproval(taskId, approval, conversationId = activeConversationId)
   bindLatestInputToTask(conversationId, taskId, approval.turn_id || null);
   upsertApprovalMessage(taskId, approval, conversationId);
   if (conversationId === activeConversationId) renderMessages();
+  autoApprovePendingApprovals(conversationId);
 }
 
 function approvalResolutionMatches(approvalRequest, resolution) {
@@ -4087,14 +4303,17 @@ function setLoading(isLoading) {
   document.getElementById('loading').classList.toggle('visible', isLoading);
 }
 
-function showError(message) {
+function showError(message, conversationId = '') {
   const banner = document.getElementById('error-banner');
   banner.textContent = message;
+  banner.dataset.conversationId = conversationId;
   banner.classList.add('visible');
 }
 
 function clearError() {
-  document.getElementById('error-banner').classList.remove('visible');
+  const banner = document.getElementById('error-banner');
+  delete banner.dataset.conversationId;
+  banner.classList.remove('visible');
 }
 
 function clearMessages() {
@@ -4553,6 +4772,8 @@ async function runTask() {
       throw new Error(`请求失败，状态码 ${response.status}${detail}`);
     }
 
+    // A successful submission confirms that the Runtime registered this Session.
+    if (activeConversation) activeConversation.isLocalDraft = false;
     const data = await response.json();
     if (diagnosticSessionMismatch) showError('会话已切换，未为本轮开启诊断。');
     if (data.diagnostic_key) {
@@ -5283,6 +5504,7 @@ function followTask(taskId, conversationId) {
     if (state.approval) {
       bindLatestInputToTask(conversationId, taskId, state.approval.turn_id || state.turn_id || null);
       upsertApprovalMessage(taskId, state.approval, conversationId);
+      autoApprovePendingApprovals(conversationId);
     } else clearApprovalMessage(taskId, conversationId);
     const submittedApprovalIsSettling = Boolean(state.approval
       && current?.task?.approvalResolution?.decision === 'APPROVE'
@@ -5433,7 +5655,12 @@ async function loadSessions() {
       const workspace = workspaces.find(
         (candidate) => candidate.path === item.workspace_path,
       );
-      if (!workspace || getConversationById(item.session_id)) return;
+      if (!workspace) return;
+      const existing = getConversationById(item.session_id);
+      if (existing) {
+        existing.isLocalDraft = false;
+        return;
+      }
       conversations.push({
         id: item.session_id,
         workspaceId: workspace.id,
@@ -5445,6 +5672,7 @@ async function loadSessions() {
         latestTaskId: item.latest_task_id,
         modelProfileId: item.model_profile_id || defaultModelProfile,
         reasoningEffort: item.reasoning_effort || null,
+        autoApprove: Boolean(item.auto_approve),
       });
     });
   } catch (error) {
@@ -5454,7 +5682,7 @@ async function loadSessions() {
 
 async function ensureConversationLoaded(conversationId) {
   const conversation = getConversationById(conversationId);
-  if (!conversation || conversation.loaded) return false;
+  if (!conversation || conversation.isLocalDraft || conversation.loaded) return false;
   conversation.loaded = true;
   const loadGeneration = (conversation.historyLoadGeneration || 0) + 1;
   conversation.historyLoadGeneration = loadGeneration;
@@ -5462,6 +5690,11 @@ async function ensureConversationLoaded(conversationId) {
   const restoreSelection = !conversation.modelSelectionPending;
   try {
     const response = await fetch(`/sessions/${conversationId}`);
+    if (response.status === 404) {
+      // A missing history leaves the current draft or transcript in place.
+      if (conversation.historyLoadGeneration === loadGeneration) conversation.loaded = false;
+      return false;
+    }
     if (!response.ok) {
       throw new Error(`历史记录接口返回 ${response.status}`);
     }
@@ -5631,6 +5864,9 @@ async function ensureConversationLoaded(conversationId) {
     conversation.messages = rebuiltMessages;
     renderConversations();
     renderMessages();
+    // A restored Session can still be waiting for approval, and the switch is
+    // remembered per Session, so a reload must not silently drop it.
+    autoApprovePendingApprovals(conversation.id);
 
     // Only the Session's authoritative active Task may auto-follow. Older
     // WAITING Tasks remain visible as pending cards but do not reopen an SSE
@@ -5649,7 +5885,7 @@ async function ensureConversationLoaded(conversationId) {
     if (conversation.historyLoadGeneration === loadGeneration) {
       conversation.loaded = false;
       if (conversationId === activeConversationId) {
-        showError(`会话历史加载失败：${error.message || '请重试'}`);
+        showError(`会话历史加载失败：${error.message || '请重试'}`, conversationId);
       }
     }
     console.error(error);
@@ -6112,18 +6348,14 @@ async function loadDiagnostics() {
     for (const issue of (data.configuration_issues || [])) {
       notes.push('配置提示：' + issue);
     }
-    for (const server of (data.mcp_servers || [])) {
-      if (server.state === 'failed') {
-        notes.push('MCP ' + server.id + ' 暂不可用（聊天仍可用）：' + server.detail);
-      }
-    }
-    const banner = document.getElementById('config-banner');
-    if (banner) {
-      banner.textContent = notes.join('\\n');
-      banner.classList.toggle('visible', notes.length > 0);
-    }
-    if ((data.mcp_servers || []).some(server => server.state === 'connecting')) {
-      setTimeout(loadDiagnostics, 2000);
+    const runtimeStatus = document.getElementById('runtime-settings-status');
+    if (runtimeStatus) runtimeStatus.textContent = notes.join('\\n');
+    const mcpStatus = document.getElementById('mcp-runtime-status');
+    if (mcpStatus) {
+      mcpStatus.textContent = (data.mcp_servers || [])
+        .filter(server => server.state === 'failed')
+        .map(server => `${server.id} · 运行时连接失败：${server.detail}`)
+        .join('\\n');
     }
   } catch (error) {
     console.error(error);
@@ -6131,7 +6363,6 @@ async function loadDiagnostics() {
 }
 
 setupWorkspaceResizer();
-loadDiagnostics();
 loadWorkspaces();
 """ + """
 </script>
@@ -6144,6 +6375,9 @@ runtime_error: str | None = None
 configuration_issues: list[str] = []
 workspace_registry: list[dict[str, str]] = []
 session_workspace_bindings: dict[str, str] = {}
+# Web-only per-Session preference: the switch decides whether this UI submits
+# APPROVE on its own. It never widens what the Runtime already permits.
+session_auto_approvals: dict[str, bool] = {}
 # Removal is an explicit deny-list rather than "absent from the index": the
 # Runtime keeps owning the Session and Task records, and the startup recovery
 # below rebuilds the index from them, so absence alone would resurrect entries.
@@ -6321,6 +6555,36 @@ def save_session_workspace_bindings() -> None:
         return
 
 
+def session_auto_approvals_path() -> Path:
+    return Path.cwd() / ".agent" / "web-session-auto-approvals.json"
+
+
+def load_session_auto_approvals() -> None:
+    session_auto_approvals.clear()
+    try:
+        raw = json.loads(session_auto_approvals_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(raw, dict):
+        return
+    for session_id, enabled in raw.items():
+        if isinstance(session_id, str) and isinstance(enabled, bool):
+            session_auto_approvals[session_id] = enabled
+
+
+def save_session_auto_approvals() -> None:
+    target = session_auto_approvals_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(session_auto_approvals, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        # A read-only workspace still runs; the switch just is not remembered.
+        return
+
+
 def bind_session_to_workspace(session_id: str, workspace_id: str) -> None:
     existing = session_workspace_bindings.get(session_id)
     if existing is not None and existing != workspace_id:
@@ -6386,6 +6650,7 @@ async def startup() -> None:
     global runtime_server, runtime_error, configuration_issues, turn_request_diagnostics
     load_workspace_registry()
     load_session_workspace_bindings()
+    load_session_auto_approvals()
     load_web_removals()
     runtime_server = LocalEventApiServer(Path.cwd())
     try:
@@ -6723,6 +6988,26 @@ async def update_session_model_profile(session_id: str, payload: dict) -> dict:
         raise HTTPException(status_code=409, detail=str(error)) from error
     return {"session_id": snapshot.session_id, "model_profile_id": snapshot.model_profile_id,
             "reasoning_effort": snapshot.reasoning_effort, "applies_to": "next_turn"}
+
+
+@app.post("/sessions/{session_id}/auto-approve")
+async def update_session_auto_approve(session_id: str, payload: dict) -> dict:
+    """Remember whether this UI auto-approves this Session's approvals.
+
+    This is a Web preference, not a Runtime policy. It decides who clicks
+    APPROVE for this Session; it cannot widen what the Runtime permits, so an
+    opted-in Session still fails every check an explicit click would fail.
+    Drafts are accepted so the switch works before the first durable message.
+    """
+    enabled = payload.get("auto_approve")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="auto_approve must be a boolean")
+    if enabled:
+        session_auto_approvals[session_id] = True
+    else:
+        session_auto_approvals.pop(session_id, None)
+    save_session_auto_approvals()
+    return {"session_id": session_id, "auto_approve": enabled}
 
 
 @app.post("/session-input")
@@ -7592,6 +7877,8 @@ async def remove_session(session_id: str) -> dict:
     save_web_removals()
     if session_workspace_bindings.pop(session_id, None) is not None:
         save_session_workspace_bindings()
+    if session_auto_approvals.pop(session_id, None) is not None:
+        save_session_auto_approvals()
     return {"removed_session_id": session_id}
 
 
@@ -7634,6 +7921,7 @@ async def list_sessions(limit: int = 40) -> dict:
             "task_count": len(snapshot.task_ids),
             "latest_task_id": latest_task_id,
             "model_profile_id": getattr(snapshot, "model_profile_id", None),
+            "auto_approve": session_auto_approvals.get(snapshot.session_id, False),
             "reasoning_effort": getattr(snapshot, "reasoning_effort", None),
             "updated_at": snapshot.updated_at.isoformat(),
         })
@@ -7746,6 +8034,7 @@ async def get_session(session_id: str) -> dict:
         "session_id": snapshot.session_id,
         "title": snapshot.title,
         "model_profile_id": getattr(snapshot, "model_profile_id", None),
+        "auto_approve": session_auto_approvals.get(snapshot.session_id, False),
         "reasoning_effort": getattr(snapshot, "reasoning_effort", None),
         "active_task_id": snapshot.active_task_id,
         "latest_task_id": latest["task_id"] if latest else None,

@@ -118,7 +118,7 @@ class PromptManifestTest(unittest.TestCase):
         # Pin content, ordering, section versions and capability gates together.
         self.assertEqual(
             self.template.manifest().manifest_hash,
-            "1e3c45cd6639303b247d84e57dcb8ba8145dbf2864e1dd9e881aa0ea5c4fe044",
+            "001ab3a9c6bd4c77ab9500d1a7375fd5dd66f12a77f7719a75094bfa5bcd4222",
         )
 
     def test_packaged_prompt_rejects_duplicate_sections(self) -> None:
@@ -306,7 +306,7 @@ class PromptManifestTest(unittest.TestCase):
     def test_request_pipeline_orders_understanding_before_tools(self) -> None:
         segment = self.segment("request-pipeline-guidance")
         content = segment.content
-        self.assertEqual(segment.version, "5.7")
+        self.assertEqual(segment.version, "5.8")
         headings = ["# Working with the user", "# Evidence and action", "# Persistence and completion", "# Progress communication"]
         positions = [content.index(h) for h in headings]
         self.assertEqual(positions, sorted(positions))
@@ -351,12 +351,12 @@ class PromptManifestTest(unittest.TestCase):
         self.assertEqual(segment.version, "1.0")
         for scenario in ("news", "headline", "article", "financial", "新闻"):
             self.assertNotIn(scenario, content)
-        self.assertEqual(self.template.revision, 58)
+        self.assertEqual(self.template.revision, 59)
 
     def test_workspace_guidance_is_capability_bound(self) -> None:
         search = self.segment("workspace-search-guidance").content
         read = self.segment("workspace-read-guidance").content
-        self.assertEqual(self.segment("workspace-read-guidance").version, "1.2")
+        self.assertEqual(self.segment("workspace-read-guidance").version, "1.3")
         self.assertIn("reused_from_call_id", read)
         self.assertIn("reference itself is not file text", read)
         self.assertIn("body is unavailable, read the needed range again", read)
@@ -367,16 +367,14 @@ class PromptManifestTest(unittest.TestCase):
         # Cross-project routing now lives in request-pipeline-guidance, so this
         # segment keeps only the negative warning at the tool's point of use.
         self.assertIn("material this workspace does not hold", search)
-        # A named subject is content, and its docs may sit outside the obvious
-        # source directory (a design-notes folder outside it was missed once).
-        # This project's own names are workspace content; another project's
-        # are not, so a named external system cannot be answered from here.
+        # Unknown owners still require workspace-wide discovery, including
+        # docs; known owners and targets can go straight to focused evidence.
         self.assertIn("this project owns or mentions", search)
         self.assertIn("is not workspace content", search)
-        self.assertIn("before restricting to one subtree", search)
-        # A cap is a cue to continue, not a licence to conclude.
-        self.assertIn("a truncated result means more exists", search)
-        self.assertEqual(self.segment("workspace-search-guidance").version, "2.1")
+        self.assertIn("Read a known target directly", search)
+        self.assertIn("When the owning scope is unknown", search)
+        self.assertIn("A truncated result means more exists", search)
+        self.assertEqual(self.segment("workspace-search-guidance").version, "2.2")
         self.assertIn("only a lead", read)
         self.assertIn("relevant caller", read)
         self.assertIn("say what is unverified", read)

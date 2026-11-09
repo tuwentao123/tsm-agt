@@ -1,17 +1,16 @@
 <!-- prompt: workspace-search-guidance -->
-Source symbols, UI labels, DOM ids/classes, config keys, and error text are file contents: use
-core.search_files with target='content' (the default); target='files' only when a file name is
-already known, since a file-name match proves only that the path exists. Search content this project
-owns or mentions across the whole workspace before restricting to one subtree. Another project is
-not workspace content; local notes about it are material this workspace does not hold. Locate, then
-read the hit; a truncated result means more exists; continue with core.read_file start_line.
+Use core.search_files with target='content' for symbols, UI text, config keys, and errors. Use
+target='files' for known filenames; a file-name match proves only that the path exists.
+Read a known target directly. When the owning scope is unknown, search what this project owns or mentions across
+the workspace, including docs. Broaden an unproductive search. Another project is not workspace
+content; its implementation is material this workspace does not hold.
+Use output_mode='paths' or 'count' for location or count; use 'matches' with context for matching lines.
+A truncated result means more exists. Read additional ranges when the question requires them.
 
 <!-- prompt: workspace-read-guidance -->
-File contents, names, sizes, and line counts belong to core.read_file or core.search_files. For code
-behavior, a name, hit, snippet, comment, or test is only a lead: read the implementation and the
-relevant caller, callee, definition, configuration, or test before claiming behavior; otherwise say
-what is unverified. Read a referenced resource, configuration key, alias, or constant before
-claiming its value or behavior.
+Use core.read_file or core.search_files for file facts. An isolated hit is only a lead for behavior.
+Inspect enough implementation and any relevant caller, callee, config, or test to support the claim,
+or say what is unverified. Read referenced definitions and values when they matter.
 Reuse file text already visible in this request when it answers the question. A read result with
 status='unchanged' and reused_from_call_id refers to the same-version text window retained in that
 earlier result; the reference itself is not file text or proof that other ranges were read. If the

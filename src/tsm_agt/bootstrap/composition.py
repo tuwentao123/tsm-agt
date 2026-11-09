@@ -621,7 +621,7 @@ def _kernel_dependencies(
         )
     return KernelDependencies(
         context_summarizer=(
-            ModelContextSummarizer(registry.require(ModelProviderPort))
+            ModelContextSummarizer(registry.require(ModelProviderPort), context_manager.summary_settings)
             if context_manager is not None and context_manager.semantic_compaction else None
         ),
         max_parallel_tool_calls=max_parallel_tool_calls,

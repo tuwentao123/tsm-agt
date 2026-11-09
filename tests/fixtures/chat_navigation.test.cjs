@@ -65,6 +65,7 @@ function setup() {
     images: [{image_url: 'data:image/png;base64,test', name: '截图.png'}]}]};
   const context = vm.createContext({document, window, activeWorkspaceId: 'workspace',
     selectedImages: [], getActiveConversation: () => conversation,
+    autoApprovePendingApprovals() {},
     renderConversationTodo() {}, renderTracePane() {}, renderTurnCallPanel: () => null,
     renderMarkdown: text => `<p>${text}</p>`,
     ResizeObserver: class {
@@ -83,6 +84,79 @@ function setup() {
 
 test('the entire emitted script compiles', () => {
   assert.doesNotThrow(() => new vm.Script(page));
+});
+
+test('an empty draft skips history until the first submission is accepted', async () => {
+  const s = setup();
+  const banner = new Node(), prompt = new Node(), diagnostic = new Node();
+  const originalLookup = s.document.getElementById;
+  const nodes = {'error-banner': banner, prompt, 'diagnostic-toggle': diagnostic};
+  s.document.getElementById = id => nodes[id] || originalLookup(id);
+  const conversations = [s.conversation];
+  const requests = [];
+  let acceptInput;
+  Object.assign(s.context, {
+    conversations, activeConversationId: 'chat', defaultModelProfile: null,
+    crypto: {randomUUID: () => 'new-session'},
+    getConversationById: id => conversations.find(conversation => conversation.id === id),
+    renderConversations() {}, restoreConversationDraft() {}, persistActiveDraft() {},
+    removeBrowserStorage() {}, draftStorageKey: id => id,
+    appendMessage(role, content, images, id) {
+      conversations.find(conversation => conversation.id === id).messages.push({role, content, images});
+    },
+    renderPreviews() {}, setLoading() {}, updateComposerButtonState() {},
+    diagnoseNextInput: false, diagnosticSessionId: null,
+    console: {error() {}},
+    fetch: async url => {
+      requests.push(url);
+      if (url === '/session-input') return new Promise(resolve => { acceptInput = resolve; });
+      if (url === '/sessions/chat' || !acceptInput) return {ok: false, status: 404};
+      return {ok: true, json: async () => ({messages: [], tasks: [], turns: []})};
+    },
+  });
+  vm.runInContext(section('function showError(', 'function clearMessages('), s.context);
+  vm.runInContext(section('function createConversation(', 'function removeConversation('), s.context);
+  vm.runInContext(section('async function runTask(', 'const 状态文案 ='), s.context);
+  vm.runInContext(section('async function ensureConversationLoaded(', 'async function loadWorkspaces('), s.context);
+
+  assert.equal(await s.context.ensureConversationLoaded('chat'), false);
+  assert.equal(s.conversation.messages.length, 1);
+  assert.equal(banner.classList.contains('visible'), false);
+
+  s.context.createConversation();
+  assert.equal(await s.context.ensureConversationLoaded('new-session'), false);
+  assert.deepEqual(requests, ['/sessions/chat']);
+  assert.equal(banner.classList.contains('visible'), false);
+
+  prompt.value = 'First message';
+  const sent = s.context.runTask();
+  assert.equal(await s.context.ensureConversationLoaded('new-session'), false);
+  assert.deepEqual(requests, ['/sessions/chat', '/session-input']);
+  acceptInput({ok: true, json: async () => ({kind: 'answer', answer: 'Received'})});
+  await sent;
+  assert.equal(await s.context.ensureConversationLoaded('new-session'), true);
+  assert.equal(requests.at(-1), '/sessions/new-session');
+  assert.equal(banner.classList.contains('visible'), false);
+});
+
+test('startup failures are visible only in their settings sections', async () => {
+  const mcpStatus = new Node(), runtimeStatus = new Node();
+  const lookups = [];
+  const context = vm.createContext({console,
+    document: {getElementById(id) {
+      lookups.push(id);
+      return {'mcp-runtime-status': mcpStatus, 'runtime-settings-status': runtimeStatus}[id];
+    }},
+    fetch: async () => ({ok: true, json: async () => ({
+      runtime_error: '测试配置缺失',
+      mcp_servers: [{id: 'Figma', state: 'failed', detail: 'HTTP 502'}],
+    })}),
+  });
+  vm.runInContext(section('async function loadDiagnostics(', '\nsetupWorkspaceResizer();'), context);
+  await context.loadDiagnostics();
+  assert.match(mcpStatus.textContent, /Figma.*HTTP 502/);
+  assert.match(runtimeStatus.textContent, /测试配置缺失/);
+  assert.deepEqual(lookups, ['runtime-settings-status', 'mcp-runtime-status']);
 });
 
 test('cold session reload renders real Task cards, later answers and durable timeline events', async () => {

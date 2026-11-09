@@ -73,6 +73,10 @@ class ResilientModelProvider:
         lookup = getattr(self._provider, "profile_catalog", None)
         return lookup() if lookup else {"default_profile": None, "profiles": []}
 
+    def summary_reasoning_effort_for(self, profile_id=None):
+        lookup = getattr(self._provider, "summary_reasoning_effort_for", None)
+        return lookup(profile_id) if lookup else None
+
     def profile_fingerprint(self, profile_id=None):
         lookup = getattr(self._provider, "profile_fingerprint", None)
         return lookup(profile_id) if lookup else None

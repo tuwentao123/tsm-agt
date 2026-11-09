@@ -174,7 +174,7 @@ class PromptTemplate:
         prompt_text = _load_prompt_text()
         template = cls(
             manifest_id="builtin.engineering-agent",
-            revision=58,
+            revision=59,
             static_segments=(
                 PromptTemplateSegment(
                     "system-safety", "core", "1.0",
@@ -184,7 +184,7 @@ class PromptTemplate:
                 # the only place that says how a request becomes an answer, so a
                 # capability-gated segment never has to carry routing rules.
                 PromptTemplateSegment(
-                    "request-pipeline-guidance", "harness", "5.7",
+                    "request-pipeline-guidance", "harness", "5.8",
                     prompt_text["request-pipeline-guidance"],
                 ),
                 # This is deliberately a stable, tool-capability-gated contract:
@@ -228,12 +228,12 @@ class PromptTemplate:
                 # the segment teaches (workspace, another project's source,
                 # external documents, live facts, runtime facts) ----
                 PromptTemplateSegment(
-                    "workspace-search-guidance", "harness", "2.1",
+                    "workspace-search-guidance", "harness", "2.2",
                     prompt_text["workspace-search-guidance"],
                     requires_any_tools=("core.search_files",),
                 ),
                 PromptTemplateSegment(
-                    "workspace-read-guidance", "harness", "1.2",
+                    "workspace-read-guidance", "harness", "1.3",
                     prompt_text["workspace-read-guidance"],
                     requires_any_tools=("core.read_file", "core.search_files"),
                 ),
@@ -276,7 +276,7 @@ class PromptTemplate:
                 # these describe how to make a call or record progress, not what
                 # any single capability is for ----
                 PromptTemplateSegment(
-                    "parallel-tool-call-guidance", "harness", "1.1",
+                    "parallel-tool-call-guidance", "harness", "1.2",
                     prompt_text["parallel-tool-call-guidance"],
                 ),
                 PromptTemplateSegment(

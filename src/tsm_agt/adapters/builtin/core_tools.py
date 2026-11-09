@@ -141,9 +141,11 @@ class CoreReadOnlyToolProvider:
                 "one explicit target. target defaults to 'content': use it for source "
                 "symbols, UI labels, DOM ids/classes, functions, configuration keys, and "
                 "error text; use target='files' only when a file name is already known. "
-                "output_mode='paths'|'count' answers a survey cheaply, and offset pages "
-                "past a capped result. Inspect hits with core.read_file before "
-                "concluding."
+                "output_mode='matches' (default) returns lines, 'paths' returns paths, "
+                "and 'count' returns per-file counts; offset pages past a capped result. "
+                "Locations and counts can answer those questions "
+                "directly. For behavior or edits, read missing implementation ranges "
+                "with core.read_file; batch independent reads of located targets."
             ),
             parameters={
                 "type": "object",
@@ -173,7 +175,7 @@ class CoreReadOnlyToolProvider:
                         "type": "string",
                         "enum": ["matches", "paths", "count"],
                         "default": "matches",
-                        "description": "Return matching lines, matching paths, or per-file counts.",
+                        "description": "Use 'matches' (default) for matching lines, 'paths' for file paths, or 'count' for per-file counts. Independent of the search target.",
                     },
                     "context": {
                         "type": "integer", "minimum": 0, "maximum": 20,
@@ -192,8 +194,8 @@ class CoreReadOnlyToolProvider:
             model_contract=ModelToolContract(
                 purpose="Locate candidate local files or lines. " + _LOCAL_READ_PATH_GUIDANCE,
                 use_when=("you need to find a symbol, text, configuration key, UI label, or known filename",),
-                avoid_when=("you need to establish what a candidate file actually says; read it next",),
-                returns=("candidate locations or counts, not a complete source interpretation", "truncation means more candidates may exist"),
+                avoid_when=("the target and relevant range are already known; read them directly if needed",),
+                returns=("locations, counts, or matching lines; isolated matches do not establish full implementation behavior", "truncation means more candidates may exist, not that every candidate must be read"),
             ),
         ),
         ToolSpec(
@@ -229,8 +231,10 @@ class CoreReadOnlyToolProvider:
             description=(
                 "Read a UTF-8 text file by path or by a resource_ref returned from a "
                 "prior list/find/search result in this Task. Reuse unchanged text already "
-                "visible in context; do not repeat the same read just for reassurance. Use it after "
-                "locating a specific source or config file; do not use it for binary or "
+                "visible in context; do not repeat the same read just for reassurance. "
+                "Read a known target directly and request independent file/range reads "
+                "together. Select enough context for the relevant function instead of "
+                "paging unrelated sections. Do not use it for binary or "
                 "secret files. An absolute outside path pauses for explicit Task-scoped "
                 "directory read approval. Escaped symlinks, .git, environment files, "
                 "credentials, and key material remain unavailable. "
@@ -504,9 +508,10 @@ class CoreReadOnlyToolProvider:
             return replace(
                 result,
                 hint=(
-                    "File-name matches are candidates only. Inspect a relevant hit with "
-                    "core.read_file before concluding or editing. If the identifier is "
-                    "inside source code, retry core.search_files with target='content'."
+                    "File-name matches are candidates for content, and establish paths only. "
+                    "If paths answer the request, no further read is needed. For behavior "
+                    "or edits, read relevant targets with core.read_file, batching independent "
+                    "reads. For an identifier inside source code, use target='content'."
                 ),
             )
 
@@ -532,19 +537,17 @@ class CoreReadOnlyToolProvider:
         )
         if not result.ok:
             return result
-        # A truncated result is a stopping cue, not a conclusion: say what to do
-        # next instead of leaving "there were more matches" to the model's
-        # imagination.
         hint = (
-            "Inspect relevant content matches with core.read_file before concluding "
-            "or editing. If no match answers the question, refine the pattern or "
-            "search a broader in-scope path."
+            "Use these results for location or count questions. For behavior or edits, "
+            "read missing relevant ranges with core.read_file; batch independent reads. "
+            "If the question is unanswered, refine the pattern or scope."
         )
         if result.truncated:
             hint = (
-                "Truncated: these matches are not the whole answer. Narrow the "
-                "pattern or path, or search past the last match shown, and read the "
-                "hit with core.read_file before concluding."
+                "Truncated: more matches exist. Continue only if the current question "
+                "needs them; a partial page cannot prove a complete count or absence. "
+                "Narrow the query or page with offset. Read missing implementation "
+                "ranges with core.read_file when needed, batching independent reads."
             )
         return replace(result, hint=hint)
 

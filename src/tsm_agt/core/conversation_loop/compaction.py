@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import asyncio
+import time
+from contextlib import suppress
 from dataclasses import replace
 
 from tsm_agt.ports import Message, MessageRole, TextBlock
@@ -11,9 +14,90 @@ from ..context_window import establish_window, ROOT_PREFIX, window_history
 from .execution_context import project_execution_context
 from .active_skills import active_skill_groups
 from .workflow_handoff import workflow_handoff
+from ..agent_loop import AgentProgress, AgentProgressKind
+from ..summary_source import prune_old_tool_messages
+
+
+async def _observed_summary(kernel, state, forgotten, capacity):
+    settings = kernel._dependencies.context_manager.summary_settings
+    started = time.monotonic()
+    latest = {}
+
+    async def progress(data):
+        latest.update(data)
+        elapsed = time.monotonic() - started
+        stage = latest.get("stage", "preparing")
+        attempt = latest.get("attempt", 0)
+        label = {"preparing": "整理历史", "input_prepared": "摘要输入已整理",
+                 "request_started": "等待摘要响应", "request_retry": "正在重试摘要"}.get(stage, "等待摘要响应")
+        activity = (f"正在压缩上下文：{label}，已用 {elapsed:.0f} 秒"
+                    + (f"，摘要请求 {attempt}/2" if attempt else ""))
+        event = {"turn_id": state.turn_id, **data, "elapsed_seconds": elapsed, "activity": activity}
+        await kernel._append_events(state.task_id, (("context.summary_progress", event),))
+        if hasattr(kernel, "_notify_agent_progress"):
+            kernel._notify_agent_progress(getattr(state, "on_progress", None), AgentProgress(
+                AgentProgressKind.COMMENTARY, turn_id=state.turn_id, activity=activity,
+                phase="context_summary", elapsed_seconds=elapsed))
+
+    await kernel._append_events(state.task_id, (("context.summary_started", {
+        "turn_id": state.turn_id, "source_message_count": len(forgotten),
+        "timeout_seconds": settings.timeout_seconds, "activity": "正在压缩上下文，准备摘要输入",
+    }),))
+    worker = asyncio.create_task(kernel._dependencies.context_summarizer.summarize(
+        forgotten, context_window=capacity,
+        model_profile_id=state.checkpoint.model_profile_id, task_id=state.task_id,
+        cancellation_scope=(kernel._cancellation_scope(state.task_id) if hasattr(kernel, "_cancellation_scope") else None),
+        on_progress=progress,
+    ))
+    try:
+        async with asyncio.timeout(settings.timeout_seconds):
+            while True:
+                done, _ = await asyncio.wait({worker}, timeout=10)
+                if done:
+                    return worker.result()
+                await progress({"stage": latest.get("stage", "preparing"), "attempt": latest.get("attempt", 0)})
+    finally:
+        if not worker.done():
+            worker.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await worker
+
+
+async def _preserve_failure(kernel, state, prepared, tools, error):
+    manager = kernel._dependencies.context_manager
+    source = tuple(state.messages)
+    window = dict(state.checkpoint.context_window_state)
+    window["summary_retry_after"] = time.time() + manager.summary_settings.failure_cooldown_seconds
+    state.checkpoint = replace(state.checkpoint, context_window_state=window)
+    if hasattr(kernel, "_save_agent_checkpoint"):
+        await kernel._save_agent_checkpoint(state.checkpoint, "summary-failed-history-preserved")
+    await kernel._append_events(state.task_id, (("context.summary_failed", {
+        "turn_id": state.turn_id, "error_type": type(error).__name__, "source_preserved": True,
+        "activity": "上下文摘要未完成，原始历史已保留", "retry_after": window["summary_retry_after"],
+    }),))
+    estimated, allocations = manager.estimate_input_budget(source, tools, kernel._dependencies.prompt_template,
+                                                          read_reuse_task_id=state.task_id)
+    if prepared.budget.hard_input_tokens and estimated > prepared.budget.hard_input_tokens:
+        raise ContextWindowExceeded("semantic compaction failed; original history was preserved") from error
+    return manager._prepared(source, replace(prepared.budget, estimated_input_tokens=estimated,
+                                             allocations=allocations), None, state.task_id)
 
 
 async def complete_window_compaction(kernel, state, prepared, tools, projections, identity):
+    if prepared.compaction is None:
+        return prepared
+    checkpoint = state.checkpoint
+    try:
+        # One deadline includes input preparation, requests and retries. It is
+        # independent of the selected model's per-request/network timeouts.
+        async with asyncio.timeout(kernel._dependencies.context_manager.summary_settings.timeout_seconds):
+            return await _complete_window_compaction(kernel, state, prepared, tools, projections, identity)
+    except TimeoutError as error:
+        state.checkpoint = checkpoint
+        return await _preserve_failure(kernel, state, prepared, tools, error)
+
+
+async def _complete_window_compaction(kernel, state, prepared, tools, projections, identity):
     if prepared.compaction is None:
         return prepared
     source = tuple(state.messages)
@@ -21,6 +105,14 @@ async def complete_window_compaction(kernel, state, prepared, tools, projections
     original_retained_ids = {message.message_id for message in retained}
     task = await kernel.get_task(state.task_id)
     manager = kernel._dependencies.context_manager
+    retry_after = state.checkpoint.context_window_state.get("summary_retry_after", 0)
+    if kernel._dependencies.context_summarizer is not None and retry_after > time.time():
+        estimate, allocations = manager.estimate_input_budget(source, tools, kernel._dependencies.prompt_template,
+                                                             read_reuse_task_id=state.task_id)
+        if prepared.budget.hard_input_tokens and estimate > prepared.budget.hard_input_tokens:
+            raise ContextWindowExceeded("summary is cooling down after failure; original history preserved")
+        return manager._prepared(source, replace(prepared.budget, estimated_input_tokens=estimate,
+                                                allocations=allocations), None, state.task_id)
     active_groups, active_receipt = active_skill_groups(
         source, tuple(task.tool_executions.values()), turn_id=state.turn_id,
         catalog=getattr(kernel._dependencies, "skill_catalog", None),
@@ -29,6 +121,37 @@ async def complete_window_compaction(kernel, state, prepared, tools, projections
         budget_bytes=max(0, prepared.budget.hard_input_tokens * 4 // 10),
     )
     active_ids = {message.message_id for group in active_groups for message in group}
+    if kernel._dependencies.context_summarizer is not None:
+        # A cheap pruning pass may free enough room without any model request.
+        # Protect all messages selected for exact retention and recent native
+        # exchanges, including signed reasoning and active Skill instructions.
+        pruned = await asyncio.to_thread(prune_old_tool_messages, source, original_retained_ids | active_ids)
+        if pruned != source:
+            local = manager.prepare(conversation=pruned, tools=tools, prompt_template=kernel._dependencies.prompt_template,
+                                    context_window=prepared.budget.context_window, max_output_tokens=prepared.budget.max_output_tokens,
+                                    read_reuse_task_id=state.task_id, defer_hard_limit_for_summary=True)
+            if local.compaction is None:
+                snapshots = (await kernel._project_context_messages(state.task_id)
+                             if hasattr(kernel, "_project_context_messages") else projections)
+                snapshots = project_execution_context(
+                    tuple(message for message in snapshots if not message.message_id.startswith("session-context-")),
+                    task_id=state.task_id, turn_id=state.turn_id, tool_specs=state.visible_tool_by_name,
+                    executions=tuple(task.tool_executions.values()))
+                baseline, window = establish_window(kernel._dependencies.prompt_template, snapshots, tools, identity,
+                                                    int(state.checkpoint.context_window_state.get("epoch", 0)) + 1)
+                candidate = (*baseline, *(message for message in window_history(pruned)
+                                          if not message.message_id.startswith(ROOT_PREFIX)))
+                estimate, allocations = manager.estimate_input_budget(candidate, tools, kernel._dependencies.prompt_template,
+                                                                     read_reuse_task_id=state.task_id)
+                if estimate < prepared.compaction.before_estimated_tokens and (not prepared.budget.hard_input_tokens or estimate <= prepared.budget.hard_input_tokens):
+                    state.checkpoint = replace(state.checkpoint, context_window_state=window)
+                    await kernel._append_events(state.task_id, (("context.tool_outputs_pruned", {
+                        "turn_id": state.turn_id, "model_calls": 0, "after_estimated_tokens": estimate,
+                    }),))
+                    receipt = replace(manager._compaction_receipt(source, candidate, prepared.budget, 0, ()),
+                                      after_estimated_tokens=estimate)
+                    return manager._prepared(candidate, replace(prepared.budget, estimated_input_tokens=estimate,
+                                                               allocations=allocations), receipt, state.task_id)
     if active_ids:
         # Merge exact canonical messages in source order. Never split parallel
         # native tool groups or synthesize a standalone tool result.
@@ -44,32 +167,16 @@ async def complete_window_compaction(kernel, state, prepared, tools, projections
     summarizer = kernel._dependencies.context_summarizer
     if forgotten and summarizer is not None:
         try:
-            summary_result = await summarizer.summarize(
-                forgotten, context_window=prepared.budget.context_window or 32768,
-                model_profile_id=state.checkpoint.model_profile_id, task_id=state.task_id,
-                cancellation_scope=(kernel._cancellation_scope(state.task_id)
-                                    if hasattr(kernel, "_cancellation_scope") else None),
-            )
+            summary_result = await _observed_summary(kernel, state, forgotten, prepared.budget.context_window or 32768)
         except Exception as error:
-            await kernel._append_events(state.task_id, (("context.summary_failed", {
-                "turn_id": state.turn_id, "error_type": type(error).__name__,
-                "source_preserved": True,
-            }),))
-            manager = kernel._dependencies.context_manager
-            estimated, allocations = manager.estimate_input_budget(
-                source, tools, kernel._dependencies.prompt_template,
-                read_reuse_task_id=state.task_id,
-            )
-            if prepared.budget.hard_input_tokens and estimated > prepared.budget.hard_input_tokens:
-                raise ContextWindowExceeded("semantic compaction failed; original history was preserved") from error
-            return manager._prepared(source, replace(prepared.budget,
-                estimated_input_tokens=estimated, allocations=allocations), None, state.task_id)
+            return await _preserve_failure(kernel, state, prepared, tools, error)
         handoff = summary_result.text
         state.input_tokens = getattr(state, "input_tokens", 0) + summary_result.usage.input_tokens
         state.output_tokens = getattr(state, "output_tokens", 0) + summary_result.usage.output_tokens
         await kernel._append_events(state.task_id, (("context.summary_completed", {
             "turn_id": state.turn_id, "model_calls": summary_result.model_calls,
             "usage": summary_result.usage.to_data(), "source_message_count": len(forgotten),
+            "diagnostics": dict(summary_result.diagnostics), "activity": "上下文摘要已完成，继续执行",
         }),))
         body = json.dumps({
             "boundary": "untrusted_historical_data", "kind": "semantic_handoff",

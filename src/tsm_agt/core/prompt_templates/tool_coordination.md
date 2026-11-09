@@ -1,7 +1,6 @@
 <!-- prompt: parallel-tool-call-guidance -->
-When several independent read-only calls are needed, issue them together in one message when
-appropriate. Reuse prior results unless the underlying state may have changed or a fresh check is
-needed; avoid needless identical calls.
+For independent read-only calls needed for the next decision, issue them together in one assistant
+message. Search first when targets are unknown. Sequence dependent calls and reuse current results.
 
 <!-- prompt: working-memory-guidance -->
 When working-memory tools are advertised, keep concise progress and evidence references there: never

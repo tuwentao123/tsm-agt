@@ -81,7 +81,10 @@ from .prompt import assemble_stable_prompt, latest_tool_result_instruction
 from .state import build_turn_state
 from .execution_context import project_execution_context
 from .tool_catalog import refresh_observed_tool_catalog
-from ..context_window import establish_window, context_updates, restore_messages, window_identity, window_history
+from ..context_window import (
+    context_updates, establish_window, restore_interrupted_inputs, restore_messages,
+    window_history, window_identity,
+)
 from ..skills import SkillCatalogBudget, render_skill_catalog
 from .compaction import complete_window_compaction
 from .workflow_handoff import workflow_handoff
@@ -230,7 +233,7 @@ class ConversationAgentLoop:
         # The input becomes history now, not when the Turn ends: a Turn that is
         # interrupted or killed never writes a result event, and the question
         # would vanish from the conversation.
-        await kernel._record_session_turn_input(task_id, turn_id, user_message)
+        input_sequence = await kernel._record_session_turn_input(task_id, turn_id, user_message)
         checkpoint = AgentTurnCheckpoint(
             task_id=task_id,
             turn_id=turn_id,
@@ -260,8 +263,17 @@ class ConversationAgentLoop:
         saved_window = session.model_context_window
         if (task.task_kind is TaskKind.CONVERSATION
                 and saved_window.get("identity") == identity):
+            history = restore_messages(saved_window)
+            window_sequence = int(saved_window.get("session_event_sequence", 0))
+            if input_sequence > window_sequence + 1:
+                events = await kernel._dependencies.store.read_session_events(
+                    task.session_id, after_sequence=window_sequence,
+                )
+                history += restore_interrupted_inputs(
+                    events, task_id=task_id, before_sequence=input_sequence,
+                )
             checkpoint = replace(checkpoint,
-                messages=(*restore_messages(saved_window), user_message),
+                messages=(*history, user_message),
                 context_window_state={key: value for key, value in saved_window.items() if key != "messages"},
             )
         checkpoint = await kernel._bind_agent_checkpoint(
@@ -441,7 +453,13 @@ class ConversationAgentLoop:
                 return await self._finalizer.persist_partial_boundary(
                     state, ITERATION_BUDGET_EXHAUSTED
                 )
-            await self._prepare_model_call(state)
+            try:
+                await self._prepare_model_call(state)
+            except Exception as error:
+                # Preparation (including compaction) must settle the task just
+                # like an API failure, including approval-resumed runners.
+                await self._record_model_failure(state, error, failure_kind="model_preparation")
+                raise
             current_goal = (await kernel.get_task(state.task_id)).goal
             with ResponseTextStream(kernel, state, goal=current_goal) as text_stream:
                 kernel._notify_agent_progress(state.on_progress, AgentProgress(
@@ -805,7 +823,7 @@ class ConversationAgentLoop:
                     await self._finalizer.record_tool_result(state, block.result)
 
     async def _record_model_failure(
-        self, state: TurnState, error: Exception,
+        self, state: TurnState, error: Exception, *, failure_kind: str = "model_response",
     ) -> None:
         """Record one stopped model exchange before it is re-raised.
 
@@ -828,18 +846,19 @@ class ConversationAgentLoop:
             recovery.decision.action if recovery is not None
             else ModelRecoveryAction.FAIL_TERMINAL
         )
+        receipt = state.prompt.receipt if state.prompt is not None else None
         if isinstance(error, InvalidModelResponse):
             await kernel._record_turn_failure(
-                state.task_id, state.turn_id, error, state.prompt.receipt,
-                failure_kind="model_response",
+                state.task_id, state.turn_id, error, receipt,
+                failure_kind=failure_kind,
                 failure_category=failure_category,
                 retry_safety=retry_safety,
                 recovery_action=recovery_action,
             )
             return
         await kernel._record_recoverable_turn_interruption(
-            state.task_id, state.turn_id, error, state.prompt.receipt,
-            failure_kind="model_response",
+            state.task_id, state.turn_id, error, receipt,
+            failure_kind=failure_kind,
             failure_category=failure_category,
             retry_safety=retry_safety,
             recovery_action=recovery_action,
@@ -1083,7 +1102,8 @@ class ConversationAgentLoop:
                 kernel, state, prepared, model_tools, projections, identity,
             )
         except ContextWindowExceeded as error:
-            await kernel._record_turn_failure(state.task_id, state.turn_id, error)
+            # The drive loop records preparation failures once, preserving a
+            # resumable checkpoint when one exists.
             raise ModelInvocationFailed(state.turn_id, str(error)) from error
         if prepared.compaction is not None:
             state.messages = list(prepared.canonical_messages)

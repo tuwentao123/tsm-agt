@@ -34,6 +34,7 @@ from tsm_agt.ports import (
     MessageRole,
     ModelFailureCategory,
     ModelRequest,
+    ModelCallPurpose,
     ModelResponse,
     ModelRetrySafety,
     ModelStreamCompleted,
@@ -142,6 +143,9 @@ class AnthropicMessagesModelProvider:
 
     def output_token_limit_for(self, profile_id=None) -> int:
         return self._max_output_tokens
+
+    def summary_reasoning_effort_for(self, profile_id=None):
+        return "none"
 
     async def start(self, context: AdapterContext) -> None:
         self._started = True
@@ -393,6 +397,8 @@ class AnthropicMessagesModelProvider:
         }
         import copy
         payload.update(copy.deepcopy(self._request_parameters))
+        if request.purpose is ModelCallPurpose.COMPACTION and request.max_output_tokens is not None:
+            payload["max_tokens"] = request.max_output_tokens
         effort = request.reasoning_effort or self._reasoning_effort
         if effort is not None:
             if effort == "none":

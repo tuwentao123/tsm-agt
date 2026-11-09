@@ -128,12 +128,15 @@ class WindowRuntimeTest(unittest.IsolatedAsyncioTestCase):
         kernel = SimpleNamespace(_dependencies=SimpleNamespace(
             context_summarizer=summarizer, context_manager=manager, prompt_template=template),
             _append_events=append_events, get_task=get_task)
+        from tsm_agt.core.agent_loop import AgentTurnCheckpoint
         state = SimpleNamespace(messages=list(source), task_id="task", turn_id="turn", visible_tool_by_name={},
-                                checkpoint=SimpleNamespace(model_profile_id=None, context_window_state=window))
+                                checkpoint=AgentTurnCheckpoint("task", "turn", 1, source, (), (), 0, 0, 0, 0, 10, 10, 128, 10,
+                                                               context_window_state=window))
         failed = await complete_window_compaction(kernel, state, prepared, (), (), "identity")
         self.assertEqual(failed.canonical_messages, source)
         self.assertIsNone(failed.compaction)
-        self.assertEqual(events[0][0], "context.summary_failed")
+        self.assertEqual(events[0][0], "context.summary_started")
+        self.assertTrue(any(kind == "context.summary_failed" for kind, _ in events))
         summarizer.fail = False
         # A real checkpoint supports replace; use one from a fixture run.
         from tsm_agt.core.agent_loop import AgentTurnCheckpoint

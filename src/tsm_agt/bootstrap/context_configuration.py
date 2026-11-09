@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from tsm_agt.core.context import ContextWindowManager
 from tsm_agt.core.session_context import SessionContextProjector
 from tsm_agt.core.skills import SkillCatalogBudget
+from tsm_agt.ports.context_summary import ContextSummarySettings
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +31,7 @@ class ContextConfiguration:
     semantic_compaction: bool = True
     skill_catalog_ratio: float = 0.02
     skill_catalog_fallback_tokens: int = 2048
+    summary_settings: ContextSummarySettings = ContextSummarySettings()
 
     def __post_init__(self) -> None:
         SkillCatalogBudget(self.skill_catalog_ratio, self.skill_catalog_fallback_tokens)
@@ -75,6 +77,7 @@ def context_window_manager(
         history_soft_tokens=configuration.history_soft_tokens,
         semantic_compaction=configuration.semantic_compaction,
         skill_catalog_budget=SkillCatalogBudget(configuration.skill_catalog_ratio, configuration.skill_catalog_fallback_tokens),
+        summary_settings=configuration.summary_settings,
     )
 
 
@@ -117,9 +120,15 @@ def load_context_configuration(document: Mapping[str, object]) -> ContextConfigu
         conversation_history_format=history_format,
         history_soft_tokens=history_soft_tokens,
         semantic_compaction=semantic_compaction,
+        summary_settings=ContextSummarySettings(**{
+            name: values.get("summary_" + name, getattr(defaults.summary_settings, name))
+            for name in defaults.summary_settings.__dataclass_fields__
+        }),
         skill_catalog_ratio=_number(values.get("skill_catalog_ratio"), "context.skill_catalog_ratio", defaults.skill_catalog_ratio),
         skill_catalog_fallback_tokens=_positive_int(values.get("skill_catalog_fallback_tokens"), "context.skill_catalog_fallback_tokens", defaults.skill_catalog_fallback_tokens),
         sources={
+            **{"context.summary_" + name: "yaml" if "summary_" + name in values else "default"
+               for name in defaults.summary_settings.__dataclass_fields__},
             "context.compaction_ratio": "yaml" if "compaction_ratio" in values else "default",
             "context.latency_soft_tokens": "yaml" if "latency_soft_tokens" in values else "default",
             "context.recent_message_floor": "yaml" if "recent_message_floor" in values else "default",

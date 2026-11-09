@@ -1985,8 +1985,11 @@ class SessionMixin:
         current = SessionSnapshot.from_data(stored.data)
         self._authorize_session(current)
         updated = current.bump_context()
+        result_sequence = stored.last_event_sequence + 1
         if model_context_window is not None:
-            updated = replace(updated, model_context_window=dict(model_context_window))
+            updated = replace(updated, model_context_window={
+                **model_context_window, "session_event_sequence": result_sequence,
+            })
         payload: dict[str, Any] = {
             "task_id": task.task_id, "turn_id": turn_id,
             "task_state": task.state.value,
@@ -2020,13 +2023,13 @@ class SessionMixin:
             task.session_id, stored.version, updated.to_data(),
             (SessionEvent(
                 f"sevt-{uuid4().hex}", task.session_id,
-                stored.last_event_sequence + 1, "session.task_result_recorded",
+                result_sequence, "session.task_result_recorded",
                 payload,
             ),),
         )
     async def _record_session_turn_input(
         self, task_id: str, turn_id: str, user_message: Message,
-    ) -> None:
+    ) -> int:
         """Record a Turn's input when the Turn starts.
 
         The result event repeats the same message, so a completed Turn is
@@ -2056,7 +2059,7 @@ class SessionMixin:
                 await self._dependencies.store.commit_session(SessionUnitOfWork(
                     task.session_id, stored.version, updated.to_data(), (event,),
                 ))
-                return
+                return event.sequence
             except ValueError as error:
                 if "version conflict" not in str(error) or attempt == 2:
                     raise

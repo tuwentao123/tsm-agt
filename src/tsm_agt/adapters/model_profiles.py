@@ -38,6 +38,15 @@ class ModelProfileProvider:
     def capabilities_for(self, profile_id=None):
         return self._providers[self.resolve_profile(profile_id)].capabilities
 
+    def summary_reasoning_effort_for(self, profile_id=None):
+        selected = self.resolve_profile(profile_id)
+        row = next(row for row in self._catalog if row["id"] == selected)
+        allowed = row.get("reasoning_efforts", [])
+        if allowed:
+            return next((value for value in ("none", "minimal", "low", "medium", "high", "xhigh", "max") if value in allowed), None)
+        lookup = getattr(self._providers[selected], "summary_reasoning_effort_for", None)
+        return lookup() if lookup else None
+
     def output_token_limit_for(self, profile_id=None):
         provider = self._providers[self.resolve_profile(profile_id)]
         lookup = getattr(provider, "output_token_limit_for", None)

@@ -100,9 +100,11 @@ class _DroppingModel(EchoModelProvider):
         super().__init__()
         self.calls = 0
         self._fail_at_call = fail_at_call
+        self.requests: list[ModelRequest] = []
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         self.calls += 1
+        self.requests.append(request)
         if self.calls >= self._fail_at_call:
             raise ModelRecoveryExhausted(
                 ModelAttemptFailure(
@@ -362,24 +364,31 @@ class ConversationTaskFlowTest(unittest.IsolatedAsyncioTestCase):
             task_id = first["task"]["task_id"]
             await client.wait_task(task_id, timeout=5)
 
-            await self._send(client, root, "dropped", input_id="i2")
-            await client.wait_task(task_id, timeout=5)
-            self.assertIs(
-                (await application.kernel.get_task(task_id)).state,
-                TaskState.INTERRUPTED,
-            )
+            question = "Why use reflection instead of PriceDetailBlockRenderer?"
+            for index, text in enumerate((question, "继续"), start=2):
+                await self._send(client, root, text, input_id=f"i{index}")
+                await client.wait_task(task_id, timeout=5)
+                self.assertIs(
+                    (await application.kernel.get_task(task_id)).state,
+                    TaskState.INTERRUPTED,
+                )
 
-            # The provider recovers; the third message must produce a real Turn.
+            # The recovered provider must receive the interrupted inputs in
+            # order, even if another continuation was also interrupted.
             model._fail_at_call = 99
-            await self._send(client, root, "third question", input_id="i3")
+            await self._send(client, root, "继续呢", input_id="i4")
             await client.wait_task(task_id, timeout=5)
+            expected = ["hello", question, "继续", "继续呢"]
+            inputs = [message.text for message in model.requests[-1].messages
+                      if message.role is MessageRole.USER and message.text in expected]
+            self.assertEqual(inputs, expected)
 
             events = await self._events(application, task_id)
             turns = [
                 event.payload["turn_id"] for event in events
                 if event.event_type == "turn.started"
             ]
-            self.assertEqual(len(turns), 3)
+            self.assertEqual(len(turns), 4)
             task = await application.kernel.get_task(task_id)
             self.assertIs(task.state, TaskState.AWAITING_INPUT)
             # The stale checkpoint of the dropped Turn is gone, so the new Turn
@@ -391,7 +400,13 @@ class ConversationTaskFlowTest(unittest.IsolatedAsyncioTestCase):
                 item.text for item in projection.messages
                 if item.role is MessageRole.USER
             ]
-            self.assertIn("third question", asked)
+            self.assertEqual(asked, expected)
+            await self._send(client, root, "下一步", input_id="i5")
+            await client.wait_task(task_id, timeout=5)
+            expected.append("下一步")
+            inputs = [message.text for message in model.requests[-1].messages
+                      if message.role is MessageRole.USER and message.text in expected]
+            self.assertEqual(inputs, expected)
         finally:
             await client.close()
 

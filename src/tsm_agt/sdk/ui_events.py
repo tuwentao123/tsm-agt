@@ -238,6 +238,10 @@ _TURN_PROGRESS_EVENT_TYPES = (
     "model.recovery_decided",
     "conversation.model_response_recorded",
     "conversation.commentary",
+    "context.summary_started",
+    "context.summary_progress",
+    "context.summary_completed",
+    "context.summary_failed",
     "tool.requested",
     "tool.completed",
     "tool.failed",
@@ -331,6 +335,10 @@ def _turn_progress_item(event, *, fallback_turn_id: str | None = None) -> dict |
             "tool_call_count": payload.get("tool_call_count"),
             "finish_reason": payload.get("finish_reason"),
         }
+    if kind.startswith("context.summary_"):
+        return {**base, "kind": "commentary", "phase": "context_summary",
+                "activity": str(payload.get("activity") or "正在压缩上下文"),
+                "elapsed_seconds": payload.get("elapsed_seconds", 0)}
     if kind == "conversation.commentary":
         return {
             **base, "kind": "commentary",

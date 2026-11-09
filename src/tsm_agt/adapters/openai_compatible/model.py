@@ -29,6 +29,7 @@ from tsm_agt.ports import (
     MessageRole,
     ModelFailureCategory,
     ModelRequest,
+    ModelCallPurpose,
     ModelResponse,
     ModelStreamCompleted,
     ModelStreamEvent,
@@ -202,6 +203,15 @@ class OpenAICompatibleModelProvider:
             else "not started"
         )
         return HealthStatus(state, message)
+
+    def summary_reasoning_effort_for(self, profile_id=None):
+        if "thinking" in self._request_parameters:
+            return "none"
+        profile = self._reasoning_registry.profile_for(self._model)
+        if profile:
+            return next((value for value in ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+                         if value in profile.allowed_efforts), None)
+        return None
 
     async def stop(self, deadline: datetime) -> None:
         self._started = False
@@ -783,6 +793,12 @@ class OpenAICompatibleModelProvider:
             payload["reasoning_effort"] = mapped_effort
         import copy
         payload.update(copy.deepcopy(self._request_parameters))
+        if request.purpose is ModelCallPurpose.COMPACTION and output_limit is not None:
+            # Interactive generation may be uncapped; auxiliary summaries are
+            # explicitly capped even when send_output_token_limit is false.
+            payload[self._output_token_parameter] = output_limit
+            if mapped_effort is not None:
+                payload["reasoning_effort"] = mapped_effort
         if "thinking" in payload and request.reasoning_effort is not None:
             payload["thinking"]["type"] = "disabled" if request.reasoning_effort == "none" else "enabled"
         if "thinking" in payload:

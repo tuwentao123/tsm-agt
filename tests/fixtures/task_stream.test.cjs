@@ -42,6 +42,9 @@ function setup({realFinal = false, realAnswers = false} = {}) {
     refreshConversationHistory: async id => { histories.push(id); return true; },
     fetch: async url => { requests.push(url); return {ok: true, json: async () => ({status: 'running', phase1_state: 'RUNNING'})}; },
   });
+  // The follower asks the per-Session auto-approve switch after a snapshot;
+  // the real function keeps that check honest, and it is a no-op while off.
+  vm.runInContext(page.slice(page.indexOf('function autoApprovePendingApprovals('), page.indexOf('async function persistConversationAutoApprove(')), context);
   const finalRenderer = page.slice(page.indexOf('async function renderFinalResult('), page.indexOf('// Each follower owns exactly one Task card.'));
   const answerRenderer = page.slice(page.indexOf('function appendTaskAssistantText('), page.indexOf('function renderTurnMarker('));
   const clarificationSync = page.slice(page.indexOf('function syncClarificationMessage('), page.indexOf('function renderClarificationCard('));
@@ -176,6 +179,7 @@ test('an older history response cannot erase the newest completed turn or reopen
     getConversationById: () => conversation,
     fetch: () => new Promise(resolve => pending.push(resolve)),
     renderConversations() {}, renderMessages() {}, setLoading() {},
+    autoApprovePendingApprovals() {},
     followTask() { throw new Error('Stale history reopened a stream'); },
   });
   vm.runInContext(page.slice(page.indexOf('async function ensureConversationLoaded('), page.indexOf('// A finished Turn is only fully described')), ctx);
@@ -200,6 +204,7 @@ test('authoritative history keeps the visible prefix of the same answer while re
   const ctx = vm.createContext({console, defaultModelProfile: null, getConversationById: () => conversation,
     fetch: async () => ({ok: true, json: async () => ({messages: [{role: 'assistant',
       content: original.content, task_id: 'task', turn_id: 'turn', source_event_sequence: 20}]})}),
+    autoApprovePendingApprovals() {},
     renderConversations() {}, renderMessages() {},
   });
   vm.runInContext(page.slice(page.indexOf('async function ensureConversationLoaded('), page.indexOf('// A finished Turn is only fully described')), ctx);
@@ -218,6 +223,7 @@ test('an interrupted task keeps its unanswered Turn trace anchored under the use
       turns: [{task_id: 'task', turn_id: 'turn', settled: false, progress: [{kind: 'turn_interrupted'}]}],
       messages: [{role: 'user', content: 'Fix it', task_id: 'task', turn_id: 'turn', source_event_sequence: 10}],
     })}), renderConversations() {}, renderMessages() {},
+    autoApprovePendingApprovals() {},
   });
   vm.runInContext(page.slice(page.indexOf('async function ensureConversationLoaded('), page.indexOf('// A finished Turn is only fully described')), ctx);
   await ctx.ensureConversationLoaded('chat');

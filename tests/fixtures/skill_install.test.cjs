@@ -10,7 +10,7 @@ const skillScript = pageScript.slice(
   pageScript.indexOf('async function startSourceEvaluation()'),
 );
 const feedbackScript = pageScript.slice(
-  pageScript.indexOf('function showError(message)'),
+  pageScript.indexOf('function showError('),
   pageScript.indexOf('function clearMessages()'),
 );
 
@@ -47,6 +47,7 @@ function setup(responses, {modalOpen = true, sidebar = true} = {}) {
   const nodes = new Map([
     'error-banner', 'skill-settings-dialog', 'skill-settings-status',
     'skill-discovered-catalog', 'skill-install-directory', 'skill-discovery-list', 'skill-installations', 'skill-builtin-catalog',
+    'installed-skills-list',
   ].map(name => [name, new Element()]));
   if (sidebar) nodes.set('skill-install-status', new Element());
   nodes.get('skill-settings-dialog').open = modalOpen;
@@ -104,6 +105,16 @@ const findElement = (node, tag) => {
   return null;
 };
 
+// Install receipts group their buttons in an action row, so locate by label.
+const findByText = (node, text) => {
+  for (const child of node.children || []) {
+    if (typeof child.onclick === 'function' && child.textContent === text) return child;
+    const found = findByText(child, text);
+    if (found) return found;
+  }
+  return null;
+};
+
 test('built-in workflow controls preserve source labels and persist disablement with directory settings', async () => {
   const data = {install_directory: '/home/skills', discovery_directories: ['/home/skills'],
     builtin_skills: [{name: 'verify-change'}], disabled_builtin_skills: [],
@@ -145,12 +156,33 @@ test('historical pending receipt can confirm file import without starting prepar
   state.context.renderSkillInstallations([job]);
   assert.match(state.nodes.get('skill-installations').textContent, /准备待启动/);
   assert.equal(state.timers.length, 0);
-  const retry = state.nodes.get('skill-installations').children[0].children.find(row => row.textContent === '确认文件安装');
+  const retry = findByText(state.nodes.get('skill-installations'), '确认文件安装');
+  assert.ok(retry, 'pending receipt keeps the confirm button');
   await retry.onclick();
   assert.match(state.requests[0].url, /pending-one\/retry$/);
   assert.match(state.nodes.get('skill-installations').textContent, /文件导入完成/);
   assert.equal(state.streams.length, 0);
   assert.deepEqual(state.opened, []);
+});
+
+test('install history shows one receipt per Skill without repeating the status label', () => {
+  const state = setup([]);
+  state.context.renderSkillInstallations([
+    {id: 'demo-failed', skill_name: 'demo', status: 'failed', checks: [],
+      summary: '安装任务失败，请打开会话查看错误或重试准备。', updated_at: '2026-11-08T09:54:36+00:00'},
+    {id: 'demo-installed', skill_name: 'demo', status: 'installed', loadable: true,
+      summary: '已安装 · 可加载；未执行指令或准备运行环境。',
+      checks: ['SKILL.md 格式可读取', 'Skill 文件及附带资源已保存'], updated_at: '2026-11-08T10:33:18+00:00'},
+  ]);
+  const panel = state.nodes.get('skill-installations');
+  assert.equal(panel.children.length, 1, '同一 Skill 只保留最近一次安装记录');
+  assert.equal(panel.children[0].dataset.settingsCard, undefined, '安装记录不参与卡片计数与搜索');
+  const text = panel.textContent;
+  assert.equal((text.match(/已安装 · 可加载/g) || []).length, 1, '状态标签不应再重复出现在摘要中');
+  assert.match(text, /未执行指令或准备运行环境/);
+  assert.match(text, /校验明细 · 2 项/);
+  assert.doesNotMatch(text, /安装任务失败/);
+  assert.equal(findByText(panel, '确认文件安装'), null, '已安装记录不再显示确认按钮');
 });
 
 test('lost progress connection retries without turning saved files into a failed upload', async () => {
@@ -442,4 +474,35 @@ test('failed load validation preserves imported files and permits retry without 
   assert.equal(discoveryControls(state)[0].button.textContent, '已导入 · 重试加载');
   assert.match(state.nodes.get('skill-settings-status').textContent, /可加载 0\/1/);
   assert.equal(state.streams.length, 0);
+});
+
+test('installed panel and discovery agree on which Skills live in the install directory', () => {
+  const data = {
+    install_directory: '/home/skills', discovery_directories: ['/home/skills', '/external/skills'],
+    builtin_skills: [{name: 'verify-change'}], disabled_builtin_skills: [], installations: [],
+    skills: [
+      {name: 'verify-change', description: 'Verification', source: 'builtin', plan_path: 'builtin://verify-change/SKILL.md'},
+      {name: 'local', description: 'Demo', source: 'user', plan_path: '/home/skills/local/SKILL.md'},
+      {name: 'external', description: 'Demo', source: 'user', plan_path: '/external/skills/external/SKILL.md'},
+    ],
+  };
+  const state = setup([]);
+  state.context.applySkillSettings(data);
+  const panel = state.nodes.get('installed-skills-list');
+  const cards = panel.children.filter(child => child.dataset.settingsCard === '');
+  assert.equal(cards.length, 2, '只有安装目录内的 Skill 与内置 Skill 算已安装');
+  assert.match(panel.textContent, /local/);
+  assert.doesNotMatch(panel.textContent, /external/, '发现目录里的 Skill 不能列在已安装里');
+  assert.match(panel.textContent, /另有 1 个 Skill 位于发现目录/);
+  const controls = discoveryControls(state);
+  const byName = name => controls.find(row => row.skill.name === name);
+  assert.equal(byName('external').button.textContent, '安装');
+  assert.equal(byName('external').button.disabled, false);
+  assert.equal(byName('local').button.textContent, '已安装');
+  assert.equal(byName('local').button.disabled, true);
+  assert.equal(byName('verify-change').button.textContent, '无需安装');
+  assert.match(discoveryToolbar(state).textContent, /已安装 1 个 · 可安装 1 个/);
+  selectAllDiscovery(state);
+  assert.deepEqual(Array.from(vm.runInContext('selectedDiscoverySkills', state.context)),
+    ['/external/skills/external/SKILL.md']);
 });

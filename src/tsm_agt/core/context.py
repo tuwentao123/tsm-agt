@@ -16,6 +16,7 @@ from .configuration import canonical_hash
 from .image_budget import estimate_image_tokens
 from .prompt import PromptTemplate
 from .skills import SkillCatalogBudget
+from tsm_agt.ports.context_summary import ContextSummarySettings
 from .context_messages import is_execution_context
 from .read_result_reuse import ReadReuseStats, project_read_results
 from .session_history import MANAGED_HISTORY_BUDGETS, compact_history_body, history_turn_groups
@@ -150,6 +151,7 @@ class ContextWindowManager:
     history_soft_tokens: int = 16384
     semantic_compaction: bool = False
     skill_catalog_budget: SkillCatalogBudget = SkillCatalogBudget()
+    summary_settings: ContextSummarySettings = ContextSummarySettings()
 
     def __post_init__(self) -> None:
         if not 0 < self.trigger_ratio < 1:
@@ -172,6 +174,8 @@ class ContextWindowManager:
             "algorithm": "provider-budget-managed-session",
             "version": 2,
             "semantic_compaction": self.semantic_compaction,
+            "summary_settings": {name: getattr(self.summary_settings, name)
+                                 for name in self.summary_settings.__dataclass_fields__},
             "skill_catalog_ratio": self.skill_catalog_budget.ratio,
             "skill_catalog_fallback_tokens": self.skill_catalog_budget.fallback_tokens,
             "trigger_ratio": self.trigger_ratio,

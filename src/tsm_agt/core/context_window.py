@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
-from tsm_agt.ports import Message, MessageRole, TextBlock, ToolSpec
+from tsm_agt.ports import Message, MessageRole, SessionEvent, TextBlock, ToolSpec
 from .configuration import canonical_hash
 from .prompt import PromptTemplate
 
@@ -50,6 +50,36 @@ def restore_messages(data: Mapping[str, Any]) -> tuple[Message, ...]:
         else message
         for message in (Message.from_data(row) for row in data.get("messages", []))
     )
+
+
+def restore_interrupted_inputs(
+    events: tuple[SessionEvent, ...], *, task_id: str, before_sequence: int,
+) -> tuple[Message, ...]:
+    """Recover authored text between the saved window and the new turn."""
+    messages = []
+    for event in reversed(events):
+        if event.sequence >= before_sequence or event.payload.get("task_id") != task_id:
+            continue
+        # Legacy windows have no cursor. Their last result is the same boundary.
+        if event.event_type == "session.task_result_recorded":
+            break
+        if event.event_type != "session.turn_input_recorded":
+            continue
+        raw = event.payload.get("user_message")
+        if not isinstance(raw, Mapping):
+            continue
+        try:
+            message = Message.from_data(raw)
+        except (KeyError, TypeError, ValueError):
+            continue
+        text = message.text
+        if message.role is MessageRole.USER and text.strip():
+            # Match ordinary session history: replay text without old attachments.
+            messages.append(Message(
+                "window-history-" + message.message_id, MessageRole.USER,
+                (TextBlock(text),),
+            ))
+    return tuple(reversed(messages))
 
 
 def _section(message: Message) -> str | None:

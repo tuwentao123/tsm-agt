@@ -201,6 +201,15 @@ class ToolConcurrencyTest(unittest.IsolatedAsyncioTestCase):
             await app.kernel.run_agent_turn(task.task_id, "read inputs")
             self.assertEqual(tools.max_active, 1)
 
+    async def test_single_read_executes_without_an_extra_model_round(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app, task, model, tools = await self.application(Path(directory), calls("only"))
+            result = await app.kernel.run_agent_turn(task.task_id, "read the one required input")
+            self.assertEqual(tools.counts, {"only": 1})
+            self.assertEqual(len(model.requests), 2)
+            self.assertEqual(result_ids(model.requests[-1].messages), ["only"])
+            self.assertEqual(result.assistant_message.text, "done")
+
     async def test_snapshot_reports_runtime_concurrency_separately_from_model(self):
         with tempfile.TemporaryDirectory() as directory:
             app, task, model, _ = await self.application(Path(directory), calls("a", "b"), limit=2)

@@ -106,6 +106,12 @@ class SkillPreparationTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(job["status"], "installed")
             self.assertFalse(result["preparation_required"])
             self.assertFalse(result["ready"])
+            self.assertTrue(result["loadable"])
+            self.assertTrue(result["load_validation"]["ok"])
+            self.assertEqual(result["warnings"], [])
+            self.assertTrue(job["loadable"])
+            self.assertFalse(job["ready"])
+            self.assertIn("已安装 · 可加载", job["summary"])
             self.assertNotIn("session_id", job)
             self.assertNotIn("task_id", job)
             self.assertIsNotNone(client.application.kernel._dependencies.skill_registry.get("demo-plan"))
@@ -121,6 +127,49 @@ class SkillPreparationTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(server.launches, [])
             self.assertEqual(web.session_workspace_bindings, {})
         self.assertEqual(UserSkillsStore(self.root / "home").installations.get(job["id"])["status"], "installed")
+
+    async def test_import_without_runtime_is_imported_but_not_loadable(self):
+        model = ScriptedModel([])
+        client = await self.client(model)
+        server = SameLoopServer(client)
+        with patch.object(web, "runtime_server", None):
+            result = await self.upload()
+            job = result["installation"]
+            self.assertTrue(result["installed"])
+            self.assertFalse(result["loadable"])
+            self.assertEqual(result["load_validation"]["error_code"], "SKILL_RUNTIME_UNAVAILABLE")
+            self.assertTrue(result["warnings"])
+            self.assertEqual(job["status"], "installed")
+            self.assertFalse(job["loadable"])
+            self.assertFalse(job["ready"])
+            self.assertIn("加载验证失败", job["summary"])
+            self.assertTrue(Path(job["plan_path"]).is_file())
+            stored = UserSkillsStore(self.root / "home").installations.get(job["id"])
+            self.assertEqual(stored["status"], "installed")
+            self.assertFalse(stored["loadable"])
+        with patch.object(web, "runtime_server", server):
+            revalidated = web.revalidate_skill_import(self.store, self.store.installations.get(job["id"]))
+        self.assertTrue(revalidated["loadable"])
+        self.assertIn("已安装 · 可加载", revalidated["summary"])
+        self.assertEqual(model.requests, [])
+        self.assertEqual(server.launches, [])
+
+    async def test_load_validation_rejects_name_bound_to_another_path(self):
+        model = ScriptedModel([])
+        client = await self.client(model)
+        server = SameLoopServer(client)
+        skill = self.store.install_upload({"demo/SKILL.md": manifest()})
+        with patch.object(web, "runtime_server", server):
+            loaded = web.validate_skill_load(self.store, skill.name, skill.plan_path)
+            mismatch = web.validate_skill_load(self.store, skill.name, str(self.root / "elsewhere" / "SKILL.md"))
+            missing = web.validate_skill_load(self.store, "no-such-skill", skill.plan_path)
+        self.assertTrue(loaded["ok"])
+        self.assertEqual(Path(loaded["path"]).resolve(), Path(skill.plan_path).resolve())
+        self.assertTrue(loaded["content_sha256"])
+        self.assertFalse(mismatch["ok"])
+        self.assertEqual(mismatch["error_code"], "SKILL_PATH_MISMATCH")
+        self.assertEqual(missing["error_code"], "SKILL_NOT_FOUND")
+        self.assertEqual(model.requests, [])
 
     async def test_legacy_preparation_receipt_still_reports_real_ready_checks(self):
         class Model(ScriptedModel):
