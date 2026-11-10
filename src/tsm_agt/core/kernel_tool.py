@@ -1873,20 +1873,7 @@ class ToolMixin:
             )
         if execution.idempotency is ToolIdempotency.NON_IDEMPOTENT:
             result = self._dependencies.tool_result_governor.govern(
-                spec,
-                execution.call,
-                ToolResult(
-                    call_id=execution.call.call_id,
-                    ok=False,
-                    error_code="UNKNOWN_OUTCOME",
-                    message=(
-                        "non-idempotent tool started before interruption; its external "
-                        "outcome must be checked before any retry"
-                    ),
-                    hint="Inspect the target system or ask the user how to proceed.",
-                    retryable=False,
-                    meta={"execution_id": execution.execution_id},
-                ),
+                spec, execution.call, execution.interrupted_outcome(),
             )
             unknown = execution.finish(ToolCommitState.UNKNOWN_OUTCOME, result)
             await self._commit_recovery_result(task, unknown, result, "tool.unknown_outcome")

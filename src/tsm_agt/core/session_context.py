@@ -18,6 +18,7 @@ from tsm_agt.ports import Message, MessageRole, SessionEvent, TextBlock
 
 from .configuration import canonical_hash
 from .execution import ToolExecutionRecord
+from .session_history import HISTORICAL_READ_TOOLS
 from .tool_result_governor import sanitize_historical_error_text
 from .session import SessionSnapshot
 from .session_resources import (
@@ -1584,10 +1585,7 @@ class SessionContextProjector:
         approval_decisions: Mapping[tuple[str, str], str],
     ) -> dict[str, Any]:
         call = execution.call
-        safe_tool = call.name in {
-            "core.list_files", "core.search_files", "core.find_files",
-            "core.read_file", "core.search_text", "core.grep_search",
-        }
+        safe_tool = call.name in HISTORICAL_READ_TOOLS
         call_data: dict[str, Any] = {
             "call_id": call.call_id, "tool": call.name,
         }

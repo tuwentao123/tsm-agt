@@ -10,8 +10,8 @@ from enum import StrEnum
 from typing import Any
 
 from tsm_agt.ports import (
-    ToolCall, ToolEffect, ToolIdempotency, ToolResult, ToolResultAuthority,
-    ToolRisk,
+    ToolCall, ToolEffect, ToolIdempotency, ToolRecoveryKind, ToolResult,
+    ToolResultAuthority, ToolRisk,
 )
 
 
@@ -128,6 +128,21 @@ class ToolExecutionRecord:
             self,
             state=ToolCommitState.RUNNING,
             updated_at=datetime.now(timezone.utc),
+        )
+
+    def interrupted_outcome(self) -> ToolResult:
+        return ToolResult(
+            call_id=self.call.call_id,
+            ok=False,
+            error_code="UNKNOWN_OUTCOME",
+            message=(
+                "non-idempotent tool started before interruption; its external "
+                "outcome must be checked before any retry"
+            ),
+            hint="Inspect the target system or ask the user how to proceed.",
+            retryable=False,
+            recovery_kind=ToolRecoveryKind.UNKNOWN_OUTCOME,
+            meta={"execution_id": self.execution_id},
         )
 
     def reconcile(self, outcome: str, reference: str) -> ToolExecutionRecord:

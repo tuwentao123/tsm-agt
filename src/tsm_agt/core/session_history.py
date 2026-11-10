@@ -6,8 +6,9 @@ The persisted events and the UI projection are not rewritten by this module.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any
 
 from tsm_agt.ports import Message, MessageRole, TextBlock
@@ -16,6 +17,18 @@ from .configuration import canonical_hash
 
 
 MANAGED_HISTORY_BUDGETS = {"turn-token-v1", "turn-token-v2"}
+HISTORICAL_READ_TOOLS = frozenset({
+    "core.list_files", "core.search_files", "core.find_files",
+    "core.read_file", "core.search_text", "core.grep_search",
+})
+
+
+def _history_execution_events(
+    summaries: Sequence[Mapping[str, Any]], unattributed: Sequence[Mapping[str, Any]],
+) -> Iterator[Mapping[str, Any]]:
+    for summary in summaries:
+        yield from summary.get("execution_events", ())
+    yield from unattributed
 
 
 def normalize_history_body(
@@ -42,8 +55,8 @@ def normalize_history_body(
     result["task_scope_observations"] = list((aggregates | explicit_aggregates).values())
     existing = result.get("read_payloads", {})
     pool: dict[str, Any] = {}
-    events = [event for summary in summaries for event in summary.get("execution_events", [])]
-    events.extend(result.get("unattributed_execution_events", []))
+    earlier_facts = result.get("earlier_summary", {}).get("execution_facts", ())
+    events = _history_execution_events([*summaries, *earlier_facts], result.get("unattributed_execution_events", ()))
     for event in events:
         observation = event.get("result", {}).get("observation")
         if not isinstance(observation, dict):
@@ -76,6 +89,53 @@ def normalize_history_body(
     return result
 
 
+def prune_unreferenced_read_payloads(messages: tuple[Message, ...]) -> tuple[Message, ...]:
+    """Trim historical bodies whose observations no longer survive in the window."""
+    pools = {}
+    summaries = []
+    unattributed = []
+    try:
+        for index, message in enumerate(messages):
+            if message.role is not MessageRole.USER or not message.message_id.startswith((
+                "session-context-", "session-facts-",
+            )):
+                continue
+            if len(message.content) != 1 or not isinstance(message.content[0], TextBlock):
+                return messages
+            body = json.loads(message.text)
+            if (message.message_id.startswith("session-context-")
+                    and body.get("boundary") == "session_conversation_projection"):
+                summaries.extend(body.get("recent_task_summaries", ()))
+                summaries.extend(body.get("earlier_summary", {}).get("execution_facts", ()))
+                unattributed.extend(body.get("unattributed_execution_events", ()))
+                if isinstance(body.get("read_payloads"), dict) and body["read_payloads"]:
+                    pools[index] = body
+            elif (message.message_id.startswith("session-facts-")
+                    and body.get("boundary") == "historical_runtime_facts"):
+                summaries.append(body["summary"])
+        if not pools:
+            return messages
+        references = set()
+        for event in _history_execution_events(summaries, unattributed):
+            observation = event.get("result", {}).get("observation")
+            if isinstance(observation, dict) and isinstance(reference := observation.get("read_payload_ref"), str):
+                references.add(reference)
+    except (ValueError, TypeError, AttributeError, KeyError):
+        # A legacy projection that cannot be decoded may still carry live references.
+        return messages
+
+    updated = {}
+    for index, body in pools.items():
+        pool = body["read_payloads"]
+        if pool.keys() <= references:
+            continue
+        body["read_payloads"] = {key: payload for key, payload in pool.items() if key in references}
+        updated[index] = replace(messages[index], content=(TextBlock(json.dumps(
+            body, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )),))
+    return tuple(updated.get(index, message) for index, message in enumerate(messages)) if updated else messages
+
+
 def _ranges(sequences: Sequence[int]) -> list[list[int]]:
     result: list[list[int]] = []
     for value in sorted(set(sequences)):
@@ -88,7 +148,7 @@ def _ranges(sequences: Sequence[int]) -> list[list[int]]:
 
 def compact_history_body(
     body: Mapping[str, Any], keep_turns: int, *, include_previews: bool = True,
-    omit_read_bodies: bool = False,
+    omit_read_bodies: bool = False, compact_execution_details: bool = False,
 ) -> dict[str, Any]:
     """Drop whole old turns, preserving bounded excerpts as claims, not facts.
 
@@ -149,6 +209,41 @@ def compact_history_body(
         "retrieval_reference": {"session_id": body.get("session_id"), "source_event_ranges": merged},
         "warning": "Older dialogue is omitted or excerpted, not verified or completed. References address durable Session events, not tool capabilities.",
     })
+    if compact_execution_details:
+        # Successful workspace exploration remains queryable by Turn. Keep
+        # execution outcomes, failures, and approvals as structured facts.
+        def keep_fact(event: Mapping[str, Any]) -> bool:
+            result = event.get("result", {})
+            observation = result.get("observation", {})
+            return not (
+                event.get("turn_id")
+                and event.get("call", {}).get("tool") in HISTORICAL_READ_TOOLS
+                and result.get("state") == "COMMITTED" and result.get("ok") is True
+                and observation.get("root_kind") == "PRIMARY_WORKSPACE"
+                and not event.get("historical_approval")
+            )
+
+        older = list(earlier.get("execution_facts", ()))
+        retained = []
+        for item in body.get("recent_task_summaries", ()):
+            events = [
+                {key: event[key] for key in ("call", "result", "historical_approval") if key in event}
+                for event in item.get("execution_events", ()) if keep_fact(event)
+            ]
+            if (item.get("task_id"), item.get("turn_id")) in identities:
+                retained.append({**item, "execution_events": events})
+            elif events or item.get("mutations") or item.get("verification_status"):
+                older.append({
+                    **{key: item[key] for key in ("task_id", "turn_id", "mutations",
+                       "verification_status", "answer_event_ref") if key in item},
+                    "execution_events": events,
+                })
+        earlier["execution_facts"] = older
+        result["recent_task_summaries"] = retained
+        earlier["history_lookup"] = (
+            "Use runtime.read_history with event_sequence for dialogue, or task_id and turn_id "
+            "to list archived executions. Use execution_id for one historical observation."
+        )
     if include_previews:
         summaries = {(item.get("task_id"), item.get("turn_id")): item
                      for item in body.get("recent_task_summaries", [])}
@@ -164,7 +259,8 @@ def compact_history_body(
                  "call": {key: event.get("call", {}).get(key) for key in ("call_id", "tool")},
                  "result": {key: value for key, value in event.get("result", {}).items()
                             if key in {"execution_id", "state", "ok", "error_code", "succeeded", "exit_code", "execution_state", "message"}},
-             } for event in summaries.get((group[0].get("task_id"), group[0].get("turn_id")), {}).get("execution_events", [])]}
+             } for event in (summaries.get((group[0].get("task_id"), group[0].get("turn_id")), {}).get("execution_events", [])
+                             if not compact_execution_details else ())]}
             for group in dropped
         ]
     earlier["content_hash"] = canonical_hash({key: value for key, value in earlier.items() if key != "content_hash"})
@@ -178,7 +274,9 @@ def compact_history_body(
     if isinstance(body.get("selection"), dict):
         result["selection"] = {**body["selection"], "algorithm": "turn-token-v2",
                                "dropped_message_count": earlier["message_count"]}
-    return normalize_history_body(result, omit_read_bodies=omit_read_bodies)
+    # Exact observations that the reader cannot recover (for example results
+    # from a previously authorized external root) still own their payloads.
+    return normalize_history_body(result, omit_read_bodies=omit_read_bodies and not compact_execution_details)
 
 
 def history_turn_groups(rows: Sequence[Mapping[str, Any]]) -> list[list[Mapping[str, Any]]]:

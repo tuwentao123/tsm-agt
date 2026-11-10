@@ -5,16 +5,20 @@ import asyncio
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from tsm_agt.adapters.builtin import CoreReadOnlyToolProvider
 from tsm_agt.adapters.sqlite import SQLiteRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import ApprovalDecision, TaskState
 from tsm_agt.core.approval import ApprovalNotPending
+from tsm_agt.core.execution import ToolCommitState
 from tsm_agt.ports import (
     FinishReason, Message, MessageRole, ModelResponse, ModelUsage,
-    RuntimeStorePort, TextBlock, ToolCall, ToolCallBlock, ToolResultBlock,
+    RuntimeStorePort, TextBlock, ToolCall, ToolCallBlock, ToolIdempotency,
+    ToolResultBlock,
 )
 from tsm_agt.sdk import EngineeringAgentClient
 from tsm_agt.sdk.ui_events import ui_snapshot
@@ -60,6 +64,82 @@ class ResumedModel(ApprovalModel):
 
 
 class ResumedTurnOwnershipTest(unittest.IsolatedAsyncioTestCase):
+    async def test_interrupted_non_idempotent_tool_does_not_invalidate_next_turn_approval(self):
+        from tests.test_conversation_loop import ScriptedModel, text_response, tool_response
+
+        class InterruptibleTool(ApprovalTool):
+            def __init__(self):
+                self.entered = asyncio.Event()
+                self.calls = []
+
+            async def list_tools(self):
+                return tuple(replace(spec, idempotency=ToolIdempotency.NON_IDEMPOTENT)
+                             for spec in await super().list_tools())
+
+            async def invoke(self, call, context):
+                self.calls.append(call.call_id)
+                if call.call_id == "old-call":
+                    self.entered.set()
+                    await asyncio.Future()
+                return await super().invoke(call, context)
+
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                tool = InterruptibleTool()
+                responses = [
+                    tool_response("old", "old-call", "fixture.sdk_approval", {}),
+                    tool_response("new", "new-call", "fixture.sdk_approval", {}),
+                    text_response("done", "new action completed"),
+                ]
+                if legacy:
+                    responses.insert(1, tool_response("middle", "middle-call", "fixture.sdk_approval", {}))
+                app = compose_fixture_application(
+                    model_adapter=ScriptedModel(responses), tool_adapters=(tool,),
+                    store_adapter=SQLiteRuntimeStore(root / "runtime.db"),
+                )
+                async with EngineeringAgentClient(root, application_factory=lambda: app) as client:
+                    accepted = await client.submit_user_input("conv", "first", input_id="first")
+                    task_id = accepted.result["task"]["task_id"]
+                    old = await client.wait_task(task_id, timeout=3)
+                    resumed = asyncio.create_task(client.resolve_approval(
+                        old.approval["request_id"], ApprovalDecision.APPROVE,
+                        "approve old action", command_id="old-approval",
+                    ))
+                    try:
+                        await asyncio.wait_for(tool.entered.wait(), 3)
+                        if legacy:
+                            # Persist the old runtime's abandoned RUNNING row,
+                            # including a newer checkpoint that no longer owns it.
+                            with patch.object(app.kernel, "_abandoned_conversation_executions", new_callable=AsyncMock) as settle:
+                                settle.return_value = ()
+                                await client.submit_user_input("conv", "intermediate", input_id="intermediate")
+                                self.assertEqual((await client.wait_task(task_id, timeout=3)).state, "AWAITING_APPROVAL")
+                        await client.submit_user_input("conv", "next action", input_id="next")
+                        waiting = await client.wait_task(task_id, timeout=3)
+                        self.assertEqual(waiting.state, "AWAITING_APPROVAL")
+                        self.assertEqual(tool.calls, ["old-call"])
+                        with self.assertRaises(asyncio.CancelledError):
+                            await resumed
+                        await client.resolve_approval(
+                            waiting.approval["request_id"], ApprovalDecision.APPROVE,
+                            "approve new action", command_id="new-approval",
+                        )
+                        result = await client.wait_task(task_id, timeout=3)
+                        self.assertEqual(result.assistant_text, "new action completed")
+                        self.assertEqual(tool.calls, ["old-call", "new-call"])
+                        current = await app.kernel.get_task(task_id)
+                        old_execution = next(e for e in current.tool_executions.values() if e.call.call_id == "old-call")
+                        self.assertEqual(old_execution.state, ToolCommitState.UNKNOWN_OUTCOME)
+                        self.assertFalse(old_execution.result.retryable)
+                        events = await app.kernel.dependencies.store.read_events(task_id)
+                        self.assertEqual(sum(e.event_type == "tool.unknown_outcome"
+                            and e.payload.get("execution_id") == old_execution.execution_id for e in events), 1)
+                        self.assertFalse(any(e.event_type == "checkpoint.conflict" for e in events))
+                    finally:
+                        resumed.cancel()
+                        await asyncio.gather(resumed, return_exceptions=True)
+
     async def test_new_message_supersedes_pending_approval_without_executing_it(self):
         class CountingTool(ApprovalTool):
             calls = 0

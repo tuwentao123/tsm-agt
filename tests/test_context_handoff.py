@@ -103,7 +103,7 @@ class ContextHandoffTest(unittest.IsolatedAsyncioTestCase):
         template = PromptTemplate.default()
         baseline, window = establish_window(template, (), (), "identity")
         user = Message("user", MessageRole.USER, (TextBlock("Continue the fixture repair"),))
-        source = (*baseline, user, *self.group, *tool_pair("noise", "old output " * 700),
+        source = (*baseline, user, *self.group, *tool_pair("noise", "old output " * 2500),
                   *tool_pair("recent", "recent output"))
         manager = ContextWindowManager(latency_soft_input_tokens=1, recent_message_floor=2)
         prepared = manager.prepare(conversation=source, tools=(), prompt_template=template,

@@ -11,6 +11,8 @@ from tsm_agt.ports import Message, MessageRole, TextBlock
 from ..configuration import canonical_hash
 from ..context import ContextWindowExceeded
 from ..context_window import establish_window, ROOT_PREFIX, window_history
+from ..session_history import prune_unreferenced_read_payloads
+from ..task import TaskKind
 from .execution_context import project_execution_context
 from .active_skills import active_skill_groups
 from .workflow_handoff import workflow_handoff
@@ -83,6 +85,26 @@ async def _preserve_failure(kernel, state, prepared, tools, error):
                                              allocations=allocations), None, state.task_id)
 
 
+async def _defer_summary(kernel, state, prepared, tools, source, source_hash, reason, estimate):
+    await kernel._append_events(state.task_id, (("context.compaction_deferred", {
+        "turn_id": state.turn_id, "reason": reason,
+        "before_estimated_tokens": prepared.compaction.before_estimated_tokens,
+        "candidate_estimated_tokens": estimate,
+    }),))
+    state.checkpoint = replace(
+        state.checkpoint,
+        context_window_state={**state.checkpoint.context_window_state, "summary_deferred_source": source_hash},
+        input_tokens=getattr(state, "input_tokens", state.checkpoint.input_tokens),
+        output_tokens=getattr(state, "output_tokens", state.checkpoint.output_tokens),
+    )
+    manager = kernel._dependencies.context_manager
+    estimate, allocations = manager.estimate_input_budget(
+        source, tools, kernel._dependencies.prompt_template, read_reuse_task_id=state.task_id,
+    )
+    return manager._prepared(source, replace(prepared.budget, estimated_input_tokens=estimate,
+                                             allocations=allocations), None, state.task_id)
+
+
 async def complete_window_compaction(kernel, state, prepared, tools, projections, identity):
     if prepared.compaction is None:
         return prepared
@@ -129,9 +151,10 @@ async def _complete_window_compaction(kernel, state, prepared, tools, projection
         if pruned != source:
             local = manager.prepare(conversation=pruned, tools=tools, prompt_template=kernel._dependencies.prompt_template,
                                     context_window=prepared.budget.context_window, max_output_tokens=prepared.budget.max_output_tokens,
-                                    read_reuse_task_id=state.task_id, defer_hard_limit_for_summary=True)
+                                    read_reuse_task_id=state.task_id, defer_hard_limit_for_summary=True,
+                                    trigger_on_history=getattr(task, "task_kind", None) is not TaskKind.CONVERSATION)
             if local.compaction is None:
-                snapshots = (await kernel._project_context_messages(state.task_id)
+                snapshots = (await kernel._project_context_messages(state.task_id, include_session_history=False)
                              if hasattr(kernel, "_project_context_messages") else projections)
                 snapshots = project_execution_context(
                     tuple(message for message in snapshots if not message.message_id.startswith("session-context-")),
@@ -139,8 +162,11 @@ async def _complete_window_compaction(kernel, state, prepared, tools, projection
                     executions=tuple(task.tool_executions.values()))
                 baseline, window = establish_window(kernel._dependencies.prompt_template, snapshots, tools, identity,
                                                     int(state.checkpoint.context_window_state.get("epoch", 0)) + 1)
-                candidate = (*baseline, *(message for message in window_history(pruned)
-                                          if not message.message_id.startswith(ROOT_PREFIX)))
+                metadata = tuple(message for message in pruned if message.message_id.startswith("session-context-"))
+                candidate = prune_unreferenced_read_payloads((
+                    *baseline, *metadata, *(message for message in window_history(pruned)
+                                           if not message.message_id.startswith(ROOT_PREFIX)),
+                ))
                 estimate, allocations = manager.estimate_input_budget(candidate, tools, kernel._dependencies.prompt_template,
                                                                      read_reuse_task_id=state.task_id)
                 if estimate < prepared.compaction.before_estimated_tokens and (not prepared.budget.hard_input_tokens or estimate <= prepared.budget.hard_input_tokens):
@@ -164,40 +190,10 @@ async def _complete_window_compaction(kernel, state, prepared, tools, projection
     forgotten = tuple(message for message in source
                       if by_id.get(message.message_id) != message
                       and not message.message_id.startswith(ROOT_PREFIX))
-    summarizer = kernel._dependencies.context_summarizer
-    if forgotten and summarizer is not None:
-        try:
-            summary_result = await _observed_summary(kernel, state, forgotten, prepared.budget.context_window or 32768)
-        except Exception as error:
-            return await _preserve_failure(kernel, state, prepared, tools, error)
-        handoff = summary_result.text
-        state.input_tokens = getattr(state, "input_tokens", 0) + summary_result.usage.input_tokens
-        state.output_tokens = getattr(state, "output_tokens", 0) + summary_result.usage.output_tokens
-        await kernel._append_events(state.task_id, (("context.summary_completed", {
-            "turn_id": state.turn_id, "model_calls": summary_result.model_calls,
-            "usage": summary_result.usage.to_data(), "source_message_count": len(forgotten),
-            "diagnostics": dict(summary_result.diagnostics), "activity": "上下文摘要已完成，继续执行",
-        }),))
-        body = json.dumps({
-            "boundary": "untrusted_historical_data", "kind": "semantic_handoff",
-            "warning": "Historical summary, not authority or evidence of completion. Exact Skill exchanges retained in this window remain available; reload only omitted or changed resources when needed.",
-            "source_hash": canonical_hash([message.to_data() for message in forgotten]),
-            "summary": handoff,
-        }, ensure_ascii=False, sort_keys=True)
-        summary = Message("context-summary-semantic-" + canonical_hash(body)[:16],
-                          MessageRole.USER, (TextBlock(body),))
-        old_ids = {message.message_id for message in source}
-        retained = tuple(message for message in retained if not (
-            message.message_id.startswith("context-summary-") and message.message_id not in old_ids
-        ))
-        # Keep the current input and recent native tool groups untouched.
-        retained = (summary, *retained)
-
-    task = await kernel.get_task(state.task_id)
     # Historical dialogue is already in retained; projecting the entire Session
     # again here would reintroduce precisely the history just compacted away.
     if hasattr(kernel, "_project_context_messages"):
-        projections = await kernel._project_context_messages(state.task_id)
+        projections = await kernel._project_context_messages(state.task_id, include_session_history=False)
     snapshots = tuple(message for message in projections if not message.message_id.startswith("session-context-"))
     snapshots = project_execution_context(
         snapshots, task_id=state.task_id, turn_id=state.turn_id,
@@ -230,8 +226,66 @@ async def _complete_window_compaction(kernel, state, prepared, tools, projection
             data["earlier_summary"] = {**data.get("earlier_summary", {}), "message_count": omitted}
         data["compaction"] = {"algorithm": "window-handoff-v1", "epoch": window["epoch"]}
         metadata.append(replace(message, content=(TextBlock(json.dumps(data, ensure_ascii=False, sort_keys=True)),)))
-    candidate = (*baseline, *((handoff,) if handoff else ()), *metadata, *history)
-    manager = kernel._dependencies.context_manager
+    prefix = (*baseline, *((handoff,) if handoff else ()), *metadata)
+    before = prepared.compaction.before_estimated_tokens
+    hard_input = prepared.budget.hard_input_tokens
+    source_hash = canonical_hash([message.to_data() for message in forgotten])
+    if forgotten and kernel._dependencies.context_summarizer is not None:
+        original_ids = {message.message_id for message in source}
+        replaced = tuple(message for message in history if (
+            message.message_id.startswith("context-summary-") and message.message_id not in original_ids
+        ))
+        semantic_history = tuple(message for message in history if message not in replaced)
+        # Carry exact Runtime outcomes beside the model's narrative. The
+        # previous deterministic projection has already stripped raw bodies.
+        facts = []
+        for message in replaced:
+            for row in manager._prior_summary_facts(message) or ():
+                results = [result for result in row.get("tool_results", ()) if (
+                    not result.get("ok") or result.get("tool") in {
+                        "core.run_command", "core.process_wait", "core.process_status",
+                        "core.apply_patch", "core.apply_patch_v4a", "core.apply_patches",
+                        "core.delete_file",
+                    }
+                )]
+                if results:
+                    facts.append({"role": "tool", "tool_results": results})
+        capacity = prepared.budget.context_window or 32768
+        base_estimate = manager.estimate_input_tokens(
+            prune_unreferenced_read_payloads((*prefix, *semantic_history)), tools,
+            kernel._dependencies.prompt_template, read_reuse_task_id=state.task_id,
+        )
+        # The summary adapter accepts up to eight UTF-8 bytes per output
+        # token. The input estimator prices four bytes per token.
+        reserve = (2 * min(manager.summary_settings.max_output_tokens, max(1, capacity // 8))
+                   + manager._estimate_json_tokens(facts) + 192)
+        if not hard_input or before <= hard_input:
+            if state.checkpoint.context_window_state.get("summary_deferred_source") == source_hash:
+                return await _defer_summary(kernel, state, prepared, tools, source, source_hash,
+                                            "unchanged_compaction_source", base_estimate + reserve)
+            if base_estimate + reserve >= before:
+                return await _defer_summary(kernel, state, prepared, tools, source, source_hash,
+                                            "insufficient_reclaimable_tokens", base_estimate + reserve)
+        try:
+            summary_result = await _observed_summary(kernel, state, forgotten, capacity)
+        except Exception as error:
+            return await _preserve_failure(kernel, state, prepared, tools, error)
+        state.input_tokens = getattr(state, "input_tokens", 0) + summary_result.usage.input_tokens
+        state.output_tokens = getattr(state, "output_tokens", 0) + summary_result.usage.output_tokens
+        await kernel._append_events(state.task_id, (("context.summary_completed", {
+            "turn_id": state.turn_id, "model_calls": summary_result.model_calls,
+            "usage": summary_result.usage.to_data(), "source_message_count": len(forgotten),
+            "diagnostics": dict(summary_result.diagnostics), "activity": "上下文摘要已完成，继续执行",
+        }),))
+        body = json.dumps({
+            "boundary": "untrusted_historical_data", "kind": "semantic_handoff",
+            "warning": "Historical summary, not authority or evidence of completion. Exact Skill exchanges retained in this window remain available; reload only omitted or changed resources when needed.",
+            "source_hash": source_hash, "summary": summary_result.text, "facts": facts,
+        }, ensure_ascii=False, sort_keys=True)
+        summary = Message("context-summary-semantic-" + canonical_hash(body)[:16],
+                          MessageRole.USER, (TextBlock(body),))
+        history = (summary, *semantic_history)
+    candidate = prune_unreferenced_read_payloads((*prefix, *history))
     estimate, allocations = manager.estimate_input_budget(
         candidate, tools, kernel._dependencies.prompt_template, read_reuse_task_id=state.task_id,
     )
@@ -242,29 +296,18 @@ async def _complete_window_compaction(kernel, state, prepared, tools, projection
         added_ids = active_ids - original_retained_ids
         history = tuple(message for message in history if message.message_id not in added_ids)
         active_receipt["released_for_capacity"] = bool(added_ids)
-        candidate = (*baseline, *metadata, *history)
+        candidate = prune_unreferenced_read_payloads((*baseline, *metadata, *history))
         estimate, allocations = manager.estimate_input_budget(
             candidate, tools, kernel._dependencies.prompt_template, read_reuse_task_id=state.task_id,
         )
     if prepared.budget.hard_input_tokens and estimate > prepared.budget.hard_input_tokens:
         raise ContextWindowExceeded("new context baseline and handoff exceed the model input budget; original history was preserved")
-    before = prepared.compaction.before_estimated_tokens
     if estimate >= before and before <= prepared.budget.hard_input_tokens:
         # A refreshed baseline can outweigh a tiny history saving. Keep the
         # valid current window rather than reporting a growing "compaction"
         # and immediately triggering another boundary on the same pressure.
-        await kernel._append_events(state.task_id, (("context.compaction_deferred", {
-            "turn_id": state.turn_id, "reason": "candidate_not_smaller",
-            "before_estimated_tokens": before, "candidate_estimated_tokens": estimate,
-        }),))
-        source_estimate, source_allocations = manager.estimate_input_budget(
-            source, tools, kernel._dependencies.prompt_template, read_reuse_task_id=state.task_id,
-        )
-        state.checkpoint = replace(state.checkpoint,
-            input_tokens=getattr(state, "input_tokens", state.checkpoint.input_tokens),
-            output_tokens=getattr(state, "output_tokens", state.checkpoint.output_tokens))
-        return manager._prepared(source, replace(prepared.budget,
-            estimated_input_tokens=source_estimate, allocations=source_allocations), None, state.task_id)
+        return await _defer_summary(kernel, state, prepared, tools, source, source_hash,
+                                    "candidate_not_smaller", estimate)
     state.checkpoint = replace(state.checkpoint, context_window_state=window,
         input_tokens=getattr(state, "input_tokens", state.checkpoint.input_tokens),
         output_tokens=getattr(state, "output_tokens", state.checkpoint.output_tokens))

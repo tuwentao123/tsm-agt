@@ -13,8 +13,10 @@ import argparse
 import asyncio
 import hashlib
 import json
+import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 from uuid import uuid4
@@ -80,9 +82,10 @@ def observe_model_exchanges(provider, observations: list):
 
 def workspace_path(root: Path, relative: str) -> Path:
     root = root.resolve()
-    path = (root / relative).resolve()
-    if (Path(relative).is_absolute() or path == root or not path.is_relative_to(root)
-            or not Path(relative).parts or Path(relative).parts[0] in {".agent", ".env", ".git"}):
+    name = Path(relative)
+    path = (root / name).resolve()
+    if (name.is_absolute() or path == root or not path.is_relative_to(root)
+            or {".agent", ".env", ".git", ".."}.intersection(name.parts)):
         raise ValueError("fixture paths must be relative, inside the disposable workspace and not runtime/config paths")
     return path
 
@@ -93,16 +96,26 @@ def load_fixture(path: Path) -> dict:
         raise ValueError("fixture requires a files object")
     if not isinstance(data.get("turns"), list) or not data["turns"]:
         raise ValueError("fixture requires nonempty turns")
+    commit = data.get("snapshot_commit")
+    if commit is not None and (not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", commit)):
+        raise ValueError("snapshot_commit must be a full Git commit hash")
     for relative, content in data["files"].items():
         workspace_path(Path("/disposable-evaluation"), relative)
         if not isinstance(content, str):
             raise ValueError("fixture file content must be text")
     preserved = data.get("preserve_files", [])
-    if not isinstance(preserved, list) or any(name not in data["files"] for name in preserved):
+    if not isinstance(preserved, list) or any(not isinstance(name, str) for name in preserved):
+        raise ValueError("preserve_files must be a list of paths")
+    for name in preserved:
+        workspace_path(Path("/disposable-evaluation"), name)
+    if commit is None and any(name not in data["files"] for name in preserved):
         raise ValueError("preserve_files must name initial fixture files")
     for turn in data["turns"]:
         if not isinstance(turn, dict) or not isinstance(turn.get("input"), str) or not turn["input"].strip():
             raise ValueError("each turn requires an input string")
+        phrases = turn.get("answer_contains", [])
+        if not isinstance(phrases, list) or any(not isinstance(item, str) or not item.strip() for item in phrases):
+            raise ValueError("answer_contains must be a list of nonempty strings")
         for field in ("files_equal", "files_contain"):
             if not isinstance(turn.get(field, {}), dict):
                 raise ValueError(f"{field} must be an object")
@@ -111,6 +124,30 @@ def load_fixture(path: Path) -> dict:
                 if not isinstance(content, str):
                     raise ValueError("file expectations must be strings")
     return data
+
+
+def _snapshot_member(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo:
+    if not (member.isfile() or member.isdir()):
+        raise ValueError(f"snapshot member must be a regular file or directory: {member.name}")
+    workspace_path(Path(destination), member.name)
+    return tarfile.data_filter(member, destination)
+
+
+def materialize_workspace(root: Path, fixture: dict, repo: Path, timeout: float) -> None:
+    commit = fixture.get("snapshot_commit")
+    if commit:
+        with tempfile.TemporaryFile() as archive:
+            subprocess.run(
+                ["git", "-C", str(repo), "archive", "--format=tar", f"{commit}^{{commit}}"],
+                stdout=archive, check=True, timeout=timeout,
+            )
+            archive.seek(0)
+            with tarfile.open(fileobj=archive) as snapshot:
+                snapshot.extractall(root, filter=_snapshot_member)
+    for relative, content in fixture["files"].items():
+        path = workspace_path(root, relative)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
 
 
 def file_state(root: Path) -> dict[str, str | None]:
@@ -167,13 +204,30 @@ def model_tool_proposals(events) -> list[dict]:
     ]
 
 
+def run_independent_tests(root: Path, timeout: float) -> int:
+    script = """\
+import sys
+import unittest
+
+suite = unittest.defaultTestLoader.discover(sys.argv[1], pattern="test_*.py")
+if not suite.countTestCases():
+    sys.exit("No tests discovered")
+sys.exit(not unittest.TextTestRunner().run(suite).wasSuccessful())
+"""
+    completed = subprocess.run(
+        [sys.executable, "-IB", "-c", script, str(root)],
+        cwd=root, capture_output=True, timeout=timeout,
+    )
+    return completed.returncode
+
+
 async def run_trial(args, fixture: dict, index: int) -> dict:
     with tempfile.TemporaryDirectory(prefix="tsm-multiturn-eval-") as directory:
         root = Path(directory).resolve()
-        for relative, content in fixture["files"].items():
-            path = workspace_path(root, relative)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
+        materialize_workspace(root, fixture, getattr(args, "snapshot_repo", Path.cwd()), args.timeout)
+        protected_files = {name: _file_hash(root, name) for name in fixture.get("preserve_files", [])}
+        if any(digest is None for digest in protected_files.values()):
+            raise ValueError("preserve_files must exist in the initial replay workspace")
         app = compose_openai_compatible_engineering_application_from_config(
             args.config, root / ".agent" / "runtime.db", session_history_format=args.history_format,
             history_soft_tokens=getattr(args, "history_soft_tokens", None),
@@ -189,7 +243,6 @@ async def run_trial(args, fixture: dict, index: int) -> dict:
             physical._request_diagnostics = capture
         session_id = f"multiturn-eval-{uuid4().hex}"
         reports = []
-        protected_files = {name: _file_hash(root, name) for name in fixture.get("preserve_files", [])}
         try:
             for number, turn in enumerate(fixture["turns"], 1):
                 before = file_state(root)
@@ -209,7 +262,12 @@ async def run_trial(args, fixture: dict, index: int) -> dict:
                     events = await app.kernel.dependencies.store.read_events(task_id)
                     current = [event for event in events if event.sequence > offsets.get(task_id, 0)]
                     calls = _tool_names(current)
+                    completed_turn = any(event.event_type == "turn.completed" for event in current)
+                    # The SDK can expose the previous answer during an approval wait.
+                    answer = result.assistant_text if completed_turn else None
                     checks = check_files(root, turn, before)
+                    for phrase_index, phrase in enumerate(turn.get("answer_contains", ()), start=1):
+                        checks[f"answer_contains:{phrase_index}"] = phrase in (answer or "")
                     checks.update({f"fixture_preserved:{name}": _file_hash(root, name) == digest
                                    for name, digest in protected_files.items()})
                     if turn.get("unchanged"):
@@ -218,14 +276,9 @@ async def run_trial(args, fixture: dict, index: int) -> dict:
                     if turn.get("verify_tests") and args.run_tests:
                         # This executes fixture/model-authored code only with an
                         # explicit operator flag; never use an existing project.
-                        completed = await asyncio.to_thread(
-                            subprocess.run,
-                            [sys.executable, "-I", "-m", "unittest", "discover", "-s", str(root), "-p", "test_*.py"],
-                            cwd=root, capture_output=True, timeout=args.timeout,
-                        )
-                        independent_tests = {"exit_code": completed.returncode,
-                                             "passed": completed.returncode == 0}
-                        checks["independent_tests"] = completed.returncode == 0
+                        exit_code = await asyncio.to_thread(run_independent_tests, root, args.timeout)
+                        independent_tests = {"exit_code": exit_code, "passed": exit_code == 0}
+                        checks["independent_tests"] = exit_code == 0
                     after = file_state(root)
                     report = {
                         "turn": number, "task_id": task_id, "state": result.state,
@@ -253,11 +306,8 @@ async def run_trial(args, fixture: dict, index: int) -> dict:
                                                 if before.get(name) != after.get(name)),
                         "checks": checks, "independent_tests": independent_tests,
                         "automated_checks_passed": all(checks.values()) if checks else None,
-                        # SDK may expose the previous archived answer while a
-                        # new Turn awaits approval. It is not this Turn's final.
-                        "final_answer": (result.assistant_text if any(
-                            event.event_type == "turn.completed" for event in current
-                        ) else None),
+                        "turn_completed": completed_turn,
+                        "final_answer": answer,
                         "final_answer_accuracy": "requires_human_review",
                         "request_receipts": [
                             {name: value for name, value in event.payload.items()
@@ -281,13 +331,22 @@ async def run_trial(args, fixture: dict, index: int) -> dict:
                         capture.reset(token)
                     if key:
                         capture.delete(key)
-            return {"trial": index, "label": args.label, "history_format": args.history_format,
+            all_turns_run = len(reports) == len(fixture["turns"])
+            case_passed = all_turns_run and all(
+                item["turn_completed"] and item["automated_checks_passed"] is not False
+                and not item["verification_not_run"] and not item["runtime_failures"]
+                and not item.get("blocked_by_explicit_user_action")
+                for item in reports
+            )
+            return {"case": args.fixture.stem, "trial": index, "label": args.label,
+                    "case_passed": case_passed, "snapshot_commit": fixture.get("snapshot_commit"),
+                    "history_format": args.history_format,
                     "context_policy": app.kernel.dependencies.context_manager.snapshot_data(),
                     "fixture_hash": hashlib.sha256(args.fixture.read_bytes()).hexdigest(),
                     "model": {name: value for name, value in
                               app.kernel.dependencies.configuration_metadata.get("model", {}).items()
                               if name in {"provider", "model", "protocol"}},
-                    "turns": reports, "all_turns_run": len(reports) == len(fixture["turns"]),
+                    "turns": reports, "all_turns_run": all_turns_run,
                     "task_completion": "not_inferred_from_tool_counts_or_file_changes"}
         finally:
             restore_observer()
@@ -298,7 +357,10 @@ async def run_trial(args, fixture: dict, index: int) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--fixture", type=Path, required=True)
+    parser.add_argument("--fixture", type=Path, action="append", required=True,
+                        help="fixture JSON, repeat for multiple cases")
+    parser.add_argument("--snapshot-repo", type=Path, default=Path.cwd(),
+                        help="local Git repository containing pinned snapshots")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--history-format", choices=("native", "json"), default="native")
     parser.add_argument("--history-soft-tokens", type=int, help="override shared history allocation; 0 disables only the soft cap")
@@ -321,25 +383,30 @@ def main() -> int:
         parser.error("history-soft-tokens must be zero or positive")
     if args.report_path is not None and args.report_path.exists():
         parser.error("report-path already exists; choose a new path")
-    fixture = load_fixture(args.fixture)
+    fixtures = [(path, load_fixture(path)) for path in args.fixture]
+    if len({path.stem for path, _ in fixtures}) != len(fixtures):
+        parser.error("fixture filenames must have distinct stems")
 
     async def run(output):
         failed = False
-        for index in range(1, args.repeat + 1):
-            report = await run_trial(args, fixture, index)
-            print(json.dumps(report, ensure_ascii=False, sort_keys=True), file=output, flush=True)
-            if args.report_path:
-                print(json.dumps({"trial": index, "label": args.label,
-                                  "all_turns_run": report["all_turns_run"],
-                                  "turns": [{"turn": item["turn"], "tool_names": item["tool_names"],
-                                             "checks": item["checks"], "state": item["state"],
-                                             "runtime_failures": item["runtime_failures"]}
-                                            for item in report["turns"]]}, ensure_ascii=False), flush=True)
-            failed |= (not report["all_turns_run"] or any(
-                item["automated_checks_passed"] is False or item["verification_not_run"]
-                or item["runtime_failures"]
-                or item.get("blocked_by_explicit_user_action") for item in report["turns"]
-            ))
+        for path, fixture in fixtures:
+            case_args = argparse.Namespace(**{**vars(args), "fixture": path})
+            passed = 0
+            for index in range(1, args.repeat + 1):
+                report = await run_trial(case_args, fixture, index)
+                print(json.dumps(report, ensure_ascii=False, sort_keys=True), file=output, flush=True)
+                if args.report_path:
+                    print(json.dumps({
+                        "case": path.stem, "trial": index, "label": args.label,
+                        "case_passed": report["case_passed"], "all_turns_run": report["all_turns_run"],
+                        "turns": [{"turn": item["turn"], "tool_names": item["tool_names"],
+                                   "checks": item["checks"], "state": item["state"],
+                                   "runtime_failures": item["runtime_failures"]}
+                                  for item in report["turns"]],
+                    }, ensure_ascii=False), flush=True)
+                passed += report["case_passed"]
+            print(f"{path.stem}: {passed}/{args.repeat} passed", file=sys.stderr, flush=True)
+            failed |= passed != args.repeat
         return int(failed)
     if args.report_path:
         with args.report_path.open("x", encoding="utf-8") as output:

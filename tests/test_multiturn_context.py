@@ -264,8 +264,8 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
             # compaction can accumulate more than the old user-only count.
             self.assertEqual(payload["earlier_summary"]["message_count"], 0)
 
-    async def test_a_compacted_prompt_admits_the_messages_it_dropped(self):
-        """The shared budget accounts for every omitted row in whole Turns."""
+    async def test_active_window_does_not_rewrite_history_at_the_admission_budget(self):
+        """Once established, the window keeps appending until capacity pressure."""
 
         with tempfile.TemporaryDirectory() as directory:
             client, model = await self.make_client(
@@ -284,10 +284,9 @@ class MultiTurnContextTest(unittest.IsolatedAsyncioTestCase):
                 )
 
             payload = self._session_context(model.requests, 0)
-            self.assertEqual(len(payload["recent_messages"]) % 2, 0)
-            self.assertIn("compaction", payload)
-            self.assertEqual(len(payload["recent_messages"]) +
-                             payload["earlier_summary"]["message_count"], 14)
+            self.assertEqual(len(payload["recent_messages"]), 14)
+            self.assertNotIn("compaction", payload)
+            self.assertEqual(payload["earlier_summary"]["message_count"], 0)
 
     async def test_small_legacy_count_knobs_cannot_override_provider_token_budget(self):
         """Only the shared token budget limits Conversation history."""

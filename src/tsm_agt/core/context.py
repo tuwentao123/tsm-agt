@@ -199,6 +199,7 @@ class ContextWindowManager:
         runtime_instruction: str | None = None,
         read_reuse_task_id: str | None = None,
         defer_hard_limit_for_summary: bool = False,
+        trigger_on_history: bool = True,
     ) -> PreparedContext:
         if max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
@@ -212,6 +213,8 @@ class ContextWindowManager:
                 "disabled-provider-window-unknown",
                 allocations, self.history_soft_tokens,
             )
+            if not trigger_on_history:
+                return self._prepared(conversation, budget, None, read_reuse_task_id)
             compacted, changed = self._compact_turn_history(
                 conversation, tools, prompt_template, budget, runtime_instruction,
                 read_reuse_task_id=read_reuse_task_id,
@@ -244,14 +247,14 @@ class ContextWindowManager:
             allocations=before_allocations,
             history_soft_tokens=self.history_soft_tokens,
         )
-        managed_history = any(
-            (body := self._session_body(message)) is not None
-            and body.get("history_budget") in MANAGED_HISTORY_BUDGETS
-            for message in conversation
-        ) or any(message.message_id.startswith("window-history-") for message in conversation)
-        history_pressure = self.history_soft_tokens and managed_history and any(
-            item.name == "session_history" and item.estimated_tokens > self.history_soft_tokens
-            for item in before_allocations
+        history_pressure = (
+            trigger_on_history and self.history_soft_tokens
+            and any(item.name == "session_history" and item.estimated_tokens > self.history_soft_tokens
+                    for item in before_allocations)
+            and any(message.message_id.startswith("window-history-") or (
+                (body := self._session_body(message)) is not None
+                and body.get("history_budget") in MANAGED_HISTORY_BUDGETS
+            ) for message in conversation)
         )
         if not budget.should_compact and not history_pressure:
             return self._prepared(conversation, budget, None, read_reuse_task_id)
@@ -271,6 +274,7 @@ class ContextWindowManager:
         compacted, receipt = self._compact(
             conversation, tools, prompt_template, budget, runtime_instruction,
             read_reuse_task_id=read_reuse_task_id,
+            trigger_on_history=trigger_on_history,
         )
         after, after_allocations = self.estimate_input_budget(
             compacted, tools, prompt_template, runtime_instruction,
@@ -308,6 +312,19 @@ class ContextWindowManager:
             projection.messages if projection else retained, budget, receipt,
             retained, projection.stats if projection else None,
         )
+
+    def admit_session_history(
+        self, projections: tuple[Message, ...], tools: tuple[ToolSpec, ...],
+        template: PromptTemplate,
+    ) -> tuple[Message, ...]:
+        """Choose history before the first provider request of a new window."""
+        if not self.history_soft_tokens or not any(tool.name == "runtime.read_history" for tool in tools):
+            return projections
+        budget = ContextBudget(0, 0, 0, 0, 0, history_soft_tokens=self.history_soft_tokens)
+        return self._compact_turn_history(
+            projections, tools, template, budget, None,
+            history_reader_available=True,
+        )[0]
 
     @staticmethod
     def estimate_input_tokens(
@@ -425,11 +442,13 @@ class ContextWindowManager:
         self, conversation: tuple[Message, ...], tools: tuple[ToolSpec, ...],
         prompt_template: PromptTemplate, budget: ContextBudget,
         runtime_instruction: str | None = None,
-        *, read_reuse_task_id: str | None = None,
+        *, read_reuse_task_id: str | None = None, trigger_on_history: bool = True,
     ) -> tuple[tuple[Message, ...], ContextCompactionReceipt | None]:
         source_conversation = conversation
         conversation, turn_history_items = self._compact_turn_history(
-            conversation, tools, prompt_template, budget, runtime_instruction,
+            conversation, tools, prompt_template,
+            budget if trigger_on_history else replace(budget, history_soft_tokens=0),
+            runtime_instruction,
             read_reuse_task_id=read_reuse_task_id,
         )
         conversation, compacted_session_items = self._compact_session_messages(
@@ -463,6 +482,19 @@ class ContextWindowManager:
             index for index, group in enumerate(groups)
             if index == 0 or self._is_protected_group(group)
         }
+        if not trigger_on_history:
+            # Keep the last answered proposal and any later unanswered input,
+            # even after a long live tool loop moves them out of the tail.
+            for index in range(len(groups) - 1, -1, -1):
+                historical = tuple(message for message in groups[index]
+                                   if message.message_id.startswith(("window-history-", "session-history-")))
+                if not any(message.role is MessageRole.USER and message.text for message in historical):
+                    continue
+                protected_indexes.add(index)
+                if any(message.role is MessageRole.ASSISTANT and message.text
+                       and not any(isinstance(block, ToolCallBlock) for block in message.content)
+                       for message in historical):
+                    break
         candidate_indexes = [
             index for index in range(len(groups))
             if index not in protected_indexes and index not in recent_indexes
@@ -497,6 +529,7 @@ class ContextWindowManager:
         self, conversation: tuple[Message, ...], tools: tuple[ToolSpec, ...],
         template: PromptTemplate, budget: ContextBudget, instruction: str | None,
         *, read_reuse_task_id: str | None = None,
+        history_reader_available: bool = False,
     ) -> tuple[tuple[Message, ...], int]:
         """One token budget, whole historical Turns, no second count cutoff.
 
@@ -512,7 +545,7 @@ class ContextWindowManager:
             total, allocations = self.estimate_input_budget(candidate_messages, tools, template, instruction,
                                                             read_reuse_task_id=read_reuse_task_id)
             history = sum(item.estimated_tokens for item in allocations if item.name == "session_history")
-            return total <= target and (not self.history_soft_tokens or history <= self.history_soft_tokens)
+            return total <= target and (not budget.history_soft_tokens or history <= budget.history_soft_tokens)
 
         for index, message in enumerate(conversation):
             body = self._session_body(message)
@@ -525,7 +558,10 @@ class ContextWindowManager:
                 continue
 
             def candidate(keep: int, previews: bool, omit_reads: bool = True) -> tuple[Message, ...]:
-                data = compact_history_body(body, keep, include_previews=previews, omit_read_bodies=omit_reads)
+                data = compact_history_body(
+                    body, keep, include_previews=previews, omit_read_bodies=omit_reads,
+                    compact_execution_details=history_reader_available,
+                )
                 replacement = Message(
                     message.message_id.removesuffix("-compacted") + "-compacted", message.role,
                     (TextBlock(json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))),),
@@ -544,8 +580,15 @@ class ContextWindowManager:
             # Binary-search the largest complete recent suffix that fits. Keep
             # provenance-only summaries when older excerpts would crowd it out.
             best_keep = 1
+            if history_reader_available:
+                # A series of interrupted requests can follow the last
+                # answered proposal. Keep that proposal and those inputs.
+                best_keep = next((
+                    count for count, group in enumerate(reversed(groups), 1)
+                    if any(row.get("role") == "assistant" for row in group)
+                ), len(groups))
             best = candidate(best_keep, False)
-            low, high = 1, len(groups) - 1
+            low, high = best_keep + 1, len(groups) - 1
             while low <= high:
                 keep = (low + high) // 2
                 proposed = candidate(keep, False)
@@ -562,9 +605,10 @@ class ContextWindowManager:
             # Read payloads can use remaining space, but never displace text or
             # execution facts. The latest full Turn may exceed the soft cap;
             # prepare() still enforces the Provider hard input limit.
-            with_reads = candidate(best_keep, fits(with_previews), omit_reads=False)
-            if fits(with_reads):
-                best = with_reads
+            if not history_reader_available:
+                with_reads = candidate(best_keep, fits(with_previews), omit_reads=False)
+                if fits(with_reads):
+                    best = with_reads
             kept_body = self._session_body(best[index])
             assert kept_body is not None
             removed += max(1, len(body.get("recent_messages", [])) - len(kept_body.get("recent_messages", [])))
@@ -965,6 +1009,11 @@ class ContextWindowManager:
         for key in ("start_line", "end_line", "total_lines", "scanned_files"):
             value = data.get(key)
             if isinstance(value, int):
+                summary[key] = value
+        for key in ("process_id", "execution_state", "succeeded", "exit_code",
+                    "return_code", "failure_code", "after_hash"):
+            value = data.get(key)
+            if isinstance(value, (str, int, bool)):
                 summary[key] = value
         return summary
 

@@ -7,6 +7,7 @@ from tsm_agt.adapters.builtin import RuntimeInspectionToolProvider
 from tsm_agt.adapters.fixture import EchoModelProvider, InMemoryRuntimeStore
 from tsm_agt.bootstrap import compose_fixture_application, compose_readonly_application
 from tsm_agt.core import SessionSnapshot, TaskSnapshot, TaskState
+from tsm_agt.core.execution import ToolCommitState, ToolExecutionRecord
 from tsm_agt.ports import (
     AdapterContext,
     FinishReason,
@@ -25,8 +26,11 @@ from tsm_agt.ports import (
     ToolCall,
     ToolCallBlock,
     ToolEffect,
+    ToolIdempotency,
     ToolInvocationContext,
+    ToolResult,
     ToolResultAuthority,
+    ToolRisk,
 )
 
 
@@ -245,10 +249,14 @@ class RuntimeInspectionToolProviderTest(unittest.IsolatedAsyncioTestCase):
             "runtime.list_task_events",
             "runtime.inspect_session",
             "runtime.search_history",
+            "runtime.read_history",
         })
         for spec in specs.values():
             self.assertEqual(spec.effect, ToolEffect.OBSERVE)
-            self.assertEqual(spec.result_authority, ToolResultAuthority.RUNTIME_FACT)
+            self.assertEqual(spec.result_authority, (
+                ToolResultAuthority.DERIVED if spec.name == "runtime.read_history"
+                else ToolResultAuthority.RUNTIME_FACT
+            ))
 
         app = compose_readonly_application()
         await app.registry.start_all()
@@ -257,6 +265,63 @@ class RuntimeInspectionToolProviderTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await app.registry.stop_all()
         self.assertTrue(set(specs).issubset(names))
+
+    async def test_history_excerpt_resolves_authored_input_and_checks_task_scope(self):
+        stored = await self.store.load_session("session-current")
+        await self.store.commit_session(SessionUnitOfWork(
+            stored.session_id, stored.version, stored.data, (SessionEvent(
+                "authored", stored.session_id, 2, "session.turn_input_recorded", {
+                    "task_id": "task-current",
+                    "user_message": Message("user", MessageRole.USER, (
+                        TextBlock("Use the original name. " + "x" * 4200 + " Keep the last constraint."),
+                    )).to_data(),
+                },
+            ),),
+        ))
+        first = await self.provider.invoke(
+            ToolCall("read-first", "runtime.read_history", {"event_sequence": 2}), self.context,
+        )
+        self.assertIn("Use the original name.", first.data["excerpt"])
+        self.assertTrue(first.truncated)
+        tail = await self.provider.invoke(ToolCall("read-tail", "runtime.read_history", {
+            "event_sequence": 2, "cursor": first.data["next_cursor"],
+        }), self.context)
+        self.assertIn("Keep the last constraint.", tail.data["excerpt"])
+        self.assertFalse(tail.truncated)
+        denied = await self.provider.invoke(ToolCall("read-denied", "runtime.read_history", {
+            "event_sequence": 2, "task_id": "other",
+        }), self.context)
+        self.assertEqual(denied.error_code, "PERMISSION_DENIED")
+
+    async def test_history_excerpt_reads_recorded_workspace_content_and_blocks_sensitive_paths(self):
+        stored = await self.store.load_task("task-current")
+        task = TaskSnapshot.from_data(stored.data)
+        for call_id, path, content in (
+            ("plain", "notes.txt", "older contents"),
+            ("sensitive", ".env", "sensitive archived contents"),
+        ):
+            call = ToolCall(call_id, "core.read_file", {"path": path})
+            execution = ToolExecutionRecord.start(
+                task_id=task.task_id, turn_id="past-turn", invocation_id=f"inv-{call_id}",
+                call=call, payload_hash=call_id, policy_decision_id="policy",
+                effective_risk=ToolRisk.R0, approval_request_id=None,
+                idempotency=ToolIdempotency.IDEMPOTENT,
+            ).mark_running().finish(ToolCommitState.COMMITTED, ToolResult(call_id, True, data={
+                "content": content, "resolved_root": str(self.workspace), "root_kind": "PRIMARY_WORKSPACE",
+                "resolved_path": str(self.workspace / path),
+            }))
+            task = task.with_tool_execution(execution)
+        await self.store.commit(RuntimeUnitOfWork(task.task_id, stored.version, task.to_data(), ()))
+        (self.workspace / "notes.txt").write_text("newer contents")
+        past = await self.provider.invoke(ToolCall("older", "runtime.read_history", {
+            "execution_id": "plain",
+        }), self.context)
+        self.assertIn("older contents", past.data["excerpt"])
+        self.assertEqual(past.data["execution_id"], "past-turn:plain")
+        hidden = await self.provider.invoke(ToolCall("hidden", "runtime.read_history", {
+            "execution_id": "past-turn:sensitive",
+        }), self.context)
+        self.assertNotIn("sensitive archived contents", hidden.data["excerpt"])
 
     async def test_result_is_durably_recorded_when_used_by_the_agent(self) -> None:
         store = InMemoryRuntimeStore()

@@ -82,8 +82,8 @@ from .state import build_turn_state
 from .execution_context import project_execution_context
 from .tool_catalog import refresh_observed_tool_catalog
 from ..context_window import (
-    context_updates, establish_window, restore_interrupted_inputs, restore_messages,
-    window_history, window_identity,
+    PORTABLE_WINDOW_VERSION, context_updates, establish_window, portable_window_history,
+    restore_interrupted_inputs, restore_messages, window_history, window_identity,
 )
 from ..skills import SkillCatalogBudget, render_skill_catalog
 from .compaction import complete_window_compaction
@@ -261,20 +261,33 @@ class ConversationAgentLoop:
                                if hasattr(kernel._dependencies.model, "profile_fingerprint") else ""),
         )
         saved_window = session.model_context_window
-        if (task.task_kind is TaskKind.CONVERSATION
-                and saved_window.get("identity") == identity):
+        exact_window = saved_window.get("identity") == identity
+        portable_window = (
+            saved_window.get("snapshot_version") == PORTABLE_WINDOW_VERSION
+            and saved_window.get("task_id") == task_id
+            and saved_window.get("workspace") == task.workspace
+        )
+        if task.task_kind is TaskKind.CONVERSATION and (exact_window or portable_window):
             history = restore_messages(saved_window)
+            window_state = {key: value for key, value in saved_window.items() if key != "messages"}
+            if not exact_window:
+                history = portable_window_history(history)
+                window_state = {
+                    "epoch": saved_window.get("epoch", 0), "portable_history": bool(history),
+                    "task_event_sequence": saved_window.get("task_event_sequence", 0),
+                }
             window_sequence = int(saved_window.get("session_event_sequence", 0))
             if input_sequence > window_sequence + 1:
                 events = await kernel._dependencies.store.read_session_events(
                     task.session_id, after_sequence=window_sequence,
                 )
-                history += restore_interrupted_inputs(
+                existing = {message.message_id for message in history}
+                history += tuple(message for message in restore_interrupted_inputs(
                     events, task_id=task_id, before_sequence=input_sequence,
-                )
+                ) if message.message_id not in existing)
             checkpoint = replace(checkpoint,
                 messages=(*history, user_message),
-                context_window_state={key: value for key, value in saved_window.items() if key != "messages"},
+                context_window_state=window_state,
             )
         checkpoint = await kernel._bind_agent_checkpoint(
             task, checkpoint, visible_tools
@@ -997,16 +1010,29 @@ class ConversationAgentLoop:
                 "run commands or make changes. If the user needs those actions, "
                 "explain this limitation and ask them to choose a model with tools."
             )
+        window = dict(state.checkpoint.context_window_state)
         projections = await kernel._project_context_messages(
-            state.task_id, updates_only=bool(state.checkpoint.context_window_state),
+            state.task_id, updates_only=bool(window.get("identity")),
+            include_session_history=not window.get("portable_history", False),
         )
         handoff = None
         if state.model_call_count == 0:
             # Reusing a Session window must still hand off this request's
             # current progress, without rebuilding the entire Session history.
             memory = await kernel.get_working_memory(state.task_id)
+            cursor = window.get("task_event_sequence")
+            execution_updates = frozenset()
+            if cursor:
+                execution_updates = frozenset(
+                    event.payload["execution_id"]
+                    for event in await kernel._dependencies.store.read_events(
+                        state.task_id, after_sequence=cursor,
+                        event_types=("tool.completed", "tool.failed", "tool.unknown_outcome", "tool.recovered"),
+                    )
+                    if isinstance(event.payload.get("execution_id"), str)
+                )
             handoff = workflow_handoff(task, source_user, projections,
-                history=tuple(state.messages), memory_state=memory.to_data())
+                history=tuple(state.messages), memory_state=memory.to_data(), execution_updates=execution_updates)
         identity = window_identity(
             task_id=state.task_id, profile_id=state.checkpoint.model_profile_id, workspace=task.workspace,
             manifest_hash=kernel._dependencies.prompt_template.manifest().manifest_hash,
@@ -1014,19 +1040,28 @@ class ConversationAgentLoop:
             model_fingerprint=(kernel._dependencies.model.profile_fingerprint(state.checkpoint.model_profile_id)
                                if hasattr(kernel._dependencies.model, "profile_fingerprint") else ""),
         )
-        window = dict(state.checkpoint.context_window_state)
-        if not window:
+        history_admitted = False
+        if not window.get("identity"):
+            portable_history = window.get("portable_history", False)
+            if task.task_kind is TaskKind.CONVERSATION:
+                admitted = kernel._dependencies.context_manager.admit_session_history(
+                    projections, model_tools, kernel._dependencies.prompt_template,
+                )
+                history_admitted = admitted != projections
+                projections = admitted
             snapshots = project_execution_context(
                 projections, task_id=state.task_id, turn_id=state.turn_id,
                 tool_specs=state.visible_tool_by_name, executions=tuple(task.tool_executions.values()),
             )
             baseline, window = establish_window(
                 kernel._dependencies.prompt_template, snapshots, model_tools, identity,
+                int(window.get("epoch", 0)) + 1,
             )
             if handoff is not None:
                 baseline = (*baseline, handoff)
             state.messages = list(baseline) + [message for message in state.messages
-                if not message.message_id.startswith(_GENERATED_CONTEXT_PREFIXES)]
+                if not message.message_id.startswith(_GENERATED_CONTEXT_PREFIXES)
+                or (portable_history and message.message_id.startswith("session-context-"))]
         else:
             updates, window = context_updates(window, projections, model_tools)
             if window.get("identity") != identity or any(message.role is MessageRole.SYSTEM for message in updates):
@@ -1097,6 +1132,7 @@ class ConversationAgentLoop:
                 runtime_instruction=runtime_instruction,
                 read_reuse_task_id=state.task_id,
                 defer_hard_limit_for_summary=kernel._dependencies.context_summarizer is not None,
+                trigger_on_history=task.task_kind is not TaskKind.CONVERSATION,
             )
             prepared = await complete_window_compaction(
                 kernel, state, prepared, model_tools, projections, identity,
@@ -1106,15 +1142,14 @@ class ConversationAgentLoop:
             # resumable checkpoint when one exists.
             raise ModelInvocationFailed(state.turn_id, str(error)) from error
         if prepared.compaction is not None:
-            state.messages = list(prepared.canonical_messages)
-            await kernel._append_events(state.task_id, (("context.compacted", {
-                "turn_id": state.turn_id,
-                "model_call": model_call,
-                **prepared.compaction.event_data(),
-            }),))
+            state.messages = list(kernel._normalize_and_validate_model_boundary(prepared.canonical_messages))
             state.checkpoint = replace(state.checkpoint, messages=tuple(state.messages))
             await kernel._save_agent_checkpoint(
-                state.checkpoint, "conversation-loop-context-compacted"
+                state.checkpoint, "conversation-loop-context-compacted", compaction_event={
+                    "turn_id": state.turn_id,
+                    "model_call": model_call,
+                    **prepared.compaction.event_data(),
+                },
             )
         if prepared.read_reuse is not None and prepared.read_reuse.references:
             await kernel._append_events(state.task_id, (("context.read_results_reused", {
@@ -1161,4 +1196,7 @@ class ConversationAgentLoop:
         state.model_started_at = time.monotonic()
         # Persist the exact baseline before the API call so crash recovery
         # cannot rebuild it from a newer filesystem or MCP connection state.
-        await kernel._save_agent_checkpoint(state.checkpoint, "conversation-loop-context-window")
+        await kernel._save_agent_checkpoint(
+            state.checkpoint, "conversation-loop-context-window",
+            publish_context_window=history_admitted and prepared.compaction is None,
+        )

@@ -167,7 +167,7 @@ class CompositionTest(unittest.IsolatedAsyncioTestCase):
                     "git.status", "git.diff", "git.log", "git.show",
                     "git.blame", "git.branches",
                     "runtime.inspect_task", "runtime.list_task_events",
-                    "runtime.inspect_session", "runtime.search_history",
+                    "runtime.inspect_session", "runtime.search_history", "runtime.read_history",
                 ],
             )
         finally:
@@ -292,7 +292,7 @@ model:
                     "git.status", "git.diff", "git.log", "git.show",
                     "git.blame", "git.branches",
                     "runtime.inspect_task", "runtime.list_task_events",
-                    "runtime.inspect_session", "runtime.search_history",
+                    "runtime.inspect_session", "runtime.search_history", "runtime.read_history",
                     "web.search", "web.fetch_markdown", "web.open",
                     "web.find_in_page", "web.read", "content.summarize",
                     "core.run_command", "core.process_list", "core.process_wait",

@@ -260,6 +260,28 @@ class SummaryRecoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 1)
         self.assertGreater(state.checkpoint.context_window_state["summary_retry_after"], time.time())
 
+    async def test_small_candidate_is_deferred_before_call_and_same_source_is_not_retried(self):
+        class MustNotCall:
+            async def summarize(self, *args, **kwargs):
+                raise AssertionError("the candidate cannot reclaim enough space")
+
+        kernel, state, _, source, events = await self.setup_runtime(MustNotCall(), timeout=1)
+        source = (*source[:-4], *tool_pair("old", "short observation"), *source[-2:])
+        state.messages = list(source)
+        state.checkpoint = replace(state.checkpoint, messages=source)
+        manager = kernel._dependencies.context_manager
+        template = kernel._dependencies.prompt_template
+        prepared = manager.prepare(
+            conversation=source, tools=(), prompt_template=template,
+            context_window=manager.estimate_input_tokens(source, (), template) + 500, max_output_tokens=128,
+        )
+        self.assertIsNotNone(prepared.compaction)
+        for expected in ("insufficient_reclaimable_tokens", "unchanged_compaction_source"):
+            result = await complete_window_compaction(kernel, state, prepared, (), (), "identity")
+            self.assertEqual(result.canonical_messages, source)
+            self.assertEqual(events[-1][1]["reason"], expected)
+        self.assertFalse(any(kind == "context.summary_started" for kind, _ in events))
+
     async def test_hard_overflow_does_not_commit_a_missing_or_incomplete_summary(self):
         class Broken:
             async def summarize(self, *args, **kwargs):
@@ -276,8 +298,19 @@ class SummaryRecoveryTest(unittest.IsolatedAsyncioTestCase):
             async def summarize(self, *args, **kwargs):
                 raise AssertionError("local pruning is sufficient")
         kernel, state, prepared, source, events = await self.setup_runtime(MustNotCall(), timeout=1)
+        metadata = Message("session-context-test", MessageRole.USER, (TextBlock(json.dumps({
+            "boundary": "session_conversation_projection", "recent_messages": [],
+            "history_format": "native", "history_budget": "turn-token-v2",
+            "read_payloads": {"source": {"content": "a past file read"}},
+        })),))
+        facts = Message("session-facts-test", MessageRole.USER, (TextBlock(json.dumps({
+            "boundary": "historical_runtime_facts", "summary": {"execution_events": [{
+                "result": {"observation": {"read_payload_ref": "source"}},
+            }]},
+        })),))
         # Make only the old tool output large enough to trigger capacity pressure.
-        source = (*source[:-4], *tool_pair("old", "old observation " * 4000), *source[-2:])
+        source = (*source[:1], metadata, facts, *source[1:-4],
+                  *tool_pair("old", "old observation " * 4000), *source[-2:])
         state.messages = list(source)
         state.checkpoint = replace(state.checkpoint, messages=source)
         manager = replace(kernel._dependencies.context_manager, trigger_ratio=0.8)
@@ -289,4 +322,6 @@ class SummaryRecoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(kind == "context.tool_outputs_pruned" for kind, _ in events))
         self.assertFalse(any(kind == "context.summary_started" for kind, _ in events))
         self.assertIsNotNone(result.compaction)
+        self.assertIn(metadata, result.canonical_messages)
+        self.assertIn(facts, result.canonical_messages)
         self.assertIn("Continue B", " ".join(m.text for m in result.messages))

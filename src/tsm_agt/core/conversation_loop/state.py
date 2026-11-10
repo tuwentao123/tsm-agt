@@ -8,12 +8,14 @@ into that state, so the loop body and the resume path cannot drift apart.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from tsm_agt.ports import Message, ToolSpec
 
 from ..agent_loop import AgentProgress, AgentTurnCheckpoint, TurnState
 from ..plan_guard import PlanGuard
+from ..session_history import prune_unreferenced_read_payloads
 
 
 def build_turn_state(
@@ -32,6 +34,9 @@ def build_turn_state(
     toolset, the visible-tool index, and the live callbacks.
     """
 
+    messages = prune_unreferenced_read_payloads(checkpoint.messages)
+    if messages is not checkpoint.messages:
+        checkpoint = replace(checkpoint, messages=messages)
     state = TurnState(
         task_id=checkpoint.task_id,
         turn_id=checkpoint.turn_id,

@@ -51,9 +51,9 @@ model:
         timeout_seconds: 180
         max_retries: 2
         strict_tool_schema: false
-      # Declare only known limitations. A profile can reduce, never add,
-      # adapter capabilities.
+      # Set the model's known context window and disable unsupported features.
       # capabilities:
+      #   context_window: 300000
       #   parallel_tools: false
 
 # All following sections are optional. Omitted values use the built-in defaults.

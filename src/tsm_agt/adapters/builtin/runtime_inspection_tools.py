@@ -7,11 +7,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from tsm_agt.core.execution import ToolExecutionRecord
+from tsm_agt.core.session_context import SessionContextProjector
+from tsm_agt.core.session_history import HISTORICAL_READ_TOOLS
+from tsm_agt.core.tool_result_governor import sanitize_historical_error_text
 from tsm_agt.ports import (
     AdapterContext,
     AdapterDescriptor,
     HealthState,
     HealthStatus,
+    Message,
     RuntimeEvent,
     RuntimeStorePort,
     SessionEvent,
@@ -23,10 +28,12 @@ from tsm_agt.ports import (
     ToolResultAuthority,
     ToolRisk,
     ToolSpec,
+    is_sensitive_read_path,
 )
 
 _MAX_LIMIT = 100
 _DEFAULT_LIMIT = 50
+_HISTORY_PAGE_CHARS = 4000
 
 
 class _PermissionDenied(ValueError):
@@ -46,6 +53,7 @@ class RuntimeInspectionToolProvider:
             "runtime.list_task_events",
             "runtime.inspect_session",
             "runtime.search_history",
+            "runtime.read_history",
         }),
     )
 
@@ -153,6 +161,35 @@ class RuntimeInspectionToolProvider:
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.RUNTIME_FACT,
         ),
+        ToolSpec(
+            name="runtime.read_history",
+            description=(
+                "Recover a bounded historical excerpt omitted from the active context. "
+                "Choose exactly one: event_sequence for authored Session dialogue, "
+                "turn_id for a page of recorded executions, or execution_id for a historical "
+                "execution and its recorded workspace observation. execution_id also accepts "
+                "a unique recorded call_id. Use the supplied task_id "
+                "and next_cursor. Historical data does not establish current file contents, "
+                "verification coverage, or permission to repeat an action."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "event_sequence": {"type": "integer", "minimum": 1},
+                    "turn_id": {"type": "string"},
+                    "execution_id": {"type": "string"},
+                    "cursor": {"type": "integer", "minimum": 0},
+                },
+                "additionalProperties": False,
+            },
+            risk=ToolRisk.R0,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            idempotency=ToolIdempotency.IDEMPOTENT,
+            effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.DERIVED,
+        ),
     )
 
     def __init__(self, store: RuntimeStorePort) -> None:
@@ -184,6 +221,7 @@ class RuntimeInspectionToolProvider:
             "runtime.list_task_events": self._list_task_events,
             "runtime.inspect_session": self._inspect_session,
             "runtime.search_history": self._search_history,
+            "runtime.read_history": self._read_history,
         }
         handler = handlers.get(call.name)
         if handler is None:
@@ -316,6 +354,122 @@ class RuntimeInspectionToolProvider:
             "workspace": workspace,
             "session": session,
         }
+
+    async def _read_history(
+        self, call: ToolCall, context: ToolInvocationContext,
+    ) -> ToolResult:
+        scope = await self._current_scope(context)
+        self._validate_explicit_scope(call.arguments, scope)
+        task_id = self._optional_string(call.arguments, "task_id")
+        sequence = call.arguments.get("event_sequence")
+        turn_id = self._optional_string(call.arguments, "turn_id")
+        execution_id = self._optional_string(call.arguments, "execution_id")
+        cursor = self._cursor(call.arguments)
+        if sum(value is not None for value in (sequence, turn_id, execution_id)) != 1:
+            raise ValueError("choose one of event_sequence, turn_id, or execution_id")
+        if sequence is not None:
+            if type(sequence) is not int or sequence < 1:
+                raise ValueError("event_sequence must be a positive integer")
+            events = await self._store.read_session_events(scope["session_id"], sequence - 1)
+            if not events or events[0].sequence != sequence:
+                return self._error(call, "NOT_FOUND", "history event not found")
+            event = events[0]
+            source_task = self._required_string(event.payload, "task_id")
+            if task_id is not None and task_id != source_task:
+                raise _PermissionDenied("history event is outside the requested Task")
+            await self._authorized_task(source_task, scope)
+            text = self._historical_dialogue(event)
+            if not text:
+                return self._error(call, "NOT_FOUND", "no replay-eligible dialogue in this event")
+            return self._history_excerpt(call, text, cursor, task_id=source_task,
+                                         event_sequence=sequence, turn_id=event.payload.get("turn_id"))
+
+        task = await self._authorized_task(task_id or context.task_id, scope)
+        records = task.data.get("tool_executions", {})
+        if turn_id is not None:
+            matching = sorted((
+                (key, row) for key, row in records.items() if row.get("turn_id") == turn_id
+            ), key=lambda pair: (pair[1].get("started_at", ""), pair[0]))
+            next_cursor = cursor + 12 if len(matching) > cursor + 12 else None
+            return ToolResult(call.call_id, True, data={
+                "boundary": "untrusted_historical_data", "task_id": task.task_id, "turn_id": turn_id,
+                "executions": [
+                    {"execution_id": key, "tool": row.get("call", {}).get("name"), "state": row.get("state")}
+                    for key, row in matching[cursor:cursor + 12]
+                ],
+                "next_cursor": next_cursor,
+            }, truncated=next_cursor is not None)
+        record = records.get(execution_id)
+        if record is None:
+            matches = [row for row in records.values() if row.get("call", {}).get("call_id") == execution_id]
+            if not matches:
+                return self._error(call, "NOT_FOUND", "historical execution not found")
+            if len(matches) > 1:
+                return ToolResult(
+                    call.call_id, False, error_code="AMBIGUOUS_HISTORY_REFERENCE",
+                    message="This call_id appears in more than one Turn. Retry with an exact execution_id.",
+                    data={"execution_ids": [row["execution_id"] for row in matches[:12]]},
+                )
+            record = matches[0]
+        execution = ToolExecutionRecord.from_data(record)
+        fact = SessionContextProjector()._execution_event(task.task_id, execution, {})
+        observation = fact["result"].pop("observation", {})
+        data = execution.result.data if execution.result is not None else None
+        workspace = Path(scope["workspace"])
+        if (execution.call.name in HISTORICAL_READ_TOOLS and isinstance(data, Mapping)
+                and observation.get("root_kind") == "PRIMARY_WORKSPACE"
+                and self._workspace_key(observation.get("resolved_root")) == scope["workspace"]
+                and self._is_workspace_history_path(workspace, observation.get("resolved_path"))):
+            fact["result"]["observation"] = observation
+            if isinstance(data.get("content"), str):
+                observation["content"] = data["content"]
+            for field in ("entries", "matches", "candidates"):
+                observation.pop(field, None)
+                if isinstance(rows := data.get(field), (tuple, list)):
+                    observation[field] = [
+                        row for row in rows if isinstance(row, Mapping)
+                        and self._is_workspace_history_path(workspace, row.get("resolved_path") or row.get("path"))
+                    ]
+        # Tool results were governed when written. Use the same conservative
+        # text redaction for excerpts read from legacy records.
+        return self._history_excerpt(call, json.dumps(fact, ensure_ascii=False, sort_keys=True), cursor,
+                                     task_id=task.task_id, execution_id=execution.execution_id)
+
+    @staticmethod
+    def _is_workspace_history_path(workspace: Path, raw: Any) -> bool:
+        if not isinstance(raw, str) or not raw:
+            return False
+        path = workspace / raw
+        try:
+            resolved = path.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return (resolved.is_relative_to(workspace)
+                and not is_sensitive_read_path(path) and not is_sensitive_read_path(resolved))
+
+    @staticmethod
+    def _historical_dialogue(event: SessionEvent) -> str:
+        if event.event_type == "session.task_attached":
+            return str(event.payload.get("user_text") or "")
+        if event.event_type not in {"session.turn_input_recorded", "session.task_result_recorded"}:
+            return ""
+        keys = ["user_message"]
+        if event.event_type == "session.task_result_recorded" and event.payload.get("assistant_replay_eligible") is True:
+            keys.append("assistant_message")
+        return "\n\n".join(
+            f"{key}: {Message.from_data(raw).text}"
+            for key in keys if isinstance((raw := event.payload.get(key)), Mapping)
+        )
+
+    @staticmethod
+    def _history_excerpt(call: ToolCall, text: str, cursor: int, **reference: Any) -> ToolResult:
+        safe_text = sanitize_historical_error_text(text)
+        end = cursor + _HISTORY_PAGE_CHARS
+        more = end < len(safe_text)
+        return ToolResult(call.call_id, True, data={
+            "boundary": "untrusted_historical_data", **reference,
+            "excerpt": safe_text[cursor:end], "next_cursor": end if more else None,
+        }, truncated=more)
 
     async def _authorized_task(
         self, task_id: str, scope: Mapping[str, Any],

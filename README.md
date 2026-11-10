@@ -54,13 +54,13 @@ model:
 - `default_profile`：默认模型的配置名，此处为 `main`。网页切换模型从下一轮生效。
 - `options`：按接口支持填写；Chat 输出上限参数使用 `max_tokens` 或 `max_completion_tokens`。
 
-主对话的上下文预算仍预留输出空间（默认 8,192 tokens），这份预留不会自动成为请求的输出上限。OpenAI Chat / Responses 默认省略输出上限，由服务端决定；需要限制时设置模型的 `options.max_output_tokens`（正整数）。本地预算会至少预留该上限。Anthropic Messages 必须发送 `max_tokens`，未配置时使用 8,192。`send_output_token_limit: false` 仍可用于 OpenAI 接口，但不能与显式 `max_output_tokens` 同时配置。
+主对话的上下文预算仍预留输出空间，这份预留不会自动成为请求的输出上限。OpenAI Chat / Responses 默认省略输出上限，由服务端决定；需要限制时设置模型的 `options.max_output_tokens`（正整数）。本地预算会至少预留该上限。Anthropic Messages 必须发送 `max_tokens`，未配置时使用 8,192。`send_output_token_limit: false` 仍可用于 OpenAI 接口，但不能与显式 `max_output_tokens` 同时配置。
 
 修改 YAML 后重启服务。更多选项见[配置示例](examples/model-profiles.yaml)。
 
 MCP 通过 `core.mcp_discover` 按需发现、`core.mcp_call` 调用，Skill 通过 `skill.discover` 查询、`skill.load` 读取。工具结果随对话保留，上下文窗口在后续轮次和重启后复用；项目指令、模型配置变化或压缩会重建基线。
 
-可选上下文配置：
+可选的上下文配置
 
 ```yaml
 context:
@@ -75,6 +75,5 @@ context:
   skill_catalog_fallback_tokens: 2048
 ```
 
-`semantic_compaction` 默认开启。先精简旧工具输出，空间仍不足时通常请求一次模型生成无工具的交接摘要；异常最多再尝试一次，整个压缩过程共用 180 秒预算。失败保留原历史，60 秒内避免重复压缩；原历史超出硬上限时报告可恢复中断。关闭后使用规则压缩。可选 `summary_model_profile_id` 指定已配置的摘要模型，默认沿用当前模型。缓存读取量以 API 返回为准，`model.request_prefix_observed` 仅记录请求字段的变化情况。
-
-Skill 目录默认使用模型窗口的 2% 作为估算 token 预算；窗口未知时使用 `skill_catalog_fallback_tokens`。先缩短说明、保留名称，仍放不下时再提示查询。该预算不随历史增长变化。
+`history_soft_tokens` 用于新会话窗口装入旧历史，已有窗口按容量或显式配置的延迟阈值触发压缩。
+被移出的历史可通过 `runtime.read_history` 在当前会话和工作区内按引用回查。

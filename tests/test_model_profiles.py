@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from tsm_agt.bootstrap import (
+    compose_openai_compatible_engineering_application_from_config,
     compose_openai_compatible_readonly_application_from_config,
 )
 from tsm_agt.bootstrap.model_configuration import (
@@ -74,6 +75,25 @@ exploration:
         snapshot = application.kernel.dependencies.configuration_metadata
         self.assertEqual(snapshot["model"]["model"], "local-model")
         self.assertEqual(snapshot["exploration_budget"]["agent_max_model_calls"], 12)
+
+    def test_profile_can_declare_a_window_above_the_adapter_default(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "config.yaml"
+            path.write_text(_configuration() + """      capabilities:
+        context_window: 300000
+    fallback:
+      provider: provider
+      model: fallback-model
+""", encoding="utf-8")
+
+            application = compose_openai_compatible_engineering_application_from_config(
+                path, root / "runtime.db",
+            )
+
+        model = application.kernel.dependencies.model
+        self.assertEqual(model.capabilities_for("primary").context_window, 300_000)
+        self.assertEqual(model.capabilities_for("fallback").context_window, 128_000)
 
     def test_missing_template_values_are_reported_as_yaml_paths(self) -> None:
         with TemporaryDirectory() as directory:

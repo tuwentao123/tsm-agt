@@ -31,6 +31,7 @@ from tsm_agt.ports import (
     SessionEvent, SessionTaskUnitOfWork, SessionUnitOfWork, TextBlock,
     ToolCallBlock, ToolIdempotency, ToolRisk, ToolSpec,
 )
+from .context_window import PORTABLE_WINDOW_VERSION
 from .agent_loop import (
     AgentTurnCheckpoint,
 )
@@ -1989,6 +1990,8 @@ class SessionMixin:
         if model_context_window is not None:
             updated = replace(updated, model_context_window={
                 **model_context_window, "session_event_sequence": result_sequence,
+                "snapshot_version": PORTABLE_WINDOW_VERSION, "workspace": task.workspace,
+                "source_turn_id": turn_id,
             })
         payload: dict[str, Any] = {
             "task_id": task.task_id, "turn_id": turn_id,

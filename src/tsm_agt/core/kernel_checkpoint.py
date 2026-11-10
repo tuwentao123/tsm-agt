@@ -38,7 +38,7 @@ from pathlib import Path
 from tsm_agt.ports import (
     CheckpointCompatibilityAction, CheckpointCompatibilityDecision,
     CheckpointCompatibilityProbe, Message, MessageRole, RuntimeEvent,
-    RuntimeUnitOfWork, TextBlock, ToolCallBlock, ToolIdempotency,
+    RuntimeUnitOfWork, SessionTaskUnitOfWork, SessionUnitOfWork, TextBlock, ToolCallBlock, ToolIdempotency,
     ToolResultBlock
 )
 from typing import Any
@@ -47,8 +47,9 @@ from uuid import uuid4
 from .context_messages import GENERATED_CONTEXT_PREFIXES
 from .agent_loop import AgentCheckpointConflict, AgentTurnCheckpoint
 from .configuration import canonical_hash, effective_toolset_hash
+from .context_window import PORTABLE_WINDOW_VERSION
 from .execution import ToolCommitState, ToolExecutionRecord
-from .session import SessionState
+from .session import SessionSnapshot, SessionState
 from .task import (
     CONVERSATION_RESTARTABLE_STATES, LEGAL_TRANSITIONS, TaskKind,
     TaskSnapshot, TaskState,
@@ -158,6 +159,27 @@ class CheckpointMixin:
                         "reason": "fresh_conversation_turn",
                     },
                 ))
+            # The fresh-turn caller has drained the previous runner. Retire
+            # its abandoned invocations atomically with the checkpoint so a
+            # later approval cannot mistake them for executing tool calls.
+            for execution in await self._abandoned_conversation_executions(
+                current, stored.last_event_sequence,
+            ):
+                result = execution.interrupted_outcome()
+                executing = executing.with_tool_execution(
+                    execution.finish(ToolCommitState.UNKNOWN_OUTCOME, result)
+                )
+                events.append(RuntimeEvent(
+                    f"evt-{uuid4().hex}", task_id,
+                    stored.last_event_sequence + len(events) + 1,
+                    "tool.unknown_outcome", {
+                        "turn_id": execution.turn_id,
+                        "execution_id": execution.execution_id,
+                        "commit_state": ToolCommitState.UNKNOWN_OUTCOME.value,
+                        "reason": "fresh_conversation_turn",
+                        "result": result.to_data(),
+                    }, turn_id=execution.turn_id,
+                ))
             event = RuntimeEvent(
                 f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
                 "task.state_changed", {
@@ -177,6 +199,42 @@ class CheckpointMixin:
             except ValueError as error:
                 if "version conflict" not in str(error) or attempt == 3:
                     raise
+
+    async def _abandoned_conversation_executions(
+        self, task: TaskSnapshot, through_sequence: int,
+    ) -> tuple[ToolExecutionRecord, ...]:
+        running = tuple(
+            execution for execution in task.tool_executions.values()
+            if execution.turn_id
+            and execution.state is ToolCommitState.RUNNING
+            and execution.idempotency is ToolIdempotency.NON_IDEMPOTENT
+        )
+        if not running:
+            return ()
+        stopped_turn = (task.active_agent_checkpoint or {}).get("turn_id")
+        stopped = {}
+        if any(execution.turn_id != stopped_turn for execution in running):
+            # Older runtimes could drop an interrupted checkpoint without
+            # settling its tool ledger. Use the last lifecycle event for that
+            # Turn to distinguish a stopped invocation from an unattributed one.
+            for event in await self._dependencies.store.read_events(
+                task.task_id, event_types=("turn.interrupted", "turn.resumed"),
+            ):
+                if event.sequence > through_sequence:
+                    break
+                turn_id = event.payload.get("turn_id")
+                if event.event_type == "turn.interrupted":
+                    stopped[turn_id] = event.occurred_at
+                else:
+                    stopped.pop(turn_id, None)
+        return tuple(
+            execution for execution in running
+            if execution.turn_id == stopped_turn
+            or (
+                (interrupted_at := stopped.get(execution.turn_id)) is not None
+                and execution.updated_at <= interrupted_at
+            )
+        )
 
     @staticmethod
     def _checkpoint_has_unknown_side_effect(task: TaskSnapshot) -> bool:
@@ -250,6 +308,7 @@ class CheckpointMixin:
 
     async def _save_agent_checkpoint(
         self, checkpoint: AgentTurnCheckpoint, reason: str,
+        *, compaction_event: Mapping[str, Any] | None = None, publish_context_window: bool = False,
     ) -> None:
         stored = await self._require_stored_task(checkpoint.task_id)
         task = TaskSnapshot.from_data(stored.data)
@@ -294,9 +353,68 @@ class CheckpointMixin:
             },
             turn_id=checkpoint.turn_id,
         )
-        await self._dependencies.store.commit(RuntimeUnitOfWork(
-            checkpoint.task_id, stored.version, updated.to_data(), (event,)
-        ))
+        events = (event,)
+        if compaction_event is not None:
+            events += (RuntimeEvent(
+                f"evt-{uuid4().hex}", task.task_id, event.sequence + 1,
+                "context.compacted", compaction_event, turn_id=checkpoint.turn_id,
+            ),)
+        task_unit = RuntimeUnitOfWork(task.task_id, stored.version, updated.to_data(), events)
+        if (publish_context_window or compaction_event is not None) and task.task_kind is TaskKind.CONVERSATION:
+            await self._publish_context_window(task, checkpoint, task_unit)
+        else:
+            await self._dependencies.store.commit(task_unit)
+
+    async def _publish_context_window(
+        self, task: TaskSnapshot, checkpoint: AgentTurnCheckpoint, task_unit: RuntimeUnitOfWork,
+    ) -> None:
+        active_turn = (task.active_agent_checkpoint or {}).get("turn_id")
+        if (task.state is not TaskState.EXECUTING or active_turn != checkpoint.turn_id
+                or checkpoint.pending_tool_calls or checkpoint.pending_user_action):
+            raise AgentCheckpointConflict("only the active model-ready turn may publish a context window")
+        store = self._dependencies.store
+        for attempt in range(3):
+            stored_session = await store.load_session(task.session_id)
+            if stored_session is None:
+                raise AgentCheckpointConflict("session disappeared before publishing compacted history")
+            session = SessionSnapshot.from_data(stored_session.data)
+            self._authorize_session(session)
+            if session.state is not SessionState.ACTIVE or session.active_task_id != task.task_id:
+                raise AgentCheckpointConflict("session changed before publishing compacted history")
+            previous = session.model_context_window
+            after = int(previous.get("session_event_sequence", 0))
+            inputs = await store.read_session_events(session.session_id, after)
+            latest = next((event for event in reversed(inputs)
+                           if event.event_type == "session.turn_input_recorded"
+                           and event.payload.get("task_id") == task.task_id), None)
+            if latest is not None and latest.payload.get("turn_id") != checkpoint.turn_id:
+                raise AgentCheckpointConflict("newer input superseded the compacted history")
+            if latest is None and previous.get("source_turn_id") != checkpoint.turn_id:
+                # Legacy checkpoint without a durable input cursor.
+                await store.commit(task_unit)
+                return
+            window = {
+                **dict(checkpoint.context_window_state),
+                "snapshot_version": PORTABLE_WINDOW_VERSION,
+                "task_id": task.task_id,
+                "workspace": task.workspace,
+                "source_turn_id": checkpoint.turn_id,
+                "session_event_sequence": latest.sequence if latest is not None else after,
+                "task_event_sequence": task_unit.events[-1].sequence,
+                "messages": [message.to_data() for message in checkpoint.messages],
+            }
+            session_unit = SessionUnitOfWork(
+                session.session_id, stored_session.version,
+                replace(session, model_context_window=window).to_data(), (),
+            )
+            try:
+                await store.commit_session_and_task(SessionTaskUnitOfWork(
+                    session_unit, task_unit, f"context-window:{checkpoint.checkpoint_hash}",
+                ))
+                return
+            except ValueError as error:
+                if "session version conflict" not in str(error) or attempt == 2:
+                    raise
 
     async def _complete_agent_checkpoint(
         self, task_id: str, turn_id: str, model_calls: int, tool_calls: int,

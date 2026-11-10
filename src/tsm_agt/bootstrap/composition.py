@@ -378,11 +378,11 @@ def _physical_model_provider(
 
 
 def _apply_capability_overrides(provider, overrides: Mapping[str, bool | int]):
-    """Allow profiles to disable or bound—not invent—adapter capabilities.
+    """Apply model-specific capacity and restrict adapter protocol features.
 
-    A model profile may state that a local deployment has a smaller context or
-    unreliable tool calling.  It must never promote a feature that the chosen
-    wire adapter cannot serialize or replay correctly.
+    The adapter's context window is a fallback for an unspecified model.
+    A profile can declare the capacity of its deployment. Boolean features
+    remain bounded by what the adapter can serialize and replay.
     """
 
     if not overrides:
@@ -405,10 +405,6 @@ def _apply_capability_overrides(provider, overrides: Mapping[str, bool | int]):
                 raise ValueError(f"model capability {name} must be an integer")
             if requested <= 0:
                 raise ValueError(f"model capability {name} must be positive")
-            if available and requested > available:
-                raise ValueError(
-                    f"model capability {name} cannot exceed adapter limit {available}"
-                )
         values[name] = requested
     provider.capabilities = replace(baseline, **values)
     return provider

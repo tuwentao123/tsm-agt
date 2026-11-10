@@ -11,11 +11,13 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
-from tsm_agt.ports import Message, MessageRole, SessionEvent, TextBlock, ToolSpec
+from tsm_agt.ports import AssistantMessagePhase, Message, MessageRole, SessionEvent, TextBlock, ToolCallBlock, ToolSpec
 from .configuration import canonical_hash
 from .prompt import PromptTemplate
+from .session_history import prune_unreferenced_read_payloads
 
 ROOT_PREFIX = "window-context-root-"
+PORTABLE_WINDOW_VERSION = 1
 _LIVE_SECTIONS = (
     "project-instructions-context-", "task-spec-context-",
     "conversation-environment-context-", "document-references-context-",
@@ -82,6 +84,23 @@ def restore_interrupted_inputs(
     return tuple(reversed(messages))
 
 
+def portable_window_history(messages: tuple[Message, ...]) -> tuple[Message, ...]:
+    """Carry history across a prompt/model change using text and recorded facts."""
+    history = []
+    for message in messages:
+        if message.message_id.startswith(("session-context-", "session-facts-", "context-summary-")):
+            history.append(message)
+        elif message.message_id.startswith(("window-history-", "session-history-")) and message.role in {
+            MessageRole.USER, MessageRole.ASSISTANT,
+        } and message.phase is not AssistantMessagePhase.COMMENTARY and not any(
+            isinstance(block, ToolCallBlock) for block in message.content
+        ):
+            text = tuple(block for block in message.content if isinstance(block, TextBlock))
+            if text:
+                history.append(replace(message, content=text))
+    return prune_unreferenced_read_payloads(tuple(history))
+
+
 def _section(message: Message) -> str | None:
     return next((prefix for prefix in _LIVE_SECTIONS if message.message_id.startswith(prefix)), None)
 
@@ -109,7 +128,7 @@ def establish_window(template: PromptTemplate, projections: tuple[Message, ...],
              "sections": {_section(message): canonical_hash(message.to_data()["content"])
                           for message in projections if _section(message)},
              "catalogs": _catalogs(tools)}
-    return (root, *baseline), state
+    return prune_unreferenced_read_payloads((root, *baseline)), state
 
 
 def context_updates(previous: Mapping[str, Any], projections: tuple[Message, ...],

@@ -1655,7 +1655,10 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
                     "model_calls": llm_payload.get("model_call") or 0,
                     "tool_calls": completed_tool_calls,
                 },
-                model_context_window=model_context_window,
+                model_context_window=(
+                    {**model_context_window, "task_event_sequence": task_events[-1].sequence}
+                    if model_context_window is not None else None
+                ),
             )
             command_id = "final-agent-result:" + canonical_hash({
                 "task_id": task_id,
