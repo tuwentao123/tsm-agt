@@ -168,6 +168,8 @@ class MutationRecord:
     created_at: datetime
     before_mode: int | None = None
     reverts_mutation_id: str | None = None
+    #: Absolute root owning ``path`` when the file is not under the primary root.
+    root: str | None = None
 
     def to_data(self) -> dict[str, Any]:
         return {
@@ -178,6 +180,7 @@ class MutationRecord:
             "created_at": self.created_at.isoformat(),
             "before_mode": self.before_mode,
             "reverts_mutation_id": self.reverts_mutation_id,
+            "root": self.root,
         }
 
     @classmethod
@@ -198,6 +201,7 @@ class MutationRecord:
                 str(data["reverts_mutation_id"])
                 if data.get("reverts_mutation_id") else None
             ),
+            root=(str(data["root"]) if data.get("root") else None),
         )
 
 
@@ -372,20 +376,20 @@ class WorkspaceTransactionManifest:
 
 def prepare_workspace_text_write(
     workspace: Path, relative_path: str, content: str, expected_hash: str | None,
-    path_service: WorkspacePathPort,
+    path_service: WorkspacePathPort, *, roots: tuple[Path, ...] = (),
 ) -> PreparedWorkspaceMutation:
     if not isinstance(content, str):
         raise TypeError("workspace text content must be a string")
     return prepare_workspace_bytes_write(
         workspace, relative_path, content.encode("utf-8"), expected_hash,
-        path_service,
+        path_service, roots=roots,
     )
 
 
 def prepare_workspace_bytes_write(
     workspace: Path, relative_path: str, content: bytes,
     expected_hash: str | None, path_service: WorkspacePathPort, *,
-    result_mode: int | None = None,
+    result_mode: int | None = None, roots: tuple[Path, ...] = (),
 ) -> PreparedWorkspaceMutation:
     if not isinstance(content, bytes):
         raise TypeError("workspace content must be bytes")
@@ -394,7 +398,7 @@ def prepare_workspace_bytes_write(
         if expected_hash is None else path_service.resolve_mutation_path
     )
     root, path, normalized = _resolve_mutation_path(
-        workspace, relative_path, path_service, resolver=resolver
+        workspace, relative_path, path_service, resolver=resolver, roots=roots
     )
     if path.is_symlink():
         raise PermissionError("workspace mutation cannot replace a symlink")
@@ -427,12 +431,12 @@ def prepare_workspace_bytes_write(
 
 def prepare_workspace_file_delete(
     workspace: Path, relative_path: str, expected_hash: str,
-    path_service: WorkspacePathPort,
+    path_service: WorkspacePathPort, *, roots: tuple[Path, ...] = (),
 ) -> PreparedWorkspaceDeletion:
     if not isinstance(expected_hash, str) or not expected_hash:
         raise ValueError("workspace deletion requires a non-empty expected hash")
     _root, path, normalized = _resolve_mutation_path(
-        workspace, relative_path, path_service
+        workspace, relative_path, path_service, roots=roots
     )
     if path.is_symlink():
         raise PermissionError("workspace mutation cannot delete a symlink")
@@ -839,18 +843,22 @@ def file_sha256(path: Path) -> str | None:
 
 def workspace_mutation_lock_key(
     workspace: Path, relative_path: str, path_service: WorkspacePathPort,
+    *, roots: tuple[Path, ...] = (),
 ) -> str:
     """Return one canonical lock key for a workspace mutation target."""
 
     # Lock identity must also exist before a CREATE's parents do. The create
     # resolver provides a stable lexical identity while enforcing containment
     # and link checks; the later prepare step still selects create vs modify.
-    _root, _path, _normalized = _resolve_mutation_path(
+    _resolve_mutation_path(
         workspace, relative_path, path_service,
-        resolver=path_service.resolve_create_path,
+        resolver=path_service.resolve_create_path, roots=roots,
+    )
+    target_root, root_relative = _resolve_root_selection(
+        workspace, roots, relative_path, path_service
     )
     return path_service.resolve_create_path(
-        workspace, os.path.normpath(relative_path)
+        target_root, os.path.normpath(root_relative)
     ).canonical_key
 
 
@@ -867,21 +875,37 @@ def workspace_mutation_lock_file(
     return directory / f"{digest}.lock"
 
 
+def _resolve_root_selection(
+    workspace: Path, roots: tuple[Path, ...], relative_path: str,
+    path_service: WorkspacePathPort,
+) -> tuple[Path, str]:
+    """Pick the root owning ``relative_path`` and return it root-relative."""
+    from .workspace_roots import select_root_for_path
+
+    return select_root_for_path(
+        (workspace, *roots) if roots else (workspace,),
+        relative_path, path_service,
+    )
+
+
 def _resolve_mutation_path(
     workspace: Path, relative_path: str, path_service: WorkspacePathPort,
-    *, resolver=None,
+    *, resolver=None, roots: tuple[Path, ...] = (),
 ) -> tuple[Path, Path, str]:
     if not relative_path or "\x00" in relative_path:
         raise ValueError("workspace path must not be empty or contain NUL")
-    candidate = Path(relative_path)
-    lexical = Path(os.path.normpath(relative_path))
+    target_root, root_relative = _resolve_root_selection(
+        workspace, roots, relative_path, path_service
+    )
+    candidate = Path(root_relative)
+    lexical = Path(os.path.normpath(root_relative))
     if (
         _is_sensitive(candidate) or _is_sensitive(lexical)
         or (lexical.parts and lexical.parts[0] in {".git", ".agent"})
     ):
         raise PermissionError("sensitive or runtime paths cannot be mutated")
     resolved = (resolver or path_service.resolve_mutation_path)(
-        workspace, lexical.as_posix()
+        target_root, lexical.as_posix()
     )
     normalized = Path(resolved.relative_path)
     if (

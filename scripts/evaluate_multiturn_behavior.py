@@ -18,14 +18,18 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 from uuid import uuid4
 
 from scripts.evaluate_execution_plan_behavior import _file_hash, _tool_names, MUTATION_TOOLS
+from scripts.export_langfuse_evaluation import LangfuseExporter, LangfuseExportError
 from tsm_agt.adapters.openai_compatible.request_diagnostics import TurnRequestDiagnostics
 from tsm_agt.bootstrap import compose_openai_compatible_engineering_application_from_config
+from tsm_agt.core.verification_command import is_verification_request
 from tsm_agt.sdk.runtime import EngineeringAgentClient
 from tsm_agt.ports import ModelCallPurpose, ModelStreamCompleted, ToolCallBlock
+from tsm_agt.ports.process import process_result_succeeded
 
 
 def observe_model_exchanges(provider, observations: list):
@@ -39,7 +43,7 @@ def observe_model_exchanges(provider, observations: list):
     original_stream = getattr(provider, "stream_complete", None)
     seen = set()
 
-    def record(request, response):
+    def record(request, response, started):
         if request.purpose is not ModelCallPurpose.AGENT_TURN:
             return
         identity = (request.turn_id, response.message.message_id)
@@ -48,6 +52,7 @@ def observe_model_exchanges(provider, observations: list):
         seen.add(identity)
         observations.append({
             "turn_id": request.turn_id, "finish_reason": response.finish_reason.value,
+            "started_at_unix_nano": started, "finished_at_unix_nano": time.time_ns(),
             "usage": response.usage.to_data(),
             "advertised_tools": [tool.name for tool in request.tools],
             "allow_tool_calls": request.allow_tool_calls,
@@ -59,14 +64,16 @@ def observe_model_exchanges(provider, observations: list):
         })
 
     async def complete(request):
+        started = time.time_ns()
         response = await original_complete(request)
-        record(request, response)
+        record(request, response, started)
         return response
 
     async def stream(request):
+        started = time.time_ns()
         async for item in original_stream(request):
             if isinstance(item, ModelStreamCompleted):
-                record(request, item.response)
+                record(request, item.response, started)
             yield item
 
     provider.complete = complete
@@ -178,8 +185,16 @@ def check_files(root: Path, turn: dict, before: dict) -> dict:
 
 
 def tool_result_facts(events) -> list[dict]:
+    requested = {}
+    started = {}
     facts = []
     for event in events:
+        if event.event_type in {"tool.requested", "tool.started"}:
+            call = event.payload["call"]
+            requested[call["call_id"]] = call["name"]
+            if event.event_type == "tool.started":
+                started[call["call_id"]] = int(event.occurred_at.timestamp() * 1_000_000_000)
+            continue
         if event.event_type not in {"tool.completed", "tool.failed"}:
             continue
         result = event.payload.get("result")
@@ -187,11 +202,44 @@ def tool_result_facts(events) -> list[dict]:
             continue
         fact = {name: result.get(name) for name in ("call_id", "ok", "error_code")}
         fact["commit_state"] = event.payload.get("commit_state")
+        call_id = result["call_id"]
+        if call_id in requested:
+            fact["tool"] = requested[call_id]
+        if getattr(event, "occurred_at", None) is not None:
+            finished = int(event.occurred_at.timestamp() * 1_000_000_000)
+            fact["started_at_unix_nano"] = started.get(call_id, finished)
+            fact["finished_at_unix_nano"] = finished
         data = result.get("data")
         if isinstance(data, dict):
             fact.update({name: data[name] for name in ("succeeded", "exit_code", "execution_state") if name in data})
         facts.append(fact)
     return facts
+
+
+def verified_after_last_edit(events) -> bool:
+    requests = {}
+    last_edit = None
+    verified = False
+    for event in events:
+        if event.event_type == "tool.requested":
+            call = event.payload["call"]
+            requests[call["call_id"]] = (event.sequence, call)
+        elif event.event_type == "tool.completed":
+            result = event.payload["result"]
+            if result["call_id"] not in requests or not result.get("ok"):
+                continue
+            started, call = requests[result["call_id"]]
+            if call["name"] in MUTATION_TOOLS:
+                last_edit = event.sequence
+                verified = False
+            elif (
+                last_edit is not None and started > last_edit
+                and call["name"] == "core.run_command"
+                and is_verification_request(call["arguments"])
+                and process_result_succeeded(result.get("data") or {})
+            ):
+                verified = True
+    return verified
 
 
 def model_tool_proposals(events) -> list[dict]:
@@ -222,6 +270,7 @@ sys.exit(not unittest.TextTestRunner().run(suite).wasSuccessful())
 
 
 async def run_trial(args, fixture: dict, index: int) -> dict:
+    trial_started = time.time_ns()
     with tempfile.TemporaryDirectory(prefix="tsm-multiturn-eval-") as directory:
         root = Path(directory).resolve()
         materialize_workspace(root, fixture, getattr(args, "snapshot_repo", Path.cwd()), args.timeout)
@@ -245,6 +294,7 @@ async def run_trial(args, fixture: dict, index: int) -> dict:
         reports = []
         try:
             for number, turn in enumerate(fixture["turns"], 1):
+                turn_started = time.time_ns()
                 before = file_state(root)
                 exchange_offset = len(exchanges)
                 # Track event offsets per Task: a Conversation reuses its Task.
@@ -266,6 +316,8 @@ async def run_trial(args, fixture: dict, index: int) -> dict:
                     # The SDK can expose the previous answer during an approval wait.
                     answer = result.assistant_text if completed_turn else None
                     checks = check_files(root, turn, before)
+                    if turn.get("require_agent_verification"):
+                        checks["agent_verified_after_last_edit"] = verified_after_last_edit(current)
                     for phrase_index, phrase in enumerate(turn.get("answer_contains", ()), start=1):
                         checks[f"answer_contains:{phrase_index}"] = phrase in (answer or "")
                     checks.update({f"fixture_preserved:{name}": _file_hash(root, name) == digest
@@ -282,6 +334,7 @@ async def run_trial(args, fixture: dict, index: int) -> dict:
                     after = file_state(root)
                     report = {
                         "turn": number, "task_id": task_id, "state": result.state,
+                        "started_at_unix_nano": turn_started, "finished_at_unix_nano": time.time_ns(),
                         "last_event_sequence": max((event.sequence for event in events), default=0),
                         "tool_names": calls,
                         "model_tool_proposals": [
@@ -339,6 +392,7 @@ async def run_trial(args, fixture: dict, index: int) -> dict:
                 for item in reports
             )
             return {"case": args.fixture.stem, "trial": index, "label": args.label,
+                    "started_at_unix_nano": trial_started, "finished_at_unix_nano": time.time_ns(),
                     "case_passed": case_passed, "snapshot_commit": fixture.get("snapshot_commit"),
                     "history_format": args.history_format,
                     "context_policy": app.kernel.dependencies.context_manager.snapshot_data(),
@@ -370,6 +424,8 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--allow-model-calls", action="store_true")
     parser.add_argument("--run-tests", action="store_true", help="explicitly allow executing fixture/model-authored tests")
+    parser.add_argument("--langfuse", action="store_true", help="export evaluation traces and scores to Langfuse")
+    parser.add_argument("--langfuse-config", type=Path, help="Langfuse YAML file (default: ~/.tsm-agt/langfuse.yaml)")
     parser.add_argument("--capture-requests", action="store_true")
     parser.add_argument("--acknowledge-sensitive-data", action="store_true")
     args = parser.parse_args()
@@ -377,6 +433,8 @@ def main() -> int:
         parser.error("real model calls require --allow-model-calls (may incur provider charges)")
     if args.capture_requests and not args.acknowledge_sensitive_data:
         parser.error("capturing request bodies requires --acknowledge-sensitive-data")
+    if args.langfuse_config is not None and not args.langfuse:
+        parser.error("--langfuse-config requires --langfuse")
     if args.repeat < 1 or args.timeout <= 0:
         parser.error("repeat and timeout must be positive")
     if args.history_soft_tokens is not None and args.history_soft_tokens < 0:
@@ -386,15 +444,22 @@ def main() -> int:
     fixtures = [(path, load_fixture(path)) for path in args.fixture]
     if len({path.stem for path, _ in fixtures}) != len(fixtures):
         parser.error("fixture filenames must have distinct stems")
+    try:
+        exporter = LangfuseExporter.from_config(args.langfuse_config) if args.langfuse else None
+    except LangfuseExportError as error:
+        parser.error(str(error))
 
     async def run(output):
         failed = False
+        reports_to_export = []
         for path, fixture in fixtures:
             case_args = argparse.Namespace(**{**vars(args), "fixture": path})
             passed = 0
             for index in range(1, args.repeat + 1):
                 report = await run_trial(case_args, fixture, index)
                 print(json.dumps(report, ensure_ascii=False, sort_keys=True), file=output, flush=True)
+                if exporter is not None:
+                    reports_to_export.append(report)
                 if args.report_path:
                     print(json.dumps({
                         "case": path.stem, "trial": index, "label": args.label,
@@ -407,6 +472,14 @@ def main() -> int:
                 passed += report["case_passed"]
             print(f"{path.stem}: {passed}/{args.repeat} passed", file=sys.stderr, flush=True)
             failed |= passed != args.repeat
+        if exporter is not None:
+            try:
+                links = await asyncio.to_thread(exporter.export, reports_to_export)
+            except LangfuseExportError as error:
+                print(f"Langfuse export failed: {error}", file=sys.stderr)
+                return 2
+            for link in links:
+                print(f"Langfuse {link}", file=sys.stderr)
         return int(failed)
     if args.report_path:
         with args.report_path.open("x", encoding="utf-8") as output:

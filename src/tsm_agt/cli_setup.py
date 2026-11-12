@@ -334,6 +334,7 @@ async def _probe_model(configuration: ModelConfiguration) -> None:
             model_timeout_seconds=configuration.timeout_seconds,
             model_max_retries=configuration.max_retries,
             model_retry_backoff_seconds=configuration.retry_backoff_seconds,
+            model_network_wait_seconds=0,
             model_output_token_parameter=(
                 configuration.effective_output_token_parameter
             ),

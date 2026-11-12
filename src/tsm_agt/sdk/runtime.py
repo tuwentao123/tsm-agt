@@ -346,6 +346,7 @@ class EngineeringAgentClient:
         workspace: Path | None = None,
         original_user_text: str | None = None,
         context_handoff: Mapping[str, Any] | None = None,
+        workspace_roots: tuple[str, ...] = (),
     ) -> TaskSnapshot:
         """Create one Task, optionally in a workspace other than the client's.
 
@@ -362,6 +363,7 @@ class EngineeringAgentClient:
             task_relation=task_relation,
             original_user_text=original_user_text,
             context_handoff=context_handoff,
+            workspace_roots=workspace_roots,
         )
 
     async def submit_task(
@@ -372,6 +374,7 @@ class EngineeringAgentClient:
         workspace: Path | None = None,
         original_user_text: str | None = None,
         context_handoff: Mapping[str, Any] | None = None,
+        workspace_roots: tuple[str, ...] = (),
     ) -> RuntimeTaskResult:
         async with self._submit_lock:
             task = await self.create_task(
@@ -379,6 +382,7 @@ class EngineeringAgentClient:
                 source_task_id=source_task_id, task_relation=task_relation,
                 workspace=workspace, original_user_text=original_user_text,
                 context_handoff=context_handoff,
+                workspace_roots=workspace_roots,
             )
             current = await self.application.kernel.get_task(task.task_id)
             if (

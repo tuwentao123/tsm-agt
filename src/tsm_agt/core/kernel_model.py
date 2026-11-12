@@ -396,6 +396,8 @@ class ModelMixin:
             "attempt_completed": "model.attempt_completed",
             "attempt_failed": "model.attempt_failed",
             "recovery_decided": "model.recovery_decided",
+            "network_waiting": "model.network_waiting",
+            "network_recovered": "model.network_recovered",
         }
         for update in updates:
             event_type = names.get(update.kind)
@@ -412,6 +414,7 @@ class ModelMixin:
                 "recovery_action": update.recovery_action,
                 "reason_code": update.reason,
                 "delay_seconds": update.delay_seconds,
+                "waited_seconds": update.waited_seconds,
                 "visible_output_emitted": update.visible_output_emitted,
                 "response_committed": update.response_committed,
                 "transport_mode": update.transport_mode,

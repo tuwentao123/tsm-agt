@@ -155,8 +155,12 @@ class _RecordingClient:
 
     async def submit_task(
         self, goal, *, command_id, session_id=None, images=(), workspace=None,
+        workspace_roots=(),
     ):
-        self.task_calls.append({"goal": goal, "workspace": workspace})
+        self.task_calls.append({
+            "goal": goal, "workspace": workspace,
+            "workspace_roots": workspace_roots,
+        })
         return type("_Result", (), {"to_data": lambda self: {"task_id": "t-1"}})()
 
 

@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import aclosing
 from collections.abc import Mapping
+
+from tsm_agt.core.tool_result_governor import sanitize_historical_error_text
 
 
 def installation_records(client, task_id: str, session_id: str | None) -> list[dict]:
@@ -148,7 +151,10 @@ async def subscribe_task_ui(client, task_id: str, *, after: int = 0, heartbeat: 
         changed = signal.changed
         snapshot = await ui_snapshot(client, task_id)
         task = await client.application.kernel.get_task(task_id)
-        names = {item.call.call_id: item.call.name for item in task.tool_executions.values()}
+        tool_calls = {
+            (item.turn_id, item.call.call_id): _progress_tool_call(item.call.name, item.call.arguments)
+            for item in task.tool_executions.values()
+        }
         approval_turns = {item.approval_request_id: item.turn_id for item in task.tool_executions.values() if item.approval_request_id}
         if cursor > snapshot["cursor"]:
             yield {"type": "stream.reset_required", "task_id": task_id, "sequence": 0}
@@ -165,16 +171,14 @@ async def subscribe_task_ui(client, task_id: str, *, after: int = 0, heartbeat: 
                 events = await store.read_events(task_id, cursor, limit=500)
                 for event in events:
                     cursor = event.sequence
-                    if event.event_type == "tool.requested":
-                        call = event.payload.get("call") or {}
-                        names[call.get("call_id")] = call.get("name")
                     if event.event_type == "approval.requested":
                         request = event.payload.get("request") or {}
                         approval_turns[request.get("request_id") or event.payload.get("request_id")] = event.turn_id or event.payload.get("turn_id")
-                    progress = _turn_progress_item(event, fallback_turn_id=approval_turns.get(event.payload.get("request_id")))
+                    progress = _turn_progress_item(
+                        event, fallback_turn_id=approval_turns.get(event.payload.get("request_id")),
+                        tool_calls=tool_calls,
+                    )
                     if progress:
-                        if progress["kind"] == "tool_completed":
-                            progress["tool_name"] = names.get(progress.get("tool_call_id"), "")
                         visible = True
                         yield {"schema_version": 1, "type": event.event_type, "task_id": task_id,
                                "session_id": event.session_id or snapshot["session_id"], "turn_id": event.turn_id or progress.get("turn_id"),
@@ -236,6 +240,8 @@ _TURN_PROGRESS_EVENT_TYPES = (
     "model.attempt_started",
     "model.attempt_failed",
     "model.recovery_decided",
+    "model.network_waiting",
+    "model.network_recovered",
     "conversation.model_response_recorded",
     "conversation.commentary",
     "context.summary_started",
@@ -268,11 +274,111 @@ _TURN_PROGRESS_TARGET_KEYS = (
     "path", "query", "pattern", "target", "file_glob", "url",
 )
 
-#: Bound for any single string copied into a progress line.
+#: Bounds for short labels and per-stream command excerpts.
 _TURN_PROGRESS_TEXT_LIMIT = 200
+_COMMAND_OUTPUT_PREVIEW_LIMIT = 400
+#: The card shows the call's own arguments, so they may be longer than a label.
+_TOOL_ARGUMENTS_TEXT_LIMIT = 1200
 
 
-def _turn_progress_item(event, *, fallback_turn_id: str | None = None) -> dict | None:
+def _progress_tool_call(name: str, arguments: Mapping) -> tuple[str, bool]:
+    argv = arguments.get("argv")
+    is_grep = (
+        name == "core.run_command" and isinstance(argv, (list, tuple)) and bool(argv)
+        and argv[0] in ("grep", "/usr/bin/grep", "/bin/grep")
+    )
+    return name, is_grep
+
+
+def _command_failure(result: Mapping, *, is_grep: bool) -> dict:
+    data = result.get("data")
+    if not isinstance(data, Mapping) or data.get("succeeded") is not False:
+        return {}
+    details: dict = {}
+    exit_code = data.get("exit_code")
+    if type(exit_code) is int:
+        details["exit_code"] = exit_code
+
+    empty_streams = 0
+    for name in ("stderr", "stdout"):
+        stream = data.get(name)
+        if not isinstance(stream, Mapping) or not isinstance(text := stream.get("text"), str):
+            continue
+        incomplete = bool(stream.get("truncated") or stream.get("has_more"))
+        if not text and not incomplete and stream.get("total_bytes", 0) == 0:
+            empty_streams += 1
+        text = sanitize_historical_error_text(text).strip()
+        if text:
+            clipped = len(text) > _COMMAND_OUTPUT_PREVIEW_LIMIT
+            details[name] = (
+                ("…" if clipped else "") + text[-_COMMAND_OUTPUT_PREVIEW_LIMIT:]
+                + ("…" if incomplete else "")
+            )
+
+    if empty_streams == 2 and data.get("output_observed") is not False:
+        details["output_empty"] = True
+        if is_grep and exit_code == 1 and result.get("error_code") == "PROCESS_EXIT_NON_ZERO":
+            details["no_match"] = True
+    return details
+
+
+def _arguments_preview(arguments: Mapping) -> str:
+    """Return the call arguments as bounded pretty JSON for the UI card."""
+
+    if not arguments:
+        return ""
+    try:
+        text = json.dumps(dict(arguments), ensure_ascii=False, indent=2, default=str)
+    except (TypeError, ValueError):
+        text = str(arguments)
+    return text[:_TOOL_ARGUMENTS_TEXT_LIMIT]
+
+
+def _command_text(name: str, arguments: Mapping) -> str:
+    """Return the executed command line so the card can name what ran.
+
+    Durable progress has no ``operation_presentation``: without this the card
+    would only say which tool was called, never which command.
+    """
+
+    argv = arguments.get("argv")
+    if name != "core.run_command" or not isinstance(argv, (list, tuple)) or not argv:
+        return ""
+    return " ".join(str(part) for part in argv if str(part).strip())[:_TURN_PROGRESS_TEXT_LIMIT]
+
+
+def _command_output(result: Mapping) -> dict:
+    """Return bounded stdout/stderr excerpts and the exit code of a command.
+
+    Applied to successful runs too: the execution card shows what the command
+    actually printed, not only why it failed.
+    """
+
+    data = result.get("data")
+    if not isinstance(data, Mapping):
+        return {}
+    details: dict = {}
+    for name in ("stdout", "stderr"):
+        stream = data.get(name)
+        if not isinstance(stream, Mapping) or not isinstance(stream.get("text"), str):
+            continue
+        text = sanitize_historical_error_text(stream["text"]).strip()
+        if not text:
+            continue
+        incomplete = bool(stream.get("truncated") or stream.get("has_more"))
+        clipped = len(text) > _COMMAND_OUTPUT_PREVIEW_LIMIT
+        excerpt = text[-_COMMAND_OUTPUT_PREVIEW_LIMIT:]
+        details[name] = ("…" if clipped else "") + excerpt + ("…" if incomplete else "")
+    exit_code = data.get("exit_code")
+    if type(exit_code) is int:
+        details["exit_code"] = exit_code
+    return details
+
+
+def _turn_progress_item(
+    event, *, fallback_turn_id: str | None = None,
+    tool_calls: dict[tuple[str, str], tuple[str, bool]] | None = None,
+) -> dict | None:
     """Normalize one durable event into a Turn progress item.
 
     The shapes mirror the live ``AgentProgress`` items the page already renders,
@@ -311,11 +417,14 @@ def _turn_progress_item(event, *, fallback_turn_id: str | None = None) -> dict |
             "visible_tool_count": len(payload.get("visible_tools") or ()),
         }
     if kind in {"model.attempt_started", "model.attempt_failed",
-                "model.recovery_decided"}:
+                "model.recovery_decided", "model.network_waiting",
+                "model.network_recovered"}:
         event_kind = {
             "model.attempt_started": "attempt_started",
             "model.attempt_failed": "attempt_failed",
             "model.recovery_decided": "recovery_decided",
+            "model.network_waiting": "network_waiting",
+            "model.network_recovered": "network_recovered",
         }[kind]
         return {
             **base, "kind": "model_transport",
@@ -327,6 +436,7 @@ def _turn_progress_item(event, *, fallback_turn_id: str | None = None) -> dict |
             "diagnostic_detail": _bounded_text(payload.get("diagnostic_detail")),
             "recovery_action": payload.get("recovery_action"),
             "retry_delay_seconds": payload.get("delay_seconds"),
+            "waited_seconds": payload.get("waited_seconds"),
         }
     if kind == "conversation.model_response_recorded":
         return {
@@ -351,6 +461,10 @@ def _turn_progress_item(event, *, fallback_turn_id: str | None = None) -> dict |
         call = call if isinstance(call, Mapping) else {}
         arguments = call.get("arguments")
         arguments = arguments if isinstance(arguments, Mapping) else {}
+        name = str(call.get("name") or "")
+        call_id = str(call.get("call_id") or "")
+        if tool_calls is not None and call_id:
+            tool_calls[turn_id, call_id] = _progress_tool_call(name, arguments)
         target = next(
             (
                 str(arguments[key]).strip()
@@ -362,20 +476,45 @@ def _turn_progress_item(event, *, fallback_turn_id: str | None = None) -> dict |
         )
         return {
             **base, "kind": "tool_started",
-            "tool_name": str(call.get("name") or ""),
-            "tool_call_id": str(call.get("call_id") or ""),
+            "tool_name": name,
+            "tool_call_id": call_id,
             "target": target[:_TURN_PROGRESS_TEXT_LIMIT],
+            "arguments_text": _arguments_preview(arguments),
+            "command": _command_text(name, arguments),
         }
     if kind in {"tool.completed", "tool.failed"}:
         result = payload.get("result")
         result = result if isinstance(result, Mapping) else {}
-        return {
+        call_id = str(result.get("call_id") or "")
+        name, is_grep = tool_calls.get((turn_id, call_id), ("", False)) if tool_calls is not None else ("", False)
+        progress = {
             **base, "kind": "tool_completed",
-            "tool_call_id": str(result.get("call_id") or ""),
+            "tool_call_id": call_id,
             "ok": bool(result.get("ok")),
             "error_code": result.get("error_code"),
             "detail": _bounded_text(result.get("message")) if not result.get("ok") else None,
         }
+        if name:
+            progress["tool_name"] = name
+        fact = result.get("fact_descriptor") or payload.get("fact_descriptor")
+        is_command = name == "core.run_command" or (
+            isinstance(fact, Mapping) and fact.get("authority") == "managed_process"
+        )
+        if is_command:
+            output = _command_output(result)
+            if output.get("stdout") or output.get("stderr"):
+                progress["output"] = {
+                    key: value for key, value in output.items() if key != "exit_code"
+                }
+            if type(output.get("exit_code")) is int:
+                progress["exit_code"] = output["exit_code"]
+            if not progress["ok"]:
+                command_failure = _command_failure(result, is_grep=is_grep)
+                if command_failure:
+                    progress["command_failure"] = command_failure
+                    if progress["detail"] == "command reached a terminal non-success outcome":
+                        progress["detail"] = None
+        return progress
     if kind == "clarification.requested":
         reconciling = payload.get("kind") == "OUTCOME_RECONCILIATION"
         return {

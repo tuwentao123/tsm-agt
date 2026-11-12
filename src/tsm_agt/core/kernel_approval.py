@@ -32,6 +32,7 @@ from tsm_agt.ports import (
     RuntimeEvent, RuntimeUnitOfWork, ToolResult, is_sensitive_read_path
 )
 from uuid import uuid4
+from .workspace_roots import select_root_for_path
 from .agent_loop import (
     AgentClarificationSuspended, AgentTurnCheckpoint, AgentTurnResult,
     AgentTurnSuspended
@@ -90,10 +91,13 @@ class ApprovalMixin:
         workspace = self._dependencies.workspace_path.normalize_workspace(
             Path(task.workspace)
         )
-        approved_roots = tuple(
-            Path(grant.canonical_root)
-            for grant in task.workspace_access_grants
-            if grant.capability is WorkspaceAccessCapability.READ
+        approved_roots = (
+            *task.all_workspace_roots()[1:],
+            *(
+                Path(grant.canonical_root)
+                for grant in task.workspace_access_grants
+                if grant.capability is WorkspaceAccessCapability.READ
+            ),
         )
         try:
             self._dependencies.workspace_path.resolve_read_path(
@@ -125,7 +129,14 @@ class ApprovalMixin:
             # directories beneath the workspace.  ``resolve_mutation_path``
             # is for an already-existing parent and would misclassify that
             # normal create as an external write.
-            self._dependencies.workspace_path.resolve_create_path(workspace, raw_path)
+            #
+            # The root is selected first so an attached root behaves exactly
+            # like the primary one and never re-asks for approval.
+            root, root_relative = select_root_for_path(
+                task.all_workspace_roots(), raw_path,
+                self._dependencies.workspace_path,
+            )
+            self._dependencies.workspace_path.resolve_create_path(root, root_relative)
             return None
         except (PermissionError, ValueError):
             return Path(raw_path).expanduser().resolve(strict=False).parent

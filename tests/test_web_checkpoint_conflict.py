@@ -126,8 +126,13 @@ applyState({state: 'CONFLICT', phase1_state: 'INTERRUPTED', status: 'interrupted
             {"kind": "turn_conflict", "detail": "policy_hash changed"},
             {"kind": "approval_invalidated", "request_id": "a"},
         ]
-        script = javascript_function("turnProgressLines") + (
-            "\nprocess.stdout.write(JSON.stringify(turnProgressLines(" + json.dumps(items) + ")));"
+        script = (
+            # turnProgressLines 先把同一 call 的 started/completed 合成一条。
+            javascript_function("mergeToolProgress")
+            + javascript_function("mergeDurableToolItems")
+            + javascript_function("turnProgressLines")
+            + "\nprocess.stdout.write(JSON.stringify(turnProgressLines("
+            + json.dumps(items) + ")));"
         )
         completed = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True)
         lines = json.loads(completed.stdout)

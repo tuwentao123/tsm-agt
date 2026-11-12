@@ -5,6 +5,7 @@ import unittest
 from collections.abc import Mapping
 from typing import Any
 
+from tsm_agt.adapters.builtin.core_tools import CoreReadOnlyToolProvider
 from tsm_agt.adapters.openai_compatible import (
     OpenAICompatibleModelProvider,
     OpenAICompatibleProviderError,
@@ -437,6 +438,23 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("strict", function)
         self.assertFalse(provider.capabilities.strict_json_schema)
         self.assertNotIn("strict-json-schema", provider.descriptor.capabilities)
+
+    async def test_read_file_schema_is_compatible_without_weakening_local_validation(self):
+        from tsm_agt.core.tool import InvalidToolArguments, validate_tool_arguments
+
+        tools = await CoreReadOnlyToolProvider().list_tools()
+        read_file = next(tool for tool in tools if tool.name == "core.read_file")
+        function = OpenAICompatibleModelProvider._tool_to_provider(
+            read_file, "core__read_file", strict_tool_schema=False,
+        )["function"]
+
+        self.assertNotIn("oneOf", function["parameters"])
+        self.assertTrue({"path", "resource_ref"} <= function["parameters"]["properties"].keys())
+        for args in ({}, {"path": "README.md", "resource_ref": "resource-1"}):
+            with self.subTest(args=args), self.assertRaises(InvalidToolArguments):
+                validate_tool_arguments(read_file, args)
+        validate_tool_arguments(read_file, {"path": "README.md"})
+        validate_tool_arguments(read_file, {"resource_ref": "resource-1"})
 
     async def test_stream_classifies_transient_failure_without_retrying(self):
         transport = AttemptStreamingTransport([

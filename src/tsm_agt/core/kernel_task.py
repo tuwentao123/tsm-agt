@@ -663,6 +663,7 @@ class TaskMixin:
         task_relation: SessionTaskRelation = SessionTaskRelation.INDEPENDENT,
         original_user_text: str | None = None,
         context_handoff: Mapping[str, Any] | None = None,
+        workspace_roots: tuple[str, ...] = (),
     ) -> TaskSnapshot:
         """Create one Task and attach it to its Session.
 
@@ -808,6 +809,7 @@ class TaskMixin:
             workspace=str(resolved_workspace),
             session_id=session_identity,
             task_kind=task_kind,
+            workspace_roots=workspace_roots,
         ).with_project_trust(
             trust.level, trust.fingerprint, trust.subject
         ).with_workspace_baseline(baseline)

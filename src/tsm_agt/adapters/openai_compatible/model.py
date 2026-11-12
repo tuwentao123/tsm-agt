@@ -824,6 +824,10 @@ class OpenAICompatibleModelProvider:
         outcome_refs: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         parameters = dict(tool.parameters)
+        if tool.name == "core.read_file":
+            # OpenAI-compatible gateways reject a top-level oneOf. The runtime
+            # still checks the original schema, and the properties explain the choice.
+            parameters.pop("oneOf", None)
         description = tool.model_description()
         if outcome_refs:
             properties = dict(parameters.get("properties", {}))

@@ -496,13 +496,14 @@ class ConversationAgentLoop:
                         ),
                         on_text_event=text_stream.delta,
                     )
+                    elapsed_seconds = time.monotonic() - state.model_started_at
                     kernel._notify_agent_progress(state.on_progress, AgentProgress(
                         AgentProgressKind.MODEL_COMPLETED,
                         model_call=state.model_call_number,
                         max_model_calls=state.checkpoint.max_model_calls,
                         tool_call=state.tool_call_count,
                         max_tool_calls=state.checkpoint.max_tool_calls,
-                        elapsed_seconds=time.monotonic() - state.model_started_at,
+                        elapsed_seconds=elapsed_seconds,
                         goal=(await kernel.get_task(state.task_id)).goal,
                     ))
                     parsed_calls = kernel._validate_agent_response(
@@ -597,7 +598,8 @@ class ConversationAgentLoop:
                     output_tokens=state.output_tokens,
                 )
                 await self._finalizer.record_model_response(
-                    state, response, len(parsed_calls)
+                    state, response, len(parsed_calls),
+                    elapsed_seconds=elapsed_seconds,
                 )
                 if parsed_calls:
                     commentary = "\n".join(

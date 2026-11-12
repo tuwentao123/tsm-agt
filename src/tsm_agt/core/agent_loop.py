@@ -106,6 +106,8 @@ class AgentProgress:
     transport_attempt: int = 0
     max_transport_attempts: int = 0
     retry_delay_seconds: float = 0.0
+    #: Seconds this round already spent waiting for the network to recover.
+    waited_seconds: float = 0.0
     transport_mode: str = ""
     transport_event: str = ""
     diagnostic_code: str = ""
@@ -176,6 +178,7 @@ class AgentProgress:
             "transport_attempt": self.transport_attempt,
             "max_transport_attempts": self.max_transport_attempts,
             "retry_delay_seconds": self.retry_delay_seconds,
+            "waited_seconds": self.waited_seconds,
             "transport_mode": self.transport_mode,
             "transport_event": self.transport_event,
             "diagnostic_code": self.diagnostic_code,
@@ -838,6 +841,7 @@ async def record_model_transport_progress(
         ModelRecoveryAction.RESAMPLE.value,
         ModelRecoveryAction.RESAMPLE_WITH_CORRECTION.value,
         ModelRecoveryAction.FALLBACK_TRANSPORT.value,
+        ModelRecoveryAction.WAIT_FOR_NETWORK.value,
     }
     is_retry = (
         update.kind == "recovery_decided"
@@ -858,6 +862,7 @@ async def record_model_transport_progress(
         transport_attempt=update.attempt,
         max_transport_attempts=update.max_attempts,
         retry_delay_seconds=update.delay_seconds,
+        waited_seconds=update.waited_seconds,
         transport_mode=update.transport_mode,
         transport_event=update.kind,
         diagnostic_code=update.diagnostic_code,

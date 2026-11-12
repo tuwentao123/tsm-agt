@@ -6,6 +6,27 @@ const page = fs.readFileSync(process.env.TSM_SKILL_TEST_SCRIPT, 'utf8');
 const constants = page.slice(page.indexOf('const TERMINAL_STATES ='), page.indexOf('function appendTaskAssistantText'));
 const follower = page.slice(page.indexOf('function followTask(taskId, conversationId)'), page.indexOf('async function loadSessions()'));
 
+test('live and restored progress explain nonzero commands with their actual output', () => {
+  const context = vm.createContext({});
+  vm.runInContext(
+    page.slice(page.indexOf('function toolFailureDescription('), page.indexOf('function describeProgress('))
+    + page.slice(page.indexOf('const TOOL_CARD_NEWLINE'), page.indexOf('// Live view of the Turn that is running:'))
+    + page.slice(page.indexOf('function turnProgressLines('), page.indexOf('function renderTurnCallPanel(')),
+    context,
+  );
+  const failure = {
+    kind: 'tool_completed', tool_name: 'core.run_command', ok: false,
+    error_code: 'PROCESS_EXIT_NON_ZERO',
+    command_failure: {exit_code: 2, stderr: 'grep: missing.kt: No such file or directory', stdout: 'partial matches'},
+  };
+  assert.match(context.toolFailureDescription(failure), /退出码 2 · stderr：grep: missing\.kt: No such file or directory · stdout：partial matches/);
+  const [restored] = context.turnProgressLines([failure]);
+  assert.equal(restored.text, 'core.run_command ' + context.toolFailureDescription(failure));
+  assert.match(context.toolFailureDescription({
+    ...failure, command_failure: {exit_code: 1, output_empty: true, no_match: true},
+  }), /退出码 1 · 未找到匹配$/);
+});
+
 function setup({realFinal = false, realAnswers = false} = {}) {
   const streams = [], timers = [], requests = [], finishes = [], histories = [], answers = [], frames = [];
   const cards = new Map();

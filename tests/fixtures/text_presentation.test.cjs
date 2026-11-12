@@ -9,7 +9,9 @@ test('unknown tool outcomes show timeout and observation guidance without claimi
   const context = vm.createContext({});
   const descriptions = page.slice(page.indexOf('function describeFailure('), page.indexOf('async function handleCancelAction('));
   const replay = page.slice(page.indexOf('function turnProgressLines('), page.indexOf('function renderTurnCallPanel('));
-  vm.runInContext(descriptions + replay, context);
+  // The replay attaches a collapsible card to each tool line.
+  const cards = page.slice(page.indexOf('const TOOL_CARD_NEWLINE'), page.indexOf('// Live view of the Turn that is running:'));
+  vm.runInContext(descriptions + cards + replay, context);
   const failure = {kind: 'tool_completed', tool_name: 'core.run_command', tool_call_id: 'push',
     ok: false, error_code: 'UNKNOWN_OUTCOME', detail: 'tool exceeded 62 second deadline'};
   const live = context.describeProgress(failure);
@@ -23,9 +25,11 @@ test('unknown tool outcomes show timeout and observation guidance without claimi
   const lines = context.turnProgressLines([
     {kind: 'tool_started', tool_name: 'core.run_command', tool_call_id: 'push'}, failure, waiting,
   ]);
-  assert.match(lines[1].text, /62 秒/);
-  assert.match(lines[1].text, /结果未确认/);
-  assert.match(lines[2].text, /核对/);
+  // 同一个 call 的 started/completed 合成一条，不会留下“运行中”旧行。
+  assert.equal(lines.length, 2);
+  assert.match(lines[0].text, /62 秒/);
+  assert.match(lines[0].text, /结果未确认/);
+  assert.match(lines[1].text, /核对/);
 });
 
 test('context overflow from tool output does not blame image attachments', () => {

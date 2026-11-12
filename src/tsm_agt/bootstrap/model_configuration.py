@@ -126,6 +126,9 @@ class ModelConfiguration:
     timeout_seconds: float = 180.0
     max_retries: int = 2
     retry_backoff_seconds: float = 1.0
+    #: How long one model round may stay parked on an unreachable network
+    #: before the recovery policy interrupts it instead of waiting.
+    network_wait_seconds: float = 600.0
     output_token_parameter: str = "max_tokens"
     protocol: str = MODEL_PROTOCOL_OPEN
     anthropic_version: str = "2023-06-01"
@@ -266,6 +269,7 @@ def load_model_configuration(
         timeout_seconds=_positive_number(options.get("timeout_seconds", 180), "model options.timeout_seconds"),
         max_retries=_int_range(options.get("max_retries", 2), "model options.max_retries", 0, 10),
         retry_backoff_seconds=_number_range(options.get("retry_backoff_seconds", 1), "model options.retry_backoff_seconds", 0, 60),
+        network_wait_seconds=_number_range(options.get("network_wait_seconds", 600), "model options.network_wait_seconds", 0, 3600),
         output_token_parameter=_choice(options.get("output_token_parameter", "max_tokens"), "model options.output_token_parameter", {"max_tokens", "max_completion_tokens"}),
         protocol=protocol,
         anthropic_version=_string_or_default(options.get("anthropic_version"), "model options.anthropic_version", "2023-06-01"),
@@ -431,6 +435,7 @@ def _optional_choice(value: object, name: str, choices: set[str]) -> str | None:
 def _validate_option_names(options: Mapping[str, object], profile_id: str) -> None:
     supported = {
         "timeout_seconds", "max_retries", "retry_backoff_seconds",
+        "network_wait_seconds",
         "output_token_parameter", "anthropic_version", "strict_tool_schema",
         "streaming", "reasoning_effort", "request_parameters", "send_output_token_limit",
         "max_output_tokens",

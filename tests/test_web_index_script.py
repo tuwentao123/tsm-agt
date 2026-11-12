@@ -140,3 +140,62 @@ def test_composer_suggest_menu_uses_the_rendered_entry_list() -> None:
     assert "const total = slashMenuItems.length;" in source
     assert "const entry = slashMenuItems[slashMenuActiveIndex];" in source
     assert "applySlashMenuItem(entry, anchorInput);" in source
+
+
+def test_composer_suggest_menu_matches_skill_names_without_the_skill_prefix() -> None:
+    """Typing "/ph" must offer installed Skills, not only after "/skill"."""
+
+    source = _index_html_source()
+
+    assert "const DIRECT_SKILL_MENU_LIMIT = 8;" in source
+    assert "function resolveDirectSkillItems(query) {" in source
+    assert "skill.name.toLowerCase().startsWith(query)" in source
+    assert "return [...commandEntries, ...resolveDirectSkillItems(query)];" in source
+    # 直接输入 "/ph" 选中后，触发文本必须被整段替换成引用句。
+    assert "function isDirectSkillQuery(value) {" in source
+    assert "if (isSkillMenuMode(value) || isDirectSkillQuery(value)) {" in source
+    assert "if (promptComposer && promptComposer.value.startsWith('/')) {" in source
+
+
+def test_composer_suggest_menu_keeps_the_highlighted_entry_in_view() -> None:
+    """The keyboard selection must scroll inside the menu instead of being clipped."""
+
+    source = _index_html_source()
+
+    assert "function revealSlashMenuItem(element) {" in source
+    assert "const visibleBottom = visibleTop + menu.clientHeight;" in source
+    assert "menu.scrollTop = itemBottom - menu.clientHeight;" in source
+    assert "menu.scrollTop = itemTop;" in source
+    assert "revealSlashMenuItem(children[index]);" in source
+    # 新一次渲染不能沿用上一次的滚动位置。
+    assert "menu.scrollTop = 0;" in source
+
+
+def test_tool_calls_render_as_collapsible_execution_cards() -> None:
+    """A command shows its real output inside a card that can be collapsed."""
+
+    source = _index_html_source()
+
+    assert "function toolExecutionCard(model) {" in source
+    assert "function toolCardModel(progress) {" in source
+    assert "card.dataset.open = initiallyOpen ? 'true' : 'false';" in source
+    assert "TOOL_CARD_OPEN_STATE.set(stateKey, next);" in source
+    assert "body.hidden = !next;" in source
+    assert "body.hidden = !initiallyOpen;" in source
+    assert "toolCardSection('参数', argumentsText)" in source
+    assert "'输出'," in source
+    assert "该工具不产生命令行输出" in source
+    assert ".live-turn-line{font-size:13px;font-weight:600;color:#6b7280;" in source
+    # 阶段性回复是正文片段：单独上下间距，不跟随进度行的灰色小字。
+    assert ".live-turn-line.turn-progress-note{margin:10px 0;" in source
+    assert "note: kind === 'commentary'," in source
+    assert "if (line.note) row.classList.add('turn-progress-note');" in source
+    # 参数/输出区要像 markdown 代码块：等宽、挂缩进、高行高。
+    assert ".tool-card-pre{margin:0;padding:10px 12px 10px 26px;text-indent:-14px;" in source
+    assert "line-height:1.75" in source
+    assert "card: toolCardModel({ ...item, tool_name: name })," in source
+    assert "holder.appendChild(toolExecutionCard(card));" in source
+    assert ".tool-card-head{display:flex;" in source
+    # display 作者样式会盖掉 [hidden]，必须显式声明收起态。
+    assert ".tool-card-body{display:flex" in source
+    assert ".tool-card-body[hidden]{display:none}" in source

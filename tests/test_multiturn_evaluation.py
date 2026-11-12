@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 from scripts.evaluate_multiturn_behavior import (
     check_files, file_state, load_fixture, materialize_workspace, model_tool_proposals,
-    observe_model_exchanges, run_independent_tests, run_trial, tool_result_facts, workspace_path,
+    observe_model_exchanges, run_independent_tests, run_trial, tool_result_facts,
+    verified_after_last_edit, workspace_path,
 )
 from tsm_agt.adapters.builtin.core_tools import CoreReadOnlyToolProvider
 from tsm_agt.bootstrap import compose_fixture_application
@@ -85,6 +86,28 @@ class MultiTurnEvaluationTest(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(run_independent_tests(root, 5), 0)
+
+    def test_agent_verification_requires_a_successful_check_started_after_the_last_edit(self):
+        from types import SimpleNamespace
+
+        def requested(sequence, call_id, name, arguments):
+            return SimpleNamespace(sequence=sequence, event_type="tool.requested", payload={
+                "call": {"call_id": call_id, "name": name, "arguments": arguments},
+            })
+
+        def completed(sequence, call_id, succeeded):
+            return SimpleNamespace(sequence=sequence, event_type="tool.completed", payload={
+                "result": {"call_id": call_id, "ok": True, "data": {"succeeded": succeeded}},
+            })
+
+        edit = requested(1, "edit", "core.apply_patch", {"path": "calculator.py"})
+        edit_result = completed(3, "edit", True)
+        test_command = {"argv": ["python3", "-m", "unittest"]}
+        early_test = requested(2, "test", "core.run_command", test_command)
+        later_test = requested(4, "test", "core.run_command", test_command)
+        self.assertFalse(verified_after_last_edit([edit, early_test, edit_result, completed(5, "test", True)]))
+        self.assertFalse(verified_after_last_edit([edit, edit_result, later_test, completed(5, "test", False)]))
+        self.assertTrue(verified_after_last_edit([edit, edit_result, later_test, completed(5, "test", True)]))
 
 
 class MultiTurnEvaluationRuntimeTest(unittest.IsolatedAsyncioTestCase):

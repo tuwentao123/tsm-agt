@@ -493,13 +493,16 @@ class PolicyMixin:
             "core.find_files", "core.search_text", "core.grep_search",
         }:
             return ()
-        return tuple(
-            Path(grant.canonical_root)
-            for grant in task.workspace_access_grants
-            if grant.capability in {
-                WorkspaceAccessCapability.READ,
-                WorkspaceAccessCapability.WRITE,
-            }
+        return (
+            *task.all_workspace_roots()[1:],
+            *(
+                Path(grant.canonical_root)
+                for grant in task.workspace_access_grants
+                if grant.capability in {
+                    WorkspaceAccessCapability.READ,
+                    WorkspaceAccessCapability.WRITE,
+                }
+            ),
         )
 
     @staticmethod

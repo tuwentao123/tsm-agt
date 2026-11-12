@@ -171,6 +171,7 @@ class UrllibHttpJsonTransport:
                 publish("error", ModelProviderTransportError(
                     f"provider connection failed: {error.reason}",
                     retryable=True, reason_code="connection_failed",
+                    category=ModelFailureCategory.NETWORK_UNAVAILABLE,
                 ))
                 terminal_published = True
             except UnicodeDecodeError:
@@ -261,11 +262,13 @@ class UrllibHttpJsonTransport:
             raise ModelProviderTransportError(
                 f"provider connection failed: {error.reason}",
                 retryable=True, reason_code="connection_failed",
+                category=ModelFailureCategory.NETWORK_UNAVAILABLE,
             ) from error
         except OSError as error:
             raise ModelProviderTransportError(
                 f"provider connection failed: {error}", retryable=True,
                 reason_code="connection_failed",
+                category=ModelFailureCategory.NETWORK_UNAVAILABLE,
             ) from error
         try:
             decoded = json.loads(raw)

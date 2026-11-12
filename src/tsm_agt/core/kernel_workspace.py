@@ -34,7 +34,7 @@ Moved from ``core/kernel.py``:
 from __future__ import annotations
 
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from tsm_agt.ports import RuntimeEvent, RuntimeUnitOfWork
@@ -58,6 +58,66 @@ from .workspace import (
 
 
 class WorkspaceMixin:
+    @staticmethod
+    def _select_workspace_root(
+        task: TaskSnapshot, relative_path: str,
+    ) -> tuple[Path, Path, str]:
+        """Return ``(primary, owning root, root-relative path)`` for one path."""
+        from .workspace_roots import select_root_for_path
+
+        primary = Path(task.workspace)
+        root, root_relative = select_root_for_path(
+            task.all_workspace_roots(), relative_path
+        )
+        return primary, root, root_relative
+
+    @staticmethod
+    def _root_record(task: TaskSnapshot, root: Path) -> str | None:
+        """Journal only a non-primary root; the primary root stays implicit."""
+        primary = Path(task.workspace).expanduser().resolve(strict=False)
+        canonical = Path(root).expanduser().resolve(strict=False)
+        return None if canonical == primary else str(canonical)
+
+    @staticmethod
+    def _mutation_root(task: TaskSnapshot, mutation: MutationRecord) -> Path:
+        """Resolve the root a journaled mutation belongs to."""
+        return Path(mutation.root) if mutation.root else Path(task.workspace)
+
+    @staticmethod
+    def _primary_only_root(
+        task: TaskSnapshot, mutations: Sequence[MutationRecord],
+    ) -> Path:
+        """Batch operations keep one root: the primary workspace root."""
+        if any(item.root for item in mutations):
+            raise ValueError(
+                "batch and cascade workspace operations must stay inside the "
+                "primary workspace root"
+            )
+        return Path(task.workspace)
+
+    async def set_workspace_roots(
+        self, task_id: str, roots: tuple[str, ...],
+    ) -> TaskSnapshot:
+        """Attach or detach extra root directories on one existing Task."""
+        stored = await self._require_stored_task(task_id)
+        task = TaskSnapshot.from_data(stored.data)
+        updated = task.with_workspace_roots(roots)
+        if updated is task:
+            return task
+        event = RuntimeEvent(
+            event_id=f"evt-{uuid4().hex}", task_id=task_id,
+            sequence=stored.last_event_sequence + 1,
+            event_type="workspace.roots_changed",
+            payload={
+                "workspace": task.workspace,
+                "roots": list(updated.workspace_roots),
+            },
+        )
+        await self._dependencies.store.commit(RuntimeUnitOfWork(
+            task_id, stored.version, updated.to_data(), (event,)
+        ))
+        return updated
+
     async def get_workspace_changes(self, task_id: str) -> WorkspaceChangeSet:
         task = await self.get_task(task_id)
         if task.workspace_baseline is None:
@@ -89,7 +149,9 @@ class WorkspaceMixin:
             raise InvalidTurnState(
                 f"task {task_id} must be EXECUTING, got {task.state.value}"
             )
-        workspace = Path(task.workspace)
+        _primary, workspace, relative_path = self._select_workspace_root(
+            task, relative_path
+        )
         async with self._workspace_path_locks.hold(workspace, relative_path):
             stored = await self._require_stored_task(task_id)
             task = TaskSnapshot.from_data(stored.data)
@@ -116,6 +178,7 @@ class WorkspaceMixin:
                 after_hash=prepared.after_hash, step_id=step_id.strip(),
                 backup_ref=backup_ref, created_at=datetime.now(timezone.utc),
                 before_mode=prepared.previous_mode,
+                root=self._root_record(task, workspace),
             )
             created_directories = commit_prepared_workspace_mutation(
                 prepared, self._dependencies.workspace_filesystem
@@ -161,6 +224,15 @@ class WorkspaceMixin:
                 f"task {task_id} must be EXECUTING, got {task.state.value}"
             )
         workspace = Path(task.workspace)
+        attached = {
+            self._select_workspace_root(task, path)[1]
+            for path, _content, _hash in writes
+        }
+        if attached - {workspace.expanduser().resolve(strict=False)}:
+            raise ValueError(
+                "batch patch must stay inside the primary workspace root; apply "
+                "each file of an attached root separately"
+            )
         paths = tuple(path for path, _content, _hash in writes)
         async with self._workspace_path_locks.hold_many(workspace, paths):
             stored = await self._require_stored_task(task_id)
@@ -287,7 +359,9 @@ class WorkspaceMixin:
             raise InvalidTurnState(
                 f"task {task_id} must be EXECUTING, got {task.state.value}"
             )
-        workspace = Path(task.workspace)
+        _primary, workspace, relative_path = self._select_workspace_root(
+            task, relative_path
+        )
         async with self._workspace_path_locks.hold(workspace, relative_path):
             stored = await self._require_stored_task(task_id)
             task = TaskSnapshot.from_data(stored.data)
@@ -312,6 +386,7 @@ class WorkspaceMixin:
                 after_hash=None, step_id=step_id.strip(), backup_ref=backup_ref,
                 created_at=datetime.now(timezone.utc),
                 before_mode=prepared.previous_mode,
+                root=self._root_record(task, workspace),
             )
             commit_prepared_workspace_deletion(
                 prepared, self._dependencies.workspace_filesystem
@@ -352,7 +427,7 @@ class WorkspaceMixin:
                 f"task {task_id} must be EXECUTING, got {task.state.value}"
             )
         original = self._require_rollback_candidate(task, mutation_id)
-        workspace = Path(task.workspace)
+        workspace = self._mutation_root(task, original)
         async with self._workspace_path_locks.hold(workspace, original.path):
             return await self._rollback_workspace_mutation_locked(
                 task_id, step_id.strip(), mutation_id, workspace
@@ -376,7 +451,10 @@ class WorkspaceMixin:
                 f"task {task_id} must be EXECUTING, got {task.state.value}"
             )
         path = self._validate_cascade_rollback(task, mutation_ids)
-        workspace = Path(task.workspace)
+        workspace = self._primary_only_root(
+            task,
+            tuple(self._require_rollback_candidate(task, item) for item in mutation_ids),
+        )
         async with self._workspace_path_locks.hold(workspace, path):
             current = await self.get_task(task_id)
             self._validate_cascade_rollback(current, mutation_ids)
@@ -410,7 +488,7 @@ class WorkspaceMixin:
                 f"task {task_id} must be EXECUTING, got {task.state.value}"
             )
         selected = self._validate_batch_rollback(task, mutation_ids)
-        workspace = Path(task.workspace)
+        workspace = self._primary_only_root(task, selected)
         paths = tuple(item.path for item in selected)
         async with self._workspace_path_locks.hold_many(workspace, paths):
             stored = await self._require_stored_task(task_id)
@@ -574,7 +652,13 @@ class WorkspaceMixin:
                 f"task {task_id} must be EXECUTING, got {task.state.value}"
             )
         paths = self._validate_grouped_rollback(task, mutation_groups)
-        workspace = Path(task.workspace)
+        workspace = self._primary_only_root(
+            task,
+            tuple(
+                self._require_rollback_candidate(task, mutation_id)
+                for mutation_id in flattened
+            ),
+        )
         async with self._workspace_path_locks.hold_many(workspace, paths):
             stored = await self._require_stored_task(task_id)
             task = TaskSnapshot.from_data(stored.data)
@@ -941,6 +1025,7 @@ class WorkspaceMixin:
                 created_at=datetime.now(timezone.utc),
                 before_mode=prepared_delete.previous_mode,
                 reverts_mutation_id=original.mutation_id,
+                root=self._root_record(task, workspace),
             )
             commit = lambda: commit_prepared_workspace_deletion(
                 prepared_delete, self._dependencies.workspace_filesystem
@@ -976,6 +1061,7 @@ class WorkspaceMixin:
                 backup_ref=backup_ref, created_at=datetime.now(timezone.utc),
                 before_mode=prepared_write.previous_mode,
                 reverts_mutation_id=original.mutation_id,
+                root=self._root_record(task, workspace),
             )
             commit = lambda: commit_prepared_workspace_mutation(
                 prepared_write, self._dependencies.workspace_filesystem

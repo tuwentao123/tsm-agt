@@ -368,6 +368,8 @@ class ModelTransportProgress:
     max_attempts: int
     reason: str = ""
     delay_seconds: float = 0.0
+    #: How long this logical round already spent waiting for the network.
+    waited_seconds: float = 0.0
     category: str = ""
     retry_safety: str = ""
     diagnostic_code: str = ""
@@ -383,6 +385,7 @@ class ModelTransportProgress:
             "kind": self.kind, "attempt": self.attempt,
             "max_attempts": self.max_attempts, "reason": self.reason,
             "delay_seconds": self.delay_seconds, "category": self.category,
+            "waited_seconds": self.waited_seconds,
             "retry_safety": self.retry_safety,
             "diagnostic_code": self.diagnostic_code,
             "diagnostic_detail": self.diagnostic_detail,

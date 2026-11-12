@@ -58,6 +58,7 @@ from tsm_agt.adapters.openai_compatible import OpenAICompatibleModelProvider
 from tsm_agt.adapters.openai_compatible.responses import OpenAIResponsesModelProvider
 from tsm_agt.adapters.anthropic_messages import AnthropicMessagesModelProvider
 from tsm_agt.adapters.resilient_model import ResilientModelProvider
+from tsm_agt.adapters.resilient_model.network import network_probe_for
 from tsm_agt.adapters.rule_based_model_recovery import (
     RuleBasedModelRecoveryPolicy,
 )
@@ -1064,6 +1065,7 @@ def compose_openai_compatible_readonly_application(
     model_timeout_seconds: float = 180.0,
     model_max_retries: int = 2,
     model_retry_backoff_seconds: float = 1.0,
+    model_network_wait_seconds: float = 600.0,
     model_output_token_parameter: str = "max_tokens",
     model_protocol: str = "openai_compatible",
     model_anthropic_version: str = "2023-06-01",
@@ -1122,6 +1124,8 @@ def compose_openai_compatible_readonly_application(
         ModelProviderPort, ResilientModelProvider(
             physical_model, recovery_policy,
             max_provider_attempts=model_max_retries + 1,
+            network_wait_limit_seconds=model_network_wait_seconds,
+            network_probe=network_probe_for(base_url),
         )
     )
     registry.register(
@@ -1277,6 +1281,7 @@ def compose_openai_compatible_engineering_application(
     model_timeout_seconds: float = 180.0,
     model_max_retries: int = 2,
     model_retry_backoff_seconds: float = 1.0,
+    model_network_wait_seconds: float = 600.0,
     model_output_token_parameter: str = "max_tokens",
     model_protocol: str = "openai_compatible",
     model_anthropic_version: str = "2023-06-01",
@@ -1338,6 +1343,8 @@ def compose_openai_compatible_engineering_application(
         ModelProviderPort, ResilientModelProvider(
             physical_model, recovery_policy,
             max_provider_attempts=model_max_retries + 1,
+            network_wait_limit_seconds=model_network_wait_seconds,
+            network_probe=network_probe_for(base_url),
         )
     )
     registry.register(
@@ -1519,6 +1526,7 @@ def compose_openai_compatible_readonly_application_from_config(
         model_timeout_seconds=configuration.timeout_seconds,
         model_max_retries=configuration.max_retries,
         model_retry_backoff_seconds=configuration.retry_backoff_seconds,
+        model_network_wait_seconds=configuration.network_wait_seconds,
         model_output_token_parameter=(
             configuration.effective_output_token_parameter
         ),
@@ -1579,6 +1587,7 @@ def compose_openai_compatible_engineering_application_from_config(
         model_timeout_seconds=configuration.timeout_seconds,
         model_max_retries=configuration.max_retries,
         model_retry_backoff_seconds=configuration.retry_backoff_seconds,
+        model_network_wait_seconds=configuration.network_wait_seconds,
         model_output_token_parameter=(
             configuration.effective_output_token_parameter
         ),

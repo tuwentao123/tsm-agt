@@ -680,7 +680,10 @@ class CoreApplyPatchTest(unittest.IsolatedAsyncioTestCase):
         os.symlink(outside, link)
         try:
             cases = (
-                ("absolute", str(self.workspace / "absolute.txt"), None),
+                # An absolute path is legal only inside a configured root; with no
+                # extra roots the workspace alone bounds it, so a sibling file is
+                # still an escape.
+                ("absolute-outside", str(outside), None),
                 ("escape", "../escape.txt", None),
                 ("env", ".env", None),
                 ("runtime", ".agent/data.txt", None),

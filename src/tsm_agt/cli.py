@@ -849,6 +849,12 @@ def _render_agent_progress_lines(
             )
         return tuple(lines)
     if progress.kind is AgentProgressKind.MODEL_RETRY:
+        if progress.recovery_action == "WAIT_FOR_NETWORK":
+            return (
+                "[等待] 网络不可用，请求已暂停并在持续探测；"
+                f"已等待 {progress.waited_seconds:g} 秒，"
+                "网络恢复后自动继续同一请求。"
+            )
         if progress.reason.startswith("stream_fallback:"):
             return (
                 "[兼容] 模型流式响应没有完整收尾，正在自动改用"

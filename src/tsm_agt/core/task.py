@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import os
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 from .approval import ApprovalRequest
@@ -252,6 +254,28 @@ class TaskNotFound(LookupError):
     pass
 
 
+def _normalized_extra_roots(
+    primary: str | Path, extra: Iterable[str | Path],
+) -> tuple[str, ...]:
+    """Canonicalise attached roots: absolute, distinct, never the primary one."""
+    canonical_primary = os.path.normcase(
+        str(Path(primary).expanduser().resolve(strict=False))
+    )
+    roots: list[str] = []
+    seen: set[str] = set()
+    for raw in extra:
+        text = str(raw).strip()
+        if not text:
+            continue
+        candidate = Path(text).expanduser().resolve(strict=False)
+        key = os.path.normcase(str(candidate))
+        if key == canonical_primary or key in seen:
+            continue
+        seen.add(key)
+        roots.append(str(candidate))
+    return tuple(roots)
+
+
 @dataclass(frozen=True, slots=True)
 class TaskSnapshot:
     task_id: str
@@ -278,18 +302,47 @@ class TaskSnapshot:
     #: Conversation Tasks return to ``AWAITING_INPUT`` between turns instead of
     #: terminalising; work items keep the one-turn completion path.
     task_kind: TaskKind = TaskKind.CONVERSATION
+    #: Extra root directories attached to the same workspace.  ``workspace``
+    #: stays the primary root and the only base for relative paths; an extra
+    #: root is reachable through an absolute path that it contains.
+    workspace_roots: tuple[str, ...] = ()
+
+    def all_workspace_roots(self) -> tuple[Path, ...]:
+        """Return the primary root first, then every attached extra root.
+
+        Every root is canonical so a containment check never compares a symlinked
+        spelling with its real path.
+        """
+        return (
+            Path(self.workspace).expanduser().resolve(strict=False),
+            *(Path(root) for root in self.workspace_roots),
+        )
+
+    def with_workspace_roots(
+        self, extra: Iterable[str | Path], now: datetime | None = None,
+    ) -> TaskSnapshot:
+        """Attach or detach extra roots; the primary root never moves."""
+        roots = _normalized_extra_roots(self.workspace, extra)
+        if roots == self.workspace_roots:
+            return self
+        return replace(
+            self, workspace_roots=roots,
+            updated_at=now or datetime.now(timezone.utc),
+        )
 
     @classmethod
     def create(
         cls, task_id: str, goal: str, workspace: str, now: datetime | None = None,
         session_id: str | None = None,
         task_kind: TaskKind = TaskKind.CONVERSATION,
+        workspace_roots: Iterable[str | Path] = (),
     ) -> TaskSnapshot:
         timestamp = now or datetime.now(timezone.utc)
         return cls(
             task_id, goal, workspace, TaskState.CREATED, timestamp, timestamp,
             session_id=session_id or standalone_session_id(task_id),
             task_kind=task_kind,
+            workspace_roots=_normalized_extra_roots(workspace, workspace_roots),
         )
 
     @classmethod
@@ -385,6 +438,12 @@ class TaskSnapshot:
             ) if isinstance(
                 (raw_access_grants := data.get("workspace_access_grants")), list
             ) else (),
+            workspace_roots=tuple(
+                str(item) for item in raw_roots
+                if isinstance(item, str) and item.strip()
+            ) if isinstance(
+                (raw_roots := data.get("workspace_roots")), list
+            ) else (),
         )
 
     def transition(
@@ -430,6 +489,7 @@ class TaskSnapshot:
             session_id=self.session_id,
             task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
+            workspace_roots=self.workspace_roots,
         )
 
     def await_approval(
@@ -461,6 +521,7 @@ class TaskSnapshot:
             session_id=self.session_id,
             task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
+            workspace_roots=self.workspace_roots,
         )
 
     def resolve_approval(self, now: datetime | None = None) -> TaskSnapshot:
@@ -490,6 +551,7 @@ class TaskSnapshot:
             session_id=self.session_id,
             task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
+            workspace_roots=self.workspace_roots,
         )
 
     def await_clarification(
@@ -561,6 +623,7 @@ class TaskSnapshot:
             session_id=self.session_id,
             task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
+            workspace_roots=self.workspace_roots,
         )
 
     def with_background_process(
@@ -587,6 +650,7 @@ class TaskSnapshot:
             session_id=self.session_id,
             task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
+            workspace_roots=self.workspace_roots,
         )
 
     def with_project_trust(
@@ -612,6 +676,7 @@ class TaskSnapshot:
             session_id=self.session_id,
             task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
+            workspace_roots=self.workspace_roots,
         )
 
     def with_workspace_baseline(
@@ -638,6 +703,7 @@ class TaskSnapshot:
             session_id=self.session_id,
             task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
+            workspace_roots=self.workspace_roots,
         )
 
     def with_mutation(
@@ -665,6 +731,7 @@ class TaskSnapshot:
             session_id=self.session_id,
             task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
+            workspace_roots=self.workspace_roots,
         )
 
     def with_effective_configuration(
@@ -697,6 +764,7 @@ class TaskSnapshot:
             session_id=self.session_id,
             task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
+            workspace_roots=self.workspace_roots,
         )
 
     def with_agent_checkpoint(
@@ -725,6 +793,7 @@ class TaskSnapshot:
             session_id=self.session_id,
             task_kind=self.task_kind,
             workspace_access_grants=self.workspace_access_grants,
+            workspace_roots=self.workspace_roots,
         )
 
     def with_workspace_access_grant(
@@ -834,4 +903,5 @@ class TaskSnapshot:
             "workspace_access_grants": [
                 grant.to_data() for grant in self.workspace_access_grants
             ],
+            "workspace_roots": list(self.workspace_roots),
         }

@@ -161,7 +161,7 @@ class ConversationFinalizer:
         )
 
     async def record_model_response(
-        self, state: TurnState, response: Any, tool_call_count: int,
+        self, state: TurnState, response: Any, tool_call_count: int, *, elapsed_seconds: float,
     ) -> None:
         """Audit one model exchange without persisting its body twice."""
 
@@ -174,6 +174,8 @@ class ConversationFinalizer:
                 "assistant_message_id": response.message.message_id,
                 "finish_reason": response.finish_reason.value,
                 "tool_call_count": tool_call_count,
+                "usage": response.usage.to_data(),
+                "elapsed_seconds": elapsed_seconds,
             },
         ),))
 

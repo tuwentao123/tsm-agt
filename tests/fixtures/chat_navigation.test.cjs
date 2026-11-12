@@ -166,7 +166,7 @@ test('cold session reload renders real Task cards, later answers and durable tim
   s.document.getElementById = id => id === 'trace-pane' ? trace : originalLookup(id);
   const errors = [];
   Object.assign(s.context, {
-    console: {error: error => errors.push(String(error))},
+    console: {error: (...args) => errors.push(args.map(String).join(' '))},
     activeConversationId: 'chat',
     defaultModelProfile: null, skillInstallInFlight: false,
     getConversationById: id => id === 'chat' ? s.conversation : null,
@@ -225,7 +225,8 @@ test('cold session reload renders real Task cards, later answers and durable tim
   s.context.fetch = async () => ({ok: false, status: 503});
   assert.equal(await s.context.ensureConversationLoaded('chat'), false);
   assert.equal(s.conversation.messages, existingMessages);
-  assert.match(banners[0], /历史加载失败.*503/);
+  assert.deepEqual(banners, []);
+  assert.match(errors.at(-1), /历史加载失败.*503/);
 });
 
 test('three viewport heights is the exact jump threshold; short or hidden chats have no arrow', () => {
@@ -401,6 +402,40 @@ function historyRow(turn, images) {
   if (images !== undefined) row.images = images;
   return row;
 }
+
+test('history refresh retries a transport error once and keeps the transcript if it still fails', async () => {
+  const s = setupHistory([historyRow('one', [])], [{role: 'user', content: '已有消息'}]);
+  const successfulRead = s.context.fetch;
+  const errors = [];
+  const banners = [];
+  let reads = 0;
+  Object.assign(s.context, {
+    setTimeout: callback => callback(),
+    console: {error: (...args) => errors.push(args.map(String).join(' '))},
+    showError: error => banners.push(error),
+    fetch: async (...args) => {
+      if (++reads === 1) throw new TypeError('Failed to fetch');
+      return successfulRead(...args);
+    },
+  });
+  assert.equal(await s.context.refreshConversationHistory('chat'), true);
+  assert.equal(reads, 2);
+  assert.deepEqual(errors, []);
+  assert.equal(s.conversation.messages[0].content, '看图');
+
+  const transcript = s.conversation.messages;
+  reads = 0;
+  s.context.fetch = async () => {
+    reads++;
+    throw new TypeError('Failed to fetch');
+  };
+  assert.equal(await s.context.refreshConversationHistory('chat'), false);
+  assert.equal(reads, 2);
+  assert.equal(s.conversation.messages, transcript);
+  assert.equal(s.conversation.loaded, false);
+  assert.deepEqual(banners, []);
+  assert.match(errors.at(-1), /历史加载失败.*Failed to fetch/);
+});
 
 function thumbnails(s) {
   return s.chat.children.flatMap(element => element.children

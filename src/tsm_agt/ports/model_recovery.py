@@ -12,6 +12,10 @@ from .adapter import RuntimeAdapter
 
 class ModelFailureCategory(StrEnum):
     TRANSIENT_PROVIDER = "TRANSIENT_PROVIDER"
+    #: The request never reached a provider that could answer it: DNS, TCP or
+    #: TLS failed. Waiting for the network to come back is a different answer
+    #: from spending the remaining attempt budget, so it is its own category.
+    NETWORK_UNAVAILABLE = "NETWORK_UNAVAILABLE"
     INVALID_RESPONSE = "INVALID_RESPONSE"
     CORRECTABLE_PROTOCOL = "CORRECTABLE_PROTOCOL"
     AUTHENTICATION = "AUTHENTICATION"
@@ -35,6 +39,9 @@ class ModelRecoveryAction(StrEnum):
     RESAMPLE = "RESAMPLE"
     RESAMPLE_WITH_CORRECTION = "RESAMPLE_WITH_CORRECTION"
     FALLBACK_TRANSPORT = "FALLBACK_TRANSPORT"
+    #: The network is down. Hold the interrupted work and poll until the
+    #: endpoint answers again instead of burning the attempt budget.
+    WAIT_FOR_NETWORK = "WAIT_FOR_NETWORK"
     PRESERVE_AND_INTERRUPT = "PRESERVE_AND_INTERRUPT"
     FAIL_TERMINAL = "FAIL_TERMINAL"
 
@@ -102,6 +109,11 @@ class ModelRecoveryProbe:
     #: stream that dies mid-flight is a different situation from a one-shot
     #: request that failed: repeating it is not what fixes it.
     streaming: bool = False
+    #: Upper bound on how long one logical model round may stay parked while
+    #: the network is unreachable. ``0`` disables waiting entirely.
+    network_wait_limit_seconds: float = 0.0
+    #: How much of that budget this round already spent waiting.
+    network_waited_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)

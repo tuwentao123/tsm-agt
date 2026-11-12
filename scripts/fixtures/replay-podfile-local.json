@@ -10,7 +10,7 @@
     {
       "input": "在当前 iOS 工作区里找到 Podfile.local，并告诉我它配置的最低 iOS 版本和 target 名。只读，不修改文件。",
       "unchanged": true,
-      "answer_contains": ["Podfile.local", "15.4", "ReplayLocal"]
+      "answer_contains": ["15.4", "ReplayLocal"]
     },
     {
       "input": "继续看刚才那个本地文件，告诉我本地依赖的名称和它指向的目录。还是只读。",

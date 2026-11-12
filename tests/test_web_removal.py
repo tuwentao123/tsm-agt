@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -159,6 +160,39 @@ class RemovedWorkspaceTest(_RemovalTestCase):
                 revived = web_app.register_workspace(workspace_path)
                 self.assertEqual(revived["path"], workspace_path)
                 self.assertNotIn(workspace_path, web_app.removed_workspace_paths)
+
+    def test_stale_registry_entry_stays_out_after_a_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            removed = root / "gone"
+            kept = root / "kept"
+            removed.mkdir()
+            kept.mkdir()
+            agent = root / ".agent"
+            agent.mkdir()
+            registry = agent / "web-workspaces.json"
+            removals = agent / "web-removals.json"
+            registry.write_text(
+                json.dumps([{"path": str(removed)}, {"path": str(kept)}]),
+                encoding="utf-8",
+            )
+            removals.write_text(
+                json.dumps({"workspaces": [str(removed)], "sessions": []}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                web_app, "workspace_registry_path", return_value=registry
+            ), mock.patch.object(
+                web_app, "web_removals_path", return_value=removals
+            ):
+                # A sidebar index written before the removal must not resurrect
+                # the entry; startup loads the deny-list first for this reason.
+                web_app.load_web_removals()
+                web_app.load_workspace_registry()
+            self.assertEqual(
+                [item["path"] for item in web_app.workspace_registry],
+                [str(kept)],
+            )
 
     def test_unknown_workspace_is_reported_as_missing(self) -> None:
         with self.assertRaises(HTTPException) as caught:

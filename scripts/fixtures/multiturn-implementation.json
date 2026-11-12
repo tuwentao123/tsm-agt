@@ -12,7 +12,8 @@
     {
       "input": "把刚才这两项都直接实施完并运行测试，不需要再次询问。不要修改已有测试。",
       "files_contain": {"calculator.py": "def multiply"},
-      "verify_tests": true
+      "verify_tests": true,
+      "require_agent_verification": true
     },
     {
       "input": "现在只解释你实际改动了什么、测试结果是什么，不要继续修改文件。",

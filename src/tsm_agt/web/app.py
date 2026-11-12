@@ -21,6 +21,7 @@ from fastapi.responses import (
     HTMLResponse, JSONResponse, Response, StreamingResponse,
 )
 
+from tsm_agt.adapters.langfuse import LangfuseExportError
 from tsm_agt.core import (
     AgentLoopLimitExceeded, ApprovalDecision, RuntimeInputIntent,
     ProjectTrustLevel, note_stream_released,
@@ -35,6 +36,7 @@ from tsm_agt.bootstrap.composition import (
 from tsm_agt.bootstrap.model_configuration import load_configuration_document
 from tsm_agt.bootstrap.mcp_status import describe_mcp_servers, mcp_configuration_summary
 from tsm_agt.ports import ImageBlock, MessageRole, MCPServerStartupError
+from tsm_agt.web.langfuse import WebLangfuse
 
 app = FastAPI(title="tsm-agt-web")
 logger = logging.getLogger(__name__)
@@ -273,12 +275,33 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .live-turn-head{display:flex;align-items:center;gap:7px;font-size:11px;font-weight:600;color:#2563eb}
 .live-turn-dot{width:7px;height:7px;border-radius:50%;background:#1677ff;box-shadow:0 0 0 4px rgba(22,119,255,.14);animation:live-turn-pulse 1.4s ease-in-out infinite;flex:none}
 @keyframes live-turn-pulse{0%,100%{opacity:1}50%{opacity:.35}}
-.live-turn-line{font-size:12px;color:#475569;line-height:1.55;word-break:break-word;padding-left:14px;position:relative}
+.live-turn-line{font-size:13px;font-weight:600;color:#6b7280;line-height:1.5;word-break:break-word;padding-left:14px;position:relative}
 .live-turn-line::before{content:'·';position:absolute;left:4px;color:#94a3b8}
 .live-turn-line.active{color:#1d4ed8}
 .live-turn-line.active::before{content:'▸';color:#1677ff}
 .live-turn-line.failed{color:#b42318}
 .live-turn-line.failed::before{content:'✕';color:#d92d20}
+/* 阶段性回复是正文片段，不是进度元信息：单独给上下间距，并回到正文颜色。 */
+.live-turn-line.turn-progress-note{margin:10px 0;font-weight:400;line-height:1.7;color:#1f2937}
+.tool-card-row{margin:4px 0}
+.tool-card{border:1px solid #dbe3ed;border-radius:9px;background:#fff;overflow:hidden}
+.tool-card-head{display:flex;align-items:center;gap:7px;width:100%;padding:7px 9px;background:#f6f9fd;border:0;font:inherit;font-size:12px;color:#334155;cursor:pointer;text-align:left}
+.tool-card[data-open='true'] .tool-card-head{border-bottom:1px solid #e2e8f0}
+.tool-card-caret{color:#64748b;font-size:10px;width:9px;flex:none}
+.tool-card-title{font-weight:600;color:#0f172a;flex:none}
+.tool-card-command{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:400;color:#475569;flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tool-card-meta{margin-left:auto;display:flex;align-items:center;gap:7px;color:#64748b;font-size:11px;flex:none}
+.tool-card-status{padding:1px 6px;border-radius:999px;background:#e8f4ff;color:#1d4ed8}
+.tool-card-status.ok{background:#e7f6ec;color:#116329}
+.tool-card-status.failed{background:#fdeceb;color:#b42318}
+.tool-card-body{display:flex;flex-direction:column;gap:8px;padding:8px 9px 10px}
+/* 作者样式的 display 会盖过浏览器对 [hidden] 的 display:none，收起就失效了。 */
+.tool-card-body[hidden]{display:none}
+.tool-card-section-title{font-size:11px;color:#94a3b8;margin-bottom:3px}
+.tool-card-pre{margin:0;padding:10px 12px 10px 26px;text-indent:-14px;border:1px solid #e1e8f0;border-radius:8px;background:#f8fafc;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.75;color:#0f172a;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;tab-size:2;max-height:320px;overflow:auto}
+.tool-card-facts{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;margin:0;font-size:11.5px;color:#475569}
+.tool-card-facts dt{color:#94a3b8}
+.tool-card-facts dd{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
 .task-progress-empty{font-size:12px;color:#686d75}
 .task-card .message.approval{max-width:100%;align-self:stretch;margin-top:4px}
 .message.approval{align-self:stretch;width:100%;max-width:none;scroll-margin-block:12px 24px;background:linear-gradient(180deg,#ffffff,#f8fafc);border:1px solid #d9e1ec;border-radius:18px;padding:10px 12px;display:flex;flex-direction:column;gap:8px;box-shadow:0 6px 14px rgba(15,23,42,.05);position:relative;overflow:hidden}
@@ -540,8 +563,6 @@ textarea::placeholder{color:#94a3b8}
 <div class=\"layout\">
   <aside class=\"sidebar\">
     <div class=\"brand\">任务协同助手</div>
-    <button id=\"new-conversation-btn\" class=\"new-session-btn\" onclick=\"createConversation()\" disabled>+ 新建会话</button>
-
     <div class=\"sidebar-section\">
       <div class=\"section-header\">
         <span class=\"section-title\">工作区</span>
@@ -716,6 +737,10 @@ textarea::placeholder{color:#94a3b8}
           <label for=\"auto-approve\" title=\"开启后本会话收到的授权请求会自动审批通过（含信任工作区）；仅影响当前会话，可随时关闭\" style=\"font-size:11px;color:#64748b;display:flex;align-items:center;gap:6px;\">
             <input id=\"auto-approve\" type=\"checkbox\" aria-label=\"帮我自动授权\" style=\"width:13px;height:13px;margin:0;accent-color:#2563eb;\" />
             帮我自动授权
+          </label>
+          <label for=\"session-langfuse\" title=\"仅将本会话新轮次的执行状态、耗时和 token 用量发送到本地 YAML 指定的 Langfuse 项目。对话和代码内容留在本地。\" style=\"font-size:11px;color:#64748b;display:flex;align-items:center;gap:6px;\">
+            <input id=\"session-langfuse\" type=\"checkbox\" disabled style=\"width:13px;height:13px;margin:0;accent-color:#2563eb;\" />
+            Langfuse 记录
           </label>
           <label for=\"model-profile\" style=\"font-size:11px;color:#64748b;\">模型
             <select id=\"model-profile\" aria-label=\"会话模型\" title=\"新建会话时选择模型；已有会话保持原模型\" style=\"max-width:250px;\">
@@ -1040,7 +1065,6 @@ function updateWorkspaceState() {
   const activeWorkspace = getActiveWorkspace();
   const disabled = !activeWorkspace;
 
-  document.getElementById('new-conversation-btn').disabled = disabled;
   document.getElementById('prompt').disabled = disabled;
   document.getElementById('image-input').disabled = disabled;
   updateComposerButtonState();
@@ -1089,7 +1113,16 @@ function renderWorkspaceList() {
       createConversation();
     };
 
-    header.append(entry, add);
+    const attachRoot = document.createElement('button');
+    attachRoot.className = 'icon-btn';
+    attachRoot.textContent = '⊕';
+    attachRoot.title = '关联另一个本地目录（同一工作区的额外根目录）';
+    attachRoot.onclick = (event) => {
+      event.stopPropagation();
+      attachWorkspaceRoot(workspace.id);
+    };
+
+    header.append(entry, attachRoot, add);
     group.appendChild(header);
 
     const removeWorkspaceBtn = document.createElement('button');
@@ -1101,6 +1134,37 @@ function renderWorkspaceList() {
       removeWorkspace(workspace.id);
     };
     header.appendChild(removeWorkspaceBtn);
+
+    // Attached roots belong to the same workspace: extra repositories the Agent
+    // may read and write through absolute paths, while relative paths keep
+    // resolving against the primary directory above.
+    const attachedRoots = Array.isArray(workspace.roots) ? workspace.roots : [];
+    if (attachedRoots.length) {
+      const rootList = document.createElement('div');
+      rootList.className = 'session-list';
+      attachedRoots.forEach((rootPath) => {
+        const row = document.createElement('div');
+        row.className = 'hint';
+        row.title = rootPath;
+        row.style.display = 'flex';
+        row.style.alignItems = 'center';
+        row.style.justifyContent = 'space-between';
+        row.style.gap = '6px';
+        const label = document.createElement('span');
+        label.textContent = `↳ ${rootPath.split('/').filter(Boolean).pop() || rootPath}`;
+        const detach = document.createElement('button');
+        detach.className = 'icon-btn';
+        detach.textContent = '−';
+        detach.title = `解除关联 ${rootPath}`;
+        detach.onclick = (event) => {
+          event.stopPropagation();
+          detachWorkspaceRoot(workspace.id, rootPath);
+        };
+        row.append(label, detach);
+        rootList.appendChild(row);
+      });
+      group.appendChild(rootList);
+    }
 
     // Sessions belong to a workspace, so they are nested under their owner
     // instead of living in a separate flat list.
@@ -1227,6 +1291,55 @@ async function pickWorkspace() {
   activateWorkspace(workspace.id);
 }
 
+async function attachWorkspaceRoot(workspaceId) {
+  clearError();
+  const picked = await fetch('/workspaces/pick-root', { method: 'POST' });
+  if (picked.status === 204) return;
+  if (!picked.ok) {
+    showError('无法打开目录选择器，请稍后重试。');
+    return;
+  }
+  const selected = await picked.json();
+  const response = await fetch(
+    `/workspaces/${encodeURIComponent(workspaceId)}/roots`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: selected.path }),
+    },
+  );
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    showError(data.detail || '关联目录失败');
+    return;
+  }
+  replaceWorkspaceEntry(data);
+}
+
+async function detachWorkspaceRoot(workspaceId, path) {
+  clearError();
+  const response = await fetch(
+    `/workspaces/${encodeURIComponent(workspaceId)}/roots?path=${encodeURIComponent(path)}`,
+    { method: 'DELETE' },
+  );
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    showError(data.detail || '解除关联失败');
+    return;
+  }
+  replaceWorkspaceEntry(data);
+}
+
+function replaceWorkspaceEntry(workspace) {
+  const index = workspaces.findIndex((item) => item.id === workspace.id);
+  if (index >= 0) {
+    workspaces[index] = { ...workspaces[index], ...workspace };
+  } else {
+    workspaces.push(workspace);
+  }
+  updateWorkspaceState();
+}
+
 function createConversation() {
   persistActiveDraft();
   if (!activeWorkspaceId) {
@@ -1242,6 +1355,7 @@ function createConversation() {
     draft: '',
     isLocalDraft: true,
     autoApprove: false,
+    langfuseEnabled: false,
   };
   conversations.unshift(conversation);
   activeConversationId = conversation.id;
@@ -1465,6 +1579,34 @@ function renderAutoApproveToggle() {
   };
 }
 
+function renderLangfuseToggle() {
+  const checkbox = document.getElementById('session-langfuse');
+  if (!checkbox) return;
+  const conversation = getActiveConversation();
+  checkbox.checked = Boolean(conversation?.langfuseEnabled);
+  checkbox.disabled = !conversation || Boolean(conversation.langfusePending);
+  checkbox.onchange = async () => {
+    if (!conversation || conversation.langfusePending) return;
+    const enabled = checkbox.checked;
+    conversation.langfusePending = true;
+    checkbox.disabled = true;
+    try {
+      const response = await fetch(`/sessions/${encodeURIComponent(conversation.id)}/langfuse`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({enabled}),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'Langfuse 设置保存失败');
+      conversation.langfuseEnabled = data.enabled;
+    } catch (error) {
+      showError(error.message || 'Langfuse 设置保存失败');
+    } finally {
+      conversation.langfusePending = false;
+      renderLangfuseToggle();
+    }
+  };
+}
+
 function updateReasoningOptions() {
   const selected = document.getElementById('model-profile')?.value;
   const profile = modelProfiles.find(item => item.id === selected);
@@ -1486,6 +1628,7 @@ function renderConversations() {
   renderSessionId(active);
   renderModelSelector();
   renderAutoApproveToggle();
+  renderLangfuseToggle();
 }
 
 // The Session id is what a Task, a Turn and any log line refer back to, so it
@@ -4519,7 +4662,18 @@ function toolFailureDescription(progress) {
   if (progress.error_code === 'UNKNOWN_OUTCOME') {
     return `结果未确认（UNKNOWN_OUTCOME）${detail ? `：${detail}` : ''}。可继续查询实际状态。`;
   }
-  return `失败${progress.error_code ? `（${progress.error_code}）` : ''}${detail ? `：${detail}` : ''}`;
+  const details = detail ? [detail] : [];
+  const command = progress.command_failure;
+  if (command) {
+    if (!detail && progress.error_code === 'PROCESS_TIMED_OUT') details.push('命令执行超时');
+    if (!detail && progress.error_code === 'PROCESS_CANCELLED') details.push('命令已取消');
+    if (Number.isInteger(command.exit_code)) details.push(`退出码 ${command.exit_code}`);
+    if (command.no_match) details.push('未找到匹配');
+    else if (command.output_empty) details.push('无标准输出和错误输出');
+    if (command.stderr) details.push(`stderr：${command.stderr}`);
+    if (command.stdout) details.push(`stdout：${command.stdout}`);
+  }
+  return `失败${progress.error_code ? `（${progress.error_code}）` : ''}${details.length ? `：${details.join(' · ')}` : ''}`;
 }
 
 function describeProgress(progress) {
@@ -4615,9 +4769,18 @@ function describeProgress(progress) {
         ? `：${progress.diagnostic_detail}` : '';
       return `${prefix} 失败${code}${detail}`;
     }
+    if (event === 'network_waiting') {
+      const waited = Math.round(progress.waited_seconds || 0);
+      return `${prefix}：网络不可用，已等待 ${waited} 秒，恢复后自动继续`;
+    }
+    if (event === 'network_recovered') {
+      const waited = Math.round(progress.waited_seconds || 0);
+      return `${prefix}：网络已恢复（等待 ${waited} 秒），继续本次请求`;
+    }
     if (event === 'recovery_decided') {
       const action = {
         FALLBACK_TRANSPORT: '切换为非流式请求',
+        WAIT_FOR_NETWORK: '等待网络恢复',
         RETRY_SAME_REQUEST: '重试同一请求',
         RESAMPLE: '重新采样',
         RESAMPLE_WITH_CORRECTION: '修正后重试',
@@ -5084,6 +5247,265 @@ function turnCallTarget(call) {
   return target ? String(target) : '';
 }
 
+// 命令/工具执行统一按“卡片”呈现：标题栏给出命令与耗时·状态，展开后是参数、
+// 实际输出和工具标识。默认收起，点标题栏随时展开/收起。
+const TOOL_CARD_NEWLINE = String.fromCharCode(10);
+// 卡片标题栏的 đ展开/收起”状态跟调用绑定，live 面板每次重绘都重建 DOM，
+// 不存到外面就会出现“点了没反应”（一下帧就被重置）。
+const TOOL_CARD_OPEN_STATE = new Map();
+
+// 参数按 “key: value” 一行一项展示：JSON 的括号、引号、逗号对读命令没帮助。
+function toolCardArgumentValue(value) {
+  if (typeof value === 'string') return value;
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value) && value.every((item) => typeof item === 'string' || typeof item === 'number')) {
+    return value.map((item) => String(item)).join(' ');
+  }
+  try {
+    return JSON.stringify(value);
+  } catch (error) {
+    return String(value);
+  }
+}
+
+function toolCardArguments(model) {
+  let args = model.arguments && typeof model.arguments === 'object' ? model.arguments : null;
+  if (!args && model.argumentsText) {
+    try {
+      const parsed = JSON.parse(model.argumentsText);
+      args = parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (error) {
+      // 超长参数会被截断成不完整 JSON；去掉外层括号和首尾空白，只留内容。
+      return model.argumentsText.replace(/^[\s{]+|[\s}]+$/g, '');
+    }
+  }
+  if (!args) return model.presentation || '';
+  const lines = Object.keys(args).map((key) => {
+    let text = toolCardArgumentValue(args[key]);
+    if (text.length > 400) text = text.slice(0, 400) + '…';
+    return `${key}: ${text}`;
+  });
+  return lines.join(TOOL_CARD_NEWLINE) || (model.presentation || '');
+}
+
+function toolCardKind(name) {
+  if (name === 'core.run_command') return 'execute';
+  if (name.startsWith('mcp.')) return 'mcp';
+  if (name.startsWith('core.')) return 'read_only';
+  return '';
+}
+
+// Live progress and durable progress items describe the same execution with
+// slightly different field names; accept both so one card covers both views.
+function toolCardModel(progress) {
+  if (!progress) return null;
+  const kind = progress.kind;
+  if (kind !== 'tool_started' && kind !== 'tool_completed') return null;
+  const completed = kind === 'tool_completed';
+  const failure = progress.command_failure && typeof progress.command_failure === 'object'
+    ? progress.command_failure : {};
+  const output = progress.output && typeof progress.output === 'object'
+    ? progress.output : {};
+  const streams = [];
+  [output.stdout, output.stderr, failure.stdout, failure.stderr].forEach((text) => {
+    if (typeof text === 'string' && text.trim() && !streams.includes(text.trim())) {
+      streams.push(text.trim());
+    }
+  });
+  const exitCode = Number.isInteger(progress.exit_code)
+    ? progress.exit_code
+    : (Number.isInteger(failure.exit_code) ? failure.exit_code : null);
+  const name = String(progress.tool_name || '未知工具');
+  const target = String(progress.target || '');
+  const argv = progress.operation_arguments && typeof progress.operation_arguments === 'object'
+    ? progress.operation_arguments.argv : null;
+  const joined = Array.isArray(argv) && argv.length
+    ? argv.map((part) => String(part)).join(' ')
+    : '';
+  const explicit = String(progress.operation_presentation || progress.command || joined || '');
+  return {
+    name,
+    callId: String(progress.tool_call_id || ''),
+    command: explicit || (target ? `${name} ${target}` : name),
+    target,
+    arguments: progress.operation_arguments || progress.arguments || null,
+    argumentsText: typeof progress.arguments_text === 'string' ? progress.arguments_text : '',
+    presentation: String(progress.operation_presentation || ''),
+    output: streams.length ? streams.join(TOOL_CARD_NEWLINE + TOOL_CARD_NEWLINE) : '',
+    status: completed
+      ? (progress.ok === false ? 'failed' : 'ok')
+      : (progress.incomplete ? 'incomplete' : 'running'),
+    errorCode: String(progress.error_code || ''),
+    exitCode,
+    elapsedSeconds: typeof progress.elapsed_seconds === 'number' ? progress.elapsed_seconds : null,
+    source: String(progress.tool_source || ''),
+    kind: toolCardKind(name),
+  };
+}
+
+function toolCardSection(label, text) {
+  const section = document.createElement('div');
+  const heading = document.createElement('div');
+  heading.className = 'tool-card-section-title';
+  heading.textContent = label;
+  const pre = document.createElement('pre');
+  pre.className = 'tool-card-pre';
+  pre.textContent = text;
+  section.appendChild(heading);
+  section.appendChild(pre);
+  return section;
+}
+
+function toolExecutionCard(model) {
+  const stateKey = model.callId || `${model.name}|${model.command}`;
+  const initiallyOpen = TOOL_CARD_OPEN_STATE.get(stateKey) === true;
+  const card = document.createElement('div');
+  card.className = 'tool-card';
+  card.dataset.open = initiallyOpen ? 'true' : 'false';
+  card.dataset.status = model.status;
+
+  const head = document.createElement('button');
+  head.type = 'button';
+  head.className = 'tool-card-head';
+  head.title = '点击展开/收起执行详情';
+  if (typeof head.setAttribute === 'function') {
+    head.setAttribute('aria-expanded', initiallyOpen ? 'true' : 'false');
+  }
+  const caret = document.createElement('span');
+  caret.className = 'tool-card-caret';
+  caret.textContent = initiallyOpen ? '▾' : '▸';
+  const title = document.createElement('span');
+  title.className = 'tool-card-title';
+  title.textContent = model.status === 'running'
+    ? '执行命令'
+    : (model.status === 'incomplete' ? '已结束' : '已运行');
+  const command = document.createElement('span');
+  command.className = 'tool-card-command';
+  command.textContent = model.command || model.name;
+  command.title = model.command || model.name;
+  const meta = document.createElement('span');
+  meta.className = 'tool-card-meta';
+  if (model.elapsedSeconds !== null) {
+    const elapsed = document.createElement('span');
+    elapsed.textContent = model.elapsedSeconds < 1
+      ? `${Math.round(model.elapsedSeconds * 1000)}ms`
+      : `${model.elapsedSeconds.toFixed(1)}s`;
+    meta.appendChild(elapsed);
+  }
+  const status = document.createElement('span');
+  status.className = `tool-card-status ${model.status === 'ok' ? 'ok' : 'failed'}`;
+  if (model.status === 'running') {
+    status.textContent = '运行中';
+  } else if (model.status === 'incomplete') {
+    // 本轮已结束却没有完成事件：这是孤儿卡片，不能继续声称在运行。
+    status.textContent = '未完成';
+  } else if (model.status === 'failed') {
+    status.textContent = model.errorCode
+      || (model.exitCode === null ? '失败' : `退出码 ${model.exitCode}`);
+  } else {
+    status.textContent = '完成';
+  }
+  meta.appendChild(status);
+  head.appendChild(caret);
+  head.appendChild(title);
+  head.appendChild(command);
+  head.appendChild(meta);
+
+  const body = document.createElement('div');
+  body.className = 'tool-card-body';
+  body.hidden = !initiallyOpen;
+  // 除了 [hidden]，再写一份内联 display：任何后续 CSS 的 display 都盖不掉它。
+  body.style.display = initiallyOpen ? '' : 'none';
+
+  const argumentsText = toolCardArguments(model);
+  if (argumentsText) body.appendChild(toolCardSection('参数', argumentsText));
+  const placeholder = model.status === 'running'
+    ? '运行中，尚未产生输出'
+    : (model.name === 'core.run_command' ? '无标准输出' : '该工具不产生命令行输出');
+  body.appendChild(toolCardSection('输出', model.output || placeholder));
+
+  const facts = document.createElement('dl');
+  facts.className = 'tool-card-facts';
+  const rows = [
+    ['工具标识', model.name],
+    ['工具分类', model.kind],
+    ['工具来源', model.source],
+    ['调用对象', model.target],
+    ['调用 ID', model.callId],
+  ].filter((row) => row[1]);
+  rows.forEach((row) => {
+    const term = document.createElement('dt');
+    term.textContent = row[0];
+    const detail = document.createElement('dd');
+    detail.textContent = String(row[1]);
+    facts.appendChild(term);
+    facts.appendChild(detail);
+  });
+  if (rows.length) body.appendChild(facts);
+
+  head.addEventListener('click', () => {
+    const open = card.dataset.open === 'true';
+    const next = !open;
+    card.dataset.open = next ? 'true' : 'false';
+    TOOL_CARD_OPEN_STATE.set(stateKey, next);
+    body.hidden = !next;
+    body.style.display = next ? '' : 'none';
+    caret.textContent = next ? '▾' : '▸';
+    if (typeof head.setAttribute === 'function') {
+      head.setAttribute('aria-expanded', next ? 'true' : 'false');
+    }
+  });
+
+  card.appendChild(head);
+  card.appendChild(body);
+  return card;
+}
+
+// 一个 call 只应占一张卡片：completed 到了就更新那条 started。否则已经跑完的
+// 命令会在历史里留下一条永远“运行中”的旧卡片。
+function mergeToolProgress(items, readProgress, mergeEntry) {
+  const byCall = new Map();
+  const merged = [];
+  items.forEach((item) => {
+    const progress = readProgress(item);
+    const kind = progress && progress.kind;
+    if (kind !== 'tool_started' && kind !== 'tool_completed') {
+      merged.push(item);
+      return;
+    }
+    const callId = String(progress.tool_call_id || '');
+    const index = callId ? byCall.get(callId) : undefined;
+    if (index !== undefined) {
+      merged[index] = mergeEntry(merged[index], item, readProgress(merged[index]), progress);
+      return;
+    }
+    if (callId) byCall.set(callId, merged.length);
+    merged.push(item);
+  });
+  return merged;
+}
+
+function mergeLiveToolEntries(entries) {
+  return mergeToolProgress(
+    entries,
+    (entry) => (entry && entry.progressData ? entry.progressData : null),
+    (current, incoming, currentProgress, incomingProgress) => ({
+      ...current,
+      progressData: { ...currentProgress, ...incomingProgress },
+      text: incoming.text || current.text,
+    }),
+  );
+}
+
+function mergeDurableToolItems(items) {
+  return mergeToolProgress(
+    items,
+    (item) => (item && typeof item === 'object' ? item : null),
+    (current, incoming) => ({ ...current, ...incoming }),
+  );
+}
+
 // Live view of the Turn that is running: model calls ("thinking") and tool
 // calls, in the order they happened. It disappears as soon as the Turn settles,
 // where the durable per-Turn panel above takes over.
@@ -5115,8 +5537,16 @@ function renderLiveTurnPanel(task) {
         : '正在思考…';
     panel.appendChild(pending);
   } else {
-    lines.forEach((item) => {
+    mergeLiveToolEntries(lines).forEach((item) => {
       const kind = item.progressData?.kind || '';
+      const card = toolCardModel(item.progressData);
+      if (card) {
+        const holder = document.createElement('div');
+        holder.className = 'tool-card-row';
+        holder.appendChild(toolExecutionCard(card));
+        panel.appendChild(holder);
+        return;
+      }
       const row = document.createElement('div');
       row.className = 'live-turn-line';
       if (kind === 'model_started' || kind === 'tool_started') {
@@ -5124,6 +5554,7 @@ function renderLiveTurnPanel(task) {
       } else if (item.progressData?.ok === false) {
         row.classList.add('failed');
       }
+      if (kind === 'commentary') row.classList.add('turn-progress-note');
       row.textContent = item.text;
       panel.appendChild(row);
     });
@@ -5145,7 +5576,12 @@ function turnProgressLines(items) {
   const closedApprovals = new Set((items || [])
     .filter((item) => ['approval_resolved', 'approval_invalidated'].includes(item?.kind))
     .map((item) => item.request_id).filter(Boolean));
-  (items || []).forEach((item) => {
+  // A Turn that already ended cannot still be executing a tool: a started item
+  // without a completion is an orphan (interrupted, cancelled, stream lost).
+  const settled = (items || []).some((item) => [
+    'turn_completed', 'turn_interrupted', 'turn_failed', 'turn_conflict',
+  ].includes(item?.kind));
+  mergeDurableToolItems(items || []).forEach((item) => {
     const kind = item?.kind || '';
     if (kind === 'turn_started') {
       lines.push({ text: '本轮开始', tone: 'active' });
@@ -5157,17 +5593,19 @@ function turnProgressLines(items) {
       lines.push({
         text: `调用工具：${name}${item.target ? ` · ${item.target}` : ''}`,
         tone: 'active',
+        card: toolCardModel({ ...item, tool_name: name, incomplete: settled }),
       });
       return;
     }
     if (kind === 'tool_completed') {
-      const name = names.get(item.tool_call_id) || '工具';
+      const name = item.tool_name || names.get(item.tool_call_id) || '工具';
       const ok = item.ok !== false;
       lines.push({
         text: ok
           ? `${name} 完成`
           : `${name} ${toolFailureDescription(item)}`,
         tone: ok ? '' : 'failed',
+        card: toolCardModel({ ...item, tool_name: name }),
       });
       return;
     }
@@ -5237,7 +5675,13 @@ function turnProgressLines(items) {
     }
     const described = describeProgress(item);
     if (described) {
-      lines.push({ text: described, tone: item.ok === false ? 'failed' : '' });
+      // A commentary fragment is real prose, not a status line: it needs its own
+      // breathing room between the progress rows around it.
+      lines.push({
+        text: described,
+        tone: item.ok === false ? 'failed' : '',
+        note: kind === 'commentary',
+      });
     }
   });
   return lines;
@@ -5310,8 +5754,16 @@ function renderTurnCallPanel(conversation, message) {
     const list = document.createElement('div');
     list.className = 'turn-call-list turn-progress-list';
     lines.forEach((line) => {
+      if (line.card) {
+        const holder = document.createElement('div');
+        holder.className = 'tool-card-row';
+        holder.appendChild(toolExecutionCard(line.card));
+        list.appendChild(holder);
+        return;
+      }
       const row = document.createElement('div');
       row.className = `live-turn-line ${line.tone || ''}`.trim();
+      if (line.note) row.classList.add('turn-progress-note');
       row.textContent = line.text;
       list.appendChild(row);
     });
@@ -5673,6 +6125,7 @@ async function loadSessions() {
         modelProfileId: item.model_profile_id || defaultModelProfile,
         reasoningEffort: item.reasoning_effort || null,
         autoApprove: Boolean(item.auto_approve),
+        langfuseEnabled: Boolean(item.langfuse_enabled),
       });
     });
   } catch (error) {
@@ -5688,20 +6141,35 @@ async function ensureConversationLoaded(conversationId) {
   conversation.historyLoadGeneration = loadGeneration;
   const selectionGeneration = conversation.modelSelectionGeneration || 0;
   const restoreSelection = !conversation.modelSelectionPending;
-  try {
+  async function readHistory() {
     const response = await fetch(`/sessions/${conversationId}`);
-    if (response.status === 404) {
-      // A missing history leaves the current draft or transcript in place.
-      if (conversation.historyLoadGeneration === loadGeneration) conversation.loaded = false;
-      return false;
-    }
+    if (response.status === 404) return null;
     if (!response.ok) {
       throw new Error(`历史记录接口返回 ${response.status}`);
     }
-    const data = await response.json();
+    return response.json();
+  }
+
+  try {
+    let data;
+    try {
+      data = await readHistory();
+    } catch (error) {
+      // Fetch and response-body transport failures can clear on reconnect.
+      if (error?.name !== 'TypeError') throw error;
+      if (conversation.historyLoadGeneration !== loadGeneration) return false;
+      await new Promise(resolve => setTimeout(resolve, 300));
+      if (conversation.historyLoadGeneration !== loadGeneration) return false;
+      data = await readHistory();
+    }
     // A history request started before a Turn finished may return afterwards.
     // Only the newest refresh can replace the transcript or reopen a follower.
     if (conversation.historyLoadGeneration !== loadGeneration) return false;
+    if (data === null) {
+      // A missing history leaves the current draft or transcript in place.
+      conversation.loaded = false;
+      return false;
+    }
     if (restoreSelection && !conversation.modelSelectionPending
         && selectionGeneration === (conversation.modelSelectionGeneration || 0)) {
       conversation.modelProfileId = data.model_profile_id || defaultModelProfile;
@@ -5884,11 +6352,8 @@ async function ensureConversationLoaded(conversationId) {
   } catch (error) {
     if (conversation.historyLoadGeneration === loadGeneration) {
       conversation.loaded = false;
-      if (conversationId === activeConversationId) {
-        showError(`会话历史加载失败：${error.message || '请重试'}`, conversationId);
-      }
+      console.error('会话历史加载失败', error);
     }
-    console.error(error);
     return false;
   }
 }
@@ -5989,8 +6454,8 @@ async function loadSkillMenuSkills() {
   } finally {
     skillMenuLoading = false;
   }
-  // 加载完成时如果用户还停在 /skill 前缀，就地刷新菜单。
-  if (promptComposer && isSkillMenuMode(promptComposer.value)) {
+  // 加载完成时如果用户还停在 "/..." 前缀，就地刷新菜单。
+  if (promptComposer && promptComposer.value.startsWith('/')) {
     renderSlashMenu(promptComposer);
   }
 }
@@ -6015,14 +6480,35 @@ function resolveSkillMenuItems(query) {
   }));
 }
 
+// 直接以名称前缀触发 Skill 联想：输入 "/ph" 就该看到 ph-* 的 Skill，不必先打 "/skill"。
+// 每次最多展示 DIRECT_SKILL_MENU_LIMIT 条，避免把命令挤出菜单。
+const DIRECT_SKILL_MENU_LIMIT = 8;
+
+function resolveDirectSkillItems(query) {
+  if (skillMenuSkills === null) {
+    // 首次输入时才读一次目录；读完 loadSkillMenuSkills 会就地重绘菜单。
+    if (!skillMenuLoading) loadSkillMenuSkills();
+    return [];
+  }
+  if (!query || skillMenuError) return [];
+  const prefixed = skillMenuSkills.filter(skill => skill.name.toLowerCase().startsWith(query));
+  const contained = skillMenuSkills.filter(skill => !skill.name.toLowerCase().startsWith(query)
+    && skill.name.toLowerCase().includes(query));
+  return [...prefixed, ...contained].slice(0, DIRECT_SKILL_MENU_LIMIT).map(skill => ({
+    kind: 'skill', label: skill.name, description: skill.description, badge: skillSourceLabel(skill.source), skill,
+  }));
+}
+
 function resolveSlashMenuItems(value) {
   if (isSkillMenuMode(value)) {
     return resolveSkillMenuItems(value.slice(SKILL_MENU_PREFIX.length).trim());
   }
   const query = value.slice(1).trim().toLowerCase();
-  return slashCommands
+  const commandEntries = slashCommands
     .filter(command => !query || command.prefix.slice(1).trim().toLowerCase().startsWith(query))
     .map(command => ({ kind: 'command', label: command.label, description: command.description, badge: '', command }));
+  // 命令排在前面，名称前缀命中的 Skill 追加在后面；方向键与 Enter 使用同一份列表。
+  return [...commandEntries, ...resolveDirectSkillItems(query)];
 }
 
 function ensureSlashMenu() {
@@ -6056,6 +6542,8 @@ function hideSlashMenu() {
 function renderSlashMenu(anchorInput) {
   const menu = ensureSlashMenu();
   menu.innerHTML = '';
+  // 重绘后从第一条开始看，不能沿用上一次的滚动位置。
+  menu.scrollTop = 0;
   slashMenuActiveIndex = -1;
 
   slashMenuItems = resolveSlashMenuItems(anchorInput.value);
@@ -6131,6 +6619,22 @@ function renderSlashMenu(anchorInput) {
   }
 }
 
+// 键盘在长列表里移动时把选中项滚进菜单可视区：向下越界让该条贴住底部，
+// 向上越界让该条贴住顶部。菜单本身是 maxHeight + overflowY:auto，不会自己跟随高亮。
+function revealSlashMenuItem(element) {
+  if (!slashMenuElement || !(element instanceof HTMLElement)) return;
+  const menu = slashMenuElement;
+  const itemTop = element.offsetTop;
+  const itemBottom = itemTop + element.offsetHeight;
+  const visibleTop = menu.scrollTop;
+  const visibleBottom = visibleTop + menu.clientHeight;
+  if (itemBottom > visibleBottom) {
+    menu.scrollTop = itemBottom - menu.clientHeight;
+  } else if (itemTop < visibleTop) {
+    menu.scrollTop = itemTop;
+  }
+}
+
 function highlightSlashMenuItem(index) {
   if (!slashMenuElement) return;
   const children = Array.from(slashMenuElement.children);
@@ -6144,6 +6648,7 @@ function highlightSlashMenuItem(index) {
     }
   });
   slashMenuActiveIndex = index;
+  revealSlashMenuItem(children[index]);
 }
 
 function moveSlashMenuSelection(delta) {
@@ -6189,7 +6694,15 @@ function skillMentionText(name) {
   return `使用 Skill「${name}」：先用 skill.load 读取 SKILL.md，再按其中的步骤执行。`;
 }
 
-// 选中 Skill 后把 "/skill 关键词" 这段触发文本替换成引用句，光标停在句尾方便继续描述任务。
+// 只由 "/前缀" 触发的待替换文本：整段以斜杠开头且不含空白，例如 "/ph"。
+function isDirectSkillQuery(value) {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('/') || isSkillMenuMode(value)) return false;
+  // 触发文本只能是单个 token；出现任何空白说明用户在写句子，按光标插入即可。
+  return !Array.from(trimmed).some(char => char.trim() === '');
+}
+
+// 选中 Skill 后把 "/skill 关键词" 或 "/ph" 这段触发文本替换成引用句，光标停在句尾方便继续描述任务。
 function applySkillMention(skill, input) {
   const mention = skillMentionText(skill.name);
   const value = input.value;
@@ -6197,7 +6710,7 @@ function applySkillMention(skill, input) {
   const selectionEnd = input.selectionEnd ?? selectionStart;
   let nextValue;
   let cursorPos;
-  if (isSkillMenuMode(value)) {
+  if (isSkillMenuMode(value) || isDirectSkillQuery(value)) {
     nextValue = mention;
     cursorPos = mention.length;
   } else {
@@ -6378,6 +6891,7 @@ session_workspace_bindings: dict[str, str] = {}
 # Web-only per-Session preference: the switch decides whether this UI submits
 # APPROVE on its own. It never widens what the Runtime already permits.
 session_auto_approvals: dict[str, bool] = {}
+web_langfuse = WebLangfuse()
 # Removal is an explicit deny-list rather than "absent from the index": the
 # Runtime keeps owning the Session and Task records, and the startup recovery
 # below rebuilds the index from them, so absence alone would resurrect entries.
@@ -6462,10 +6976,20 @@ def load_workspace_registry() -> None:
         if not path or not Path(path).is_dir():
             # A directory that disappeared must not stay selectable.
             continue
+        if path in removed_workspace_paths:
+            # The user removed this workspace from the sidebar; a stale copy of
+            # the index must not resurrect it on the next start.
+            continue
         workspace_registry.append({
             "id": workspace_identifier(path),
             "name": str(item.get("name") or Path(path).name or path),
             "path": path,
+            # Attached roots bound the same workspace. A root that disappeared is
+            # dropped here so it never stays silently writable.
+            "roots": [
+                str(root) for root in item.get("roots", [])
+                if isinstance(root, str) and root.strip() and Path(root).is_dir()
+            ],
             **({"last_used_at": item["last_used_at"]} if isinstance(item.get("last_used_at"), str) else {}),
         })
 
@@ -6648,16 +7172,20 @@ def recover_workspace_registry_from_runtime() -> None:
 @app.on_event("startup")
 async def startup() -> None:
     global runtime_server, runtime_error, configuration_issues, turn_request_diagnostics
+    # Removals load first: the registry filters against that deny-list while it
+    # restores entries, otherwise a removed workspace reappears after restart.
+    load_web_removals()
     load_workspace_registry()
     load_session_workspace_bindings()
     load_session_auto_approvals()
-    load_web_removals()
     runtime_server = LocalEventApiServer(Path.cwd())
     try:
         runtime_server.start()
         turn_request_diagnostics = configure_request_diagnostics(
             runtime_server._client.application
         )
+        store = runtime_server._client.application.kernel.dependencies.store
+        store.on_task_commit = lambda unit: web_langfuse.observe_commit(store, unit)
         recover_workspace_registry_from_runtime()
         runtime_error = None
         configuration_issues = list(getattr(
@@ -6674,7 +7202,10 @@ async def shutdown() -> None:
     global turn_request_diagnostics
     turn_request_diagnostics = None
     if runtime_server is not None:
-        runtime_server.stop()
+        try:
+            runtime_server._call(web_langfuse.close())
+        finally:
+            runtime_server.stop()
 
 
 @app.get("/")
@@ -6775,6 +7306,7 @@ def register_workspace(raw_path: str) -> dict[str, str]:
         "id": workspace_identifier(workspace_path),
         "name": resolved.name or workspace_path,
         "path": workspace_path,
+        "roots": [],
         "last_used_at": datetime.now(timezone.utc).isoformat(),
     }
     workspace_registry.append(workspace)
@@ -6906,6 +7438,75 @@ async def pick_workspace() -> Response:
     return JSONResponse(content=register_workspace(selected))
 
 
+@app.post("/workspaces/pick-root")
+async def pick_workspace_root() -> Response:
+    """Let the user choose an extra root directory without registering one."""
+    selected = await asyncio.to_thread(choose_workspace_directory)
+    if selected is None:
+        return Response(status_code=204)
+    return JSONResponse(content={
+        "path": str(Path(selected).expanduser().resolve(strict=False))
+    })
+
+
+def _workspace_entry(workspace_id: str) -> dict:
+    workspace = next(
+        (item for item in workspace_registry if item["id"] == workspace_id), None
+    )
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="工作区不存在")
+    return workspace
+
+
+@app.post("/workspaces/{workspace_id}/roots")
+async def attach_workspace_root(workspace_id: str, payload: dict) -> dict:
+    """Attach one extra root directory to an existing workspace.
+
+    The primary directory keeps its role: relative paths still resolve there,
+    and an attached root is reachable through absolute paths it contains.
+    """
+    workspace = _workspace_entry(workspace_id)
+    candidate = str(payload.get("path", "")).strip()
+    if not candidate:
+        raise HTTPException(status_code=400, detail="关联目录不能为空")
+    try:
+        resolved = Path(candidate).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise HTTPException(
+            status_code=400, detail=f"无法访问所选目录：{error}"
+        ) from error
+    if not resolved.is_dir():
+        raise HTTPException(status_code=400, detail="所选路径不是目录")
+    primary = Path(str(workspace["path"])).expanduser().resolve(strict=False)
+    if resolved == primary:
+        raise HTTPException(status_code=400, detail="主目录已经是工作区根目录")
+    roots = [
+        str(item) for item in workspace.get("roots", []) if isinstance(item, str)
+    ]
+    if str(resolved) not in roots:
+        roots.append(str(resolved))
+        workspace["roots"] = roots
+        save_workspace_registry()
+    return workspace
+
+
+@app.delete("/workspaces/{workspace_id}/roots")
+async def detach_workspace_root(workspace_id: str, path: str = "") -> dict:
+    """Detach one extra root directory; the directory itself is untouched."""
+    workspace = _workspace_entry(workspace_id)
+    if not path.strip():
+        raise HTTPException(status_code=400, detail="path is required")
+    target = str(Path(path).expanduser().resolve(strict=False))
+    roots = [
+        str(item) for item in workspace.get("roots", []) if isinstance(item, str)
+    ]
+    remaining = [item for item in roots if item != target]
+    if remaining != roots:
+        workspace["roots"] = remaining
+        save_workspace_registry()
+    return workspace
+
+
 @app.post("/workspaces/{workspace_id}/trust")
 async def set_workspace_trust(workspace_id: str, payload: dict) -> dict:
     """Persist an explicit workspace trust choice.
@@ -6935,18 +7536,18 @@ async def set_workspace_trust(workspace_id: str, payload: dict) -> dict:
     return {**workspace, "trust_level": binding.level.value, "trust": binding.to_data()}
 
 
-def _require_local_diagnostic_request(request: Request | None) -> None:
+def _require_local_diagnostic_request(request: Request | None, *, purpose: str = "diagnostics") -> None:
     if request is None or request.client is None:
-        raise HTTPException(status_code=403, detail='diagnostics require a local request')
+        raise HTTPException(status_code=403, detail=f'{purpose} requires a local request')
     try:
         peer_is_local = ipaddress.ip_address(request.client.host).is_loopback
     except ValueError:
         peer_is_local = False
     if not peer_is_local or request.url.hostname not in {'localhost', '127.0.0.1', '::1'}:
-        raise HTTPException(status_code=403, detail='diagnostics require loopback access')
+        raise HTTPException(status_code=403, detail=f'{purpose} requires loopback access')
     origin = request.headers.get('origin')
     if origin and origin.rstrip('/') != str(request.base_url).rstrip('/'):
-        raise HTTPException(status_code=403, detail='diagnostic origin mismatch')
+        raise HTTPException(status_code=403, detail=f'{purpose} origin mismatch')
 
 
 @app.post("/turn-diagnostics/read")
@@ -7008,6 +7609,23 @@ async def update_session_auto_approve(session_id: str, payload: dict) -> dict:
         session_auto_approvals.pop(session_id, None)
     save_session_auto_approvals()
     return {"session_id": session_id, "auto_approve": enabled}
+
+
+@app.post("/sessions/{session_id}/langfuse")
+async def update_session_langfuse(session_id: str, payload: dict, request: Request) -> dict:
+    _require_local_diagnostic_request(request, purpose="Langfuse")
+    if runtime_server is None:
+        raise HTTPException(status_code=503, detail="Runtime unavailable")
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="enabled must be a boolean")
+    if session_id in removed_session_ids:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    try:
+        runtime_server._call(web_langfuse.configure(session_id, enabled))
+    except LangfuseExportError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    return {"session_id": session_id, "enabled": enabled}
 
 
 @app.post("/session-input")
@@ -7835,6 +8453,16 @@ async def create_task(payload: dict) -> dict:
     if session_id is not None:
         bind_session_to_workspace(session_id, workspace_id)
 
+    # Attached roots come from the workspace entry, not from the browser: the
+    # Task must be created with every root the workspace was configured with.
+    workspace_entry = next(
+        (item for item in workspace_registry if item["id"] == workspace_id), None
+    )
+    attached_roots = tuple(
+        str(item) for item in (workspace_entry or {}).get("roots", [])
+        if isinstance(item, str) and item.strip()
+    )
+
     goal = str(payload.get("goal", ""))
     image_blocks = _normalize_image_blocks(payload.get("images"))
     if image_blocks:
@@ -7850,6 +8478,7 @@ async def create_task(payload: dict) -> dict:
             session_id=session_id,
             images=tuple(image_blocks),
             workspace=Path(workspace_path),
+            workspace_roots=attached_roots,
         ))
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
@@ -7879,6 +8508,8 @@ async def remove_session(session_id: str) -> dict:
         save_session_workspace_bindings()
     if session_auto_approvals.pop(session_id, None) is not None:
         save_session_auto_approvals()
+    if web_langfuse.enabled(session_id):
+        runtime_server._call(web_langfuse.configure(session_id, False))
     return {"removed_session_id": session_id}
 
 
@@ -7922,6 +8553,7 @@ async def list_sessions(limit: int = 40) -> dict:
             "latest_task_id": latest_task_id,
             "model_profile_id": getattr(snapshot, "model_profile_id", None),
             "auto_approve": session_auto_approvals.get(snapshot.session_id, False),
+            "langfuse_enabled": web_langfuse.enabled(snapshot.session_id),
             "reasoning_effort": getattr(snapshot, "reasoning_effort", None),
             "updated_at": snapshot.updated_at.isoformat(),
         })
@@ -7971,6 +8603,7 @@ async def get_session(session_id: str) -> dict:
             unfinished_turn_by_task[task_id] = turn_id
     for task_id in snapshot.task_ids:
         approval_turns: dict[str, str] = {}
+        tool_calls: dict[tuple[str, str], tuple[str, bool]] = {}
         for event in runtime_server._call(
             kernel.dependencies.store.read_events(
                 task_id, event_types=_TURN_PROGRESS_EVENT_TYPES,
@@ -7979,6 +8612,7 @@ async def get_session(session_id: str) -> dict:
             payload = event.payload if isinstance(event.payload, Mapping) else {}
             item = _turn_progress_item(
                 event, fallback_turn_id=approval_turns.get(str(payload.get("request_id") or "")),
+                tool_calls=tool_calls,
             )
             if item is None:
                 continue
@@ -8035,6 +8669,7 @@ async def get_session(session_id: str) -> dict:
         "title": snapshot.title,
         "model_profile_id": getattr(snapshot, "model_profile_id", None),
         "auto_approve": session_auto_approvals.get(snapshot.session_id, False),
+        "langfuse_enabled": web_langfuse.enabled(snapshot.session_id),
         "reasoning_effort": getattr(snapshot, "reasoning_effort", None),
         "active_task_id": snapshot.active_task_id,
         "latest_task_id": latest["task_id"] if latest else None,

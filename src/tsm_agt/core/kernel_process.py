@@ -540,12 +540,15 @@ class ProcessMixin:
             ),),
         )
 
-    def _resolve_process_cwd(self, workspace: Path, cwd: str) -> Path:
+    def _resolve_process_cwd(self, roots: tuple[Path, ...], cwd: str) -> Path:
         if not cwd.strip() or "\x00" in cwd:
             raise ValueError("process cwd must not be empty or contain NUL")
+        from .workspace_roots import select_root_for_path
+
+        root, root_relative = select_root_for_path(roots, cwd)
         try:
             resolved = self._dependencies.workspace_path.resolve_access_path(
-                workspace, cwd
+                root, root_relative
             ).path
         except (PermissionError, ValueError) as error:
             raise ValueError("process cwd must stay inside the workspace") from error
@@ -583,7 +586,7 @@ class ProcessMixin:
         """
         executor = self._require_process_executor()
         try:
-            resolved_cwd = self._resolve_process_cwd(Path(task.workspace), cwd)
+            resolved_cwd = self._resolve_process_cwd(task.all_workspace_roots(), cwd)
         except (OSError, ValueError) as error:
             raise ProcessPreparationError(
                 "INVALID_PARAM", str(error), executable=argv[0], stage="resolve_cwd",

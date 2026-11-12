@@ -53,6 +53,24 @@ class RuleBasedModelRecoveryPolicy:
             return ModelRecoveryDecision(
                 ModelRecoveryAction.FAIL_TERMINAL, "failure_is_not_retryable"
             )
+        if failure.category is ModelFailureCategory.NETWORK_UNAVAILABLE:
+            # The request never reached a provider that could answer it, so the
+            # attempt budget says nothing about whether sending it again is
+            # worth doing. Wait for the network instead of spending an attempt;
+            # only a spent wait budget makes this an interruption.
+            remaining = (
+                probe.network_wait_limit_seconds - probe.network_waited_seconds
+            )
+            if probe.network_wait_limit_seconds <= 0 or remaining <= 0:
+                return ModelRecoveryDecision(
+                    ModelRecoveryAction.PRESERVE_AND_INTERRUPT,
+                    "network_wait_limit_reached",
+                )
+            return ModelRecoveryDecision(
+                ModelRecoveryAction.WAIT_FOR_NETWORK,
+                "network_unavailable_wait_for_recovery",
+                min(max(self._retry_backoff_seconds, 1.0), remaining),
+            )
         if probe.provider_attempt >= probe.max_provider_attempts:
             return ModelRecoveryDecision(
                 ModelRecoveryAction.PRESERVE_AND_INTERRUPT,
