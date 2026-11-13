@@ -187,7 +187,7 @@ def test_tool_calls_render_as_collapsible_execution_cards() -> None:
     assert "该工具不产生命令行输出" in source
     assert ".live-turn-line{font-size:13px;font-weight:600;color:#6b7280;" in source
     # 阶段性回复是正文片段：单独上下间距，不跟随进度行的灰色小字。
-    assert ".live-turn-line.turn-progress-note{margin:10px 0;" in source
+    assert ".live-turn-line.turn-progress-note{margin:12px 0;font-size:15px;font-weight:700;" in source
     assert "note: kind === 'commentary'," in source
     assert "if (line.note) row.classList.add('turn-progress-note');" in source
     # 参数/输出区要像 markdown 代码块：等宽、挂缩进、高行高。

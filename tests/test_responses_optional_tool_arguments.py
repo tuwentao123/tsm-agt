@@ -56,10 +56,19 @@ def test_non_strict_responses_explicitly_opt_out_for_optional_file_arguments(str
         # Omitting this field permits the API to normalize optional fields into
         # strict, required fields. False must survive configuration → wire.
         assert advertised.get("strict") is False
-        assert advertised["parameters"] == tool.parameters
+        # The wire schema is the gateway-compatible form the chat encoder already
+        # sends: OpenAI-compatible gateways reject a top-level oneOf, so both
+        # properties are advertised and the runtime keeps the XOR check. What this
+        # test pins is that the strict opt-out survives configuration → wire.
+        parameters = advertised["parameters"]
+        assert parameters == {k: v for k, v in tool.parameters.items() if k != "oneOf"}
+        assert "oneOf" not in parameters
+        assert {"path", "resource_ref"} <= parameters["properties"].keys()
         call = next(block.call for block in response.message.content if isinstance(block, ToolCallBlock))
         assert call.arguments == {"path": "sample.txt"}
         validate_tool_arguments(tool, call.arguments)
+        with pytest.raises(InvalidToolArguments):
+            validate_tool_arguments(tool, {})
 
     asyncio.run(run())
 

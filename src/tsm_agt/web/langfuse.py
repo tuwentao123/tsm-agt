@@ -8,11 +8,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from hashlib import sha256
 
-from tsm_agt.adapters.langfuse import (
-    LangfuseClient, LangfuseExportError, attributes, langfuse_config_path, trace_payload,
-)
 from tsm_agt.core import ToolCommitState
 from tsm_agt.ports import FinishReason, RuntimeEvent, RuntimeUnitOfWork, ToolEffect, ToolRecoveryKind
+from tsm_agt.ports.langfuse import (
+    LangfuseClientPort, LangfuseExportError, LangfuseExporter,
+)
 
 logger = logging.getLogger(__name__)
 _TURN_STATUS = {
@@ -34,14 +34,16 @@ _FINISH_REASONS = frozenset(FinishReason)
 class TurnRecording:
     session_id: str
     started: RuntimeEvent
-    client: LangfuseClient
+    client: LangfuseClientPort
 
 
 class WebLangfuse:
     """Session consent and pending turns live only for this Web server run."""
 
-    def __init__(self):
-        self._sessions: dict[str, LangfuseClient] = {}
+    def __init__(self, exporter: LangfuseExporter):
+        # Injected by the composition root: this layer never imports an adapter.
+        self._exporter = exporter
+        self._sessions: dict[str, LangfuseClientPort] = {}
         self._turns: dict[str, TurnRecording] = {}
         self._pending: set[asyncio.Task] = set()
 
@@ -52,7 +54,7 @@ class WebLangfuse:
         if enabled == self.enabled(session_id):
             return
         if enabled:
-            client = LangfuseClient.from_config(langfuse_config_path())
+            client = self._exporter.client_from_config(self._exporter.config_path())
             if (client.endpoint.scheme != "https"
                     and client.endpoint.hostname not in {"127.0.0.1", "::1", "localhost"}):
                 raise LangfuseExportError("Langfuse 地址需要使用 HTTPS，本机地址可使用 HTTP。")
@@ -102,7 +104,7 @@ class WebLangfuse:
                 event for event in events
                 if event.sequence < ended.sequence and event.turn_id == recording.started.turn_id
             ]
-            payload = _turn_payload(recording, ended, status, events)
+            payload = _turn_payload(recording, ended, status, events, self._exporter)
 
             def send_if_enabled():
                 if self._sessions.get(recording.session_id) is recording.client:
@@ -120,6 +122,7 @@ def _count(value):
 
 def _turn_payload(
     recording: TurnRecording, ended: RuntimeEvent, status: str, events: list[RuntimeEvent],
+    exporter: LangfuseExporter,
 ) -> dict:
     start = recording.started
     session = sha256(recording.session_id.encode()).hexdigest()[:32]
@@ -136,7 +139,7 @@ def _turn_payload(
             "traceId": trace, "spanId": span_id, "name": label, "kind": 1,
             "startTimeUnixNano": str(int(started.timestamp() * 1e6) * 1000),
             "endTimeUnixNano": str(int(max(started, finished).timestamp() * 1e6) * 1000),
-            "attributes": attributes({
+            "attributes": exporter.attributes({
                 "langfuse.session.id": session,
                 "langfuse.environment": "web",
                 "langfuse.trace.name": name,
@@ -224,4 +227,4 @@ def _turn_payload(
             "langfuse.observation.level": {"failed": "ERROR", "interrupted": "WARNING"}.get(status),
         },
     )
-    return trace_payload("tsm-agt-web", [root_span, *spans])
+    return exporter.trace_payload("tsm-agt-web", [root_span, *spans])

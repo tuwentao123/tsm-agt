@@ -11,9 +11,12 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from tsm_agt.ports.langfuse import LangfuseExportError
 
-class LangfuseExportError(RuntimeError):
-    pass
+__all__ = [
+    "LangfuseClient", "LangfuseExportError", "LangfuseExporterAdapter",
+    "attributes", "langfuse_config_path", "trace_payload",
+]
 
 
 def langfuse_config_path() -> Path:
@@ -109,3 +112,23 @@ class LangfuseClient:
         rejected = result.get("partialSuccess", {}).get("rejectedSpans")
         if rejected and int(rejected):
             raise LangfuseExportError(f"Langfuse rejected {rejected} spans for {description}")
+
+
+class LangfuseExporterAdapter:
+    """Implement ``ports.langfuse.LangfuseExporter`` for the composition root.
+
+    The Web layer builds trace payloads, but only this adapter knows how a
+    client is configured and shipped.
+    """
+
+    def config_path(self) -> Path:
+        return langfuse_config_path()
+
+    def client_from_config(self, path: Path | None = None) -> LangfuseClient:
+        return LangfuseClient.from_config(path)
+
+    def attributes(self, values):
+        return attributes(values)
+
+    def trace_payload(self, service_name, spans):
+        return trace_payload(service_name, spans)

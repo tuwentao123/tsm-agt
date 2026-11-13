@@ -9,7 +9,7 @@ import httpx
 from tests.runtime_fixtures import RuntimeEchoModel
 from tsm_agt.adapters.evented_runtime_store import EventedRuntimeStore
 from tsm_agt.adapters.fixture.runtime_store import InMemoryRuntimeStore
-from tsm_agt.adapters.langfuse import LangfuseClient
+from tsm_agt.adapters.langfuse import LangfuseClient, LangfuseExporterAdapter
 from tsm_agt.adapters.local_skills import UserSkillsStore
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.local_api import LocalEventApiServer
@@ -20,7 +20,15 @@ from tsm_agt.web import langfuse
 
 def test_web_langfuse_records_only_opted_in_future_turns(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(web, "web_langfuse", langfuse.WebLangfuse())
+    config_path = tmp_path / "langfuse.yaml"
+
+    class TempConfigExporter(LangfuseExporterAdapter):
+        """Pin the real adapter to this test's temporary YAML."""
+
+        def config_path(self):
+            return config_path
+
+    monkeypatch.setattr(web, "web_langfuse", langfuse.WebLangfuse(TempConfigExporter()))
     monkeypatch.setattr(web, "runtime_server", None)
     monkeypatch.setattr(web, "runtime_error", None)
     monkeypatch.setattr(web, "configuration_issues", [])
@@ -29,8 +37,6 @@ def test_web_langfuse_records_only_opted_in_future_turns(tmp_path, monkeypatch):
     monkeypatch.setattr(web, "session_auto_approvals", {})
     monkeypatch.setattr(web, "removed_workspace_paths", set())
     monkeypatch.setattr(web, "removed_session_ids", set())
-    config_path = tmp_path / "langfuse.yaml"
-    monkeypatch.setattr(langfuse, "langfuse_config_path", lambda: config_path)
     monkeypatch.setattr(
         "tsm_agt.bootstrap.composition.UserSkillsStore",
         lambda: UserSkillsStore(tmp_path / "skills"),
@@ -145,7 +151,7 @@ def test_web_langfuse_records_only_opted_in_future_turns(tmp_path, monkeypatch):
 def test_langfuse_turn_interruption_and_tool_failure_stay_metadata_only(monkeypatch):
     client = LangfuseClient("http://127.0.0.1", "sample", "sample-secret")
     monkeypatch.setattr(LangfuseClient, "from_config", lambda _: client)
-    recorder = langfuse.WebLangfuse()
+    recorder = langfuse.WebLangfuse(LangfuseExporterAdapter())
     store = EventedRuntimeStore(InMemoryRuntimeStore())
     store.on_task_commit = lambda unit: recorder.observe_commit(store, unit)
     sent = []

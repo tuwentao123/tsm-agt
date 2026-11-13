@@ -21,7 +21,6 @@ from fastapi.responses import (
     HTMLResponse, JSONResponse, Response, StreamingResponse,
 )
 
-from tsm_agt.adapters.langfuse import LangfuseExportError
 from tsm_agt.core import (
     AgentLoopLimitExceeded, ApprovalDecision, RuntimeInputIntent,
     ProjectTrustLevel, note_stream_released,
@@ -31,11 +30,12 @@ from tsm_agt.local_api import LocalEventApiServer
 from tsm_agt.bootstrap.composition import (
     configure_request_diagnostics, user_skills_store_for_application,
     skill_installation_prompt, skill_catalog_for_application, builtin_skill_names,
-    mcp_runtime_status,
+    langfuse_exporter_for_web, mcp_runtime_status,
 )
 from tsm_agt.bootstrap.model_configuration import load_configuration_document
 from tsm_agt.bootstrap.mcp_status import describe_mcp_servers, mcp_configuration_summary
 from tsm_agt.ports import ImageBlock, MessageRole, MCPServerStartupError
+from tsm_agt.ports.langfuse import LangfuseExportError
 from tsm_agt.web.langfuse import WebLangfuse
 
 app = FastAPI(title="tsm-agt-web")
@@ -282,7 +282,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .live-turn-line.failed{color:#b42318}
 .live-turn-line.failed::before{content:'✕';color:#d92d20}
 /* 阶段性回复是正文片段，不是进度元信息：单独给上下间距，并回到正文颜色。 */
-.live-turn-line.turn-progress-note{margin:10px 0;font-weight:400;line-height:1.7;color:#1f2937}
+.live-turn-line.turn-progress-note{margin:12px 0;font-size:15px;font-weight:700;line-height:1.75;color:#0f172a}
 .tool-card-row{margin:4px 0}
 .tool-card{border:1px solid #dbe3ed;border-radius:9px;background:#fff;overflow:hidden}
 .tool-card-head{display:flex;align-items:center;gap:7px;width:100%;padding:7px 9px;background:#f6f9fd;border:0;font:inherit;font-size:12px;color:#334155;cursor:pointer;text-align:left}
@@ -6891,7 +6891,7 @@ session_workspace_bindings: dict[str, str] = {}
 # Web-only per-Session preference: the switch decides whether this UI submits
 # APPROVE on its own. It never widens what the Runtime already permits.
 session_auto_approvals: dict[str, bool] = {}
-web_langfuse = WebLangfuse()
+web_langfuse = WebLangfuse(langfuse_exporter_for_web())
 # Removal is an explicit deny-list rather than "absent from the index": the
 # Runtime keeps owning the Session and Task records, and the startup recovery
 # below rebuilds the index from them, so absence alone would resurrect entries.

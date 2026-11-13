@@ -1652,6 +1652,13 @@ def builtin_skill_names() -> tuple[str, ...]:
     return tuple(BUILTIN_SKILLS)
 
 
+def langfuse_exporter_for_web() -> "LangfuseExporter":
+    """Composition root wiring for the Web app's Langfuse export seam."""
+    from tsm_agt.adapters.langfuse import LangfuseExporterAdapter
+
+    return LangfuseExporterAdapter()
+
+
 def configure_request_diagnostics(application: Application):
     """Attach optional provider diagnostics without exposing provider types to UI."""
     from tsm_agt.adapters.openai_compatible.request_diagnostics import TurnRequestDiagnostics
