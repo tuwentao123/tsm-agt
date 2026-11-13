@@ -55,6 +55,7 @@ from tsm_agt.adapters.rule_based_investigation_flow import (
     RuleBasedInvestigationFlowProjector,
 )
 from tsm_agt.adapters.openai_compatible import OpenAICompatibleModelProvider
+from tsm_agt.adapters.openai_compatible.model_catalog import fetch_model_ids
 from tsm_agt.adapters.openai_compatible.responses import OpenAIResponsesModelProvider
 from tsm_agt.adapters.anthropic_messages import AnthropicMessagesModelProvider
 from tsm_agt.adapters.resilient_model import ResilientModelProvider
@@ -218,6 +219,9 @@ def compose_mcp_application_from_config(
     )
 from .model_configuration import (
     MODEL_PROTOCOL_ANTHROPIC_MESSAGES,
+    ModelConfiguration,
+    ModelConfigurationError,
+    discover_model_profiles,
     endpoint_origin,
     load_configuration_document,
     load_model_configuration,
@@ -1500,15 +1504,34 @@ def compose_openai_compatible_engineering_application(
     )
 
 
+def _load_model_document(
+    path: Path | None,
+) -> tuple[Path, Mapping[str, object], tuple[str, ...]]:
+    configuration_file, document = load_configuration_document(path)
+    document, issues = discover_model_profiles(
+        document, fetch_model_ids, configuration_file=configuration_file,
+    )
+    return configuration_file, document, issues
+
+
+def inspect_model_configuration(path: Path | None = None) -> tuple[ModelConfiguration | None, tuple[str, ...]]:
+    try:
+        configuration_file, document, _ = _load_model_document(path)
+        return load_model_configuration(configuration_file, document), ()
+    except ModelConfigurationError as error:
+        return None, error.missing
+
+
 def compose_openai_compatible_readonly_application_from_config(
     configuration_file: Path | None = None,
     database_path: Path | None = None,
 ) -> Application:
     """Compose a read-only application from the single private YAML file."""
 
-    selected_configuration_file, document = load_configuration_document(configuration_file)
+    selected_configuration_file, document, model_issues = _load_model_document(configuration_file)
     configuration = load_model_configuration(selected_configuration_file, document)
     assert configuration is not None
+    catalog = model_profile_catalog(document)
     budget = load_exploration_budget_configuration(document)
     context = load_context_configuration(document)
     egress = load_web_egress_configuration(document)
@@ -1516,7 +1539,7 @@ def compose_openai_compatible_readonly_application_from_config(
     github_source = load_github_source_configuration(document)
     orchestration = load_orchestration_configuration(document)
     review = load_completion_review_configuration(document)
-    return compose_openai_compatible_readonly_application(
+    application = compose_openai_compatible_readonly_application(
         base_url=configuration.base_url,
         model=configuration.model,
         api_key=configuration.api_key,
@@ -1539,10 +1562,10 @@ def compose_openai_compatible_readonly_application_from_config(
         model_capability_overrides=configuration.capability_overrides,
         model_profile_id=configuration.profile_id,
         model_request_parameters=configuration.request_parameters,
-        model_catalog=model_profile_catalog(document),
+        model_catalog=catalog,
         model_configurations={row["id"]: load_model_configuration(
             selected_configuration_file, document, profile_id=row["id"],
-        ) for row in model_profile_catalog(document) if row["enabled"]},
+        ) for row in catalog if row["enabled"]},
         max_parallel_tool_calls=load_max_parallel_tool_calls(document),
         context_configuration=context,
         web_egress_configuration=egress,
@@ -1553,6 +1576,7 @@ def compose_openai_compatible_readonly_application_from_config(
         completion_review_max_continuations=review.max_continuations,
         completion_review_failure_policy=review.failure_policy,
     )
+    return replace(application, configuration_issues=application.configuration_issues + model_issues)
 
 
 def compose_openai_compatible_engineering_application_from_config(
@@ -1562,9 +1586,10 @@ def compose_openai_compatible_engineering_application_from_config(
 ) -> Application:
     """Load private YAML settings and compose the engineering Agent."""
 
-    selected_configuration_file, document = load_configuration_document(configuration_file)
+    selected_configuration_file, document, model_issues = _load_model_document(configuration_file)
     configuration = load_model_configuration(selected_configuration_file, document)
     assert configuration is not None
+    catalog = model_profile_catalog(document)
     budget = load_exploration_budget_configuration(document)
     context = load_context_configuration(document)
     if session_history_format is not None:
@@ -1577,7 +1602,7 @@ def compose_openai_compatible_engineering_application_from_config(
     orchestration = load_orchestration_configuration(document)
     review = load_completion_review_configuration(document)
     mcp_tools_enabled, mcp_servers = load_mcp_servers_from_configuration(document)
-    return compose_openai_compatible_engineering_application(
+    application = compose_openai_compatible_engineering_application(
         base_url=configuration.base_url,
         model=configuration.model,
         api_key=configuration.api_key,
@@ -1600,10 +1625,10 @@ def compose_openai_compatible_engineering_application_from_config(
         model_capability_overrides=configuration.capability_overrides,
         model_profile_id=configuration.profile_id,
         model_request_parameters=configuration.request_parameters,
-        model_catalog=model_profile_catalog(document),
+        model_catalog=catalog,
         model_configurations={row["id"]: load_model_configuration(
             selected_configuration_file, document, profile_id=row["id"],
-        ) for row in model_profile_catalog(document) if row["enabled"]},
+        ) for row in catalog if row["enabled"]},
         max_parallel_tool_calls=load_max_parallel_tool_calls(document),
         context_configuration=context,
         web_egress_configuration=egress,
@@ -1616,6 +1641,7 @@ def compose_openai_compatible_engineering_application_from_config(
         mcp_servers=mcp_servers,
         mcp_tools_enabled=mcp_tools_enabled,
     )
+    return replace(application, configuration_issues=application.configuration_issues + model_issues)
 
 
 # Kept as import-only aliases for extensions compiled against pre-YAML package

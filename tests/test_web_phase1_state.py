@@ -246,8 +246,16 @@ class ComposerLayoutTest(unittest.TestCase):
     def test_panes_scroll_independently(self) -> None:
         html = web_app.INDEX_HTML
         self.assertRegex(html, r"\.layout\{[^}]*height:100(?:d)?vh;[^}]*overflow:hidden")
-        self.assertRegex(html, r"\.chat-area,\.trace-pane\{[^}]*overflow-y:auto")
+        self.assertRegex(html, r"\.chat-area,\.files-pane\{[^}]*overflow-y:auto")
         self.assertIn("overscroll-behavior:contain", html)
+
+    def test_right_pane_is_reserved_for_files(self) -> None:
+        html = web_app.INDEX_HTML
+        self.assertIn('files-pane', html)
+        self.assertIn("工作区文件", html)
+        # The trace timeline is retired: the pane now waits for opened/changed files.
+        self.assertNotIn("执行轨迹", html)
+        self.assertNotIn("Trace Graph Ready", html)
 
     def test_sessions_are_nested_under_their_workspace(self) -> None:
         html = web_app.INDEX_HTML

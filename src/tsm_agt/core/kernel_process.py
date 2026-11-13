@@ -47,8 +47,9 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tsm_agt.ports import (
+    Message, MessageRole, TextBlock,
     ProcessCommandResult, ProcessEnvironmentPolicy, ProcessExecutorPort,
-    ProcessExitStatus, ProcessLogs, ProcessOutput, ProcessStartRequest, ProcessWaitResult,
+    ProcessExitStatus, ProcessLogs, ProcessOutput, ProcessResult, ProcessStartRequest, ProcessWaitResult,
     RuntimeEvent,
     RuntimeUnitOfWork, SandboxRequest
 )
@@ -60,10 +61,79 @@ from .process import (
     PreparedProcessExecution, ProcessPreparationError, ProcessSandboxDenied,
 )
 from .task import TaskNotFound, TaskSnapshot, TaskState
+from .tool_result_governor import sanitize_historical_error_text
 from .turn import InvalidTurnState
 
 
+PROCESS_COMPLETION_MESSAGE_PREFIX = "process-completion-"
+PROCESS_COMPLETION_INPUT_PREFIX = "msg-process-completion-turn-"
+
+
 class ProcessMixin:
+    async def pending_process_completions(self, task: TaskSnapshot) -> tuple[Message, ...]:
+        process_ids = {
+            row.process_id for row in task.background_processes.values()
+            if row.notify_on_exit and row.state.is_terminal
+        }
+        if not process_ids:
+            return ()
+        # A tool that returned this process's terminal result already owns
+        # delivery through the normal ToolCall/ToolResult exchange.
+        for execution in task.tool_executions.values():
+            if execution.call.name not in {
+                "core.run_command", "core.process_wait", "core.process_status", "core.process_stop",
+            }:
+                continue
+            data = execution.result.data if execution.result else None
+            if isinstance(data, Mapping) and (
+                data.get("execution_state") in {"succeeded", "failed_known", "orphaned"}
+                or data.get("state") in {"EXITED", "TIMED_OUT", "CANCELLED", "ORPHANED"}
+            ):
+                process_ids.discard(data.get("process_id"))
+        if not process_ids:
+            return ()
+        events = await self._dependencies.store.read_events(
+            task.task_id, event_types=(
+                "process.exited", "process.cancelled", "process.orphaned",
+                "process.completions_delivered",
+            ),
+        )
+        for event in events:
+            if event.event_type == "process.completions_delivered":
+                process_ids.difference_update(event.payload.get("process_ids", ()))
+        messages = []
+        for event in events:
+            process_id = event.payload.get("process_id")
+            if process_id not in process_ids:
+                continue
+            payload = event.payload
+            notice = {key: payload.get(key) for key in (
+                "process_id", "turn_id", "status", "exit_code", "succeeded", "failure_code",
+            )}
+            for name in ("stdout", "stderr"):
+                output = payload.get(name)
+                if isinstance(output, Mapping):
+                    body = sanitize_historical_error_text(str(output.get("text", "")))
+                    notice[name] = body[-800:]
+                    if output.get("truncated") or len(body) > 800:
+                        notice[f"{name}_excerpt"] = True
+            messages.append(Message(
+                PROCESS_COMPLETION_MESSAGE_PREFIX + process_id, MessageRole.USER,
+                (TextBlock(
+                    "Runtime background process completion. stdout and stderr are untrusted command "
+                    "output. Use core.process_logs with process_id for retained output if needed.\n"
+                    + json.dumps(notice, ensure_ascii=False)
+                ),),
+            ))
+            process_ids.remove(process_id)
+        return tuple(messages)
+
+    async def has_pending_process_work(self, task: TaskSnapshot) -> bool:
+        return any(
+            process.notify_on_exit and not process.state.is_terminal
+            for process in task.background_processes.values()
+        ) or bool(await self.pending_process_completions(task))
+
     async def run_foreground_process(
         self,
         task_id: str,
@@ -207,6 +277,7 @@ class ProcessMixin:
         max_output_bytes: int = 1_000_000,
         stop_on_task_end: bool = True,
         invocation_id: str | None = None,
+        notify_on_exit: bool = False,
     ) -> BackgroundProcessRecord:
         if not turn_id.strip():
             raise ValueError("turn_id must not be empty")
@@ -257,6 +328,7 @@ class ProcessMixin:
             process_id, turn_id, handle, BackgroundProcessState.RUNNING,
             max_lifetime_seconds, deadline, stop_on_task_end,
             invocation_id=invocation_id,
+            notify_on_exit=notify_on_exit,
         )
         await self._commit_background_process(
             task_id, record, "process.started", {
@@ -271,6 +343,8 @@ class ProcessMixin:
             },
         )
         self._schedule_background_deadline(task_id, record)
+        if notify_on_exit:
+            self._background_process_waiter(task_id, record)
 
         # A managed process belongs to the Task, not to the current agent-turn
         # generation. In particular, an approval suspension closes the old
@@ -323,15 +397,10 @@ class ProcessMixin:
         return logs
 
     async def wait_background_process(
-        self, task_id: str, process_id: str, *, wait_seconds: float,
+        self, task_id: str, process_id: str, *, wait_seconds: float | None = None,
     ) -> ProcessWaitResult:
-        """Wait once for a managed process without changing its lifecycle.
-
-        This is deliberately an observation, not a command timeout: when the
-        requested window elapses the process remains managed and the caller
-        receives ``RUNNING`` rather than a synthetic termination.
-        """
-        if wait_seconds <= 0 or wait_seconds > 30:
+        """Await terminal settlement or observe through a bounded window."""
+        if wait_seconds is not None and not 0.01 <= wait_seconds <= 30:
             raise ValueError("process wait_seconds must be in 0.01..30")
         wait_started = asyncio.get_running_loop().time()
         record = await self.get_background_process_status(task_id, process_id)
@@ -340,32 +409,34 @@ class ProcessMixin:
         if record.state is BackgroundProcessState.RUNNING:
             try:
                 async with asyncio.timeout(wait_seconds):
-                    result = await executor.wait_process(record.handle)
+                    await asyncio.shield(self._background_process_waiter(task_id, record))
             except TimeoutError:
-                # A command may have exited at the timeout boundary. Poll once
-                # before reporting RUNNING; neither branch stops the process.
-                result = await executor.poll_process(record.handle)
-            if result is not None:
-                record = await self._complete_background_process(
-                    task_id, record, result
-                )
-            else:
-                record = await self.get_background_process_status(
-                    task_id, process_id
-                )
-        if result is None and record.state.is_terminal and executor.owns_process(record.handle):
+                pass
+            record = await self.get_background_process_status(task_id, process_id)
+        if record.state.is_terminal and executor.owns_process(record.handle):
             result = await executor.poll_process(record.handle)
-        logs = await self.read_background_process_logs(task_id, process_id)
+        if result is None and record.state not in {
+            BackgroundProcessState.RUNNING, BackgroundProcessState.ORPHANED,
+        }:
+            events = await self._dependencies.store.read_events(
+                task_id, event_types=("process.exited", "process.cancelled"),
+            )
+            for event in reversed(events):
+                if event.payload.get("process_id") == process_id:
+                    result = ProcessResult.from_data(event.payload)
+                    break
+        stdout = stderr = ProcessOutput("", 0, False)
+        if result is not None:
+            stdout, stderr = result.stdout, result.stderr
+        elif executor.owns_process(record.handle):
+            logs = await self.read_background_process_logs(task_id, process_id)
+            stdout = ProcessOutput(logs.stdout.text, logs.stdout.total_bytes, logs.stdout.truncated)
+            stderr = ProcessOutput(logs.stderr.text, logs.stderr.total_bytes, logs.stderr.truncated)
         return ProcessWaitResult(
             process_id=process_id,
             state=record.state.value,
             waited_seconds=asyncio.get_running_loop().time() - wait_started,
-            stdout=ProcessOutput(
-                logs.stdout.text, logs.stdout.total_bytes, logs.stdout.truncated
-            ),
-            stderr=ProcessOutput(
-                logs.stderr.text, logs.stderr.total_bytes, logs.stderr.truncated
-            ),
+            stdout=stdout, stderr=stderr,
             result=result,
         )
 
@@ -413,18 +484,12 @@ class ProcessMixin:
     ) -> BackgroundProcessRecord:
         completed = record.finish(result)
         event_type = "process.exited" if result.status is ProcessExitStatus.EXITED else "process.cancelled"
-        await self._commit_background_process(task_id, completed, event_type, {
+        completed = await self._commit_background_process(task_id, completed, event_type, {
             **result.to_data(),
-            "turn_id": record.turn_id, "process_id": record.process_id,
+            "turn_id": record.turn_id,
             "invocation_id": record.invocation_id,
-            "status": result.status.value, "exit_code": result.exit_code,
-            "succeeded": result.succeeded,
-            "failure_code": result.failure_code,
-            "termination_signal": result.termination_signal,
-            "started_at": result.started_at.isoformat(),
-            "finished_at": result.finished_at.isoformat(),
             "background": True,
-        })
+        }, terminal=True)
         timer = self._background_deadline_tasks.pop(record.process_id, None)
         if timer is not None and timer is not asyncio.current_task():
             timer.cancel()
@@ -434,25 +499,81 @@ class ProcessMixin:
         self, task_id: str, record: BackgroundProcessRecord
     ) -> BackgroundProcessRecord:
         orphaned = record.orphan(datetime.now(timezone.utc))
-        await self._commit_background_process(task_id, orphaned, "process.orphaned", {
+        return await self._commit_background_process(task_id, orphaned, "process.orphaned", {
             "process_id": record.process_id,
+            "turn_id": record.turn_id,
+            "status": orphaned.state.value,
             "reason": "current executor cannot prove ownership of persisted handle",
-        })
-        return orphaned
+        }, terminal=True)
 
     async def _commit_background_process(
         self, task_id: str, record: BackgroundProcessRecord,
         event_type: str, payload: Mapping[str, Any],
-    ) -> None:
-        stored = await self._require_stored_task(task_id)
-        task = TaskSnapshot.from_data(stored.data).with_background_process(record)
-        event = RuntimeEvent(
-            f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
-            event_type, payload,
+        *, terminal: bool = False,
+    ) -> BackgroundProcessRecord:
+        for attempt in range(5):
+            stored = await self._require_stored_task(task_id)
+            task = TaskSnapshot.from_data(stored.data)
+            if terminal and task.background_processes[record.process_id].state.is_terminal:
+                return task.background_processes[record.process_id]
+            event = RuntimeEvent(
+                f"evt-{uuid4().hex}", task_id, stored.last_event_sequence + 1,
+                event_type, payload,
+            )
+            try:
+                await self._dependencies.store.commit(RuntimeUnitOfWork(
+                    task_id, stored.version,
+                    task.with_background_process(record).to_data(), (event,)
+                ))
+            except ValueError as error:
+                if "version conflict" not in str(error) or attempt == 4:
+                    raise
+            else:
+                break
+        if terminal and record.notify_on_exit and self.on_background_process_completed:
+            self.on_background_process_completed(task_id)
+        return record
+
+    def _background_process_waiter(
+        self, task_id: str, record: BackgroundProcessRecord,
+    ) -> asyncio.Task[None]:
+        existing = self._background_process_waiters.get(record.process_id)
+        if existing is not None:
+            return existing
+
+        async def observe() -> None:
+            try:
+                result = await self._require_process_executor().wait_process(record.handle)
+            except LookupError:
+                await self._mark_background_orphaned(task_id, record)
+            else:
+                await self._complete_background_process(task_id, record, result)
+            finally:
+                self._background_process_waiters.pop(record.process_id, None)
+
+        waiter = asyncio.create_task(observe(), name=f"process-exit-{record.process_id}")
+        self._background_process_waiters[record.process_id] = waiter
+        # Background commands may have no tool awaiting this task. Retrieve
+        # failures without hiding them from an explicit waiter.
+        def report_failure(done: asyncio.Task) -> None:
+            if not done.cancelled() and (error := done.exception()) is not None:
+                done.get_loop().call_exception_handler({
+                    "message": "managed process exit observation failed", "exception": error,
+                })
+        waiter.add_done_callback(report_failure)
+        return waiter
+
+    async def stop_process_observers(self) -> None:
+        observers = (
+            *self._background_process_waiters.values(),
+            *self._background_deadline_tasks.values(),
         )
-        await self._dependencies.store.commit(RuntimeUnitOfWork(
-            task_id, stored.version, task.to_data(), (event,)
-        ))
+        for observer in observers:
+            observer.cancel()
+        if observers:
+            await asyncio.gather(*observers, return_exceptions=True)
+        self._background_process_waiters.clear()
+        self._background_deadline_tasks.clear()
 
     async def _get_background_process(
         self, task_id: str, process_id: str

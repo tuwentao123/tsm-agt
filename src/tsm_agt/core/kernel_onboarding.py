@@ -79,8 +79,8 @@ class OnboardingMixin:
         root = self._dependencies.workspace_path.normalize_workspace(workspace)
         workspace_key = self._dependencies.workspace_path.workspace_key(root)
         subject = self._dependencies.local_identity.current_subject()
-        fingerprint = workspace_fingerprint(
-            root, self._dependencies.workspace_path
+        fingerprint = await asyncio.to_thread(
+            workspace_fingerprint, root, self._dependencies.workspace_path,
         )
         stored = await self._dependencies.store.load_project_trust(
             workspace_key, subject

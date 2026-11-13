@@ -123,6 +123,7 @@ class DefaultToolResultGovernor:
 def _profile_for(tool_name: str) -> str:
     if tool_name in {
         "core.read_file",
+        "core.read_files",
         "core.list_files",
         "core.search_files",
         "core.find_files",

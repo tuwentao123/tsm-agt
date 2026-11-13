@@ -28,16 +28,18 @@ from tsm_agt.core import (
     TaskRuntimeProjection, TaskRuntimeProjector,
     TaskSnapshot, TaskState, TaskKind, build_session_follow_up_goal,
     build_session_follow_up_handoff,
-    canonical_hash, SteeringKind, RuntimeInputIntent,
+    canonical_hash, SteeringKind, SteeringProjector, RuntimeInputIntent,
 )
 from tsm_agt.core.conversation_orchestration import (
     TaskBindingDecision,
     TaskBindingKind,
 )
+from tsm_agt.core.session import SessionState
 from tsm_agt.ports import (
     ImageBlock, ModelRecoveryAction,
     ModelRecoveryExhausted, ModelRetrySafety,
-    RuntimeCommandRecord, RuntimeStorePort, SessionInputRelation, TextBlock,
+    RuntimeCommandRecord, RuntimeEvent, RuntimeStorePort, SessionEvent,
+    SessionInputRelation, TextBlock,
 )
 
 
@@ -280,6 +282,8 @@ class EngineeringAgentClient:
         self._submit_lock = asyncio.Lock()
         # One foreground Task per Session: serialize inputs per Session id.
         self._session_input_locks: dict[str, asyncio.Lock] = {}
+        self._process_wakeups: dict[str, asyncio.Task[None]] = {}
+        self._closing = False
 
     @property
     def application(self) -> Application:
@@ -293,9 +297,28 @@ class EngineeringAgentClient:
             # Adapters, then settle crash-left INTERRUPTING Tasks (§6.2 plan A)
             # before any user input is accepted.
             await self._application.start()
+            self._closing = False
+            kernel = self._application.kernel
+            kernel.on_background_process_completed = self._schedule_process_wakeup
+            if self._application.reconcile_on_start:
+                for session in await kernel.list_sessions():
+                    if session.state is SessionState.ACTIVE and session.active_task_id:
+                        task = await kernel.get_task(session.active_task_id)
+                        if not any(process.notify_on_exit for process in task.background_processes.values()):
+                            continue
+                        if any(process.notify_on_exit and not process.state.is_terminal
+                               for process in task.background_processes.values()):
+                            await kernel.reconcile_background_processes(task.task_id)
+                        self._schedule_process_wakeup(session.active_task_id)
         return self
 
     async def close(self) -> None:
+        self._closing = True
+        wakeups = tuple(self._process_wakeups.values())
+        for wakeup in wakeups:
+            wakeup.cancel()
+        if wakeups:
+            await asyncio.gather(*wakeups, return_exceptions=True)
         for task_id, runner in tuple(self._run_tasks.items()):
             if runner.done():
                 continue
@@ -330,6 +353,8 @@ class EngineeringAgentClient:
         self._redirect_runners.clear()
         self._redirect_wait_targets.clear()
         if self._application is not None:
+            self._application.kernel.on_background_process_completed = None
+            await self._application.kernel.stop_process_observers()
             await self._application.registry.stop_all()
             self._application = None
 
@@ -1233,8 +1258,15 @@ class EngineeringAgentClient:
 
     async def _run_submitted_task(
         self, task_id: str, goal: str, *, images: tuple[ImageBlock, ...] = (),
+        background_completion: bool = False,
     ) -> RuntimeTaskResult:
         try:
+            if background_completion:
+                result = await self.application.kernel.run_agent_turn(
+                    task_id, goal, background_completion=True,
+                    on_progress=lambda item: self._record_progress(task_id, item),
+                )
+                return await self._finish_agent_result(result)
             return await self.run_task(task_id, goal, images=images)
         except asyncio.CancelledError:
             raise
@@ -1350,7 +1382,7 @@ class EngineeringAgentClient:
         return await self._finish_agent_result(result)
 
     async def _persisted_assistant_text(
-        self, task: TaskSnapshot,
+        self, task: TaskSnapshot, session_events: tuple[SessionEvent, ...] | None = None,
     ) -> str | None:
         """Read only a durable *user-facing* Task result after a restart.
 
@@ -1360,7 +1392,8 @@ class EngineeringAgentClient:
         message was actually handed to the user, so it is the only safe fallback
         once the live ``_latest_results`` cache is gone.
         """
-        session_events = await self._store().read_session_events(task.session_id)
+        if session_events is None:
+            session_events = await self._store().read_session_events(task.session_id)
         for event in reversed(session_events):
             if (
                 event.event_type != "session.task_result_recorded"
@@ -1383,17 +1416,31 @@ class EngineeringAgentClient:
         return None
 
     async def get_task_result(self, task_id: str) -> RuntimeTaskResult:
-        task = await self.application.kernel.get_task(task_id)
-        stored = await self._store().load_task(task_id)
-        assert stored is not None
-        events = await self._store().read_events(task_id)
+        _, result, _ = await self._read_task_result(task_id)
+        return result
+
+    async def read_task_history(
+        self, task_id: str, session_events: tuple[SessionEvent, ...],
+    ) -> tuple[TaskSnapshot, RuntimeTaskResult, tuple[RuntimeEvent, ...]]:
+        return await self._read_task_result(task_id, session_events=session_events)
+
+    async def _read_task_result(
+        self, task_id: str, *, session_events: tuple[SessionEvent, ...] | None = None,
+    ) -> tuple[TaskSnapshot, RuntimeTaskResult, tuple[RuntimeEvent, ...]]:
+        kernel = self.application.kernel
+        stored = await kernel._require_stored_task(task_id)
+        task = TaskSnapshot.from_data(stored.data)
+        if session_events is None:
+            events = await self._store().read_events(task_id)
+        else:
+            events = await self._store().read_events(task_id, include_approval_checkpoint=False)
         projected = TaskRuntimeProjector.project(task, events)
         projection = projected.to_data()
         cached = self._latest_results.get(task_id)
         assistant_text = (
             cached.assistant_text
             if cached is not None and cached.assistant_text is not None
-            else await self._persisted_assistant_text(task)
+            else await self._persisted_assistant_text(task, session_events)
         )
         # A queued message expires with the Task it was queued into: once the Task
         # can no longer run, no safe point will ever drain the queue, so reporting
@@ -1403,13 +1450,11 @@ class EngineeringAgentClient:
             if task.state.is_terminal
             else tuple(
                 {"text": item.text}
-                for item in (await self.application.kernel.get_steering(
-                    task_id
-                )).pending
+                for item in SteeringProjector.project(task_id, events).pending
             )
         )
         todo_list = _todo_list_projection(
-            await self.application.kernel.get_effective_working_memory(task_id)
+            kernel.project_effective_working_memory(task, events)
         )
         status = _status_for_state(task.state)
         partial = (
@@ -1432,7 +1477,7 @@ class EngineeringAgentClient:
         elif (cached_clarification and status == "awaiting_user"
                 and cached_clarification.get("kind") == "CONTINUATION"):
             clarification = cached_clarification
-        return RuntimeTaskResult(
+        result = RuntimeTaskResult(
             task_id, task.state.value,
             "INTERRUPTED" if partial is not None else task.state.phase1_state.value,
             status, stored.last_event_sequence,
@@ -1452,6 +1497,7 @@ class EngineeringAgentClient:
                 if partial is not None else _completion_diagnostics(events)
             ),
         )
+        return task, result, events
 
     async def read_events(
         self, task_id: str, *, after: int = 0, limit: int = 200,
@@ -1614,6 +1660,50 @@ class EngineeringAgentClient:
         # done callbacks can run after close() has released the application.
         if self._application is not None:
             self._store().notify(task_id)
+            self._schedule_process_wakeup(task_id)
+
+    def _schedule_process_wakeup(self, task_id: str) -> None:
+        if self._closing or task_id in self._process_wakeups:
+            return
+        self._process_wakeups[task_id] = asyncio.create_task(
+            self._wake_for_process_completion(task_id),
+            name=f"tsm-agt-process-wakeup-{task_id}",
+        )
+
+    async def _wake_for_process_completion(self, task_id: str) -> None:
+        try:
+            kernel = self.application.kernel
+            task = await kernel.get_task(task_id)
+            if task.task_kind is not TaskKind.CONVERSATION:
+                return
+            lock = self._session_input_locks.setdefault(task.session_id, asyncio.Lock())
+            async with lock, self._submit_lock:
+                session = await kernel.get_session(task.session_id)
+                task = await kernel.get_task(task_id)
+                if (session.state is not SessionState.ACTIVE
+                        or session.active_task_id != task_id
+                        or session.pending_interaction is not None
+                        or task.state is not TaskState.AWAITING_INPUT
+                        or self._has_live_turn(task_id)
+                        or not await kernel.pending_process_completions(task)):
+                    return
+                # Reserve the durable turn state before releasing the same
+                # locks used by user input. A simultaneous user message must
+                # see a live turn and enter the normal redirect/steer path.
+                await kernel.transition_task(
+                    task_id, TaskState.EXECUTING, "background process completion",
+                )
+                runner = asyncio.create_task(self._run_submitted_task(
+                    task_id,
+                    "Background work completed. Report the result or continue the originating "
+                    "task as appropriate, using the Runtime process completion below.",
+                    background_completion=True,
+                ), name=f"tsm-agt-process-turn-{task_id}")
+                self._register_runner(task_id, runner)
+        except (LookupError, PermissionError):
+            return
+        finally:
+            self._process_wakeups.pop(task_id, None)
 
     def _record_progress(self, task_id: str, progress: AgentProgress) -> None:
         if progress.kind in {AgentProgressKind.TEXT_DELTA, AgentProgressKind.TEXT_STATE}:

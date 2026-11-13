@@ -670,9 +670,12 @@ class FlowProjector:
         if projection is None:
             tool_by_invocation: dict[str, str] = {}
             process_invocation_by_id: dict[str, str] = {}
+        seen_edges = set(edges)
+        seen_facts = set(diagnostic_facts)
 
         def add_edge(edge: FlowEdge) -> None:
-            if edge not in edges:
+            if edge not in seen_edges:
+                seen_edges.add(edge)
                 edges.append(edge)
 
         def add_node(node: FlowNode) -> None:
@@ -720,7 +723,8 @@ class FlowProjector:
                     str(invocation_id) if invocation_id is not None else None
                 ),
             )
-            if fact not in diagnostic_facts:
+            if fact not in seen_facts:
+                seen_facts.add(fact)
                 diagnostic_facts.append(fact)
 
         def result_fact_values(payload: Any) -> dict[str, FlowDiagnosticValue]:

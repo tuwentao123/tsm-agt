@@ -70,14 +70,12 @@ class CoreProcessToolProvider:
             description=(
                 "Run a command as a structured argv array inside the task workspace. "
                 "No shell parses the arguments. Commands run in foreground mode by "
-                "default. Runtime waits briefly for completion and automatically "
-                "returns a managed process id if the command is still running. "
-                "An elapsed observation window NEVER terminates the command. "
-                "Do not estimate or set a command timeout. For RUNNING results, "
-                "continue with core.process_wait until a terminal result; do not "
-                "rerun the command or claim success. This also applies to git push, "
-                "builds, tests, and installs. Set mode='background' to return immediately "
-                "for a service or other asynchronous command. Output returns at most 16000 "
+                "default and wait for the process to finish. Use foreground when "
+                "the next step depends on a test, build, install, or push result. "
+                "Set mode='background' to return immediately for a service or "
+                "independent job. Background completion is delivered to the session. "
+                "If a running job becomes a dependency, call core.process_wait with "
+                "until='exit' once. Output returns at most 16000 "
                 "UTF-8 text bytes per stream per observation. If has_more is true, "
                 "use core.process_logs with the process id and returned next cursors "
                 "to read retained output, including foreground commands; do not rerun "
@@ -111,7 +109,7 @@ class CoreProcessToolProvider:
                     "cwd": {"type": "string", "description": "Required workspace-relative working directory."},
                     "environment": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Optional non-secret environment overrides."},
                     "max_output_bytes": {"type": "integer", "minimum": 1, "maximum": 5000000, "description": "Retained stdout/stderr byte limit; defaults to 1000000."},
-                    "mode": {"type": "string", "enum": ["foreground", "background"], "description": "foreground (default) observes briefly, then returns a process id without stopping a running command; background returns immediately."},
+                    "mode": {"type": "string", "enum": ["foreground", "background"], "description": "foreground (default) waits for the process result; background returns immediately."},
                     "timeout_seconds": {"type": "number", "minimum": 0.01, "maximum": 60, "description": "Legacy observation hint for compatibility. Omit this field. It never terminates a process and Runtime caps the wait at 10 seconds."},
                 },
                 # Directory is part of the command identity: it must be visible
@@ -133,7 +131,7 @@ class CoreProcessToolProvider:
             result_authority=ToolResultAuthority.PROCESS_FACT,
             model_contract=ModelToolContract(
                 purpose="Run one structured command; return its result or a managed process id if still running. Waiting never kills the command.",
-                use_when=("a local command is needed to inspect, build, test, or operate the current task", "omit timeout_seconds; Runtime yields automatically", "on RUNNING, use core.process_wait until terminal completion instead of rerunning or claiming success"),
+                use_when=("a local command is needed to inspect, build, test, or operate the current task", "use foreground and omit timeout_seconds when the next step needs the exit result", "use background when independent work can proceed"),
                 avoid_when=("you only need public web content; use web tools", "you need shell parsing; it is not available"),
                 returns=(
                     "foreground: bounded stdout, stderr, exit outcome, and success/failure status",
@@ -157,24 +155,21 @@ class CoreProcessToolProvider:
         ToolSpec(
             name="core.process_wait",
             description=(
-                "Wait once, for a bounded number of seconds, for one session-owned "
-                "managed process. wait_seconds must be from 0.01 through 30 and is "
-                "one observation window, not the process resource lease. For a longer "
-                "exit-bound task, make later wait calls with windows no greater than 30. "
-                "If it has not exited at the end of the window, it "
-                "remains running and this tool returns its current logs and state; it "
-                "never terminates the process on wait expiry. Use this only when a "
-                "subsequent step needs the exit result."
+                "Wait for one session-owned process. Pass until='exit' when the "
+                "next step depends on its result. Pass wait_seconds instead for "
+                "one short observation. A short observation leaves the process "
+                "running when its window elapses."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "process_id": {"type": "string"},
+                    "until": {"type": "string", "enum": ["exit"]},
                     "wait_seconds": {
                         "type": "number", "minimum": 0.01, "maximum": 30,
                     },
                 },
-                "required": ["process_id", "wait_seconds"],
+                "required": ["process_id"],
                 "additionalProperties": False,
             },
             risk=ToolRisk.R0,
@@ -184,8 +179,8 @@ class CoreProcessToolProvider:
             effect=ToolEffect.OBSERVE,
             result_authority=ToolResultAuthority.PROCESS_FACT,
             model_contract=ModelToolContract(
-                purpose="Observe one managed process through a bounded wait window.",
-                use_when=("a later step needs to know whether a process has exited",),
+                purpose="Wait for a managed process result or observe it briefly.",
+                use_when=("pass until='exit' if the next step needs the exit result",),
                 avoid_when=("the process is not managed by this session",),
                 returns=("current state and bounded logs", "a timeout leaves the process running and is not a failure by itself"),
             ),
@@ -343,9 +338,14 @@ class CoreProcessToolProvider:
                 data = await control.status(process_id)
             elif call.name == "core.process_wait":
                 process_id = self._non_empty_string(call.arguments, "process_id")
-                wait_seconds = self._bounded_number(
-                    call.arguments, "wait_seconds", 0.0, 0.01, 30.0
-                )
+                if call.arguments.get("until") == "exit":
+                    if "wait_seconds" in call.arguments:
+                        raise ValueError("provide either until or wait_seconds")
+                    wait_seconds = None
+                else:
+                    wait_seconds = self._bounded_number(
+                        call.arguments, "wait_seconds", 0.0, 0.01, 30.0
+                    )
                 data = (await control.wait(process_id, wait_seconds)).to_data()
             elif call.name == "core.process_logs":
                 process_id = self._non_empty_string(call.arguments, "process_id")
@@ -435,11 +435,11 @@ class CoreProcessToolProvider:
         if mode not in {"foreground", "background"}:
             raise TypeError("mode must be 'foreground' or 'background'")
         timeout_seconds: float | None = None
-        if mode == "foreground":
+        if mode == "foreground" and "timeout_seconds" in arguments:
             timeout_seconds = self._bounded_number(
                 arguments, "timeout_seconds", 10.0, 0.01, 60.0,
             )
-        elif "timeout_seconds" in arguments:
+        elif mode == "background" and "timeout_seconds" in arguments:
             raise TypeError("timeout_seconds is only valid when mode is 'foreground'")
         return await control.run(
             tuple(raw_argv), cwd=cwd, environment=dict(raw_environment),
@@ -494,8 +494,9 @@ class CoreProcessToolProvider:
         if data.get("execution_state") == "running":
             running_hint = (
                 "The command is still running under Runtime supervision. "
-                f"Continue with core.process_wait process_id={data.get('process_id')} "
-                "until it exits; do not rerun it or report completion."
+                f"If a next step needs its result, call core.process_wait "
+                f"with process_id={data.get('process_id')} and until='exit'. "
+                "Otherwise continue independent work."
             )
             hint = f"{hint} {running_hint}" if hint else running_hint
         if data.get("succeeded") is False:

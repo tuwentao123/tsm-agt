@@ -63,10 +63,10 @@ function setup() {
   document.createElement = tag => new Node(tag);
   const conversation = {id: 'chat', messages: [{role: 'user', content: '看这张图片',
     images: [{image_url: 'data:image/png;base64,test', name: '截图.png'}]}]};
-  const context = vm.createContext({document, window, activeWorkspaceId: 'workspace',
+  const context = vm.createContext({document, window, activeWorkspaceId: 'workspace', activeConversationId: 'chat',
     selectedImages: [], getActiveConversation: () => conversation,
     autoApprovePendingApprovals() {},
-    renderConversationTodo() {}, renderTracePane() {}, renderTurnCallPanel: () => null,
+    renderConversationTodo() {}, renderFilesPane() {}, renderTurnCallPanel: () => null,
     renderMarkdown: text => `<p>${text}</p>`,
     ResizeObserver: class {
       constructor(callback) { this.callback = callback; this.observed = []; observers.push(this); }
@@ -74,7 +74,7 @@ function setup() {
     },
   });
   vm.runInContext(section('let shouldAutoFollowChat =', "document.addEventListener('click'"), context);
-  vm.runInContext(section('function renderMessages(', 'function renderTracePane('), context);
+  vm.runInContext(section('function renderMessages(', 'let sourceEvaluationRunId ='), context);
   vm.runInContext(section('let imagePreviewReturnFocus =', 'const MAX_IMAGE_EDGE ='), context);
   function thumb() { return chat.children[0].children.find(item => item.className === 'message-images').children[0]; }
   function scroll(top) { chat.scrollTop = top; chat.dispatch('scroll'); }
@@ -84,6 +84,34 @@ function setup() {
 
 test('the entire emitted script compiles', () => {
   assert.doesNotThrow(() => new vm.Script(page));
+});
+
+test('a restored conversation distinguishes loading, failure, and empty history', async () => {
+  const s = setup();
+  s.conversation.messages = [];
+  s.conversation.loaded = false;
+  let resolveHistory;
+  Object.assign(s.context, {
+    console: {error() {}}, defaultModelProfile: null,
+    getConversationById: () => s.conversation,
+    renderConversations() {},
+    fetch: () => new Promise(resolve => { resolveHistory = resolve; }),
+  });
+  vm.runInContext(section('async function ensureConversationLoaded(', '// A finished Turn is only fully described'), s.context);
+
+  s.context.renderMessages();
+  assert.match(s.chat.html, /正在加载会话历史/);
+  const firstLoad = s.context.ensureConversationLoaded('chat');
+  resolveHistory({ok: false, status: 503});
+  assert.equal(await firstLoad, false);
+  assert.match(s.chat.html, /会话历史加载失败/);
+  assert.match(s.chat.html, /重试/);
+
+  const retry = s.context.ensureConversationLoaded('chat');
+  assert.match(s.chat.html, /正在加载会话历史/);
+  resolveHistory({ok: true, json: async () => ({messages: [], tasks: [], turns: []})});
+  assert.equal(await retry, true);
+  assert.match(s.chat.html, /描述一个任务/);
 });
 
 test('an empty draft skips history until the first submission is accepted', async () => {
@@ -161,9 +189,9 @@ test('startup failures are visible only in their settings sections', async () =>
 
 test('cold session reload renders real Task cards, later answers and durable timeline events', async () => {
   const s = setup();
-  const trace = new Node('aside');
+  const files = new Node('aside');
   const originalLookup = s.document.getElementById;
-  s.document.getElementById = id => id === 'trace-pane' ? trace : originalLookup(id);
+  s.document.getElementById = id => id === 'files-pane' ? files : originalLookup(id);
   const errors = [];
   Object.assign(s.context, {
     console: {error: (...args) => errors.push(args.map(String).join(' '))},
@@ -172,17 +200,18 @@ test('cold session reload renders real Task cards, later answers and durable tim
     getConversationById: id => id === 'chat' ? s.conversation : null,
     renderConversations() {}, setLoading() {},
     followTask() { throw new Error('settled history must not restart a Task'); },
+    renderSourceEvaluationRunner: () => new Node('section'),
+    renderSkillInstallButton: () => new Node('section'),
   });
   const banners = [];
   s.context.showError = message => banners.push(message);
   vm.runInContext('const taskDetailCollapseState = new Map();', s.context);
   vm.runInContext(section('const 状态文案 = {', 'const TERMINAL_STATES ='), s.context);
-  vm.runInContext(section('const 风险文案 =', 'const TIMELINE_KIND_TEXT ='), s.context);
+  vm.runInContext(section('const 风险文案 =', 'function renderMessages('), s.context);
   vm.runInContext(section('function describeFailure(', 'async function handleCancelAction('), s.context);
   vm.runInContext(section('function renderTurnMarker(', 'function turnCallTarget('), s.context);
-  vm.runInContext(section('const TIMELINE_KIND_TEXT = {', 'let skillInstallInFlight'), s.context);
   vm.runInContext(section('function renderTodoPanel(', 'function taskMessage('), s.context);
-  vm.runInContext(section('function renderTracePane(', 'const 风险文案 ='), s.context);
+  vm.runInContext(section('function renderFilesPane(', 'function applyTaskProjection('), s.context);
   vm.runInContext(section('async function ensureConversationLoaded(', '// A finished Turn is only fully described'), s.context);
   const started = {kind: 'tool_started', sequence: 2, tool_name: 'core.read_file', tool_call_id: 'read'};
   const completed = {kind: 'tool_completed', sequence: 3, tool_call_id: 'read', ok: true};
@@ -206,20 +235,19 @@ test('cold session reload renders real Task cards, later answers and durable tim
   const answers = s.chat.children.filter(node => node.className === 'message assistant');
   assert.equal(answers.length, 2);
   assert.match(answers[1].children[0].html, /Second answer/);
-  let events = trace.children[1];
-  assert.equal(events.className, 'trace-timeline-list');
-  assert.equal(events.children.filter(node => node.dataset.eventKey.includes(':2:tool_started')).length, 1);
-  assert.equal(events.children.filter(node => node.dataset.eventKey.includes(':3:tool_completed')).length, 1);
+  // The right pane is a reserved file view: the retired trace timeline must not
+  // come back on a reload or on a later render pass.
+  assert.equal(files.children.length, 3);
+  assert.equal(files.children[0].className, 'files-pane-empty');
+  assert.match(files.children[0].children[0].textContent, /暂无打开的文件/);
+  const paneClasses = () => files.children.map(node => String(node.className || '')).join(' ');
+  assert.doesNotMatch(paneClasses(), /trace-timeline|trace-event/);
 
   // Reconnection may deliver the same durable event into the live buffer.
   const task = s.conversation.messages.find(message => message.role === 'task').task;
   task.progress = [{sequence: 2, text: 'Read file', progressData: started}];
-  s.context.renderTracePane(s.conversation);
-  events = trace.children[1];
-  assert.equal(events.children.filter(node => node.dataset.eventKey.includes(':2:tool_started')).length, 1);
-  s.context.renderTracePane({messages: [], turnCalls: new Map()});
-  assert.equal(trace.children[1].className, 'trace-timeline-caption');
-
+  s.context.renderFilesPane();
+  assert.doesNotMatch(paneClasses(), /trace-timeline|trace-event/);
   const existingMessages = s.conversation.messages;
   s.conversation.loaded = false;
   s.context.fetch = async () => ({ok: false, status: 503});

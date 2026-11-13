@@ -118,8 +118,12 @@ class _FakeKernel:
             raise LookupError(f"task not found: {task_id}")
         return self._tasks[task_id]
 
-    async def get_session_conversation(self, _session_id: str):
-        return self._projection
+    async def read_session_history(self, session_id: str):
+        return (
+            await self.get_session(session_id),
+            self._projection,
+            await self.dependencies.store.read_session_events(session_id),
+        )
 
 
 class _FakeClient:
@@ -131,6 +135,14 @@ class _FakeClient:
         if isinstance(self._result, dict):
             return self._result[task_id]
         return self._result
+
+    async def read_task_history(self, task_id, _session_events):
+        kernel = self.application.kernel
+        return (
+            await kernel.get_task(task_id),
+            await self.get_task_result(task_id),
+            await kernel.dependencies.store.read_events(task_id),
+        )
 
     def latest_progress_sequence(self, _task_id: str) -> int:
         return 7
@@ -742,8 +754,8 @@ class StreamResilienceUiTest(unittest.TestCase):
         self,
     ) -> None:
         html = web_app.INDEX_HTML
-        self.assertIn("async function loadSessions()", html)
-        self.assertIn("await loadSessions();", html)
+        self.assertIn("async function loadSessions(", html)
+        self.assertIn("await loadSessions(sessionsResponse);", html)
         self.assertIn("ensureConversationLoaded(", html)
         self.assertIn("todoList: task.todo_list || null", html)
         self.assertIn("const activeTask = tasksById.get(data.active_task_id)", html)
@@ -909,13 +921,19 @@ class TaskCardIsolationUiTest(unittest.TestCase):
         self.assertIn("payload.sequence", html)
         self.assertIn("item.task?.taskId === taskId", html)
 
-    def test_trace_state_uses_structured_progress_not_display_text(self) -> None:
+    def test_tool_card_state_uses_structured_progress_not_display_text(self) -> None:
         html = web_app.INDEX_HTML
-        self.assertIn("function traceStateForProgress(progress)", html)
-        self.assertIn("kind === 'tool_started'", html)
-        self.assertIn("kind === 'tool_completed'", html)
-        self.assertIn("progress.ok === false || progress.error_code", html)
-        self.assertIn("const progress = (item && item.progressData) || {}", html)
+        # A tool card's state comes from structured progress only: `kind` names the
+        # phase, `ok`/`error_code` decide the result, and `incomplete` marks an
+        # orphaned call whose Turn already ended.
+        self.assertIn("function toolCardModel(progress)", html)
+        self.assertIn("if (kind !== 'tool_started' && kind !== 'tool_completed') return null", html)
+        self.assertIn("progress.ok === false ? 'failed' : 'ok'", html)
+        self.assertIn("progress.incomplete ? 'incomplete' : 'running'", html)
+        self.assertIn("errorCode: String(progress.error_code || '')", html)
+        # The retired timeline view kept a parallel state heuristic; it must not
+        # survive as dead code that no live view reaches.
+        self.assertNotIn("function traceStateForProgress(", html)
         # Patch contents and filenames are untrusted display text. In particular,
         # `approval-request-bound` must never turn a completed patch into waiting.
         self.assertNotIn("lower.includes('approval')", html)

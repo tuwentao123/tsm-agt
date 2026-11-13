@@ -1,19 +1,19 @@
 """YAML-only model configuration for the local tsm-agt installation.
 
-The application deliberately has no dotenv or process-environment model
-configuration path. A model name alone does not identify its wire protocol,
-so each named profile selects a provider and that provider declares its
-protocol explicitly.
+Each profile selects a provider that determines its wire protocol. Opted-in
+providers can also supply their model IDs through a model listing endpoint.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import yaml
+
+from tsm_agt.core.configuration import canonical_hash
 
 
 MODEL_PROTOCOL_OPEN = "open"
@@ -198,6 +198,107 @@ def load_configuration_document(path: Path | None = None) -> tuple[Path, Mapping
     return configuration_file, data
 
 
+def discover_model_profiles(
+    document: Mapping[str, object],
+    fetch_models: Callable[[str, str], tuple[str, ...]],
+    *,
+    configuration_file: Path | None = None,
+) -> tuple[Mapping[str, object], tuple[str, ...]]:
+    """Expand opted-in providers into a process-local profile catalog."""
+    model = _mapping(document.get("model"), "model")
+    providers = _mapping(model.get("providers"), "model.providers")
+    profiles = _optional_mapping(model.get("profiles"), "model.profiles")
+    discovered_providers: dict[str, Mapping[str, object]] = {}
+    discovered_profiles: dict[str, dict[str, str]] = {}
+    existing_models = {
+        (profile.get("provider"), profile.get("model"))
+        for profile in profiles.values()
+        if isinstance(profile, Mapping)
+        and isinstance(profile.get("provider"), str)
+        and isinstance(profile.get("model"), str)
+    }
+    issues: list[str] = []
+    for provider_id, raw in providers.items():
+        if not isinstance(raw, Mapping) or raw.get("discover_models", False) is False:
+            continue
+        field = f"model.providers.{provider_id}"
+        try:
+            provider = _mapping(raw, field)
+            _bool(provider["discover_models"], f"{field}.discover_models")
+            protocol = _choice(provider.get("protocol", WIRE_PROTOCOL_OPENAI_CHAT),
+                               f"{field}.protocol", WIRE_PROTOCOLS)
+            base_url = _discovery_base_url(provider.get("base_url"), field)
+            auth = _mapping(provider.get("auth"), f"{field}.auth")
+            api_key = _string(auth.get("api_key"), f"{field}.auth.api_key")
+            if api_key in _PLACEHOLDER_API_KEYS:
+                raise ValueError(f"{field}.auth.api_key 尚未配置")
+            options = _optional_mapping(provider.get("options"), f"{field}.options")
+            model_ids = fetch_models(base_url, api_key)
+            if not model_ids:
+                raise ValueError("未返回模型")
+
+            # Static profiles keep using the provider exactly as written in YAML.
+            discovered_provider_id = f"discovered-provider-{canonical_hash(provider_id)}"
+            provider_profiles = {
+                f"discovered-{canonical_hash([provider_id, model_id])}": {
+                    "provider": discovered_provider_id,
+                    "model": model_id,
+                    "label": f"{model_id} · {provider_id}",
+                }
+                for model_id in model_ids if (provider_id, model_id) not in existing_models
+            }
+            if not provider_profiles:
+                continue
+            if (discovered_provider_id in providers or discovered_provider_id in discovered_providers
+                    or provider_profiles.keys() & (profiles.keys() | discovered_profiles.keys())):
+                raise ValueError("自动发现的模型配置 ID 与现有配置冲突")
+            discovered_provider = {
+                "protocol": protocol, "base_url": base_url, "auth": auth,
+                "options": {"strict_tool_schema": False, **options},
+            }
+            candidate = {"model": {
+                "providers": {discovered_provider_id: discovered_provider},
+                "profiles": provider_profiles,
+            }}
+            for profile_id in provider_profiles:
+                load_model_configuration(configuration_file, candidate, profile_id=profile_id)
+        except ValueError as error:
+            issues.append(f"{provider_id}：{error}")
+            continue
+        discovered_providers[discovered_provider_id] = discovered_provider
+        discovered_profiles.update(provider_profiles)
+
+    if not discovered_profiles:
+        if not profiles and issues:
+            raise ValueError("；".join(issues))
+        return document, tuple(issues)
+    default_profile = model.get("default_profile")
+    if default_profile is None and not profiles:
+        default_profile = next(iter(discovered_profiles))
+    return {
+        **document,
+        "model": {
+            **model,
+            "providers": {**providers, **discovered_providers},
+            "profiles": {**profiles, **discovered_profiles},
+            "default_profile": default_profile,
+        },
+    }, tuple(issues)
+
+
+def _discovery_base_url(value: object, field: str) -> str:
+    url = _string(value, f"{field}.base_url")
+    try:
+        endpoint_origin(url)
+        parts = urlsplit(url)
+    except ValueError:
+        raise ValueError(f"{field}.base_url 必须是有效的 HTTP(S) 地址") from None
+    if parts.username is not None or parts.query or parts.fragment:
+        raise ValueError(f"{field}.base_url 不可包含认证信息、查询参数或片段")
+    # Kiro advertises its origin without the API path.
+    return urlunsplit(parts._replace(path=parts.path.rstrip("/") or "/v1"))
+
+
 def load_model_configuration(
     path: Path | None = None,
     document: Mapping[str, object] | None = None,
@@ -357,13 +458,6 @@ def _request_parameters(value: object, protocol: str) -> Mapping[str, object]:
     if "parallel_tool_calls" in parameters:
         _bool(parameters["parallel_tool_calls"], "parallel_tool_calls")
     return copy.deepcopy(dict(parameters))
-
-
-def inspect_model_configuration(path: Path | None = None) -> tuple[ModelConfiguration | None, tuple[str, ...]]:
-    try:
-        return load_model_configuration(path), ()
-    except ModelConfigurationError as error:
-        return None, error.missing
 
 
 def model_configuration_sources(configuration: ModelConfiguration) -> dict[str, str]:

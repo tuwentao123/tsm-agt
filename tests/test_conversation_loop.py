@@ -8,13 +8,16 @@ exhausted iteration budget is reported as a partial boundary rather than success
 
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 import tempfile
 import unittest
+from contextlib import aclosing
 from datetime import datetime
 from pathlib import Path
 
-from tsm_agt.adapters.builtin import CoreProcessToolProvider
+from tsm_agt.adapters.builtin import CoreProcessToolProvider, CoreReadOnlyToolProvider
 from tsm_agt.adapters.fixture import EchoModelProvider
 from tsm_agt.bootstrap import compose_fixture_application
 from tsm_agt.core import (
@@ -56,6 +59,8 @@ from tsm_agt.ports import (
     ToolRisk,
     ToolSpec,
 )
+from tsm_agt.sdk.runtime import EngineeringAgentClient
+from tests.test_core_process_tools import _AllowProcessSandbox
 
 
 class ScriptedCompletionReviewer(EchoModelProvider):
@@ -262,6 +267,100 @@ async def _executing(application, root: Path, task_id: str = "task-conv"):
 
 
 class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
+    async def test_completion_arriving_during_tool_joins_next_model_request(self):
+        class FinishDuringTool(CoreReadOnlyToolProvider):
+            async def invoke(self, call, context):
+                (context.workspace / "release").touch()
+                await asyncio.wait_for(finished.wait(), timeout=3)
+                return await super().invoke(call, context)
+
+        finished = asyncio.Event()
+        model = ScriptedModel([
+            tool_response("read", "read-input", "core.read_file", {"path": "input.txt"}),
+            text_response("reported", "Read the input and checked the job."),
+        ])
+        application = compose_fixture_application(
+            model_adapter=model, sandbox_adapter=_AllowProcessSandbox(),
+            tool_adapters=(FinishDuringTool(),),
+        )
+        await application.registry.start_all()
+        kernel = application.kernel
+        kernel.on_background_process_completed = lambda _: finished.set()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "input.txt").write_text("file evidence")
+                task = await _executing(application, root)
+                await kernel.start_background_process(
+                    task.task_id, "earlier", (sys.executable, "-c", (
+                        "import time\nfrom pathlib import Path\n"
+                        "while not Path('release').exists(): time.sleep(.01)\n"
+                        "print('process evidence')"
+                    )), notify_on_exit=True,
+                )
+                await kernel.run_agent_turn(task.task_id, "Read input.txt and check the job")
+                self.assertEqual(len(model.requests), 2)
+                messages = model.requests[1].messages
+                tool_result = next(i for i, message in enumerate(messages) if message.role is MessageRole.TOOL)
+                completion = next(i for i, message in enumerate(messages) if "process evidence" in message.text)
+                self.assertLess(tool_result, completion)
+        finally:
+            await kernel.stop_process_observers()
+            await application.registry.stop_all()
+
+    async def test_background_exit_wakes_idle_conversation_once(self):
+        command = (
+            "import time\nfrom pathlib import Path\n"
+            "while not Path('release').exists(): time.sleep(.01)\n"
+            "print('background-result')"
+        )
+        model = ScriptedModel([
+            tool_response("start", "start-background", "core.run_command", {
+                "argv": [sys.executable, "-c", command], "cwd": ".", "mode": "background",
+            }),
+            text_response("idle", "Waiting for the background command."),
+            text_response("reported", "The background command passed."),
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = compose_fixture_application(
+                model_adapter=model, sandbox_adapter=_AllowProcessSandbox(),
+                tool_adapters=(CoreProcessToolProvider(),),
+            )
+            async with EngineeringAgentClient(root, application_factory=lambda: application) as client:
+                task = await client.submit_task("Run a check", command_id="background-test")
+                paused = await client.wait_task(task.task_id)
+                self.assertIsNotNone(paused.approval, paused.to_data())
+                await client.resolve_approval(
+                    paused.approval["request_id"], ApprovalDecision.APPROVE, "approved",
+                    command_id="approve-background-test",
+                )
+                kernel = application.kernel
+                self.assertEqual((await kernel.get_task(task.task_id)).state, TaskState.AWAITING_INPUT)
+                snapshot = await client.get_task_result(task.task_id)
+                async with aclosing(client.subscribe_task_ui(task.task_id, after=snapshot.cursor)) as stream:
+                    async with asyncio.timeout(5):
+                        async for packet in stream:
+                            if packet.get("background_work_pending"):
+                                break
+                        (root / "release").touch()
+                        remaining = [packet async for packet in stream]
+                self.assertTrue(any(
+                    packet.get("progress", {}).get("trigger") == "background_process"
+                    for packet in remaining
+                ))
+                self.assertEqual(remaining[-1]["assistant_text"], "The background command passed.")
+                await client.wait_task(task.task_id)
+                self.assertEqual(len(model.requests), 3)
+                self.assertTrue(any("background-result" in message.text for message in model.requests[2].messages))
+                events = await kernel.dependencies.store.read_events(task.task_id, event_types=(
+                    "turn.started", "process.completions_delivered",
+                ))
+                self.assertEqual([event.event_type for event in events], [
+                    "turn.started", "turn.started", "process.completions_delivered",
+                ])
+                self.assertEqual(events[1].payload["trigger"], "background_process")
+
     async def test_runtime_never_summarizes_tool_outcomes_as_commentary(self):
         model = ScriptedModel([
             tool_response("first", "first-call", "fixture.fail", {"text": "test"}),
@@ -978,6 +1077,13 @@ class ConversationLoopTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("conversation.partial_boundary", types)
                 self.assertIn("turn.incomplete_boundary", types)
                 self.assertNotIn("conversation.text_completed", types)
+                boundary = next(event for event in events if event.event_type == "turn.incomplete_boundary")
+                self.assertEqual(boundary.payload["model_calls"], 2)
+                self.assertEqual(boundary.payload["max_model_calls"], 2)
+                from tsm_agt.sdk.ui_events import _incomplete_reason
+                self.assertIn("模型调用额度已用完（已用 2/2 次）", _incomplete_reason(boundary.payload))
+                legacy = {key: value for key, value in boundary.payload.items() if key != "max_model_calls"}
+                self.assertIn("模型调用额度已用完（已用 2 次）", _incomplete_reason(legacy))
         finally:
             await application.registry.stop_all()
 

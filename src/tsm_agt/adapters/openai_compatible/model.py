@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -156,7 +157,6 @@ class OpenAICompatibleModelProvider:
         self._streaming = streaming
         self._native_structured_conclusion = native_structured_conclusion
         self._request_diagnostics = request_diagnostics
-        import copy
         self._request_parameters = copy.deepcopy(dict(request_parameters or {}))
         # `structured-conclusion` advertises a Kernel-reachable protocol, not
         # only an optional provider-native message field.  Every compatible
@@ -791,7 +791,6 @@ class OpenAICompatibleModelProvider:
         )
         if mapped_effort is not None:
             payload["reasoning_effort"] = mapped_effort
-        import copy
         payload.update(copy.deepcopy(self._request_parameters))
         if request.purpose is ModelCallPurpose.COMPACTION and output_limit is not None:
             # Interactive generation may be uncapped; auxiliary summaries are
@@ -828,6 +827,11 @@ class OpenAICompatibleModelProvider:
             # OpenAI-compatible gateways reject a top-level oneOf. The runtime
             # still checks the original schema, and the properties explain the choice.
             parameters.pop("oneOf", None)
+        elif tool.name == "core.read_files":
+            # Keep the alternative target fields in the advertised shape;
+            # validate the exclusive choice locally for every item.
+            parameters = copy.deepcopy(parameters)
+            parameters["properties"]["reads"]["items"].pop("oneOf", None)
         description = tool.model_description()
         if outcome_refs:
             properties = dict(parameters.get("properties", {}))

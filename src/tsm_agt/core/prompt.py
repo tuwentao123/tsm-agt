@@ -233,9 +233,9 @@ class PromptTemplate:
                     requires_any_tools=("core.search_files",),
                 ),
                 PromptTemplateSegment(
-                    "workspace-read-guidance", "harness", "1.3",
+                    "workspace-read-guidance", "harness", "1.4",
                     prompt_text["workspace-read-guidance"],
-                    requires_any_tools=("core.read_file", "core.search_files"),
+                    requires_any_tools=("core.read_file", "core.read_files", "core.search_files"),
                 ),
                 PromptTemplateSegment(
                     "code-edit-guidance", "harness", "1.6",
@@ -243,7 +243,7 @@ class PromptTemplate:
                     requires_any_tools=("core.apply_patch", "core.apply_patch_v4a"),
                 ),
                 PromptTemplateSegment(
-                    "workspace-command-guidance", "harness", "1.9",
+                    "workspace-command-guidance", "harness", "1.10",
                     prompt_text["workspace-command-guidance"],
                     requires_any_tools=("core.run_command", "core.process_wait"),
                 ),

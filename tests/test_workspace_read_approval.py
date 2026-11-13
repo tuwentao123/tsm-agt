@@ -58,6 +58,40 @@ class ExternalReadModel(EchoModelProvider):
 
 
 class WorkspaceReadApprovalTest(unittest.IsolatedAsyncioTestCase):
+    async def test_batch_read_respects_exact_external_directory_grant(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "local.txt").write_text("local")
+            allowed, separate = root / "allowed", root / "separate"
+            for folder in (allowed, separate):
+                folder.mkdir()
+                (folder / "note.txt").write_text(folder.name)
+            application = compose_fixture_application(tool_adapters=(CoreReadOnlyToolProvider(),))
+            await application.registry.start_all()
+            try:
+                task = await self._executing_task(application, workspace)
+                call = ToolCall("batch", "core.read_files", {"reads": [
+                    {"path": "local.txt"},
+                    {"path": str(allowed / "note.txt")},
+                    {"path": str(separate / "note.txt")},
+                ]})
+                with self.assertRaises(ApprovalRequired) as caught:
+                    await application.kernel.invoke_tool(task.task_id, "turn-1", call)
+                request = caught.exception.request
+                self.assertEqual(request.workspace_access_root, str(allowed.resolve()))
+                result = await application.kernel.resolve_approval(
+                    task.task_id, request.request_id, request.payload_hash,
+                    ApprovalDecision.APPROVE, "allow the selected directory",
+                )
+                local, approved, denied = result.data["reads"]
+                self.assertEqual(local["data"]["content"], "local")
+                self.assertEqual(approved["data"]["content"], "allowed")
+                self.assertEqual(denied["error_code"], "PERMISSION_DENIED")
+            finally:
+                await application.registry.stop_all()
+
     async def _executing_task(
         self, application, workspace: Path,
         task_id: str = "task-external-read",

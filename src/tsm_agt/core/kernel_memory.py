@@ -66,8 +66,13 @@ class MemoryMixin:
         """
         task = await self.get_task(task_id)
         events = await self._dependencies.store.read_events(task_id)
+        return self.project_effective_working_memory(task, events)
+
+    def project_effective_working_memory(
+        self, task: TaskSnapshot, events: tuple[RuntimeEvent, ...],
+    ) -> EffectiveWorkingMemory:
         snapshot = self._dependencies.working_memory_projector.project(
-            task_id, task.goal, events
+            task.task_id, task.goal, events
         )
         return self._dependencies.effective_working_memory_projector.project(
             snapshot

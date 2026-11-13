@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -133,6 +133,7 @@ class BackgroundProcessRecord:
     termination_signal: str | None = None
     finished_at: datetime | None = None
     invocation_id: str | None = None
+    notify_on_exit: bool = False
 
     def finish(self, result: ProcessResult) -> BackgroundProcessRecord:
         states = {
@@ -140,19 +141,14 @@ class BackgroundProcessRecord:
             "cancelled": BackgroundProcessState.CANCELLED,
             "timed_out": BackgroundProcessState.TIMED_OUT,
         }
-        return BackgroundProcessRecord(
-            self.process_id, self.turn_id, self.handle, states[result.status.value],
-            self.max_lifetime_seconds, self.deadline_at, self.stop_on_task_end,
-            result.exit_code, result.termination_signal, result.finished_at,
-            self.invocation_id,
+        return replace(
+            self, state=states[result.status.value], exit_code=result.exit_code,
+            termination_signal=result.termination_signal, finished_at=result.finished_at,
         )
 
     def orphan(self, when: datetime) -> BackgroundProcessRecord:
-        return BackgroundProcessRecord(
-            self.process_id, self.turn_id, self.handle,
-            BackgroundProcessState.ORPHANED, self.max_lifetime_seconds,
-            self.deadline_at, self.stop_on_task_end, finished_at=when,
-            invocation_id=self.invocation_id,
+        return replace(
+            self, state=BackgroundProcessState.ORPHANED, finished_at=when,
         )
 
     def to_data(self) -> dict[str, Any]:
@@ -163,6 +159,7 @@ class BackgroundProcessRecord:
             "max_lifetime_seconds": self.max_lifetime_seconds,
             "deadline_at": self.deadline_at.isoformat(),
             "stop_on_task_end": self.stop_on_task_end,
+            "notify_on_exit": self.notify_on_exit,
             "exit_code": self.exit_code,
             "termination_signal": self.termination_signal,
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
@@ -193,6 +190,7 @@ class BackgroundProcessRecord:
             deadline_at=datetime.fromisoformat(str(data["deadline_at"])),
             stop_on_task_end=bool(data.get("stop_on_task_end", True)),
             invocation_id=data.get("invocation_id"),
+            notify_on_exit=bool(data.get("notify_on_exit", False)),
             exit_code=int(data["exit_code"]) if data.get("exit_code") is not None else None,
             termination_signal=(str(data["termination_signal"]) if data.get("termination_signal") else None),
             finished_at=datetime.fromisoformat(str(finished)) if finished else None,

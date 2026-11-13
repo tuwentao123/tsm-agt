@@ -43,6 +43,8 @@ from .file_read_cache import FileReadCache, file_version
 _MAX_LIST_LIMIT = 1000
 _MAX_READ_LINES = 1000
 _MAX_READ_CHARS = 8000
+_MAX_BATCH_READS = 8
+_MAX_BATCH_READ_CHARS = 24_000
 _MAX_SEARCH_MATCHES = 500
 _MAX_SEARCH_FILES = 5000
 _MAX_SEARCH_FILE_BYTES = 1_000_000
@@ -88,7 +90,7 @@ class CoreReadOnlyToolProvider:
         capabilities=frozenset(
             {
                 "core.list_files", "core.search_files",
-                "core.find_files", "core.read_file", "core.search_text",
+                "core.find_files", "core.read_file", "core.read_files", "core.search_text",
                 "core.grep_search",
             }
         ),
@@ -292,6 +294,33 @@ class CoreReadOnlyToolProvider:
             ),
         ),
         ToolSpec(
+            name="core.read_files",
+            description=(
+                "Read up to eight already located files or independent line ranges in one call. "
+                "Each item takes the same path, resource_ref and range options as core.read_file. "
+                "Results preserve order and report errors per item. Use returned cursors for "
+                "needed continuation. " + _LOCAL_READ_PATH_GUIDANCE
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"reads": {
+                    "type": "array", "minItems": 1, "maxItems": _MAX_BATCH_READS,
+                    "items": {"type": "object"},
+                }},
+                "required": ["reads"], "additionalProperties": False,
+            },
+            risk=ToolRisk.R0, is_read_only=True, is_concurrency_safe=True,
+            idempotency=ToolIdempotency.IDEMPOTENT, effect=ToolEffect.OBSERVE,
+            result_authority=ToolResultAuthority.WORKSPACE_FACT,
+            model_contract=ModelToolContract(
+                purpose="Read multiple known files or line ranges together. "
+                        "Each read accepts path or resource_ref, start_line, start_column and max_lines. "
+                        + _LOCAL_READ_PATH_GUIDANCE,
+                use_when=("several known ranges are needed and none depends on another read",),
+                returns=("ordered read results with file hashes, per-item errors and continuation cursors",),
+            ),
+        ),
+        ToolSpec(
             name="core.search_text",
             description=(
                 "Legacy content-search alias retained for checkpoint compatibility. "
@@ -385,7 +414,16 @@ class CoreReadOnlyToolProvider:
         self._file_reads.clear()
 
     async def list_tools(self) -> tuple[ToolSpec, ...]:
-        return self._tools
+        read = next(tool for tool in self._tools if tool.name == "core.read_file")
+        return tuple(
+            replace(tool, parameters={
+                **tool.parameters,
+                "properties": {"reads": {
+                    **tool.parameters["properties"]["reads"], "items": read.parameters,
+                }},
+            }) if tool.name == "core.read_files" else tool
+            for tool in self._tools
+        )
 
     async def invoke(
         self, call: ToolCall, context: ToolInvocationContext
@@ -397,16 +435,20 @@ class CoreReadOnlyToolProvider:
             "core.search_files": self._search_files,
             "core.find_files": self._find_files,
             "core.read_file": self._read_file,
+            "core.read_files": self._read_files,
             "core.search_text": self._search_text,
             "core.grep_search": self._search_text,
         }
         handler = handlers.get(call.name)
         if handler is None:
             return self._error(call, "NOT_FOUND", f"unknown core tool: {call.name}")
+        # Reads and ripgrep are synchronous I/O. Yield the event loop so
+        # independent read-only calls can actually overlap.
+        return await asyncio.to_thread(self._invoke_read_handler, handler, call, context)
+
+    def _invoke_read_handler(self, handler, call: ToolCall, context: ToolInvocationContext) -> ToolResult:
         try:
-            # Reads and ripgrep are synchronous I/O. Yield the event loop so
-            # independent read-only calls can actually overlap.
-            return await asyncio.to_thread(handler, call, context)
+            return handler(call, context)
         except _SensitivePathError as error:
             return self._error(call, "PERMISSION_DENIED", str(error))
         except _WorkspaceAccessError as error:
@@ -420,6 +462,36 @@ class CoreReadOnlyToolProvider:
             )
         except OSError as error:
             return self._error(call, "TOOL_FAILED", str(error), retryable=True)
+
+    def _read_files(self, call: ToolCall, context: ToolInvocationContext) -> ToolResult:
+        reads = call.arguments["reads"]
+        if not isinstance(reads, (list, tuple)) or not 1 <= len(reads) <= _MAX_BATCH_READS:
+            raise ValueError("reads must contain 1 through 8 file or range requests")
+        remaining = _MAX_BATCH_READ_CHARS
+        results = []
+        for index, arguments in enumerate(reads):
+            subcall = ToolCall(f"{call.call_id}:{index}", "core.read_file", arguments)
+            result = self._invoke_read_handler(self._read_file, subcall, context)
+            row = result.to_data()
+            row.pop("call_id", None)
+            row["index"] = index
+            if result.ok:
+                content = result.data["content"]
+                if len(content) > remaining:
+                    # Preserve exact single-read range and hash semantics. A
+                    # whole deferred item resumes at its original cursor.
+                    results.append({
+                        "index": index, "ok": False, "error_code": "BATCH_OUTPUT_LIMIT",
+                        "next_read": dict(arguments),
+                    })
+                    continue
+                remaining -= len(content)
+            results.append(row)
+        return ToolResult(
+            call.call_id, True, data={"reads": results},
+            truncated=any(row.get("truncated") or row.get("next_read") for row in results),
+            meta={"untrusted_data": True},
+        )
 
     def _list_files(
         self, call: ToolCall, context: ToolInvocationContext

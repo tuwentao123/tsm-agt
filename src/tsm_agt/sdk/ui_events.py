@@ -98,6 +98,10 @@ async def ui_snapshot(client, task_id: str):
                     message = event.payload.get("assistant_message") or {}
                     data["assistant_text"] = "\n".join(str(block.get("text", "")) for block in message.get("content", []) if block.get("type") == "text").strip() or None
                     break
+        if result.status == "awaiting_input":
+            data["background_work_pending"] = (
+                await client.application.kernel.has_pending_process_work(task)
+            )
         after = await store.load_task(task_id)
         session_after = await store.load_session(task.session_id) if task.session_id else None
         if before.version != after.version or (session.version if session else 0) != (session_after.version if session_after else 0):
@@ -183,7 +187,7 @@ async def subscribe_task_ui(client, task_id: str, *, after: int = 0, heartbeat: 
                         yield {"schema_version": 1, "type": event.event_type, "task_id": task_id,
                                "session_id": event.session_id or snapshot["session_id"], "turn_id": event.turn_id or progress.get("turn_id"),
                                "sequence": event.sequence, "progress": progress}
-                    if event.event_type in {"task.state_changed", "working_memory.updated", "steering.queued", "turn.failed", "turn.incomplete_boundary", "clarification.resolved"}:
+                    if event.event_type in {"task.state_changed", "working_memory.updated", "steering.queued", "turn.failed", "turn.incomplete_boundary", "clarification.resolved", "process.exited", "process.cancelled", "process.orphaned"}:
                         visible = True
                 if len(events) < 500:
                     if visible or initial:
@@ -217,7 +221,9 @@ async def subscribe_task_ui(client, task_id: str, *, after: int = 0, heartbeat: 
                 snapshot["installations"] = installation_records(client, task_id, snapshot["session_id"])
                 yield snapshot
                 initial = False
-                if snapshot["final"] or snapshot["waiting"] or snapshot["status"] == "awaiting_input":
+                if (snapshot["final"] or snapshot["waiting"]
+                        or (snapshot["status"] == "awaiting_input"
+                            and not snapshot.get("background_work_pending"))):
                     return
             elif cursor:
                 yield {"type": "stream.cursor", "task_id": task_id, "sequence": cursor}
@@ -237,6 +243,7 @@ async def subscribe_task_ui(client, task_id: str, *, after: int = 0, heartbeat: 
 #: keeps whole model messages and patch bodies out of the per-Turn view.
 _TURN_PROGRESS_EVENT_TYPES = (
     "turn.started",
+    "process.started",
     "model.attempt_started",
     "model.attempt_failed",
     "model.recovery_decided",
@@ -413,9 +420,12 @@ def _turn_progress_item(
         return {
             **base, "kind": "turn_started",
             "input_characters": payload.get("input_character_count"),
+            "trigger": payload.get("trigger"),
             "tool_exposure_profile": payload.get("tool_exposure_profile"),
             "visible_tool_count": len(payload.get("visible_tools") or ()),
         }
+    if kind == "process.started":
+        return {**base, "kind": "process_started", "process_id": payload.get("process_id")}
     if kind in {"model.attempt_started", "model.attempt_failed",
                 "model.recovery_decided", "model.network_waiting",
                 "model.network_recovered"}:
@@ -446,8 +456,13 @@ def _turn_progress_item(
             "finish_reason": payload.get("finish_reason"),
         }
     if kind.startswith("context.summary_"):
-        return {**base, "kind": "commentary", "phase": "context_summary",
+        # Compaction progress is runtime status, not a model fragment: the view
+        # keeps it as one replaceable status line instead of a commentary
+        # paragraph, so it must not borrow the commentary kind.
+        return {**base, "kind": "context_summary", "phase": "context_summary",
                 "activity": str(payload.get("activity") or "正在压缩上下文"),
+                "summary_stage": str(payload.get("stage") or ""),
+                "summary_failed": kind == "context.summary_failed",
                 "elapsed_seconds": payload.get("elapsed_seconds", 0)}
     if kind == "conversation.commentary":
         return {
@@ -595,6 +610,15 @@ def _bounded_text(value: Any) -> str:
 
 def _incomplete_reason(payload) -> str:
     reason = str(payload.get("reason") or "unknown")
+    if reason == "iteration_budget_exhausted":
+        used, maximum = payload.get("model_calls"), payload.get("max_model_calls")
+        if type(used) is int and type(maximum) is int:
+            count = f"（已用 {used}/{maximum} 次）"
+        elif type(used) is int:
+            count = f"（已用 {used} 次）"
+        else:
+            count = ""
+        return f"本轮模型调用额度已用完{count}，尚未生成最终答复，执行进度已保留。"
     if reason == "tool_call_budget_exhausted":
         used, maximum = payload.get("tool_calls"), payload.get("max_tool_calls")
         requested, remaining = payload.get("requested_tool_calls"), payload.get("remaining_tool_calls")

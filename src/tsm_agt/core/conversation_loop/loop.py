@@ -70,6 +70,7 @@ from ..approval import ApprovalNotPending
 from ..clarification import ClarificationNotPending
 from ..context import ContextWindowExceeded
 from ..context_messages import GENERATED_CONTEXT_PREFIXES
+from ..kernel_process import PROCESS_COMPLETION_INPUT_PREFIX
 from ..task import TaskKind, TaskSnapshot, TaskState
 from ..tool import InvalidToolArguments, validate_tool_arguments
 from ..turn import InvalidModelResponse, InvalidTurnState, ModelInvocationFailed
@@ -164,6 +165,7 @@ class ConversationAgentLoop:
         tool_timeout_seconds: float,
         on_text_delta: Callable[[str], None] | None,
         on_progress: Callable[[AgentProgress], None] | None,
+        background_completion: bool = False,
     ) -> AgentTurnResult | AgentTurnIncomplete | AgentTurnSuspended | AgentClarificationSuspended:
         kernel = self._kernel
         task = await kernel.get_task(task_id)
@@ -200,7 +202,10 @@ class ConversationAgentLoop:
             initial_exposure_profile = "text_only"
         turn_id = f"turn-{uuid4().hex}"
         user_message = Message(
-            message_id=f"msg-{uuid4().hex}",
+            message_id=(
+                PROCESS_COMPLETION_INPUT_PREFIX + turn_id
+                if background_completion else f"msg-{uuid4().hex}"
+            ),
             role=MessageRole.USER,
             content=user_blocks or (TextBlock(user_text),),
         )
@@ -210,6 +215,7 @@ class ConversationAgentLoop:
             "current_input_ref": f"message:{user_message.message_id}",
             "input_role": user_message.role.value,
             "input_character_count": len(user_text),
+            **({"trigger": "background_process"} if background_completion else {}),
             "max_model_calls": max_model_calls,
             "max_tool_calls": max_tool_calls,
             "max_output_tokens": max_output_tokens,
@@ -464,9 +470,11 @@ class ConversationAgentLoop:
             )
             if state.model_call_count >= state.checkpoint.max_model_calls:
                 return await self._finalizer.persist_partial_boundary(
-                    state, ITERATION_BUDGET_EXHAUSTED
+                    state, ITERATION_BUDGET_EXHAUSTED,
+                    budget={"max_model_calls": state.checkpoint.max_model_calls},
                 )
             try:
+                state.messages.extend(await self._pending_process_messages(state))
                 await self._prepare_model_call(state)
             except Exception as error:
                 # Preparation (including compaction) must settle the task just
@@ -743,6 +751,9 @@ class ConversationAgentLoop:
                     ):
                         await self._record_superseded_model_response(state)
                         continue
+                    if (state.model_call_count < checkpoint.max_model_calls
+                            and await self._pending_process_messages(state)):
+                        continue
                     state.messages.append(response.message)
                     await self._finalization.persist_finalization_state(
                         state, "conversation-loop-text-completion"
@@ -772,6 +783,16 @@ class ConversationAgentLoop:
                     state.checkpoint, "conversation-loop-model-response"
                 )
                 state.pending_tool_calls = list(parsed_calls)
+
+    async def _pending_process_messages(self, state: TurnState) -> tuple[Message, ...]:
+        task = await self._kernel.get_task(state.task_id)
+        if task.task_kind is not TaskKind.CONVERSATION:
+            return ()
+        existing = {message.message_id for message in state.messages}
+        return tuple(
+            message for message in await self._kernel.pending_process_completions(task)
+            if message.message_id not in existing
+        )
 
     async def _apply_pending_steering_at_boundary(
         self, state: TurnState, safe_point: str,

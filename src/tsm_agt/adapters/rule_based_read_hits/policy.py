@@ -96,8 +96,19 @@ class RuleBasedReadHitsPolicy:
         semantic_action: SemanticAction | None, state: ReadHitsState,
     ) -> ReadHitsUpdate:
         self._require_started()
-        if result.ok and state.active and self._consumes_candidate(call, state):
-            return ReadHitsUpdate(ReadHitsState(), "consumed")
+        if result.ok and state.active:
+            if call.name == "core.read_files" and isinstance(result.data, Mapping):
+                consumed = any(
+                    isinstance(row, Mapping) and row.get("ok")
+                    and isinstance(row.get("data"), Mapping)
+                    and isinstance(row["data"].get("path"), str)
+                    and self._path_hash(row["data"]["path"]) in state.candidate_path_hashes
+                    for row in result.data.get("reads", ())
+                )
+            else:
+                consumed = self._consumes_candidate(call, state)
+            if consumed:
+                return ReadHitsUpdate(ReadHitsState(), "consumed")
         if (
             result.ok and (
                 call.name in self._MUTATION_TOOLS

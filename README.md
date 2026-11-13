@@ -78,6 +78,24 @@ context:
 `history_soft_tokens` 用于新会话窗口装入旧历史，已有窗口按容量或显式配置的延迟阈值触发压缩。
 被移出的历史可通过 `runtime.read_history` 在当前会话和工作区内按引用回查。
 
+## 从 Kiro 反代获取模型
+
+只使用 Kiro 反代时，本机配置可以写成下面这样。把地址和密钥换成 Kiro 面板里的值。
+
+```yaml
+version: 1
+model:
+  providers:
+    kiro:
+      base_url: http://127.0.0.1:5580
+      auth: {api_key: your-api-key}
+      discover_models: true
+```
+
+启动时，tsm-agt 从反代的 `/v1/models` 读取模型列表，在会话的「模型」下拉框里显示。选择在下一轮生效。默认通过 Chat Completions 调用。Kiro 的模型列表变化后，重启 tsm-agt 即可重新读取。
+
+已有直连模型时，在 `model.providers` 里新增独立的 `kiro` 条目，并保留原有的 `profiles` 和 `default_profile`。Kiro 配置有误或模型列表读取失败时，可在网页的 Runtime 设置里查看提示，直连模型仍可使用。自动补齐的 `/v1` 路径和协议默认值只应用于自动发现的模型。
+
 ## 在 Langfuse 查看评测
 
 在 Langfuse 项目设置中创建 API 密钥，并保存到本机的 `~/.tsm-agt/langfuse.yaml`。

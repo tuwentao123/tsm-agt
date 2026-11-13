@@ -23,6 +23,35 @@ from tsm_agt.ports import (
 
 
 class CoreReadOnlyToolProviderTest(unittest.IsolatedAsyncioTestCase):
+    async def test_read_files_preserves_order_ranges_and_item_errors(self) -> None:
+        call = ToolCall("batch", "core.read_files", {"reads": [
+            {"path": "src/app.py", "start_line": 2, "max_lines": 1},
+            {"path": ".env"},
+            {"path": "README.md"},
+            {"path": "src/app.py", "start_line": 4},
+        ]})
+        result = await self.provider.invoke(call, self.context)
+        self.assertTrue(result.ok)
+        first, denied, second, last = result.data["reads"]
+        self.assertEqual([row["index"] for row in result.data["reads"]], [0, 1, 2, 3])
+        self.assertEqual(first["data"]["content"], "class Kernel:\n")
+        self.assertEqual(first["data"]["next_cursor"], {"start_line": 3, "start_column": 1})
+        self.assertEqual(denied["error_code"], "PERMISSION_DENIED")
+        self.assertEqual(second["data"]["content"], "Kernel documentation\n")
+        self.assertEqual(first["data"]["sha256"], last["data"]["sha256"])
+        self.assertEqual(last["data"]["content"], "last line\n")
+
+    async def test_read_files_defers_items_that_exceed_combined_budget(self) -> None:
+        (self.workspace / "large.txt").write_text("x" * 9000, encoding="utf-8")
+        reads = [{"path": "large.txt"}] * 4
+        result = await self.provider.invoke(
+            ToolCall("batch", "core.read_files", {"reads": reads}), self.context,
+        )
+        rows = result.data["reads"]
+        self.assertEqual(sum(len(row["data"]["content"]) for row in rows[:3]), 24000)
+        self.assertEqual(rows[-1]["next_read"], reads[-1])
+        self.assertTrue(result.truncated)
+
     async def test_missing_and_denied_reads_have_serializable_recovery(self) -> None:
         for call, code in (
             (ToolCall("missing", "core.list_files", {"path": "missing"}), "NOT_FOUND"),

@@ -109,7 +109,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .pane-title{font-size:15px;font-weight:700;color:#111827}
 .pane-subtitle{margin-top:4px;font-size:12px;color:#64748b}
 .pane-badge{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:#eff6ff;color:#2563eb;font-size:12px;font-weight:600}
-.chat-area,.trace-pane{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:10px;display:flex;flex-direction:column;gap:8px;background:transparent}
+.chat-area,.files-pane{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:10px;display:flex;flex-direction:column;gap:8px;background:transparent}
 .chat-area.has-approval-dock{padding-bottom:min(52vh,460px)}
 .chat-jump-bottom{position:absolute;left:50%;bottom:18px;transform:translateX(-50%);z-index:22;width:40px;height:40px;display:flex;align-items:center;justify-content:center;border:none;border-radius:50%;background:#fff;color:#475569;box-shadow:0 3px 14px rgba(15,23,42,.18);cursor:pointer}
 .chat-jump-bottom[hidden]{display:none}
@@ -119,43 +119,17 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .approval-dock.visible{display:block}
 .approval-dock .message.approval{width:100%;max-width:none;min-height:0;max-height:min(48vh,420px);overflow:auto;pointer-events:auto;padding:9px 11px;gap:6px;box-shadow:0 12px 28px rgba(15,23,42,.16)}
 .approval-dock .approval-title{font-size:14px}.approval-dock .approval-subtitle{display:none}.approval-dock .approval-risk{padding:3px 8px;font-size:10px}.approval-dock .approval-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.approval-dock .approval-item{padding:5px 7px}.approval-dock .approval-label{margin-bottom:2px;font-size:9px}.approval-dock .approval-value{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.approval-dock .approval-actions{gap:7px}.approval-dock .approval-btn{min-height:32px;padding:7px 13px;border-radius:10px;font-size:12px}.approval-details{border-top:1px solid #e5edf5;padding-top:5px}.approval-details>summary{cursor:pointer;font-size:11px;color:#64748b;user-select:none}.approval-details[open]>summary{margin-bottom:6px}.approval-details .approval-preview{max-height:140px}
-.trace-pane{gap:10px;padding:12px 0;background:transparent;border-radius:0;box-shadow:none}
-.trace-timeline-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;padding:0 4px}
-.trace-timeline-heading{font-size:13px;font-weight:700;color:#0f172a}
-.trace-timeline-caption{font-size:11px;color:#64748b}
+.files-pane{gap:10px;padding:12px 0;background:transparent;border-radius:0;box-shadow:none}
+.files-pane-empty{padding:12px 14px;border:1px dashed #dbe3ed;border-radius:12px;background:#f8fafc;font-size:12px;line-height:1.7;color:#64748b}
+.files-pane-empty strong{display:block;margin-bottom:2px;font-size:13px;font-weight:600;color:#334155}
 .trace-overview-panel{background:linear-gradient(180deg,rgba(255,255,255,.94),rgba(248,250,252,.98));border-radius:14px;padding:10px;display:flex;flex-direction:column;gap:8px}
 .trace-panel-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px}
 .trace-panel-title{font-size:12px;font-weight:600;color:#0f172a}
 .trace-panel-caption{font-size:11px;color:#64748b}
-.trace-timeline-list{list-style:none;margin:0;padding:2px 0 8px 16px;position:relative;display:flex;flex-direction:column;gap:6px}
-.trace-timeline-list::before{content:'';position:absolute;left:5px;top:6px;bottom:12px;width:2px;background:linear-gradient(180deg,#dbe5f0,#e8eef6)}
-.trace-event{position:relative}
-.trace-event::before{content:'';position:absolute;left:-14px;top:11px;width:7px;height:7px;border-radius:50%;background:#94a3b8;box-shadow:0 0 0 2px #fff}
-.trace-event-running::before{background:#1677ff}
-.trace-event-waiting::before{background:#faad14}
-.trace-event-done::before{background:#52c41a}
-.trace-event-failed::before{background:#ff4d4f}
-.trace-event-card{background:rgba(255,255,255,.96);border-radius:10px;padding:7px 10px;display:flex;flex-direction:column;gap:3px}
-.trace-event-head{display:flex;align-items:center;gap:7px;min-width:0}
-.trace-event-kind{flex:none;font-size:10px;font-weight:600;color:#2563eb;background:#eff6ff;border-radius:999px;padding:1px 7px}
-.trace-event-kind.kind-tool{color:#0f766e;background:#ecfdf5}
-.trace-event-kind.kind-task{color:#475569;background:#f1f5f9}
-.trace-event-kind.kind-approval,.trace-event-kind.kind-input{color:#b45309;background:#fffbeb}
-.trace-event-title{flex:1;min-width:0;font-size:12px;font-weight:600;color:#111827;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.trace-event-state{flex:none;font-size:10px;color:#64748b}
-.trace-event-state.state-running{color:#2563eb}
-.trace-event-state.state-waiting{color:#b45309}
-.trace-event-state.state-done{color:#15803d}
-.trace-event-state.state-failed{color:#b42318}
-.trace-event-body{margin-top:1px;font-size:11px;line-height:1.5;color:#64748b;white-space:pre-wrap;word-break:break-word}
-.trace-event-body.clamped{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;cursor:pointer}
-.trace-timeline-tools{margin-top:4px;border-top:1px solid #edf2f7;padding-top:6px}
-.trace-timeline-tools > summary{cursor:pointer;font-size:11px;color:#64748b;list-style:none;user-select:none}
-.trace-timeline-tools > summary::-webkit-details-marker{display:none}
-.trace-timeline-tools .trace-overview-panel{margin-top:6px}
 .message{display:flex;flex-direction:column;position:relative;max-width:min(920px,100%);word-break:break-word;gap:8px}
 .message.assistant{align-self:flex-start;width:100%;padding:18px 8px 22px;background:linear-gradient(180deg,rgba(255,255,255,.72),rgba(248,250,252,.58));border:none;border-radius:0;box-shadow:none}
 .message.user{display:inline-flex;align-self:flex-end !important;margin-left:auto !important;margin-right:0 !important;width:fit-content;max-width:min(720px,calc(100% - 24px));background:#f3f4f6;color:#334155;border:none !important;outline:none !important;box-shadow:none !important;border-radius:16px;padding:12px 14px;text-align:left}
+.message.user.background-turn{align-self:flex-start !important;margin-left:0 !important;background:#eef4fa;color:#475569}
 .message-body{width:100%;margin:0;white-space:normal;font-size:15px;line-height:1.68;letter-spacing:-.003em;color:var(--text);font-family:Inter,"SF Pro Display","Segoe UI",sans-serif}
 .message-body > *:first-child{margin-top:0}
 .message-body > *:last-child{margin-bottom:0}
@@ -446,8 +420,8 @@ textarea::placeholder{color:#94a3b8}
 .loading.visible,.error-banner.visible{display:block}
 @media(max-width:1500px){.workspace-stage{grid-template-columns:minmax(0,1fr) 380px}}
 @media(max-width:1280px){.workspace-stage{grid-template-columns:1fr}.task-card-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:1024px){.layout{grid-template-columns:1fr;height:auto}.sidebar{display:none}.topbar{padding-inline:16px}.chat-shell{padding:16px 16px 14px}.chat-area,.trace-pane{padding:14px}.message.user{max-width:100%}.composer{padding:8px 14px 10px}.composer-box{padding:9px 10px}.textarea{min-height:44px}}
-@media(max-width:720px){.task-card-summary{grid-template-columns:1fr}.chat-area,.trace-pane{padding:10px 12px 18px}.task-card{padding:9px 10px}.composer{padding:8px 10px}.composer-meta{align-items:flex-start;flex-direction:column;gap:3px}.composer-input-row{align-items:stretch;flex-wrap:wrap}.composer-actions{width:100%;justify-content:space-between}.send-btn{padding:8px 14px}.composer-hint{white-space:normal}}
+@media(max-width:1024px){.layout{grid-template-columns:1fr;height:auto}.sidebar{display:none}.topbar{padding-inline:16px}.chat-shell{padding:16px 16px 14px}.chat-area,.files-pane{padding:14px}.message.user{max-width:100%}.composer{padding:8px 14px 10px}.composer-box{padding:9px 10px}.textarea{min-height:44px}}
+@media(max-width:720px){.task-card-summary{grid-template-columns:1fr}.chat-area,.files-pane{padding:10px 12px 18px}.task-card{padding:9px 10px}.composer{padding:8px 10px}.composer-meta{align-items:flex-start;flex-direction:column;gap:3px}.composer-input-row{align-items:stretch;flex-wrap:wrap}.composer-actions{width:100%;justify-content:space-between}.send-btn{padding:8px 14px}.composer-hint{white-space:normal}}
 /* 设置面板：左侧分类导航 + 右侧卡片区（对齐插件广场的信息层级） */
 .settings-dialog { width: min(1320px, 96vw); height: min(864px, 92vh); padding: 0; border: none; border-radius: 20px; background: var(--panel, #fff); color: inherit; box-shadow: 0 32px 80px rgba(15, 23, 42, .32); overflow: hidden; }
 .settings-dialog[open] { display: flex; flex-direction: column; }
@@ -714,16 +688,16 @@ textarea::placeholder{color:#94a3b8}
           <button id=\"chat-jump-bottom\" class=\"chat-jump-bottom\" type=\"button\" title=\"回到最新消息\" aria-label=\"回到最新消息\" aria-controls=\"chat-area\" onclick=\"jumpToChatBottom()\" hidden><svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M12 4v16m-6-6 6 6 6-6\" /></svg></button>
           <section id=\"approval-dock\" class=\"approval-dock\" aria-live=\"polite\"></section>
         </section>
-        <div id=\"workspace-resizer\" class=\"workspace-resizer\" role=\"separator\" tabindex=\"0\" aria-label=\"调整对话与轨迹宽度\" aria-orientation=\"vertical\" aria-controls=\"chat-area trace-pane\" hidden><div class=\"workspace-resizer-handle\"></div></div>
+        <div id=\"workspace-resizer\" class=\"workspace-resizer\" role=\"separator\" tabindex=\"0\" aria-label=\"调整对话与文件面板宽度\" aria-orientation=\"vertical\" aria-controls=\"chat-area files-pane\" hidden><div class=\"workspace-resizer-handle\"></div></div>
         <aside class=\"pane-shell\">
           <div class=\"pane-header\">
             <div>
-              <div class=\"pane-title\">执行轨迹</div>
-              <div class=\"pane-subtitle\">实时 Trace Timeline，并为未来节点图与链路分析预留结构</div>
+              <div class=\"pane-title\">工作区文件</div>
+              <div class=\"pane-subtitle\">打开与改动过的文件会显示在这里</div>
             </div>
-            <div class=\"pane-badge\">Trace Graph Ready</div>
+            <div class=\"pane-badge\">Files Ready</div>
           </div>
-          <section id=\"trace-pane\" class=\"trace-pane\"></section>
+          <section id=\"files-pane\" class=\"files-pane\"></section>
         </aside>
       </div>
     </div>
@@ -1093,14 +1067,15 @@ function renderWorkspaceList() {
     entry.className = `list-item workspace-entry ${workspace.id === activeWorkspaceId ? 'active' : ''}`;
     entry.onclick = () => activateWorkspace(workspace.id);
     entry.title = workspace.path;
-    const trustLevel = String(workspace.trust_level || 'UNTRUSTED');
+    const trustLevel = workspace.trust_level;
     const trustLabel = trustLevel === 'TRUSTED_FULL'
       ? '完全信任' : trustLevel === 'TRUSTED_BUILD'
         ? '可执行' : trustLevel === 'TRUSTED_READ' ? '可读' : '只读未信任';
     const trustClass = trustLevel === 'UNTRUSTED' ? 'untrusted' : 'trusted';
     entry.innerHTML = `
       <div class='item-title'>${workspace.name}</div>
-      <div class='item-meta'>${workspace.path}<span class='workspace-trust ${trustClass}'>${trustLabel}</span></div>
+      <div class='item-meta'>${workspace.path}${trustLevel
+        ? `<span class='workspace-trust ${trustClass}'>${trustLabel}</span>` : ''}</div>
     `;
 
     const add = document.createElement('button');
@@ -1198,9 +1173,11 @@ function renderWorkspaceList() {
           restoreConversationDraft();
           ensureConversationLoaded(conversation.id);
         };
+        const count = (conversation.loaded && !conversation.historyLoading) || conversation.isLocalDraft
+          ? `${conversation.messages.length} 条消息 · ` : '';
         item.innerHTML = `
           <div class='item-title'>${conversation.title}</div>
-          <div class='item-meta' style='direction:ltr'>${conversation.messages.length} 条消息 · ${conversation.createdAt}</div>
+          <div class='item-meta' style='direction:ltr'>${count}${conversation.createdAt}</div>
         `;
         const row = document.createElement('div');
         row.className = 'session-row';
@@ -2068,6 +2045,8 @@ document.addEventListener('click', (event) => {
   }
 });
 
+const 风险文案 = { R0: '无副作用', R1: '低风险', R2: '需授权', R3: '高风险' };
+
 function renderMessages(forceScrollToBottom = false) {
   const active = getActiveConversation();
   const errorConversationId = document.getElementById('error-banner')?.dataset?.conversationId;
@@ -2093,7 +2072,7 @@ function renderMessages(forceScrollToBottom = false) {
         <button class='link-btn' onclick='pickWorkspace()'>添加目录</button>
       </div>
     `;
-    renderTracePane(null);
+    renderFilesPane();
     return;
   }
 
@@ -2104,18 +2083,27 @@ function renderMessages(forceScrollToBottom = false) {
         <button class='link-btn' onclick='createConversation()'>新建会话</button>
       </div>
     `;
-    renderTracePane(null);
+    renderFilesPane();
     return;
   }
 
   if (active.messages.length === 0) {
+    if (!active.isLocalDraft && (active.historyLoading || !active.loaded)) {
+      chatArea.innerHTML = active.historyError
+        ? `<div class='empty-state' role='status'>会话历史加载失败
+            <button class='link-btn' onclick='ensureConversationLoaded(activeConversationId)'>重试</button>
+          </div>`
+        : "<div class='empty-state' role='status'>正在加载会话历史…</div>";
+      renderFilesPane();
+      return;
+    }
     chatArea.innerHTML = `
       <div class='empty-state'>
         <h2>${active.title}</h2>
         <div>描述一个任务，或上传图片继续</div>
       </div>
     `;
-    renderTracePane(active);
+    renderFilesPane();
     return;
   }
 
@@ -2147,6 +2135,7 @@ function renderMessages(forceScrollToBottom = false) {
   active.messages.forEach((message, index) => {
     const element = document.createElement('div');
     element.className = `message ${message.role}`;
+    if (message.backgroundTurn) element.classList.add('background-turn');
     let inputTrace = null;
     const text = String(message.content ?? '').trim();
     if (message.role === 'task') {
@@ -2246,10 +2235,8 @@ function renderMessages(forceScrollToBottom = false) {
     chatArea.appendChild(renderLiveTurnPanel(runningTask.task));
   }
 
-  // The trace pane is a sibling view, not a tail step of chat scrolling. It must
-  // render on every pass; keeping it after the scroll branches meant the whole
-  // panel stayed blank in the common "stick to bottom" case.
-  renderTracePane(active);
+  // 右栏是独立视图，不是对话滚动的尾部步骤：它必须每轮都渲染。
+  renderFilesPane();
 
   if (shouldStickToBottom) {
     chatArea.scrollTop = chatArea.scrollHeight;
@@ -2264,47 +2251,24 @@ function renderMessages(forceScrollToBottom = false) {
   updateChatJumpButton(chatArea);
 }
 
-function timelineTasksOf(conversation) {
-  const turnsByTask = new Map();
-  for (const turn of conversation?.turnCalls?.values() || []) {
-    if (!turn?.task_id) continue;
-    if (!turnsByTask.has(turn.task_id)) turnsByTask.set(turn.task_id, []);
-    turnsByTask.get(turn.task_id).push(turn);
-  }
-  return (conversation?.messages || [])
-    .filter(message => message.role === 'task' && message.task)
-    .map(message => {
-      const task = message.task;
-      const progress = new Map();
-      const add = (row, fallback) => {
-        const sequence = Number(row.sequence || 0);
-        const kind = row.progressData?.kind || row.progressData?.type || '';
-        progress.set(sequence > 0 ? `${sequence}:${kind}` : fallback, row);
-      };
-      for (const turn of turnsByTask.get(task.taskId) || []) {
-        (turn.progress || []).forEach((item, index) => add({
-          sequence: Number(item.sequence || 0),
-          text: describeProgress(item), progressData: item,
-        }, `${turn.turn_id}:${index}`));
-      }
-      (task.progress || []).forEach((row, index) => add(row, `live:${index}`));
-      return {...task, progress: [...progress.values()].sort((a, b) => a.sequence - b.sequence)};
-    });
+// 右侧文件面板：原时间线视图已下线，这块区域留给打开的文件与改动过的文件。
+// 目前只渲染空状态，后续由文件读写事件填充列表。
+function renderFilesPane() {
+  const pane = document.getElementById('files-pane');
+  if (!pane) return;
+  pane.replaceChildren();
+  // An empty state keeps the reserved pane readable instead of blank.
+  const empty = document.createElement('div');
+  empty.className = 'files-pane-empty';
+  const title = document.createElement('strong');
+  title.textContent = '暂无打开的文件';
+  const hint = document.createElement('span');
+  hint.textContent = '读取或修改文件后，这里会按文件展示路径与改动状态。';
+  empty.append(title, hint);
+  pane.appendChild(empty);
+  pane.append(renderSourceEvaluationRunner());
+  pane.append(renderSkillInstallButton());
 }
-
-function renderTracePane(conversation) {
-  const tracePane = document.getElementById('trace-pane');
-  if (!tracePane) return;
-  if (!conversation) {
-    tracePane.innerHTML = '';
-    return;
-  }
-  // The conversation stores Task messages and durable per-Turn progress.
-  // The timeline consumes a derived view, never a second conversation.tasks cache.
-  renderTraceView(tracePane, {tasks: timelineTasksOf(conversation)});
-}
-
-const 风险文案 = { R0: '无副作用', R1: '低风险', R2: '需授权', R3: '高风险' };
 
 function taskStateClass(task) {
   const state = task?.projection?.display_status || task?.phase1State;
@@ -2409,273 +2373,6 @@ function taskExecutionLabel(task) {
     running: '持续执行', waiting_approval: '等待授权',
     waiting_input: '等待输入', interrupted: '已中断', stopped: '已停止',
   }[projection.execution_status] || projection.execution_status;
-}
-
-function traceStateForProgress(progress) {
-  const kind = progress?.kind || '';
-  if (kind === 'tool_completed') {
-    return progress.ok === false || progress.error_code ? 'failed' : 'done';
-  }
-  if (kind === 'model_completed') return 'done';
-  if (kind === 'waiting') return 'waiting';
-  if (kind === 'tool_started' || kind === 'model_started') return 'running';
-  return progress?.ok === false ? 'failed' : 'running';
-}
-
-// 右侧“执行轨迹”：按 deepagents streaming 的三类流事件（messages / updates / custom）
-// 组织成一条时间线。事件顺序取自持久化进度事件的 sequence，跨 Task 依次串联。
-const TIMELINE_KIND_TEXT = {
-  task: '任务',
-  model: '模型',
-  tool: '工具',
-  approval: '授权',
-  input: '输入',
-  commentary: '说明',
-  result: '结论',
-  event: '事件',
-};
-const TIMELINE_STATE_TEXT = {
-  running: '执行中',
-  waiting: '等待',
-  done: '完成',
-  failed: '失败',
-};
-
-function timelineKindOf(kind, progress) {
-  const name = String(kind || '');
-  if (/tool/i.test(name)) return 'tool';
-  if (/model|assistant|message|token/i.test(name)) return 'model';
-  if (/approval|permission|consent/i.test(name)) return 'approval';
-  if (/input|question|waiting/i.test(name)) return 'input';
-  if (/commentary|narration|progress_note/i.test(name)) return 'commentary';
-  if (/result|conclusion|answer|final/i.test(name)) return 'result';
-  if (progress && (progress.tool_name || progress.toolName)) return 'tool';
-  return 'event';
-}
-
-function timelineStateOf(kind, progress) {
-  const name = String(kind || '');
-  const status = String((progress && (progress.status || progress.state)) || '');
-  const probe = name + ' ' + status;
-  if (/fail|error|cancel|denied|reject|timeout|abort/i.test(probe)) return 'failed';
-  if (progress && progress.ok === false) return 'failed';
-  if (progress && progress.error_code) return 'failed';
-  if (/waiting|approval|input_request|question/i.test(name)) return 'waiting';
-  if (/start|begin|running|delta/i.test(name)) return 'running';
-  return 'done';
-}
-
-function timelineTaskStateOf(task) {
-  const value = String(
-    (task && task.projection && task.projection.display_status) || (task && task.status) || '',
-  ).toLowerCase();
-  if (/fail|error|interrupt|timeout/.test(value)) return { state: 'failed', text: '失败' };
-  if (/cancel|stop|paused/.test(value)) return { state: 'failed', text: '已停止' };
-  if (/done|complete|success|finished/.test(value)) return { state: 'done', text: '已完成' };
-  if (/wait|approval|input/.test(value)) return { state: 'waiting', text: '等待中' };
-  if (/run|active|progress|executing|working/.test(value)) return { state: 'running', text: '执行中' };
-  return { state: 'done', text: '已结束' };
-}
-
-function timelineEvent(patch) {
-  return {
-    key: patch.key,
-    kind: patch.kind,
-    label: TIMELINE_KIND_TEXT[patch.kind] || TIMELINE_KIND_TEXT.event,
-    title: patch.title,
-    body: patch.body || '',
-    state: patch.state,
-    stateText: patch.stateText || '',
-    sequence: Number(patch.sequence || 0),
-  };
-}
-
-function timelineEventsOfTask(task) {
-  const events = [];
-  const taskId = String((task && (task.taskId || task.task_id)) || '');
-  const goal = String((task && task.goal) || '').trim();
-  const taskState = timelineTaskStateOf(task);
-  events.push(timelineEvent({
-    key: taskId + ':start',
-    kind: 'task',
-    title: goal || (taskId ? '任务 ' + taskId.slice(0, 8) : '任务'),
-    body: taskId ? 'task ' + taskId : '',
-    state: taskState.state,
-    sequence: Number.MIN_SAFE_INTEGER,
-  }));
-  const progressItems = task && Array.isArray(task.progress) ? task.progress : [];
-  progressItems.forEach((item) => {
-    const progress = (item && item.progressData) || {};
-    const rawKind = String(progress.kind || progress.type || '');
-    if (/^waiting$/i.test(rawKind)) return;
-    const kind = timelineKindOf(rawKind, progress);
-    const toolName = String(progress.tool_name || progress.toolName || progress.operation || '').trim();
-    const phase = /start/i.test(rawKind) ? '开始' : (/complet|done|finish|end/i.test(rawKind) ? '结束' : '');
-    const text = String((item && item.text) || progress.activity || '').trim();
-    events.push(timelineEvent({
-      key: taskId + ':' + String((item && item.sequence) || 0) + ':' + rawKind,
-      kind,
-      title: TIMELINE_KIND_TEXT[kind] + phase + (toolName ? ' · ' + toolName : ''),
-      body: text,
-      state: timelineStateOf(rawKind, progress),
-      sequence: Number((item && item.sequence) || 0),
-    }));
-  });
-  const waiting = task && task.waiting;
-  if (waiting) {
-    const kind = String(waiting.kind || '').toUpperCase() === 'APPROVAL' ? 'approval' : 'input';
-    const approval = waiting.approval || {};
-    events.push(timelineEvent({
-      key: taskId + ':waiting',
-      kind,
-      title: kind === 'approval' ? '等待用户授权' : '等待用户输入',
-      body: String(approval.action || waiting.question || '任务已暂停，等待用户操作。'),
-      state: 'waiting',
-      sequence: Number.MAX_SAFE_INTEGER - 1,
-    }));
-  }
-  if (taskState.state !== 'running') {
-    events.push(timelineEvent({
-      key: taskId + ':end',
-      kind: 'task',
-      title: '任务结束',
-      body: taskState.text,
-      state: taskState.state,
-      stateText: taskState.text,
-      sequence: Number.MAX_SAFE_INTEGER,
-    }));
-  }
-  return events.sort((left, right) => left.sequence - right.sequence);
-}
-
-function buildTimelineEvents(tasks) {
-  const seen = new Set();
-  const merged = [];
-  (Array.isArray(tasks) ? tasks : []).forEach((task) => {
-    timelineEventsOfTask(task).forEach((event) => {
-      if (seen.has(event.key)) return;
-      seen.add(event.key);
-      merged.push(event);
-    });
-  });
-  return merged;
-}
-
-function renderTimelineEvent(event) {
-  const item = document.createElement('li');
-  item.className = 'trace-event trace-event-' + event.state;
-  item.dataset.eventKey = event.key;
-  const card = document.createElement('div');
-  card.className = 'trace-event-card';
-  const head = document.createElement('div');
-  head.className = 'trace-event-head';
-  const label = document.createElement('span');
-  label.className = 'trace-event-kind kind-' + event.kind;
-  label.textContent = event.label;
-  const title = document.createElement('span');
-  title.className = 'trace-event-title';
-  title.textContent = event.title;
-  title.title = event.title;
-  const state = document.createElement('span');
-  state.className = 'trace-event-state state-' + event.state;
-  state.textContent = event.stateText || TIMELINE_STATE_TEXT[event.state] || '';
-  head.append(label, title, state);
-  card.append(head);
-  if (event.body) {
-    const body = document.createElement('div');
-    body.className = 'trace-event-body clamped';
-    body.textContent = event.body;
-    card.append(body);
-  }
-  item.append(card);
-  return item;
-}
-
-function renderTimelineTodo(tracePane, tasks) {
-  for (let index = tasks.length - 1; index >= 0; index -= 1) {
-    const panel = renderTodoPanel(tasks[index] && tasks[index].todoList);
-    if (panel) {
-      tracePane.append(panel);
-      return;
-    }
-  }
-}
-
-function renderTimelineTopology(tracePane) {
-  const details = document.createElement('details');
-  details.className = 'trace-timeline-tools';
-  const summary = document.createElement('summary');
-  summary.textContent = '节点与链路分析';
-  details.append(summary);
-  const panel = document.createElement('div');
-  panel.className = 'trace-overview-panel';
-  const heading = document.createElement('div');
-  heading.className = 'trace-panel-heading';
-  const title = document.createElement('div');
-  title.className = 'trace-panel-title';
-  title.textContent = '节点拓扑 / 链路追溯';
-  const caption = document.createElement('div');
-  caption.className = 'trace-panel-caption';
-  caption.textContent = '规划中';
-  heading.append(title, caption);
-  const note = document.createElement('div');
-  note.className = 'trace-panel-caption';
-  note.textContent = '后续按节点图展示模型 / 工具 / 子任务之间的调用链路，并支持由事件反查输入输出。';
-  panel.append(heading, note);
-  details.append(panel);
-  tracePane.append(details);
-}
-
-function renderTraceView(tracePane, conversation) {
-  if (!tracePane) return;
-  const tasks = Array.isArray(conversation && conversation.tasks) ? conversation.tasks : [];
-  const events = buildTimelineEvents(tasks);
-  const states = tasks.map((task) => timelineTaskStateOf(task).state);
-  const running = states.filter((state) => state === 'running').length;
-  const waiting = states.filter((state) => state === 'waiting').length;
-  tracePane.replaceChildren();
-
-  const head = document.createElement('div');
-  head.className = 'trace-timeline-head';
-  const heading = document.createElement('div');
-  heading.className = 'trace-timeline-heading';
-  heading.textContent = '执行轨迹';
-  const summary = document.createElement('div');
-  summary.className = 'trace-timeline-caption';
-  const parts = [events.length + ' 个事件'];
-  if (tasks.length) parts.push(tasks.length + ' 个任务');
-  if (running) parts.push(running + ' 个执行中');
-  if (waiting) parts.push(waiting + ' 个等待操作');
-  summary.textContent = parts.join(' · ');
-  head.append(heading, summary);
-  tracePane.append(head);
-
-  if (!events.length) {
-    const empty = document.createElement('div');
-    empty.className = 'trace-timeline-caption';
-    empty.textContent = '暂无执行事件；发送消息后，模型、工具与任务状态会按时间顺序出现在这里。';
-    tracePane.append(empty);
-  } else {
-    const list = document.createElement('ol');
-    list.className = 'trace-timeline-list';
-    list.setAttribute('aria-label', '执行轨迹时间线');
-    events.forEach((event) => list.append(renderTimelineEvent(event)));
-    tracePane.append(list);
-  }
-
-  if (running || waiting) {
-    const hint = document.createElement('div');
-    hint.className = 'trace-timeline-caption';
-    hint.textContent = waiting
-      ? '任务在等待你的确认或补充输入。'
-      : '流式推送中，新事件到达后会追加到时间线末尾。';
-    tracePane.append(hint);
-  }
-
-  renderTimelineTodo(tracePane, tasks);
-  if (tasks.length) renderTimelineTopology(tracePane);
-  tracePane.append(renderSourceEvaluationRunner());
-  tracePane.append(renderSkillInstallButton());
 }
 
 let sourceEvaluationRunId = '';
@@ -4153,6 +3850,16 @@ function appendTaskProgress(taskId, progress, conversationId) {
       }
     }
   }
+  if (progressData.kind === 'context_summary') {
+    // 一次压缩只占一行：新阶段覆盖旧状态，并落到当前位置。
+    const previousSummary = lines.findIndex(
+      (item) => item.progressData?.kind === 'context_summary',
+    );
+    if (previousSummary >= 0) lines.splice(previousSummary, 1);
+    lines.push({ sequence, text, progressData });
+    scheduleProgressRender(conversationId);
+    return;
+  }
   if (progressData.kind === 'reasoning_delta') {
     const fragment = progressData.reasoning_text || '';
     const conversation = getConversationById(conversationId);
@@ -4679,6 +4386,8 @@ function toolFailureDescription(progress) {
 function describeProgress(progress) {
   if (!progress) return '';
   const kind = progress.kind;
+  if (kind === 'turn_started' && progress.trigger === 'background_process') return '后台任务完成，继续会话';
+  if (kind === 'process_started') return '进程已启动';
   if (kind === 'completion_review') {
     if (progress.review_action === 'STARTED') return '正在进行完成复核，最终答复尚未发布…';
     if (progress.review_action === 'FAILED') return `完成复核失败：${progress.review_reason_code || '未知错误'}`;
@@ -4690,6 +4399,8 @@ function describeProgress(progress) {
   }
   // 处理说明完全来自模型；工具状态由各自的结构化进度项显示。
   if (kind === 'commentary') return progress.activity || '';
+  // 压缩上下文是运行时状态（阶段 + 耗时），不是模型正文段落。
+  if (kind === 'context_summary') return progress.activity || '正在压缩上下文…';
   // 推理增量：保持原有中文前缀。
   if (kind === 'reasoning_delta') {
     return progress.reasoning_text ? `推理摘要：${progress.reasoning_text}` : '';
@@ -5551,7 +5262,7 @@ function renderLiveTurnPanel(task) {
       row.className = 'live-turn-line';
       if (kind === 'model_started' || kind === 'tool_started') {
         row.classList.add('active');
-      } else if (item.progressData?.ok === false) {
+      } else if (item.progressData?.ok === false || item.progressData?.summary_failed) {
         row.classList.add('failed');
       }
       if (kind === 'commentary') row.classList.add('turn-progress-note');
@@ -5584,7 +5295,14 @@ function turnProgressLines(items) {
   mergeDurableToolItems(items || []).forEach((item) => {
     const kind = item?.kind || '';
     if (kind === 'turn_started') {
-      lines.push({ text: '本轮开始', tone: 'active' });
+      lines.push({
+        text: item.trigger === 'background_process' ? '后台任务完成，继续会话' : '本轮开始',
+        tone: 'active',
+      });
+      return;
+    }
+    if (kind === 'process_started') {
+      lines.push({text: '进程已启动', tone: 'active'});
       return;
     }
     if (kind === 'tool_started') {
@@ -5671,6 +5389,18 @@ function turnProgressLines(items) {
           tone: item.review_action === 'CONTINUE' ? 'active' : '',
         });
       }
+      return;
+    }
+    if (kind === 'context_summary') {
+      // 压缩上下文连续上报阶段与耗时，但一次压缩只该占一行：新状态覆盖旧行，
+      // 并挪到当前位置，让它始终出现在最新发生的事情附近。
+      const previousSummary = lines.findIndex((line) => line.summary === 'context_summary');
+      if (previousSummary >= 0) lines.splice(previousSummary, 1);
+      lines.push({
+        text: describeProgress(item) || '正在压缩上下文…',
+        tone: item.summary_failed ? 'failed' : '',
+        summary: 'context_summary',
+      });
       return;
     }
     const described = describeProgress(item);
@@ -5915,6 +5645,7 @@ function followTask(taskId, conversationId) {
   const follower = {
     conversationId, source: null, timer: null, attempts: 0, stopped: false,
     turnId: null, turnSequence: 0, queue: Promise.resolve(),
+    renderedIdleTurn: null,
     stop() {
       this.stopped = true;
       if (this.source) this.source.close();
@@ -5967,7 +5698,15 @@ function followTask(taskId, conversationId) {
       // Ordinary completed conversations use WAITING/awaiting_input too.
       // Keep their delivered answer if the history refresh is stale or fails,
       // just as for DONE/FAILED; otherwise the refresh can erase the answer.
-      await finish(state);
+      if (state.background_work_pending) {
+        if (follower.renderedIdleTurn !== state.turn_id) {
+          follower.renderedIdleTurn = state.turn_id;
+          await renderFinalResult(taskId, state, conversationId);
+          if (conversationId === activeConversationId) setLoading(false);
+        }
+      } else {
+        await finish(state);
+      }
     } else if ((state.waiting || state.status === 'awaiting_user') && !submittedApprovalIsSettling) {
       // 澄清 / 等待用户输入视为“当前 Turn 结束但任务挂起”：
       // 在前端视角中结束这一轮 Turn，并刷新历史，同时让取消按钮跟随
@@ -6025,7 +5764,23 @@ function followTask(taskId, conversationId) {
         current.task.progress = [];
         current.task.streamTurnId = follower.turnId;
       }
-      bindLatestInputToTask(conversationId, taskId, payload.turn_id);
+      if (payload.progress.trigger === 'background_process') {
+        if (current) current.task.phase1State = 'RUNNING';
+        const conversation = getConversationById(conversationId);
+        if (conversation && !(conversation.messages || []).some(row => row.turnId === payload.turn_id)) {
+          conversation.messages.push({
+            role: 'user', content: '后台任务完成，继续会话', images: [],
+            taskId, turnId: payload.turn_id, backgroundTurn: true,
+          });
+          conversation.turnCalls ||= new Map();
+          conversation.turnCalls.set(payload.turn_id, {
+            turn_id: payload.turn_id, task_id: taskId, settled: false, progress: [],
+          });
+        }
+        if (conversationId === activeConversationId) setLoading(true);
+      } else {
+        bindLatestInputToTask(conversationId, taskId, payload.turn_id);
+      }
     }
     // 进度事件只属于当前跟踪的 Turn；避免旧事件影响当前按钮状态。
     if (payload.turn_id && follower.turnId && payload.turn_id !== follower.turnId) return;
@@ -6095,13 +5850,13 @@ function followTask(taskId, conversationId) {
   connect();
 }
 
-async function loadSessions() {
+async function loadSessions(responsePromise = fetch('/sessions')) {
   // Conversations live in Runtime, not in this tab. Rebuilding them from the
   // durable Session records is what makes a reload or a server restart keep the
   // history instead of starting from an empty page.
   try {
-    const response = await fetch('/sessions');
-    if (!response.ok) return;
+    const response = await responsePromise;
+    if (!response?.ok) return;
     const data = await response.json();
     (data.sessions || []).forEach((item) => {
       const workspace = workspaces.find(
@@ -6137,8 +5892,12 @@ async function ensureConversationLoaded(conversationId) {
   const conversation = getConversationById(conversationId);
   if (!conversation || conversation.isLocalDraft || conversation.loaded) return false;
   conversation.loaded = true;
+  conversation.historyLoading = true;
+  const retrying = conversation.historyError;
+  conversation.historyError = false;
   const loadGeneration = (conversation.historyLoadGeneration || 0) + 1;
   conversation.historyLoadGeneration = loadGeneration;
+  if (retrying && conversationId === activeConversationId) renderMessages();
   const selectionGeneration = conversation.modelSelectionGeneration || 0;
   const restoreSelection = !conversation.modelSelectionPending;
   async function readHistory() {
@@ -6168,6 +5927,9 @@ async function ensureConversationLoaded(conversationId) {
     if (data === null) {
       // A missing history leaves the current draft or transcript in place.
       conversation.loaded = false;
+      conversation.historyLoading = false;
+      conversation.historyError = true;
+      if (conversationId === activeConversationId) renderMessages();
       return false;
     }
     if (restoreSelection && !conversation.modelSelectionPending
@@ -6222,6 +5984,7 @@ async function ensureConversationLoaded(conversationId) {
         taskId: message.task_id || null,
         turnId: message.turn_id || null,
         firstTurnInput: Boolean(message.first_turn_input),
+        backgroundTurn: message.trigger === 'background_process',
       };
       if (!Array.isArray(message.images)) localImageFallbackRows.push(restoredMessage);
       timeline.push({
@@ -6330,6 +6093,7 @@ async function ensureConversationLoaded(conversationId) {
       if (target) target.textPresentation = previous.textPresentation;
     });
     conversation.messages = rebuiltMessages;
+    conversation.historyLoading = false;
     renderConversations();
     renderMessages();
     // A restored Session can still be waiting for approval, and the switch is
@@ -6343,16 +6107,21 @@ async function ensureConversationLoaded(conversationId) {
     if (
       activeTask
       && !activeTask.waiting
-      && ['PREPARING', 'RUNNING'].includes(activeTask.phase1_state)
+      && (['PREPARING', 'RUNNING'].includes(activeTask.phase1_state)
+        || activeTask.background_work_pending)
+      && !followers.has(activeTask.task_id)
     ) {
-      setLoading(true);
+      if (['PREPARING', 'RUNNING'].includes(activeTask.phase1_state)) setLoading(true);
       followTask(activeTask.task_id, conversationId);
     }
     return true;
   } catch (error) {
     if (conversation.historyLoadGeneration === loadGeneration) {
       conversation.loaded = false;
+      conversation.historyLoading = false;
+      conversation.historyError = true;
       console.error('会话历史加载失败', error);
+      if (conversationId === activeConversationId && !conversation.messages.length) renderMessages();
     }
     return false;
   }
@@ -6369,28 +6138,37 @@ async function refreshConversationHistory(conversationId) {
 }
 
 async function loadWorkspaces() {
+  loadModelProfiles();
+  const sessionsResponse = fetch('/sessions').catch(error => {
+    console.error(error);
+    return null;
+  });
   try {
-    await loadModelProfiles();
-    const response = await fetch('/workspaces');
+    const response = await fetch('/workspaces?include_trust=false');
     if (!response.ok) {
       throw new Error('加载工作区列表失败');
     }
 
     const data = await response.json();
     workspaces.splice(0, workspaces.length, ...data.workspaces);
-    await loadSessions();
+    await loadSessions(sessionsResponse);
 
     const restoredWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
 
     if (restoredWorkspace) {
       activateWorkspace(restoredWorkspace.id);
-      return;
-    }
-
-    if (workspaces.length > 0) {
+    } else if (workspaces.length > 0) {
       activateWorkspace(workspaces[0].id);
-      return;
     }
+    fetch('/workspaces').then(async response => {
+      if (!response.ok) return;
+      const data = await response.json();
+      for (const item of data.workspaces || []) {
+        const workspace = workspaces.find(workspace => workspace.id === item.id);
+        if (workspace && workspace.trust_level === undefined) workspace.trust_level = item.trust_level;
+      }
+      renderWorkspaceList();
+    }).catch(error => console.error(error));
   } catch (error) {
     console.error(error);
     showError(error.message || '无法加载工作区列表。');
@@ -7219,7 +6997,9 @@ async def index() -> HTMLResponse:
 
 
 @app.get("/workspaces")
-async def list_workspaces() -> dict:
+async def list_workspaces(include_trust: bool = True) -> dict:
+    if not include_trust:
+        return {"workspaces": list(workspace_registry)}
     if runtime_server is None:
         return {
             "workspaces": [
@@ -7248,7 +7028,7 @@ async def list_workspaces() -> dict:
                 })
         return enriched
 
-    return {"workspaces": runtime_server._call(enrich_on_runtime_thread())}
+    return {"workspaces": await asyncio.to_thread(runtime_server._call, enrich_on_runtime_thread())}
 
 
 @app.get("/diagnostics")
@@ -8563,23 +8343,23 @@ async def list_sessions(limit: int = 40) -> dict:
 @app.get("/sessions/{session_id}")
 async def get_session(session_id: str) -> dict:
     """Return one Session's user-visible messages and what it is waiting for."""
-    if runtime_server is None:
+    server = runtime_server
+    if server is None:
         raise HTTPException(
             status_code=503, detail=runtime_error or "runtime unavailable",
         )
-    kernel = runtime_server._client.application.kernel
     try:
-        snapshot = runtime_server._call(kernel.get_session(session_id))
-        projection = runtime_server._call(
-            kernel.get_session_conversation(session_id)
-        )
-        session_events = runtime_server._call(
-            kernel.dependencies.store.read_session_events(session_id)
+        return await asyncio.to_thread(
+            server._call, _session_history_payload(server._client, session_id),
         )
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except PermissionError as error:
         raise HTTPException(status_code=403, detail=str(error)) from error
+
+
+async def _session_history_payload(client, session_id: str) -> dict:
+    snapshot, projection, session_events = await client.application.kernel.read_session_history(session_id)
     task_attach_sequences = {
         str(event.payload.get("task_id")): event.sequence
         for event in session_events
@@ -8601,14 +8381,40 @@ async def get_session(session_id: str) -> dict:
         turn_id = str(turn.get("turn_id") or "")
         if task_id and turn_id and not turn.get("settled"):
             unfinished_turn_by_task[task_id] = turn_id
+    task_items: list[dict] = []
     for task_id in snapshot.task_ids:
+        try:
+            task, result, events = await client.read_task_history(task_id, session_events)
+        except (LookupError, PermissionError):
+            continue
+        task_items.append({
+            "task_id": task_id,
+            "goal": task.goal,
+            "attached_sequence": task_attach_sequences.get(task_id, 0),
+            "phase1_state": result.phase1_state,
+            "status": result.status,
+            "progress_cursor": result.cursor,
+            "waiting": _waiting_payload(result),
+            "failure_reason": (
+                _failure_reason_from_events(events)
+                if result.phase1_state in {"FAILED", "INTERRUPTED"} else None
+            ),
+            "assistant_text": result.assistant_text,
+            "projection": dict(result.projection) if result.projection else None,
+            "todo_list": (
+                dict(result.todo_list) if result.todo_list is not None else None
+            ),
+            "is_active": task_id == snapshot.active_task_id,
+            "background_work_pending": (
+                result.status == "awaiting_input"
+                and await client.application.kernel.has_pending_process_work(task)
+            ),
+        })
         approval_turns: dict[str, str] = {}
         tool_calls: dict[tuple[str, str], tuple[str, bool]] = {}
-        for event in runtime_server._call(
-            kernel.dependencies.store.read_events(
-                task_id, event_types=_TURN_PROGRESS_EVENT_TYPES,
-            )
-        ):
+        for event in events:
+            if event.event_type not in _TURN_PROGRESS_EVENT_TYPES:
+                continue
             payload = event.payload if isinstance(event.payload, Mapping) else {}
             item = _turn_progress_item(
                 event, fallback_turn_id=approval_turns.get(str(payload.get("request_id") or "")),
@@ -8635,34 +8441,6 @@ async def get_session(session_id: str) -> dict:
         if task_id and turn_id and task_id not in first_turn_by_task:
             first_turn_by_task[task_id] = turn_id
     images_by_turn = _session_input_images(session_events)
-    task_items: list[dict] = []
-    for task_id in snapshot.task_ids:
-        try:
-            task = runtime_server._call(kernel.get_task(task_id))
-            result = runtime_server._call(
-                runtime_server._client.get_task_result(task_id)
-            )
-        except (LookupError, PermissionError):
-            continue
-        task_items.append({
-            "task_id": task_id,
-            "goal": task.goal,
-            "attached_sequence": task_attach_sequences.get(task_id, 0),
-            "phase1_state": result.phase1_state,
-            "status": result.status,
-            "progress_cursor": result.cursor,
-            "waiting": _waiting_payload(result),
-            "failure_reason": (
-                _task_failure_reason(task_id)
-                if result.phase1_state in {"FAILED", "INTERRUPTED"} else None
-            ),
-            "assistant_text": result.assistant_text,
-            "projection": dict(result.projection) if result.projection else None,
-            "todo_list": (
-                dict(result.todo_list) if result.todo_list is not None else None
-            ),
-            "is_active": task_id == snapshot.active_task_id,
-        })
     latest = task_items[-1] if task_items else None
     return {
         "session_id": snapshot.session_id,
@@ -8731,9 +8509,11 @@ def _session_message_data(
     # id; the Turn it opened is that Task's first result event.
     if turn_id is None and message.role is MessageRole.USER and task_id:
         turn_id = first_turn_by_task.get(task_id)
+    background_turn = getattr(message, "message_id", "").startswith("msg-process-completion-turn-")
     return {
         "role": message.role.value,
-        "content": message.text,
+        "content": "后台任务完成，继续会话" if background_turn else message.text,
+        **({"trigger": "background_process"} if background_turn else {}),
         "task_id": message.task_id,
         "turn_id": turn_id,
         "images": (
@@ -9016,6 +8796,10 @@ def _task_failure_reason(task_id: str) -> str | None:
         )
     except Exception:
         return None
+    return _failure_reason_from_events(events)
+
+
+def _failure_reason_from_events(events) -> str | None:
     for event in reversed(events):
         if event.event_type == "turn.started":
             break  # Never reuse an older Turn's failure for this Turn.

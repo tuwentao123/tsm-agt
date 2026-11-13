@@ -343,6 +343,45 @@ class CoreProcessToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(e.event_type == "process.started" for e in events), 1)
         self.assertFalse(any(e.event_type == "process.cancelled" for e in events))
 
+    async def test_foreground_waits_past_generic_tool_timeout(self) -> None:
+        call = ToolCall("foreground-long", "core.run_command", {
+            "argv": [sys.executable, "-c", "import time; time.sleep(.2); print('finished')"],
+            "cwd": ".",
+        })
+        kernel = self.application.kernel
+        with self.assertRaises(ApprovalRequired) as caught:
+            await kernel.invoke_tool(self.task.task_id, "turn-long", call, timeout_seconds=.05)
+        request = caught.exception.request
+        result = await kernel.resolve_approval(
+            self.task.task_id, request.request_id, request.payload_hash,
+            ApprovalDecision.APPROVE, "approved", timeout_seconds=.05,
+        )
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual(result.data["exit_code"], 0)
+        self.assertIn("finished", result.data["stdout"]["text"])
+
+    async def test_explicit_exit_wait_is_settled_once(self) -> None:
+        kernel = self.application.kernel
+        started = await self._approve_call(ToolCall("async-exit", "core.run_command", {
+            "argv": [sys.executable, "-c", "import time; time.sleep(.2); print('done')"],
+            "cwd": ".", "mode": "background",
+        }))
+        process_id = started.data["process_id"]
+        result = await kernel.invoke_tool(
+            self.task.task_id, "turn-wait-exit",
+            ToolCall("exit", "core.process_wait", {"process_id": process_id, "until": "exit"}),
+            timeout_seconds=.05,
+        )
+        self.assertTrue(result.data["succeeded"])
+        self.assertIn("done", result.data["stdout"]["text"])
+        events = await kernel.dependencies.store.read_events(
+            self.task.task_id, event_types=("process.exited",),
+        )
+        self.assertEqual([event.payload["process_id"] for event in events], [process_id])
+        self.assertEqual(await kernel.pending_process_completions(
+            await kernel.get_task(self.task.task_id)
+        ), ())
+
     async def test_cancelling_command_observer_returns_managed_identity_without_killing(self):
         control = _TaskProcessControl(self.application.kernel, self.task.task_id, "turn-yield", "observer")
         observer = asyncio.create_task(control.run(

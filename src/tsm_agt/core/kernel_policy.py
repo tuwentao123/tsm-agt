@@ -487,9 +487,9 @@ class PolicyMixin:
     def _additional_read_roots(
         task: TaskSnapshot, tool_name: str,
     ) -> tuple[Path, ...]:
-        """Expose Task grants only to the four built-in read operations."""
+        """Expose Task grants to the built-in read operations."""
         if tool_name not in {
-            "core.read_file", "core.list_files", "core.search_files",
+            "core.read_file", "core.read_files", "core.list_files", "core.search_files",
             "core.find_files", "core.search_text", "core.grep_search",
         }:
             return ()

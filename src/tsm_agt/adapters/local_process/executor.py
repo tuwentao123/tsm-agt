@@ -34,6 +34,8 @@ class _LiveProcess:
     stderr_buffer: _LogBuffer
     stdout_task: asyncio.Task[None]
     stderr_task: asyncio.Task[None]
+    stop_status: ProcessExitStatus | None = None
+    termination_signal: str | None = None
 
 
 @dataclass(slots=True)
@@ -181,7 +183,9 @@ class LocalProcessExecutor:
         if completed is not None:
             return completed
         live = self._require_live(handle)
-        if live.process.returncode is None:
+        if live.process.returncode is None or not (
+            live.stdout_task.done() and live.stderr_task.done()
+        ):
             return None
         return await self._finish(
             live, live.process.returncode, ProcessExitStatus.EXITED, None
@@ -219,12 +223,21 @@ class LocalProcessExecutor:
         if completed is not None:
             return completed
         live = self._require_live(handle)
-        if live.process.returncode is None:
+        if live.process.returncode is None or not (
+            live.stdout_task.done() and live.stderr_task.done()
+        ):
+            live.stop_status = live.stop_status or status
+            live.termination_signal = "TERM"
             self._signal_group(live.handle.pgid, signal.SIGTERM)
             termination_signal = "TERM"
             try:
-                await asyncio.wait_for(live.process.wait(), timeout=grace_seconds)
+                async with asyncio.timeout(grace_seconds):
+                    await live.process.wait()
+                    return await self._finish(
+                        live, live.process.returncode, status, termination_signal,
+                    )
             except TimeoutError:
+                live.termination_signal = "KILL"
                 self._signal_group(live.handle.pgid, signal.SIGKILL)
                 termination_signal = "KILL"
                 await live.process.wait()
@@ -270,17 +283,20 @@ class LocalProcessExecutor:
         status: ProcessExitStatus,
         termination_signal: str | None,
     ) -> ProcessResult:
-        await asyncio.gather(live.stdout_task, live.stderr_task)
+        await asyncio.shield(asyncio.gather(live.stdout_task, live.stderr_task))
+        completed = self._completed_result(live.handle)
+        if completed is not None:
+            return completed
         self._live.pop(live.handle.process_id, None)
         result = ProcessResult(
             process_id=live.handle.process_id,
-            status=status,
+            status=live.stop_status or status,
             exit_code=return_code,
             stdout=live.stdout_buffer.output(),
             stderr=live.stderr_buffer.output(),
             started_at=live.handle.started_at,
             finished_at=datetime.now(timezone.utc),
-            termination_signal=termination_signal,
+            termination_signal=live.termination_signal or termination_signal,
         )
         self._completed[live.handle.process_id] = (
             live.handle, result, live.stdout_buffer, live.stderr_buffer

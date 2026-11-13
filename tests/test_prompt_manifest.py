@@ -98,7 +98,7 @@ class PromptManifestTest(unittest.TestCase):
         )
         self.assertEqual(
             gated["workspace-read-guidance"],
-            ["core.read_file", "core.search_files"],
+            ["core.read_file", "core.read_files", "core.search_files"],
         )
         self.assertIsNone(gated["completion-behavior-examples"])
         self.assertEqual(
@@ -118,7 +118,7 @@ class PromptManifestTest(unittest.TestCase):
         # Pin content, ordering, section versions and capability gates together.
         self.assertEqual(
             self.template.manifest().manifest_hash,
-            "001ab3a9c6bd4c77ab9500d1a7375fd5dd66f12a77f7719a75094bfa5bcd4222",
+            "7c75b970a0d33549f0eb535c673b494beaeebf6fa958f12019d09bf0723dfcd8",
         )
 
     def test_packaged_prompt_rejects_duplicate_sections(self) -> None:
@@ -356,7 +356,7 @@ class PromptManifestTest(unittest.TestCase):
     def test_workspace_guidance_is_capability_bound(self) -> None:
         search = self.segment("workspace-search-guidance").content
         read = self.segment("workspace-read-guidance").content
-        self.assertEqual(self.segment("workspace-read-guidance").version, "1.3")
+        self.assertEqual(self.segment("workspace-read-guidance").version, "1.4")
         self.assertIn("reused_from_call_id", read)
         self.assertIn("reference itself is not file text", read)
         self.assertIn("body is unavailable, read the needed range again", read)
@@ -446,7 +446,7 @@ class PromptManifestTest(unittest.TestCase):
     def test_workspace_command_guidance_keeps_cwd_in_workspace(self) -> None:
         segment = self.segment("workspace-command-guidance")
 
-        self.assertEqual(segment.version, "1.9")
+        self.assertEqual(segment.version, "1.10")
         self.assertEqual(
             segment.requires_any_tools, ("core.run_command", "core.process_wait"),
         )

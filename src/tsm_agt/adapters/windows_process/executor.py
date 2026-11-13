@@ -55,6 +55,9 @@ class _LiveProcess:
     stderr_buffer: _LogBuffer
     stdout_task: asyncio.Task[None]
     stderr_task: asyncio.Task[None]
+    stop_status: ProcessExitStatus | None = None
+    termination_signal: str | None = None
+    job_closed: bool = False
 
 
 class WindowsProcessExecutor:
@@ -234,15 +237,18 @@ class WindowsProcessExecutor:
         live = self._require_live(handle)
         termination_signal: str | None = None
         if live.process.returncode is None:
+            live.stop_status = live.stop_status or status
             try:
                 live.process.send_signal(signal.CTRL_BREAK_EVENT)
                 termination_signal = "CTRL_BREAK"
+                live.termination_signal = termination_signal
             except OSError:
                 # A detached/headless process may not share a console even
                 # though it owns a process group.  The Job Object remains the
                 # authoritative process-tree boundary in that case.
                 self._terminate_job(live.job_handle, 1)
                 termination_signal = "JOB_TERMINATE"
+                live.termination_signal = termination_signal
                 await live.process.wait()
             else:
                 try:
@@ -252,6 +258,7 @@ class WindowsProcessExecutor:
                 except TimeoutError:
                     self._terminate_job(live.job_handle, 1)
                     termination_signal = "JOB_TERMINATE"
+                    live.termination_signal = termination_signal
                     await live.process.wait()
         return await self._finish(
             live, live.process.returncode, status, termination_signal
@@ -263,13 +270,19 @@ class WindowsProcessExecutor:
     ) -> ProcessResult:
         # Root exit does not prove its descendants exited. Closing a
         # KILL_ON_JOB_CLOSE job makes the tree terminal before logs are finalized.
-        self._close_job(live.job_handle)
-        await asyncio.gather(live.stdout_task, live.stderr_task)
+        if not live.job_closed:
+            self._close_job(live.job_handle)
+            live.job_closed = True
+        await asyncio.shield(asyncio.gather(live.stdout_task, live.stderr_task))
+        completed = self._completed_result(live.handle)
+        if completed is not None:
+            return completed
         self._live.pop(live.handle.process_id, None)
         result = ProcessResult(
-            live.handle.process_id, status, return_code,
+            live.handle.process_id, live.stop_status or status, return_code,
             live.stdout_buffer.output(), live.stderr_buffer.output(),
-            live.handle.started_at, datetime.now(timezone.utc), termination_signal,
+            live.handle.started_at, datetime.now(timezone.utc),
+            live.termination_signal or termination_signal,
         )
         self._completed[live.handle.process_id] = (
             live.handle, result, live.stdout_buffer, live.stderr_buffer

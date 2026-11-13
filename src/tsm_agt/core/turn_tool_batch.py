@@ -633,7 +633,7 @@ async def _run_tool_call(
                 ),
                 hint=(
                     "Read one of the candidate paths from the previous tool "
-                    "result with core.read_file or code.symbol_overview before "
+                    "result with core.read_file, core.read_files, or code.symbol_overview before "
                     "searching again. Use a new evidence question only when the "
                     "unknown has genuinely changed."
                 ),

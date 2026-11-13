@@ -16,6 +16,8 @@ Only the first two shapes are finalized here.
 
 from __future__ import annotations
 
+from ..kernel_process import PROCESS_COMPLETION_MESSAGE_PREFIX
+
 from dataclasses import replace
 from typing import Any
 
@@ -165,7 +167,7 @@ class ConversationFinalizer:
     ) -> None:
         """Audit one model exchange without persisting its body twice."""
 
-        await self._kernel._append_events(state.task_id, ((
+        events = ((
             "conversation.model_response_recorded",
             {
                 "turn_id": state.turn_id,
@@ -177,7 +179,23 @@ class ConversationFinalizer:
                 "usage": response.usage.to_data(),
                 "elapsed_seconds": elapsed_seconds,
             },
-        ),))
+        ),)
+        process_ids = [
+            message.message_id.removeprefix(PROCESS_COMPLETION_MESSAGE_PREFIX)
+            for message in state.request.messages
+            if message.message_id.startswith(PROCESS_COMPLETION_MESSAGE_PREFIX)
+        ]
+        if process_ids:
+            delivered = await self._kernel._dependencies.store.read_events(
+                state.task_id, event_types=("process.completions_delivered",),
+            )
+            seen = {pid for event in delivered for pid in event.payload["process_ids"]}
+            new_ids = [pid for pid in process_ids if pid not in seen]
+            if new_ids:
+                events += (("process.completions_delivered", {
+                    "turn_id": state.turn_id, "process_ids": new_ids,
+                }),)
+        await self._kernel._append_events(state.task_id, events)
 
     async def record_tool_result(
         self, state: TurnState, result: Any,

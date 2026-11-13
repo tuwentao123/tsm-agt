@@ -108,6 +108,22 @@ from .patch_text import plan_text_edits
 from .workspace import WorkspacePatchConflict, prepare_workspace_text_write
 
 
+def _tool_execution_timeout(call: ToolCall, default: float) -> float | None:
+    if call.name == "core.run_command":
+        if (call.arguments.get("mode", "foreground") == "foreground"
+                and "timeout_seconds" not in call.arguments):
+            return None
+        return max(default, 15.0)
+    if call.name == "core.process_wait":
+        if call.arguments.get("until") == "exit":
+            return None
+        requested = call.arguments.get("wait_seconds")
+        if (isinstance(requested, (int, float)) and not isinstance(requested, bool)
+                and 0 < requested <= 30):
+            return max(default, requested + _PROCESS_WAIT_RETURN_GRACE_SECONDS)
+    return default
+
+
 def _render_workspace_patch(
     path: str, before_bytes: bytes | None,
     edits: tuple[Mapping[str, str], ...],
@@ -208,26 +224,33 @@ class _TaskProcessControl(ToolProcessControl):
                 max_output_bytes=max_output_bytes,
                 stop_on_task_end=stop_on_task_end,
                 invocation_id=self.invocation_id,
+                notify_on_exit=mode == "background" or timeout_seconds is not None,
             )
         except (ProcessPreparationError, ProcessSandboxDenied) as error:
             raise ProcessStartError(
                 error.code, str(error), data=error.to_data(), hint=error.hint,
             ) from error
         if mode == "foreground":
-            # The tool owns an observation window, not the OS process lifetime.
-            # Every command is registered before waiting, so a slow push/build
-            # survives both this window and cancellation of the tool observer.
+            # Only callers that explicitly request the legacy observation
+            # window can yield a running receipt.
             try:
                 observation = await self.kernel.wait_background_process(
                     self.task_id, record.process_id,
-                    wait_seconds=min(timeout_seconds or 10.0, 10.0),
+                    wait_seconds=(min(timeout_seconds, 10.0)
+                                  if timeout_seconds is not None else None),
                 )
                 if observation.result is not None:
                     return ProcessCommandResult(record.handle, observation.result)
             except asyncio.CancelledError:
-                # The outer tool deadline must not stop a registered process
-                # or erase its durable identity with UNKNOWN_OUTCOME.
-                pass
+                if timeout_seconds is None:
+                    await self.kernel.stop_background_process(
+                        self.task_id, record.process_id,
+                    )
+                    observation = await self.kernel.wait_background_process(
+                        self.task_id, record.process_id,
+                    )
+                    if observation.result is not None:
+                        return ProcessCommandResult(record.handle, observation.result)
         # A non-blocking poll captures fast command completion without making
         # process start depend on an eventual exit.
         record = await self.kernel.get_background_process_status(
@@ -262,7 +285,7 @@ class _TaskProcessControl(ToolProcessControl):
         )
 
     async def wait(
-        self, process_id: str, wait_seconds: float
+        self, process_id: str, wait_seconds: float | None
     ) -> ProcessWaitResult:
         return await self.kernel.wait_background_process(
             await self._owner(process_id), process_id, wait_seconds=wait_seconds
@@ -1528,27 +1551,7 @@ class ToolMixin:
         initial_events: tuple[RuntimeEvent, ...] = (),
         next_state: Mapping[str, Any] | None = None,
     ) -> ToolResult:
-        effective_timeout_seconds = timeout_seconds
-        if call.name == "core.run_command":
-            # Command lifetime is a Runtime resource lease, independent of the
-            # model's observation. Legacy timeout_seconds no longer schedules
-            # process termination or inflates this tool's deadline.
-            effective_timeout_seconds = max(timeout_seconds, 15.0)
-        elif call.name == "core.process_wait":
-            requested_wait = call.arguments.get("wait_seconds")
-            if (
-                isinstance(requested_wait, (int, float))
-                and not isinstance(requested_wait, bool)
-                and 0 < float(requested_wait) <= 30
-            ):
-                # Waiting out the observation window is a successful result:
-                # the process may still be RUNNING.  Do not let the generic
-                # tool deadline race the inner wait and turn that fact into a
-                # synthetic TIMEOUT error.
-                effective_timeout_seconds = max(
-                    timeout_seconds,
-                    float(requested_wait) + _PROCESS_WAIT_RETURN_GRACE_SECONDS,
-                )
+        effective_timeout_seconds = _tool_execution_timeout(call, timeout_seconds)
         stored = await self._dependencies.store.load_task(task_id)
         if stored is None:
             raise TaskNotFound(f"task not found: {task_id}")
@@ -1656,7 +1659,7 @@ class ToolMixin:
             turn_id=turn_id,
             workspace=Path(task.workspace),
             deadline=(datetime.now(timezone.utc)
-                      + timedelta(seconds=effective_timeout_seconds)),
+                      + timedelta(seconds=effective_timeout_seconds or timeout_seconds)),
             policy_decision_id=policy_decision_id,
             authorized_risk=effective_risk,
             payload_hash=payload_hash,
@@ -1702,6 +1705,8 @@ class ToolMixin:
                 error_code="TIMEOUT",
                 message=(
                     f"tool exceeded {effective_timeout_seconds:g} second deadline"
+                    if effective_timeout_seconds is not None
+                    else "process provider reported a timeout while collecting the result"
                 ),
                 retryable=selected_spec.idempotency.value != "non_idempotent",
                 recovery_kind=(
@@ -1833,6 +1838,11 @@ class ToolMixin:
                 events=completed_events,
             )
         )
+        if (call.name == "core.run_command" and effective_timeout_seconds is None
+                and (runner := asyncio.current_task()) is not None and runner.cancelling()):
+            # The command was stopped and its actual outcome is in the ledger.
+            # Propagate the interruption before the loop can make another call.
+            raise asyncio.CancelledError
         return result
 
     async def recover_tool_execution(
@@ -1872,6 +1882,29 @@ class ToolMixin:
                 f"tool execution has no recoverable result: {execution.execution_id}"
             )
         if execution.idempotency is ToolIdempotency.NON_IDEMPOTENT:
+            if execution.call.name == "core.run_command":
+                process = next((record for record in task.background_processes.values()
+                                if record.invocation_id == execution.invocation_id), None)
+                if process is not None and process.state.is_terminal:
+                    observed = await self.wait_background_process(task.task_id, process.process_id)
+                    if observed.result is not None:
+                        data = ProcessCommandResult(process.handle, observed.result).to_data()
+                        for name in ("stdout", "stderr"):
+                            data[name] = process_output_page(data[name])
+                        result = self._dependencies.tool_result_governor.govern(
+                            spec, execution.call, ToolResult(
+                                execution.call.call_id, observed.result.succeeded, data=data,
+                                error_code=observed.result.failure_code,
+                            ),
+                        )
+                        settled = execution.finish(
+                            ToolCommitState.COMMITTED if result.ok else ToolCommitState.FAILED,
+                            result,
+                        )
+                        await self._commit_recovery_result(
+                            task, settled, result, "tool.completed" if result.ok else "tool.failed",
+                        )
+                        return result
             result = self._dependencies.tool_result_governor.govern(
                 spec, execution.call, execution.interrupted_outcome(),
             )
@@ -1959,7 +1992,8 @@ class ToolMixin:
         )
         try:
             result = await invoke_tool_provider(
-                provider, spec, execution.call, context, timeout_seconds,
+                provider, spec, execution.call, context,
+                _tool_execution_timeout(execution.call, timeout_seconds),
             )
             if result.call_id != execution.call.call_id:
                 raise InvalidToolResult(

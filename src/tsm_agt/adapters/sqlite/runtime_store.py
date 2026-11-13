@@ -174,7 +174,7 @@ class SQLiteRuntimeStore:
     async def read_events(
         self, task_id: str, after_sequence: int = 0,
         event_types: tuple[str, ...] | None = None,
-        *, limit: int | None = None,
+        *, limit: int | None = None, include_approval_checkpoint: bool = True,
     ) -> tuple[RuntimeEvent, ...]:
         if after_sequence < 0:
             raise ValueError("after_sequence must not be negative")
@@ -193,6 +193,15 @@ class SQLiteRuntimeStore:
         turn_column = (
             "turn_id" if "turn_id" in event_columns else "NULL AS turn_id"
         )
+        payload_column = "payload_json"
+        if not include_approval_checkpoint:
+            # History renders the approval receipt. Its embedded model
+            # context is only needed by execution/recovery callers.
+            payload_column = (
+                "CASE WHEN event_type = 'approval.requested' "
+                "THEN json_remove(payload_json, '$.agent_checkpoint', '$.request.agent_checkpoint') "
+                "ELSE payload_json END AS payload_json"
+            )
         # A caller that only needs one kind of fact (a Turn's progress, say)
         # must not pay for the bulk it does not read: event payloads include
         # whole model messages and patch bodies.
@@ -208,7 +217,7 @@ class SQLiteRuntimeStore:
             parameters.append(limit)
         rows = connection.execute(
             """
-            SELECT event_id, task_id, sequence, event_type, payload_json,
+            SELECT event_id, task_id, sequence, event_type, """ + payload_column + """,
                    occurred_at, schema_version, """ + session_column + """,
                    """ + turn_column + """
             FROM runtime_events

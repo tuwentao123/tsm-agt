@@ -1586,9 +1586,16 @@ class SessionMixin:
         self, session_id: str,
     ) -> SessionConversationProjection:
         """Rebuild the durable, user-visible conversation from Session events."""
+        _, projection, _ = await self.read_session_history(session_id)
+        return projection
+
+    async def read_session_history(
+        self, session_id: str,
+    ) -> tuple[SessionSnapshot, SessionConversationProjection, tuple[SessionEvent, ...]]:
         session = await self.get_session(session_id)
         events = await self._dependencies.store.read_session_events(session_id)
-        return self._dependencies.session_context_projector.project(session, events)
+        projection = self._dependencies.session_context_projector.project(session, events)
+        return session, projection, events
     async def update_session_working_state(
         self, session_id: str, working_state: SessionWorkingState, *,
         expected_version: int | None = None,

@@ -65,6 +65,29 @@ class SQLiteRuntimeStoreTest(unittest.IsolatedAsyncioTestCase):
         later = await self.store.read_events("task-1", after_sequence=1)
         self.assertEqual([event.sequence for event in later], [2, 3])
 
+    async def test_history_can_read_approval_receipts_without_their_checkpoints(self) -> None:
+        events = (
+            RuntimeEvent("evt-1", "task-1", 1, "approval.requested", {
+                "request_id": "approval-1",
+                "agent_checkpoint": {"messages": ["saved context"]},
+            }),
+            RuntimeEvent("evt-2", "task-1", 2, "approval.requested", {
+                "request": {"request_id": "approval-2", "agent_checkpoint": {"messages": []}},
+            }),
+            RuntimeEvent("evt-3", "task-1", 3, "turn.completed", {"agent_checkpoint": {"revision": 2}}),
+        )
+        await self.store.commit(
+            RuntimeUnitOfWork("task-1", 0, {"state": "EXECUTING"}, events)
+        )
+
+        receipts = await self.store.read_events("task-1", include_approval_checkpoint=False)
+
+        self.assertEqual([event.sequence for event in receipts], [1, 2, 3])
+        self.assertEqual(receipts[0].payload, {"request_id": "approval-1"})
+        self.assertEqual(receipts[1].payload, {"request": {"request_id": "approval-2"}})
+        self.assertEqual(receipts[2], events[2])
+        self.assertEqual(await self.store.read_events("task-1"), events)
+
     async def test_failed_runtime_command_does_not_remain_in_progress(self) -> None:
         now = datetime.now(timezone.utc)
         claimed = await self.store.claim_runtime_command(RuntimeCommandRecord(

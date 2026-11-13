@@ -148,17 +148,27 @@ class StructuredEvidenceDeltaEvaluator:
                             f"{field}:{self._location_identity(value)}",
                         )
 
-        if call.name == "core.read_file" and isinstance(data, Mapping):
+        read_pages = ()
+        if isinstance(data, Mapping):
+            if call.name == "core.read_file":
+                read_pages = (data,)
+            elif call.name == "core.read_files":
+                read_pages = tuple(
+                    row["data"] for row in data.get("reads", ())
+                    if isinstance(row, Mapping) and row.get("ok")
+                    and isinstance(row.get("data"), Mapping)
+                )
+        for page in read_pages:
             identity = {
-                "path": data.get("path"), "sha256": data.get("sha256"),
-                "start_line": data.get("start_line"),
-                "end_line": data.get("end_line"),
+                "path": page.get("path"), "sha256": page.get("sha256"),
+                "start_line": page.get("start_line"),
+                "end_line": page.get("end_line"),
             }
             add(
                 "new_facts", identity,
-                f"artifact:{data.get('path', '?')} lines "
-                f"{data.get('start_line', '?')}-{data.get('end_line', '?')} "
-                f"sha256:{str(data.get('sha256', ''))[:16]}",
+                f"artifact:{page.get('path', '?')} lines "
+                f"{page.get('start_line', '?')}-{page.get('end_line', '?')} "
+                f"sha256:{str(page.get('sha256', ''))[:16]}",
             )
 
         if call.name == "core.run_command" and isinstance(data, Mapping):

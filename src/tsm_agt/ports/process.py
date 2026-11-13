@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -138,6 +138,19 @@ class ProcessResult:
     started_at: datetime
     finished_at: datetime
     termination_signal: str | None = None
+
+    @classmethod
+    def from_data(cls, data: Mapping[str, Any]) -> ProcessResult:
+        return cls(
+            process_id=data["process_id"],
+            status=ProcessExitStatus(data["status"]),
+            exit_code=data["exit_code"],
+            stdout=ProcessOutput(**data["stdout"]),
+            stderr=ProcessOutput(**data["stderr"]),
+            started_at=datetime.fromisoformat(data["started_at"]),
+            finished_at=datetime.fromisoformat(data["finished_at"]),
+            termination_signal=data.get("termination_signal"),
+        )
 
     @property
     def succeeded(self) -> bool:
@@ -316,7 +329,7 @@ class BackgroundProcessStartResult:
 
 @dataclass(frozen=True, slots=True)
 class ProcessWaitResult:
-    """One bounded observation of a Runtime-managed process."""
+    """One observation of a Runtime-managed process."""
 
     process_id: str
     state: str
@@ -332,7 +345,7 @@ class ProcessWaitResult:
         else:
             data = {
                 "process_id": self.process_id,
-                "execution_state": "running",
+                "execution_state": "orphaned" if self.state == "ORPHANED" else "running",
                 "succeeded": None,
                 "failure_code": None,
                 "status": None,
@@ -351,7 +364,7 @@ class ProcessWaitResult:
             }
             data["state"] = self.state
         data["waited_seconds"] = self.waited_seconds
-        data["output_observed"] = True
+        data["output_observed"] = self.state != "ORPHANED"
         return data
 
 

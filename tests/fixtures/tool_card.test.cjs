@@ -276,6 +276,21 @@ test('a commentary fragment is a note, not a grey meta line', () => {
   assert.equal(meta.note, undefined);
 });
 
+test('compaction progress collapses to one status line and is not a note', () => {
+  globalThis.describeProgress = item => (
+    item.kind === 'commentary' || item.kind === 'context_summary' ? item.activity : ''
+  );
+  const lines = globalThis.turnProgressLines([
+    {kind: 'context_summary', activity: '正在压缩上下文，准备摘要输入'},
+    {kind: 'context_summary', activity: '正在压缩上下文：摘要输入已整理，已用 2 秒'},
+    {kind: 'context_summary', activity: '正在压缩上下文：等待摘要响应，已用 21 秒，摘要请求 1/2'},
+  ]);
+  const statuses = lines.filter(line => /正在压缩上下文/.test(line.text));
+  assert.equal(statuses.length, 1, 'one compaction status line per turn');
+  assert.match(statuses[0].text, /已用 21 秒/, 'the newest stage wins');
+  assert.equal(statuses[0].note, undefined, 'compaction is runtime status, not model prose');
+});
+
 test('live entries merge a finished call into its started entry', () => {
   const entries = [
     {text: '执行命令 vitest', progressData: {kind: 'tool_started', tool_name: 'core.run_command',

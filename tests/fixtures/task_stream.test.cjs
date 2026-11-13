@@ -4,7 +4,7 @@ const vm = require('node:vm');
 const {test} = require('node:test');
 const page = fs.readFileSync(process.env.TSM_SKILL_TEST_SCRIPT, 'utf8');
 const constants = page.slice(page.indexOf('const TERMINAL_STATES ='), page.indexOf('function appendTaskAssistantText'));
-const follower = page.slice(page.indexOf('function followTask(taskId, conversationId)'), page.indexOf('async function loadSessions()'));
+const follower = page.slice(page.indexOf('function followTask(taskId, conversationId)'), page.indexOf('async function loadSessions('));
 
 test('live and restored progress explain nonzero commands with their actual output', () => {
   const context = vm.createContext({});
@@ -101,6 +101,32 @@ test('text fragments render before completion and the final snapshot replaces th
     status: 'awaiting_input', phase1_state: 'WAITING', assistant_text: '你好 🌍'});
   assert.equal(s.conversation.messages.length, 1);
   assert.equal(s.conversation.messages[0].textStream, undefined);
+});
+
+test('an idle conversation follows a pending background process into an automatic turn', async () => {
+  const s = setup();
+  s.context.followTask('task', 'chat');
+  const source = s.streams[0];
+  await s.emit(source, {type: 'stream.open', active_turn_id: 'first'});
+  await s.emit(source, {
+    type: 'task.snapshot', phase1_state: 'WAITING', status: 'awaiting_input',
+    turn_id: 'first', background_work_pending: true,
+  });
+  assert.equal(source.closed, undefined);
+  assert.equal(s.finishes.length, 1);
+  await s.emit(source, {
+    type: 'turn.started', turn_id: 'automatic', sequence: 2,
+    progress: {kind: 'turn_started', trigger: 'background_process'},
+  });
+  const row = s.conversation.messages[0];
+  assert.equal(row.turnId, 'automatic');
+  assert.equal(row.backgroundTurn, true);
+  await s.emit(source, {
+    type: 'task.snapshot', phase1_state: 'WAITING', status: 'awaiting_input',
+    turn_id: 'automatic', background_work_pending: false,
+  });
+  assert.equal(source.closed, true);
+  assert.equal(s.finishes.length, 2);
 });
 
 test('discarded candidates disappear and reconnect snapshots replace partial text without duplication', async () => {

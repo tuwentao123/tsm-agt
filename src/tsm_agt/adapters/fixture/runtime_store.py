@@ -88,15 +88,25 @@ class InMemoryRuntimeStore:
     async def read_events(
         self, task_id: str, after_sequence: int = 0,
         event_types: tuple[str, ...] | None = None,
-        *, limit: int | None = None,
+        *, limit: int | None = None, include_approval_checkpoint: bool = True,
     ) -> tuple[RuntimeEvent, ...]:
         if limit is not None and not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
-        return tuple(
+        events = tuple(
             event for event in self._events.get(task_id, ())
             if event.sequence > after_sequence
             and (not event_types or event.event_type in event_types)
         )[:limit]
+        if include_approval_checkpoint:
+            return events
+        return tuple(
+            replace(event, payload={
+                key: ({k: v for k, v in value.items() if k != "agent_checkpoint"}
+                      if key == "request" and isinstance(value, dict) else value)
+                for key, value in event.payload.items() if key != "agent_checkpoint"
+            }) if event.event_type == "approval.requested" else event
+            for event in events
+        )
 
     async def load_task(self, task_id: str) -> StoredTask | None:
         state = self._tasks.get(task_id)

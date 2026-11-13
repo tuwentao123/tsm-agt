@@ -831,7 +831,7 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
             for tool in transport.requests[0]["payload"]["tools"]
         }
         self.assertEqual(set(functions), {
-            "core__list_files", "core__read_file", "core__search_files",
+            "core__list_files", "core__read_file", "core__read_files", "core__search_files",
             "core__find_files", "core__search_text", "core__grep_search",
         })
         for name, function in functions.items():
@@ -843,7 +843,10 @@ class OpenAICompatibleModelProviderTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Task-scoped directory read approval", description)
                 self.assertIn("Pending approval is not a denial", description)
                 self.assertIn("policy denials and sensitive-file restrictions still apply", description)
-                path_description = function["parameters"]["properties"]["path"]["description"]
+                properties = function["parameters"]["properties"]
+                if name == "core__read_files":
+                    properties = properties["reads"]["items"]["properties"]
+                path_description = properties["path"]["description"]
                 self.assertIn("Workspace-relative or absolute local", path_description)
                 self.assertIn("read approval", path_description)
 

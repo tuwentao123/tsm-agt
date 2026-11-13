@@ -765,6 +765,8 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         self._dependencies = dependencies
         self._tool_policy = CoreToolPolicy()
         self._background_deadline_tasks: dict[str, asyncio.Task[None]] = {}
+        self._background_process_waiters: dict[str, asyncio.Task[None]] = {}
+        self.on_background_process_completed: Callable[[str], None] | None = None
         #: Per-turn in-process cancellation resources (task-cancellation-spec
         #: §5.1). Not persisted; closed when a turn is replaced, suspended, or
         #: settled. Task-owned managed processes deliberately live outside it.
@@ -1862,6 +1864,8 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         tool_timeout_seconds: float = 30.0,
         on_text_delta: Callable[[str], None] | None = None,
         on_progress: Callable[[AgentProgress], None] | None = None,
+        *,
+        background_completion: bool = False,
     ) -> AgentTurnResult | AgentTurnSuspended | AgentClarificationSuspended:
         """Run a turn; max_output_tokens reserves local context space.
 
@@ -1909,6 +1913,7 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
             max_output_tokens=max_output_tokens,
             tool_timeout_seconds=tool_timeout_seconds,
             on_text_delta=on_text_delta, on_progress=on_progress,
+            background_completion=background_completion,
         )
 
     async def resume_agent_turn(

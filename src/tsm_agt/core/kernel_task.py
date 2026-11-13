@@ -757,18 +757,10 @@ class TaskMixin:
             else TaskKind.WORK_ITEM
         )
         if task_kind is TaskKind.CONVERSATION:
+            # Superseding writes Session events. The version and sequence are
+            # re-read right before the atomic commit below, so this call never
+            # commits against a snapshot that an earlier await made stale.
             await self._supersede_idle_conversations(session)
-            if session_stored is not None:
-                # Superseding wrote session events, so the version and sequence
-                # read above are stale; reload before the atomic create commit.
-                reloaded = await self._dependencies.store.load_session(
-                    session_identity
-                )
-                assert reloaded is not None
-                session = SessionSnapshot.from_data(reloaded.data)
-                session_version = reloaded.version
-                session_sequence = reloaded.last_event_sequence
-                attach_sequence = session_sequence + 1
         session = session.attach_task(identity)
         attached_payload: dict[str, Any] = {
             "task_id": identity, "active_task_id": identity,
@@ -783,8 +775,8 @@ class TaskMixin:
             "session.task_attached", attached_payload,
         )
         session_events += (attached_event,)
-        if source_task_id is not None:
-            session_events += (SessionEvent(
+        derived_event = (
+            SessionEvent(
                 f"sevt-{uuid4().hex}", session_identity, attach_sequence + 1,
                 "session.task_derived", {
                     "task_id": identity,
@@ -797,7 +789,11 @@ class TaskMixin:
                         "unknown_outcome",
                     ],
                 },
-            ),)
+            )
+            if source_task_id is not None else None
+        )
+        if derived_event is not None:
+            session_events += (derived_event,)
 
         trust = await self.get_project_trust(resolved_workspace)
         baseline = capture_workspace_baseline(
@@ -819,6 +815,28 @@ class TaskMixin:
         )
         document_references = extract_document_references(normalized_goal)
         visible_tool_names = {tool.name for tool in await self.list_tools()}
+        # Session writes are optimistically versioned, and every step above
+        # awaits (trust fingerprinting runs off the event loop, tool discovery is
+        # async). A concurrent Turn of the same Session can append events in
+        # between, so the version read earlier would no longer describe the state
+        # this call commits. Re-read the Session as the last step before the
+        # atomic commit and rebuild the attach events against that sequence; the
+        # window that remains contains no awaits.
+        if session_stored is not None:
+            current_session = await self._dependencies.store.load_session(
+                session_identity
+            )
+            assert current_session is not None
+            session_version = current_session.version
+            session = SessionSnapshot.from_data(current_session.data).attach_task(
+                identity
+            )
+            attach_sequence = current_session.last_event_sequence + 1
+            session_events = (replace(attached_event, sequence=attach_sequence),)
+            if derived_event is not None:
+                session_events += (replace(
+                    derived_event, sequence=attach_sequence + 1,
+                ),)
         document_fetch_failure = (
             ToolResult(
                 call_id=f"document-fetch-{canonical_hash(normalized_goal)[:16]}",

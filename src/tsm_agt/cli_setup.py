@@ -18,9 +18,9 @@ from tsm_agt import __version__
 from tsm_agt.bootstrap import (
     compose_fixture_application, compose_openai_compatible_readonly_application,
 )
+from tsm_agt.bootstrap.composition import inspect_model_configuration
 from tsm_agt.bootstrap.model_configuration import (
     CONFIGURATION_TEMPLATE, ModelConfiguration, default_configuration_path,
-    inspect_model_configuration,
 )
 from tsm_agt.core.configuration import ripgrep_binary
 from tsm_agt.ports import (
@@ -107,7 +107,7 @@ async def run_doctor(
     config_error: str | None = None
     missing: tuple[str, ...] = ()
     try:
-        configuration, missing = inspect_model_configuration(configuration_file)
+        configuration, missing = await asyncio.to_thread(inspect_model_configuration, configuration_file)
     except (OSError, UnicodeError, ValueError) as error:
         config_error = str(error)
 

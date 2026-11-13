@@ -97,7 +97,7 @@ class ToolExecutionGate:
 
 async def invoke_tool_provider(
     provider: ToolProviderPort, spec: ToolSpec, call: ToolCall,
-    context: ToolInvocationContext, timeout_seconds: float,
+    context: ToolInvocationContext, timeout_seconds: float | None,
 ) -> ToolResult:
     gate = _execution_gate.get()
     if gate is not None:

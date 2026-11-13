@@ -78,6 +78,14 @@ class ApprovalMixin:
         self, task: TaskSnapshot, call: ToolCall,
     ) -> Path | None:
         """Return the narrow external directory that needs Task approval."""
+        if call.name == "core.read_files":
+            for arguments in call.arguments["reads"]:
+                root = self._external_read_root_requiring_approval(
+                    task, replace(call, name="core.read_file", arguments=arguments)
+                )
+                if root is not None:
+                    return root
+            return None
         if call.name not in {
             "core.read_file", "core.list_files", "core.search_files",
             "core.find_files", "core.search_text", "core.grep_search",
@@ -324,7 +332,7 @@ class ApprovalMixin:
                 or (not is_write and (
                     not selected_spec.is_read_only
                     or request.call.name not in {
-                        "core.read_file", "core.list_files", "core.search_files",
+                        "core.read_file", "core.read_files", "core.list_files", "core.search_files",
                         "core.find_files", "core.search_text", "core.grep_search",
                     }
                 ))

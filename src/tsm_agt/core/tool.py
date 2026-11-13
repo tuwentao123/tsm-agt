@@ -66,6 +66,10 @@ def validate_tool_arguments(spec: ToolSpec, arguments: Mapping[str, Any]) -> Non
             raise InvalidToolArguments(
                 "core.read_file requires exactly one of path or resource_ref"
             )
+    if spec.name == "core.process_wait" and (
+        ("wait_seconds" in arguments) == ("until" in arguments)
+    ):
+        raise InvalidToolArguments("core.process_wait requires either until or wait_seconds")
 
 
 @lru_cache(maxsize=256)
