@@ -1364,7 +1364,10 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         failures: list[dict[str, Any]] = []
         for related_task_id in session.task_ids:
             try:
-                events = await self._dependencies.store.read_events(related_task_id)
+                # Only the creation fact is read; every Task has exactly one.
+                events = await self._dependencies.store.read_events(
+                    related_task_id, event_types=("task.created",), limit=1,
+                )
             except Exception:
                 continue
             created = next((
@@ -1699,11 +1702,7 @@ class Kernel(CheckpointMixin, SteeringMixin, InputMixin, ModelMixin, PolicyMixin
         unfinished step must never reject completion. A short instruction keeps
         the scratchpad honest without letting it override recorded facts.
         """
-        task = await self.get_task(task_id)
-        events = await self._dependencies.store.read_events(task_id)
-        memory = self._dependencies.working_memory_projector.project(
-            task_id, task.goal, events
-        )
+        memory = await self.get_working_memory(task_id)
         unfinished = any(
             step.status in {
                 WorkingPlanStepStatus.PENDING,

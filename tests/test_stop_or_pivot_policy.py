@@ -154,19 +154,27 @@ class PivotFixtureTool:
 class ChangeMethodModel(EchoModelProvider):
     capabilities = ProviderCapabilities(tools=True, context_window=8192)
 
+    def __init__(self):
+        super().__init__()
+        self.search_calls = 0
+        self.received_method_change = False
+
     async def complete(self, request: ModelRequest) -> ModelResponse:
         results = [
             block.result for message in request.messages for block in message.content
             if isinstance(block, ToolResultBlock)
         ]
         if results and results[-1].error_code == "EXPLORATION_CHANGE_METHOD_REQUIRED":
+            self.received_method_change = True
             requested = call("pivot-read", "core.read_file")
         elif results and results[-1].call_id == "pivot-read":
             return ModelResponse(Message(
                 "final", MessageRole.ASSISTANT, (TextBlock("changed method"),)
             ))
         else:
-            requested = call(f"search-{len(results) + 1}")
+            # Compaction may remove older results from the model request.
+            self.search_calls += 1
+            requested = call(f"search-{self.search_calls}")
         return ModelResponse(Message(
             requested.call_id, MessageRole.ASSISTANT,
             (ToolCallBlock(requested),),
@@ -183,8 +191,9 @@ class StopOrPivotKernelTest(unittest.IsolatedAsyncioTestCase):
             )
             database = root / "runtime.db"
             tool = PivotFixtureTool()
+            model = ChangeMethodModel()
             app = compose_fixture_application(
-                model_adapter=ChangeMethodModel(), tool_adapters=(tool,),
+                model_adapter=model, tool_adapters=(tool,),
                 store_adapter=SQLiteRuntimeStore(database),
                 evidence_delta_evaluator_adapter=StructuredEvidenceDeltaEvaluator(),
                 semantic_action_classifier_adapter=RuleBasedSemanticActionClassifier(),
@@ -212,14 +221,7 @@ class StopOrPivotKernelTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     tool.calls, ["core.search_text"] * 3 + ["core.read_file"]
                 )
-                results = [
-                    block.result for message in result.messages
-                    for block in message.content if isinstance(block, ToolResultBlock)
-                ]
-                self.assertIn(
-                    "EXPLORATION_CHANGE_METHOD_REQUIRED",
-                    [item.error_code for item in results],
-                )
+                self.assertTrue(model.received_method_change)
                 events = await app.registry.require(RuntimeStorePort).read_events(
                     task.task_id
                 )

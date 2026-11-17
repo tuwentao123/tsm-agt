@@ -29,7 +29,9 @@ from tsm_agt.ports import (
 from uuid import uuid4
 from .agent_loop import AgentTurnCheckpoint
 from .configuration import canonical_hash
-from .steering import SteeringKind, SteeringProjection, SteeringProjector
+from .steering import (
+    STEERING_EVENT_TYPES, SteeringKind, SteeringProjection, SteeringProjector,
+)
 from .task import TaskSnapshot, TaskState
 from .task_spec import TaskSpecProjector, TaskSpecSnapshot
 from .turn import InvalidTurnState
@@ -39,7 +41,9 @@ from .working_memory import WorkingMemorySnapshot
 class SteeringMixin:
     async def get_steering(self, task_id: str) -> SteeringProjection:
         await self.get_task(task_id)
-        events = await self._dependencies.store.read_events(task_id)
+        events = await self._dependencies.store.read_events(
+            task_id, event_types=STEERING_EVENT_TYPES,
+        )
         return SteeringProjector.project(task_id, events)
 
     async def queue_steering(
@@ -61,7 +65,9 @@ class SteeringMixin:
                 raise InvalidTurnState(
                     f"steering requires an active Task, got {task.state.value}"
                 )
-            events = await self._dependencies.store.read_events(task_id)
+            events = await self._dependencies.store.read_events(
+                task_id, event_types=STEERING_EVENT_TYPES,
+            )
             projection = SteeringProjector.project(task_id, events)
             existing = next((
                 event for event in events
@@ -109,6 +115,19 @@ class SteeringMixin:
         for attempt in range(5):
             stored = await self._require_stored_task(checkpoint.task_id)
             task = TaskSnapshot.from_data(stored.data)
+            # Almost every boundary has nothing queued. Decide that from the
+            # steering events alone; only an actual merge needs the full log
+            # (Task SPEC and Working Memory revisions are projected from it).
+            steering_events = await self._dependencies.store.read_events(
+                checkpoint.task_id, event_types=STEERING_EVENT_TYPES,
+            )
+            if not any(
+                item.inbound_sequence > checkpoint.last_steering_inbound_sequence
+                for item in SteeringProjector.project(
+                    checkpoint.task_id, steering_events,
+                ).pending
+            ):
+                return checkpoint, False
             events = await self._dependencies.store.read_events(checkpoint.task_id)
             projection = SteeringProjector.project(checkpoint.task_id, events)
             pending = tuple(

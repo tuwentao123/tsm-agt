@@ -9,7 +9,8 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from tsm_agt.ports import (
-    ImageBlock, Message, MessageRole, TextBlock, ToolCallBlock, ToolResultBlock, ToolSpec,
+    AssistantMessagePhase, ImageBlock, Message, MessageRole, TextBlock, ToolCallBlock,
+    ToolResultBlock, ToolSpec,
 )
 
 from .configuration import canonical_hash
@@ -17,9 +18,14 @@ from .image_budget import estimate_image_tokens
 from .prompt import PromptTemplate
 from .skills import SkillCatalogBudget
 from tsm_agt.ports.context_summary import ContextSummarySettings
-from .context_messages import is_execution_context
+from .context_messages import is_execution_context, is_generated_context
 from .read_result_reuse import ReadReuseStats, project_read_results
-from .session_history import MANAGED_HISTORY_BUDGETS, compact_history_body, history_turn_groups
+from .session_history import (
+    MANAGED_HISTORY_BUDGETS, compact_history_body, history_turn_groups,
+    prune_unreferenced_read_payloads,
+)
+
+CONVERSATION_COMPACTION_TARGET_RATIO = 0.15
 
 
 class ContextWindowExceeded(RuntimeError):
@@ -50,6 +56,7 @@ class ContextBudget:
     allocations: tuple[ContextBudgetAllocation, ...] = ()
     history_soft_tokens: int = 0
     trigger_reasons: tuple[str, ...] = ()
+    compaction_target_input_tokens: int | None = None
 
     @property
     def should_compact(self) -> bool:
@@ -76,6 +83,7 @@ class ContextBudget:
             "history_estimated_tokens": history_tokens,
             "history_soft_limit_exceeded": bool(self.history_soft_tokens and history_tokens > self.history_soft_tokens),
             "trigger_reasons": list(self.trigger_reasons),
+            "compaction_target_input_tokens": self.compaction_target_input_tokens,
         }
 
 
@@ -99,6 +107,7 @@ class ContextCompactionReceipt:
     forgotten_event_sequences: tuple[int, ...] = ()
     pinned_message_ids: tuple[str, ...] = ()
     trigger_reasons: tuple[str, ...] = ()
+    compaction_target_input_tokens: int | None = None
 
     def event_data(self) -> dict[str, Any]:
         return {
@@ -121,6 +130,7 @@ class ContextCompactionReceipt:
             "pinned_message_ids": list(self.pinned_message_ids),
             "summary_body_persisted": False,
             "trigger_reasons": list(self.trigger_reasons),
+            "compaction_target_input_tokens": self.compaction_target_input_tokens,
         }
 
 
@@ -200,6 +210,7 @@ class ContextWindowManager:
         read_reuse_task_id: str | None = None,
         defer_hard_limit_for_summary: bool = False,
         trigger_on_history: bool = True,
+        compact_to_target: bool = False,
     ) -> PreparedContext:
         if max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
@@ -261,6 +272,11 @@ class ContextWindowManager:
         reasons = []
         if before + max_output_tokens >= math.floor(context_window * self.trigger_ratio):
             reasons.append("context_capacity")
+            if compact_to_target:
+                budget = replace(budget, compaction_target_input_tokens=min(
+                    budget.hard_input_tokens,
+                    max(1, math.floor(context_window * CONVERSATION_COMPACTION_TARGET_RATIO)),
+                ))
         if self.latency_soft_input_tokens and before + max_output_tokens >= self.latency_soft_input_tokens:
             reasons.append("latency_target")
         if history_pressure:
@@ -455,14 +471,17 @@ class ContextWindowManager:
             conversation
         )
         compacted_session_items += turn_history_items
-        target = min(budget.hard_input_tokens, budget.trigger_tokens - budget.max_output_tokens)
+        target = budget.compaction_target_input_tokens or min(
+            budget.hard_input_tokens, budget.trigger_tokens - budget.max_output_tokens,
+        )
         if self.estimate_input_tokens(conversation, tools, prompt_template, runtime_instruction,
                                       read_reuse_task_id=read_reuse_task_id) <= target:
             # History pressure alone must not compact the live tool exchange.
             return conversation, (self._compaction_receipt(
                 source_conversation, conversation, budget, compacted_session_items, (),
             ) if compacted_session_items else None)
-        groups = self._atomic_groups(conversation)
+        use_target = budget.compaction_target_input_tokens is not None
+        groups = self._atomic_groups(conversation, merge_historical_turns=not use_target)
         if len(groups) <= 2:
             if compacted_session_items == 0:
                 return conversation, None
@@ -470,19 +489,15 @@ class ContextWindowManager:
                 source_conversation, conversation, budget,
                 compacted_session_items, (),
             )
-        recent_indexes: set[int] = set()
-        recent_count = 0
-        for index in range(len(groups) - 1, 0, -1):
-            if recent_count >= self.recent_message_floor:
-                break
-            group = groups[index]
-            recent_indexes.add(index)
-            recent_count += len(group)
         protected_indexes = {
             index for index, group in enumerate(groups)
             if index == 0 or self._is_protected_group(group)
         }
-        if not trigger_on_history:
+        if use_target:
+            protected_indexes.update(self._continuation_anchor_indexes(groups))
+            protected_indexes.update(index for index, group in enumerate(groups)
+                                     if group[0].role is MessageRole.SYSTEM)
+        elif not trigger_on_history:
             # Keep the last answered proposal and any later unanswered input,
             # even after a long live tool loop moves them out of the tail.
             for index in range(len(groups) - 1, -1, -1):
@@ -495,6 +510,30 @@ class ContextWindowManager:
                        and not any(isinstance(block, ToolCallBlock) for block in message.content)
                        for message in historical):
                     break
+        if use_target:
+            protected_indexes.add(len(groups) - 1)
+            # Context updates can arrive after the tool batch. Preserve the
+            # latest live exchange even when the last row is such an update.
+            for index in range(len(groups) - 1, 0, -1):
+                first = groups[index][0]
+                if any(isinstance(block, ToolCallBlock) for block in first.content):
+                    protected_indexes.add(index)
+                    break
+                if (first.role is MessageRole.USER and not is_generated_context(first.message_id)
+                        and self._is_protected_group((first,))):
+                    break
+            recent_indexes = self._retain_recent_groups(
+                groups, protected_indexes, tools, prompt_template, budget,
+                runtime_instruction, read_reuse_task_id=read_reuse_task_id,
+            )
+        else:
+            recent_indexes = set()
+            recent_count = 0
+            for index in range(len(groups) - 1, 0, -1):
+                if recent_count >= self.recent_message_floor:
+                    break
+                recent_indexes.add(index)
+                recent_count += len(groups[index])
         candidate_indexes = [
             index for index in range(len(groups))
             if index not in protected_indexes and index not in recent_indexes
@@ -519,11 +558,65 @@ class ContextWindowManager:
                 continue
             preserved_messages.extend(group)
         preserved = tuple(preserved_messages)
+        if use_target:
+            preserved = prune_unreferenced_read_payloads(preserved)
         receipt = self._compaction_receipt(
             source_conversation, preserved, budget, compacted_session_items,
             compacted_messages,
         )
         return preserved, receipt
+
+    def summary_text_reserve(self, context_window: int) -> int:
+        # The summarizer accepts eight UTF-8 bytes per output token, while
+        # the request estimator prices four bytes per input token.
+        return 2 * min(self.summary_settings.max_output_tokens, max(1, context_window // 8)) + 192
+
+    @staticmethod
+    def _continuation_anchor_indexes(groups: tuple[tuple[Message, ...], ...]) -> set[int]:
+        """Keep the last answered proposal and later unanswered user inputs."""
+        protected = set()
+        answer = None
+        for index in reversed(range(len(groups))):
+            message = groups[index][0]
+            if len(groups[index]) != 1 or not message.message_id.startswith(("window-history-", "session-history-")):
+                continue
+            if message.role is MessageRole.USER and message.text:
+                protected.add(index)
+                if answer is not None:
+                    protected.add(answer)
+                    break
+            elif (message.role is MessageRole.ASSISTANT and message.text
+                  and message.phase is not AssistantMessagePhase.COMMENTARY
+                  and not any(isinstance(block, ToolCallBlock) for block in message.content)
+                  and answer is None):
+                answer = index
+        return protected
+
+    def _retain_recent_groups(
+        self, groups: tuple[tuple[Message, ...], ...], protected: set[int],
+        tools: tuple[ToolSpec, ...], template: PromptTemplate, budget: ContextBudget,
+        instruction: str | None, *, read_reuse_task_id: str | None,
+    ) -> set[int]:
+        assert budget.compaction_target_input_tokens is not None
+        limit = budget.compaction_target_input_tokens - self.summary_text_reserve(budget.context_window)
+        optional = [
+            index for index in reversed(range(len(groups)))
+            if index not in protected and not groups[index][0].message_id.startswith("context-summary-")
+        ]
+        low, high = 0, len(optional)
+        while low < high:
+            count = (low + high + 1) // 2
+            kept = protected.union(optional[:count])
+            candidate = tuple(message for index, group in enumerate(groups)
+                              if index in kept for message in group)
+            # Price the assembled input so the tool schemas, static prompt
+            # and protected messages share the same budget as the history.
+            if self.estimate_input_tokens(prune_unreferenced_read_payloads(candidate), tools, template, instruction,
+                                          read_reuse_task_id=read_reuse_task_id) <= limit:
+                low = count
+            else:
+                high = count - 1
+        return set(optional[:low])
 
     def _compact_turn_history(
         self, conversation: tuple[Message, ...], tools: tuple[ToolSpec, ...],
@@ -538,8 +631,10 @@ class ContextWindowManager:
         silently cutting off the proposal the user just accepted.
         """
         removed = 0
-        target = (max(1, min(budget.hard_input_tokens, budget.trigger_tokens - budget.max_output_tokens))
-                  if budget.context_window else math.inf)
+        target = budget.compaction_target_input_tokens or (
+            max(1, min(budget.hard_input_tokens, budget.trigger_tokens - budget.max_output_tokens))
+            if budget.context_window else math.inf
+        )
 
         def fits(candidate_messages: tuple[Message, ...]) -> bool:
             total, allocations = self.estimate_input_budget(candidate_messages, tools, template, instruction,
@@ -797,6 +892,7 @@ class ContextWindowManager:
             forgotten_event_sequences=tuple(sorted(forgotten_sequences)),
             pinned_message_ids=pinned_message_ids,
             trigger_reasons=budget.trigger_reasons,
+            compaction_target_input_tokens=budget.compaction_target_input_tokens,
         )
 
     @staticmethod
@@ -857,7 +953,7 @@ class ContextWindowManager:
 
     @staticmethod
     def _atomic_groups(
-        messages: tuple[Message, ...],
+        messages: tuple[Message, ...], *, merge_historical_turns: bool = True,
     ) -> tuple[tuple[Message, ...], ...]:
         groups: list[tuple[Message, ...]] = []
         index = 0
@@ -887,8 +983,9 @@ class ContextWindowManager:
                 continue
             groups.append((message,))
             index += 1
-        # Previous user turns restored from a window are indivisible history:
-        # preserve their user input, tool protocol and final reply together.
+        if not merge_historical_turns:
+            return tuple(groups)
+        # The legacy history policy keeps restored turns as indivisible groups.
         merged: list[tuple[Message, ...]] = []
         historical_turn: list[Message] = []
         for group in groups:

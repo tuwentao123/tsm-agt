@@ -83,8 +83,9 @@ async def ui_snapshot(client, task_id: str):
         key = (before.version, session.version if session else 0, redirect_pending)
         if task_id in cache and cache[task_id][0] == key:
             return dict(cache[task_id][1])
-        result = await client.get_task_result(task_id)
-        events = await store.read_events(task_id)
+        # One log read serves both the result projection and the turn/failure
+        # scan below; reading it twice doubled the cost of opening a stream.
+        _, result, events = await client._read_task_result(task_id)
         latest = next((event for event in reversed(events) if event.event_type == "turn.started"), None)
         turn_id = latest.turn_id or latest.payload.get("turn_id") if latest else None
         data = result.to_data()

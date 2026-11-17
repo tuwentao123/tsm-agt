@@ -318,6 +318,10 @@ class FocusSequenceModel(EchoModelProvider):
 class BudgetSequenceModel(EchoModelProvider):
     capabilities = ProviderCapabilities(tools=True, context_window=8192)
 
+    def __init__(self):
+        super().__init__()
+        self.search_calls = 0
+
     async def complete(self, request: ModelRequest) -> ModelResponse:
         results = [
             block.result for message in request.messages for block in message.content
@@ -328,7 +332,9 @@ class BudgetSequenceModel(EchoModelProvider):
                 "budget-final", MessageRole.ASSISTANT,
                 (TextBlock("budget wrapped up"),),
             ))
-        call = search_call(f"budget-search-{len(results) + 1}")
+        # Compaction may remove older results from the model request.
+        self.search_calls += 1
+        call = search_call(f"budget-search-{self.search_calls}")
         return ModelResponse(Message(
             call.call_id, MessageRole.ASSISTANT, (ToolCallBlock(call),)
         ), FinishReason.TOOL_CALL)

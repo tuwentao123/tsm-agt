@@ -161,6 +161,20 @@ class LocalEventApiServer:
         future = asyncio.run_coroutine_threadsafe(awaitable, self._loop)
         return future.result(timeout=timeout)
 
+    async def call_async(self, awaitable, *, timeout: float = 70) -> Any:
+        """``_call`` for a caller that runs on its own event loop.
+
+        The Runtime loop still owns the work and a timeout still does not
+        cancel it, but the calling loop keeps serving other requests and
+        streams while it waits instead of blocking in ``future.result``.
+        """
+        if self._loop is None:
+            raise RuntimeError("local Event API is not running")
+        future = asyncio.run_coroutine_threadsafe(awaitable, self._loop)
+        return await asyncio.wait_for(
+            asyncio.shield(asyncio.wrap_future(future)), timeout,
+        )
+
     async def iterate_runtime(self, iterator):
         """Pull at most one batch across loops; never block the ASGI thread.
 

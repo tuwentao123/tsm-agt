@@ -135,12 +135,27 @@ async def _complete_window_compaction(kernel, state, prepared, tools, projection
             raise ContextWindowExceeded("summary is cooling down after failure; original history preserved")
         return manager._prepared(source, replace(prepared.budget, estimated_input_tokens=estimate,
                                                 allocations=allocations), None, state.task_id)
+    target = prepared.budget.compaction_target_input_tokens
+    skill_budget_bytes = max(0, prepared.budget.hard_input_tokens * 4 // 10)
+    if target is not None:
+        # Revalidated Skill exchanges consume the same budget as the recent
+        # history. A Skill already in the retained tail does not need adding.
+        template = kernel._dependencies.prompt_template
+        original_ids = {message.message_id for message in source}
+        retained_without_draft = tuple(message for message in retained
+                                       if message.message_id in original_ids
+                                       or not message.message_id.startswith("context-summary-"))
+        retained_tokens = manager.estimate_input_tokens(
+            retained_without_draft, tools, template, read_reuse_task_id=state.task_id,
+        )
+        summary_reserve = manager.summary_text_reserve(prepared.budget.context_window)
+        skill_budget_bytes = min(skill_budget_bytes, max(0, target - retained_tokens - summary_reserve) * 4)
     active_groups, active_receipt = active_skill_groups(
         source, tuple(task.tool_executions.values()), turn_id=state.turn_id,
         catalog=getattr(kernel._dependencies, "skill_catalog", None),
         registry=getattr(kernel._dependencies, "skill_registry", None),
         groups=manager._atomic_groups(source),
-        budget_bytes=max(0, prepared.budget.hard_input_tokens * 4 // 10),
+        budget_bytes=skill_budget_bytes,
     )
     active_ids = {message.message_id for group in active_groups for message in group}
     if kernel._dependencies.context_summarizer is not None:
@@ -169,7 +184,9 @@ async def _complete_window_compaction(kernel, state, prepared, tools, projection
                 ))
                 estimate, allocations = manager.estimate_input_budget(candidate, tools, kernel._dependencies.prompt_template,
                                                                      read_reuse_task_id=state.task_id)
-                if estimate < prepared.compaction.before_estimated_tokens and (not prepared.budget.hard_input_tokens or estimate <= prepared.budget.hard_input_tokens):
+                if (estimate < prepared.compaction.before_estimated_tokens
+                        and (not prepared.budget.hard_input_tokens or estimate <= prepared.budget.hard_input_tokens)
+                        and (target is None or estimate <= target)):
                     state.checkpoint = replace(state.checkpoint, context_window_state=window)
                     await kernel._append_events(state.task_id, (("context.tool_outputs_pruned", {
                         "turn_id": state.turn_id, "model_calls": 0, "after_estimated_tokens": estimate,
@@ -255,10 +272,7 @@ async def _complete_window_compaction(kernel, state, prepared, tools, projection
             prune_unreferenced_read_payloads((*prefix, *semantic_history)), tools,
             kernel._dependencies.prompt_template, read_reuse_task_id=state.task_id,
         )
-        # The summary adapter accepts up to eight UTF-8 bytes per output
-        # token. The input estimator prices four bytes per token.
-        reserve = (2 * min(manager.summary_settings.max_output_tokens, max(1, capacity // 8))
-                   + manager._estimate_json_tokens(facts) + 192)
+        reserve = manager.summary_text_reserve(capacity) + manager._estimate_json_tokens(facts)
         if not hard_input or before <= hard_input:
             if state.checkpoint.context_window_state.get("summary_deferred_source") == source_hash:
                 return await _defer_summary(kernel, state, prepared, tools, source, source_hash,

@@ -58,6 +58,11 @@ class SteeringProjection:
     content_hash: str
 
 
+#: The event types ``SteeringProjector`` consumes. Readers pass them as an
+#: ``event_types`` filter so a projection never decodes the whole Task log.
+STEERING_EVENT_TYPES = ("steering.queued", "steering.applied")
+
+
 class SteeringProjector:
     @staticmethod
     def project(task_id: str, events: Sequence[RuntimeEvent]) -> SteeringProjection:

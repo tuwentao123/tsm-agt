@@ -347,7 +347,9 @@ class OnboardingMixin:
         snapshot = await self.get_project_instructions(task_id, audit=False)
         if not snapshot.activated or snapshot.content is None:
             return None
-        events = await self._dependencies.store.read_events(task_id)
+        events = await self._dependencies.store.read_events(
+            task_id, event_types=("project_instructions.inspected",),
+        )
         bound = next((
             event for event in reversed(events)
             if event.event_type == "project_instructions.inspected"

@@ -87,6 +87,13 @@ class WindowRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     saved = session.model_context_window
                     self.assertEqual(saved["epoch"], 2)
                     self.assertTrue(saved["task_event_sequence"])
+                    events = await first.kernel.dependencies.store.read_events(
+                        task.task_id, event_types=("context.compacted",),
+                    )
+                    self.assertEqual(len(events), 1)
+                    receipt = events[0].payload
+                    self.assertEqual(receipt["compaction_target_input_tokens"], 4_800)
+                    self.assertLess(receipt["after_estimated_tokens"], receipt["before_estimated_tokens"])
                     await first.kernel.interrupt_agent_turn(task.task_id, "fixture interruption")
                 finally:
                     entered.cancel()

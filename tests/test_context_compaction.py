@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -100,6 +101,50 @@ class ContextWindowManagerTest(unittest.TestCase):
         rendered = json.dumps(receipt.event_data())
         self.assertNotIn("old observation", rendered)
         self.assertNotIn("recent observation", rendered)
+
+    def test_conversation_compaction_reserves_prompt_tools_and_summary_before_retaining_history(self) -> None:
+        manager = ContextWindowManager()
+        tools = (ToolSpec(
+            "fixture.echo", "tool schema description " * 1_800,
+            {"type": "object", "properties": {}}, ToolRisk.R0, True,
+        ),)
+        current = text("goal", MessageRole.USER, "Keep the current requirement.")
+        old = tuple(message for index in range(6)
+                    for message in tool_pair(f"old-{index}", "old content " * 10_000))
+        expensive_recent = tool_pair("large", "recent content " * 4_000)
+        recent = tool_pair("latest", "latest result")
+        update = text("window-context-directory-updated", MessageRole.USER, "Directory updated.")
+        last_request = text("window-history-request", MessageRole.USER, "Draft a proposal.")
+        proposal = text("window-history-proposal", MessageRole.ASSISTANT, "Implement option A.")
+        old_turn_results = tuple(
+            replace(message, message_id=f"window-history-{message.message_id}")
+            for message in tool_pair("prior-research", "prior research " * 10_000)
+        )
+        baseline = text("window-context-root-1", MessageRole.USER, "Window baseline.")
+        source = (baseline, last_request, *old_turn_results, proposal,
+                  current, *old, *expensive_recent, *recent, update)
+
+        prepared = manager.prepare(
+            conversation=source, tools=tools, prompt_template=self.template,
+            context_window=300_000, max_output_tokens=8192,
+            trigger_on_history=False, compact_to_target=True,
+        )
+
+        assert prepared.compaction is not None
+        self.assertEqual(prepared.budget.compaction_target_input_tokens, 45_000)
+        self.assertEqual(prepared.compaction.event_data()["compaction_target_input_tokens"], 45_000)
+        self.assertLessEqual(prepared.budget.estimated_input_tokens, 45_000)
+        self.assertIn(current, prepared.canonical_messages)
+        self.assertIn(last_request, prepared.canonical_messages)
+        self.assertIn(proposal, prepared.canonical_messages)
+        self.assertTrue(set(message.message_id for message in old_turn_results).isdisjoint(
+            message.message_id for message in prepared.canonical_messages
+        ))
+        self.assertEqual(prepared.canonical_messages[-3:], (*recent, update))
+        self.assertNotIn(expensive_recent[0], prepared.canonical_messages)
+        self.assertNotIn(expensive_recent[1], prepared.canonical_messages)
+        self.assertIn("large", next(message.text for message in prepared.canonical_messages
+                                    if message.message_id.startswith("context-summary-")))
 
     def test_does_not_split_multi_tool_call_and_result_group(self) -> None:
         first = text("goal", MessageRole.USER, "goal")

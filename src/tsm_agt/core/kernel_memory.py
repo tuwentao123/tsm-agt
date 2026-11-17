@@ -44,14 +44,20 @@ from .memory import MemoryRecord, MemoryScope, MemorySourceKind, MemoryView
 from .task import TaskSnapshot, TaskState
 from .trust import workspace_fingerprint
 from .turn import InvalidTurnState
-from .working_memory import EffectiveWorkingMemory, WorkingMemorySnapshot
+from .working_memory import (
+    WORKING_MEMORY_EVENT_TYPES, EffectiveWorkingMemory, WorkingMemorySnapshot,
+)
 from .workspace import file_sha256
 
 
 class MemoryMixin:
     async def get_working_memory(self, task_id: str) -> WorkingMemorySnapshot:
         task = await self.get_task(task_id)
-        events = await self._dependencies.store.read_events(task_id)
+        # The projection consumes only its own events; reading the whole Task
+        # log decoded every tool result and approval checkpoint on each call.
+        events = await self._dependencies.store.read_events(
+            task_id, event_types=WORKING_MEMORY_EVENT_TYPES,
+        )
         return self._dependencies.working_memory_projector.project(
             task_id, task.goal, events
         )
@@ -65,7 +71,9 @@ class MemoryMixin:
         reconstructed from the same durable Task events after every restart.
         """
         task = await self.get_task(task_id)
-        events = await self._dependencies.store.read_events(task_id)
+        events = await self._dependencies.store.read_events(
+            task_id, event_types=WORKING_MEMORY_EVENT_TYPES,
+        )
         return self.project_effective_working_memory(task, events)
 
     def project_effective_working_memory(

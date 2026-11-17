@@ -7408,6 +7408,19 @@ async def update_session_langfuse(session_id: str, payload: dict, request: Reque
     return {"session_id": session_id, "enabled": enabled}
 
 
+async def _runtime_call(awaitable):
+    """Await Runtime work without blocking this ASGI event loop.
+
+    ``_call`` waits in ``future.result()``, which stalls every other request
+    and SSE stream of this server for as long as the Runtime takes. A server
+    that only offers the blocking form (an embedded test double) keeps it.
+    """
+    call_async = getattr(runtime_server, "call_async", None)
+    if call_async is None:
+        return runtime_server._call(awaitable)
+    return await call_async(awaitable)
+
+
 @app.post("/session-input")
 async def submit_session_input(payload: dict, request: Request = None) -> dict:
     """Web's high-level normal-message ingress; `/tasks` stays low-level."""
@@ -7474,7 +7487,7 @@ async def submit_session_input(payload: dict, request: Request = None) -> dict:
                 )
 
     try:
-        runtime_server._call(ensure_session())
+        await _runtime_call(ensure_session())
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     # Attachments stay structured. Inlining base64 into the text would blow
@@ -7509,7 +7522,7 @@ async def submit_session_input(payload: dict, request: Request = None) -> dict:
                 turn_request_diagnostics.reset(token)
 
     try:
-        result = runtime_server._call(submit_with_diagnostics())
+        result = await _runtime_call(submit_with_diagnostics())
     except AgentLoopLimitExceeded as error:
         if diagnostic_key:
             turn_request_diagnostics.delete(diagnostic_key)

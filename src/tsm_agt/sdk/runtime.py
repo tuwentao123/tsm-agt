@@ -433,9 +433,16 @@ class EngineeringAgentClient:
         request open for the whole model/tool loop.
         """
 
+        runner: asyncio.Task[RuntimeTaskResult] | None = None
         async with self._submit_lock:
             existing = self._run_tasks.get(task_id)
             if existing is None or existing.done():
+                kernel = self.application.kernel
+                task = await kernel.get_task(task_id)
+                stored_session = (
+                    await self._store().load_session(task.session_id)
+                    if task.session_id else None
+                )
                 runner = asyncio.create_task(
                     # The same wrapper a first turn uses: it records a failed
                     # turn on the Task and returns its result. Scheduling
@@ -448,6 +455,21 @@ class EngineeringAgentClient:
                     name=f"tsm-agt-sdk-turn-{task_id}",
                 )
                 self._register_runner(task_id, runner)
+        if runner is not None:
+            idle = task.state is TaskState.AWAITING_INPUT
+            if idle and stored_session is not None:
+                # An idle conversation used to answer only after the runner's
+                # first yield, which came after the whole pre-request
+                # preparation. Answer once its input is durable instead.
+                await self._await_turn_input_recorded(
+                    task.session_id, task_id,
+                    stored_session.last_event_sequence, runner,
+                )
+            if not idle or stored_session is not None:
+                # A stopped Task (INTERRUPTED/CONFLICT) answers before its
+                # runner starts, as before. Either way the receipt states the
+                # Task's state and cursor; the caller follows the stream.
+                return await self._accepted_turn_result(task_id)
         # Report the turn as started, not the conversation's idle state it is
         # leaving: a caller (the Web UI) that sees AWAITING_INPUT would treat
         # the accepted turn as "waiting for input" and never follow it. The turn
@@ -459,6 +481,51 @@ class EngineeringAgentClient:
                 break
             await asyncio.sleep(0.01)
         return await self.get_task_result(task_id)
+
+    async def _accepted_turn_result(self, task_id: str) -> RuntimeTaskResult:
+        """Receipt for a turn that was just scheduled.
+
+        It states the Task's current state and event cursor without projecting
+        the event log. The caller follows the Task's stream for everything
+        else; its first frame is the complete snapshot.
+        """
+        stored = await self.application.kernel._require_stored_task(task_id)
+        task = TaskSnapshot.from_data(stored.data)
+        return RuntimeTaskResult(
+            task_id, task.state.value, task.state.phase1_state.value,
+            _status_for_state(task.state), stored.last_event_sequence,
+            approval=_approval_data(task),
+            clarification=_clarification_data(task),
+        )
+
+    async def _await_turn_input_recorded(
+        self, session_id: str, task_id: str, after_sequence: int,
+        runner: asyncio.Task[RuntimeTaskResult], *, timeout: float = 30.0,
+    ) -> None:
+        """Wait until ``runner`` has durably recorded its Turn input.
+
+        The conversation loop yields once right after recording the input, so
+        this normally completes on its first check. It returns early if the
+        runner ends first (a failed turn is reported by the runner itself).
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        attempts = 0
+        while not runner.done() and loop.time() < deadline:
+            # Hand the loop to the runner. A zero-delay sleep resumes this
+            # coroutine right after the runner's next yield; once that is not
+            # enough, back off so a slow start cannot become a busy loop.
+            await asyncio.sleep(0 if attempts < 20 else 0.01)
+            attempts += 1
+            events = await self._store().read_session_events(
+                session_id, after_sequence,
+            )
+            if any(
+                event.event_type == "session.turn_input_recorded"
+                and event.payload.get("task_id") == task_id
+                for event in events
+            ):
+                return
 
     async def submit_session_text(
         self,
@@ -1430,10 +1497,12 @@ class EngineeringAgentClient:
         kernel = self.application.kernel
         stored = await kernel._require_stored_task(task_id)
         task = TaskSnapshot.from_data(stored.data)
-        if session_events is None:
-            events = await self._store().read_events(task_id)
-        else:
-            events = await self._store().read_events(task_id, include_approval_checkpoint=False)
+        # Every projection below reads approval receipts, never the model
+        # context embedded in them (the pending approval lives on the Task).
+        # Those embedded checkpoints are most of a long Task's log by size.
+        events = await self._store().read_events(
+            task_id, include_approval_checkpoint=False,
+        )
         projected = TaskRuntimeProjector.project(task, events)
         projection = projected.to_data()
         cached = self._latest_results.get(task_id)

@@ -1842,7 +1842,9 @@ class SessionMixin:
                 if execution.approval_request_id
             }
             if approval_ids:
-                for event in await self._dependencies.store.read_events(recent_task_id):
+                for event in await self._dependencies.store.read_events(
+                    recent_task_id, event_types=("approval.resolved",),
+                ):
                     if event.event_type != "approval.resolved":
                         continue
                     request_id = event.payload.get("request_id")

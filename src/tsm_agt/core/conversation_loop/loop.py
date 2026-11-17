@@ -17,6 +17,7 @@ A tool result -- success, failure, truncation, or timeout -- is written back as 
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Callable
@@ -240,6 +241,11 @@ class ConversationAgentLoop:
         # interrupted or killed never writes a result event, and the question
         # would vanish from the conversation.
         input_sequence = await kernel._record_session_turn_input(task_id, turn_id, user_message)
+        # Store calls do not yield the Runtime loop, so without this the whole
+        # pre-request preparation below would run before anything else could:
+        # the submitter acknowledging this now-durable input, or a UI stream
+        # publishing turn.started.
+        await asyncio.sleep(0)
         checkpoint = AgentTurnCheckpoint(
             task_id=task_id,
             turn_id=turn_id,
@@ -1156,6 +1162,7 @@ class ConversationAgentLoop:
                 read_reuse_task_id=state.task_id,
                 defer_hard_limit_for_summary=kernel._dependencies.context_summarizer is not None,
                 trigger_on_history=task.task_kind is not TaskKind.CONVERSATION,
+                compact_to_target=task.task_kind is TaskKind.CONVERSATION,
             )
             prepared = await complete_window_compaction(
                 kernel, state, prepared, model_tools, projections, identity,

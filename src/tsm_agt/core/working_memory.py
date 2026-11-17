@@ -313,6 +313,11 @@ class EffectiveWorkingMemoryProjector:
         )
 
 
+#: The only event type ``WorkingMemoryProjector`` consumes. Readers pass it as
+#: an ``event_types`` filter so a projection never decodes the whole Task log.
+WORKING_MEMORY_EVENT_TYPES = ("working_memory.updated",)
+
+
 @dataclass(frozen=True, slots=True)
 class WorkingMemoryProjector:
     def project(
